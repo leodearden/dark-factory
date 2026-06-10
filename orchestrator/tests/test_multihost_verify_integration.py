@@ -1,4 +1,4 @@
-"""Integration gate for task λ — multi-host verify end-to-end throughput (PRD Phase 5, §B B1–B8).
+"""Integration gate for task λ — multi-host verify queueing model + provenance plumbing (PRD Phase 5, §B B1–B8).
 
 This module is the sole deliverable of task 1702.  It composes the REAL substrate
 from α–κ (VerifyRunnerPool.dispatch, DriftDetector.check, run_verdict_parity,
@@ -6,17 +6,35 @@ enforce_persistent_worktree_serial_lane, check_merge_liveness_margin) and fakes
 ONLY the non-deterministic/external surface (verify service time + laptop/SSH
 transport) via _FakeRunner.
 
+NOTE on concurrency model
+--------------------------
+VerifyRunnerPool.dispatch is currently serial — it dispatches and awaits one SHA
+at a time.  The K-permit semaphore that would enable real concurrent dispatch is
+explicitly deferred to ζ (see verify_runner.py VerifyRunnerPool docstring).
+Consequently run_backlog_window models concurrency ANALYTICALLY via a K-server
+virtual clock; the throughput-direction improvements it measures are guaranteed
+by the K-server queueing model's arithmetic, not by observing actual concurrent
+pool behavior.  The headline gate therefore validates:
+
+  (a) the queueing MODEL (direction improvement is deterministic by construction),
+  (b) runner provenance plumbing (merge_verify events carry the correct runner tag),
+  (c) drift-detector integration (AGREE path → verdict_parity_ok, zero escalations).
+
+Once ζ's K-permit semaphore lands, the gate can be upgraded to drive real
+overlapping dispatch (e.g. asyncio.gather over slow fake runners with an
+injected clock) and measure observed, rather than computed, overlap.
+
 §B scenarios covered:
   B1  local-only provenance (runners_seen == {'local'})
   B2  remote happy-path provenance (runners_seen == {'local','laptop'})
   B3  fail-safe fallback — laptop unavailable, queue never stalls, local used
   B4  verdict parity over a pass/fail corpus via run_verdict_parity
   B5  drift divergence alarm — dedup'd L1 escalation + quarantine
-  B6  K=2 concurrency — peak in-flight==2, overlapping spans, serialized advance
+  B6  K=2 virtual-clock model — peak in-flight==2, overlapping spans, serialized advance
   B7  per-host warmth guard — enforce_persistent_worktree_serial_lane
   B8  liveness-margin guard — check_merge_liveness_margin
 
-Headline λ gate: test_end_to_end_throughput_gate_direction_and_provenance_and_zero_drift
+Headline λ gate (queueing-model + provenance): test_queueing_model_direction_and_provenance_and_zero_drift
 """
 from __future__ import annotations
 
@@ -189,6 +207,14 @@ async def run_backlog_window(
     service_secs: dict[str, float],
 ) -> WindowRun:
     """Drive *n_merges* synthetic merges through *pool* using a K-server virtual clock.
+
+    NOTE: concurrency is ANALYTICAL, not real parallel dispatch.
+    VerifyRunnerPool.dispatch is awaited serially (one SHA at a time) — the real
+    K-permit semaphore is deferred to ζ.  The K-slot virtual-clock below is a
+    queueing-model computation: it assigns each job to the earliest-free slot and
+    tracks virtual start/end times arithmetically.  It does NOT exercise real
+    concurrent dispatch; it exercises (1) the real pool.dispatch provenance path and
+    (2) the K-server queueing model that guarantees throughput direction.
 
     Serialised dispatch: each SHA is dispatched through the REAL pool.dispatch()
     in arrival order so advance_order == shas (PRD §A Invariant 3).  Concurrency
@@ -746,12 +772,18 @@ class TestDriftDivergenceAlarm:
 @pytest.mark.asyncio
 class TestK2ConcurrencyAndAdvanceOrder:
     async def test_k2_concurrency_overlaps_and_advance_is_ordered(self):
-        """B6: K=2 window produces overlapping spans and preserves arrival order.
+        """B6: K=2 virtual-clock model produces overlapping spans and preserves arrival order.
+
+        NOTE: the concurrency asserted here (peak_concurrency==2, overlapping spans)
+        is derived from the K-server VIRTUAL-CLOCK model, not from real simultaneous
+        pool.dispatch calls.  See run_backlog_window for the analytical model details.
+        The advance_order assertion (PRD §A Invariant 3) exercises the REAL serialized
+        dispatch ordering through pool.dispatch.
 
         With K=2 and equal service times, at least one pair of spans must
-        overlap in virtual time (proving two verifies ran concurrently).
+        overlap in virtual time (by the K-server slot assignment arithmetic).
         advance_order must equal the SHA arrival order (PRD §A Invariant 3).
-        peak_concurrency must equal 2.
+        peak_concurrency must equal 2 (per the slot-overlap computation).
         """
         rec = _RecordingEventStore()
         local_fake = _FakeRunner('local', is_local=True, service_secs=1.0)
@@ -904,7 +936,13 @@ async def run_window_comparison(
     service_secs: dict[str, float],
     drift_sample: bool = False,
 ) -> WindowComparisonResult:
-    """Orchestrate the end-to-end λ gate.
+    """Orchestrate the queueing-model + provenance-plumbing validation gate.
+
+    NOTE: this is an analytical simulation, not real concurrent dispatch.
+    See module docstring and run_backlog_window for the distinction.  The
+    direction improvements (rate_improved / oldest_age_reduced / depth_reduced)
+    are guaranteed by K-server queueing arithmetic, not by observing real
+    concurrent pool behavior.
 
     (1) Single-host baseline: K=1, local-only pool, fresh _RecordingEventStore.
     (2) Two-host window:      K=2, local+laptop pool, fresh _RecordingEventStore.
@@ -998,28 +1036,46 @@ async def run_window_comparison(
 
 
 # ---------------------------------------------------------------------------
-# Step-19 (RED): HEADLINE λ gate — end-to-end throughput direction +
+# Step-19 (RED) / Step-20 (GREEN): HEADLINE λ gate — queueing-model direction +
 # provenance + zero drift.  Fails until run_window_comparison exists.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestEndToEndThroughputGate:
-    async def test_end_to_end_throughput_gate_direction_and_provenance_and_zero_drift(self):
-        """HEADLINE λ gate: multi-host window outperforms single-host baseline.
+class TestQueueingModelAndProvenance:
+    """Validates the K-server queueing model and provenance plumbing.
 
-        Calls run_window_comparison(n_merges=6, service_secs=..., drift_sample=True)
+    SCOPE: this class tests the ANALYTICAL concurrency model (K-server virtual
+    clock) and the real provenance/drift-integration plumbing — NOT production
+    concurrent throughput.  VerifyRunnerPool.dispatch is serial; the K-permit
+    semaphore enabling real concurrent dispatch is deferred to ζ.  The direction
+    improvements (rate_improved, oldest_age_reduced, depth_reduced) follow from
+    queueing arithmetic and are guaranteed by construction for N≥2 equal-service
+    jobs; they do not require observing actual simultaneous dispatch.
+
+    Once ζ's K-permit semaphore lands, these tests can be upgraded to drive
+    real overlapping dispatch and measure observed (not computed) concurrency.
+    """
+
+    async def test_queueing_model_direction_and_provenance_and_zero_drift(self):
+        """Headline λ gate: K-server queueing model outperforms K=1 baseline.
+
+        Validates the queueing model and provenance plumbing — NOT real concurrent
+        dispatch (see class docstring).  Calls
+        run_window_comparison(n_merges=6, service_secs=..., drift_sample=True)
         and asserts all four headline properties:
 
-        (a) Throughput DIRECTION: rate_improved, oldest_age_reduced, depth_reduced
-            are all True.  Deltas are RECORDED but never compared against a frozen
-            multiplier (PRD G6).
+        (a) Queueing-model DIRECTION: rate_improved, oldest_age_reduced, depth_reduced
+            are all True (K=2 makespan < K=1 makespan by construction for N≥2).
+            Deltas are RECORDED but never compared against a frozen multiplier (PRD G6).
 
-        (b) Provenance: multihost_report.runners_seen == {'local', 'laptop'}.
+        (b) Provenance plumbing: multihost_report.runners_seen == {'local', 'laptop'}
+            (real pool.dispatch events carry the correct runner tag).
 
         (c) Zero drift divergence: result.drift_escalation_count == 0.
 
-        (d) ≥1 verdict_parity_ok event over the window (drift sampling confirms AGREE).
+        (d) ≥1 verdict_parity_ok event over the window (DriftDetector AGREE path
+            confirmed via real detector integration).
         """
         result = await run_window_comparison(
             n_merges=6,
