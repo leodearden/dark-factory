@@ -288,6 +288,34 @@ class TestMainHealthAutoHealRegistry:
 
 
 # ---------------------------------------------------------------------------
+# Task-1712: SpeculativeMergeWorker bare-harness constructibility contract
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeWorkerBareHarnessContract:
+    """SpeculativeMergeWorker must be constructible with a bare MagicMock(spec=GitOps).
+
+    Regression guard: task 1710 added an unconditional `git_ops.project_root`
+    access in __init__ which broke all bare-worker/bare-harness tests.  The
+    defensive fix (`getattr(git_ops, 'project_root', None)`) must keep
+    _shadow_state_path=None when project_root is absent, mirroring the
+    escalation_queue None-safety contract documented in the same constructor.
+    """
+
+    def test_bare_spec_mock_does_not_raise(self) -> None:
+        """Constructing with bare MagicMock(spec=GitOps) — NO project_root wired —
+        must NOT raise AttributeError."""
+        from orchestrator.merge_queue import MainHealthAutoHealRegistry, SpeculativeMergeWorker
+
+        # Intentionally bare: project_root is NOT set on this mock.
+        # This exercises the project_root-absent / None path in __init__.
+        git_ops = MagicMock(spec=GitOps)
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+        assert worker._shadow_state_path is None
+        assert isinstance(worker.auto_heal_registry, MainHealthAutoHealRegistry)
+
+
+# ---------------------------------------------------------------------------
 # Step-9: MergeRequest.lane wired from task metadata in _submit_to_merge_queue
 # ---------------------------------------------------------------------------
 
