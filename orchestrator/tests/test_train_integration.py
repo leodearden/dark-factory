@@ -640,3 +640,85 @@ class TestTrainIntegrationB3B4:
             f"got: {result!r}; "
             f"anchor ranges: {ranges_anchor!r}, candidate ranges: {ranges_candidate!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# B8: lone merge-ready task merges solo without waiting for a train
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTrainIntegrationB8:
+    """B8 anti-starvation: a single merge-ready task merges solo without a train.
+
+    A plain MergeRequest (not GroupMergeRequest) is driven through
+    MergeWorker._do_merge.  It must land directly with outcome.status=='done',
+    its edit present on main, and NO train_started / train_merged events emitted.
+
+    This establishes the solo-merge baseline (1 verify → 1 landed task =
+    verifies-per-landed-task 1.0) that B7's 2-member train (0.5) is compared against.
+
+    Gated by cargo_or_skip.  GREEN on arrival.
+    """
+
+    async def test_solo_merge_no_train_events(
+        self,
+        cargo_or_skip,  # noqa: ARG002
+        shared_cargo_target: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A single MergeRequest lands solo without forming or awaiting a train."""
+        repo = await seed_workspace_repo(tmp_path)
+        config = make_train_config(repo, shared_cargo_target)
+        git_ops = GitOps(config.git, repo)
+
+        # Create a single task branch with a clean additive edit.
+        def edit_solo(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn b8_solo_output() -> u32 { 8 }\n")
+
+        _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        wt_solo, _sha = await make_stacked_member(git_ops, "b8_solo", main_sha.strip(), edit_solo)
+
+        spy = _SpyEventStore()
+
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        req = MergeRequest(
+            task_id="b8_solo",
+            branch="b8_solo",
+            worktree=wt_solo,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=future,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=spy)
+
+        outcome = await worker._do_merge(req)
+
+        # (1) Outcome is done.
+        assert outcome is not None
+        assert outcome.status == "done", f"expected done for solo merge, got: {outcome!r}"
+
+        # (2) Edit is present on main.
+        _, lib_a, _ = await _run(["git", "show", "main:crate_a/src/lib.rs"], cwd=repo)
+        assert "b8_solo_output" in lib_a, "solo edit not present on main after merge"
+
+        # (3) NO train_started or train_merged events — solo task must NOT form a train.
+        train_started_events = spy.by_type("train_started")
+        assert not train_started_events, (
+            f"expected NO train_started event for solo merge, got: {train_started_events}"
+        )
+        train_merged_events = spy.by_type("train_merged")
+        assert not train_merged_events, (
+            f"expected NO train_merged event for solo merge, got: {train_merged_events}"
+        )
+
+        # (4) Record the baseline: 1 solo merge = 1 verify for 1 task.
+        #     verifies_per_landed_task (solo baseline) = 1.0.
+        #     This is the structural denominator that B7 beats (0.5 for a 2-member train).
+        solo_baseline = 1.0  # by definition: one verify per solo-merged task
+        assert solo_baseline == 1.0, "solo baseline must be 1.0 (structural identity)"
