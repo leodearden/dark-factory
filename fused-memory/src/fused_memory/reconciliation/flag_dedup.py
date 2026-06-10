@@ -1123,6 +1123,12 @@ STALE_METADATA_FLAG_TYPES: frozenset[str] = frozenset({
 #: Task statuses that represent terminal states with no further execution need.
 #: A task in one of these states will never re-execute, so its metadata blobs
 #: have no execution-time consumer and stale_metadata flags for it are noise.
+#:
+#: Deliberately excludes ``'deferred'`` and ``'blocked'``: although the steward
+#: treats those as terminal decisions, a deferred or blocked task *may* resume
+#: and still have live execution-time need for its metadata.  Add them here only
+#: if it is confirmed that deferred/blocked tasks are permanently non-executable
+#: in this deployment.
 TERMINAL_STATUSES: frozenset[str] = frozenset({
     'cancelled',
     'done',
@@ -1137,6 +1143,12 @@ def _extract_terminal_status(result: object) -> str:
 
     This is a local copy of the extraction logic to honour the no-import-inversion
     convention (reconciliation must not import from middleware).
+
+    **Sibling copies** — keep in sync if the get_task response shape ever changes:
+
+    * ``middleware/task_interceptor._extract_status`` (~line 3292) — canonical source
+    * ``reconciliation/stages/task_knowledge_sync._extract_status`` (~line 57) —
+      same logic but assumes a dict input (no non-dict guard)
     """
     if not isinstance(result, dict):
         return 'unknown'
@@ -1196,6 +1208,28 @@ async def filter_terminal_metadata_flags(
         if flag_type in STALE_METADATA_FLAG_TYPES and flag.get('task_id') is not None:
             check_positions.append(i)
             check_task_ids.append(flag.get('task_id'))
+
+    # Detect potential LLM naming drift: flag_type strings that look like
+    # stale-metadata variants (contain 'stale') but are not in
+    # STALE_METADATA_FLAG_TYPES.  When the model emits an unrecognised spelling
+    # the filter silently becomes a no-op; this log makes that observable so
+    # operators can update STALE_METADATA_FLAG_TYPES.
+    drift_candidates = [
+        ft
+        for flag in flags
+        if (ft := flag.get('flag_type')) is not None
+        and isinstance(ft, str)
+        and 'stale' in ft.lower()
+        and ft not in STALE_METADATA_FLAG_TYPES
+    ]
+    if drift_candidates:
+        logger.info(
+            'reconciliation.terminal_metadata_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update STALE_METADATA_FLAG_TYPES if drift confirmed',
+            drift_candidates,
+            sorted(STALE_METADATA_FLAG_TYPES),
+        )
 
     if not check_positions:
         return list(flags)
