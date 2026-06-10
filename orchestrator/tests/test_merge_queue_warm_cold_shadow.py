@@ -5,8 +5,10 @@ born-at-L2 alarm on divergence.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -14,9 +16,11 @@ import pytest
 # Step-1: cadence predicate _shadow_compare_due
 # ---------------------------------------------------------------------------
 
-from unittest.mock import MagicMock
-
 from escalation.models import BORN_AT_L2_SEVERITIES
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
+from orchestrator.git_ops import GitOps, _run
 
 from orchestrator.merge_queue import (  # noqa: E402
     ShadowCompareState,
@@ -26,6 +30,7 @@ from orchestrator.merge_queue import (  # noqa: E402
     _save_shadow_compare_state,
     _shadow_compare_due,
     _submit_shadow_divergence_escalation,
+    _run_shadow_compare,
     diff_per_test_results,
     parse_per_test_results,
 )
@@ -550,3 +555,256 @@ class TestSubmitShadowDivergenceEscalation:
         diff = _make_diverging_diff()
         _submit_shadow_divergence_escalation(q, "sha", diff, {}, {})
         q.make_id.assert_called_once_with(_WARM_COLD_SHADOW_SENTINEL)
+
+
+# ---------------------------------------------------------------------------
+# Step-11: create_throwaway_verify_worktree (real-git) + _run_shadow_compare
+# ---------------------------------------------------------------------------
+
+# --- Real-git fixtures for create_throwaway_verify_worktree ---
+
+
+async def _setup_repo(repo: Path) -> None:
+    """Set up a minimal git repo with one commit."""
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def git_repo_wcs(tmp_path: Path) -> Path:
+    """Real git repository for warm/cold shadow tests."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def git_ops_wcs(git_repo_wcs: Path) -> GitOps:
+    """GitOps instance backed by a real git repo."""
+    git = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        persistent_merge_worktree=False,
+    )
+    return GitOps(git, git_repo_wcs)
+
+
+class TestCreateThrowawayVerifyWorktree:
+    """Tests for git_ops.create_throwaway_verify_worktree (step-11 real-git).
+
+    (1) Verifies create_throwaway_verify_worktree creates an EPHEMERAL
+    _merge-<uuid> worktree (not the warm _merge-verify path) checked out at
+    merge_commit, and that cleanup_merge_worktree removes it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_creates_ephemeral_worktree_at_merge_commit(
+        self, git_ops_wcs: GitOps, git_repo_wcs: Path
+    ) -> None:
+        # Resolve the current HEAD SHA (a real commit in the repo)
+        _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
+        merge_commit = sha_out.strip()
+
+        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+
+        try:
+            assert wt.exists(), f'Throwaway worktree dir must exist: {wt}'
+            # Name must start with _merge- (ephemeral UUID)
+            assert wt.name.startswith('_merge-'), (
+                f'Expected _merge-<uuid>, got {wt.name!r}'
+            )
+            # Must be checked out at the requested commit
+            _, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+            assert head_out.strip() == merge_commit, (
+                f'Worktree HEAD {head_out.strip()!r} != merge_commit {merge_commit!r}'
+            )
+        finally:
+            await git_ops_wcs.cleanup_merge_worktree(wt)
+
+    @pytest.mark.asyncio
+    async def test_path_is_not_persistent_merge_verify(
+        self, git_ops_wcs: GitOps, git_repo_wcs: Path
+    ) -> None:
+        _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
+        merge_commit = sha_out.strip()
+
+        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+
+        try:
+            # Path must NOT be the persistent warm worktree
+            persistent = git_ops_wcs.persistent_merge_worktree_path
+            assert wt.resolve() != persistent.resolve(), (
+                f'Throwaway path must not be {persistent}'
+            )
+            assert wt.name != '_merge-verify', (
+                f'Throwaway name must not be _merge-verify; got {wt.name!r}'
+            )
+        finally:
+            await git_ops_wcs.cleanup_merge_worktree(wt)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_removes_throwaway_worktree(
+        self, git_ops_wcs: GitOps, git_repo_wcs: Path
+    ) -> None:
+        _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
+        merge_commit = sha_out.strip()
+
+        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        assert wt.exists()
+
+        await git_ops_wcs.cleanup_merge_worktree(wt)
+        assert not wt.exists(), f'cleanup_merge_worktree must remove the throwaway worktree'
+
+
+# --- _run_shadow_compare async tests (cold leg stubbed) ---
+
+
+def _make_mock_req(tmp_path: Path) -> MagicMock:
+    """Build a minimal MergeRequest stub."""
+    req = MagicMock()
+    req.task_id = 'task-1710'
+    req.config = OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(warm_verify_shadow_compare=True),
+    )
+    return req
+
+
+class TestRunShadowCompare:
+    """Tests for _run_shadow_compare — cold leg stubbed.
+
+    (2) _run_shadow_compare with _run_cold_shadow_verify patched:
+    - (c) matching warm/cold → NO escalation, parity-ok event emitted
+    - (d) diverging warm=pass/cold=fail → escalation submitted, diverging test named
+    - cold leg called with the merge_commit so throwaway worktree WOULD be at merge_commit
+    """
+
+    @pytest.mark.asyncio
+    async def test_matching_warm_cold_no_escalation(self, tmp_path: Path) -> None:
+        warm = {'reify-core ok::test': True, 'reify-eval other::test': False}
+        cold = {'reify-core ok::test': True, 'reify-eval other::test': False}
+        q = _make_escalation_queue()
+        event_store = MagicMock()
+        req = _make_mock_req(tmp_path)
+        git_ops_stub = MagicMock()
+
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify',
+            new=AsyncMock(return_value=cold),
+        ):
+            await _run_shadow_compare(
+                git_ops_stub, req, 'sha123abc', warm, q, event_store
+            )
+
+        # Case (c): no divergence → no escalation
+        q.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_matching_warm_cold_emits_parity_ok_event(
+        self, tmp_path: Path
+    ) -> None:
+        warm = {'t1': True}
+        cold = {'t1': True}
+        event_store = MagicMock()
+        req = _make_mock_req(tmp_path)
+
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify',
+            new=AsyncMock(return_value=cold),
+        ):
+            await _run_shadow_compare(
+                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store
+            )
+
+        # Parity-ok event should be emitted
+        event_store.emit.assert_called_once()
+        emit_args = event_store.emit.call_args
+        assert emit_args[0][0] == EventType.verdict_parity_ok
+
+    @pytest.mark.asyncio
+    async def test_diverging_warm_pass_cold_fail_fires_escalation(
+        self, tmp_path: Path
+    ) -> None:
+        # (d) warm=pass/cold=fail → escalation submitted
+        warm = {'reify-core bad::test': True}
+        cold = {'reify-core bad::test': False}
+        q = _make_escalation_queue()
+        event_store = MagicMock()
+        req = _make_mock_req(tmp_path)
+
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify',
+            new=AsyncMock(return_value=cold),
+        ):
+            await _run_shadow_compare(
+                MagicMock(), req, 'deadbeef1234', warm, q, event_store
+            )
+
+        q.submit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_diverging_escalation_names_diverging_test(
+        self, tmp_path: Path
+    ) -> None:
+        warm = {'reify-core bad::test': True}
+        cold = {'reify-core bad::test': False}
+        q = _make_escalation_queue()
+        req = _make_mock_req(tmp_path)
+
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify',
+            new=AsyncMock(return_value=cold),
+        ):
+            await _run_shadow_compare(
+                MagicMock(), req, 'deadbeef1234', warm, q, MagicMock()
+            )
+
+        esc = q.submit.call_args[0][0]
+        assert 'reify-core bad::test' in esc.detail
+
+    @pytest.mark.asyncio
+    async def test_diverging_no_parity_ok_event(self, tmp_path: Path) -> None:
+        # On divergence we submit escalation; no parity-ok event
+        warm = {'t': True}
+        cold = {'t': False}
+        event_store = MagicMock()
+        req = _make_mock_req(tmp_path)
+
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify',
+            new=AsyncMock(return_value=cold),
+        ):
+            await _run_shadow_compare(
+                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store
+            )
+
+        event_store.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cold_leg_called_with_merge_commit(self, tmp_path: Path) -> None:
+        # The cold leg must be invoked with the exact merge_commit (→ throwaway
+        # worktree WOULD be created at that commit)
+        warm = {'t1': True}
+        cold = {'t1': True}
+        req = _make_mock_req(tmp_path)
+        mock_cold = AsyncMock(return_value=cold)
+
+        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(
+                MagicMock(), req, 'sha_target_123', warm,
+                _make_escalation_queue(), MagicMock()
+            )
+
+        # _run_cold_shadow_verify must have been called with the exact merge_commit
+        call_args = mock_cold.call_args
+        assert 'sha_target_123' in call_args[0], (
+            f'cold leg must be called with merge_commit; call_args={call_args}'
+        )
