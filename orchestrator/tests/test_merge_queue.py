@@ -17758,3 +17758,575 @@ class TestSpeculationPermitLeakOnMergerError:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestOwnedMergeWorktreeLivenessHeartbeat
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOwnedMergeWorktreeLivenessHeartbeat:
+    """Unit/integration tests for SpeculativeMergeWorker owned-worktree liveness ledger.
+
+    Distinct from the existing queue-depth heartbeat tests (~:15448) which test
+    _maybe_log_queue_heartbeat; this class tests _touch_owned_merge_worktrees
+    and the ledger (register/deregister/cleanup wrapper) and their wiring into
+    _heartbeat_loop.
+    """
+
+    async def test_touch_advances_mtime_and_returns_count(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
+    ):
+        """_touch_owned_merge_worktrees: updates mtime of a real worktree and returns 1.
+
+        Scenario:
+          - Create a real on-disk _merge-* worktree via git_ops.merge_to_main.
+          - Add its path to worker._owned_merge_worktrees.
+          - Force mtime to ancient (0) via os.utime.
+          - Call _touch_owned_merge_worktrees().
+          - Assert mtime is now near-current (within 5s) and count == 1.
+          - Assert a DEBUG 'touched 1 owned merge worktree(s)' record is emitted.
+
+        RED: _owned_merge_worktrees attribute and _touch_owned_merge_worktrees do
+        not exist yet.
+        """
+        import os as _os
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Build a real _merge-* worktree on disk
+        wt = await _make_branch_with_file(git_ops, 'hb-touch-test', 'hb.py', 'x = 1\n')
+        merge_result = await git_ops.merge_to_main(wt, 'hb-touch-test')
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None, 'merge_worktree must be set after successful merge'
+
+        # Seed the ledger manually (registration wired in later steps)
+        worker._owned_merge_worktrees.add(merge_wt)
+
+        # Force an ancient mtime so any real touch is detectable
+        _os.utime(str(merge_wt), (0, 0))
+        assert merge_wt.stat().st_mtime == 0, 'pre-condition: mtime should be 0'
+
+        # Touch and check
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            n = worker._touch_owned_merge_worktrees()
+
+        assert n == 1, f'Expected touched count 1, got {n}'
+        assert merge_wt.stat().st_mtime > time.time() - 5, (
+            f'mtime not updated: st_mtime={merge_wt.stat().st_mtime}, now={time.time()}'
+        )
+
+        # Check DEBUG log record
+        debug_records = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG and 'touched' in r.message and 'owned merge worktree' in r.message
+        ]
+        assert len(debug_records) >= 1, (
+            f'Expected DEBUG "touched N owned merge worktree(s)" record; got: '
+            f'{[r.message for r in caplog.records]}'
+        )
+        assert '1' in debug_records[0].message, (
+            f'DEBUG record must mention count 1; got: {debug_records[0].message!r}'
+        )
+
+        # Cleanup
+        await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_touch_enoent_self_heal(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
+    ):
+        """_touch_owned_merge_worktrees: ENOENT self-heals by dropping path from ledger.
+
+        Scenario:
+          - Register a non-existent path (never created on disk).
+          - Call _touch_owned_merge_worktrees().
+          - Assert: path removed from _owned_merge_worktrees, INFO log mentions
+            the drop, returned count excludes it (0 when it was the only entry).
+
+        RED (step-3 design): step-2 os.utime raises FileNotFoundError uncaught.
+        GREEN because the ENOENT branch was included in step-2 implementation.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Non-existent path
+        gone_path = git_ops.worktree_base / '_merge-gone-enoent'
+        worker._owned_merge_worktrees.add(gone_path)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            n = worker._touch_owned_merge_worktrees()
+
+        assert n == 0, f'Expected 0 (ENOENT path excluded), got {n}'
+        assert gone_path not in worker._owned_merge_worktrees, (
+            'ENOENT path must be removed from ledger'
+        )
+        info_records = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and 'dropped' in r.message.lower()
+        ]
+        assert len(info_records) >= 1, (
+            f'Expected INFO "dropped from liveness ledger" record; got: '
+            f'{[r.message for r in caplog.records]}'
+        )
+
+    async def test_touch_oserror_warns_once_per_episode(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path, caplog,
+        monkeypatch,
+    ):
+        """_touch_owned_merge_worktrees: persistent OSError → exactly 1 WARNING/episode.
+
+        Scenario:
+          1. Register a real worktree dir (so the path exists — rules out ENOENT).
+          2. monkeypatch.setattr os.utime to raise PermissionError (auto-teardown).
+          3. Call _touch_owned_merge_worktrees() twice with caplog at WARNING.
+          4. Assert: exactly ONE WARNING across both calls (loud-once).
+          5. Assert: path still in _owned_merge_worktrees (kept for retry).
+          6. Assert: count == 0 both times.
+          7. monkeypatch.undo() to restore; call once → count == 1, no new WARNING.
+          8. Re-inject failure → a fresh WARNING is emitted (warned-state
+             cleared on success).
+        """
+        import orchestrator.merge_queue as mq_mod
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Use a real dir so utime mock is necessary to trigger OSError
+        wt_dir = tmp_path / '_merge-perm-test'
+        wt_dir.mkdir()
+        worker._owned_merge_worktrees.add(wt_dir)
+
+        def _raise_permission(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise PermissionError('permission denied (test)')
+
+        # Inject failure via monkeypatch (guarantees auto-teardown on test exit)
+        monkeypatch.setattr(mq_mod.os, 'utime', _raise_permission)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            n1 = worker._touch_owned_merge_worktrees()
+            n2 = worker._touch_owned_merge_worktrees()
+
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'liveness heartbeat' in r.message
+        ]
+        assert len(warn_records) == 1, (
+            f'Expected exactly 1 WARNING across 2 calls with injected failure; '
+            f'got {len(warn_records)}: {[r.message for r in warn_records]}'
+        )
+        assert n1 == 0, f'Expected count 0 on first failed call, got {n1}'
+        assert n2 == 0, f'Expected count 0 on second failed call, got {n2}'
+        assert wt_dir in worker._owned_merge_worktrees, (
+            'Path must remain in ledger after non-ENOENT OSError'
+        )
+
+        # --- Recovery: undo monkeypatch → os.utime restored; call once → success ---
+        monkeypatch.undo()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            n3 = worker._touch_owned_merge_worktrees()
+        assert n3 == 1, f'Expected count 1 after recovery, got {n3}'
+        warn_after_recovery = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'liveness heartbeat' in r.message
+        ]
+        assert len(warn_after_recovery) == 0, (
+            f'No WARNING expected after recovery; got: {warn_after_recovery}'
+        )
+
+        # --- Re-inject failure → a fresh WARNING emitted (warned-state cleared on success) ---
+        monkeypatch.setattr(mq_mod.os, 'utime', _raise_permission)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            n4 = worker._touch_owned_merge_worktrees()
+        assert n4 == 0
+        fresh_warns = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'liveness heartbeat' in r.message
+        ]
+        assert len(fresh_warns) == 1, (
+            f'Expected fresh WARNING after re-inject; got {len(fresh_warns)}'
+        )
+        # monkeypatch teardown automatically restores os.utime at test exit
+
+    async def test_register_guard_rejects_none_and_persistent(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_register_owned_merge_worktree: guards None and _merge-verify; admits ephemeral.
+
+        Scenario:
+          - Register None → no error, nothing added.
+          - Register persistent worktree path (_merge-verify) → NOT added.
+          - Register an ephemeral _merge-xyz path → IS added.
+
+        RED (step-7 design): step-2's register has no None/name guard.
+        GREEN because the guard was included in step-2 implementation.
+        """
+        from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME as _PMN
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        persistent_path = git_ops.worktree_base / _PMN
+
+        # None → no-op, no error
+        worker._register_owned_merge_worktree(None)
+        assert len(worker._owned_merge_worktrees) == 0, (
+            'Registering None must not add any entry'
+        )
+
+        # Persistent warm worktree → rejected
+        worker._register_owned_merge_worktree(persistent_path)
+        assert persistent_path not in worker._owned_merge_worktrees, (
+            f'Persistent {_PMN!r} path must never enter the liveness ledger'
+        )
+
+        # Ephemeral _merge-xyz → admitted
+        ephemeral = git_ops.worktree_base / '_merge-abc123'
+        worker._register_owned_merge_worktree(ephemeral)
+        assert ephemeral in worker._owned_merge_worktrees, (
+            'Ephemeral _merge-<id> path must be added to ledger'
+        )
+
+    async def test_heartbeat_loop_touches_ledger_and_freezes_on_stop(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog, monkeypatch,
+    ):
+        """_heartbeat_loop wires touch into per-tick; mtime freezes after stop().
+
+        Scenario:
+          1. monkeypatch.setattr _HEARTBEAT_POLL_S to a small value (0.02 s).
+          2. Set _heartbeat_interval_s high (9999 s) so rate-limited log stays quiet.
+          3. Create a real _merge-* worktree; register it; force mtime to 0.
+          4. Start _heartbeat_loop as a standalone task (set _running=True).
+          5. Poll ≤ 1 s asserting mtime advanced to near-now (touched).
+          6. Set _running=False, cancel/await task (await ensures task is done).
+          7. Confirm task.done() before sampling frozen mtime; sleep > 2× poll;
+             assert mtime unchanged (frozen).
+
+        RED because _heartbeat_loop does not call _touch_owned_merge_worktrees yet.
+        """
+        import os as _os
+
+        import orchestrator.merge_queue as mq_mod
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker._heartbeat_interval_s = 9999.0  # suppress rate-limited log
+
+        # Build a real _merge-* worktree
+        wt = await _make_branch_with_file(git_ops, 'hb-loop-test', 'f.py', 'x = 1\n')
+        merge_result = await git_ops.merge_to_main(wt, 'hb-loop-test')
+        assert merge_result.success
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        worker._owned_merge_worktrees.add(merge_wt)
+        _os.utime(str(merge_wt), (0, 0))
+        assert merge_wt.stat().st_mtime == 0
+
+        # Start heartbeat with fast poll; monkeypatch handles restoration
+        monkeypatch.setattr(mq_mod, '_HEARTBEAT_POLL_S', 0.02)
+        worker._running = True
+        task = asyncio.create_task(worker._heartbeat_loop())
+        try:
+            # Poll up to 1 s for mtime to advance
+            deadline = asyncio.get_event_loop().time() + 1.0
+            while asyncio.get_event_loop().time() < deadline:
+                if merge_wt.stat().st_mtime > time.time() - 5:
+                    break
+                await asyncio.sleep(0.05)
+            assert merge_wt.stat().st_mtime > time.time() - 5, (
+                f'mtime not advanced after heartbeat loop ran; '
+                f'st_mtime={merge_wt.stat().st_mtime}'
+            )
+        finally:
+            worker._running = False
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        # Confirm task is truly done before sampling mtime — avoids a race
+        # where a final in-flight tick fires after stop() during the sleep window.
+        assert task.done(), 'Heartbeat task must be done after cancel+await'
+        frozen_mtime = merge_wt.stat().st_mtime
+        await asyncio.sleep(0.12)  # > 2× poll
+        assert merge_wt.stat().st_mtime == frozen_mtime, (
+            'mtime advanced after worker stopped — heartbeat leaked'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_merger_registers_worktree_while_in_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
+    ):
+        """Merger registers the ephemeral worktree in the liveness ledger.
+
+        Drives a full worker.run() with a blocking fake verify.  While verify
+        is blocked the worktree must be in _owned_merge_worktrees.
+
+        RED because no _register_owned_merge_worktree call exists at the
+        _merger_loop success handoff yet.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'reg-test', 'reg.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Event that lets the test hold the verify open, and a separate
+        # event that fires when verify starts so we can sample the ledger.
+        verify_started = asyncio.Event()
+        verify_gate = asyncio.Event()
+
+        async def _blocking_verify(merge_wt, cfg, module_configs, **kwargs):
+            verify_started.set()
+            await verify_gate.wait()
+            return MagicMock(passed=True, summary='')
+
+        worker_task = asyncio.create_task(worker.run())
+        try:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                side_effect=_blocking_verify,
+            ):
+                req = _make_request('reg-test', 'reg-test', wt, config)
+                await queue.put(req)
+
+                # Wait until verify has started (worktree is merged + in-verify)
+                await asyncio.wait_for(verify_started.wait(), timeout=30)
+
+                # --- THE ASSERTION ---
+                # At this point the merger has succeeded and put a SpeculativeItem
+                # on the verifier queue.  The worktree must be registered.
+                ledger = worker._owned_merge_worktrees
+                assert len(ledger) >= 1, (
+                    '_owned_merge_worktrees must be non-empty while verify is running; '
+                    'got empty set'
+                )
+                wt_path = next(iter(ledger))
+                assert wt_path.name.startswith('_merge-'), (
+                    f'Ledger entry must be a _merge-* path; got {wt_path.name!r}'
+                )
+                assert wt_path.parent == git_ops.worktree_base, (
+                    f'Ledger entry must live under worktree_base; got {wt_path}'
+                )
+
+                # Unblock verify
+                verify_gate.set()
+                outcome = await asyncio.wait_for(req.result, timeout=30)
+                assert outcome.status == 'done', f'Expected done; got {outcome}'
+
+        finally:
+            await worker.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+    async def test_cleanup_wrapper_deregisters_before_disk_removal(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_cleanup_owned_merge_worktree: deregisters then removes from disk.
+
+        Part (a): Unit — register a real worktree, call the wrapper, assert
+        path gone from _owned_merge_worktrees AND removed from disk.
+
+        Part (b): Robustness — monkeypatch git_ops.cleanup_merge_worktree to
+        raise; call wrapper via contextlib.suppress; path must still be
+        deregistered (a failed remove cannot immortalise a ledger entry).
+
+        GREEN for (a) + (b): wrapper implemented in step-2.
+        RED lives in test_done_landing_clears_ledger (part c) below.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # --- Part (a): unit --- #
+        wt_a = await _make_branch_with_file(git_ops, 'cleanup-a', 'a.py', 'a = 1\n')
+        merge_result_a = await git_ops.merge_to_main(wt_a, 'cleanup-a')
+        assert merge_result_a.success
+        merge_wt_a = merge_result_a.merge_worktree
+        assert merge_wt_a is not None and merge_wt_a.exists()
+
+        worker._owned_merge_worktrees.add(merge_wt_a)
+        await worker._cleanup_owned_merge_worktree(merge_wt_a)
+
+        assert merge_wt_a not in worker._owned_merge_worktrees, (
+            'Wrapper must deregister the worktree from the liveness ledger'
+        )
+        assert not merge_wt_a.exists(), (
+            'Wrapper must remove the worktree directory from disk'
+        )
+
+        # --- Part (b): robustness — cleanup raises → still deregistered --- #
+        wt_b = await _make_branch_with_file(git_ops, 'cleanup-b', 'b.py', 'b = 2\n')
+        merge_result_b = await git_ops.merge_to_main(wt_b, 'cleanup-b')
+        assert merge_result_b.success
+        merge_wt_b = merge_result_b.merge_worktree
+        assert merge_wt_b is not None
+
+        worker._owned_merge_worktrees.add(merge_wt_b)
+
+        original_cleanup = git_ops.cleanup_merge_worktree
+
+        async def _raising_cleanup(wt: Path) -> None:
+            raise OSError('test-induced cleanup failure')
+
+        git_ops.cleanup_merge_worktree = _raising_cleanup  # type: ignore[method-assign]
+        try:
+            with contextlib.suppress(OSError):
+                await worker._cleanup_owned_merge_worktree(merge_wt_b)
+        finally:
+            git_ops.cleanup_merge_worktree = original_cleanup  # type: ignore[method-assign]
+
+        assert merge_wt_b not in worker._owned_merge_worktrees, (
+            'Failed disk removal must NOT prevent deregistration from the ledger'
+        )
+        # Actual cleanup of the real dir (cleanup was mocked)
+        await git_ops.cleanup_merge_worktree(merge_wt_b)
+
+    async def test_done_landing_clears_ledger(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Done landing removes the ephemeral worktree from the liveness ledger.
+
+        Part (c) end-to-end: drive a merge to 'done' status and assert the
+        registered ephemeral worktree path is NOT in _owned_merge_worktrees
+        after completion.
+
+        GREEN regression guard: the done-landing path in _verify_and_advance
+        uses _cleanup_owned_merge_worktree (the wrapper that calls
+        _deregister_owned_merge_worktree before disk removal). If the wrapper
+        were accidentally reverted to a direct git_ops call the ledger entry
+        would survive the 'done' landing as a ghost until the next ENOENT
+        self-heal tick.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'done-clear', 'done.py', 'd = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        worker_task = asyncio.create_task(worker.run())
+        try:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _mock_verify_pass(),
+            ):
+                req = _make_request('done-clear', 'done-clear', wt, config)
+                await queue.put(req)
+                outcome = await asyncio.wait_for(req.result, timeout=30)
+            assert outcome.status == 'done', (
+                f'Expected done landing; got {outcome}'
+            )
+        finally:
+            await worker.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+        # After a successful 'done' landing the ephemeral worktree was cleaned
+        # from disk.  The liveness ledger must also be cleared — a ghost entry
+        # would accumulate until the next ENOENT self-heal tick.
+        assert len(worker._owned_merge_worktrees) == 0, (
+            f'_owned_merge_worktrees must be empty after done landing; '
+            f'residual: {worker._owned_merge_worktrees}'
+        )
+
+    async def test_warm_swap_deregisters_ephemeral_from_ledger(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Warm-swap branch deregisters the ephemeral path from the liveness ledger.
+
+        Regression guard for _verify_and_advance:6542-6543: when
+        _acquire_warm_verify_worktree returns the persistent _merge-verify path,
+        the conditional branch must deregister item.merge_wt from the liveness
+        ledger IMMEDIATELY (before verify runs).  If the branch were removed the
+        ephemeral would ghost in the ledger until the next ENOENT self-heal tick.
+
+        Verification strategy: use a blocking verify so we can observe the ledger
+        state AFTER the warm swap has already happened but BEFORE verify completes.
+        At verify-started time:
+          - The ephemeral _merge-<uuid> is NOT in the ledger (deregistered by the
+            warm-swap branch).
+          - The persistent _merge-verify path was NEVER registered.
+
+        This is a tighter guard than test_done_landing_clears_ledger because it
+        asserts the deregistration happened at swap time, not later at cleanup.
+        """
+        from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME as _PMN
+
+        # Create a config with persistent_merge_worktree=True so the warm swap runs
+        warm_git_config = GitConfig(
+            main_branch=config.git.main_branch,
+            branch_prefix=config.git.branch_prefix,
+            remote=config.git.remote,
+            worktree_dir=config.git.worktree_dir,
+            push_after_advance=False,
+            persistent_merge_worktree=True,
+        )
+        warm_config = OrchestratorConfig(
+            project_root=config.project_root,
+            git=warm_git_config,
+        )
+
+        wt = await _make_branch_with_file(git_ops, 'warm-swap', 'ws.py', 'x = 1\n')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Capture the ephemeral path at registration time (before the swap removes it)
+        captured_ephemeral: list[Path] = []
+        _orig_register = worker._register_owned_merge_worktree
+
+        def _capturing_register(wt_path: Path | None) -> None:
+            if wt_path is not None:
+                captured_ephemeral.append(wt_path)
+            _orig_register(wt_path)
+
+        worker._register_owned_merge_worktree = _capturing_register  # type: ignore[method-assign]
+
+        verify_started = asyncio.Event()
+        verify_gate = asyncio.Event()
+
+        async def _blocking_verify(merge_wt, cfg, module_configs, **kwargs):
+            verify_started.set()
+            await verify_gate.wait()
+            return MagicMock(passed=True, summary='')
+
+        worker_task = asyncio.create_task(worker.run())
+        try:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                side_effect=_blocking_verify,
+            ):
+                req = _make_request('warm-swap', 'warm-swap', wt, warm_config)
+                await queue.put(req)
+
+                # Wait until verify has started — the warm swap has already
+                # happened at this point (swap is done before run_scoped_verification
+                # is called in _verify_and_advance).
+                await asyncio.wait_for(verify_started.wait(), timeout=30)
+
+                # --- KEY ASSERTION ---
+                # The warm swap branch must have deregistered the ephemeral.
+                assert len(captured_ephemeral) == 1, (
+                    f'Expected exactly one ephemeral registered; '
+                    f'got {captured_ephemeral!r}'
+                )
+                ephemeral = captured_ephemeral[0]
+                assert ephemeral not in worker._owned_merge_worktrees, (
+                    f'Ephemeral {ephemeral.name!r} must be deregistered at warm-swap '
+                    'time (before verify), not left as a ghost in the liveness ledger'
+                )
+                # Persistent path must never have been registered
+                persistent_path = git_ops.worktree_base / _PMN
+                assert persistent_path not in worker._owned_merge_worktrees, (
+                    f'Persistent {_PMN!r} path must never enter the liveness ledger'
+                )
+
+                verify_gate.set()
+                outcome = await asyncio.wait_for(req.result, timeout=30)
+            assert outcome.status == 'done', f'Expected done; got {outcome}'
+        finally:
+            await worker.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task

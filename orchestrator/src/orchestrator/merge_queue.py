@@ -18,6 +18,7 @@ import dataclasses
 import json
 import logging
 import math
+import os
 import posixpath
 import re
 import shutil
@@ -30,7 +31,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
+from orchestrator.git_ops import (
+    PERSISTENT_MERGE_WORKTREE_NAME,
+    GitOps,
+    MergeResult,
+    WorktreeMissing,
+    _run,
+)
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
@@ -4657,6 +4664,101 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the last _maybe_coalesce_waiting_singles attempt (incl. no-viable-train
         # attempts).  Short-circuits when the waiting set is unchanged.
         self._last_coalesce_signature: frozenset[str] | None = None
+        # α liveness ledger: ephemeral _merge-<uuid> worktrees owned by THIS
+        # SpeculativeMergeWorker instance.  Touched every _heartbeat_loop tick
+        # so the stale-worktree reaper (coalesce_or_enqueue_merge_request) never
+        # reaps a live-owner worktree under Lever C prefer-remote.
+        #
+        # Scope on current main:
+        #   (a) PERSISTENT_MERGE_WORKTREE_NAME ('_merge-verify') is reset-in-place
+        #       per verify and already exempt from prune/find_inflight
+        #       (git_ops.py:2075) — guard in _register_owned_merge_worktree keeps
+        #       it out.
+        #   (b) Serial MergeWorker (:4062) holds ≤1 worktree whose build activity
+        #       refreshes mtime — out of ledger scope.
+        #   (c) Cold-shadow (_run_cold_shadow_verify :7670) and drift-check
+        #       (_run_drift_check :7912) _merge-* creators are short-lived local
+        #       executions — out of ledger scope.
+        #   (d) reverify_member_solo's _solo-* worktrees (git_ops.materialize_
+        #       member_solo) use a different prefix the reaper never scans
+        #       (git_ops.py:2069) — out of ledger scope.
+        #   (e) Coalesced GroupMergeRequest merge worktrees ARE in scope;
+        #       registered automatically at _merger_loop handoff (:5703).
+        self._owned_merge_worktrees: set[Path] = set()
+        # One-warning-per-path set: added when a non-ENOENT OSError is logged
+        # for a path; cleared on next successful touch or on ENOENT-drop so
+        # each new failure episode emits exactly one WARNING.
+        self._merge_wt_touch_warned: set[Path] = set()
+
+    # ── owned-worktree liveness ledger ───────────────────────────────────
+
+    def _register_owned_merge_worktree(self, wt: Path | None) -> None:
+        """Add *wt* to the liveness ledger.
+
+        No-ops for None and for the persistent warm worktree
+        (PERSISTENT_MERGE_WORKTREE_NAME = '_merge-verify'): the persistent
+        worktree is reset-in-place and already exempt from reaper scans
+        (git_ops.py:2075), so touching it would be meaningless.
+        The guard is also defence-in-depth against accidental registration.
+        """
+        if wt is None or wt.name == PERSISTENT_MERGE_WORKTREE_NAME:
+            return
+        self._owned_merge_worktrees.add(wt)
+
+    def _deregister_owned_merge_worktree(self, wt: Path | None) -> None:
+        """Remove *wt* from both ledger sets (idempotent)."""
+        if wt is None:
+            return
+        self._owned_merge_worktrees.discard(wt)
+        self._merge_wt_touch_warned.discard(wt)
+
+    async def _cleanup_owned_merge_worktree(self, wt: Path | None) -> None:
+        """Deregister *wt* then clean it up from disk.
+
+        Deregister-before-cleanup ensures a failed git cleanup cannot
+        immortalise a ledger entry (PRD §3 / design decision).
+        """
+        self._deregister_owned_merge_worktree(wt)
+        if wt is not None:
+            await self._git_ops.cleanup_merge_worktree(wt)
+
+    def _touch_owned_merge_worktrees(self) -> int:
+        """Touch (os.utime) every ledger path to refresh its mtime.
+
+        Called unconditionally every _heartbeat_loop tick so a live owner's
+        worktrees never age past ~1 poll period (~30 s; 360× inside the 10800 s
+        liveness window).  A dead owner stops calling this; its worktrees age
+        and are reaped exactly as before.
+
+        Mirrors the sync, clock-injectable pattern of _maybe_log_queue_heartbeat
+        so unit tests can drive it directly without running the async loop.
+
+        Returns:
+            Number of worktrees successfully touched this tick.
+        """
+        touched = 0
+        for p in list(self._owned_merge_worktrees):
+            try:
+                os.utime(p, None)
+            except FileNotFoundError:
+                self._deregister_owned_merge_worktree(p)
+                logger.info(
+                    'owned merge worktree %s gone (ENOENT) — dropped from liveness ledger', p
+                )
+                continue
+            except OSError as exc:
+                if p not in self._merge_wt_touch_warned:
+                    logger.warning(
+                        'failed to touch owned merge worktree %s for liveness heartbeat: %s',
+                        p, exc,
+                    )
+                    self._merge_wt_touch_warned.add(p)
+                continue
+            self._merge_wt_touch_warned.discard(p)
+            touched += 1
+        if touched:
+            logger.debug('touched %d owned merge worktree(s)', touched)
+        return touched
 
     # ── lane-buffer helpers ───────────────────────────────────────────────
 
@@ -4916,20 +5018,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         return True
 
     async def _heartbeat_loop(self) -> None:
-        """Periodically emit merge-queue depth heartbeats while the worker runs.
+        """Periodically emit merge-queue depth heartbeats and touch owned worktrees.
 
         Runs independently of the merger and verifier loops so it continues to
         fire even when those are blocked on ``queue.get()`` or semaphores (the
         exact silence window that caused the 2026-06-04 dead-slot misdiagnosis).
 
-        Wakes every ``_HEARTBEAT_POLL_S`` seconds and delegates the
-        fire/rate-limit/format/emit decision to the synchronous, clock-injectable
-        :meth:`_maybe_log_queue_heartbeat`.  Any unexpected exception is logged
-        and swallowed so a heartbeat bug can never crash the worker.
+        Wakes every ``_HEARTBEAT_POLL_S`` seconds and:
+          1. Touches every owned ephemeral _merge-* worktree in the liveness
+             ledger (α mechanism) so the stale-worktree reaper never reaps a
+             live-owner worktree.  Touch runs FIRST, unconditionally, and
+             swallows per-path errors internally (ENOENT/OSError) so it can
+             never starve the heartbeat log.
+          2. Delegates the fire/rate-limit/format/emit decision to the
+             synchronous, clock-injectable :meth:`_maybe_log_queue_heartbeat`.
+
+        Any unexpected exception from either call is logged and swallowed so a
+        heartbeat bug can never crash the worker.
         """
         while self._running:
             await asyncio.sleep(_HEARTBEAT_POLL_S)
             try:
+                self._touch_owned_merge_worktrees()
                 self._maybe_log_queue_heartbeat(time.time())
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
@@ -5006,7 +5116,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if item is not None:
                     if item.merge_wt is not None:
                         with contextlib.suppress(BaseException):
-                            await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                            await self._cleanup_owned_merge_worktree(item.merge_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
             except asyncio.QueueEmpty:
@@ -5038,7 +5148,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if item is not None:
                     if item.merge_wt is not None:
                         with contextlib.suppress(BaseException):
-                            await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                            await self._cleanup_owned_merge_worktree(item.merge_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
             except asyncio.QueueEmpty:
@@ -5698,6 +5808,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     if counts_against_cap:
                         await self._merge_ahead_cap.acquire()
                     try:
+                        self._register_owned_merge_worktree(merge_result.merge_worktree)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=merge_result,
                             merge_wt=merge_result.merge_worktree,
@@ -5908,7 +6019,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if self._request_abandoned(req):
                 if item.merge_wt is not None:
                     with contextlib.suppress(BaseException):
-                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                        await self._cleanup_owned_merge_worktree(item.merge_wt)
                 # Treat as failed for chain-invalidation: any speculative
                 # item built on this one's commit is now stale.
                 n_failed = True
@@ -5931,7 +6042,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if self._operator_halt.is_set() and item.immediate_outcome is None:
                 if item.merge_wt is not None:
                     with contextlib.suppress(BaseException):
-                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                        await self._cleanup_owned_merge_worktree(item.merge_wt)
                 n_failed = True
                 if item.speculative:
                     self._speculation_slot.release()
@@ -6014,9 +6125,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         prev_merge_tree = await _resolve_commit_tree(
                             self._git_ops, item.merge_result.merge_commit,
                         )
-                    # Clean up the stale merge worktree.
+                    # Clean up the stale merge worktree (deregister-before-cleanup).
                     if item.merge_wt:
-                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                        await self._cleanup_owned_merge_worktree(item.merge_wt)
                     self._emit_speculative(
                         EventType.speculative_discard, req.task_id,
                         reason=remerge_reason,
@@ -6068,7 +6179,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 logger.exception(f'Task {req.task_id}: unexpected verifier error')
                 if item.merge_wt is not None:
                     with contextlib.suppress(BaseException):
-                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                        await self._cleanup_owned_merge_worktree(item.merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
                         'blocked', reason=f'Verifier error: {exc}',
@@ -6079,7 +6190,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # and clean up the merge worktree so callers don't hang forever.
                 if item.merge_wt is not None:
                     with contextlib.suppress(BaseException):
-                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                        await self._cleanup_owned_merge_worktree(item.merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
                         'blocked', reason='Merge worker cancelled',
@@ -6233,6 +6344,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # ('pre_rebased AND main unchanged', SpeculativeItem.skip_verify) does
                 # NOT hold; skipping verification would let semantically-unverified
                 # main commits land on the protected branch.  Always verify.
+                self._register_owned_merge_worktree(retry_result.merge_worktree)
                 return SpeculativeItem(
                     request=req, merge_result=retry_result,
                     merge_wt=retry_result.merge_worktree,
@@ -6355,6 +6467,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 and new_tree is not None
                 and new_tree == prev_merge_tree
             )
+        self._register_owned_merge_worktree(merge_result.merge_worktree)
         return SpeculativeItem(
             request=req, merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
@@ -6418,6 +6531,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 safety_valve_due=_due,
             )
             assert merge_wt is not None  # input was non-None; warm or unchanged
+            # Warm-swap: if _acquire_warm_verify_worktree returned the
+            # persistent _merge-verify path instead of the ephemeral
+            # item.merge_wt, the helper already removed item.merge_wt from
+            # disk.  Deregister it from the liveness ledger now so the
+            # ghost is cleared immediately (no need to wait for the touch
+            # loop's ENOENT self-heal).  If no swap occurred, merge_wt IS
+            # item.merge_wt and the cleanup calls below deregister it via
+            # _cleanup_owned_merge_worktree.
+            if merge_wt is not item.merge_wt:
+                self._deregister_owned_merge_worktree(item.merge_wt)
 
         # ── Step 4: verify ────────────────────────────────────────────
         # PRD §10 invariant 6(b): warm per-test results captured here for the
@@ -6473,7 +6596,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         verify_task.cancel()
                         with contextlib.suppress(BaseException):
                             await verify_task
-                        await self._git_ops.cleanup_merge_worktree(merge_wt)
+                        await self._cleanup_owned_merge_worktree(merge_wt)
                         return False
                     # Abort trigger 2 — operator halt: terminate the in-flight
                     # verify (CancelledError propagates into _run_cmd, which kills
@@ -6490,7 +6613,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         verify_task.cancel()
                         with contextlib.suppress(BaseException):
                             await verify_task
-                        await self._git_ops.cleanup_merge_worktree(merge_wt)
+                        await self._cleanup_owned_merge_worktree(merge_wt)
                         self._queue.put_nowait(req)
                         return False
             except Exception as exc:
@@ -6498,7 +6621,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'Task {req.task_id}: verify end '
                     f'(merge={merge_commit[:8]}, error)'
                 )
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                await self._cleanup_owned_merge_worktree(merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
                         'blocked', reason=f'Verification error: {exc}',
@@ -6551,7 +6674,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # detach(); _request_abandoned emits the canonical log once and we
         # clean up merge_wt before returning (task 1681, reviewer suggestion 1).
         if self._request_abandoned(req):
-            await self._git_ops.cleanup_merge_worktree(merge_wt)
+            await self._cleanup_owned_merge_worktree(merge_wt)
             return False
 
         # ── Step 5: CAS advance_main ──────────────────────────────────
@@ -6578,7 +6701,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # mirrors MergeWorker which already cleans merge_wt right after
                 # advance_main.
                 self._gate_retries.pop(req.task_id, None)
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                await self._cleanup_owned_merge_worktree(merge_wt)
                 outcome = await _finalize_advanced_merge(
                     self._git_ops, req, self._event_store,
                     merge_commit_fallback=merge_commit,
@@ -6702,7 +6825,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         attempt=gate_total,
                         duration_ms=_elapsed_ms(item.started_monotonic),
                     )
-                    await self._git_ops.cleanup_merge_worktree(merge_wt)
+                    await self._cleanup_owned_merge_worktree(merge_wt)
                     if not req.result.done():
                         req.result.set_result(MergeOutcome(
                             'blocked',
@@ -6750,7 +6873,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # Workflow soft-cancelled mid-merge: dropping the request
                 # prevents the orphan-halt window where no escalation
                 # owner is registered (2026-05-04 incident).
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                await self._cleanup_owned_merge_worktree(merge_wt)
                 if result in ('unmerged_state', 'pop_conflict_no_advance'):
                     self._cas_retries.pop(req.task_id, None)
                     self._gate_retries.pop(req.task_id, None)
@@ -6766,7 +6889,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # halted with no escalation owner on the single-task workflow
                 # path, which routes 'blocked' to _mark_blocked with no
                 # is_wip_halted probe (task 1598).
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                await self._cleanup_owned_merge_worktree(merge_wt)
                 outcome = await _map_advance_failure(
                     self._git_ops, result,
                     task_id=req.task_id,
@@ -6791,7 +6914,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'({self.MAX_CAS_RETRIES} attempts)'
                 )
                 _emit_merge_attempt(self._event_store, req.task_id, 'cas_exhausted', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
-                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                await self._cleanup_owned_merge_worktree(merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
                         'blocked',
