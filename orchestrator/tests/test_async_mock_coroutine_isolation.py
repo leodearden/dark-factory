@@ -37,9 +37,11 @@ def test_drain_closes_orphaned_asyncmock_coroutine_in_cycle():
     """drain_async_mock_coroutines() closes orphaned _execute_mock_call coroutines.
 
     Build an AsyncMock, call it (without awaiting), stash the coroutine in a
-    self-referential dict cycle, then delete all local refs.  The GC can find
-    it via gc.get_objects() but ref-count reclamation cannot reclaim it.  After
-    drain the count drops to zero.
+    self-referential dict cycle.  The GC can find it via gc.get_objects() but
+    ref-count reclamation cannot reclaim it (the cycle keeps it alive).  After
+    drain the probe count drops to zero AND the specific coroutine object is in
+    CORO_CLOSED state — providing an independent observable that does not depend
+    on the probe's selection predicate.
     """
     # Flush any orphans from prior tests before measuring
     drain_async_mock_coroutines()
@@ -49,8 +51,11 @@ def test_drain_closes_orphaned_asyncmock_coroutine_in_cycle():
     cycle: dict = {}
     cycle['self'] = cycle
     cycle['coro'] = coro
-    del coro
     del m
+    # Keep `coro` as a direct reference so we can inspect its state after drain.
+    # The cycle still holds it (preventing ref-count reclamation); the direct
+    # reference does not change that — it only lets us verify the object state
+    # independently of _count_open_mock_coros()'s predicate.
 
     # Force GC to discover the cycle
     gc.collect()
@@ -62,6 +67,15 @@ def test_drain_closes_orphaned_asyncmock_coroutine_in_cycle():
     assert closed >= 1, 'drain_async_mock_coroutines() should have closed >= 1 coroutine'
     assert _count_open_mock_coros() == 0, (
         'After drain, no orphaned _execute_mock_call coroutines should remain'
+    )
+    # Independent observable: verify the specific coroutine object (not just the
+    # aggregate count) reached CORO_CLOSED state.  This assertion does not share
+    # the _count_open_mock_coros() predicate, so it catches a bug where drain
+    # mis-selects objects (the predicate would be wrong in lockstep with the probe,
+    # but this direct state check would still fail if .close() was not called).
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED, (
+        'drain_async_mock_coroutines() must call .close() on the specific '
+        '_execute_mock_call coroutine, bringing it to CORO_CLOSED state'
     )
 
 

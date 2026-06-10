@@ -10,9 +10,12 @@ from __future__ import annotations
 import asyncio
 import gc
 import inspect
+import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
+
+_log = logging.getLogger(__name__)
 
 from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -54,6 +57,20 @@ def drain_async_mock_coroutines() -> int:
     SAFETY NET preserved: only AsyncMock's internal ``_execute_mock_call``
     coroutines are closed; a genuinely forgotten ``await`` on product code yields
     a coroutine with a different co_name and still trips filterwarnings=error.
+    Product coroutines are intentionally NOT reclaimed here, so a missing
+    ``await`` in production code will still raise under filterwarnings=error.
+
+    PERFORMANCE NOTE: ``gc.get_objects()`` materialises every live Python object
+    (O(total live objects)) on every call.  The teardown ``gc.collect()`` is
+    skipped when ``closed == 0`` to avoid a full-generation collection on the
+    common no-orphan path.  If profiling shows the walk itself is a bottleneck
+    across the full suite, consider a pytest opt-in marker for tests that use
+    AsyncMock to scope the walk — the current unconditional path is a safe
+    default.
+
+    DIAGNOSTIC: a DEBUG-level log is emitted for each test that leaks AsyncMock
+    orphans, so tests that routinely call AsyncMock without awaiting can be
+    identified and fixed at source rather than being masked indefinitely.
 
     Returns the number of coroutines closed (useful for assertions in tests).
     """
@@ -67,7 +84,14 @@ def drain_async_mock_coroutines() -> int:
         ):
             obj.close()
             closed += 1
-    gc.collect()
+    if closed:
+        _log.debug(
+            'drain_async_mock_coroutines: closed %d orphaned AsyncMock '
+            '_execute_mock_call coroutine(s) — consider auditing un-awaited '
+            'AsyncMock calls in the preceding test',
+            closed,
+        )
+        gc.collect()
     return closed
 
 

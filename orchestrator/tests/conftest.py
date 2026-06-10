@@ -181,7 +181,19 @@ def _drain_async_mock_coroutines():
     a sibling.  Product coroutines (co_name != _execute_mock_call) are untouched,
     preserving the real-leak safety net.
 
-    See drain_async_mock_coroutines() in _orch_helpers.py for full rationale.
+    KNOWN LIMITATION — module/session-scoped fixture teardowns: pytest finalises
+    fixtures in reverse setup order.  An orphaned AsyncMock coroutine created in
+    the *teardown* of a fixture set up BEFORE this one (e.g. a module- or
+    session-scoped fixture) will be finalised AFTER drain's teardown runs, so it
+    is reclaimed at the *next* test's drain boundary rather than the current one.
+    This is an edge case: function-scoped fixtures (the majority) tear down in
+    definition order before this fixture's teardown, so they are covered.  If a
+    module/session fixture teardown is found to create AsyncMock orphans, either
+    add an explicit ``await`` there or register an additional
+    ``pytest_runtest_teardown`` hook that fires after all finalizers.
+
+    See drain_async_mock_coroutines() in _orch_helpers.py for full rationale and
+    performance notes.
     """
     yield
     drain_async_mock_coroutines()
