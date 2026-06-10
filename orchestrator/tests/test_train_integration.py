@@ -389,3 +389,103 @@ class TestTrainIntegrationB1B7:
             f"expected verifies-per-landed-task delta=0.5 for a 2-member train "
             f"(1 union verify / 2 members = 0.5 vs baseline 1.0), got: {delta}"
         )
+
+
+# ---------------------------------------------------------------------------
+# B2: lower-member compile break is CAUGHT by union verify → blocked
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTrainIntegrationB2:
+    """B2 correctness invariant: a compile-breaking lower member blocks the entire train.
+
+    The union/workspace post-merge verify catches the break → outcome.status != 'done'
+    (blocked); main SHA is UNMOVED; zero mark_member_done calls; train_derailed event
+    is captured.
+
+    This is the load-bearing union-scope correctness invariant (§A.1 / §B B2) proven
+    end-to-end.  Gated by cargo_or_skip.  GREEN on arrival — a persistent RED signals
+    a regression in the former's post-merge verify→block path.
+    """
+
+    async def test_lower_member_break_blocks_train(
+        self,
+        cargo_or_skip,  # noqa: ARG002
+        shared_cargo_target: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Anchor (crate_a) introduces a compile break; tip (crate_b) is clean.
+
+        The post-merge union verify must fail → outcome blocked, main unmoved,
+        zero member flips, train_derailed captured.
+        """
+        repo = await seed_workspace_repo(tmp_path)
+        config = make_train_config(repo, shared_cargo_target)
+        git_ops = GitOps(config.git, repo)
+
+        # Anchor: deliberately broken edit — references a non-existent symbol.
+        def edit_anchor_broken(wt: Path) -> None:
+            lib = wt / "crate_a" / "src" / "lib.rs"
+            lib.write_text(
+                lib.read_text()
+                + "\npub fn b2_broken() { crate_that_does_not_exist_b2::nonexistent_fn(); }\n"
+            )
+
+        # Tip: clean additive edit.
+        def edit_tip_clean(wt: Path) -> None:
+            lib = wt / "crate_b" / "src" / "lib.rs"
+            lib.write_text(lib.read_text() + "\npub fn b2_tip_output() -> u32 { 99 }\n")
+
+        _, main_sha_before, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha_before = main_sha_before.strip()
+
+        wt_anchor, sha_anchor = await make_stacked_member(
+            git_ops, "b2_anchor", main_sha_before, edit_anchor_broken
+        )
+        wt_tip, _sha_tip = await make_stacked_member(
+            git_ops, "b2_tip", sha_anchor, edit_tip_clean
+        )
+
+        spy = _SpyEventStore()
+        req = build_group_merge_request(
+            git_ops=git_ops,
+            config=config,
+            train_id="train-b2",
+            member_names=["b2_anchor", "b2_tip"],
+            tip_name="b2_tip",
+            tip_worktree=wt_tip,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=spy)
+
+        outcome = await worker._do_merge(req)
+
+        # (1) Outcome is NOT done — compile break blocked the train.
+        assert outcome is not None
+        assert outcome.status != "done", (
+            f"expected outcome != 'done' (train blocked by compile break), "
+            f"got: {outcome!r}"
+        )
+
+        # (2) Main SHA is UNMOVED — the broken train must NOT advance main.
+        _, main_sha_after, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
+        main_sha_after = main_sha_after.strip()
+        assert main_sha_before == main_sha_after, (
+            f"expected main SHA to be unmoved after failed train merge, "
+            f"but advanced from {main_sha_before!r} to {main_sha_after!r}"
+        )
+
+        # (3) ZERO mark_member_done calls — no member should flip when the train is blocked.
+        assert req.mark_member_done.call_count == 0, (  # type: ignore[union-attr]
+            f"expected 0 mark_member_done calls (train blocked), "
+            f"got: {req.mark_member_done.call_count}"  # type: ignore[union-attr]
+        )
+
+        # (4) train_derailed event captured (or at minimum no train_merged event).
+        merged_events = spy.by_type("train_merged")
+        assert not merged_events, (
+            f"expected NO train_merged event when train is blocked by compile break, "
+            f"got: {merged_events}"
+        )
