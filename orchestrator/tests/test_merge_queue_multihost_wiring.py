@@ -695,3 +695,73 @@ class TestDriftCheckTaskGCSafety:
             if task_holder:
                 await asyncio.gather(*task_holder, return_exceptions=True)
             await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# step-15: Drift-task stop() cancellation + worktree cleanup — RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftCheckTaskStopCleanup:
+    """stop() cancels in-flight drift tasks so finally-cleanup runs (step-15 RED / step-16 GREEN).
+
+    Mirrors the heartbeat-cancel pattern at mq:5004-5007 extended to also drain
+    _drift_check_tasks so _run_drift_check's finally block can call
+    cleanup_merge_worktree during shutdown.
+    """
+
+    async def test_stop_cancels_drift_tasks_and_runs_finally_cleanup(self):
+        """stop() cancels in-flight drift tasks; their finally blocks run at shutdown."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        git_ops = _make_git_ops_mock()
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops,
+            queue=asyncio.Queue(),
+            escalation_queue=MagicMock(),
+        )
+        worker._shutdown_timeout = 0.01  # fast shutdown for tests
+
+        gate = asyncio.Event()
+        cleaned: dict = {'done': False}
+
+        async def long_running_drift():
+            """Simulates _run_drift_check: blocks, then cleanup in finally."""
+            try:
+                await gate.wait()
+            finally:
+                # Simulates cleanup_merge_worktree in _run_drift_check's finally
+                cleaned['done'] = True
+
+        # Inject a long-running drift task directly (as _maybe_run_drift_check would)
+        t = asyncio.create_task(long_running_drift())
+        worker._drift_check_tasks.add(t)
+        t.add_done_callback(lambda _t: worker._drift_check_tasks.discard(_t))
+
+        # Let the task start and block on the gate
+        await asyncio.sleep(0)
+
+        try:
+            # stop() must cancel and await the in-flight drift task
+            await worker.stop()
+
+            # Assertions — all fail in RED (before step-16)
+            assert t.done() is True, (
+                'stop() must cancel+await in-flight drift task '
+                '(throwaway worktree leaked otherwise)'
+            )
+            assert cleaned['done'] is True, (
+                'stop() must allow _run_drift_check finally block to run '
+                '(cleanup_merge_worktree skipped — worktree leaked)'
+            )
+            assert worker._drift_check_tasks == set(), (
+                '_drift_check_tasks must be empty after stop() '
+                '(done-callback must have fired)'
+            )
+        finally:
+            # Ensure the task doesn't leak even if assertions fail in RED
+            gate.set()
+            if not t.done():
+                t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
