@@ -275,6 +275,9 @@ def make_placeholder_future() -> asyncio.Future:
     bound to the actual running loop.
     """
     global _PLACEHOLDER_LOOP
+    # `is_closed()` is defensive cover for an externally-closed loop — this
+    # module never closes _PLACEHOLDER_LOOP itself, so the branch is not
+    # exercised in normal use.
     if _PLACEHOLDER_LOOP is None or _PLACEHOLDER_LOOP.is_closed():
         _PLACEHOLDER_LOOP = asyncio.new_event_loop()
     return _PLACEHOLDER_LOOP.create_future()
