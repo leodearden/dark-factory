@@ -735,6 +735,62 @@ class TestMaybeFormTrainStackBranches:
         )
 
     @pytest.mark.asyncio
+    async def test_d4_abandon_when_only_anchor_survives(self):
+        """D4: if all successors are ejected (only anchor survives), return False.
+
+        Setup:
+          - anchor 200, candidates 201+202
+          - stack_train_branches mocked: survivors=['200'], ejected=['201','202']
+
+        Expected:
+          - _maybe_form_train returns False
+          - NO update_task call carries 'train' metadata
+          - event_store.emit NOT called with train_formed
+          - self._train is None (anchor falls through to solo merge)
+        """
+        fix = _make(
+            task_id='200',
+            former_enabled=True,
+            max_members=3,
+            get_tasks_return=[_ip_task('201'), _ip_task('202')],
+        )
+        event_store = MagicMock()
+        fix.wf.event_store = event_store
+
+        fix.git_ops.get_changed_line_ranges = AsyncMock(
+            side_effect=self._ranges_side_effect({
+                '200': {'fileA.txt': [(1, 10)]},
+                '201': {'fileB.txt': [(1, 10)]},
+                '202': {'fileC.txt': [(1, 10)]},
+            })
+        )
+        # All successors conflict → only anchor survives.
+        fix.git_ops.stack_train_branches = AsyncMock(
+            return_value=TrainStackResult(survivors=['200'], ejected=['201', '202'])
+        )
+
+        result = await fix.wf._maybe_form_train()
+
+        assert result is False, 'D4: must return False when < 2 survivors'
+
+        # No train metadata must be written.
+        for c in fix.scheduler.update_task.call_args_list:
+            payload = c.args[1] if c.args else {}
+            assert 'train' not in payload, (
+                'No update_task call should carry train metadata when formation is abandoned'
+            )
+
+        # No train_formed event.
+        for c in event_store.emit.call_args_list:
+            if c.args:
+                assert c.args[0] is not EventType.train_formed, (
+                    'train_formed event must NOT be emitted when formation is abandoned'
+                )
+
+        # Anchor must NOT have been placed in a train.
+        assert fix.wf._train is None, 'self._train must be None after D4 abandon'
+
+    @pytest.mark.asyncio
     async def test_stack_train_branches_is_called_with_selected_members(self):
         """stack_train_branches is called with the selected member list from _select_train_members."""
         fix = _make(
