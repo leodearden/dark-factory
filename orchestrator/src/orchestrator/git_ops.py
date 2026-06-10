@@ -1121,6 +1121,29 @@ class GitOps:
         )
         return diff
 
+    async def get_changed_line_ranges(
+        self, ref: str,
+    ) -> dict[str, list[tuple[int, int]]]:
+        """Return old-side (BASE/main) changed line ranges for *ref* vs main.
+
+        Runs ``git diff {main}...{ref} --unified=0 --no-color`` in
+        ``self.project_root`` and delegates parsing to
+        :func:`parse_diff_line_ranges`.  Using ``--unified=0`` gives exact
+        hunk boundaries with no context padding, so the old-side ranges are
+        the minimal set of lines actually modified.  The ``main...{ref}``
+        three-dot syntax diffs *ref* against the merge-base of main and ref,
+        so both tasks diffed against the same main share BASE coordinates that
+        are directly comparable for stackability.
+
+        Returns an empty dict when the diff is empty (no changes vs main).
+        """
+        _, diff, _ = await _run(
+            ['git', 'diff', f'{self.config.main_branch}...{ref}',
+             '--unified=0', '--no-color'],
+            cwd=self.project_root,
+        )
+        return parse_diff_line_ranges(diff)
+
     async def get_current_branch(self, worktree: Path) -> str:
         """Get the current branch name in a worktree."""
         _, branch, _ = await _run(
