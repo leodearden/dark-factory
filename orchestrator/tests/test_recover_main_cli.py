@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-
 # Minimal YAML that load_config accepts and carries a main_gate_mark_command.
 _MINIMAL_CONFIG_YAML = """\
 git:
