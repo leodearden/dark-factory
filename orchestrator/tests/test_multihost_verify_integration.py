@@ -839,3 +839,74 @@ class TestStartupGuards:
             f'expected safe=True for timeout={_B8_SMALL_TIMEOUT}, '
             f'worst_case={assessment_small.worst_case_secs}, threshold={assessment_small.threshold_secs}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-19 (RED): HEADLINE λ gate — end-to-end throughput direction +
+# provenance + zero drift.  Fails until run_window_comparison exists.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEndToEndThroughputGate:
+    async def test_end_to_end_throughput_gate_direction_and_provenance_and_zero_drift(self):
+        """HEADLINE λ gate: multi-host window outperforms single-host baseline.
+
+        Calls run_window_comparison(n_merges=6, service_secs=..., drift_sample=True)
+        and asserts all four headline properties:
+
+        (a) Throughput DIRECTION: rate_improved, oldest_age_reduced, depth_reduced
+            are all True.  Deltas are RECORDED but never compared against a frozen
+            multiplier (PRD G6).
+
+        (b) Provenance: multihost_report.runners_seen == {'local', 'laptop'}.
+
+        (c) Zero drift divergence: result.drift_escalation_count == 0.
+
+        (d) ≥1 verdict_parity_ok event over the window (drift sampling confirms AGREE).
+        """
+        result = await run_window_comparison(
+            n_merges=6,
+            service_secs={'local': 1.0, 'laptop': 1.0},
+            drift_sample=True,
+        )
+
+        delta = result.delta
+
+        # (a) Direction assertions — strict inequalities, no frozen threshold (G6)
+        assert delta.rate_improved is True, (
+            f'rate must improve: rate_delta={delta.rate_delta}; '
+            f'baseline={result.baseline_report.completion_rate}, '
+            f'multihost={result.multihost_report.completion_rate}'
+        )
+        assert delta.oldest_age_reduced is True, (
+            f'oldest-age must decrease: oldest_age_delta={delta.oldest_age_delta}'
+        )
+        assert delta.depth_reduced is True, (
+            f'peak depth must decrease: depth_delta={delta.depth_delta}'
+        )
+
+        # Deltas are RECORDED (non-zero) — no frozen threshold/multiplier (G6)
+        assert delta.rate_delta != 0.0, 'rate_delta must be recorded (non-zero)'
+        assert delta.oldest_age_delta != 0.0, 'oldest_age_delta must be recorded (non-zero)'
+        assert delta.depth_delta != 0, 'depth_delta must be recorded (non-zero)'
+
+        # (b) Provenance: both runners contributed
+        assert result.multihost_report.runners_seen == {'local', 'laptop'}, (
+            f'expected runners_seen=={{"local","laptop"}}; '
+            f'got {result.multihost_report.runners_seen}'
+        )
+
+        # (c) Zero drift divergence escalations
+        assert result.drift_escalation_count == 0, (
+            f'expected 0 drift escalations; got {result.drift_escalation_count}'
+        )
+
+        # (d) ≥1 verdict_parity_ok event (DriftDetector confirmed AGREE at least once)
+        parity_events = [
+            e for e in result.multihost_events
+            if e[0] == EventType.verdict_parity_ok
+        ]
+        assert len(parity_events) >= 1, (
+            f'expected ≥1 verdict_parity_ok event; got {len(parity_events)}'
+        )
