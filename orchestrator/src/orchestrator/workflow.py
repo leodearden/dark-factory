@@ -879,6 +879,42 @@ class TaskWorkflow:
             candidates.append(task)
         return candidates
 
+    async def _maybe_form_train(self) -> bool:
+        """β former: try to form a merge train for this task (PRD §7 β).
+
+        Called at the merge decision point when the former is enabled and self
+        is not already a train member.  Returns True iff a train was formed and
+        self.task['metadata']['train'] was set (routing then sends self into
+        merge-deferred).  Returns False in all other cases (self merges solo on
+        the existing path).
+
+        Guards (return False immediately):
+          - merge_train_former_enabled is False — former is opt-in, off by default.
+          - self._train is not None — self is already a train member (no double-forming).
+          - merge_train_max_members < 2 — defensive; the ge=2 pydantic constraint
+            should prevent this, but guard anyway to keep the invariant local.
+
+        Skeleton (step-14): guards + candidate discovery only.
+        Selection, metadata assignment, and train_formed event are added in step-16.
+        """
+        # Guard 1: former must be explicitly enabled.
+        if not self.config.merge_train_former_enabled:
+            return False
+        # Guard 2: no double-forming — if self is already in a train, skip.
+        if self._train is not None:
+            return False
+        # Guard 3: defensive cap sanity check.
+        if self.config.merge_train_max_members < 2:
+            return False
+
+        # Discover merge-ready candidates.
+        candidates = await self._train_candidates()
+        if not candidates:
+            return False
+
+        # Selection, metadata assignment, and event emission deferred to step-16.
+        return False  # placeholder — step-16 completes this
+
     def _union_train_scope(
         self, members: list[dict],
     ) -> tuple[list[str] | None, list[ModuleConfig]]:
