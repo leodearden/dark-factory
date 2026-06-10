@@ -371,6 +371,54 @@ class TestSummarizeThroughput:
 
 
 # ---------------------------------------------------------------------------
+# Step-6 (GREEN): ThroughputDelta + compare_throughput
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ThroughputDelta:
+    """Direction booleans + signed numeric deltas between two ThroughputReports.
+
+    All deltas are (multihost - baseline):
+    - rate_delta > 0 means throughput improved.
+    - oldest_age_delta < 0 means queue age improved.
+    - depth_delta < 0 means queue depth improved.
+
+    PRD G6: never embed frozen multiplier/% thresholds here.
+    """
+
+    rate_improved: bool
+    oldest_age_reduced: bool
+    depth_reduced: bool
+    rate_delta: float
+    oldest_age_delta: float
+    depth_delta: int
+
+
+def compare_throughput(
+    baseline: ThroughputReport,
+    multihost: ThroughputReport,
+) -> ThroughputDelta:
+    """Compute direction booleans and signed numeric deltas.
+
+    Direction is a strict inequality; the delta is the signed magnitude
+    (multihost − baseline).  No frozen threshold is embedded (PRD G6).
+    """
+    rate_delta = multihost.completion_rate - baseline.completion_rate
+    oldest_age_delta = multihost.peak_oldest_age_secs - baseline.peak_oldest_age_secs
+    depth_delta = multihost.peak_depth - baseline.peak_depth
+
+    return ThroughputDelta(
+        rate_improved=rate_delta > 0.0,
+        oldest_age_reduced=oldest_age_delta < 0.0,
+        depth_reduced=depth_delta < 0,
+        rate_delta=rate_delta,
+        oldest_age_delta=oldest_age_delta,
+        depth_delta=depth_delta,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step-5 (RED): test_compare_throughput_reports_direction_and_records_delta
 # ---------------------------------------------------------------------------
 
