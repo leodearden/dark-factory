@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from _orch_helpers import make_placeholder_future
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
@@ -81,7 +82,7 @@ def _make_req(
     worktree: Path,
     config: OrchestratorConfig,
 ) -> MergeRequest:
-    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
         branch=f'task/{task_id}',
