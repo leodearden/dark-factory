@@ -3129,6 +3129,13 @@ class TrainCallbacks:
 # Called with a train_id str; returns a TrainCallbacks for that train.
 TrainCallbackFactory = Callable[[str], TrainCallbacks]
 
+# Type alias for the injectable merge-ready predicate (δ/1720 confidence gate).
+# Called with a MergeRequest; returns an exclusion REASON string (truthy →
+# exclude from train) or None (eligible).  Returning the reason (not a bool)
+# lets the same value flow uniformly into the log line and the event
+# data['exclusions'] entry, for both built-in and injected predicates.
+MergeReadyPredicate = Callable[['MergeRequest'], 'str | None']
+
 
 @dataclass
 class GroupMergeRequest(MergeRequest):
@@ -4500,6 +4507,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         speculation_depth: int = _MERGE_AHEAD_BOUND,
         escalation_queue: Any = None,
         train_callback_factory: TrainCallbackFactory | None = None,
+        merge_ready_predicate: MergeReadyPredicate | None = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -4521,6 +4529,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # worker importing the scheduler (pure-git-engine layering preserved).
         # The worker itself does NOT call this factory in this task; γ uses it.
         self._train_callback_factory: TrainCallbackFactory | None = train_callback_factory
+        # δ/1720 merge-ready confidence gate: injectable predicate for excluding
+        # known-risky candidates from coalescing.  None → use the built-in
+        # _default_coalesce_exclusion_reason (event-store history + one-strike).
+        # The injectable seam keeps the worker a pure git engine while letting
+        # the harness thread richer closures (flakiness counters, dry-run
+        # proposals) later without re-opening the worker layering.
+        self._merge_ready_predicate: MergeReadyPredicate | None = merge_ready_predicate
         # Tracks in-flight shadow compare asyncio.Tasks (single-in-flight guard).
         self._shadow_compare_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Persisted cadence state path — under project_root/data/orchestrator/
@@ -5236,6 +5251,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # Retroactive coalescing pass (γ/1719)
     # ------------------------------------------------------------------
 
+    def _default_coalesce_exclusion_reason(self, req: MergeRequest) -> str | None:
+        """Built-in merge-ready predicate (δ/1720 confidence gate).
+
+        Returns an exclusion REASON string (truthy → exclude from coalescing) or
+        None (eligible).  Signals implemented here use only worker-reachable
+        substrate (no scheduler import):
+
+          1. One-strike registry (cheapest, in-memory first):
+             If req.task_id is in self._coalesce_derailed_task_ids (a prior
+             coalesce-formed train that included this task derailed), exclude.
+             Filled in step-6; always empty until then.
+
+          2. Event-store blocked history:
+             If the branch's most-recent terminal merge outcome was 'blocked' or
+             'error', exclude.  Filled in step-4; always returns None until then.
+        """
+        # Signal 1 will be added in step-6.
+        # Signal 2 will be added in step-4.
+        return None
+
     async def _maybe_coalesce_waiting_singles(self) -> bool:
         """Attempt to coalesce waiting single MergeRequests into one GroupMergeRequest.
 
@@ -5307,6 +5342,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if sig == self._last_coalesce_signature:
             return False
         self._last_coalesce_signature = sig
+
+        # ── δ/1720: merge-ready exclusion filter ──────────────────────────────
+        # Split structural candidates into eligible + exclusions.  The predicate
+        # returns a REASON string (truthy → exclude) or None (eligible).
+        # Run AFTER recording the debounce signature (keyed on the structural
+        # waiting set) so risk signals — which are monotonic within a process —
+        # only re-evaluate when the structural set changes, avoiding per-tick
+        # event-store reads.
+        predicate = self._merge_ready_predicate or self._default_coalesce_exclusion_reason
+        eligible: list[MergeRequest] = []
+        exclusions: list[dict[str, str]] = []
+        for _c in candidates:
+            _reason = predicate(_c)
+            if _reason:
+                exclusions.append({'request_id': _c.request_id, 'reason': _reason})
+                logger.info(
+                    'Coalesce exclusion: request_id=%s task_id=%s branch=%s reason=%s',
+                    _c.request_id, _c.task_id, _c.branch, _reason,
+                )
+            else:
+                eligible.append(_c)
+        candidates = eligible
+        if len(candidates) < 2:
+            return False
 
         # ── Step-6: core pass body ─────────────────────────────────────────────
         # SELECTION: fan out line-range fetches concurrently (one git subprocess
@@ -5437,6 +5496,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'tip_task_id': tip_id,
                 'ejected': ejected,
                 'size': len(survivors),
+                'exclusions': exclusions,
             },
         )
 
