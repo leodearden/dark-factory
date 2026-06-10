@@ -130,7 +130,6 @@ def test_make_req_works_with_no_current_event_loop(tmp_path: Path) -> None:
     first, then assert _make_req() completes and returns a MergeRequest whose
     .result is an asyncio.Future.
     """
-    prior_loop = asyncio.get_event_loop_policy().get_event_loop() if False else None
     asyncio.set_event_loop(None)
     try:
         req = _make_req('99', tmp_path / 'wt', _make_config(tmp_path))

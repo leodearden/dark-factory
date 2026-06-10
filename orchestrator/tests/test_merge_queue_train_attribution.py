@@ -76,7 +76,7 @@ def _make_group_req(
     members = member_task_ids or ['b1', 'b2', 'tip99']
     status_check = AsyncMock(return_value={m: 'merge-deferred' for m in members})
     mark_member_done = AsyncMock()
-    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
 
     config = MagicMock()
     config.merge_verify_workspace = False
