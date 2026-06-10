@@ -120,7 +120,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
-    from orchestrator.merge_queue import InFlightMergeRegistry, SoloVerifyResult
+    from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
     from orchestrator.usage_gate import UsageGate
 
 
@@ -659,6 +659,40 @@ class TaskWorkflow:
         trigger_outcome = await self._maybe_enqueue_group_merge()
         if trigger_outcome is not None:
             return trigger_outcome
+        return WorkflowOutcome.MERGE_DEFERRED
+
+    async def _handle_superseded(self, result: MergeOutcome) -> WorkflowOutcome:
+        """Park a single-task workflow whose merge was absorbed by a coalesced train or γ2 chain.
+
+        Mirrors the PARK sequence of :meth:`_enter_merge_deferred` without the
+        train-only ``_maybe_enqueue_group_merge()`` trigger — a superseded single
+        task is not necessarily a train member, so that path must not be invoked.
+
+        The absorbing request's ``mark_member_done`` callback (or the γ2 chain's
+        terminal handler) is responsible for flipping status merge-deferred→done
+        with merged provenance once the absorbing request lands.
+        """
+        self._enter_phase(WorkflowState.MERGE_DEFERRED)
+        await self.scheduler.set_task_status(self.task_id, 'merge-deferred')
+        # Clear any requeue counter accumulated from prior failed attempts: the
+        # task's work is structurally complete — its branch was absorbed — so
+        # old retry counts are no longer relevant.  Mirrors _enter_merge_deferred.
+        self.scheduler.clear_requeue_count(self.task_id)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.merge_attempt,
+                task_id=self.task_id,
+                phase='merge',
+                data={
+                    'outcome': 'superseded',
+                    'superseded_by': result.superseded_by,
+                },
+            )
+        logger.info(
+            'Task %s: merge absorbed into %s — parking in merge-deferred '
+            '(absorbing request owns done transition)',
+            self.task_id, result.superseded_by,
+        )
         return WorkflowOutcome.MERGE_DEFERRED
 
     async def _maybe_enqueue_group_merge(self) -> WorkflowOutcome | None:
@@ -4280,7 +4314,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         from orchestrator.merge_queue import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             AttachAction,
-            MergeOutcome,
             MergeRequest,
             TipRelation,
             WaiterRecord,
@@ -4485,6 +4518,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if result.status == 'already_merged':
             logger.info(f'Task {self.task_id}: already merged to main')
             return WorkflowOutcome.DONE
+        if result.status == 'superseded':
+            return await self._handle_superseded(result)
         if result.status == 'conflict':
             return await self._resolve_and_resubmit(
                 branch_name, result.conflict_details,
