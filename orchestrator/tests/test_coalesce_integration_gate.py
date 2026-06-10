@@ -355,3 +355,145 @@ class TestScenario1:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ─── Scenario 2 ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestScenario2:
+    """step-3 (RED): partial stackability — overlap keeps 3rd as solo.
+
+    Three branches: s21 and s22 are disjoint (unique files → stackable);
+    s23 edits the SAME file as s21 → get_changed_line_ranges returns
+    overlapping ranges → _select_train_members rejects co-selection.
+
+    Assertions:
+      (a) the formed train has exactly 2 members (s21 + s22), NOT s23
+      (b) s23's future is UNRESOLVED at gate_entered — it is NOT absorbed
+          into the train (status NOT 'superseded')
+      (c) train_coalesced event member_task_ids == {s21, s22} (excludes s23)
+      (d) after gate_release the 2-member train lands; s21/s22 files on main
+      (e) s23 stays in the worker queue as a solo MergeRequest (not a GroupMergeRequest)
+
+    RED: s23 currently uses a UNIQUE file (file_s23.py) — disjoint from s21 →
+    all 3 get coalesced into a 3-member train → assertion (b) fails because
+    s23.result.done() is True (absorbed).  step-4 fixes this by giving s23
+    the SAME filename as s21 (file_overlap.py) so ranges overlap.
+    """
+
+    async def test_partial_stackability_overlap_keeps_solo(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        import contextlib
+        from unittest.mock import patch
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
+
+        # Three branches:
+        #   s21: adds file_overlap.py → old-side range (0,0) on file_overlap.py
+        #   s22: adds file_s22.py (unique) → no shared file with s21 → stackable
+        #   s23: RED — adds file_s23.py (unique) instead of file_overlap.py →
+        #        disjoint from everyone → all 3 get coalesced → assertion (b) fails.
+        #        step-4 fixes s23 to add file_overlap.py → overlaps with s21 → stays solo.
+        wt1 = await _make_branch_with_file(git_ops, 'ig_s21', 'file_overlap.py', 'x = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'ig_s22', 'file_s22.py',      'y = 2\n')
+        wt3 = await _make_branch_with_file(git_ops, 'ig_s23', 'file_s23.py',      'z = 3\n')
+
+        db_path = tmp_path / 'es_s2.db'
+        es = EventStore(db_path=db_path, run_id='s2-run')
+
+        scheduler = FakeScheduler()
+        for mid in ('ig_s21', 'ig_s22', 'ig_s23'):
+            scheduler.statuses[mid] = ['merge-deferred']
+
+        # Collect mark_done calls for the 2-member train (s21 + s22).
+        mark_done_calls: list[str] = []
+        train_done = asyncio.Event()
+        _real_mark_done = scheduler.mark_done
+
+        async def _counting_mark_done(task_id: str, *, kind: str, sha: str, note: str | None = None) -> None:
+            await _real_mark_done(task_id, kind=kind, sha=sha, note=note)
+            mark_done_calls.append(task_id)
+            # Train has 2 members; fire when both are flipped.
+            if len(mark_done_calls) >= 2:
+                train_done.set()
+
+        scheduler.mark_done = _counting_mark_done
+
+        factory = build_train_callback_factory(scheduler)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es, train_callback_factory=factory,
+        )
+
+        req1 = _make_req('ig_s21', 'ig_s21', wt1, coalesce_config)
+        req2 = _make_req('ig_s22', 'ig_s22', wt2, coalesce_config)
+        req3 = _make_req('ig_s23', 'ig_s23', wt3, coalesce_config)
+        await queue.put(req1)
+        await queue.put(req2)
+        await queue.put(req3)
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _gated_verify(gate_release, gate_entered),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+
+            await asyncio.wait_for(gate_entered.wait(), timeout=60)
+
+            # (b) s23's future must be UNRESOLVED — it is not absorbed.
+            # RED: s23 uses file_s23.py (disjoint) → all 3 coalesced → s23.result.done()
+            # is True → this assertion FAILS.
+            assert not req3.result.done(), (
+                's23 must remain solo (future unresolved); '
+                'expected s23 NOT absorbed by the train'
+            )
+
+            # (a) Train has exactly 2 members: s21 + s22.
+            train_id = req1.result.result().superseded_by
+            assert train_id is not None and train_id.startswith('coalesce-'), (
+                f'train_id must start with "coalesce-"; got {train_id!r}'
+            )
+            assert req2.result.result().superseded_by == train_id, (
+                f's22 must be absorbed into the same train as s21'
+            )
+
+            # (c) train_coalesced event member_task_ids == {{s21, s22}}.
+            events = _events_of_type(db_path, 'train_coalesced')
+            assert len(events) == 1, f'Expected 1 train_coalesced event; got {len(events)}'
+            event_data = events[0]['data']
+            assert set(event_data.get('member_task_ids', [])) == {'ig_s21', 'ig_s22'}, (
+                f'train_coalesced member_task_ids must be {{s21, s22}}; got {event_data}'
+            )
+
+            gate_release.set()
+            await asyncio.wait_for(train_done.wait(), timeout=30)
+
+        # (d) s21 and s22 files on main after the train lands.
+        from orchestrator.git_ops import _run
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'file_overlap.py' in main_files, 'file_overlap.py (s21) must be on main'
+        assert 'file_s22.py' in main_files,     'file_s22.py (s22) must be on main'
+
+        # (e) s23 remains in worker queue as solo (not GroupMergeRequest).
+        # The worker stopped processing after the train landed; s23 is still pending.
+        buf = list(worker._lane_buffers['normal'])
+        solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
+        assert any(r.task_id == 'ig_s23' for r in solos), (
+            f's23 must remain as a solo in lane_buffers; buf={[r.task_id for r in buf]}'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
