@@ -91,9 +91,11 @@ pushes thin).
   **Not yet active in production env** (needs `sccache:` block in reify yaml at enable
   time + an sccache server restart on the workstation at a quiet moment — the running
   server's backend is fixed at server start).
-- Verdict-parity proof: **in progress** at write time over a 5-SHA corpus
-  (2 known-pass, 1 historical fail [environmental-looking], 2 synthetic deterministic
-  fails). Results → `docs/verdict-parity-report.md` (replacing the template).
+- Verdict-parity proof: **✅ PROVEN 2026-06-10 17:34 BST** — 5/5 corpus rows
+  agree after one real env fix (laptop `libtbb-dev` removed) and one method fix
+  (ephemeral worktree for CLI runs on the orchestrator host). Full record:
+  `docs/verdict-parity-report.md`. The D6 trust gate is satisfied; enable still
+  blocked solely on task 1716.
 
 ## Staged (NOT enabled)
 
@@ -105,8 +107,9 @@ pushes thin).
 
 ## Enable checklist (after task 1716 lands on df main)
 
-1. Parity report green over the corpus (the HARD GATE — see
-   `docs/verdict-parity-report.md`).
+1. ~~Parity report green over the corpus~~ **DONE 2026-06-10** (the HARD GATE —
+   see `docs/verdict-parity-report.md`; re-prove only if either host's env
+   changes before the flip).
 2. Uncomment/write the real `verify_runners` block in reify `orchestrator.yaml`
    per 1716's landed schema (laptop: ssh_host `leo-laptop`, git_remote `leo-laptop`,
    config_path `/home/leo/.config/orchestrator/reify-laptop.yaml`), K=2, drift cadence,
