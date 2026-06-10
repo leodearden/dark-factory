@@ -604,3 +604,207 @@ class TestExclusionIdempotency:
                 f'pre-existing GroupMergeRequest task_id must not appear in new train: '
                 f'{ng.member_task_ids}'
             )
+
+
+# ─── Step 9 ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestPartialStackability:
+    """step-9 (RED): overlap eject, stack-conflict eject, survivors<2."""
+
+    async def test_overlap_pair_stays_solo(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        """(a) OVERLAP: 2 tasks editing overlapping lines + 1 disjoint task.
+
+        The overlapping pair is not mutually stackable; only the anchor + the
+        disjoint task form a viable train.  The non-stackable task stays solo
+        in the buffer with its future unresolved.
+        """
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.git_ops import TrainStackResult
+        from orchestrator.event_store import EventStore
+
+        db_path = tmp_path / 'es_overlap.db'
+        es = EventStore(db_path=db_path, run_id='run-overlap')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('ov1', 'task/ov1', tmp_path / 'wt-ov1', coalesce_config)
+        req2 = _make_req('ov2', 'task/ov2', tmp_path / 'wt-ov2', coalesce_config)
+        req3 = _make_req('ov3', 'task/ov3', tmp_path / 'wt-ov3', coalesce_config)
+
+        worker._lane_buffers['normal'].extend([req1, req2, req3])
+
+        # ov1 and ov2 both touch file_a.py lines 1–5 / 3–7 → overlapping → NOT stackable.
+        # ov3 touches file_b.py only → disjoint from both → stackable with ov1.
+        async def _mock_gcr(task_id: str):
+            return {
+                'ov1': {'file_a.py': [(1, 5)]},
+                'ov2': {'file_a.py': [(3, 7)]},
+                'ov3': {'file_b.py': [(1, 3)]},
+            }.get(task_id, {})
+
+        # stack_train_branches([ov1, ov3]) succeeds (ov1=anchor, ov3 rebased onto ov1).
+        async def _mock_stb(member_ids: list) -> TrainStackResult:
+            return TrainStackResult(survivors=list(member_ids), ejected=[])
+
+        with patch.object(git_ops, 'get_changed_line_ranges', side_effect=_mock_gcr), \
+             patch.object(git_ops, 'stack_train_branches', side_effect=_mock_stb):
+            result = await worker._maybe_coalesce_waiting_singles()
+
+        assert result is True, 'pass must form a train from the 2 stackable tasks'
+
+        buf = list(worker._lane_buffers['normal'])
+        # ov2 must remain as a solo in the buffer (not absorbed).
+        solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
+        assert len(solos) == 1, f'Expected 1 solo; got {[r.task_id for r in solos]}'
+        assert solos[0].task_id == 'ov2', (
+            f'ov2 must stay solo; solo task_id={solos[0].task_id}'
+        )
+        assert not req2.result.done(), 'ov2 future must remain unresolved (not absorbed)'
+
+        # The train must contain only ov1 + ov3.
+        trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        assert len(trains) == 1
+        assert set(trains[0].member_task_ids) == {'ov1', 'ov3'}, (
+            f'train members must be ov1+ov3; got {trains[0].member_task_ids}'
+        )
+
+    async def test_stack_conflict_eject(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        """(b) STACK CONFLICT EJECT.
+
+        stack_train_branches returns survivors=[m1, m2], ejected=[m3].  The train
+        absorbs only the 2 survivors; m3 stays solo (future unresolved, in buffer);
+        the train_coalesced event data includes the ejected list.
+        """
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.git_ops import TrainStackResult
+        from orchestrator.event_store import EventStore
+
+        db_path = tmp_path / 'es_eject.db'
+        es = EventStore(db_path=db_path, run_id='run-eject')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('ej1', 'task/ej1', tmp_path / 'wt-ej1', coalesce_config)
+        req2 = _make_req('ej2', 'task/ej2', tmp_path / 'wt-ej2', coalesce_config)
+        req3 = _make_req('ej3', 'task/ej3', tmp_path / 'wt-ej3', coalesce_config)
+
+        worker._lane_buffers['normal'].extend([req1, req2, req3])
+
+        # All disjoint → _select_train_members selects all 3.
+        async def _mock_gcr(task_id: str):
+            return {
+                'ej1': {'fa.py': [(1, 2)]},
+                'ej2': {'fb.py': [(1, 2)]},
+                'ej3': {'fc.py': [(1, 2)]},
+            }.get(task_id, {})
+
+        # Stack ejects ej3 due to a simulated rebase conflict.
+        async def _mock_stb(member_ids: list) -> TrainStackResult:
+            survivors = [m for m in member_ids if m != 'ej3']
+            ejected = ['ej3'] if 'ej3' in member_ids else []
+            return TrainStackResult(survivors=survivors, ejected=ejected)
+
+        with patch.object(git_ops, 'get_changed_line_ranges', side_effect=_mock_gcr), \
+             patch.object(git_ops, 'stack_train_branches', side_effect=_mock_stb):
+            result = await worker._maybe_coalesce_waiting_singles()
+
+        assert result is True, 'pass must form a train from ej1+ej2 survivors'
+
+        buf = list(worker._lane_buffers['normal'])
+        # ej3 must remain in the buffer as a solo.
+        solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
+        assert len(solos) == 1 and solos[0].task_id == 'ej3', (
+            f'ej3 must stay solo; got {[r.task_id for r in solos]}'
+        )
+        assert not req3.result.done(), 'ejected ej3 future must remain unresolved'
+
+        # Train must cover only ej1 + ej2.
+        trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        assert len(trains) == 1
+        assert set(trains[0].member_task_ids) == {'ej1', 'ej2'}, (
+            f'train must absorb ej1+ej2; got {trains[0].member_task_ids}'
+        )
+
+        # train_coalesced event must list ej3 in ejected.
+        events = _events_of_type(db_path, 'train_coalesced')
+        assert len(events) == 1, f'expected 1 event; got {len(events)}'
+        assert events[0]['data'].get('ejected') == ['ej3'], (
+            f'event ejected mismatch: {events[0]["data"].get("ejected")}'
+        )
+
+    async def test_survivors_lt2_no_train(
+        self,
+        git_ops: 'GitOps',
+        coalesce_config: 'OrchestratorConfig',
+        tmp_path: Path,
+    ):
+        """(c) SURVIVORS<2: stack ejects all but the anchor → no train formed.
+
+        The pass returns False, no future is resolved, no event is emitted, and
+        all candidates remain in the buffer.
+        """
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.git_ops import TrainStackResult
+        from orchestrator.event_store import EventStore
+
+        db_path = tmp_path / 'es_nosurv.db'
+        es = EventStore(db_path=db_path, run_id='run-nosurv')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        req1 = _make_req('ns1', 'task/ns1', tmp_path / 'wt-ns1', coalesce_config)
+        req2 = _make_req('ns2', 'task/ns2', tmp_path / 'wt-ns2', coalesce_config)
+        req3 = _make_req('ns3', 'task/ns3', tmp_path / 'wt-ns3', coalesce_config)
+
+        worker._lane_buffers['normal'].extend([req1, req2, req3])
+
+        async def _mock_gcr(task_id: str):
+            return {}  # all disjoint → all selected
+
+        # Only the anchor survives — not enough for a train.
+        async def _mock_stb(member_ids: list) -> TrainStackResult:
+            return TrainStackResult(survivors=[member_ids[0]], ejected=list(member_ids[1:]))
+
+        with patch.object(git_ops, 'get_changed_line_ranges', side_effect=_mock_gcr), \
+             patch.object(git_ops, 'stack_train_branches', side_effect=_mock_stb):
+            result = await worker._maybe_coalesce_waiting_singles()
+
+        assert result is False, 'must return False when survivors < 2'
+
+        # All 3 candidates must remain in the buffer unchanged.
+        buf = list(worker._lane_buffers['normal'])
+        buf_ids = [r.task_id for r in buf]
+        assert set(buf_ids) == {'ns1', 'ns2', 'ns3'}, (
+            f'all candidates must remain in buffer; got {buf_ids}'
+        )
+
+        # No futures resolved.
+        for req in (req1, req2, req3):
+            assert not req.result.done(), f'{req.task_id} future must remain unresolved'
+
+        # No train_coalesced event emitted.
+        events = _events_of_type(db_path, 'train_coalesced')
+        assert len(events) == 0, f'no event must be emitted; got {len(events)}'
