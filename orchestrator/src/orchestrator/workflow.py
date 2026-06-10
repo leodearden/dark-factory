@@ -976,6 +976,29 @@ class TaskWorkflow:
         )
         return True
 
+    async def _maybe_defer_as_train_member(self) -> 'WorkflowOutcome | None':
+        """Merge-decision routing helper (PRD §7 β, design decision 4).
+
+        Encapsulates the "form-or-defer-or-fall-through" logic so it can be
+        unit-tested independently from the large run() state machine.
+
+        Returns:
+          - The MERGE_DEFERRED outcome (from _enter_merge_deferred) when self
+            is — or becomes — a train member.
+          - None when self is not a train member and the former either did not
+            form a train or is disabled; the caller should fall through to the
+            solo MERGE path.
+
+        Non-train / former-disabled behavior is byte-identical to the previous
+        inline ``if self._train is not None: return await self._enter_merge_deferred()``
+        guard — the former returns False → None → caller falls through.
+        """
+        if self._train is None:
+            await self._maybe_form_train()
+        if self._train is not None:
+            return await self._enter_merge_deferred()
+        return None
+
     def _union_train_scope(
         self, members: list[dict],
     ) -> tuple[list[str] | None, list[ModuleConfig]]:
@@ -1520,8 +1543,9 @@ class TaskWorkflow:
                     # above (PRD acceptance criterion 5).  Non-train path is
                     # byte-identical — this guard only fires when metadata.train
                     # is a dict.
-                    if self._train is not None:
-                        return await self._enter_merge_deferred()
+                    _defer = await self._maybe_defer_as_train_member()
+                    if _defer is not None:
+                        return _defer
 
                     self._enter_phase(WorkflowState.MERGE)
 
