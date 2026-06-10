@@ -2965,3 +2965,74 @@ class TestTrainThroughputStats:
         assert result['baseline_cas_retry_rate'] == 0.0
         assert result['cas_retry_rate_delta'] == 0.0
         assert result['improved'] is False
+
+    async def test_verifies_per_landed_task_counting(self, tmp_path):
+        """train_merged + solo done rows → verifies-per-landed-task counting identity.
+
+        One train_merged(members=['10','11']) in window + two solo merge_attempt
+        done rows + one train_merged OUTSIDE the window (must be excluded).
+
+        Asserts exact counting identity: trains_landed=1, tasks_landed_via_trains=2,
+        train_verifies_per_landed_task=0.5, baseline_solo_landed=2,
+        baseline_verifies_per_landed_task=1.0, verifies_per_landed_task_delta=0.5,
+        improved=True.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.data.merge_queue import train_throughput_stats
+
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        in_window = now - timedelta(hours=1)
+        out_of_window = now - timedelta(hours=48)
+
+        events = [
+            # in-window: one train_merged with 2 members
+            dict(
+                event_type='train_merged',
+                timestamp=in_window,
+                run_id='run-train-1',
+                task_id='11',
+                data={'train_id': 't1', 'member_task_ids': ['10', '11'],
+                      'merge_commit_sha': 'aaa', 'base_sha': 'bbb'},
+            ),
+            # in-window: two solo merge_attempt(done, no train_id)
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-20',
+                task_id='20',
+                data={'outcome': 'done'},
+            ),
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-21',
+                task_id='21',
+                data={'outcome': 'done'},
+            ),
+            # OUT-of-window: must be excluded
+            dict(
+                event_type='train_merged',
+                timestamp=out_of_window,
+                run_id='run-train-old',
+                task_id='99',
+                data={'train_id': 't0', 'member_task_ids': ['90', '91'],
+                      'merge_commit_sha': 'zzz', 'base_sha': 'yyy'},
+            ),
+        ]
+        db_path = _make_db(tmp_path, 'verifies.db', events)
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await train_throughput_stats(conn, hours=24, now=now)
+
+        assert result['trains_landed'] == 1
+        assert result['tasks_landed_via_trains'] == 2
+        assert result['train_verifies_per_landed_task'] == 0.5, (
+            f"expected 1 union verify / 2 members = 0.5, got: {result['train_verifies_per_landed_task']}"
+        )
+        assert result['baseline_solo_landed'] == 2
+        assert result['baseline_verifies_per_landed_task'] == 1.0
+        assert result['verifies_per_landed_task_delta'] == 0.5, (
+            f"expected baseline(1.0) - train(0.5) = 0.5, got: {result['verifies_per_landed_task_delta']}"
+        )
+        assert result['improved'] is True
