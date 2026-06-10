@@ -5108,12 +5108,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 merge_sha=None,
                 reason='unstackable',
             )
+        # WorktreeInfo carries path + base_commit (=rebased tip SHA).
+        # The solo branch name mirrors materialize_member_solo's default prefix.
+        solo_branch = f'_solo-{member_id}'
         return await reverify_member_solo(
             self.git_ops,
             member_id=member_id,
             solo_wt=solo_wt_info.path,
-            solo_branch=solo_wt_info.branch,
-            tip_sha=solo_wt_info.tip_sha,
+            solo_branch=solo_branch,
+            tip_sha=solo_wt_info.base_commit,
             config=self.config,
             task_files=self._task_files,
             module_configs=self._module_configs,
@@ -5190,12 +5193,149 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 escalate_to_human=True,
             )
 
-        # Some fail → land passers, block failers (steps 12/14).
-        # Stub: delegate to _mark_blocked until step-12 implements landing.
+        # Some fail → land each passer, block each failer.
+        passers = [r for r in solo_results if r.passed]
         offender_ids = [r.member_id for r in failers]
+        passer_ids = [r.member_id for r in passers]
+
+        # Read current main sha before landing passers (used as expected_main for CAS).
+        probe_main = await self.git_ops.get_main_sha()
+
+        # Land each passer: advance main with the solo-verified sha.
+        # Each passer's solo worktree is cleaned up in a finally block so no
+        # worktree leaks even when advance_main fails or raises unexpectedly.
+        landed_ids: list[str] = []
+        for r in passers:
+            # Guard: passers always have a merge_sha (set by reverify_member_solo).
+            if r.merge_sha is None:  # defensive — should not happen for a passer
+                logger.warning(
+                    'Task %s: train %r member %s passer has no merge_sha — skipping',
+                    self.task_id, train_id, r.member_id,
+                )
+                continue
+            try:
+                adv = await self.git_ops.advance_main(
+                    r.merge_sha,
+                    r.solo_wt,
+                    branch=r.solo_branch,
+                    expected_main=probe_main,
+                    reverify_on_rebase=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # advance_main raised (unexpected); leave member parked for
+                # re-dispatch and continue processing the remaining passers.
+                logger.warning(
+                    'Task %s: train %r member %s advance_main raised %r '
+                    '— leaving parked for re-dispatch',
+                    self.task_id, train_id, r.member_id, exc,
+                )
+                adv = 'exception'
+            finally:
+                # Always clean up the solo worktree after processing this
+                # passer — the worktree is no longer needed once advance_main
+                # has run (or failed), and cleanup must not depend on outcome.
+                if r.solo_wt is not None:
+                    await self.git_ops.cleanup_merge_worktree(r.solo_wt)
+            if adv == 'advanced':
+                landed_sha: str = (
+                    getattr(self.git_ops, '_last_advanced_sha', None) or r.merge_sha
+                )
+                await self.scheduler.mark_done(
+                    r.member_id,
+                    kind='merged',
+                    sha=landed_sha,
+                    note=f'train {train_id} attribution: member passed solo',
+                )
+                landed_ids.append(r.member_id)
+                if self.event_store is not None:
+                    self.event_store.emit(
+                        EventType.train_merged,
+                        task_id=r.member_id,
+                        phase='merge',
+                        data={
+                            'train_id': train_id,
+                            'verdict': 'attributed',
+                            'merge_sha': landed_sha,
+                        },
+                    )
+                logger.info(
+                    'Task %s: train %r member %s passed solo — advanced main to %s',
+                    self.task_id, train_id, r.member_id, landed_sha,
+                )
+            else:
+                # advance_main failure or exception: leave member parked for
+                # re-dispatch — do NOT flip to done; log a warning.
+                logger.warning(
+                    'Task %s: train %r member %s advance_main returned %r '
+                    '— leaving parked for re-dispatch',
+                    self.task_id, train_id, r.member_id, adv,
+                )
+
+        # Block each failer: set status blocked and submit an L1.
+        for r in failers:
+            await self.scheduler.set_task_status(r.member_id, 'blocked')
+            if self.escalation_queue:
+                from escalation.models import Escalation
+                train_state = await self._build_train_state()
+                # Override failing_member to point at the actual offender.
+                if train_state is not None:
+                    train_state = dict(train_state)  # type: ignore[assignment]
+                    train_state['failing_member'] = r.member_id  # type: ignore[index]
+                esc = Escalation(
+                    id=self.escalation_queue.make_id(r.member_id),
+                    task_id=r.member_id,
+                    agent_role='orchestrator',
+                    severity='blocking',
+                    category='task_failure',
+                    summary=(
+                        f'Train {train_id!r} attribution: member {r.member_id!r} '
+                        f'failed solo verify — reason: {r.reason[:120]}'
+                    ),
+                    detail=(
+                        f'Train {train_id!r} union verify failed; member '
+                        f'{r.member_id!r} was re-verified in isolation and '
+                        f'failed (reason: {r.reason}). '
+                        f'Passers landed: {passer_ids}. '
+                        f'Offenders blocked: {offender_ids}.'
+                    ),
+                    suggested_action='manual_intervention',
+                    worktree=None,
+                    workflow_state=self.state.value,
+                    level=1,
+                    train_state=train_state,  # type: ignore[arg-type]
+                )
+                self.escalation_queue.submit(esc)
+                logger.warning(
+                    'Task %s: train %r member %s blocked as attribution offender — L1 %s',
+                    self.task_id, train_id, r.member_id, esc.id,
+                )
+
+        # Emit attributed train_derailed telemetry.
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.train_derailed,
+                task_id=self.task_id,
+                phase='merge',
+                data={
+                    'train_id': train_id,
+                    'member_task_ids': member_ids,
+                    'verdict': 'attributed',
+                    'offenders': offender_ids,
+                    'passers': passer_ids,
+                    'derail_reason': (
+                        f'Solo attribution: offenders={offender_ids} '
+                        f'passers={passer_ids}'
+                    ),
+                },
+            )
+
+        # Tip return value: DONE if the tip landed, BLOCKED otherwise.
+        if self.task_id in landed_ids:
+            return WorkflowOutcome.DONE
+        # Tip is blocked or advance failed — need to surface tip as blocked too.
         return await self._mark_blocked(
-            f'Train {train_id!r} union verify failed — '
-            f'offenders: {offender_ids}',
+            f'Train {train_id!r} union verify failed — tip {self.task_id!r} '
+            f'{"is an offender" if self.task_id in offender_ids else "advance failed"}',
             escalate_to_human=True,
         )
 
