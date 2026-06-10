@@ -1415,6 +1415,114 @@ class GitOps:
 
         return TrainStackResult(survivors=survivors, ejected=ejected)
 
+    async def materialize_member_solo(
+        self,
+        member_id: str,
+        predecessor_ref: str,
+        *,
+        solo_prefix: str = '_solo-',
+    ) -> WorktreeInfo | None:
+        """Un-stack a train member's own delta onto current main.
+
+        Creates an isolated ``<solo_prefix><member_id>`` branch starting at the
+        member's current branch tip (``branch_prefix + member_id``) and checks
+        it out in a new worktree at ``worktree_base / <solo_prefix><member_id>``.
+        Then runs::
+
+            git rebase --onto <main_branch> <predecessor_ref>
+
+        inside that worktree, replaying only the commits between
+        ``predecessor_ref`` and the member branch tip onto the current main
+        HEAD.  This is the opposite of the cumulative stacking performed by
+        ``stack_train_branches``: it extracts the member's *own* delta.
+
+        On success returns a :class:`WorktreeInfo` whose *path* is the solo
+        worktree directory and *base_commit* is the rebased tip SHA.  The
+        caller is responsible for cleaning up the worktree via
+        :meth:`cleanup_merge_worktree` when done.
+
+        On rebase conflict (non-zero rc): aborts the rebase, removes the
+        worktree and its temporary branch, and returns ``None``.  No dangling
+        ``_solo-*`` worktrees or branches are left behind.
+
+        Does NOT hold ``_merge_lock`` — runs outside the lock like
+        ``rebase_onto_main`` and ``stack_train_branches``.
+
+        Args:
+            member_id: The member's task id (used to locate its branch/worktree).
+            predecessor_ref: The ref that forms the base of the member's own
+                commits — ``task/<predecessor_id>`` for non-anchors, or
+                ``self.config.main_branch`` for the anchor.
+            solo_prefix: Prefix for the temporary branch/worktree name.
+                Defaults to ``'_solo-'``.
+
+        Returns:
+            WorktreeInfo on success, None on conflict.
+        """
+        member_branch = f'{self.config.branch_prefix}{member_id}'
+        solo_name = f'{solo_prefix}{member_id}'
+        solo_wt = self.worktree_base / solo_name
+        solo_wt.parent.mkdir(parents=True, exist_ok=True)
+
+        # Create a temporary branch _solo-<member_id> starting at the member's
+        # current tip and check it out in an isolated worktree.  Using -b with
+        # the member branch as start-point avoids modifying the original branch.
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', solo_name, str(solo_wt), member_branch],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.warning(
+                'materialize_member_solo: failed to create worktree %s for member %s: %s',
+                solo_wt, member_id, err,
+            )
+            return None
+
+        # Rebase the temporary branch's commits (predecessor_ref..HEAD) onto main.
+        rc, _, err = await _run(
+            ['git', 'rebase', '--onto', self.config.main_branch, predecessor_ref],
+            cwd=solo_wt,
+        )
+        if rc != 0:
+            # Abort the rebase and clean up both the worktree and temp branch.
+            await _run(['git', 'rebase', '--abort'], cwd=solo_wt)
+            logger.info(
+                'materialize_member_solo: rebase conflict for member %s '
+                '(predecessor=%s): %s — cleaning up',
+                member_id, predecessor_ref, err,
+            )
+            # Remove the worktree first, then delete the branch.
+            rm_rc, _, rm_err = await _run(
+                ['git', 'worktree', 'remove', str(solo_wt), '--force'],
+                cwd=self.project_root,
+            )
+            if rm_rc != 0:
+                logger.warning(
+                    'materialize_member_solo: failed to remove worktree %s: %s',
+                    solo_wt, rm_err,
+                )
+            del_rc, _, del_err = await _run(
+                ['git', 'branch', '-D', solo_name],
+                cwd=self.project_root,
+            )
+            if del_rc != 0:
+                logger.warning(
+                    'materialize_member_solo: failed to delete branch %s: %s',
+                    solo_name, del_err,
+                )
+            return None
+
+        # Resolve the rebased tip SHA.
+        _, tip_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=solo_wt)
+        tip_sha = tip_sha_raw.strip()
+
+        logger.info(
+            'materialize_member_solo: member %s un-stacked onto main, '
+            'solo branch %s tip=%s worktree=%s',
+            member_id, solo_name, tip_sha, solo_wt,
+        )
+        return WorktreeInfo(path=solo_wt, base_commit=tip_sha)
+
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         """Return True if *ancestor* is an ancestor of *descendant*."""
         rc, _, _ = await _run(
