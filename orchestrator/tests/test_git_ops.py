@@ -4693,3 +4693,63 @@ class TestPersistentMergeWorktree:
         assert result != warm_path, (
             'find_inflight_merge_worktree must never return _merge-verify'
         )
+
+    # ------------------------------------------------------------------
+    # Step 19 — multi-dir reap_build_artifact_dirs regression
+    # ------------------------------------------------------------------
+
+    async def test_reset_persistent_merge_worktree_multi_artifact_dirs(
+        self, git_config: GitConfig, git_repo: Path,
+    ):
+        """Multi-dir reap_build_artifact_dirs: ALL configured dirs retained.
+
+        Regression test for step-19: the buggy per-dir git-clean loop calls
+        ``git clean -xfd -e build`` (which removes dist/) then
+        ``git clean -xfd -e dist`` (which removes build/) — with >1 dir NONE
+        survive, defeating the warm-cache purpose.
+
+        With the fix (step-20: single invocation with all -e flags) both dirs
+        must be retained after the reset-in-place.
+        """
+        cfg = git_config.model_copy(
+            update={'reap_build_artifact_dirs': ['build', 'dist']}
+        )
+        multi_ops = GitOps(cfg, git_repo)
+
+        # Create warm worktree at merge_commit_a
+        merge_commit_a = await _get_merge_commit(
+            multi_ops, 'multi-dir-a', 'multi_a.py',
+        )
+        warm_path = await multi_ops.reset_persistent_merge_worktree(merge_commit_a)
+        assert warm_path.exists()
+
+        # Simulate warm build artifacts in BOTH configured dirs + a stray file
+        build_dir = warm_path / 'build'
+        dist_dir = warm_path / 'dist'
+        build_dir.mkdir()
+        dist_dir.mkdir()
+        build_cache = build_dir / 'cache.bin'
+        dist_out = dist_dir / 'out.bin'
+        build_cache.write_bytes(b'\xca\xfe\xba\xbe')
+        dist_out.write_bytes(b'\xfe\xed\xfa\xce')
+        stray_txt = warm_path / 'stray.txt'
+        stray_txt.write_text('stray untracked\n')
+
+        # Create a second merge_commit_b and reset in place
+        merge_commit_b = await _get_merge_commit(
+            multi_ops, 'multi-dir-b', 'multi_b.py',
+        )
+        await multi_ops.reset_persistent_merge_worktree(merge_commit_b)
+
+        # BOTH configured build-artifact dirs must survive (warm retained)
+        assert build_cache.exists(), (
+            'build/cache.bin must be retained (build/ is a configured artifact dir)'
+        )
+        assert dist_out.exists(), (
+            'dist/out.bin must be retained (dist/ is a configured artifact dir)'
+        )
+
+        # Stray untracked file must be cleaned
+        assert not stray_txt.exists(), (
+            'stray.txt must be cleaned by git clean -xfd'
+        )
