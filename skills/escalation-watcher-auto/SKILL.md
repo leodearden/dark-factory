@@ -15,6 +15,7 @@ You are running an autonomous, fully non-interactive level-1 escalation handler.
 - **No code edits.** Do not use `Edit`, `Write`, or any tool that modifies source files.
 - **No merge-queue interaction.** Do not call merge-queue or git-merge tools. This skill never submits to the merge queue — no `merge_request` call exists anywhere in this flow and none may be added; if merge interaction is ever introduced, it must use the bounded submit→poll protocol (explicit `wait_secs`, `merge_status` polling — see `skills/escalation-watcher/SKILL.md` §"Merge Submissions — Bounded Submit, Then Poll").
 - **No infra commands.** Do not issue infrastructure commands (docker, systemctl, kill, etc.).
+- **No recovery ref-moves.** NEVER perform red-on-main recovery ref-moves — no `git reset`, `git update-ref refs/heads/main`, or any other direct ref mutation. When main is RED and a recovery ref-move is required, PROMOTE to L2 so the human-driven escalation-watcher can execute the enforce-safe recovery procedure (`skills/escalation-watcher/SKILL.md §"Red-on-main recovery"`). This invariant applies even if a recovery SHA is known — the auto-watcher is read-only and has no sanctioned path to move the main ref.
 
 When in doubt, **promote the escalation to L2** (see [Promote to L2](#promote-to-l2)). Leaving items pending at L1 indefinitely is not acceptable; if the tool is unavailable fall back to the legacy digest (see [Graceful Degradation](#graceful-degradation)).
 
@@ -369,6 +370,33 @@ A task is blocked with no active workflow and no pending sibling escalation (fil
 ### Promote-to-L2 categories (require human judgment)
 
 For all categories below, **promote rather than leave pending**. Check for a causal cluster first (see [Shallow-by-default RCA](#shallow-by-default--deepen-on-signal-rca)): if multiple escalations share a root cause, promote them together as one L2 cluster. Otherwise, promote each as a 1-member L2.
+
+#### Red-on-main / bad merge (any category where root cause is a broken main ref)
+
+When shallow RCA identifies that the root cause is a **bad merge on main** (main is RED, CI is broken across multiple tasks because of one merge commit), **promote to L2 immediately** — do NOT attempt to fix the ref yourself.
+
+Root_cause: `"bad-merge-to-main:<merge-sha-prefix or symptom-slug>"`
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<task_id or "infra">,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause="bad-merge-to-main:<merge-sha-prefix>",
+  evidence="main is RED after merge <sha>; tasks {ids} failing. Recovery ref-move required — see escalation-watcher SKILL.md §Red-on-main recovery.",
+  options=[
+    "A: run enforce-safe recovery via recover_main CLI (see escalation-watcher SKILL.md §Red-on-main recovery)",
+    "B: investigate whether main is actually broken (may be a flaky test)",
+    "C: pause orchestration while diagnosing",
+    "D: something else",
+  ],
+  summary="bad merge on main — recovery ref-move required",
+  category="infra_issue",
+  severity="blocking",
+)
+```
+
+**Critical**: the auto-watcher NEVER executes the recovery itself (see Hard Constraints §"No recovery ref-moves"). The L2 option A is the signal to the human-driven escalation-watcher to run `recover_main` with the enforce-safe CAS procedure.
 
 #### `task_failure` / `wip_conflict`
 
