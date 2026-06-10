@@ -972,6 +972,18 @@ class TaskWorkflow:
             return False
 
         # --- Metadata assignment (survivors only) ---
+        # NOTE: partial-metadata / half-formed-train hazard.
+        # stack_train_branches has already physically rebased the survivor
+        # branches before we reach this point.  If a scheduler.update_task
+        # call below raises (or the process dies mid-loop), some survivors will
+        # have train metadata and others will not — their branches are already
+        # stacked but there is no metadata recording the relationship.
+        # This is a tolerated TOCTOU window: the former is off-by-default
+        # (merge_train_former_enabled=False), and the solo-merge fallback
+        # recovers the survivors gracefully — a member without train metadata
+        # falls through to the normal solo-merge path unchanged.  A future
+        # hardening task should wrap this loop in a compensating transaction or
+        # idempotent retry.
         train_id = f'train-{self.task_id}-{uuid.uuid4().hex[:8]}'
         all_members = survivors  # anchor first (order-0), then surviving members
 

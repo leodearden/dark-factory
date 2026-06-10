@@ -14,17 +14,13 @@ from orchestrator.git_ops import (
     GitOps,
     ScrubOutcome,
     ScrubResult,
+    TrainStackResult,
     WorktreeInfo,
     WorktreeMissing,
     _merge_subject,
     _run,
     scrub_task_dir_from_tree,
 )
-
-try:
-    from orchestrator.git_ops import TrainStackResult  # added in step-4
-except ImportError:
-    TrainStackResult = None  # type: ignore[assignment,misc]
 
 
 @pytest.fixture
@@ -5231,6 +5227,61 @@ class TestGetChangedLineRanges:
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers: branch/worktree creation + clean-state assertion
+# ---------------------------------------------------------------------------
+
+
+async def _make_member(
+    git_ops: GitOps,
+    name: str,
+    base_ref: str,
+    filename: str,
+    content: str,
+) -> Path:
+    """Create branch task/<name> off base_ref, write filename, commit.
+
+    Returns the worktree path (git_ops.worktree_base/<name>).  Used by
+    TestRebaseOntoArbitraryRef, TestStackTrainBranchesHappyPath, and
+    TestStackTrainBranchesConflictEject — all need a branch with a single-file
+    edit off an arbitrary base ref.  Mirrors the make_stacked_member helper in
+    test_atomic_train_merge.py.
+    """
+    full_branch = f'{git_ops.config.branch_prefix}{name}'
+    wt_path = git_ops.worktree_base / name
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    await _run(
+        ['git', 'worktree', 'add', '-b', full_branch, str(wt_path), base_ref],
+        cwd=git_ops.project_root,
+    )
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=wt_path)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=wt_path)
+    (wt_path / filename).write_text(content)
+    await _run(['git', 'add', '-A'], cwd=wt_path)
+    await _run(['git', 'commit', '-m', f'Add {filename}'], cwd=wt_path)
+    return wt_path
+
+
+async def _assert_no_rebase_in_progress(wt_path: Path) -> None:
+    """Assert the worktree has no rebase in progress.
+
+    Resolves the worktree's actual gitdir via ``git rev-parse --git-dir`` and
+    checks that the ``rebase-merge`` directory is absent.  This is the correct
+    clean-state check for both regular repos and ``git worktree add`` worktrees
+    (where ``.git`` is a file pointer, not a directory).  A vacuous ``git
+    status`` exit-code check does NOT distinguish mid-rebase from clean state.
+    """
+    _, gitdir_str, _ = await _run(['git', 'rev-parse', '--git-dir'], cwd=wt_path)
+    gitdir = Path(gitdir_str.strip())
+    if not gitdir.is_absolute():
+        gitdir = wt_path / gitdir
+    rebase_merge = gitdir / 'rebase-merge'
+    assert not rebase_merge.exists(), (
+        f'rebase-merge directory {rebase_merge} should not exist — '
+        'rebase was not properly aborted'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-1: rebase_onto_main generalized with optional onto= kwarg
 # ---------------------------------------------------------------------------
 
@@ -5243,29 +5294,6 @@ class TestRebaseOntoArbitraryRef:
     onto=... raises TypeError.
     """
 
-    async def _make_branch(
-        self,
-        git_ops: GitOps,
-        name: str,
-        base_ref: str,
-        filename: str,
-        content: str,
-    ) -> Path:
-        """Create branch task/<name> off base_ref, write a file, commit."""
-        full_branch = f'{git_ops.config.branch_prefix}{name}'
-        wt_path = git_ops.worktree_base / name
-        wt_path.parent.mkdir(parents=True, exist_ok=True)
-        await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(wt_path), base_ref],
-            cwd=git_ops.project_root,
-        )
-        await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=wt_path)
-        await _run(['git', 'config', 'user.name', 'Test'], cwd=wt_path)
-        (wt_path / filename).write_text(content)
-        await _run(['git', 'add', '-A'], cwd=wt_path)
-        await _run(['git', 'commit', '-m', f'Add {filename}'], cwd=wt_path)
-        return wt_path
-
     async def test_onto_sibling_branch_clean_returns_true(
         self, git_ops: GitOps, git_repo: Path,
     ):
@@ -5273,10 +5301,8 @@ class TestRebaseOntoArbitraryRef:
         returns True and the feature worktree now contains fileA.
         """
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
-        await self._make_branch(
-            git_ops, 'base-rb', 'main', 'fileA.txt', 'content A\n',
-        )
-        feature_wt = await self._make_branch(
+        await _make_member(git_ops, 'base-rb', 'main', 'fileA.txt', 'content A\n')
+        feature_wt = await _make_member(
             git_ops, 'feature-rb', 'main', 'fileB.txt', 'content B\n',
         )
         base_branch = f'{git_ops.config.branch_prefix}base-rb'
@@ -5298,11 +5324,11 @@ class TestRebaseOntoArbitraryRef:
         """
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
         # base edits shared.txt with one value
-        await self._make_branch(
+        await _make_member(
             git_ops, 'base-conf', 'main', 'shared.txt', 'version: alpha\n',
         )
         # feature also edits shared.txt with a different value → conflict
-        feature_wt = await self._make_branch(
+        feature_wt = await _make_member(
             git_ops, 'feature-conf', 'main', 'shared.txt', 'version: beta\n',
         )
         base_branch = f'{git_ops.config.branch_prefix}base-conf'
@@ -5311,42 +5337,13 @@ class TestRebaseOntoArbitraryRef:
 
         assert result is False
         # Worktree must be clean — rebase was aborted.
-        # Check via git status: exits 0 when the worktree is in a clean state.
-        rc2, _, _ = await _run(['git', 'status'], cwd=feature_wt)
-        assert rc2 == 0, 'worktree should be in a clean state after failed rebase'
+        # git status exits 0 even mid-rebase so we check the gitdir directly.
+        await _assert_no_rebase_in_progress(feature_wt)
 
 
 # ---------------------------------------------------------------------------
 # step-3: stack_train_branches happy path (all members survive)
 # ---------------------------------------------------------------------------
-
-
-async def _make_member(
-    git_ops: GitOps,
-    name: str,
-    base_ref: str,
-    filename: str,
-    content: str,
-) -> Path:
-    """Create branch task/<name> off base_ref, write filename, commit.
-
-    Returns the worktree path (git_ops.worktree_base/<name>).
-    This mirrors the make_stacked_member helper in test_atomic_train_merge.py
-    but writes independent files so members are stackable without conflicts.
-    """
-    full_branch = f'{git_ops.config.branch_prefix}{name}'
-    wt_path = git_ops.worktree_base / name
-    wt_path.parent.mkdir(parents=True, exist_ok=True)
-    await _run(
-        ['git', 'worktree', 'add', '-b', full_branch, str(wt_path), base_ref],
-        cwd=git_ops.project_root,
-    )
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=wt_path)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=wt_path)
-    (wt_path / filename).write_text(content)
-    await _run(['git', 'add', '-A'], cwd=wt_path)
-    await _run(['git', 'commit', '-m', f'Add {filename}'], cwd=wt_path)
-    return wt_path
 
 
 @pytest.mark.asyncio
@@ -5364,10 +5361,6 @@ class TestStackTrainBranchesHappyPath:
         Expected: TrainStackResult(survivors=['A','B','C'], ejected=[])
         and the tip worktree (C) contains fileA, fileB, and fileC.
         """
-        assert TrainStackResult is not None, (
-            'TrainStackResult must be importable from orchestrator.git_ops'
-        )
-
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
         main_ref = 'main'
 
@@ -5431,10 +5424,10 @@ class TestStackTrainBranchesConflictEject:
         assert result.survivors == ['ta', 'tb'], f'got survivors={result.survivors}'
         assert result.ejected == ['tc'], f'got ejected={result.ejected}'
 
-        # task/tc branch must be in a clean state
+        # task/tc branch must be in a clean state (rebase properly aborted).
+        # git status exits 0 even mid-rebase, so check the gitdir directly.
         tc_wt = git_ops.worktree_base / 'tc'
-        rc, _, _ = await _run(['git', 'status'], cwd=tc_wt)
-        assert rc == 0, 'ejected member worktree must be in a clean git state'
+        await _assert_no_rebase_in_progress(tc_wt)
 
     async def test_middle_conflict_relink(
         self, git_ops: GitOps, git_repo: Path,
@@ -5465,13 +5458,52 @@ class TestStackTrainBranchesConflictEject:
         assert result.survivors == ['ma', 'mc'], f'got survivors={result.survivors}'
         assert result.ejected == ['mb'], f'got ejected={result.ejected}'
 
-        # task/mb branch must be in a clean state
+        # task/mb branch must be in a clean state (rebase properly aborted).
+        # git status exits 0 even mid-rebase, so check the gitdir directly.
         mb_wt = git_ops.worktree_base / 'mb'
-        rc, _, _ = await _run(['git', 'status'], cwd=mb_wt)
-        assert rc == 0, 'ejected member B worktree must be in a clean git state'
+        await _assert_no_rebase_in_progress(mb_wt)
 
         # tip worktree (C) must have foo.txt (from A, since C re-linked onto A)
         # and its own baz.txt
         mc_wt = git_ops.worktree_base / 'mc'
         assert (mc_wt / 'foo.txt').exists(), 'tip C must contain foo.txt from anchor A'
         assert (mc_wt / 'baz.txt').exists(), 'tip C must contain its own baz.txt'
+
+    async def test_missing_worktree_eject_and_relink(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """Missing worktree directory is treated as an eject; re-link invariant holds.
+
+        Setup:
+          - anchor A: worktree exists, edits fileA.txt
+          - member MISSING: worktree directory never created
+          - member C: worktree exists, edits fileC.txt (different file, clean)
+
+        Expected:
+          - 'missing' is ejected (wt_path.is_dir() → False)
+          - last_good_id stays 'xa' (not advanced past the missing member)
+          - 'xc' re-links onto 'xa' and survives (clean rebase)
+          - survivors == ['xa', 'xc'], ejected == ['xmissing']
+          - No exception is raised
+        """
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        main_ref = 'main'
+
+        await _make_member(git_ops, 'xa', main_ref, 'fileA.txt', 'content A\n')
+        # xmissing: deliberately omit worktree creation
+        await _make_member(git_ops, 'xc', main_ref, 'fileC.txt', 'content C\n')
+
+        result = await git_ops.stack_train_branches(['xa', 'xmissing', 'xc'])
+
+        assert result.survivors == ['xa', 'xc'], (
+            f'xc should re-link onto xa after xmissing is ejected; '
+            f'got survivors={result.survivors}'
+        )
+        assert result.ejected == ['xmissing'], (
+            f'xmissing should be ejected; got ejected={result.ejected}'
+        )
+        # xc's tip must carry fileA (from xa, since it re-linked onto xa)
+        xc_wt = git_ops.worktree_base / 'xc'
+        assert (xc_wt / 'fileA.txt').exists(), (
+            'xc must contain fileA from anchor xa after re-linking'
+        )
