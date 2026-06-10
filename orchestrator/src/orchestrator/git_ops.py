@@ -54,7 +54,7 @@ PushResult = Literal['pushed', 'noop', 'rejected', 'error']
 
 # Return type for recover_red_main — distinguishes a successful CAS move
 # from an atomic abort (another writer beat us to the ref).
-RecoverResult = Literal['rewound', 'cas_failed']
+RecoverResult = Literal['rewound', 'cas_failed', 'error']
 
 
 class TrainMembership(TypedDict, total=False):
@@ -2683,6 +2683,27 @@ class GitOps:
         if rc == 0 and branch_out.strip() == self.config.main_branch:
             is_on_main = True
 
+        # ── Pre-validate SHAs (distinguish bad-input from CAS mismatch) ─────
+        # A non-existent or non-commit SHA would make update-ref fail with a
+        # repo-level error indistinguishable from a CAS mismatch.  Fail early
+        # with 'error' so the runbook routes to "fix the SHA" rather than the
+        # retry loop intended for genuine CAS races.
+        for _sha_label, _sha_val in (
+            ('target_sha', target_sha),
+            ('expected_main', expected_main),
+        ):
+            _v_rc, _, _v_err = await _run(
+                ['git', 'rev-parse', '--verify', f'{_sha_val}^{{commit}}'],
+                cwd=self.project_root,
+            )
+            if _v_rc != 0:
+                logger.error(
+                    'recover_red_main: %s %r does not resolve to a commit; '
+                    'fix the SHA before retrying. detail=%s',
+                    _sha_label, (_sha_val or '')[:8], _v_err.strip(),
+                )
+                return 'error'
+
         # ── Main-gate mark (best-effort) ──────────────────────────────────
         # Run the project-configurable sentinel command immediately before
         # update-ref so reify's reference-transaction hook sees the marker
@@ -2732,6 +2753,21 @@ class GitOps:
 
         # ── Sync working tree to new HEAD ─────────────────────────────────
         if is_on_main:
+            # Warn if the tree is dirty — read-tree will silently discard
+            # uncommitted tracked changes.  The caller/runbook is expected to
+            # clean up first; this is a last-resort advisory so an operator
+            # under stress isn't silently burned.
+            _st_rc, _st_out, _ = await _run(
+                ['git', 'status', '--porcelain'],
+                cwd=self.project_root,
+            )
+            if _st_rc == 0 and _st_out.strip():
+                logger.warning(
+                    'recover_red_main: working tree has uncommitted changes '
+                    '(git status --porcelain non-empty); '
+                    'git read-tree will silently discard tracked WIP. '
+                    'Ensure project_root is clean before break-glass recovery.',
+                )
             sync_rc, _, sync_err = await _run(
                 ['git', 'read-tree', '-u', '--reset', 'HEAD'],
                 cwd=self.project_root,

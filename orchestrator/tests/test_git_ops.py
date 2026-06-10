@@ -5770,3 +5770,73 @@ class TestRecoverRedMain:
         assert not any(
             c[:3] == ['git', 'read-tree', '-u'] for c in recorded
         ), f'read-tree called when not on main; commands: {recorded}'
+
+    async def test_recover_returns_error_for_invalid_sha(self, git_repo: Path):
+        """recover_red_main returns 'error' (not 'cas_failed') when SHA pre-validation fails.
+
+        A typo'd or non-existent target_sha must route the operator to 'fix the
+        SHA', not into the 'retry' loop intended for genuine CAS races.
+        No mark command should fire before we detect the bad input.
+        """
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command='echo should-not-run',
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            # Fail ALL rev-parse --verify calls (simulates invalid SHA)
+            if cmd[:3] == ['git', 'rev-parse', '--verify']:
+                return (128, '', f'fatal: Not a valid object name {cmd[-1]}')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'error', f'Expected error for invalid SHA; got {result!r}'
+        # Mark command must NOT have been issued (fail-fast before mark)
+        assert not any(c[:2] == ['sh', '-c'] for c in recorded), (
+            f'Unexpected sh -c (mark) fired before pre-validation completed; recorded: {recorded}'
+        )
+
+    async def test_recover_warns_on_dirty_tree_when_on_main(
+        self, git_repo: Path, caplog,
+    ):
+        """recover_red_main emits a WARNING when the working tree is dirty and on main.
+
+        A dirty tree would cause read-tree to silently discard uncommitted WIP;
+        the warning gives operators a last-resort advisory even if they skipped
+        the runbook's 'ensure clean tree' prerequisite.  The function still
+        returns 'rewound' — the warning is advisory only.
+        """
+        ops = GitOps(
+            GitConfig(main_branch='main', branch_prefix='task/', push_after_advance=False),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+        # git_repo is on main; dirty a tracked file (committed in _two_main_shas)
+        (git_repo / '_bad_merge.txt').write_text('modified after commit — uncommitted WIP\n')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'rewound', (
+            f'Expected rewound even with dirty tree (warning is advisory only); got {result!r}'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'uncommitted' in r.getMessage() or 'WIP' in r.getMessage() or 'dirty' in r.getMessage()
+            for r in warnings
+        ), (
+            f'No dirty-tree warning found in records; all warnings: '
+            f'{[r.getMessage() for r in warnings]}'
+        )

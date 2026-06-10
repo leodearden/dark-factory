@@ -8,11 +8,15 @@ CLI usage (JSON to stdout):
       --expected-main <current-bad-sha>
 
 Prints a JSON object:
-  {"result": "rewound"|"cas_failed", "target_sha": "<sha>"}
+  {"result": "rewound"|"cas_failed"|"error", "target_sha": "<sha>"}
+
+On unexpected exceptions (bad config path, inaccessible repo, etc.), the JSON
+contract is still honored:
+  {"result": "error", "detail": "<exception message>", "target_sha": "<sha>"}
 
 Exit codes:
   0  — rewound (success)
-  1  — cas_failed (another writer moved the ref first)
+  1  — cas_failed (another writer moved the ref first), error, or exception
 
 Mirrors b3_gate's cross-project invocation pattern: loads the WATCHED
 project's GitConfig (where main_gate_mark_command is set), constructs
@@ -51,17 +55,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point; returns 0 on rewound, 1 on cas_failed."""
+    """Entry point; returns 0 on rewound, 1 on cas_failed / error / exception."""
     p = _build_parser()
     args = p.parse_args(argv)
 
-    cfg = load_config(Path(args.config))
-    git_ops = GitOps(cfg.git, Path(args.project_root))
-
-    result = asyncio.run(git_ops.recover_red_main(args.target_sha, args.expected_main))
+    try:
+        cfg = load_config(Path(args.config))
+        git_ops = GitOps(cfg.git, Path(args.project_root))
+        result = asyncio.run(git_ops.recover_red_main(args.target_sha, args.expected_main))
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            'result': 'error',
+            'detail': str(exc),
+            'target_sha': args.target_sha,
+        }))
+        return 1
 
     print(json.dumps({'result': result, 'target_sha': args.target_sha}))
-
     return 0 if result == 'rewound' else 1
 
 

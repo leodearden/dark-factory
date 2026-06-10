@@ -115,3 +115,30 @@ class TestRecoverMainCLI:
         raw = capsys.readouterr().out.strip()
         # json.loads already validated in _run_cli; assert single-line here
         assert '\n' not in raw, f'Multiple lines in stdout: {raw!r}'
+
+    def test_error_path_json_contract(self, config_path, project_root, capsys):
+        """On load_config / GitOps / recover_red_main exception, JSON contract holds.
+
+        A JSON-parsing consumer (e.g. the escalation-watcher skill script) must
+        not receive a raw traceback — it must receive a parseable JSON object so
+        it can route the failure to a human rather than failing opaquely.
+        """
+        from orchestrator.recover_main import main  # noqa: PLC0415
+
+        with patch(
+            'orchestrator.recover_main.load_config',
+            side_effect=ValueError('config file not found or invalid'),
+        ):
+            rc = main([
+                '--project-root', str(project_root),
+                '--config', str(config_path),
+                '--target-sha', _TARGET_SHA,
+                '--expected-main', _EXPECTED_MAIN,
+            ])
+
+        raw = capsys.readouterr().out.strip()
+        assert rc != 0, f'Expected non-zero exit on exception; got {rc}'
+        data = json.loads(raw)  # must be parseable JSON (not a raw traceback)
+        assert data['result'] == 'error', f'Expected result=error; got {data}'
+        assert 'detail' in data, f'Missing detail key in error output; got {data}'
+        assert data['target_sha'] == _TARGET_SHA, f'target_sha missing/wrong; got {data}'
