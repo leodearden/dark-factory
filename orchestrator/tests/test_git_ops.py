@@ -4997,6 +4997,60 @@ index 000000..111111 100644
 -del 4
 """
 
+# File completely deleted — +++ /dev/null, no new path.
+CANNED_DIFF_FILE_DELETED = """\
+diff --git a/src/gone.rs b/src/gone.rs
+deleted file mode 100644
+index aaaaaa..000000
+--- a/src/gone.rs
++++ /dev/null
+@@ -1,5 +0,0 @@
+-line 1
+-line 2
+-line 3
+-line 4
+-line 5
+"""
+
+# Pure rename with no content changes (R100) — no --- / +++ / hunk lines.
+CANNED_DIFF_PURE_RENAME = """\
+diff --git a/src/old_name.rs b/src/new_name.rs
+similarity index 100%
+rename from src/old_name.rs
+rename to src/new_name.rs
+"""
+
+# Rename with content changes — old path vanishes, new path gets hunk ranges.
+CANNED_DIFF_RENAME_WITH_CHANGES = """\
+diff --git a/src/old_mod.rs b/src/new_mod.rs
+similarity index 80%
+rename from src/old_mod.rs
+rename to src/new_mod.rs
+index aaaaaa..bbbbbb 100644
+--- a/src/old_mod.rs
++++ b/src/new_mod.rs
+@@ -10,3 +10,4 @@
+ context
+-deleted line
++added line 1
++added line 2
+"""
+
+# New file — --- /dev/null, +++ b/src/new.rs.
+CANNED_DIFF_NEW_FILE = """\
+diff --git a/src/new.rs b/src/new.rs
+new file mode 100644
+index 000000..bbbbbb
+--- /dev/null
++++ b/src/new.rs
+@@ -0,0 +1,5 @@
++line 1
++line 2
++line 3
++line 4
++line 5
+"""
+
 
 class TestParseDiffLineRanges:
     """Unit tests for parse_diff_line_ranges (pure function, no git invocation)."""
@@ -5043,6 +5097,74 @@ class TestParseDiffLineRanges:
         fn = self._fn()
         result = fn(CANNED_DIFF_TWO_FILES)
         assert set(result.keys()) == {'src/foo.rs', 'src/bar.rs'}
+
+    # --- deleted / renamed / new-file edge cases (amendment, suggestion 1+2) ---
+
+    def test_file_deletion_records_old_path_with_sentinel(self):
+        """'+++ /dev/null' → old path represented with whole-file sentinel.
+
+        A task that deletes a file must not appear stackable with any task that
+        modifies the same file.  The sentinel ensures the shared-file intersection
+        always returns non-stackable.
+        """
+        from orchestrator.git_ops import _WHOLE_FILE_SENTINEL
+        fn = self._fn()
+        result = fn(CANNED_DIFF_FILE_DELETED)
+        assert 'src/gone.rs' in result, 'Deleted file path must be in result'
+        assert _WHOLE_FILE_SENTINEL in result['src/gone.rs'], (
+            'Deleted file must carry the whole-file sentinel'
+        )
+        # '/dev/null' must never appear as a key.
+        assert all('/dev/null' not in k for k in result), (
+            '/dev/null must not be a key in the result dict'
+        )
+
+    def test_pure_rename_records_old_path_with_sentinel(self):
+        """Pure rename (R100, no hunks) → old path with sentinel; new path absent.
+
+        The old file is gone; any task modifying the old name conflicts.
+        """
+        from orchestrator.git_ops import _WHOLE_FILE_SENTINEL
+        fn = self._fn()
+        result = fn(CANNED_DIFF_PURE_RENAME)
+        assert 'src/old_name.rs' in result, 'Renamed-from path must be in result'
+        assert _WHOLE_FILE_SENTINEL in result['src/old_name.rs'], (
+            'Renamed-from path must carry the whole-file sentinel'
+        )
+        # New name has no hunks in a pure rename — absent from result.
+        assert 'src/new_name.rs' not in result, (
+            'Pure rename: new path has no hunk ranges, must not appear'
+        )
+
+    def test_rename_with_changes_records_old_sentinel_and_new_hunks(self):
+        """Rename + content changes → old path sentinel + new path with hunk ranges."""
+        from orchestrator.git_ops import _WHOLE_FILE_SENTINEL
+        fn = self._fn()
+        result = fn(CANNED_DIFF_RENAME_WITH_CHANGES)
+        # Old path must carry the sentinel.
+        assert 'src/old_mod.rs' in result, 'Old (renamed-from) path must be in result'
+        assert _WHOLE_FILE_SENTINEL in result['src/old_mod.rs'], (
+            'Old path must carry the whole-file sentinel'
+        )
+        # New path must carry hunk ranges from the content change.
+        assert 'src/new_mod.rs' in result, 'New (renamed-to) path must be in result'
+        # @@ -10,3 → old_start=10, old_count=3 → (10, 12)
+        assert (10, 12) in result['src/new_mod.rs'], (
+            'New path must record the content-change hunk range'
+        )
+
+    def test_new_file_records_new_path_normally(self):
+        """'--- /dev/null' (new file) → new path recorded with hunk ranges; no /dev/null key."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_NEW_FILE)
+        assert 'src/new.rs' in result, 'New file path must be in result'
+        # @@ -0,0 +1,5 @@ → old_start=0, old_count=0 → point range (0, 0)
+        assert (0, 0) in result['src/new.rs'], (
+            'New-file insertion hunk must map to point range (0, 0)'
+        )
+        assert all('/dev/null' not in k for k in result), (
+            '/dev/null must not be a key in the result dict'
+        )
 
 
 # ---------------------------------------------------------------------------

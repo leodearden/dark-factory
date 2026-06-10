@@ -371,6 +371,12 @@ def _merge_subject(branch: str, main_branch: str) -> str:
     return f'Merge {branch} into {main_branch}'
 
 
+# Sentinel range used to represent files that are fully deleted or renamed.
+# The range (0, 2**30) spans every plausible line number, so an intersection
+# check against any real hunk range always returns True (not stackable).
+_WHOLE_FILE_SENTINEL: tuple[int, int] = (0, 2**30)
+
+
 def parse_diff_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
     """Parse a unified diff and return old-side (BASE) line ranges per file.
 
@@ -385,24 +391,55 @@ def parse_diff_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
     comparable; ``@@ -N,0 ... @@`` anchors at line N (the line *before* the
     insertion in the old file).
 
+    Deleted files (``+++ /dev/null``), pure renames (``rename from``), and
+    renames with content changes (``--- a/old`` → ``+++ b/new``) are
+    represented via ``_WHOLE_FILE_SENTINEL`` on the old-side path.  This
+    ensures that a modify/delete or rename/modify pair between two tasks is
+    always flagged non-stackable by the stackability gate.
+
     Returns an empty dict for an empty or header-only diff.
     """
     import re
 
     result: dict[str, list[tuple[int, int]]] = {}
     current_file: str | None = None
+    old_path: str | None = None  # from '--- a/<path>'; reset per diff block
 
     hunk_re = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@')
 
     for line in diff_text.splitlines():
-        if line.startswith('+++ b/'):
-            # Strip the "b/" prefix to get the canonical file path.
-            current_file = line[6:]
+        if line.startswith('diff --git '):
+            # Start of a new file block — reset per-file state.
+            current_file = None
+            old_path = None
+        elif line.startswith('--- a/'):
+            # Record old-side path for deletion / rename detection below.
+            old_path = line[6:]
+        elif line.startswith('+++ b/'):
+            new_path = line[6:]
+            # Rename with content changes: old_path ≠ new_path.  The old file is
+            # gone; represent it with a sentinel so tasks touching the old name
+            # are flagged non-stackable with this rename.
+            if old_path and old_path != new_path and old_path not in result:
+                result[old_path] = [_WHOLE_FILE_SENTINEL]
+            current_file = new_path
             if current_file not in result:
                 result[current_file] = []
-        elif line.startswith('diff --git '):
-            # Reset current file; it will be set when +++ b/ is seen.
-            current_file = None
+        elif line.startswith('+++ /dev/null'):
+            # File deletion: old file is completely gone.  Represent old_path
+            # with the whole-file sentinel so any task modifying this file is
+            # flagged non-stackable with the deletion.
+            if old_path and old_path not in result:
+                result[old_path] = [_WHOLE_FILE_SENTINEL]
+            current_file = None  # no new file; skip hunk parsing
+        elif line.startswith('rename from '):
+            # Pure rename (R100) header — no --- / +++ lines follow for the old
+            # path.  Add it with the sentinel so tasks touching the old name are
+            # flagged.  For renames with content changes the --- a/ handler above
+            # also runs, but the 'not in result' guard prevents a double-insert.
+            renamed_from = line[len('rename from '):]
+            if renamed_from not in result:
+                result[renamed_from] = [_WHOLE_FILE_SENTINEL]
         elif current_file is not None:
             m = hunk_re.match(line)
             if m:
