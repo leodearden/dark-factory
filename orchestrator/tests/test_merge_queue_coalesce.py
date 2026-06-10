@@ -1466,3 +1466,148 @@ class TestOneStrikeExclusion:
             'request_id': req2.request_id,
             'reason': 'coalesce_derailed_one_strike',
         }, f'exclusion entry mismatch: {exc[0]}'
+
+
+# ─── δ Step 7 ────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestOneStrikeRecording:
+    """δ step-7 (RED): a derailed coalesce train marks its members one-strike.
+
+    Drives the merger loop pattern from TestEndToEndWiring.  Patches
+    _do_train_merge to return MergeOutcome('blocked').  A coalesce-prefixed
+    train (train_id startswith 'coalesce-') must populate
+    worker._coalesce_derailed_task_ids with all its member_task_ids.
+
+    Negative control: a non-coalesce train (train_id does NOT start with
+    'coalesce-') that derails must NOT populate the set.
+    """
+
+    async def test_coalesce_train_derail_marks_members(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """Coalesce-prefixed train derail → members marked one-strike."""
+        import contextlib
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+            TrainCallbacks,
+        )
+
+        db_path = tmp_path / 'es_osr.db'
+        es = EventStore(db_path=db_path, run_id='run-osr-test')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        # Build a GroupMergeRequest with a coalesce-prefixed train_id.
+        group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        group = GroupMergeRequest(
+            task_id='m2',
+            branch='task/m2',
+            worktree=tmp_path / 'wt-m2',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=group_future,
+            train_id='coalesce-tipm-deadbeef',
+            member_task_ids=['m1', 'm2'],
+            tip_branch='task/m2',
+            tip_task_id='m2',
+            status_check=AsyncMock(return_value={}),
+            mark_member_done=AsyncMock(),
+        )
+
+        # Patch _do_train_merge to return blocked (simulating verify failure).
+        with patch(
+            'orchestrator.merge_queue._do_train_merge',
+            AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
+        ):
+            await queue.put(group)
+            worker_task = asyncio.create_task(worker.run())
+
+            # Wait for the group future to be resolved by the verifier path.
+            await asyncio.wait_for(group_future, timeout=30)
+
+        assert worker._coalesce_derailed_task_ids == {'m1', 'm2'}, (
+            f'coalesce train members must be marked one-strike after derail; '
+            f'got {worker._coalesce_derailed_task_ids}'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_non_coalesce_train_derail_does_not_mark(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """Non-coalesce-prefixed train derail → set remains empty."""
+        import contextlib
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
+
+        db_path = tmp_path / 'es_ncosr.db'
+        es = EventStore(db_path=db_path, run_id='run-ncosr-test')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        group = GroupMergeRequest(
+            task_id='nc2',
+            branch='task/nc2',
+            worktree=tmp_path / 'wt-nc2',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=group_future,
+            train_id='train-beta-xyz',   # NOT coalesce-prefixed
+            member_task_ids=['nc1', 'nc2'],
+            tip_branch='task/nc2',
+            tip_task_id='nc2',
+            status_check=AsyncMock(return_value={}),
+            mark_member_done=AsyncMock(),
+        )
+
+        with patch(
+            'orchestrator.merge_queue._do_train_merge',
+            AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
+        ):
+            await queue.put(group)
+            worker_task = asyncio.create_task(worker.run())
+            await asyncio.wait_for(group_future, timeout=30)
+
+        assert worker._coalesce_derailed_task_ids == set(), (
+            f'non-coalesce train derail must NOT populate one-strike set; '
+            f'got {worker._coalesce_derailed_task_ids}'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
