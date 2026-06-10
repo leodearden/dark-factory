@@ -3100,6 +3100,29 @@ class MergeRequest:
     'normal' requests; within a lane FIFO order is preserved."""
 
 
+@dataclass(frozen=True)
+class TrainCallbacks:
+    """Scheduler-backed callbacks for a single train, built in the harness.
+
+    Holds two async callables captured over a live scheduler + train_id so
+    the merge worker (a pure git engine with no scheduler import) can flip
+    member tasks done after a train advance.  Built by
+    :func:`harness.build_train_callback_factory` and consumed by task γ when
+    it constructs :class:`GroupMergeRequest` inside SpeculativeMergeWorker.
+    """
+
+    status_check: Callable[[list[str]], Awaitable[dict[str, str]]]
+    """Async callback: given member_task_ids, return {task_id: status}."""
+
+    mark_member_done: Callable[[str, str], Awaitable[None]]
+    """Async callback: mark a single member task done with the merge SHA."""
+
+
+# Type alias for the factory that produces per-train callbacks.
+# Called with a train_id str; returns a TrainCallbacks for that train.
+TrainCallbackFactory = Callable[[str], TrainCallbacks]
+
+
 @dataclass
 class GroupMergeRequest(MergeRequest):
     """A request to atomically merge a linear-stacked train of task branches.
@@ -4469,6 +4492,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         on_merge_landed: Callable[[str, str, str], Awaitable[object]] | None = None,
         speculation_depth: int = _MERGE_AHEAD_BOUND,
         escalation_queue: Any = None,
+        train_callback_factory: TrainCallbackFactory | None = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -4484,6 +4508,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # PRD §10 invariant 6(b): born-at-L2 shadow compare escalation queue.
         # None-safe so bare-worker/bare-harness tests stay green without wiring.
         self._escalation_queue: Any = escalation_queue
+        # Opaque factory for building per-train GroupMergeRequest callbacks.
+        # Built by harness.build_train_callback_factory(self.scheduler) and
+        # injected here so task γ can construct GroupMergeRequests without the
+        # worker importing the scheduler (pure-git-engine layering preserved).
+        # The worker itself does NOT call this factory in this task; γ uses it.
+        self._train_callback_factory: TrainCallbackFactory | None = train_callback_factory
         # Tracks in-flight shadow compare asyncio.Tasks (single-in-flight guard).
         self._shadow_compare_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Persisted cadence state path — under project_root/data/orchestrator/

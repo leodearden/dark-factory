@@ -42,7 +42,7 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
-    from orchestrator.merge_queue import MergeWorker, SpeculativeMergeWorker
+    from orchestrator.merge_queue import MergeWorker, SpeculativeMergeWorker, TrainCallbackFactory
 
 try:
     from escalation.queue import EscalationQueue
@@ -296,6 +296,100 @@ class HarnessReport:
                 f'(${r.cost_usd:.2f}, {r.agent_invocations} invocations)'
             )
         return '\n'.join(lines)
+
+
+def build_train_callback_factory(scheduler: Any) -> TrainCallbackFactory:
+    """Build a per-train callback factory that captures the live scheduler.
+
+    Returns a factory function ``factory(train_id) -> TrainCallbacks`` whose
+    closures mirror ``workflow._status_check`` / ``workflow._mark_member_done``
+    in ``workflow._maybe_enqueue_group_merge`` but are rooted at the harness
+    scheduler and hardened to tolerate non-task members (e.g. MCP-submitted
+    branches like 'cargo-run-prebuilt-fix') without raising.
+
+    The factory is module-level (not a Harness method) so unit tests can drive
+    it with a FakeScheduler without constructing a full Harness.
+
+    NOTE (task γ follow-up): once γ wires GroupMergeRequest construction through
+    this factory inside SpeculativeMergeWorker, the inline ``_status_check`` /
+    ``_mark_member_done`` closures in ``workflow._maybe_enqueue_group_merge``
+    should be retired so there is a single source of truth for train-callback
+    semantics (synthesis logic, no-op guard, merged-provenance shape).
+    """
+    from orchestrator.merge_queue import TrainCallbacks
+
+    def factory(train_id: str) -> TrainCallbacks:
+        async def status_check(ids: list[str]) -> dict[str, str]:
+            statuses, err = await scheduler.get_statuses(ids)
+            if err is not None:
+                logger.warning(
+                    'train %s: status_check get_statuses error — returning partial (will park): %s',
+                    train_id, err,
+                )
+                return statuses or {}
+            # Synthesize _TRAIN_MEMBER_READY_STATUS for ids the scheduler does not
+            # know about (non-task members such as MCP-submitted branches).
+            # SpeculativeMergeWorker._do_train_merge status pre-check parks the train
+            # if any member status != 'merge-deferred'; synthesising it here lets a
+            # mixed task/non-task train pass the gate.  Synthesis only fires when
+            # Scheduler.get_statuses succeeded (err is None) to prevent advancing a
+            # train on a lie when the backend is down.
+            #
+            # TRADE-OFF: any id silently omitted by the scheduler — whether a genuine
+            # non-task MCP branch or a real scheduler task that was dropped/lost — is
+            # treated as a non-task member and synthesised ready.  A dropped real task
+            # would advance (and mark_member_done would no-op), leaving it un-flipped
+            # with a stale status.  A debug diagnostic is emitted for each synthesised
+            # id so this path does not advance trains completely silently.
+            synthesised = [mid for mid in ids if mid not in statuses]
+            for mid in synthesised:
+                logger.debug(
+                    'train %s: member %s absent from scheduler — synthesising '
+                    '%r as ready (treating as non-task member)',
+                    train_id, mid, _TRAIN_MEMBER_READY_STATUS,
+                )
+            return {mid: statuses.get(mid, _TRAIN_MEMBER_READY_STATUS) for mid in ids}
+
+        async def mark_member_done(mid: str, sha: str) -> None:
+            # Existence check: issue a Scheduler.get_statuses probe before calling
+            # mark_done so a non-task member (absent from the scheduler) can be
+            # no-op'd without raising.  (err is None and mid not in result) is the
+            # unambiguous "no scheduler task" signal: Scheduler.get_statuses silently
+            # omits unknown ids, so this is NOT a transient error.  A raise would hit
+            # SpeculativeMergeWorker._do_train_merge post-advance flip loop and
+            # falsely trigger TRAIN_PARTIAL_FLIP.
+            #
+            # LIMITATION: the no-op guarantee holds only when the existence check
+            # itself succeeds (err is None).  On a transient Scheduler.get_statuses
+            # error (err is not None), control falls through to mark_done
+            # unconditionally; for a genuine non-task member this could raise and
+            # trigger TRAIN_PARTIAL_FLIP.  This is low-probability (transient error
+            # must coincide with a non-task member's guard call) and accepted: for
+            # real task members the fall-through is correct (best-effort flip; any
+            # mark_done error propagates to the partial-flip handler as intended).
+            #
+            # PERFORMANCE NOTE: this issues an extra Scheduler.get_statuses round-trip
+            # per member solely to detect task existence before mark_done.  Trains are
+            # small and infrequent so the cost is acceptable.  Future task γ wiring
+            # could reuse the statuses already fetched by status_check to avoid it.
+            statuses, err = await scheduler.get_statuses([mid])
+            if err is None and mid not in statuses:
+                logger.info(
+                    'train %s: member %s has no scheduler task — mark_member_done no-op',
+                    train_id, mid,
+                )
+                return
+            await scheduler.mark_done(mid, kind='merged', sha=sha, note=f'train {train_id}')
+
+        return TrainCallbacks(status_check=status_check, mark_member_done=mark_member_done)
+
+    return factory
+
+
+# Status synthesised for non-task train members (MCP-submitted branches with no
+# scheduler task).  Must match the value accepted by the status pre-check in
+# SpeculativeMergeWorker._do_train_merge exactly; see merge_queue.py.
+_TRAIN_MEMBER_READY_STATUS: str = 'merge-deferred'
 
 
 class Harness:
@@ -3276,6 +3370,12 @@ Output JSON matching the schema. Every task must appear in the output.
 
         self._service_restart_coordinator = self._build_service_restart_coordinator()
 
+        # Build the callback factory here (where self.scheduler is live) and
+        # inject it opaquely into the worker so task γ can construct
+        # GroupMergeRequests without the worker importing the scheduler
+        # (pure-git-engine layering preserved; the worker never calls the factory).
+        train_callback_factory = build_train_callback_factory(self.scheduler)
+
         self._merge_worker = SpeculativeMergeWorker(
             self.git_ops,
             self._merge_queue,
@@ -3283,6 +3383,7 @@ Output JSON matching the schema. Every task must appear in the output.
             event_store=self.event_store,
             on_merge_landed=self._service_restart_coordinator.note_merge,
             escalation_queue=self._escalation_queue,
+            train_callback_factory=train_callback_factory,
         )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',
