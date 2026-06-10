@@ -505,6 +505,44 @@ class GitConfig(BaseModel):
             'lane is the alarm).  0 disables the safety valve.'
         ),
     )
+    warm_verify_shadow_compare: bool = Field(
+        default=False,
+        description=(
+            'Master enable for PRD §10 invariant 6(b) same-candidate warm-vs-cold '
+            'SHADOW compare.  When True (and persistent_merge_worktree is on), '
+            'after each warm-verified land the orchestrator periodically spawns '
+            'an ASYNC (off the serial lane) cold re-verify against the same '
+            'just-landed commit and compares results TEST-LEVEL.  Any per-test '
+            'divergence fires a born-at-L2 alarm.  Default False; reify opts in '
+            'via orchestrator.yaml.  Cadence is controlled by '
+            'warm_verify_shadow_compare_every_n_merges and '
+            'warm_verify_shadow_compare_nightly_interval_secs (whichever '
+            'fires sooner).  Only meaningful when persistent_merge_worktree is '
+            'also on.'
+        ),
+    )
+    warm_verify_shadow_compare_every_n_merges: int = Field(
+        default=40,
+        ge=0,
+        description=(
+            'When warm_verify_shadow_compare is on, trigger a shadow compare '
+            'after every Nth successful warm-verified land.  0 disables the '
+            'merge-count leg; the nightly-timer leg still applies.  Part of '
+            'the \"nightly OR every-N-merges, whichever sooner\" = OR cadence.'
+        ),
+    )
+    warm_verify_shadow_compare_nightly_interval_secs: float = Field(
+        default=86400.0,
+        gt=0,
+        description=(
+            'When warm_verify_shadow_compare is on, trigger a shadow compare '
+            'if at least this many seconds have elapsed since the last run.  '
+            'Default 86400 s (nightly).  Part of the '
+            '\"nightly OR every-N-merges, whichever sooner\" = OR cadence.  '
+            'This is a SHADOW/detective control that runs off the serial merge '
+            'lane and never blocks a warm land.'
+        ),
+    )
 
 
 # --- Per-module overrides ---

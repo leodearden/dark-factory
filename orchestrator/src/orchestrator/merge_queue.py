@@ -15,9 +15,11 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import json
 import logging
 import math
 import posixpath
+import re
 import shutil
 import time
 import uuid
@@ -25,7 +27,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
@@ -597,6 +599,7 @@ async def _run_post_merge_verify(
     max_enospc: int,
     event_store: EventStore | None = None,
     merge_sha: str = '',
+    on_result: Callable[[VerifyResult], None] | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -609,6 +612,13 @@ async def _run_post_merge_verify(
     ``MergeWorker`` calls this bare (exceptions reach ``_process``);
     ``SpeculativeMergeWorker`` wraps the call in its existing ``try/except``
     that maps a raised verify to a ``'Verification error: ...'`` outcome.
+
+    Args:
+        on_result: Optional callback invoked with the final :class:`~orchestrator.verify.VerifyResult`
+            BEFORE the pass/fail branch — additive, default ``None`` keeps
+            :class:`MergeWorker` call sites byte-identical.  Used by
+            :class:`SpeculativeMergeWorker` to capture warm per-test results
+            for PRD §10 invariant 6(b) shadow compare.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -668,6 +678,13 @@ async def _run_post_merge_verify(
                 req.task_id, len(pruned),
             )
             verify = await pool.dispatch(merge_sha, spec, attempt=1)
+
+    # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
+    # called with the FINAL VerifyResult (after any ENOSPC retry) so the
+    # warm per-test results are always the last-observed verify for this commit.
+    # Default None keeps MergeWorker call sites byte-identical.
+    if on_result is not None:
+        on_result(verify)
 
     if not verify.passed:
         await git_ops.cleanup_merge_worktree(merge_wt)
@@ -4227,6 +4244,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         event_store: EventStore | None = None,
         on_merge_landed: Callable[[str, str, str], Awaitable[object]] | None = None,
         speculation_depth: int = _MERGE_AHEAD_BOUND,
+        escalation_queue: Any = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -4239,6 +4257,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # and merger-ahead bound track runner count as a single knob (PRD D4).
         # Default = _MERGE_AHEAD_BOUND (1) → byte-identical to prior behaviour.
         self._speculation_depth: int = speculation_depth
+        # PRD §10 invariant 6(b): born-at-L2 shadow compare escalation queue.
+        # None-safe so bare-worker/bare-harness tests stay green without wiring.
+        self._escalation_queue: Any = escalation_queue
+        # Tracks in-flight shadow compare asyncio.Tasks (single-in-flight guard).
+        self._shadow_compare_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # Persisted cadence state path — under project_root/data/orchestrator/
+        # so it survives orchestrator restarts and lives next to other data files.
+        self._shadow_state_path: Path = (
+            git_ops.project_root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
+        )
         # Internal pipeline: Merger → Verifier
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
@@ -5861,12 +5889,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             assert merge_wt is not None  # input was non-None; warm or unchanged
 
         # ── Step 4: verify ────────────────────────────────────────────
+        # PRD §10 invariant 6(b): warm per-test results captured here for the
+        # same-candidate shadow compare scheduled in the 'done' block below.
+        # Initialised empty so the shadow compare scheduler sees {} if the warm
+        # path was not taken (skip_verify, safety-valve, or knob off) and
+        # short-circuits without scheduling a cold leg.
+        _warm_results: dict[str, bool] = {}
         if not item.skip_verify:
             self._verify_phase = 'verifying'
             self._verify_started_at = time.time()  # wall-clock verify start for triage
             logger.info(
                 f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
                 f'worktree={merge_wt.name})'
+            )
+            # Capture the VerifyResult via on_result callback on the genuine warm
+            # path (persistent_merge_worktree on, safety valve not due) to provide
+            # per-test results to the shadow compare scheduler.
+            _warm_capture: list[VerifyResult] = []
+            _is_warm_path = (
+                req.config.git.persistent_merge_worktree
+                and not _due
             )
             try:
                 # Wrap _run_post_merge_verify in an abort-poll loop so that a
@@ -5882,6 +5924,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                     event_store=self._event_store,
                     merge_sha=merge_commit,
+                    on_result=_warm_capture.append if _is_warm_path else None,
                 ))
                 while True:
                     done, _ = await asyncio.wait(
@@ -5934,6 +5977,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
                     f'passed=True)'
                 )
+                # Parse per-test results from the warm verify for shadow compare.
+                # Only populated when _is_warm_path and on_result captured a result.
+                if _warm_capture:
+                    _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
+                    if not _warm_results and req.config.git.warm_verify_shadow_compare:
+                        logger.warning(
+                            'Task %s: warm verify produced no parseable test results '
+                            'for shadow compare (merge=%s) — the parser may not match '
+                            'the project verify command output format; shadow compare '
+                            'will be skipped for this landing',
+                            req.task_id,
+                            merge_commit[:8],
+                        )
             elif out.verify_skipped:
                 # Disk guard fired — run_scoped_verification was never called;
                 # log 'skipped' rather than 'passed=False' to avoid misleading
@@ -6016,21 +6072,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # status == 'done' to preserve that semantics; outcome.merge_sha
                 # carries the advanced SHA that the old inline code passed.
                 # MergeWorker deliberately has no such hook.
-                if (
-                    outcome.status == 'done'
-                    and outcome.merge_sha is not None
-                    and self._on_merge_landed is not None
-                ):
-                    try:
-                        await self._on_merge_landed(
-                            req.task_id, item.base_sha, outcome.merge_sha
-                        )
-                    except Exception:
-                        logger.warning(
-                            'on_merge_landed hook raised for task %s; ignoring (fail-open)',
-                            req.task_id,
-                            exc_info=True,
-                        )
+                if outcome.status == 'done':
+                    if (
+                        outcome.merge_sha is not None
+                        and self._on_merge_landed is not None
+                    ):
+                        try:
+                            await self._on_merge_landed(
+                                req.task_id, item.base_sha, outcome.merge_sha
+                            )
+                        except Exception:
+                            logger.warning(
+                                'on_merge_landed hook raised for task %s; ignoring (fail-open)',
+                                req.task_id,
+                                exc_info=True,
+                            )
+                    # PRD §10 invariant 6(b): schedule shadow compare on the
+                    # same-candidate merge commit — off the serial lane.
+                    # _maybe_schedule_shadow_compare returns IMMEDIATELY (spawns a
+                    # task); _warm_results empty → no-op inside the scheduler.
+                    await _maybe_schedule_shadow_compare(
+                        self, self._git_ops, req, merge_commit,
+                        _warm_results, self._escalation_queue, self._event_store,
+                    )
                 return True
 
             if result == 'rebased_pending_reverify':
@@ -6468,6 +6532,617 @@ def _safety_valve_due(attempt_count: int, every_n: int) -> bool:
         ``attempt_count`` is a positive multiple of ``every_n``.
     """
     return every_n > 0 and attempt_count > 0 and attempt_count % every_n == 0
+
+
+# ---------------------------------------------------------------------------
+# PRD §10 invariant 6(b): warm-vs-cold SHADOW compare cadence
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ShadowCompareState:
+    """Persisted cadence state for the warm-vs-cold shadow compare.
+
+    Stored as JSON at ``config.project_root/data/orchestrator/warm_verify_shadow.json``
+    so both cadence conditions survive orchestrator restarts.
+
+    Fields:
+        merges_since_last_shadow: Count of warm-verified lands since the last
+            shadow compare run.  Reset to 0 when a shadow compare is triggered.
+        last_shadow_run_at: Unix timestamp (float) of the last shadow compare
+            trigger.  0.0 when no shadow compare has ever run.
+    """
+
+    merges_since_last_shadow: int = 0
+    last_shadow_run_at: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Per-test result parsers for the warm-vs-cold shadow compare.
+#
+# Two formats are supported so that the shadow compare works regardless of
+# which test runner the project's verify command uses:
+#
+#   cargo-nextest (reify's default):
+#       "        PASS [   0.045s] reify-core some::mod::test_a"
+#       "        FAIL [   1.200s] reify-eval other::test_b"
+#       "        TIMEOUT [  5.000s] crate slow::test"
+#       "        LEAK [   0.100s] crate leaky::test"
+#       "        SIGSEGV [  0.001s] crate crash::test"
+#   Groups: (1) status, (2) crate, (3) test_path
+#
+#   Rust libtest (plain `cargo test` output):
+#       "test some::mod::test_name ... ok"
+#       "test some::mod::test_name ... FAILED"
+#   Groups: (1) test_path, (2) status
+#
+# SKIP / ignored lines are intentionally excluded: a skipped/ignored test
+# is not "run" so treating it as present-but-failed would create spurious
+# only_warm / only_cold presence divergences between warm and cold runs.
+# ---------------------------------------------------------------------------
+
+# Matches cargo-nextest human-output test result lines.
+# Capture groups: (1) status, (2) crate name, (3) test path (rest of line)
+_NEXTEST_TEST_LINE_RE = re.compile(
+    r'^\s*(PASS|FAIL|TIMEOUT|LEAK|SIGSEGV)\s+\[[^\]]*\]\s+(\S+)\s+(\S.*?)\s*$'
+)
+
+# Matches plain `cargo test` (libtest) result lines.
+# Capture groups: (1) test_path, (2) status ("ok" or "FAILED")
+_LIBTEST_TEST_LINE_RE = re.compile(
+    r'^test\s+(\S+)\s+\.\.\.\s+(ok|FAILED)\s*$'
+)
+
+
+def parse_per_test_results(test_output: str) -> dict[str, bool]:
+    """Parse test runner output into a per-test pass/fail map.
+
+    Supports two formats:
+
+    * **cargo-nextest** (reify's default merge-verify runner)::
+
+          <whitespace> PASS|FAIL|TIMEOUT|LEAK|SIGSEGV [<timing>] <crate> <path>
+
+      Key: ``"<crate> <test::path>"``, value: ``True`` iff status is ``PASS``.
+      TIMEOUT / LEAK / SIGSEGV are treated as failures (``False``).
+
+    * **libtest** (plain ``cargo test``)::
+
+          test <test::path> ... ok|FAILED
+
+      Key: ``"<test::path>"``, value: ``True`` iff status is ``ok``.
+
+    SKIP / ignored lines are excluded from both formats so they do not
+    introduce spurious presence-divergences in the shadow compare diff.
+
+    All other lines (build output, summary footer, blank lines) are ignored.
+
+    Used by the warm-vs-cold shadow compare (PRD §10 invariant 6(b)) to
+    capture per-test granularity so divergences can be named in the L2 alarm.
+
+    Args:
+        test_output: Raw string output from a verify run.
+
+    Returns:
+        ``dict[str, bool]`` mapping test id to pass status.  Empty dict for
+        empty/blank input or when no test lines are present.  A caller that
+        receives an empty dict from a genuine verify run should log a warning
+        — the parser may not match the project's verify command output format.
+    """
+    result: dict[str, bool] = {}
+    for line in test_output.splitlines():
+        m = _NEXTEST_TEST_LINE_RE.match(line)
+        if m:
+            status, crate, test_path = m.group(1), m.group(2), m.group(3)
+            result[f"{crate} {test_path}"] = (status == 'PASS')
+            continue
+        m = _LIBTEST_TEST_LINE_RE.match(line)
+        if m:
+            test_path, status = m.group(1), m.group(2)
+            result[test_path] = (status == 'ok')
+    return result
+
+
+@dataclass
+class ShadowCompareDiff:
+    """Per-test divergence between a warm and a cold verify run.
+
+    Produced by :func:`diff_per_test_results` for PRD §10 invariant 6(b).
+    The ``diverging`` dict contains every test whose warm/cold verdicts differ;
+    the list buckets partition diverging tests by direction for easy alarming.
+
+    Presence divergences (a test in only one result set) are also recorded
+    because they indicate structural differences between the two runs.
+
+    Attributes:
+        diverging: Maps test_id → (warm_passed, cold_passed) for every
+            diverging test.
+        warm_pass_cold_fail: Test ids that passed warm but failed cold
+            (the dangerous class: warm landed OK, cold reveals a real fail).
+        warm_fail_cold_pass: Test ids that failed warm but passed cold
+            (less dangerous; warm was conservative).
+        only_warm: Test ids present in the warm result but absent from cold
+            (structural difference; may indicate a cold build failure).
+        only_cold: Test ids present in the cold result but absent from warm.
+    """
+
+    diverging: dict[str, tuple[bool, bool]]
+    warm_pass_cold_fail: list[str]
+    warm_fail_cold_pass: list[str]
+    only_warm: list[str]
+    only_cold: list[str]
+
+    @property
+    def has_divergence(self) -> bool:
+        """True iff any divergence bucket is non-empty."""
+        return bool(
+            self.diverging
+            or self.only_warm
+            or self.only_cold
+        )
+
+
+def diff_per_test_results(
+    warm: dict[str, bool],
+    cold: dict[str, bool],
+) -> ShadowCompareDiff:
+    """Compute the per-test divergence between warm and cold verify results.
+
+    Classifies every test in the union of both result sets into a divergence
+    bucket.  Tests whose warm verdict equals their cold verdict are omitted.
+
+    Args:
+        warm: Per-test results from the warm (in-place) verify run,
+            as returned by :func:`parse_per_test_results`.
+        cold: Per-test results from the cold (throwaway-worktree) verify run.
+
+    Returns:
+        A :class:`ShadowCompareDiff` with buckets populated for diverging
+        tests.  ``has_divergence`` is False iff all buckets are empty.
+    """
+    diverging: dict[str, tuple[bool, bool]] = {}
+    warm_pass_cold_fail: list[str] = []
+    warm_fail_cold_pass: list[str] = []
+    only_warm: list[str] = []
+    only_cold: list[str] = []
+
+    all_tests = warm.keys() | cold.keys()
+    for test_id in sorted(all_tests):
+        in_warm = test_id in warm
+        in_cold = test_id in cold
+        if in_warm and in_cold:
+            w, c = warm[test_id], cold[test_id]
+            if w != c:
+                diverging[test_id] = (w, c)
+                if w and not c:
+                    warm_pass_cold_fail.append(test_id)
+                else:
+                    warm_fail_cold_pass.append(test_id)
+        elif in_warm:
+            only_warm.append(test_id)
+        else:
+            only_cold.append(test_id)
+
+    return ShadowCompareDiff(
+        diverging=diverging,
+        warm_pass_cold_fail=warm_pass_cold_fail,
+        warm_fail_cold_pass=warm_fail_cold_pass,
+        only_warm=only_warm,
+        only_cold=only_cold,
+    )
+
+
+def _load_shadow_compare_state(path: Path) -> ShadowCompareState:
+    """Load the shadow compare cadence state from a JSON file.
+
+    Fail-safe: returns a default ``ShadowCompareState()`` on any error
+    (file not found, unreadable, unparseable JSON, or missing keys) so the
+    orchestrator never fails to start due to a corrupt state file.
+
+    Args:
+        path: Path to the JSON state file (typically
+            ``config.project_root/data/orchestrator/warm_verify_shadow.json``).
+
+    Returns:
+        The persisted state, or ``ShadowCompareState(0, 0.0)`` on any failure.
+    """
+    try:
+        data = json.loads(path.read_text())
+        return ShadowCompareState(
+            merges_since_last_shadow=int(data['merges_since_last_shadow']),
+            last_shadow_run_at=float(data['last_shadow_run_at']),
+        )
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return ShadowCompareState()
+
+
+def _save_shadow_compare_state(path: Path, state: ShadowCompareState) -> None:
+    """Persist the shadow compare cadence state to a JSON file.
+
+    Creates parent directories as needed.
+
+    Args:
+        path: Destination path for the JSON state file.
+        state: The :class:`ShadowCompareState` to serialise.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dataclasses.asdict(state)))
+
+
+def _shadow_compare_due(
+    state: ShadowCompareState,
+    now: float,
+    *,
+    every_n_merges: int,
+    nightly_interval_secs: float,
+) -> bool:
+    """Return True when a shadow compare should be triggered.
+
+    Implements PRD §10 invariant 6(b) "whichever sooner" = OR cadence:
+    a shadow compare fires when EITHER the merge-count leg OR the nightly-timer
+    leg is satisfied.
+
+    Count leg: fires when ``state.merges_since_last_shadow >= every_n_merges``
+        (provided ``every_n_merges > 0``; 0 disables the count leg entirely).
+
+    Nightly leg: fires when ``now - state.last_shadow_run_at >= nightly_interval_secs``
+        (provided ``nightly_interval_secs > 0``; 0 disables the timer leg).
+
+    Args:
+        state: Current persisted cadence state.
+        now: Current Unix timestamp (time.time()).
+        every_n_merges: From ``config.git.warm_verify_shadow_compare_every_n_merges``.
+            0 → count leg disabled.
+        nightly_interval_secs: From
+            ``config.git.warm_verify_shadow_compare_nightly_interval_secs``.
+            0 → timer leg disabled.
+
+    Returns:
+        True when at least one trigger condition is met.
+    """
+    count_due = (
+        every_n_merges > 0
+        and state.merges_since_last_shadow >= every_n_merges
+    )
+    timer_due = (
+        nightly_interval_secs > 0
+        and (now - state.last_shadow_run_at) >= nightly_interval_secs
+    )
+    return count_due or timer_due
+
+
+# Sentinel task_id used for dedup on the warm/cold shadow divergence escalation.
+# Mirrors ``_DRIFT_SENTINEL`` in verify_runner.py.
+_WARM_COLD_SHADOW_SENTINEL = '__warm_cold_shadow__'
+
+
+def _submit_shadow_divergence_escalation(
+    escalation_queue: Any,
+    merge_commit: str,
+    diff: ShadowCompareDiff,
+    warm_results: dict[str, bool],
+    cold_results: dict[str, bool],
+) -> None:
+    """Submit a born-at-L2 escalation for a warm/cold shadow divergence.
+
+    Implements PRD §10 invariant 6(b) L2 alarm.  The escalation is:
+
+    * ``severity='critical'`` (in ``BORN_AT_L2_SEVERITIES``) → born at L2
+    * ``level=2``
+    * ``agent_role='orchestrator-warm-cold-shadow'`` (``orchestrator-`` prefix →
+      harness sentinel → not downgraded by the escalation server)
+    * ``category='risk_identified'``
+    * ``task_id=_WARM_COLD_SHADOW_SENTINEL`` (dedup key)
+
+    The detail explicitly states that the warm merge has ALREADY LANDED via the
+    shadow/async lane and that the commit may be bad on main.
+
+    None-safe: if *escalation_queue* is None the function is a no-op.
+    Dedup: if an open escalation for the sentinel already exists (checked via
+    ``escalation_queue.has_open_l1``), no second submission is made.
+
+    Args:
+        escalation_queue: Live escalation queue (``EscalationQueue`` instance),
+            or ``None`` when escalation is unavailable.
+        merge_commit: Full or abbreviated SHA of the just-landed merge commit.
+        diff: Per-test divergence bucket summary from :func:`diff_per_test_results`.
+        warm_results: Per-test pass/fail map from the warm verify run.
+        cold_results: Per-test pass/fail map from the cold verify run.
+    """
+    if escalation_queue is None:
+        return
+
+    # Dedup: don't fire again while an open/pending alarm already exists.
+    # Global-dedup is intentional — matches DriftDetector's _DRIFT_SENTINEL pattern.
+    # A single open escalation suppresses ALL subsequent shadow-divergence alarms
+    # while it is unresolved.  The expectation is that divergences are investigated
+    # in sequence; a rollback recommendation implicitly covers subsequent same-area
+    # divergences.  If per-commit independent alarms are ever needed, incorporate
+    # the commit into the dedup key (e.g. make_id(f'{_WARM_COLD_SHADOW_SENTINEL}
+    # :{merge_commit[:8]}')) — but that change is out of scope for this task.
+    if escalation_queue.has_open_l1(_WARM_COLD_SHADOW_SENTINEL):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    n_diverging = len(diff.diverging) + len(diff.only_warm) + len(diff.only_cold)
+    short_sha = merge_commit[:8]
+
+    # Build summary (must name commit[:8] and diverging test count).
+    summary = (
+        f'Warm/cold shadow divergence on {short_sha}: '
+        f'{n_diverging} diverging test(s)'
+    )
+
+    # Build detail: list diverging tests + both result sets + "already landed" statement.
+    lines: list[str] = [
+        f'Commit: {merge_commit}',
+        f'Diverging tests ({n_diverging}):',
+    ]
+    for test_id, (w, c) in sorted(diff.diverging.items()):
+        lines.append(f'  warm={w} cold={c}  {test_id}')
+    if diff.only_warm:
+        lines.append('Tests present only in warm run (absent cold):')
+        lines.extend(f'  {t}' for t in diff.only_warm)
+    if diff.only_cold:
+        lines.append('Tests present only in cold run (absent warm):')
+        lines.extend(f'  {t}' for t in diff.only_cold)
+    lines.append('')
+    lines.append('Warm results: ' + repr(warm_results))
+    lines.append('Cold results: ' + repr(cold_results))
+    lines.append('')
+    lines.append(
+        'The warm merge has ALREADY LANDED via the shadow/async lane — '
+        'this commit may be bad on main.  '
+        'Investigate the diverging tests and consider a potential rollback.'
+    )
+    detail = '\n'.join(lines)
+
+    esc = Escalation(
+        id=escalation_queue.make_id(_WARM_COLD_SHADOW_SENTINEL),
+        task_id=_WARM_COLD_SHADOW_SENTINEL,
+        agent_role='orchestrator-warm-cold-shadow',
+        severity='critical',
+        level=2,
+        category='risk_identified',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            'Investigate the diverging tests on the landed merge commit; '
+            'roll back main if the cold leg reveals a real failure.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+
+async def _run_cold_shadow_verify(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    event_store: EventStore | None,
+) -> dict[str, bool]:
+    """Run a from-scratch cold verify on *merge_commit* in a throwaway worktree.
+
+    Creates an ephemeral ``_merge-<uuid>`` worktree at *merge_commit* via
+    :meth:`~orchestrator.git_ops.GitOps.create_throwaway_verify_worktree`,
+    runs the full merge verify (build_merge_verify_spec + VerifyRunnerPool
+    dispatch — the same execution path as ``_run_post_merge_verify``), parses
+    the per-test results from the output, and removes the throwaway worktree
+    in a ``finally`` block.
+
+    The throwaway worktree is NEVER the persistent warm ``_merge-verify`` path
+    — it has no retained ``target/`` warmth — ensuring a true from-scratch
+    cold verify (PRD §10 invariant 6(b)).
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that just warm-landed (provides config,
+            module_configs, task_files, task_id).
+        merge_commit: The merge commit SHA to verify cold.
+        event_store: Optional event store (passed to VerifyRunnerPool; None-safe).
+
+    Returns:
+        Per-test pass/fail map as returned by :func:`parse_per_test_results`.
+        Empty dict if the cold verify produced no parseable test output.
+    """
+    wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+    try:
+        task_files_tuple = (
+            tuple(req.task_files) if req.task_files is not None else None
+        )
+        spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+        pool = VerifyRunnerPool(
+            [LocalRunner(
+                wt, req.config, req.module_configs, task_files_tuple,
+                run_scoped=run_scoped_verification,
+                run_unscoped=_run_unscoped_typechecks,
+                task_id=req.task_id,
+            )],
+            event_store=event_store,
+            task_id=req.task_id,
+        )
+        verify = await pool.dispatch(merge_commit, spec)
+        return parse_per_test_results(verify.test_output or '')
+    finally:
+        await git_ops.cleanup_merge_worktree(wt)
+
+
+async def _run_shadow_compare(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    warm_results: dict[str, bool],
+    escalation_queue: Any,
+    event_store: EventStore | None,
+) -> None:
+    """Compare warm vs cold verify results for *merge_commit* and alarm on divergence.
+
+    Implements PRD §10 invariant 6(b) DETECTIVE control:
+
+    1. Runs a cold verify on *merge_commit* via :func:`_run_cold_shadow_verify`
+       in a throwaway ``_merge-<uuid>`` worktree (off the serial lane).
+    2. Diffs the cold results against *warm_results* via :func:`diff_per_test_results`.
+    3. On per-test divergence: submits a born-at-L2 critical escalation via
+       :func:`_submit_shadow_divergence_escalation` naming the diverging tests
+       and explicitly stating the warm merge has ALREADY LANDED.
+    4. On agreement (no divergence): emits an :attr:`~orchestrator.event_store.EventType.verdict_parity_ok`
+       event (mirrors :class:`~orchestrator.verify_runner.DriftDetector`).
+
+    **Exception handling**: any exception from the cold leg is logged at WARNING
+    level and swallowed.  A shadow/detective control must never crash or stall
+    the merge worker — it runs off the critical serial lane via
+    ``asyncio.create_task`` (see :func:`_maybe_schedule_shadow_compare`).
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that warm-landed (provides config +
+             module_configs for the cold verify spec).
+        merge_commit: The just-landed merge commit SHA.
+        warm_results: Per-test pass/fail map captured from the warm verify run.
+        escalation_queue: Live escalation queue, or ``None`` (None-safe).
+        event_store: Optional event store for parity-ok event emission.
+    """
+    try:
+        cold_results = await _run_cold_shadow_verify(
+            git_ops, req, merge_commit, event_store
+        )
+    except Exception:
+        logger.warning(
+            'Shadow compare cold leg failed for %s — swallowing exception',
+            merge_commit[:8],
+            exc_info=True,
+        )
+        return
+
+    # Inconclusive guard: if the cold leg produced NO test results but the warm
+    # run had results, treat this as inconclusive rather than divergence.
+    # An empty cold result usually signals a build/compile failure, OOM, or
+    # infra hiccup — not a genuine warm-pass/cold-fail flip.
+    # diff_per_test_results({warm tests…}, {}) would classify every warm test as
+    # only_warm (has_divergence=True), producing a false-positive born-at-L2 alarm
+    # that states "warm merge may be bad" when the cold side simply didn't run.
+    # This mirrors DriftDetector's INCONCLUSIVE path (avoids alarming on transport
+    # failure).  Neither alarm nor parity-ok event is emitted on inconclusive.
+    if not cold_results and warm_results:
+        logger.warning(
+            'Shadow compare inconclusive for %s: cold leg produced no parseable '
+            'test results (possible build/compile/infra failure in the throwaway '
+            'worktree); not alarming',
+            merge_commit[:8],
+        )
+        return
+
+    diff = diff_per_test_results(warm_results, cold_results)
+
+    if diff.has_divergence:
+        _submit_shadow_divergence_escalation(
+            escalation_queue, merge_commit, diff, warm_results, cold_results
+        )
+    else:
+        # Parity OK — emit event (mirrors DriftDetector.check verdict_parity_ok)
+        if event_store is not None:
+            event_store.emit(
+                EventType.verdict_parity_ok,
+                task_id=req.task_id,
+                data={
+                    'merge_commit': merge_commit,
+                    'shadow_compare': True,
+                    'warm_test_count': len(warm_results),
+                    'cold_test_count': len(cold_results),
+                },
+            )
+
+
+async def _maybe_schedule_shadow_compare(
+    worker: SpeculativeMergeWorker,
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    warm_results: dict[str, bool],
+    escalation_queue: Any,
+    event_store: EventStore | None,
+) -> None:
+    """Non-blocking scheduler for the warm-vs-cold SHADOW compare (PRD §10 invariant 6(b)).
+
+    Called from :meth:`SpeculativeMergeWorker._verify_and_advance` on every
+    successful warm-verified land.  Returns **immediately** without awaiting
+    the cold leg — the shadow/detective control must never block or occupy the
+    serial merge lane.
+
+    Cadence (whichever sooner = OR):
+
+    * Every *N* merges (``warm_verify_shadow_compare_every_n_merges``).
+    * Once per nightly window (``warm_verify_shadow_compare_nightly_interval_secs``).
+
+    State is persisted to ``worker._shadow_state_path`` so the cadence
+    survives orchestrator restarts.
+
+    Single-in-flight guard: if a shadow compare task is already running (tracked in
+    ``worker._shadow_compare_tasks``), the new trigger is silently skipped so the
+    cold leg never piles up behind the serial lane.
+
+    Args:
+        worker: The live :class:`SpeculativeMergeWorker` instance (provides
+            ``_shadow_compare_tasks`` set and ``_shadow_state_path``).
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that just landed (provides config).
+        merge_commit: The just-landed merge commit SHA (same-candidate guarantee).
+        warm_results: Per-test pass/fail map from the warm verify run.
+        escalation_queue: Live escalation queue, or ``None`` (None-safe).
+        event_store: Optional event store for parity-ok event emission.
+    """
+    # Early exits: knob off or no warm results to compare against
+    if not req.config.git.warm_verify_shadow_compare:
+        return
+    if not warm_results:
+        return
+
+    # Load persisted cadence state (fail-safe: returns default on missing/corrupt)
+    state = _load_shadow_compare_state(worker._shadow_state_path)
+
+    # Increment the merge counter (counts this landing)
+    state = ShadowCompareState(
+        merges_since_last_shadow=state.merges_since_last_shadow + 1,
+        last_shadow_run_at=state.last_shadow_run_at,
+    )
+
+    now = time.time()
+    due = _shadow_compare_due(
+        state, now,
+        every_n_merges=req.config.git.warm_verify_shadow_compare_every_n_merges,
+        nightly_interval_secs=req.config.git.warm_verify_shadow_compare_nightly_interval_secs,
+    )
+
+    if not due:
+        # Save incremented counter and return without scheduling a task
+        _save_shadow_compare_state(worker._shadow_state_path, state)
+        return
+
+    # In-flight guard: skip if a shadow compare task is already running.
+    # Persist the incremented counter even on early-return so merges that
+    # land during an in-flight cold leg are still counted (amendment: fix
+    # cadence_counter_loss where the due-but-in-flight path did not persist).
+    in_flight = [t for t in worker._shadow_compare_tasks if not t.done()]
+    if in_flight:
+        _save_shadow_compare_state(worker._shadow_state_path, state)
+        return
+
+    # Due and no in-flight task: reset state + persist
+    state = ShadowCompareState(merges_since_last_shadow=0, last_shadow_run_at=now)
+    _save_shadow_compare_state(worker._shadow_state_path, state)
+
+    # Spawn the shadow compare OFF the serial lane — this call returns IMMEDIATELY
+    # without awaiting the cold verify (detective/async control, PRD §10 invariant 6(b)).
+    t = asyncio.create_task(
+        _run_shadow_compare(
+            git_ops, req, merge_commit, warm_results, escalation_queue, event_store
+        )
+    )
+
+    def _discard_task(task: asyncio.Task) -> None:  # type: ignore[type-arg]
+        worker._shadow_compare_tasks.discard(task)
+
+    t.add_done_callback(_discard_task)
+    worker._shadow_compare_tasks.add(t)
 
 
 async def _acquire_warm_verify_worktree(
