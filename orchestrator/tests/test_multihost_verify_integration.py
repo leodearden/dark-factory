@@ -569,6 +569,35 @@ class TestFailsafeFallback:
 
 
 # ---------------------------------------------------------------------------
+# Step-14 (GREEN): _FakeEscalationQueue — mirrors DriftDetector's escalation
+# surface (test_verify_runner.py MagicMock pattern, now a concrete class).
+# ---------------------------------------------------------------------------
+
+
+class _FakeEscalationQueue:
+    """Minimal escalation-queue double for DriftDetector.check.
+
+    Mirrors the three methods DriftDetector.check calls:
+      has_open_l1(task_id) → bool
+      make_id(task_id)     → str
+      submit(escalation)   → None (appends to .submitted)
+    """
+
+    def __init__(self) -> None:
+        self.submitted: list[Any] = []
+        self._has_open_l1: bool = False
+
+    def has_open_l1(self, task_id: str) -> bool:
+        return self._has_open_l1
+
+    def make_id(self, task_id: str) -> str:
+        return f'{task_id}-esc-{len(self.submitted)}'
+
+    def submit(self, escalation: Any) -> None:
+        self.submitted.append(escalation)
+
+
+# ---------------------------------------------------------------------------
 # Step-11 (RED) / Step-12 (GREEN): B4 verdict parity over known corpus
 # _FakeRunner.verdict_map already implemented in step-2 GREEN.
 # ---------------------------------------------------------------------------
@@ -616,3 +645,62 @@ class TestVerdictParity:
                     f'got {row.matches_expected} (local={row.local_passed}, '
                     f'remote={row.remote_passed}, expected={row.expected_pass})'
                 )
+
+
+# ---------------------------------------------------------------------------
+# Step-13 (RED) + Step-14 (GREEN): B5 drift divergence alarm
+# _FakeEscalationQueue defined above (step-14 GREEN, needed by step-13 RED).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftDivergenceAlarm:
+    async def test_drift_divergence_escalates_dedup_and_quarantines(self):
+        """B5: local passes / laptop fails → DriftDetector escalates (once) + quarantines.
+
+        Checks:
+        - First check: DIVERGE + escalated=True + one submit to _FakeEscalationQueue
+          with category=='verify_drift_divergence' + laptop quarantined.
+        - Second check with has_open_l1=True: NO second submit (dedup) but
+          quarantine still holds (INCONCLUSIVE because laptop is quarantined).
+        """
+        sha = 'sha_drift_b5'
+        rec = _RecordingEventStore()
+        esc_queue = _FakeEscalationQueue()
+
+        # local passes, laptop fails → divergence
+        local_fake = _FakeRunner('local', is_local=True, verdict_map={sha: True})
+        laptop_fake = _FakeRunner('laptop', is_local=False, verdict_map={sha: False})
+        pool = VerifyRunnerPool([local_fake, laptop_fake], event_store=rec, task_id='b5')
+        detector = DriftDetector(
+            pool,
+            event_store=rec,
+            escalation_queue=esc_queue,
+            task_id='1702',
+        )
+
+        # --- First check → DIVERGE ---
+        result1 = await detector.check(sha, _make_spec())
+
+        assert result1.verdict == DriftVerdict.DIVERGE, (
+            f'expected DIVERGE, got {result1.verdict}'
+        )
+        assert result1.escalated is True
+        assert len(esc_queue.submitted) == 1, (
+            f'expected 1 escalation submitted, got {len(esc_queue.submitted)}'
+        )
+        assert esc_queue.submitted[0].category == 'verify_drift_divergence', (
+            f"expected category='verify_drift_divergence', got {esc_queue.submitted[0].category!r}"
+        )
+        assert pool.is_quarantined('laptop'), 'laptop must be quarantined after DIVERGE'
+
+        # --- Second check with dedup flag set → no second submit, quarantine held ---
+        esc_queue._has_open_l1 = True
+        result2 = await detector.check(sha, _make_spec())
+
+        # Laptop quarantined → eligible_remote()=None → INCONCLUSIVE (no submit path)
+        assert result2.verdict in (DriftVerdict.INCONCLUSIVE, DriftVerdict.DIVERGE)
+        assert len(esc_queue.submitted) == 1, (
+            'dedup: second check must NOT submit a second escalation'
+        )
+        assert pool.is_quarantined('laptop'), 'quarantine must still hold on second check'
