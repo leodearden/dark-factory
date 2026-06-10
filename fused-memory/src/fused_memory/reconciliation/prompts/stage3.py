@@ -19,8 +19,20 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__get_entity` — look up entities in the knowledge graph
 - `mcp__fused-memory__get_episodes` — retrieve recent episodes
 - `mcp__fused-memory__get_status` — health check for backends
-- `mcp__fused-memory__get_tasks` — list all tasks
-- `mcp__fused-memory__get_task` — get a single task by ID
+- `mcp__fused-memory__get_statuses` — **PRIMARY task enumerator.** Returns \
+  `{{'statuses': {{id: status, ...}}}}` — a compact status map (~95% smaller than \
+  get_tasks, ~62 KB vs ~600 KB). Proven safe on projects with 4500+ tasks. **Always \
+  call this first** and unwrap via `result['statuses']` to enumerate all task IDs and \
+  statuses; then call `get_task` for per-task detail only on the sampled or flagged subset.
+- `mcp__fused-memory__get_task` — get a single task by ID (carries `project_id` stamp \
+  for cross-project routing verification — see routing guard below).
+- `mcp__fused-memory__get_tasks` — **Full-scan fallback only.** Returns the full task \
+  list with all fields. **WARNING: on large projects (4500+ tasks) this serialises \
+  ~600 KB over the MCP session transport and will cause a session-expiry error.** \
+  Use `get_statuses` + `get_task` instead for normal enumeration. If a full dump is \
+  genuinely necessary, pass `page_size` and `offset` to paginate: \
+  `get_tasks(project_root=..., page_size=200, offset=0)` then increment offset by \
+  page_size until `pagination.has_more` is False.
 - `mcp__fused-memory__count_memories_by_metadata` — deterministic exact-count query \
   against Qdrant metadata payload (not semantic); use for existence checks such as \
   confirming a Stage 2 per-cycle summary by `{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}}`
@@ -100,14 +112,16 @@ for them — Path 1 semantic search remains their fallback. New summaries have b
 
 ## Cross-Project Routing Guard (IMPORTANT — task 1661)
 
-When calling `mcp__fused-memory__get_tasks` or `mcp__fused-memory__get_task`:
+When calling `mcp__fused-memory__get_statuses`, `mcp__fused-memory__get_tasks`, or \
+`mcp__fused-memory__get_task`:
 
 1. **Always pass the explicit project_root** for the project under reconciliation \
 (use the project_root value shown in the harness payload above — do NOT omit it or rely on defaults).
 
-2. **Verify the stamped `project_id`** in every `get_tasks`/`get_task` result. \
-Both tools now stamp a `project_id` key on their returned envelope/dict. \
-This stamp reflects which project's database was actually queried. \
+2. **Verify the stamped `project_id`** on `get_task` and `get_tasks` results. \
+`get_task` and `get_tasks` both stamp a `project_id` key on their returned envelope. \
+**`get_statuses` does NOT carry a `project_id` stamp** — verify routing correctness via \
+`get_task` on at least one sampled task instead. \
 Confirm that `result['project_id']` equals the project under reconciliation \
 (shown in the harness payload header as "Project: <project_id>").
 
@@ -116,13 +130,20 @@ the project under reconciliation — this signals that a wrong project_root was 
 and the data is from another project. Include the offending task IDs in your description. \
 `cross_project_routing` is an allowed `category` value in the finding schema.
 
-Example verification (pseudocode):
+Example verification (pseudocode — preferred get_statuses + get_task pattern):
 ```
-tasks_result = get_tasks(project_root="<this project's root>")
+# Step 1: enumerate all statuses (compact, safe on large projects)
+# get_statuses returns {{'statuses': {{id: status, ...}}}} — unwrap the envelope
+statuses = get_statuses(project_root="<this project's root>")['statuses']
+# statuses is now the bare {{id: status, ...}} dict — no project_id stamp here
+
+# Step 2: verify routing by sampling one task via get_task
+sample_id = next(iter(statuses))
+task_result = get_task(id=sample_id, project_root="<this project's root>")
 expected_project_id = "<the project under reconciliation>"
-if tasks_result.get('project_id') != expected_project_id:
+if task_result.get('project_id') != expected_project_id:
     add_finding(category='cross_project_routing', severity='serious',
-                description='get_tasks returned tasks from project ..., expected ...')
+                description='get_task returned task from project ..., expected ...')
 ```
 
 ## Report Channel — recon_report MCP Tools (PRD γ §9)

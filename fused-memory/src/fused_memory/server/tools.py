@@ -2020,13 +2020,33 @@ def create_mcp_server(
     async def get_tasks(
         project_root: str,
         tag: str | None = None,
+        page_size: int | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """List all tasks in the project.
 
         Args:
             project_root: Absolute path to project root
             tag: Tag context (optional)
+            page_size: If provided, return at most this many tasks (must be a positive
+                integer).  When omitted (default), the full task list is returned with no
+                ``pagination`` key — backward-compatible behaviour for the scheduler and
+                all existing callers.
+            offset: Zero-based index of the first task to return (default 0).  Only
+                meaningful when page_size is provided.
         """
+        # Input validation — early-exit before touching the interceptor.
+        if page_size is not None and (not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0):
+            return {
+                'error': 'page_size must be a positive integer',
+                'error_type': 'ValidationError',
+            }
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            return {
+                'error': 'offset must be a non-negative integer',
+                'error_type': 'ValidationError',
+            }
+
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -2037,6 +2057,28 @@ def create_mcp_server(
                 pid = resolve_project_id(project_root)
                 # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
                 result = {**result, 'project_id': pid, 'project_root': project_root}
+
+                # Opt-in pagination — only applied when page_size is explicitly provided.
+                # When page_size is None the response is the full untouched list (no
+                # ``pagination`` key), preserving backward compatibility for the scheduler.
+                if page_size is not None:
+                    all_tasks = result.get('tasks')
+                    # Only paginate when tasks is a proper list — a non-standard backend
+                    # could return None or a dict; in that case skip pagination and leave
+                    # the result untouched rather than masking the real failure with a
+                    # generic slicing error.
+                    if isinstance(all_tasks, list):
+                        total = len(all_tasks)
+                        page = all_tasks[offset:offset + page_size]
+                        result['tasks'] = page
+                        result['pagination'] = {
+                            'total': total,
+                            'offset': offset,
+                            'page_size': page_size,
+                            'returned': len(page),
+                            'has_more': offset + len(page) < total,
+                        }
+
                 await _log_read(
                     'get_tasks',
                     project_id=pid,
