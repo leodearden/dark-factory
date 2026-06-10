@@ -185,6 +185,9 @@ class EventType(StrEnum):
     worktree_quarantined = 'worktree_quarantined'
     worktree_reaped = 'worktree_reaped'
 
+    # Train formation (β former — emitted when the former selects a train)
+    train_formed = 'train_formed'
+
     # Atomic train lifecycle (PRD 13.7)
     train_started = 'train_started'
     train_member_deferred = 'train_member_deferred'

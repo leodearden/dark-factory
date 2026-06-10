@@ -911,6 +911,16 @@ class OrchestratorConfig(BaseSettings):
     # configs that do not merge defaults.yaml keep the old fallback behaviour.
     merge_verify_cold_command_timeout_secs: float | None = Field(default=None)
     merge_verify_workspace: bool = Field(default=False)
+    # Train-former opt-in knob (β).  OFF by default so β can land before γ/δ
+    # complete the full stack; an always-on former would assign metadata.train
+    # and route members to merge-deferred with no stacking (γ) in place, which
+    # would strand members indefinitely.  Projects opt in once γ,δ,ε land.
+    merge_train_former_enabled: bool = Field(default=False)
+    # Maximum members per train (inclusive of the anchor).  Defaults to 3 per
+    # the s(N) go/no-go gate resolved GO at N=3 (reify esc-4455-16;
+    # s(3)=0.962 ≫ 1/3, true coupling-failure rate 0/104 at N≥3).  ge=2
+    # because a single-member "train" is meaningless.
+    merge_train_max_members: int = Field(default=3, ge=2)
     # Upper bound on concurrent per-subproject ``run_verification`` calls inside
     # a single ``run_scoped_verification`` fan-out.  Caps the blast radius if the
     # module set is large (or accidentally polluted) so a fan-out can never spawn

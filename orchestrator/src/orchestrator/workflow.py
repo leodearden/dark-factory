@@ -355,6 +355,65 @@ def compute_preexisting_main_break_fingerprint(
         return ''
 
 
+def _line_ranges_stackable(
+    ranges_a: dict[str, list[tuple[int, int]]],
+    ranges_b: dict[str, list[tuple[int, int]]],
+) -> bool:
+    """Return True iff tasks A and B are line-level stackable.
+
+    Two tasks are stackable iff no file they both touch has overlapping changed
+    line ranges relative to BASE (main).  Crate/file-disjointness is NOT
+    required for stackability — same file, different lines is fine (PRD §A.2).
+
+    Uses closed-interval intersection: range (s1,e1) intersects (s2,e2)
+    iff s1 <= e2 and s2 <= e1.
+    """
+    shared_files = set(ranges_a) & set(ranges_b)
+    for fname in shared_files:
+        for s1, e1 in ranges_a[fname]:
+            for s2, e2 in ranges_b[fname]:
+                if s1 <= e2 and s2 <= e1:
+                    return False
+    return True
+
+
+def _select_train_members(
+    anchor_id: str,
+    candidate_ids: list[str],
+    ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]],
+    max_members: int,
+) -> list[str]:
+    """Select a mutually-stackable subset of candidates capped at max_members.
+
+    Greedy selection: start with the anchor, then iterate candidates in
+    deterministic (id-sorted) order, adding each that is _line_ranges_stackable
+    against ALL already-selected members.  Stops when len(selected) == max_members.
+
+    Returns [] when the result has fewer than 2 members — the sentinel for
+    "no viable train" (a single-member train is meaningless).
+
+    The anchor is always first (order-0) in the returned list.
+    """
+    selected: list[str] = [anchor_id]
+
+    for candidate_id in sorted(candidate_ids):
+        if len(selected) >= max_members:
+            break
+        candidate_ranges = ranges_by_id.get(candidate_id, {})
+        # Must be stackable with every already-selected member (mutual stackability).
+        stackable_with_all = all(
+            _line_ranges_stackable(candidate_ranges, ranges_by_id.get(sel_id, {}))
+            for sel_id in selected
+        )
+        if stackable_with_all:
+            selected.append(candidate_id)
+
+    # A single-member "train" is a no-op — return the empty sentinel.
+    if len(selected) < 2:
+        return []
+    return selected
+
+
 @dataclass
 class WorkflowMetrics:
     total_cost_usd: float = 0.0
@@ -784,6 +843,179 @@ class TaskWorkflow:
             f'Group merge for train {train_id!r} failed: {result.status} — {result.reason}',
             escalate_to_human=True,
         )
+
+    async def _train_candidates(self) -> list[dict]:
+        """Discover other tasks that are merge-ready candidates for this train.
+
+        Conservative proxy for "merge-ready": the task is in-progress, has no
+        existing train metadata, and its branch resolves (i.e. the branch exists
+        in the repo).  Self is always excluded.  Tighter merge-ready gating and
+        trigger cadence/debounce are deferred to γ/ε; this proxy is safe because
+        the former is off-by-default.
+
+        The branch name for a task follows the established convention:
+        task_id (bare, same as ``branch_name = self.task_id`` in run()).
+        """
+        all_tasks: list[dict] = await self.scheduler.get_tasks()
+        # Quick filters that require no git I/O.
+        pre_filtered: list[dict] = []
+        for task in all_tasks:
+            task_id: str = str(task.get('id', ''))
+            # Exclude self.
+            if task_id == self.task_id:
+                continue
+            # Exclude non-in-progress statuses (done, blocked, cancelled,
+            # merge-deferred, deferred, …).
+            if task.get('status') != 'in-progress':
+                continue
+            # Exclude tasks already assigned to a train.
+            metadata: dict = task.get('metadata') or {}
+            if metadata.get('train'):
+                continue
+            pre_filtered.append(task)
+        if not pre_filtered:
+            return []
+        # Branch-existence gate: fan out resolve_branch_sha concurrently
+        # instead of one serial subprocess per candidate.
+        _pre_ids = [str(t.get('id', '')) for t in pre_filtered]
+        _shas = await asyncio.gather(*[
+            self.git_ops.resolve_branch_sha(tid) for tid in _pre_ids
+        ])
+        return [t for t, sha in zip(pre_filtered, _shas, strict=True) if sha is not None]
+
+    async def _maybe_form_train(self) -> bool:
+        """β former: try to form a merge train for this task (PRD §7 β).
+
+        Called at the merge decision point when the former is enabled and self
+        is not already a train member.  Returns True iff a train was formed and
+        self.task['metadata']['train'] was set (routing then sends self into
+        merge-deferred).  Returns False in all other cases (self merges solo on
+        the existing path).
+
+        Guards (return False immediately):
+          - merge_train_former_enabled is False — former is opt-in, off by default.
+          - self._train is not None — self is already a train member (no double-forming).
+          - merge_train_max_members < 2 — defensive; the ge=2 pydantic constraint
+            should prevent this, but guard anyway to keep the invariant local.
+
+        Formation (when guards pass and candidates exist):
+          1. Fetch line ranges for self + each candidate.
+          2. Select a mutually-stackable subset via _select_train_members (greedy, capped).
+          3. Assign metadata.train={id, order, members} to every selected member via
+             scheduler.update_task(append=True) — backend recursive-merge touches only
+             the train key, preserving all other metadata keys without a race.
+          4. Set self.task['metadata']['train'] in-memory so self._train flips truthy
+             for the immediate merge-decision routing.
+          5. Emit EventType.train_formed.
+          6. Return True.
+        """
+        # Guard 1: former must be explicitly enabled.
+        if not self.config.merge_train_former_enabled:
+            return False
+        # Guard 2: no double-forming — if self is already in a train, skip.
+        if self._train is not None:
+            return False
+        # Guard 3: defensive cap sanity check.
+        if self.config.merge_train_max_members < 2:
+            return False
+
+        # Discover merge-ready candidates.
+        candidates = await self._train_candidates()
+        if not candidates:
+            return False
+
+        # TOCTOU NOTE: Between _train_candidates() and the update_task writes
+        # below, another anchor's former (running concurrently for a different
+        # task) may assign trains to the same candidates.  The append=True
+        # recursive merge is last-write-wins on the 'train' key, so a member
+        # could end up carrying a train id whose members list disagrees with
+        # its own.  Full closure via a compare-and-set or serialised-formation
+        # lock is deferred to γ/ε (the former is off-by-default so this window
+        # is safe to ship).
+
+        # --- Selection ---
+        # Coerce candidate ids to str so all member ids are string-typed,
+        # consistent with self.task_id, regardless of the store's id type.
+        candidate_ids: list[str] = [str(c['id']) for c in candidates]
+        # Fan out line-range fetches concurrently (one git subprocess each).
+        _all_range_ids = [self.task_id] + candidate_ids
+        _range_results = await asyncio.gather(*[
+            self.git_ops.get_changed_line_ranges(cid) for cid in _all_range_ids
+        ])
+        ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]] = {
+            cid: r for cid, r in zip(_all_range_ids, _range_results, strict=True)
+        }
+
+        selected = _select_train_members(
+            self.task_id, candidate_ids, ranges_by_id,
+            self.config.merge_train_max_members,
+        )
+        if len(selected) < 2:
+            # No viable train (no stackable candidates or lone anchor).
+            return False
+
+        # --- Metadata assignment ---
+        train_id = f'train-{self.task_id}-{uuid.uuid4().hex[:8]}'
+        all_members = selected  # anchor first (order-0), then selected candidates
+
+        for order, member_id in enumerate(all_members):
+            train_meta: dict = {
+                'id': train_id,
+                'order': order,
+                'members': list(all_members),
+            }
+            await self.scheduler.update_task(
+                member_id, {'train': train_meta}, append=True,
+            )
+
+        # Set self's metadata in-memory so self._train flips truthy immediately
+        # for the subsequent merge-decision routing (avoids a round-trip read).
+        (self.task.setdefault('metadata', {}))['train'] = {
+            'id': train_id,
+            'order': 0,
+            'members': list(all_members),
+        }
+
+        # --- Event emission ---
+        if self.event_store:
+            self.event_store.emit(
+                EventType.train_formed,
+                task_id=self.task_id,
+                data={
+                    'train_id': train_id,
+                    'members': list(all_members),
+                    'size': len(all_members),
+                },
+            )
+
+        logger.info(
+            'Task %s: train formed — id=%s members=%s',
+            self.task_id, train_id, all_members,
+        )
+        return True
+
+    async def _maybe_defer_as_train_member(self) -> WorkflowOutcome | None:
+        """Merge-decision routing helper (PRD §7 β, design decision 4).
+
+        Encapsulates the "form-or-defer-or-fall-through" logic so it can be
+        unit-tested independently from the large run() state machine.
+
+        Returns:
+          - The MERGE_DEFERRED outcome (from _enter_merge_deferred) when self
+            is — or becomes — a train member.
+          - None when self is not a train member and the former either did not
+            form a train or is disabled; the caller should fall through to the
+            solo MERGE path.
+
+        Non-train / former-disabled behavior is byte-identical to the previous
+        inline ``if self._train is not None: return await self._enter_merge_deferred()``
+        guard — the former returns False → None → caller falls through.
+        """
+        if self._train is None:
+            await self._maybe_form_train()
+        if self._train is not None:
+            return await self._enter_merge_deferred()
+        return None
 
     def _union_train_scope(
         self, members: list[dict],
@@ -1329,8 +1561,9 @@ class TaskWorkflow:
                     # above (PRD acceptance criterion 5).  Non-train path is
                     # byte-identical — this guard only fires when metadata.train
                     # is a dict.
-                    if self._train is not None:
-                        return await self._enter_merge_deferred()
+                    _defer = await self._maybe_defer_as_train_member()
+                    if _defer is not None:
+                        return _defer
 
                     self._enter_phase(WorkflowState.MERGE)
 

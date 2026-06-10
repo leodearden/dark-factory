@@ -4943,3 +4943,283 @@ class TestAcquireHostVerifyWorktree:
             )
         finally:
             await ops.cleanup_merge_worktree(wt3)
+
+
+# ---------------------------------------------------------------------------
+# parse_diff_line_ranges — pure function unit tests (step-3)
+# ---------------------------------------------------------------------------
+
+CANNED_DIFF_TWO_FILES = """\
+diff --git a/src/foo.rs b/src/foo.rs
+index aaaaaa..bbbbbb 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -10,3 +10,2 @@
+ context
+-deleted line 1
+-deleted line 2
++added replacement
+@@ -40,1 +41,1 @@
+-old single line
++new single line
+diff --git a/src/bar.rs b/src/bar.rs
+index cccccc..dddddd 100644
+--- a/src/bar.rs
++++ b/src/bar.rs
+@@ -5,2 +5,3 @@
+ context
+-removed line
++inserted a
++inserted b
++inserted c
+"""
+
+CANNED_DIFF_INSERTION_ONLY = """\
+diff --git a/src/baz.rs b/src/baz.rs
+index 000000..111111 100644
+--- a/src/baz.rs
++++ b/src/baz.rs
+@@ -7,0 +8,3 @@
++new line 1
++new line 2
++new line 3
+"""
+
+CANNED_DIFF_DELETION_ONLY = """\
+diff --git a/src/qux.rs b/src/qux.rs
+index 000000..111111 100644
+--- a/src/qux.rs
++++ b/src/qux.rs
+@@ -20,4 +20,0 @@
+-del 1
+-del 2
+-del 3
+-del 4
+"""
+
+# File completely deleted — +++ /dev/null, no new path.
+CANNED_DIFF_FILE_DELETED = """\
+diff --git a/src/gone.rs b/src/gone.rs
+deleted file mode 100644
+index aaaaaa..000000
+--- a/src/gone.rs
++++ /dev/null
+@@ -1,5 +0,0 @@
+-line 1
+-line 2
+-line 3
+-line 4
+-line 5
+"""
+
+# Pure rename with no content changes (R100) — no --- / +++ / hunk lines.
+CANNED_DIFF_PURE_RENAME = """\
+diff --git a/src/old_name.rs b/src/new_name.rs
+similarity index 100%
+rename from src/old_name.rs
+rename to src/new_name.rs
+"""
+
+# Rename with content changes — old path vanishes, new path gets hunk ranges.
+CANNED_DIFF_RENAME_WITH_CHANGES = """\
+diff --git a/src/old_mod.rs b/src/new_mod.rs
+similarity index 80%
+rename from src/old_mod.rs
+rename to src/new_mod.rs
+index aaaaaa..bbbbbb 100644
+--- a/src/old_mod.rs
++++ b/src/new_mod.rs
+@@ -10,3 +10,4 @@
+ context
+-deleted line
++added line 1
++added line 2
+"""
+
+# New file — --- /dev/null, +++ b/src/new.rs.
+CANNED_DIFF_NEW_FILE = """\
+diff --git a/src/new.rs b/src/new.rs
+new file mode 100644
+index 000000..bbbbbb
+--- /dev/null
++++ b/src/new.rs
+@@ -0,0 +1,5 @@
++line 1
++line 2
++line 3
++line 4
++line 5
+"""
+
+
+class TestParseDiffLineRanges:
+    """Unit tests for parse_diff_line_ranges (pure function, no git invocation)."""
+
+    def _fn(self):
+        from orchestrator.git_ops import parse_diff_line_ranges
+        return parse_diff_line_ranges
+
+    def test_two_files_multi_hunk(self):
+        fn = self._fn()
+        result = fn(CANNED_DIFF_TWO_FILES)
+        # src/foo.rs: hunk @@ -10,3 → old_start=10, old_count=3 → (10, 12)
+        #             hunk @@ -40,1 → old_start=40, old_count=1 → (40, 40)
+        assert 'src/foo.rs' in result
+        assert (10, 12) in result['src/foo.rs']
+        assert (40, 40) in result['src/foo.rs']
+        # src/bar.rs: hunk @@ -5,2 → old_start=5, old_count=2 → (5, 6)
+        assert 'src/bar.rs' in result
+        assert (5, 6) in result['src/bar.rs']
+
+    def test_empty_diff_returns_empty_dict(self):
+        fn = self._fn()
+        assert fn('') == {}
+
+    def test_insertion_only_hunk_uses_anchor_range(self):
+        """@@ -7,0 +8,3 @@ (pure insertion) maps to a point range (7, 7)."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_INSERTION_ONLY)
+        assert 'src/baz.rs' in result
+        ranges = result['src/baz.rs']
+        # old_start=7, old_count=0 → point range (7, 7)
+        assert (7, 7) in ranges
+
+    def test_deletion_only_hunk_counted_on_old_side(self):
+        """@@ -20,4 +20,0 @@ maps to (20, 23)."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_DELETION_ONLY)
+        assert 'src/qux.rs' in result
+        ranges = result['src/qux.rs']
+        # old_start=20, old_count=4 → (20, 23)
+        assert (20, 23) in ranges
+
+    def test_no_unexpected_keys(self):
+        fn = self._fn()
+        result = fn(CANNED_DIFF_TWO_FILES)
+        assert set(result.keys()) == {'src/foo.rs', 'src/bar.rs'}
+
+    # --- deleted / renamed / new-file edge cases (amendment, suggestion 1+2) ---
+
+    def test_file_deletion_records_old_path_with_sentinel(self):
+        """'+++ /dev/null' → old path represented with whole-file sentinel.
+
+        A task that deletes a file must not appear stackable with any task that
+        modifies the same file.  The sentinel ensures the shared-file intersection
+        always returns non-stackable.
+        """
+        from orchestrator.git_ops import _WHOLE_FILE_SENTINEL
+        fn = self._fn()
+        result = fn(CANNED_DIFF_FILE_DELETED)
+        assert 'src/gone.rs' in result, 'Deleted file path must be in result'
+        assert _WHOLE_FILE_SENTINEL in result['src/gone.rs'], (
+            'Deleted file must carry the whole-file sentinel'
+        )
+        # '/dev/null' must never appear as a key.
+        assert all('/dev/null' not in k for k in result), (
+            '/dev/null must not be a key in the result dict'
+        )
+
+    def test_pure_rename_records_old_path_with_sentinel(self):
+        """Pure rename (R100, no hunks) → old path with sentinel; new path absent.
+
+        The old file is gone; any task modifying the old name conflicts.
+        """
+        from orchestrator.git_ops import _WHOLE_FILE_SENTINEL
+        fn = self._fn()
+        result = fn(CANNED_DIFF_PURE_RENAME)
+        assert 'src/old_name.rs' in result, 'Renamed-from path must be in result'
+        assert _WHOLE_FILE_SENTINEL in result['src/old_name.rs'], (
+            'Renamed-from path must carry the whole-file sentinel'
+        )
+        # New name has no hunks in a pure rename — absent from result.
+        assert 'src/new_name.rs' not in result, (
+            'Pure rename: new path has no hunk ranges, must not appear'
+        )
+
+    def test_rename_with_changes_records_old_sentinel_and_new_hunks(self):
+        """Rename + content changes → old path sentinel + new path with hunk ranges."""
+        from orchestrator.git_ops import _WHOLE_FILE_SENTINEL
+        fn = self._fn()
+        result = fn(CANNED_DIFF_RENAME_WITH_CHANGES)
+        # Old path must carry the sentinel.
+        assert 'src/old_mod.rs' in result, 'Old (renamed-from) path must be in result'
+        assert _WHOLE_FILE_SENTINEL in result['src/old_mod.rs'], (
+            'Old path must carry the whole-file sentinel'
+        )
+        # New path must carry hunk ranges from the content change.
+        assert 'src/new_mod.rs' in result, 'New (renamed-to) path must be in result'
+        # @@ -10,3 → old_start=10, old_count=3 → (10, 12)
+        assert (10, 12) in result['src/new_mod.rs'], (
+            'New path must record the content-change hunk range'
+        )
+
+    def test_new_file_records_new_path_normally(self):
+        """'--- /dev/null' (new file) → new path recorded with hunk ranges; no /dev/null key."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_NEW_FILE)
+        assert 'src/new.rs' in result, 'New file path must be in result'
+        # @@ -0,0 +1,5 @@ → old_start=0, old_count=0 → point range (0, 0)
+        assert (0, 0) in result['src/new.rs'], (
+            'New-file insertion hunk must map to point range (0, 0)'
+        )
+        assert all('/dev/null' not in k for k in result), (
+            '/dev/null must not be a key in the result dict'
+        )
+
+
+# ---------------------------------------------------------------------------
+# get_changed_line_ranges — async method unit tests (step-5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGetChangedLineRanges:
+    """Unit tests for GitOps.get_changed_line_ranges."""
+
+    async def test_invokes_correct_git_command(self, git_config, git_repo):
+        """Verify that git diff is called with main...ref --unified=0 --no-color."""
+        ops = GitOps(git_config, git_repo)
+        ref = 'task/123'
+
+        captured_cmds: list[list[str]] = []
+
+        async def mock_run(cmd, cwd=None):
+            captured_cmds.append(cmd)
+            return (0, CANNED_DIFF_TWO_FILES, '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            await ops.get_changed_line_ranges(ref)
+
+        assert len(captured_cmds) == 1
+        cmd = captured_cmds[0]
+        assert 'git' in cmd
+        assert 'diff' in cmd
+        assert f'{git_config.main_branch}...{ref}' in cmd
+        assert '--unified=0' in cmd
+        assert '--no-color' in cmd
+
+    async def test_returns_parsed_ranges(self, git_config, git_repo):
+        """Verify the returned dict matches parse_diff_line_ranges output."""
+        from orchestrator.git_ops import parse_diff_line_ranges
+        ops = GitOps(git_config, git_repo)
+        ref = 'task/456'
+
+        async def mock_run(cmd, cwd=None):
+            return (0, CANNED_DIFF_TWO_FILES, '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await ops.get_changed_line_ranges(ref)
+
+        expected = parse_diff_line_ranges(CANNED_DIFF_TWO_FILES)
+        assert result == expected
+
+    async def test_empty_diff_returns_empty_dict(self, git_config, git_repo):
+        ops = GitOps(git_config, git_repo)
+
+        async def mock_run(cmd, cwd=None):
+            return (0, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await ops.get_changed_line_ranges('task/789')
+
+        assert result == {}
