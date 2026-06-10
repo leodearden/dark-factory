@@ -965,7 +965,7 @@ class TestDebounce:
         # Signature must have been set during the first call (non-None after a
         # successful coalesce).
         assert sig_after_coalesce is not None, '_last_coalesce_signature must be set'
-        assert 'sc1' in {r for r in sig_after_coalesce} or len(sig_after_coalesce) == 2, (
+        assert sig_after_coalesce == {req1.request_id, req2.request_id}, (
             'signature must capture the pre-coalesce request_ids of both singles'
         )
 

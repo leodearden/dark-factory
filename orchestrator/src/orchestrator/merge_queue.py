@@ -5260,15 +5260,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         if f not in _seen_files:
                             _seen_files.add(f)
                             union_task_files.append(f)
-            # module_configs: deduplicate by object identity (same config object
-            # is shared across requests created by the same caller context).
+            # module_configs: deduplicate by mc.prefix (semantic identity),
+            # matching workflow._union_train_scope.  Using id(mc) would retain
+            # duplicate configs for equal-but-distinct objects and produce
+            # redundant verify-scope entries.
             union_module_configs = []
-            _seen_mc: set[int] = set()
+            _seen_mc: set[str] = set()
             for sr in survivor_reqs:
                 for mc in sr.module_configs:
-                    _mc_id = id(mc)
-                    if _mc_id not in _seen_mc:
-                        _seen_mc.add(_mc_id)
+                    if mc.prefix not in _seen_mc:
+                        _seen_mc.add(mc.prefix)
                         union_module_configs.append(mc)
 
         train_id = f'coalesce-{tip_id}-{uuid.uuid4().hex[:8]}'
@@ -5323,6 +5324,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             member_task_ids=list(survivors),
             data={
                 'absorbed_request_ids': [r.request_id for r in survivor_reqs],
+                'tip_task_id': tip_id,
                 'ejected': ejected,
                 'size': len(survivors),
             },
@@ -5367,13 +5369,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # • DD2: idempotency via candidate filter (excludes GroupMergeRequests,
                 #   done/cancelled futures); no new MergeRequest field required.
                 # • DD3: debounce via _last_coalesce_signature prevents re-stacking an
-                #   unchanged waiting set on every tick.
+                #   unchanged waiting set on every tick.  NOTE: the signature is set
+                #   before the stack attempt, so a transient stack/worktree error
+                #   (survivors<2 due to env issue, not a deterministic rebase conflict)
+                #   permanently skips the set until the candidate composition changes.
+                #   Low priority given feature ships OFF; tracked for δ/ζ follow-up.
                 # • DD6 (timing): absorbed members park merge-deferred asynchronously;
                 #   _do_train_merge's status pre-check may return TRAIN_INCOMPLETE on a
                 #   prematurely-dequeued train — same retryable 'blocked' the β/δ path
                 #   uses; full retry is left to δ/ζ.  Feature is OFF by default.
-                # When merge_train_coalesce_enabled=False (default) this returns
-                # immediately, keeping the loop byte-identical to pre-γ behaviour.
+                # When merge_train_coalesce_enabled=False (default) the call has
+                # near-zero overhead: it drains the queue (already done at acquire
+                # time), builds the candidate list, reads the knob, and returns False.
                 if spec_base is None and prefetched is None:
                     await self._maybe_coalesce_waiting_singles()
 
