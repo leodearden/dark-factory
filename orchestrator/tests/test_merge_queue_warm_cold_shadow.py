@@ -1612,3 +1612,93 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         # None is passed — SMW accepts it (None-safe)
         call_kwargs = mock_smw_cls.call_args[1]
         assert call_kwargs.get('escalation_queue') is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1723 Step-1: parse_per_test_results with real nextest counter (N/M)
+# ---------------------------------------------------------------------------
+
+# Realistic reify multi-pass nextest sample WITH parenthesized progress counters.
+# Real cargo-nextest 0.9.136 inserts a padded '(  N/M)' token between the timing
+# bracket and the package::binary id.  This sample covers:
+#   - debug pass: 3 tests (PASS, FAIL, PASS) with counter  X/250
+#   - release pass: 1 test (PASS) with counter  1/  1
+# Clean expected keys: 'pkg::bin test_path' (counter stripped, no '(' or '/').
+_NEXTEST_REIFY_COUNTER_SAMPLE = """\
+    Compiling reify-core v0.1.0
+       Finished test [unoptimized + debuginfo] target(s) in 3.52s
+        Starting 3 tests across 2 binaries
+
+        PASS [   0.130s] (  1/250) reify-cli::cli_affine_eval eval_x
+        FAIL [   0.200s] (  2/250) reify-core::some_crate test_b
+        PASS [   0.003s] (  3/250) reify-core::some_crate test_c
+
+------------
+Summary [   1.25s] 3 tests run: 2 passed, 1 failed, 0 skipped
+
+        Starting 1 tests across 1 binaries
+
+        PASS [   0.200s] (  1/  1) reify-cli::release_tests release_test_a
+
+------------
+Summary [   0.20s] 1 tests run: 1 passed, 0 failed, 0 skipped
+"""
+
+
+class TestParsePerTestResultsWithCounter:
+    """Task 1723: nextest N/M progress counter between timing and crate must be stripped.
+
+    Real cargo-nextest 0.9.136 output inserts a parenthesized progress counter
+    such as '(  1/250)' between the timing bracket and the package::binary id.
+    The counter is run-specific (differs warm vs cold), so it MUST be stripped
+    from the key to produce stable 'pkg::bin test_path' keys for shadow compare.
+    """
+
+    def test_pass_line_produces_clean_key(self) -> None:
+        """PASS line with counter must yield key 'pkg::bin test_path' (no counter)."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        assert result.get("reify-cli::cli_affine_eval eval_x") is True, (
+            "PASS line with counter must produce stable key 'pkg::bin test'; "
+            f"got keys: {sorted(result)}"
+        )
+
+    def test_fail_line_produces_clean_key(self) -> None:
+        """FAIL line with counter must yield clean key."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        assert result.get("reify-core::some_crate test_b") is False, (
+            f"FAIL line with counter must produce 'reify-core::some_crate test_b'; "
+            f"got keys: {sorted(result)}"
+        )
+
+    def test_release_pass_present(self) -> None:
+        """Release-pass test (counter  1/  1) must produce clean key."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        assert result.get("reify-cli::release_tests release_test_a") is True, (
+            f"Release pass test must appear with clean key; got keys: {sorted(result)}"
+        )
+
+    def test_no_key_contains_open_paren(self) -> None:
+        """Counter open-paren must not bleed into any key."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        bad = [k for k in result if '(' in k]
+        assert not bad, f"Keys contain '(' (counter not stripped): {bad}"
+
+    def test_no_key_contains_counter_slash(self) -> None:
+        """Counter 'N/M' slash must not appear in any key (Rust paths use '::')."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        bad = [k for k in result if '/' in k]
+        assert not bad, f"Keys contain '/' (counter fragment not stripped): {bad}"
+
+    def test_four_distinct_test_results(self) -> None:
+        """All 4 tests across both passes must be present in the map."""
+        result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
+        assert len(result) == 4, (
+            f"Expected 4 distinct test results, got {len(result)}: {sorted(result)}"
+        )
+
+    def test_backward_compat_no_counter_format_unchanged(self) -> None:
+        """Old no-counter format (_NEXTEST_SAMPLE) must still parse correctly."""
+        result = parse_per_test_results(_NEXTEST_SAMPLE)
+        assert result["reify-core some::mod::test_a"] is True
+        assert result["reify-eval other::test_b"] is False
+        assert result["reify-eval some::other::test_c"] is True
