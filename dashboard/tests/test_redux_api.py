@@ -830,3 +830,67 @@ class TestShapeMergeQueueActiveApproximate:
         assert isinstance(active, list)
         assert len(active) == 1
         assert active[0]['task_id'] == '1'
+
+
+# ---------------------------------------------------------------------------
+# shape_merge_queue — train_throughput passthrough (step-14 RED / step-15 GREEN)
+# ---------------------------------------------------------------------------
+
+
+def test_shape_merge_queue_includes_train_throughput():
+    """shape_merge_queue exposes train_throughput dict per project.
+
+    When per-project data contains 'train_throughput', it must appear in the
+    shaped output alongside 'train_events' and 'speculative'.
+    When 'train_throughput' is absent, the shaped output defaults to {}.
+    """
+    throughput_payload = {
+        'trains_landed': 2,
+        'tasks_landed_via_trains': 4,
+        'train_verifies_per_landed_task': 0.5,
+        'baseline_solo_landed': 3,
+        'baseline_verifies_per_landed_task': 1.0,
+        'verifies_per_landed_task_delta': 0.5,
+        'train_cas_retry_rate': 0.25,
+        'baseline_cas_retry_rate': 0.5,
+        'cas_retry_rate_delta': 0.25,
+        'improved': True,
+    }
+    raw = {
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {'hit_rate': 0.0},
+            'active': [],
+            'train_events': [],
+            'train_throughput': throughput_payload,
+        },
+    }
+    body = redux_api.shape_merge_queue(raw)
+    section = body['MERGE_QUEUE']['dark-factory']
+
+    assert 'train_throughput' in section, (
+        f"expected 'train_throughput' in shaped output; keys: {list(section.keys())}"
+    )
+    tt = section['train_throughput']
+    assert tt['trains_landed'] == 2
+    assert tt['tasks_landed_via_trains'] == 4
+    assert tt['improved'] is True
+
+    # When 'train_throughput' key is absent, defaults to {}.
+    raw_no_throughput = {
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {'hit_rate': 0.0},
+            'active': [],
+            'train_events': [],
+            # no 'train_throughput' key
+        },
+    }
+    body2 = redux_api.shape_merge_queue(raw_no_throughput)
+    assert body2['MERGE_QUEUE']['dark-factory']['train_throughput'] == {}

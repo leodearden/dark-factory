@@ -549,6 +549,167 @@ async def speculative_stats(
 
 
 # ---------------------------------------------------------------------------
+# 5b. Train throughput stats
+# ---------------------------------------------------------------------------
+
+# All-zeros default dict for train_throughput_stats (returned when db is None
+# or when an exception occurs inside the query).
+_TRAIN_THROUGHPUT_DEFAULT: dict = {
+    'trains_landed': 0,
+    'tasks_landed_via_trains': 0,
+    'train_verifies_per_landed_task': 0.0,
+    'baseline_solo_landed': 0,
+    'baseline_verifies_per_landed_task': 0.0,
+    'verifies_per_landed_task_delta': 0.0,
+    'train_cas_retry_rate': 0.0,
+    'baseline_cas_retry_rate': 0.0,
+    'cas_retry_rate_delta': 0.0,
+    'improved': False,
+}
+
+
+async def train_throughput_stats(
+    db: aiosqlite.Connection | None,
+    *,
+    hours: int = 24,
+    now: datetime | None = None,
+) -> dict:
+    """Throughput amortisation metrics derived from the events table.
+
+    Reads train_merged + merge_attempt rows in the look-back window and computes:
+    - trains_landed: count of train_merged events
+    - tasks_landed_via_trains: Σ len(member_task_ids) over train_merged rows
+    - train_verifies_per_landed_task: trains_landed / tasks_landed_via_trains
+      (one union verify per landed train; 0.0 when no trains)
+    - baseline_solo_landed: count of merge_attempt(outcome='done', train_id IS NULL)
+    - baseline_verifies_per_landed_task: 1.0 when any solo landed, else 0.0
+    - verifies_per_landed_task_delta: baseline − train (positive = amortisation win)
+    - train_cas_retry_rate: train cas_retry count / tasks_landed_via_trains
+    - baseline_cas_retry_rate: solo cas_retry count / baseline_solo_landed
+    - cas_retry_rate_delta: baseline − train
+    - improved: True when verifies_per_landed_task_delta > 0
+
+    Returns the all-zeros default when db is None or on exception.
+
+    Args:
+        db: aiosqlite connection, or None (returns all-zeros dict).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp. When None, uses datetime.now(UTC).
+    """
+    if db is None:
+        return dict(_TRAIN_THROUGHPUT_DEFAULT)
+
+    async def _query(conn: aiosqlite.Connection) -> dict:
+        since = _cutoff_iso(hours, now=now)
+        # --- train_merged rows ---
+        train_merged_rows = list(await conn.execute_fetchall(
+            "SELECT data, timestamp FROM events "
+            "WHERE event_type = 'train_merged' AND timestamp >= ?",
+            (since,),
+        ))
+        trains_landed = len(train_merged_rows)
+        tasks_landed_via_trains = 0
+        for row in train_merged_rows:
+            try:
+                data = json.loads(row['data'] or '{}')
+                members = data.get('member_task_ids') or []
+                if not isinstance(members, list):
+                    logger.warning(
+                        "train_throughput_stats: member_task_ids is not a list "
+                        "(got %s) at timestamp=%s; skipping row",
+                        type(members).__name__,
+                        row['timestamp'],
+                    )
+                    continue
+                tasks_landed_via_trains += len(members)
+            except Exception as exc:
+                logger.warning(
+                    "train_throughput_stats: failed to parse train_merged data "
+                    "at timestamp=%s: %s; skipping row",
+                    row['timestamp'],
+                    exc,
+                )
+
+        train_verifies_per_landed_task = (
+            trains_landed / tasks_landed_via_trains
+            if tasks_landed_via_trains > 0
+            else 0.0
+        )
+
+        # --- baseline solo merge_attempt(outcome='done', train_id IS NULL) ---
+        solo_rows = list(await conn.execute_fetchall(
+            "SELECT COUNT(*) AS cnt FROM events "
+            "WHERE event_type = 'merge_attempt' "
+            "  AND json_extract(data, '$.outcome') = 'done' "
+            "  AND json_extract(data, '$.train_id') IS NULL "
+            "  AND timestamp >= ?",
+            (since,),
+        ))
+        baseline_solo_landed = solo_rows[0]['cnt'] if solo_rows else 0
+        baseline_verifies_per_landed_task = 1.0 if baseline_solo_landed > 0 else 0.0
+
+        verifies_per_landed_task_delta = (
+            baseline_verifies_per_landed_task - train_verifies_per_landed_task
+        )
+
+        # --- CAS-retry rates ---
+        train_retry_rows = list(await conn.execute_fetchall(
+            "SELECT COUNT(*) AS cnt FROM events "
+            "WHERE event_type = 'merge_attempt' "
+            "  AND json_extract(data, '$.outcome') = 'cas_retry' "
+            "  AND json_extract(data, '$.train_id') IS NOT NULL "
+            "  AND timestamp >= ?",
+            (since,),
+        ))
+        train_retries = train_retry_rows[0]['cnt'] if train_retry_rows else 0
+        train_cas_retry_rate = (
+            train_retries / tasks_landed_via_trains
+            if tasks_landed_via_trains > 0
+            else 0.0
+        )
+
+        solo_retry_rows = list(await conn.execute_fetchall(
+            "SELECT COUNT(*) AS cnt FROM events "
+            "WHERE event_type = 'merge_attempt' "
+            "  AND json_extract(data, '$.outcome') = 'cas_retry' "
+            "  AND json_extract(data, '$.train_id') IS NULL "
+            "  AND timestamp >= ?",
+            (since,),
+        ))
+        solo_retries = solo_retry_rows[0]['cnt'] if solo_retry_rows else 0
+        baseline_cas_retry_rate = (
+            solo_retries / baseline_solo_landed
+            if baseline_solo_landed > 0
+            else 0.0
+        )
+
+        cas_retry_rate_delta = baseline_cas_retry_rate - train_cas_retry_rate
+        # Only report improved=True when there is a real baseline to compare against.
+        # A window with trains but no solo merges has no baseline and should not
+        # report improved=False as a false regression signal.
+        improved = (
+            baseline_solo_landed > 0
+            and trains_landed > 0
+            and verifies_per_landed_task_delta > 0
+        )
+
+        return {
+            'trains_landed': trains_landed,
+            'tasks_landed_via_trains': tasks_landed_via_trains,
+            'train_verifies_per_landed_task': train_verifies_per_landed_task,
+            'baseline_solo_landed': baseline_solo_landed,
+            'baseline_verifies_per_landed_task': baseline_verifies_per_landed_task,
+            'verifies_per_landed_task_delta': verifies_per_landed_task_delta,
+            'train_cas_retry_rate': train_cas_retry_rate,
+            'baseline_cas_retry_rate': baseline_cas_retry_rate,
+            'cas_retry_rate_delta': cas_retry_rate_delta,
+            'improved': improved,
+        }
+
+    return await with_db(db, _query, dict(_TRAIN_THROUGHPUT_DEFAULT))
+
+
+# ---------------------------------------------------------------------------
 # 6. Active queued merges
 # ---------------------------------------------------------------------------
 
@@ -771,7 +932,7 @@ async def build_per_project_merge_queue(
             the Python post-filter tightens to the exact minute boundary.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative, active, train_events}}``.
+        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative, active, train_events, train_throughput}}``.
     """
     _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
     _DEFAULT_OUTCOMES: ChartData = {'labels': [], 'values': []}
@@ -782,7 +943,7 @@ async def build_per_project_merge_queue(
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
         try:
-            depth_r, outcomes_r, latency_r, recent_r, spec_r, active_r, train_r = await asyncio.gather(
+            depth_r, outcomes_r, latency_r, recent_r, spec_r, active_r, train_r, throughput_r = await asyncio.gather(
                 queue_depth_timeseries(db, hours=hours, now=now),
                 outcome_distribution(db, hours=hours, now=now),
                 latency_stats(db, hours=hours, now=now),
@@ -790,6 +951,7 @@ async def build_per_project_merge_queue(
                 speculative_stats(db, hours=hours, now=now),
                 active_queued_merges(db, ttl_minutes=30, now=now),
                 recent_train_events(db, hours=hours, now=now),
+                train_throughput_stats(db, hours=hours, now=now),
                 return_exceptions=True,
             )
             depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
@@ -799,6 +961,7 @@ async def build_per_project_merge_queue(
             spec = safe_gather_result(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
             active_list = safe_gather_result(active_r, [], f'{pid}/active')
             train_events_list = safe_gather_result(train_r, [], f'{pid}/train_events')
+            train_throughput = safe_gather_result(throughput_r, dict(_TRAIN_THROUGHPUT_DEFAULT), f'{pid}/train_throughput')
             if len(recent_raw) > _RECENT_MERGES_BURST_WARN:  # type: ignore[arg-type]
                 logger.warning(
                     'build_per_project_merge_queue %s: recent_merges returned %d rows'
@@ -822,6 +985,7 @@ async def build_per_project_merge_queue(
                 'speculative': spec,
                 'active': active_list,
                 'train_events': train_events_list,
+                'train_throughput': train_throughput,
             }
         except Exception as exc:
             logger.warning(
@@ -837,6 +1001,7 @@ async def build_per_project_merge_queue(
                 'speculative': _DEFAULT_SPEC,
                 'active': [],
                 'train_events': [],
+                'train_throughput': dict(_TRAIN_THROUGHPUT_DEFAULT),
             }
 
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])

@@ -2895,3 +2895,302 @@ class TestResolveActive:
 
         assert result['approximate'] is True
         assert result['entries'] == []
+
+
+# ---------------------------------------------------------------------------
+# TestTrainThroughputStats — step-6 RED / step-7+ GREEN
+# ---------------------------------------------------------------------------
+
+_TRAIN_THROUGHPUT_DEFAULT_KEYS = {
+    'trains_landed',
+    'tasks_landed_via_trains',
+    'train_verifies_per_landed_task',
+    'baseline_solo_landed',
+    'baseline_verifies_per_landed_task',
+    'verifies_per_landed_task_delta',
+    'train_cas_retry_rate',
+    'baseline_cas_retry_rate',
+    'cas_retry_rate_delta',
+    'improved',
+}
+
+
+@pytest.mark.asyncio
+class TestTrainThroughputStats:
+    """Tests for train_throughput_stats(db, *, hours=24, now=None) -> dict.
+
+    step-6: default contract (None / empty DB → all-zeros).
+    step-8: verifies-per-landed-task counting.
+    step-10: CAS-retry rate.
+    step-12: aggregator wiring.
+    """
+
+    async def test_none_db_returns_all_zeros_default(self):
+        """train_throughput_stats(None) returns the all-zeros default dict."""
+        from dashboard.data.merge_queue import train_throughput_stats
+
+        result = await train_throughput_stats(None)
+
+        assert set(result.keys()) == _TRAIN_THROUGHPUT_DEFAULT_KEYS, (
+            f"expected keys {_TRAIN_THROUGHPUT_DEFAULT_KEYS}, got: {set(result.keys())}"
+        )
+        assert result['trains_landed'] == 0
+        assert result['tasks_landed_via_trains'] == 0
+        assert result['train_verifies_per_landed_task'] == 0.0
+        assert result['baseline_solo_landed'] == 0
+        assert result['baseline_verifies_per_landed_task'] == 0.0
+        assert result['verifies_per_landed_task_delta'] == 0.0
+        assert result['train_cas_retry_rate'] == 0.0
+        assert result['baseline_cas_retry_rate'] == 0.0
+        assert result['cas_retry_rate_delta'] == 0.0
+        assert result['improved'] is False
+
+    async def test_empty_db_returns_all_zeros_default(self, tmp_path):
+        """train_throughput_stats(db) on an empty events table returns the all-zeros default."""
+        from dashboard.data.merge_queue import train_throughput_stats
+
+        db_path = _make_db(tmp_path, 'empty.db', [])
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await train_throughput_stats(conn)
+
+        assert set(result.keys()) == _TRAIN_THROUGHPUT_DEFAULT_KEYS
+        assert result['trains_landed'] == 0
+        assert result['tasks_landed_via_trains'] == 0
+        assert result['train_verifies_per_landed_task'] == 0.0
+        assert result['baseline_solo_landed'] == 0
+        assert result['baseline_verifies_per_landed_task'] == 0.0
+        assert result['verifies_per_landed_task_delta'] == 0.0
+        assert result['train_cas_retry_rate'] == 0.0
+        assert result['baseline_cas_retry_rate'] == 0.0
+        assert result['cas_retry_rate_delta'] == 0.0
+        assert result['improved'] is False
+
+    async def test_verifies_per_landed_task_counting(self, tmp_path):
+        """train_merged + solo done rows → verifies-per-landed-task counting identity.
+
+        One train_merged(members=['10','11']) in window + two solo merge_attempt
+        done rows + one train_merged OUTSIDE the window (must be excluded).
+
+        Asserts exact counting identity: trains_landed=1, tasks_landed_via_trains=2,
+        train_verifies_per_landed_task=0.5, baseline_solo_landed=2,
+        baseline_verifies_per_landed_task=1.0, verifies_per_landed_task_delta=0.5,
+        improved=True.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.data.merge_queue import train_throughput_stats
+
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        in_window = now - timedelta(hours=1)
+        out_of_window = now - timedelta(hours=48)
+
+        events = [
+            # in-window: one train_merged with 2 members
+            dict(
+                event_type='train_merged',
+                timestamp=in_window,
+                run_id='run-train-1',
+                task_id='11',
+                data={'train_id': 't1', 'member_task_ids': ['10', '11'],
+                      'merge_commit_sha': 'aaa', 'base_sha': 'bbb'},
+            ),
+            # in-window: two solo merge_attempt(done, no train_id)
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-20',
+                task_id='20',
+                data={'outcome': 'done'},
+            ),
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-21',
+                task_id='21',
+                data={'outcome': 'done'},
+            ),
+            # OUT-of-window: must be excluded
+            dict(
+                event_type='train_merged',
+                timestamp=out_of_window,
+                run_id='run-train-old',
+                task_id='99',
+                data={'train_id': 't0', 'member_task_ids': ['90', '91'],
+                      'merge_commit_sha': 'zzz', 'base_sha': 'yyy'},
+            ),
+        ]
+        db_path = _make_db(tmp_path, 'verifies.db', events)
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await train_throughput_stats(conn, hours=24, now=now)
+
+        assert result['trains_landed'] == 1
+        assert result['tasks_landed_via_trains'] == 2
+        assert result['train_verifies_per_landed_task'] == 0.5, (
+            f"expected 1 union verify / 2 members = 0.5, got: {result['train_verifies_per_landed_task']}"
+        )
+        assert result['baseline_solo_landed'] == 2
+        assert result['baseline_verifies_per_landed_task'] == 1.0
+        assert result['verifies_per_landed_task_delta'] == 0.5, (
+            f"expected baseline(1.0) - train(0.5) = 0.5, got: {result['verifies_per_landed_task_delta']}"
+        )
+        assert result['improved'] is True
+
+    async def test_cas_retry_rates(self, tmp_path):
+        """CAS-retry rates: train vs baseline, delta, train excluded from baseline.
+
+        One train_merged(members=['10','11']), one train cas_retry row,
+        two solo done rows, two solo cas_retry rows.
+
+        Asserts:
+        - train_cas_retry_rate == 0.5   (1 train retry / 2 tasks_landed_via_trains)
+        - baseline_cas_retry_rate == 1.0 (2 solo retries / 2 baseline_solo_landed)
+        - cas_retry_rate_delta == 0.5    (baseline - train)
+        - train retry rows excluded from baseline retry count
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.data.merge_queue import train_throughput_stats
+
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        in_window = now - timedelta(hours=1)
+
+        events = [
+            # train landed with 2 members
+            dict(
+                event_type='train_merged',
+                timestamp=in_window,
+                run_id='run-train-1',
+                task_id='11',
+                data={'train_id': 't1', 'member_task_ids': ['10', '11'],
+                      'merge_commit_sha': 'aaa', 'base_sha': 'bbb'},
+            ),
+            # one train cas_retry row (has train_id)
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-train-retry',
+                task_id='10',
+                data={'outcome': 'cas_retry', 'train_id': 't1',
+                      'member_task_ids': ['10', '11']},
+            ),
+            # two solo done rows (no train_id)
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-20',
+                task_id='20',
+                data={'outcome': 'done'},
+            ),
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-21',
+                task_id='21',
+                data={'outcome': 'done'},
+            ),
+            # two solo cas_retry rows (no train_id) — must NOT bleed into train rate
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-retry-20',
+                task_id='20',
+                data={'outcome': 'cas_retry'},
+            ),
+            dict(
+                event_type='merge_attempt',
+                timestamp=in_window,
+                run_id='run-solo-retry-21',
+                task_id='21',
+                data={'outcome': 'cas_retry'},
+            ),
+        ]
+        db_path = _make_db(tmp_path, 'cas_retry.db', events)
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await train_throughput_stats(conn, hours=24, now=now)
+
+        assert result['tasks_landed_via_trains'] == 2
+        assert result['baseline_solo_landed'] == 2
+        assert result['train_cas_retry_rate'] == 0.5, (
+            f"expected 1 train retry / 2 tasks_landed = 0.5, got: {result['train_cas_retry_rate']}"
+        )
+        assert result['baseline_cas_retry_rate'] == 1.0, (
+            f"expected 2 solo retries / 2 solo_landed = 1.0, got: {result['baseline_cas_retry_rate']}"
+        )
+        assert result['cas_retry_rate_delta'] == 0.5, (
+            f"expected baseline(1.0) - train(0.5) = 0.5, got: {result['cas_retry_rate_delta']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAggregatorTrainThroughput — step-12 RED / step-13 GREEN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAggregatorTrainThroughput:
+    """step-12: build_per_project_merge_queue includes 'train_throughput' key.
+
+    Verifies:
+    - each project result dict contains a 'train_throughput' key
+    - its value is the train_throughput_stats dict (all-zeros for empty/None db)
+    - populated with a train_merged row: trains_landed=1, tasks_landed=2
+    """
+
+    async def test_none_db_includes_train_throughput_zeros(self):
+        """db=None project includes train_throughput with all-zeros default."""
+        from datetime import UTC, datetime
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        result = await build_per_project_merge_queue(
+            [('/tmp/proj-none', None)],
+            hours=24,
+            now=now,
+            recent_window_minutes=15,
+        )
+
+        assert 'train_throughput' in result['/tmp/proj-none'], (
+            "expected 'train_throughput' key in per-project result (got None-db path)"
+        )
+        tt = result['/tmp/proj-none']['train_throughput']
+        assert tt['trains_landed'] == 0
+        assert tt['tasks_landed_via_trains'] == 0
+        assert tt['improved'] is False
+
+    async def test_populated_db_includes_train_throughput(self, tmp_path):
+        """DB with a train_merged row → train_throughput has trains_landed=1."""
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        events = [
+            dict(
+                event_type='train_merged',
+                timestamp=now - timedelta(hours=1),
+                run_id='run-1',
+                task_id='11',
+                data={'train_id': 't1', 'member_task_ids': ['10', '11'],
+                      'merge_commit_sha': 'abc', 'base_sha': 'def'},
+            ),
+        ]
+        db_path = _make_db(tmp_path, 'agg_train.db', events)
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [('/tmp/proj-train', conn)],
+                hours=24,
+                now=now,
+                recent_window_minutes=15,
+            )
+
+        assert 'train_throughput' in result['/tmp/proj-train'], (
+            "expected 'train_throughput' key in per-project result"
+        )
+        tt = result['/tmp/proj-train']['train_throughput']
+        assert tt['trains_landed'] == 1
+        assert tt['tasks_landed_via_trains'] == 2
