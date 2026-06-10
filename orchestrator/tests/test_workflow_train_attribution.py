@@ -19,7 +19,8 @@ import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_queue import MergeOutcome
+from orchestrator.event_store import EventType
+from orchestrator.merge_queue import MergeOutcome, SoloVerifyResult, TRAIN_VERIFY_FAILED_REASON_PREFIX
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
@@ -257,3 +258,150 @@ class TestDetectionWiring:
         assert result is None, f'train_incomplete should return None (park), got {result!r}'
         attr_mock.assert_not_awaited()
         f.mark_blocked.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Step-9: All-pass → escalate the TRAIN as an interaction; land nothing.
+# ---------------------------------------------------------------------------
+
+
+def _make_tagged_result(failure_category: str = 'cargo_test') -> MergeOutcome:
+    return MergeOutcome(
+        'blocked',
+        reason=f'{TRAIN_VERIFY_FAILED_REASON_PREFIX}: 3 tests failed',
+        failure_category=failure_category,
+    )
+
+
+def _solo_pass(member_id: str) -> SoloVerifyResult:
+    return SoloVerifyResult(
+        member_id=member_id,
+        passed=True,
+        merge_sha=f'sha-{member_id}-solo',
+        reason='',
+    )
+
+
+@pytest.mark.asyncio
+class TestAllPassInteraction:
+    """All members pass solo → genuine interaction; escalate the TRAIN, land nothing."""
+
+    async def test_all_pass_calls_reverify_exactly_n_times(self) -> None:
+        """_reverify_one_member is called exactly N=3 times (≤N+1 bound)."""
+        members = _train_members(train_id='T-all-pass', tip_id='103')
+        f = _make(
+            task_id='103',
+            metadata={'train': {'id': 'T-all-pass', 'order': 2, 'members': ['101', '102', '103']}},
+        )
+        f.wf.event_store = MagicMock()
+
+        reverify_mock = AsyncMock(side_effect=[
+            _solo_pass('101'),
+            _solo_pass('102'),
+            _solo_pass('103'),
+        ])
+        f.wf._reverify_one_member = reverify_mock  # type: ignore[method-assign]
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-all-pass', members)
+
+        assert reverify_mock.await_count == 3, (
+            f'Expected _reverify_one_member called 3 times, got {reverify_mock.await_count}'
+        )
+
+    async def test_all_pass_does_not_land_any_member(self) -> None:
+        """When all pass, advance_main and scheduler.mark_done are never called."""
+        members = _train_members(train_id='T-all-pass2', tip_id='103')
+        f = _make(
+            task_id='103',
+            metadata={'train': {'id': 'T-all-pass2', 'order': 2, 'members': ['101', '102', '103']}},
+        )
+        f.wf.event_store = MagicMock()
+
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_pass('101'), _solo_pass('102'), _solo_pass('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-all-pass2', members)
+
+        f.git_ops.advance_main.assert_not_awaited()
+        f.scheduler.mark_done.assert_not_awaited()
+
+    async def test_all_pass_emits_train_derailed_interaction(self) -> None:
+        """train_derailed event emitted with data.verdict='interaction'."""
+        members = _train_members(train_id='T-interaction', tip_id='103')
+        f = _make(
+            task_id='103',
+            metadata={'train': {'id': 'T-interaction', 'order': 2, 'members': ['101', '102', '103']}},
+        )
+        event_store = MagicMock()
+        f.wf.event_store = event_store
+
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_pass('101'), _solo_pass('102'), _solo_pass('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-interaction', members)
+
+        # Find the train_derailed emit call
+        derailed_calls = [
+            c for c in event_store.emit.call_args_list
+            if c.args and c.args[0] == EventType.train_derailed
+        ]
+        assert len(derailed_calls) >= 1, (
+            f'Expected at least one train_derailed event, got: {event_store.emit.call_args_list}'
+        )
+        # Check verdict='interaction' in the data payload
+        derailed_call = derailed_calls[0]
+        data_kwarg = derailed_call.kwargs.get('data') or {}
+        assert data_kwarg.get('verdict') == 'interaction', (
+            f'Expected verdict="interaction" in data, got: {data_kwarg!r}'
+        )
+
+    async def test_all_pass_escalates_train_not_single_member(self) -> None:
+        """All-pass: _mark_blocked is called with a reason naming the train (not a single member)."""
+        members = _train_members(train_id='T-train-esc', tip_id='103')
+        f = _make(
+            task_id='103',
+            metadata={'train': {'id': 'T-train-esc', 'order': 2, 'members': ['101', '102', '103']}},
+        )
+        f.wf.event_store = MagicMock()
+
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_pass('101'), _solo_pass('102'), _solo_pass('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-train-esc', members)
+
+        # _mark_blocked should be called (stub or real) with escalate_to_human=True
+        f.mark_blocked.assert_awaited_once()
+        call_kwargs = f.mark_blocked.call_args.kwargs
+        assert call_kwargs.get('escalate_to_human') is True
+        # The reason should mention 'interaction' (not a single member id)
+        reason_arg = f.mark_blocked.call_args.args[0] if f.mark_blocked.call_args.args else ''
+        assert 'interaction' in reason_arg.lower() or 'T-train-esc' in reason_arg, (
+            f'Expected reason to mention train or interaction, got: {reason_arg!r}'
+        )
+
+    async def test_all_pass_returns_blocked(self) -> None:
+        """All-pass: tip workflow returns WorkflowOutcome.BLOCKED."""
+        members = _train_members(train_id='T-blocked', tip_id='103')
+        f = _make(
+            task_id='103',
+            metadata={'train': {'id': 'T-blocked', 'order': 2, 'members': ['101', '102', '103']}},
+        )
+        f.wf.event_store = MagicMock()
+
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_pass('101'), _solo_pass('102'), _solo_pass('103'),
+        ])
+
+        tagged = _make_tagged_result()
+        result = await f.wf._attribute_train_failure(tagged, 'T-blocked', members)
+
+        assert result == WorkflowOutcome.BLOCKED, (
+            f'Expected WorkflowOutcome.BLOCKED, got {result!r}'
+        )
