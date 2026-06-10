@@ -6534,6 +6534,95 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
     return result
 
 
+@dataclass
+class ShadowCompareDiff:
+    """Per-test divergence between a warm and a cold verify run.
+
+    Produced by :func:`diff_per_test_results` for PRD §10 invariant 6(b).
+    The ``diverging`` dict contains every test whose warm/cold verdicts differ;
+    the list buckets partition diverging tests by direction for easy alarming.
+
+    Presence divergences (a test in only one result set) are also recorded
+    because they indicate structural differences between the two runs.
+
+    Attributes:
+        diverging: Maps test_id → (warm_passed, cold_passed) for every
+            diverging test.
+        warm_pass_cold_fail: Test ids that passed warm but failed cold
+            (the dangerous class: warm landed OK, cold reveals a real fail).
+        warm_fail_cold_pass: Test ids that failed warm but passed cold
+            (less dangerous; warm was conservative).
+        only_warm: Test ids present in the warm result but absent from cold
+            (structural difference; may indicate a cold build failure).
+        only_cold: Test ids present in the cold result but absent from warm.
+    """
+
+    diverging: dict[str, tuple[bool, bool]]
+    warm_pass_cold_fail: list[str]
+    warm_fail_cold_pass: list[str]
+    only_warm: list[str]
+    only_cold: list[str]
+
+    @property
+    def has_divergence(self) -> bool:
+        """True iff any divergence bucket is non-empty."""
+        return bool(
+            self.diverging
+            or self.only_warm
+            or self.only_cold
+        )
+
+
+def diff_per_test_results(
+    warm: dict[str, bool],
+    cold: dict[str, bool],
+) -> ShadowCompareDiff:
+    """Compute the per-test divergence between warm and cold verify results.
+
+    Classifies every test in the union of both result sets into a divergence
+    bucket.  Tests whose warm verdict equals their cold verdict are omitted.
+
+    Args:
+        warm: Per-test results from the warm (in-place) verify run,
+            as returned by :func:`parse_per_test_results`.
+        cold: Per-test results from the cold (throwaway-worktree) verify run.
+
+    Returns:
+        A :class:`ShadowCompareDiff` with buckets populated for diverging
+        tests.  ``has_divergence`` is False iff all buckets are empty.
+    """
+    diverging: dict[str, tuple[bool, bool]] = {}
+    warm_pass_cold_fail: list[str] = []
+    warm_fail_cold_pass: list[str] = []
+    only_warm: list[str] = []
+    only_cold: list[str] = []
+
+    all_tests = warm.keys() | cold.keys()
+    for test_id in sorted(all_tests):
+        in_warm = test_id in warm
+        in_cold = test_id in cold
+        if in_warm and in_cold:
+            w, c = warm[test_id], cold[test_id]
+            if w != c:
+                diverging[test_id] = (w, c)
+                if w and not c:
+                    warm_pass_cold_fail.append(test_id)
+                else:
+                    warm_fail_cold_pass.append(test_id)
+        elif in_warm:
+            only_warm.append(test_id)
+        else:
+            only_cold.append(test_id)
+
+    return ShadowCompareDiff(
+        diverging=diverging,
+        warm_pass_cold_fail=warm_pass_cold_fail,
+        warm_fail_cold_pass=warm_fail_cold_pass,
+        only_warm=only_warm,
+        only_cold=only_cold,
+    )
+
+
 def _load_shadow_compare_state(path: Path) -> ShadowCompareState:
     """Load the shadow compare cadence state from a JSON file.
 
