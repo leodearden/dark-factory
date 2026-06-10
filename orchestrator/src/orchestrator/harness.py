@@ -3349,8 +3349,20 @@ Output JSON matching the schema. Every task must appear in the output.
         # Fail-CLOSED on an over-budget liveness verdict: if the configured
         # per-host bound × timeout exceeds the safe threshold, refuse to start
         # the merge worker and propagate MergeLivenessConfigError to the caller.
-        # num_hosts=_k: with K runners across K hosts, per-host bound =
+        # num_hosts=_k: with K runners across K distinct hosts, per-host bound =
         # ceil(K/K)=1 → worst_case = 1 * timeout → safe even with K > 1.
+        #
+        # INVARIANT: num_hosts=_k is valid only if:
+        #   (a) each of the K verify runners runs on a SEPARATE host, and
+        #   (b) the SpeculativeMergeWorker dispatches all K verifies concurrently
+        #       (one per runner, none co-located or serialized on the same host).
+        # If two runners share a host, the Kth worktree can queue ~2×timeout and
+        # be prematurely reaped mid-verify — the exact race INFLIGHT_MERGE_
+        # WORKTREE_LIVENESS_SECS was added to close (esc-1674-34).
+        # Validate at operator-enable time: confirm that local _merge-* worktrees
+        # do NOT linger while remote verify is in flight (see task 1726
+        # physical-model note).  If lingering IS observed, reduce num_hosts here.
+        #
         # Any OTHER exception (e.g. config resolution failure in a mock or
         # misconfigured environment) is still fail-OPEN (non-fatal warning),
         # preserving the original crash-loop protection for unrelated errors.

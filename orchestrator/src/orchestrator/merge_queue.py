@@ -7061,6 +7061,7 @@ def enforce_merge_liveness_margin(
         logger=logger,
     )
     if not assessment.safe:
+        _per_host = math.ceil(max(1, assessment.merge_ahead_bound) / max(1, num_hosts))
         raise MergeLivenessConfigError(
             f'enforce_merge_liveness_margin: startup refused — queued _merge-* '
             f'worktree worst-case age ({assessment.worst_case_secs:.0f}s) is not '
@@ -7068,7 +7069,8 @@ def enforce_merge_liveness_margin(
             f'factor={safety_factor:.2f}, liveness={assessment.liveness_secs:.0f}s). '
             f'Reduce merge_verify_cold_command_timeout_secs (currently '
             f'{assessment.timeout_secs:.0f}s) or lower merge_ahead_bound '
-            f'(currently {assessment.merge_ahead_bound}, num_hosts={num_hosts}).'
+            f'(currently {assessment.merge_ahead_bound}, num_hosts={num_hosts}, '
+            f'per_host_bound={_per_host}).'
         )
     return assessment
 

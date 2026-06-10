@@ -17328,7 +17328,10 @@ class TestEnforceMergeLivenessMarginPerHost:
             enforce_merge_liveness_margin,
         )
 
-        cfg = OrchestratorConfig(project_root=tmp_path)
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=7200.0,
+        )
         result = enforce_merge_liveness_margin(cfg, merge_ahead_bound=2, num_hosts=2)
 
         assert isinstance(result, MergeLivenessAssessment), (
@@ -17354,7 +17357,10 @@ class TestEnforceMergeLivenessMarginPerHost:
             enforce_merge_liveness_margin,
         )
 
-        cfg = OrchestratorConfig(project_root=tmp_path)
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=7200.0,
+        )
         with pytest.raises(MergeLivenessConfigError):
             enforce_merge_liveness_margin(cfg, merge_ahead_bound=2, num_hosts=1)
 
