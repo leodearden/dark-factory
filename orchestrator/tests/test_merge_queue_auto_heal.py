@@ -38,10 +38,29 @@ from orchestrator.workflow import (  # type: ignore[attr-defined]
 
 MAIN_SHA = 'deadbeef1234567890'
 
+_DEFAULT_FAKE_ROOT = Path('/tmp/df-test-root')
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirror test_workflow_main_health_routing.py)
 # ---------------------------------------------------------------------------
+
+
+def _make_mock_git_ops(project_root: Path | None = None) -> MagicMock:
+    """Return MagicMock(spec=GitOps) with project_root wired.
+
+    Using a wired project_root prevents bare-spec mocks from breaking when
+    SpeculativeMergeWorker.__init__ reads ``git_ops.project_root`` — which is an
+    instance attribute (git_ops.py:474) and therefore absent on a spec-only mock.
+    Call sites that hold a tmp_path should pass it; otherwise the default fake
+    root is used.
+
+    Do NOT use this helper in tests that intentionally exercise the
+    project_root-absent / None path (e.g. TestSpeculativeWorkerBareHarnessContract).
+    """
+    mock = MagicMock(spec=GitOps)
+    mock.project_root = project_root if project_root is not None else _DEFAULT_FAKE_ROOT
+    return mock
 
 
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
@@ -68,7 +87,7 @@ def _make_workflow(config: OrchestratorConfig, worktree: Path, *, task_metadata:
         },
         modules=['lib'],
     )
-    git_ops = MagicMock(spec=GitOps)
+    git_ops = _make_mock_git_ops()
     git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock()
@@ -276,13 +295,13 @@ class TestMainHealthAutoHealRegistry:
 
     def test_merge_worker_exposes_registry(self) -> None:
         from orchestrator.merge_queue import MainHealthAutoHealRegistry, MergeWorker
-        git_ops = MagicMock(spec=GitOps)
+        git_ops = _make_mock_git_ops()
         worker = MergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         assert isinstance(worker.auto_heal_registry, MainHealthAutoHealRegistry)
 
     def test_speculative_merge_worker_exposes_registry(self) -> None:
         from orchestrator.merge_queue import MainHealthAutoHealRegistry, SpeculativeMergeWorker
-        git_ops = MagicMock(spec=GitOps)
+        git_ops = _make_mock_git_ops()
         worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         assert isinstance(worker.auto_heal_registry, MainHealthAutoHealRegistry)
 
@@ -738,7 +757,7 @@ class TestAutoHealOwnerTiedResume:
         workflow.merge_queue = asyncio.Queue()
 
         # Use a REAL SpeculativeMergeWorker so _WipHaltMixin state is exercised
-        git_ops = MagicMock(spec=GitOps)
+        git_ops = _make_mock_git_ops(tmp_path)
         real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         workflow.merge_worker = real_worker
 
@@ -948,7 +967,7 @@ class TestAutoHealHaltOwnerIsDedupeParent:
 
         # Use a REAL SpeculativeMergeWorker so _WipHaltMixin lane-owner state is
         # exercised.
-        git_ops = MagicMock(spec=GitOps)
+        git_ops = _make_mock_git_ops(tmp_path)
         real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         workflow.merge_worker = real_worker
 
@@ -1095,7 +1114,7 @@ class TestAutoHealConcurrentSameSignature:
         config = _make_config(tmp_path)
 
         # Use a REAL SpeculativeMergeWorker so is_lane_halted reflects actual state
-        git_ops = MagicMock(spec=GitOps)
+        git_ops = _make_mock_git_ops(tmp_path)
         real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
 
         # ── Task A setup ─────────────────────────────────────────────────────
