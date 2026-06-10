@@ -227,6 +227,16 @@ git:
   # Safety valve: when >0, every Nth verifying serial attempt runs a
   # from-scratch cold verify in a throwaway ephemeral worktree.  0 = disabled.
   persistent_merge_worktree_safety_valve_every_n: 0
+  # PRD §10 invariant 6(b) warm-vs-cold SHADOW compare (detective, off serial lane).
+  # When true, periodically re-verifies the same just-landed commit COLD and
+  # compares TEST-LEVEL against the warm result.  Divergence fires a born-at-L2
+  # alarm naming the commit + diverging tests.  Only meaningful with
+  # persistent_merge_worktree: true.  Cadence: nightly OR every-N-merges.
+  warm_verify_shadow_compare: false
+  # Merge-count trigger leg: trigger after this many warm-verified lands.  0 = off.
+  warm_verify_shadow_compare_every_n_merges: 40
+  # Nightly-timer trigger leg: trigger after this many seconds since last run.
+  warm_verify_shadow_compare_nightly_interval_secs: 86400.0
 
 # Autonomous dry-run unblock hook
 unblock_auto:
