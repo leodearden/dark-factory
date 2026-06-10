@@ -954,9 +954,26 @@ class TaskWorkflow:
             # No viable train (no stackable candidates or lone anchor).
             return False
 
-        # --- Metadata assignment ---
+        # --- γ: Materialize the linear branch stack ---
+        # Rebase each successor's worktree onto the last surviving member's
+        # branch.  Members that conflict during stacking are ejected; they
+        # carry no train metadata and fall through to the solo merge path.
+        stack_result = await self.git_ops.stack_train_branches(selected)
+        survivors = stack_result.survivors
+        ejected = stack_result.ejected
+
+        # D4: abandon train formation when fewer than 2 members survive.
+        if len(survivors) < 2:
+            logger.info(
+                'Task %s: train abandoned after stacking — only %d survivor(s) '
+                '(ejected: %s); anchor merges solo.',
+                self.task_id, len(survivors), ejected,
+            )
+            return False
+
+        # --- Metadata assignment (survivors only) ---
         train_id = f'train-{self.task_id}-{uuid.uuid4().hex[:8]}'
-        all_members = selected  # anchor first (order-0), then selected candidates
+        all_members = survivors  # anchor first (order-0), then surviving members
 
         for order, member_id in enumerate(all_members):
             train_meta: dict = {
@@ -985,12 +1002,14 @@ class TaskWorkflow:
                     'train_id': train_id,
                     'members': list(all_members),
                     'size': len(all_members),
+                    # Include ejected for δ failure-attribution telemetry.
+                    'ejected': list(ejected),
                 },
             )
 
         logger.info(
-            'Task %s: train formed — id=%s members=%s',
-            self.task_id, train_id, all_members,
+            'Task %s: train formed — id=%s members=%s ejected=%s',
+            self.task_id, train_id, all_members, ejected,
         )
         return True
 
