@@ -16,6 +16,7 @@ import collections
 import contextlib
 import dataclasses
 import logging
+import math
 import posixpath
 import shutil
 import time
@@ -6437,13 +6438,13 @@ def enforce_merge_liveness_margin(
 
 class PersistentWorktreeConfigError(Exception):
     """Raised by :func:`enforce_persistent_worktree_serial_lane` when the
-    persistent warm merge-verify worktree is enabled but the merge-ahead bound
-    is not 1, which would risk concurrent cargo invocations on a single shared
-    ``target/`` directory.
+    persistent warm merge-verify worktree is enabled but the per-host
+    in-flight verify count would exceed 1, which would risk concurrent cargo
+    invocations on a single shared ``target/`` directory.
 
-    The exception message names the bad bound so the operator knows what to
-    change (lower merge_ahead_bound back to 1 or disable
-    ``git.persistent_merge_worktree``).
+    The exception message names the bound, host count, and per-host in-flight
+    count so the operator knows what to change (lower merge_ahead_bound,
+    increase num_hosts, or disable ``git.persistent_merge_worktree``).
     """
 
 
@@ -6519,14 +6520,19 @@ def enforce_persistent_worktree_serial_lane(
     config: OrchestratorConfig,
     *,
     merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
+    num_hosts: int = 1,
 ) -> None:
     """Fail-closed startup guard for the persistent warm merge-verify worktree.
 
-    The warm worktree feature is SERIAL-LANE-ONLY (PRD §10 invariant 3): a
-    single shared ``target/`` directory is only safe when exactly one verify
-    attempt runs at a time.  Raising the merge-ahead bound above 1 while the
-    knob is on would allow concurrent ``cargo`` invocations inside one
-    ``target/`` — undefined behaviour / data corruption.
+    The warm worktree feature is SERIAL-LANE-ONLY per host (PRD §A invariant 4):
+    a single shared ``target/`` directory is only safe when exactly one verify
+    attempt runs at a time on that host.  The guard now computes the worst-case
+    per-host in-flight count as ``ceil(merge_ahead_bound / num_hosts)`` and
+    rejects only when that exceeds 1.
+
+    At ``num_hosts=1`` (the default, matching the harness call site) the logic
+    reduces exactly to the original ``bound != 1`` check so all pre-existing
+    guard tests and the harness call site are unaffected.
 
     This guard is called immediately after :func:`enforce_merge_liveness_margin`
     in :meth:`Harness._start_merge_worker` so that any misconfiguration is
@@ -6536,23 +6542,38 @@ def enforce_persistent_worktree_serial_lane(
         config: Live per-project orchestrator config.
         merge_ahead_bound: The effective merge-ahead bound (defaults to the
             module-level :data:`_MERGE_AHEAD_BOUND`).
+        num_hosts: Number of verify hosts sharing the workload (default 1).
+            Set to the number of RemoteRunner hosts when operating in a
+            multi-host configuration so that the per-host ceiling is computed
+            correctly (e.g. K=2 across 2 hosts → per_host=1 → no raise).
 
     Returns:
-        ``None`` when the configuration is safe (knob off OR bound == 1).
+        ``None`` when the configuration is safe (knob off OR per-host
+        in-flight ≤ 1).
 
     Raises:
         :exc:`PersistentWorktreeConfigError`: When
-            ``config.git.persistent_merge_worktree is True`` and
-            ``merge_ahead_bound != 1``.
+            ``config.git.persistent_merge_worktree is True`` and the per-host
+            in-flight count ``ceil(merge_ahead_bound / num_hosts) > 1``.
     """
-    if config.git.persistent_merge_worktree and merge_ahead_bound != 1:
+    if not config.git.persistent_merge_worktree:
+        return None
+    # max(1, ...) clamps degenerate inputs: merge_ahead_bound is always >= 1
+    # in practice (harness pins _k = _MERGE_AHEAD_BOUND = 1; callers never pass
+    # 0 or negative).  The clamp ensures we fail-safe (per_host_inflight stays
+    # >= 1 → guard still raises for any positive bound with a single host) rather
+    # than silently allowing division-by-zero or a spuriously permissive result.
+    per_host_inflight = math.ceil(max(1, merge_ahead_bound) / max(1, num_hosts))
+    if per_host_inflight > 1:
         raise PersistentWorktreeConfigError(
             f'enforce_persistent_worktree_serial_lane: startup refused — '
-            f'git.persistent_merge_worktree is enabled but merge_ahead_bound '
-            f'is {merge_ahead_bound} (must be 1). The persistent warm '
-            f'_merge-verify worktree is serial-lane-only (PRD §10 invariant 3): '
-            f'a shared target/ is unsafe under concurrent verify attempts. '
-            f'Lower merge_ahead_bound to 1 or disable '
+            f'git.persistent_merge_worktree is enabled but the per-host '
+            f'in-flight verify count is {per_host_inflight} '
+            f'(merge_ahead_bound={merge_ahead_bound}, num_hosts={num_hosts}). '
+            f'The persistent warm _merge-verify worktree is serial-lane-only '
+            f'per host (PRD §A invariant 4): a shared target/ is unsafe under '
+            f'concurrent verify attempts on the same host. '
+            f'Lower merge_ahead_bound, increase num_hosts, or disable '
             f'git.persistent_merge_worktree.'
         )
     return None

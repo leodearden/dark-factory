@@ -1481,6 +1481,102 @@ class GitOps:
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
 
+    #: Name of the counter file used to persist the verify attempt count across
+    #: stateless CLI invocations.  Scope is **per-project-worktree** — the file
+    #: lives under ``worktree_base`` (``project_root / config.worktree_dir``), so
+    #: a single laptop host running ``verify-merge`` for multiple projects keeps
+    #: independent counters per project.  The file is never inside a registered
+    #: worktree, so it is never pruned or git-cleaned.
+    _VERIFY_ATTEMPT_COUNTER_FILENAME: str = '.merge_verify_host_attempts'
+
+    def _bump_host_verify_attempt_count(self) -> int:
+        """Read, increment, and persist the per-project-worktree verify attempt counter.
+
+        The counter is stored as a plain integer in
+        ``<worktree_base>/.merge_verify_host_attempts`` so that it survives
+        across the stateless ``orchestrator verify-merge`` CLI invocations
+        (each invocation is a fresh process; an in-memory counter cannot
+        persist on the laptop host).  The counter is **per-project-worktree**:
+        a single host running verify-merge for multiple projects has one
+        independent counter file per project under that project's
+        ``worktree_base``.
+
+        A missing or corrupt counter file is treated as count 0 so the next
+        call returns 1 — fail-safe, no exception raised.
+
+        The non-atomic read / modify / write is safe because the per-host
+        serial invariant enforced by
+        :func:`~orchestrator.merge_queue.enforce_persistent_worktree_serial_lane`
+        guarantees that at most one ``verify-merge`` process runs at a time on
+        this host for this project.
+
+        Returns:
+            The new 1-based attempt count after the increment.
+        """
+        counter_file = self.worktree_base / self._VERIFY_ATTEMPT_COUNTER_FILENAME
+        # Read existing count; treat missing/corrupt file as 0 (fail-safe)
+        try:
+            current = int(counter_file.read_text().strip())
+        except (FileNotFoundError, ValueError, OSError):
+            current = 0
+        new_count = current + 1
+        # Ensure worktree_base exists before writing
+        self.worktree_base.mkdir(parents=True, exist_ok=True)
+        counter_file.write_text(str(new_count))
+        return new_count
+
+    async def acquire_host_verify_worktree(self, merge_sha: str) -> Path:
+        """Acquire a verify worktree for the laptop (host-side) verify-merge CLI.
+
+        Mirrors :func:`~orchestrator.merge_queue._acquire_warm_verify_worktree`
+        for the off-host CLI path (PRD §8 η / §A invariant 4).  Picks between
+        the warm fixed-path worktree and a fresh ephemeral worktree based on
+        the ``git.persistent_merge_worktree`` knob and the per-host safety
+        valve (PRD §10 invariant 6).
+
+        **Warm path** (knob ON, safety valve not due):
+            Calls :meth:`reset_persistent_merge_worktree` which creates or
+            resets-in-place the fixed ``_merge-verify`` worktree retaining
+            build-artifact dirs (invariants 1+4).  Returns the fixed path.
+
+        **Ephemeral path** (knob OFF or safety valve due):
+            Calls :meth:`_create_merge_worktree` for a fresh ``_merge-<uuid>``
+            worktree.  The valve fires on ``attempt % every_n == 0`` (1-based,
+            every_n > 0), mirroring :func:`~orchestrator.merge_queue._safety_valve_due`
+            but inlined to avoid a git_ops→merge_queue import cycle.  Returns
+            the ephemeral path; ``cleanup_merge_worktree`` will remove it in
+            the caller's finally block (invariant 6: cold verify, target NOT
+            retained).
+
+        Args:
+            merge_sha: The merge commit SHA to check out (passed to
+                :meth:`reset_persistent_merge_worktree` or
+                :meth:`_create_merge_worktree` as appropriate).
+
+        Returns:
+            The worktree path to use for verification.
+        """
+        if not self.config.persistent_merge_worktree:
+            # Knob off — ephemeral path (byte-identical to today's behavior)
+            wt, _ = await self._create_merge_worktree(base_sha=merge_sha)
+            return wt
+
+        # Bump the disk-persistent counter; check the valve predicate inline
+        attempt = self._bump_host_verify_attempt_count()
+        every_n = self.config.persistent_merge_worktree_safety_valve_every_n
+        # Inlined from merge_queue._safety_valve_due to avoid an import cycle
+        # (merge_queue already imports git_ops).
+        due = every_n > 0 and attempt > 0 and attempt % every_n == 0
+
+        if due:
+            # Safety-valve fired: use a fresh ephemeral worktree so that a
+            # true cold verify runs without a retained target/ (invariant 6).
+            wt, _ = await self._create_merge_worktree(base_sha=merge_sha)
+            return wt
+
+        # Warm path: reset the fixed worktree in place (invariants 1+4).
+        return await self.reset_persistent_merge_worktree(merge_sha)
+
     async def reset_persistent_merge_worktree(self, merge_commit: str) -> Path:
         """Create or reset-in-place the persistent warm merge-verify worktree.
 

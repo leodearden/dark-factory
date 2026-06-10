@@ -170,6 +170,64 @@ class TestEnforcePersistentWorktreeSerialLane:
         result = enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=2)
         assert result is None
 
+    # ---- per-host reframe cases (task η, step-1 RED) ----
+
+    def test_reframe_bound2_num_hosts2_no_raise(self, tmp_path: Path):
+        """knob ON + bound=2 + num_hosts=2 → per_host=ceil(2/2)=1 → no raise (K=2 / 2-host)."""
+        from orchestrator.merge_queue import (
+            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
+        )
+
+        cfg = _make_config(tmp_path, persistent=True)
+        result = enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=2, num_hosts=2)
+        assert result is None
+
+    def test_reframe_bound2_num_hosts1_raises(self, tmp_path: Path):
+        """knob ON + bound=2 + num_hosts=1 → per_host=ceil(2/1)=2 → raises (single host, 2 in-flight)."""
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            PersistentWorktreeConfigError,
+            enforce_persistent_worktree_serial_lane,
+        )
+
+        cfg = _make_config(tmp_path, persistent=True)
+        with pytest.raises(PersistentWorktreeConfigError) as exc_info:
+            enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=2, num_hosts=1)
+        msg = str(exc_info.value)
+        # Message must mention bound and per-host count
+        assert '2' in msg, f'Message must mention bound or per-host count; got: {msg!r}'
+
+    def test_reframe_bound3_num_hosts2_raises(self, tmp_path: Path):
+        """knob ON + bound=3 + num_hosts=2 → per_host=ceil(3/2)=2 → raises (uneven split)."""
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            PersistentWorktreeConfigError,
+            enforce_persistent_worktree_serial_lane,
+        )
+
+        cfg = _make_config(tmp_path, persistent=True)
+        with pytest.raises(PersistentWorktreeConfigError):
+            enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=3, num_hosts=2)
+
+    def test_reframe_bound4_num_hosts4_no_raise(self, tmp_path: Path):
+        """knob ON + bound=4 + num_hosts=4 → per_host=ceil(4/4)=1 → no raise."""
+        from orchestrator.merge_queue import (
+            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
+        )
+
+        cfg = _make_config(tmp_path, persistent=True)
+        result = enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=4, num_hosts=4)
+        assert result is None
+
+    def test_reframe_bound4_num_hosts2_raises(self, tmp_path: Path):
+        """knob ON + bound=4 + num_hosts=2 → per_host=ceil(4/2)=2 → raises."""
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            PersistentWorktreeConfigError,
+            enforce_persistent_worktree_serial_lane,
+        )
+
+        cfg = _make_config(tmp_path, persistent=True)
+        with pytest.raises(PersistentWorktreeConfigError):
+            enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=4, num_hosts=2)
+
 
 # ---------------------------------------------------------------------------
 # Step 13 — _acquire_warm_verify_worktree unit tests

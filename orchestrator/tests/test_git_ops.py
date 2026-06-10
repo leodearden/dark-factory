@@ -4753,3 +4753,193 @@ class TestPersistentMergeWorktree:
         assert not stray_txt.exists(), (
             'stray.txt must be cleaned by git clean -xfd'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 1699 — per-host disk-persistent attempt counter (step-3 RED)
+# ---------------------------------------------------------------------------
+
+
+class TestHostVerifyAttemptCounter:
+    """Disk-persistent per-host attempt counter for the verify-merge CLI.
+
+    Step-3 (RED): _bump_host_verify_attempt_count absent today — AttributeError.
+    """
+
+    def test_counter_monotonically_increasing(self, git_ops: GitOps):
+        """Successive calls return 1-based monotonically increasing counts."""
+        assert git_ops._bump_host_verify_attempt_count() == 1
+        assert git_ops._bump_host_verify_attempt_count() == 2
+        assert git_ops._bump_host_verify_attempt_count() == 3
+
+    def test_counter_persists_across_instances(self, git_config: GitConfig, git_repo: Path):
+        """Counter survives across separate stateless GitOps instances (separate CLI invocations)."""
+        ops1 = GitOps(git_config, git_repo)
+        ops2 = GitOps(git_config, git_repo)
+        ops3 = GitOps(git_config, git_repo)
+
+        c1 = ops1._bump_host_verify_attempt_count()
+        c2 = ops2._bump_host_verify_attempt_count()
+        c3 = ops3._bump_host_verify_attempt_count()
+
+        assert c1 == 1
+        assert c2 == 2
+        assert c3 == 3
+
+    def test_counter_failsafe_on_corrupt_file(self, git_config: GitConfig, git_repo: Path):
+        """A corrupt counter file is treated as 0; next call returns 1 (no exception)."""
+        ops = GitOps(git_config, git_repo)
+        # Manually write garbage into the counter file location
+        ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        counter_file = ops.worktree_base / '.merge_verify_host_attempts'
+        counter_file.write_text('not-an-integer\n')
+
+        # Must not raise; must treat corrupt file as 0 and return 1
+        result = ops._bump_host_verify_attempt_count()
+        assert result == 1, f'Corrupt file must be treated as 0; got count={result}'
+
+    def test_counter_failsafe_missing_file(self, git_config: GitConfig, git_repo: Path):
+        """A missing counter file is treated as 0; first call returns 1 (no exception)."""
+        ops = GitOps(git_config, git_repo)
+        # Ensure no counter file exists
+        counter_file = ops.worktree_base / '.merge_verify_host_attempts'
+        if counter_file.exists():
+            counter_file.unlink()
+
+        result = ops._bump_host_verify_attempt_count()
+        assert result == 1, f'Missing file must be treated as 0; got count={result}'
+
+
+# ---------------------------------------------------------------------------
+# Task 1699 — acquire_host_verify_worktree integration tests (step-5 RED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcquireHostVerifyWorktree:
+    """Integration tests for acquire_host_verify_worktree.
+
+    Step-5 (RED): method absent today — AttributeError.
+    """
+
+    async def test_knob_off_returns_ephemeral(
+        self, git_config: GitConfig, git_repo: Path,
+    ):
+        """Knob OFF: returns an ephemeral _merge-<uuid> path, NOT the fixed warm path."""
+        ops = GitOps(git_config, git_repo)
+        merge_sha = await _get_merge_commit(ops, 'knob-off-a', 'knob_off_a.py')
+
+        wt = await ops.acquire_host_verify_worktree(merge_sha)
+        try:
+            warm_path = ops.persistent_merge_worktree_path
+            assert wt.name.startswith('_merge-'), (
+                f'Expected ephemeral _merge-<uuid>; got: {wt}'
+            )
+            assert wt.resolve() != warm_path.resolve(), (
+                f'Knob OFF must not use the fixed warm path; got: {wt}'
+            )
+            assert not warm_path.exists(), (
+                'Warm path must NOT be created when knob is off'
+            )
+        finally:
+            await ops.cleanup_merge_worktree(wt)
+
+    async def test_knob_on_every_n_0_returns_warm_path(
+        self, git_config: GitConfig, git_repo: Path,
+    ):
+        """Knob ON, every_n=0 (disabled): consecutive calls return the same fixed warm path."""
+        cfg = git_config.model_copy(update={
+            'persistent_merge_worktree': True,
+            'persistent_merge_worktree_safety_valve_every_n': 0,
+        })
+        ops = GitOps(cfg, git_repo)
+        warm_path = ops.persistent_merge_worktree_path
+
+        sha1 = await _get_merge_commit(ops, 'warm-call1', 'warm_call1.py')
+        wt1 = await ops.acquire_host_verify_worktree(sha1)
+        assert wt1.resolve() == warm_path.resolve(), (
+            f'First call with knob ON must return warm path; got: {wt1}'
+        )
+
+        # Plant a fake target/ cache to verify invariant 1 (retained across reset)
+        target_dir = warm_path / 'target'
+        target_dir.mkdir(exist_ok=True)
+        cache_file = target_dir / 'cache.bin'
+        cache_file.write_bytes(b'\xde\xad\xbe\xef')
+
+        sha2 = await _get_merge_commit(ops, 'warm-call2', 'warm_call2.py')
+        wt2 = await ops.acquire_host_verify_worktree(sha2)
+        assert wt2.resolve() == warm_path.resolve(), (
+            f'Second call must also return the same warm path; got: {wt2}'
+        )
+
+        # Exactly one _merge-verify registered (not multiple ephemeral worktrees)
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_repo,
+        )
+        worktree_paths = [
+            line.split(' ', 1)[1]
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        merge_verify_paths = [p for p in worktree_paths if '_merge-verify' in p]
+        assert len(merge_verify_paths) == 1, (
+            f'Exactly one _merge-verify worktree expected; got: {merge_verify_paths}'
+        )
+
+        # target/ retained (invariant 1)
+        assert cache_file.exists(), (
+            'target/cache.bin must be retained across reset-in-place (warm invariant 1)'
+        )
+
+    async def test_knob_on_every_n_1_always_uses_ephemeral(
+        self, git_config: GitConfig, git_repo: Path,
+    ):
+        """Knob ON, every_n=1: every call is safety-valve-due → ephemeral, warm NOT created."""
+        cfg = git_config.model_copy(update={
+            'persistent_merge_worktree': True,
+            'persistent_merge_worktree_safety_valve_every_n': 1,
+        })
+        ops = GitOps(cfg, git_repo)
+        warm_path = ops.persistent_merge_worktree_path
+
+        sha = await _get_merge_commit(ops, 'valve-n1', 'valve_n1.py')
+        wt = await ops.acquire_host_verify_worktree(sha)
+        try:
+            assert wt.resolve() != warm_path.resolve(), (
+                'every_n=1: first call must be valve-due → ephemeral path'
+            )
+            assert not warm_path.exists(), (
+                'every_n=1: fixed warm worktree must NOT be created'
+            )
+        finally:
+            await ops.cleanup_merge_worktree(wt)
+
+    async def test_knob_on_every_n_3_call3_uses_ephemeral(
+        self, git_config: GitConfig, git_repo: Path,
+    ):
+        """Knob ON, every_n=3: calls 1 and 2 → warm; call 3 → ephemeral (valve due)."""
+        cfg = git_config.model_copy(update={
+            'persistent_merge_worktree': True,
+            'persistent_merge_worktree_safety_valve_every_n': 3,
+        })
+        ops = GitOps(cfg, git_repo)
+        warm_path = ops.persistent_merge_worktree_path
+
+        sha1 = await _get_merge_commit(ops, 'valve-n3-a', 'valve_n3_a.py')
+        wt1 = await ops.acquire_host_verify_worktree(sha1)
+        assert wt1.resolve() == warm_path.resolve(), 'Call 1 must use warm path'
+
+        sha2 = await _get_merge_commit(ops, 'valve-n3-b', 'valve_n3_b.py')
+        wt2 = await ops.acquire_host_verify_worktree(sha2)
+        assert wt2.resolve() == warm_path.resolve(), 'Call 2 must use warm path'
+
+        sha3 = await _get_merge_commit(ops, 'valve-n3-c', 'valve_n3_c.py')
+        wt3 = await ops.acquire_host_verify_worktree(sha3)
+        try:
+            assert wt3.resolve() != warm_path.resolve(), (
+                'Call 3 (every_n=3) must be valve-due → ephemeral path'
+            )
+        finally:
+            await ops.cleanup_merge_worktree(wt3)

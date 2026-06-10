@@ -293,6 +293,13 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None):
     code is 0 on success (even when passed=False); non-zero only on bad input or
     infrastructure errors.
 
+    When ``git.persistent_merge_worktree`` is on (PRD §8 η), the subcommand
+    reuses the host's own fixed-path warm worktree (``_merge-verify``) across
+    invocations via :meth:`~orchestrator.git_ops.GitOps.acquire_host_verify_worktree`,
+    mirroring κ invariants 1–6 on the laptop host.  The periodic from-scratch
+    safety valve (invariant 6) is driven by a disk-persistent per-host attempt
+    counter so it fires correctly even across stateless CLI invocations.
+
     Consumer: RemoteRunner (δ) parses stdout as a VerifyResult.
     """
     from orchestrator.git_ops import GitOps
@@ -316,7 +323,7 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None):
 
     async def _run():
         git_ops = GitOps(config.git, config.project_root)
-        wt, _ = await git_ops._create_merge_worktree(base_sha=sha)
+        wt = await git_ops.acquire_host_verify_worktree(sha)
         try:
             return await run_merge_verify_on_worktree(wt, config, spec, merge_sha=sha)
         finally:
