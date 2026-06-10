@@ -972,7 +972,6 @@ def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
     Step-7 (RED): the subcommand currently calls _create_merge_worktree;
     _create_merge_worktree.assert_not_called() fails until step-8 swaps it.
     """
-    from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock
 
     sha = 'abc1234567890abc1234567890abc1234567890ab'

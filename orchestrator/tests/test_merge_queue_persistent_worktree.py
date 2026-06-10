@@ -174,7 +174,9 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_reframe_bound2_num_hosts2_no_raise(self, tmp_path: Path):
         """knob ON + bound=2 + num_hosts=2 → per_host=ceil(2/2)=1 → no raise (K=2 / 2-host)."""
-        from orchestrator.merge_queue import enforce_persistent_worktree_serial_lane  # noqa: PLC0415
+        from orchestrator.merge_queue import (
+            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
+        )
 
         cfg = _make_config(tmp_path, persistent=True)
         result = enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=2, num_hosts=2)
@@ -207,7 +209,9 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_reframe_bound4_num_hosts4_no_raise(self, tmp_path: Path):
         """knob ON + bound=4 + num_hosts=4 → per_host=ceil(4/4)=1 → no raise."""
-        from orchestrator.merge_queue import enforce_persistent_worktree_serial_lane  # noqa: PLC0415
+        from orchestrator.merge_queue import (
+            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
+        )
 
         cfg = _make_config(tmp_path, persistent=True)
         result = enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=4, num_hosts=4)
