@@ -4314,7 +4314,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         from orchestrator.merge_queue import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             AttachAction,
-            MergeOutcome,
             MergeRequest,
             TipRelation,
             WaiterRecord,
