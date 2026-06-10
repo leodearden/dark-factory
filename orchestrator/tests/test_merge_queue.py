@@ -17758,3 +17758,79 @@ class TestSpeculationPermitLeakOnMergerError:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestOwnedMergeWorktreeLivenessHeartbeat
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOwnedMergeWorktreeLivenessHeartbeat:
+    """Unit/integration tests for SpeculativeMergeWorker owned-worktree liveness ledger.
+
+    Distinct from the existing queue-depth heartbeat tests (~:15448) which test
+    _maybe_log_queue_heartbeat; this class tests _touch_owned_merge_worktrees
+    and the ledger (register/deregister/cleanup wrapper) and their wiring into
+    _heartbeat_loop.
+    """
+
+    async def test_touch_advances_mtime_and_returns_count(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
+    ):
+        """_touch_owned_merge_worktrees: updates mtime of a real worktree and returns 1.
+
+        Scenario:
+          - Create a real on-disk _merge-* worktree via git_ops.merge_to_main.
+          - Add its path to worker._owned_merge_worktrees.
+          - Force mtime to ancient (0) via os.utime.
+          - Call _touch_owned_merge_worktrees().
+          - Assert mtime is now near-current (within 5s) and count == 1.
+          - Assert a DEBUG 'touched 1 owned merge worktree(s)' record is emitted.
+
+        RED: _owned_merge_worktrees attribute and _touch_owned_merge_worktrees do
+        not exist yet.
+        """
+        import os as _os
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Build a real _merge-* worktree on disk
+        wt = await _make_branch_with_file(git_ops, 'hb-touch-test', 'hb.py', 'x = 1\n')
+        merge_result = await git_ops.merge_to_main(wt, 'hb-touch-test')
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None, 'merge_worktree must be set after successful merge'
+
+        # Seed the ledger manually (registration wired in later steps)
+        worker._owned_merge_worktrees.add(merge_wt)
+
+        # Force an ancient mtime so any real touch is detectable
+        _os.utime(str(merge_wt), (0, 0))
+        assert merge_wt.stat().st_mtime == 0, 'pre-condition: mtime should be 0'
+
+        # Touch and check
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            n = worker._touch_owned_merge_worktrees()
+
+        assert n == 1, f'Expected touched count 1, got {n}'
+        assert merge_wt.stat().st_mtime > time.time() - 5, (
+            f'mtime not updated: st_mtime={merge_wt.stat().st_mtime}, now={time.time()}'
+        )
+
+        # Check DEBUG log record
+        debug_records = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG and 'touched' in r.message and 'owned merge worktree' in r.message
+        ]
+        assert len(debug_records) >= 1, (
+            f'Expected DEBUG "touched N owned merge worktree(s)" record; got: '
+            f'{[r.message for r in caplog.records]}'
+        )
+        assert '1' in debug_records[0].message, (
+            f'DEBUG record must mention count 1; got: {debug_records[0].message!r}'
+        )
+
+        # Cleanup
+        await git_ops.cleanup_merge_worktree(merge_wt)
