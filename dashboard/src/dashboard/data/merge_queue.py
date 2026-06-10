@@ -913,7 +913,7 @@ async def build_per_project_merge_queue(
             the Python post-filter tightens to the exact minute boundary.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative, active, train_events}}``.
+        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative, active, train_events, train_throughput}}``.
     """
     _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
     _DEFAULT_OUTCOMES: ChartData = {'labels': [], 'values': []}
@@ -924,7 +924,7 @@ async def build_per_project_merge_queue(
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
         try:
-            depth_r, outcomes_r, latency_r, recent_r, spec_r, active_r, train_r = await asyncio.gather(
+            depth_r, outcomes_r, latency_r, recent_r, spec_r, active_r, train_r, throughput_r = await asyncio.gather(
                 queue_depth_timeseries(db, hours=hours, now=now),
                 outcome_distribution(db, hours=hours, now=now),
                 latency_stats(db, hours=hours, now=now),
@@ -932,6 +932,7 @@ async def build_per_project_merge_queue(
                 speculative_stats(db, hours=hours, now=now),
                 active_queued_merges(db, ttl_minutes=30, now=now),
                 recent_train_events(db, hours=hours, now=now),
+                train_throughput_stats(db, hours=hours, now=now),
                 return_exceptions=True,
             )
             depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
@@ -941,6 +942,7 @@ async def build_per_project_merge_queue(
             spec = safe_gather_result(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
             active_list = safe_gather_result(active_r, [], f'{pid}/active')
             train_events_list = safe_gather_result(train_r, [], f'{pid}/train_events')
+            train_throughput = safe_gather_result(throughput_r, dict(_TRAIN_THROUGHPUT_DEFAULT), f'{pid}/train_throughput')
             if len(recent_raw) > _RECENT_MERGES_BURST_WARN:  # type: ignore[arg-type]
                 logger.warning(
                     'build_per_project_merge_queue %s: recent_merges returned %d rows'
@@ -964,6 +966,7 @@ async def build_per_project_merge_queue(
                 'speculative': spec,
                 'active': active_list,
                 'train_events': train_events_list,
+                'train_throughput': train_throughput,
             }
         except Exception as exc:
             logger.warning(
@@ -979,6 +982,7 @@ async def build_per_project_merge_queue(
                 'speculative': _DEFAULT_SPEC,
                 'active': [],
                 'train_events': [],
+                'train_throughput': dict(_TRAIN_THROUGHPUT_DEFAULT),
             }
 
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
