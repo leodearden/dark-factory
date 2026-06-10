@@ -683,7 +683,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         registry = InFlightMergeRegistry()
 
         TIP = 'abc123def456abc1'
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',
@@ -747,7 +747,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
 
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',
@@ -819,7 +819,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
 
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',
@@ -894,7 +894,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
 
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',
@@ -948,7 +948,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
 
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',
@@ -1000,7 +1000,7 @@ class TestAttachedWaiterOutcomeMapping:
         registry = InFlightMergeRegistry()
 
         TIP = 'guardtip0000000001'
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',
@@ -1127,7 +1127,7 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         registry = InFlightMergeRegistry()
 
         TIP = 'tip000000000000001'
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',
@@ -1209,7 +1209,7 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         registry = InFlightMergeRegistry()
 
         TIP = 'tip000000000000002'
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',
@@ -1300,7 +1300,7 @@ class TestAwaitCancellableSoftCancelHook:
         wf = _make_workflow(tmp_path=tmp_path)
         wf._cancel_event.set()  # cancel wins immediately
 
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         hook_calls: list[int] = []
 
         result = await wf._await_cancellable(fut, on_soft_cancel=lambda: hook_calls.append(1))
@@ -1318,7 +1318,7 @@ class TestAwaitCancellableSoftCancelHook:
         wf = _make_workflow(tmp_path=tmp_path)
         wf._cancel_event.set()
 
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
 
         result = await wf._await_cancellable(fut)
 
@@ -1334,7 +1334,7 @@ class TestAwaitCancellableSoftCancelHook:
         wf = _make_workflow(tmp_path=tmp_path)
         # cancel_event is NOT set
 
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         fut.set_result('the_result')
         hook_calls: list[int] = []
 
@@ -1523,7 +1523,7 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         registry = InFlightMergeRegistry()
 
         TIP = 'tip000000000000003'
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',
@@ -1639,7 +1639,7 @@ class TestBoundaryTableWorkflow:
         registry = InFlightMergeRegistry()
 
         TIP = 'tip-bt10-000000001'
-        P: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         registry.acquire(
             'B', 'mcp-task', P,
             request_id='mr-mcp', source='mcp',

@@ -13,7 +13,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import make_placeholder_future, pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -103,7 +103,10 @@ def _make_request(
     pre_rebased: bool = False,
     lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
-    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    try:
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    except RuntimeError:
+        future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
         branch=branch,
@@ -3766,7 +3769,7 @@ class TestSpeculativeMergeWorker:
 
         worker = SpeculativeMergeWorker(MagicMock(), MagicMock())
 
-        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = MagicMock(spec=MergeRequest)
         req.result = future
 
@@ -3782,7 +3785,7 @@ class TestSpeculativeMergeWorker:
         )
 
         # Verify 'done' outcome is equally excluded
-        future2: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        future2: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req2 = MagicMock(spec=MergeRequest)
         req2.result = future2
 
@@ -6417,7 +6420,7 @@ class TestEnqueueMergeRequest:
         wt = tmp_path / 'wt'
         wt.mkdir()
         # Build request with snapshot_tip so we can verify it is captured
-        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='77',
             branch='task/77',
@@ -6541,8 +6544,7 @@ class TestEnqueueMergeRequest:
 
         wt = tmp_path / 'wt-sup'
         wt.mkdir()
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future[MergeOutcome] = loop.create_future()
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='sup-task',
             branch='task/sup-task',
@@ -6667,7 +6669,7 @@ class TestMergeRequestIdentity:
         self, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
         """(d) snapshot_tip carries an explicitly-set value."""
-        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='1',
             branch='task/1',
@@ -8510,8 +8512,7 @@ async def _make_stacked_train(
     })
     mark_member_done = AsyncMock()
 
-    loop = asyncio.get_event_loop()
-    future: asyncio.Future[MergeOutcome] = loop.create_future()
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
 
     return GroupMergeRequest(
         task_id=c_name,
@@ -10991,7 +10992,7 @@ def _make_request_with_module_configs(
     module_configs: list[ModuleConfig],
 ) -> MergeRequest:
     """Like _make_request but accepts explicit module_configs."""
-    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
         branch=branch,

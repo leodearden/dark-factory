@@ -250,6 +250,39 @@ def make_gate_yielding(slots, *, active_account_name=None) -> MagicMock:
     return gate
 
 
+_PLACEHOLDER_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def make_placeholder_future() -> asyncio.Future:
+    """Return an asyncio.Future bound to a dedicated placeholder event loop.
+
+    Use this in SYNC test bodies (``def test_*``) that build a ``MergeRequest``
+    before entering ``asyncio.run()``, where the ``MergeRequest.result`` future
+    is a structural placeholder that is *never* awaited or resolved on the test's
+    run loop.
+
+    The future is created on a module-global loop that is:
+
+    * Lazily created (once) and reused across calls within a process.
+    * NEVER installed as the thread-current loop via ``asyncio.set_event_loop()``,
+      so this helper neither reads nor mutates the thread-current-loop state that
+      ``asyncio.run()`` nulls on completion.
+    * Persistently alive (not GC'd), so no ``ResourceWarning`` is emitted.
+
+    **Do NOT use this helper where the future is awaited or resolved inside a
+    running event loop** — in those contexts (``async def`` test bodies) use
+    ``asyncio.get_running_loop().create_future()`` instead so the future stays
+    bound to the actual running loop.
+    """
+    global _PLACEHOLDER_LOOP
+    # `is_closed()` is defensive cover for an externally-closed loop — this
+    # module never closes _PLACEHOLDER_LOOP itself, so the branch is not
+    # exercised in normal use.
+    if _PLACEHOLDER_LOOP is None or _PLACEHOLDER_LOOP.is_closed():
+        _PLACEHOLDER_LOOP = asyncio.new_event_loop()
+    return _PLACEHOLDER_LOOP.create_future()
+
+
 def build_usage_gate(
     account_configs: list[AccountConfig],
     tokens: Sequence[str | None],

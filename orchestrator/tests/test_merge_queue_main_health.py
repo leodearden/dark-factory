@@ -12,6 +12,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -81,7 +82,7 @@ def _make_req(
     worktree: Path,
     config: OrchestratorConfig,
 ) -> MergeRequest:
-    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
         branch=f'task/{task_id}',
@@ -111,6 +112,32 @@ async def _drive_verify(
         max_enospc=1,
         event_store=event_store,
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: _make_req must work even when there is no current event loop.
+# (task 1711 step-1 RED)
+# ---------------------------------------------------------------------------
+
+
+def test_make_req_works_with_no_current_event_loop(tmp_path: Path) -> None:
+    """_make_req must not raise when the thread's current event loop is None.
+
+    asyncio.run() calls set_event_loop(None) in its finally block, so any
+    test that calls _make_req() AFTER a prior asyncio.run() finds the thread
+    loop explicitly None and gets RuntimeError: There is no current event
+    loop.  This regression test pins that behaviour: set_event_loop(None)
+    first, then assert _make_req() completes and returns a MergeRequest whose
+    .result is an asyncio.Future.
+    """
+    asyncio.set_event_loop(None)
+    try:
+        req = _make_req('99', tmp_path / 'wt', _make_config(tmp_path))
+        assert isinstance(req.result, asyncio.Future)
+    finally:
+        # Restore None (the realistic post-asyncio.run() state) so this test
+        # does not mutate loop state for other tests on the same xdist worker.
+        asyncio.set_event_loop(None)
 
 
 # ---------------------------------------------------------------------------
