@@ -5172,8 +5172,137 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if orch_config.merge_train_max_members < 2:
             return False
 
-        # Core pass body will be added in step-6.
-        return False
+        # ── Step-6: core pass body ─────────────────────────────────────────────
+        # SELECTION: fan out line-range fetches concurrently (one git subprocess
+        # per candidate), then delegate to the greedy mutually-stackable selector.
+        # Function-local import avoids a load-time circular import: workflow.py
+        # imports merge_queue only lazily, so merge_queue→workflow is safe here.
+        from orchestrator.workflow import _select_train_members  # noqa: PLC0415
+
+        anchor = candidates[0]
+        other_ids = [c.task_id for c in candidates[1:]]
+        all_ids = [c.task_id for c in candidates]
+
+        range_results = await asyncio.gather(*[
+            self._git_ops.get_changed_line_ranges(task_id) for task_id in all_ids
+        ])
+        ranges_by_id: dict[str, dict] = {
+            tid: r for tid, r in zip(all_ids, range_results, strict=True)
+        }
+
+        selected = _select_train_members(
+            anchor.task_id, other_ids, ranges_by_id,
+            orch_config.merge_train_max_members,
+        )
+        if len(selected) < 2:
+            # Record attempt so an unchanged waiting set is not re-stacked next tick.
+            self._last_coalesce_signature = frozenset(c.request_id for c in candidates)
+            return False
+
+        # STACK: rebase successors onto the previous survivor's branch.  Rebase
+        # conflicts or missing worktrees produce ejected members that stay solo.
+        stack_result = await self._git_ops.stack_train_branches(selected)
+        survivors: list[str] = stack_result.survivors
+        ejected: list[str] = stack_result.ejected
+
+        if len(survivors) < 2:
+            self._last_coalesce_signature = frozenset(c.request_id for c in candidates)
+            return False
+
+        # BUILD GroupMergeRequest from the tip (last survivor) request.
+        req_by_task_id: dict[str, MergeRequest] = {c.task_id: c for c in candidates}
+        tip_id = survivors[-1]
+        tip_req = req_by_task_id[tip_id]
+        survivor_reqs = [req_by_task_id[sid] for sid in survivors]
+
+        # Union scope: if workspace-wide verify, use tip's scope (no per-module
+        # constraint); otherwise union task_files + module_configs across survivors.
+        if orch_config.merge_verify_workspace:
+            union_task_files = tip_req.task_files
+            union_module_configs = tip_req.module_configs
+        else:
+            # task_files=None means "all files"; any None in the set wins.
+            if any(r.task_files is None for r in survivor_reqs):
+                union_task_files = None
+            else:
+                _seen_files: set[str] = set()
+                union_task_files = []
+                for sr in survivor_reqs:
+                    for f in (sr.task_files or []):
+                        if f not in _seen_files:
+                            _seen_files.add(f)
+                            union_task_files.append(f)
+            # module_configs: deduplicate by object identity (same config object
+            # is shared across requests created by the same caller context).
+            union_module_configs = []
+            _seen_mc: set[int] = set()
+            for sr in survivor_reqs:
+                for mc in sr.module_configs:
+                    _mc_id = id(mc)
+                    if _mc_id not in _seen_mc:
+                        _seen_mc.add(_mc_id)
+                        union_module_configs.append(mc)
+
+        train_id = f'coalesce-{tip_id}-{uuid.uuid4().hex[:8]}'
+        callbacks = self._train_callback_factory(train_id)  # type: ignore[misc]
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+
+        group_req = GroupMergeRequest(
+            task_id=tip_req.task_id,
+            branch=tip_req.branch,
+            worktree=tip_req.worktree,
+            pre_rebased=False,
+            task_files=union_task_files,
+            module_configs=union_module_configs,
+            config=tip_req.config,
+            result=future,
+            train_id=train_id,
+            member_task_ids=list(survivors),
+            tip_branch=tip_req.branch,
+            tip_task_id=tip_id,
+            status_check=callbacks.status_check,
+            mark_member_done=callbacks.mark_member_done,
+        )
+
+        # QUEUE SURGERY: rebuild _lane_buffers['normal'] preserving FIFO order for
+        # non-survivor + ejected solos, then append the new train at the tail.
+        survivor_set = set(survivors)
+        new_buffer: collections.deque[MergeRequest] = collections.deque()
+        for buf_req in self._lane_buffers['normal']:
+            # Keep GroupMergeRequests and non-survivor singles intact.
+            if isinstance(buf_req, GroupMergeRequest):
+                new_buffer.append(buf_req)
+            elif buf_req.task_id not in survivor_set:
+                new_buffer.append(buf_req)
+        new_buffer.append(group_req)
+        self._lane_buffers['normal'] = new_buffer
+
+        # RESOLVE absorbed futures: park each absorbed workflow as merge-deferred.
+        # The existing workflow._handle_superseded consumer (α/1717) transitions
+        # the task; mark_member_done flips it done after the train lands.
+        # Detached/cancelled requests were filtered from candidates in step 1, so
+        # no set_result is ever called on a cancelled future here.
+        for s_req in survivor_reqs:
+            if not s_req.result.done():
+                s_req.result.set_result(
+                    MergeOutcome('superseded', superseded_by=train_id)
+                )
+
+        # EMIT train_coalesced lifecycle event.
+        _emit_train_event(
+            self._event_store,
+            EventType.train_coalesced,
+            task_id=tip_id,
+            train_id=train_id,
+            member_task_ids=list(survivors),
+            data={
+                'absorbed_request_ids': [r.request_id for r in survivor_reqs],
+                'ejected': ejected,
+                'size': len(survivors),
+            },
+        )
+
+        return True
 
     # ------------------------------------------------------------------
     # Merger coroutine

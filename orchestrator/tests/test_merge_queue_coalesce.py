@@ -323,9 +323,11 @@ class TestCoreFormation:
         from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
 
         # Set up 3 branches each touching a unique file (disjoint → line-stackable).
-        wt1 = await _make_branch_with_file(git_ops, 'task/t1', 'file_a.py', 'a = 1\n')
-        wt2 = await _make_branch_with_file(git_ops, 'task/t2', 'file_b.py', 'b = 2\n')
-        wt3 = await _make_branch_with_file(git_ops, 'task/t3', 'file_c.py', 'c = 3\n')
+        # Branch names are BARE (no prefix): create_worktree('t1') creates branch
+        # 'task/t1' at worktree .worktrees/t1.  req.branch = 't1' (bare).
+        wt1 = await _make_branch_with_file(git_ops, 't1', 'file_a.py', 'a = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 't2', 'file_b.py', 'b = 2\n')
+        wt3 = await _make_branch_with_file(git_ops, 't3', 'file_c.py', 'c = 3\n')
 
         # Event store to capture train_coalesced event.
         db_path = tmp_path / 'es_coalesce.db'
