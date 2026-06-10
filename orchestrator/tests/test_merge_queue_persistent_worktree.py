@@ -15,7 +15,6 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
 
-
 # ---------------------------------------------------------------------------
 # Real-git fixtures (mirroring test_merge_queue_restart_hook.py)
 # ---------------------------------------------------------------------------

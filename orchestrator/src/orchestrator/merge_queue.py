@@ -4088,6 +4088,7 @@ class MergeWorker(_WipHaltMixin):
                 merge_result.merge_commit or '',
                 safety_valve_due=False,
             )
+            assert merge_wt is not None  # input was non-None; warm or unchanged
         if not skip_verify:
             out = await _run_post_merge_verify(
                 self._git_ops, req, merge_wt,
@@ -5845,6 +5846,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._git_ops, req, merge_wt, merge_commit,
                 safety_valve_due=_due,
             )
+            assert merge_wt is not None  # input was non-None; warm or unchanged
 
         # ── Step 4: verify ────────────────────────────────────────────
         if not item.skip_verify:
@@ -6457,13 +6459,13 @@ def _safety_valve_due(attempt_count: int, every_n: int) -> bool:
 
 
 async def _acquire_warm_verify_worktree(
-    git_ops: 'GitOps',
-    req: 'MergeRequest',
-    merge_wt: 'Path | None',
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_wt: Path | None,
     merge_commit: str,
     *,
     safety_valve_due: bool,
-) -> 'Path | None':
+) -> Path | None:
     """Swap the ephemeral merge worktree for the persistent warm worktree.
 
     Called at the top of ``_verify_and_advance`` (and ``MergeWorker._process``)
@@ -6503,7 +6505,7 @@ async def _acquire_warm_verify_worktree(
 
 
 def enforce_persistent_worktree_serial_lane(
-    config: 'OrchestratorConfig',
+    config: OrchestratorConfig,
     *,
     merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
 ) -> None:
