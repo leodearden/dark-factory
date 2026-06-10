@@ -107,6 +107,140 @@ class _RecordingEventStore:
 
 
 # ---------------------------------------------------------------------------
+# Step-2 (GREEN): Core harness — _FakeRunner, WindowRun, run_backlog_window
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeRunner:
+    """Fake VerifyRunner that returns deterministic results without real I/O.
+
+    Implements the VerifyRunner protocol: name, is_local, health(), run_merge_verify().
+    """
+
+    name: str
+    is_local: bool
+    service_secs: float = 1.0
+    unavailable: bool = False
+    verdict_map: dict[str, bool] | None = None
+
+    async def health(self) -> bool:
+        return not self.unavailable
+
+    async def run_merge_verify(
+        self, merge_sha: str, spec: MergeVerifySpec
+    ) -> VerifyResult:
+        if self.unavailable:
+            raise RunnerUnavailable(f'runner {self.name!r} is unavailable')
+        if self.verdict_map is not None:
+            passed = self.verdict_map.get(merge_sha, True)
+        else:
+            passed = True
+        return _make_result(passed)
+
+
+@dataclass
+class WindowRun:
+    """Result of run_backlog_window — summary of a simulated merge window."""
+
+    completed: int
+    spans: list[tuple[str, str, float, float]] = field(default_factory=list)
+    """List of (merge_sha, runner_name, start_vt, end_vt) in completion order."""
+    peak_concurrency: int = 0
+    """Maximum number of simultaneous in-flight verifies."""
+    advance_order: list[str] = field(default_factory=list)
+    """SHAs committed to advance in arrival order (matches submission order)."""
+
+
+async def run_backlog_window(
+    pool: VerifyRunnerPool,
+    event_store: _RecordingEventStore,
+    *,
+    n_merges: int,
+    k: int,
+    service_secs: dict[str, float],
+) -> WindowRun:
+    """Drive *n_merges* synthetic merges through *pool* under a K-permit semaphore.
+
+    Uses a virtual-clock model: each dispatch is tracked by its (start_vt, end_vt)
+    in virtual time rather than real wall-clock time (no real asyncio.sleep).
+    Emits EventType.merge_heartbeat after each job is scheduled.
+
+    The semaphore(k) mirrors merge_queue._speculation_slot so at most k verifies
+    run concurrently.  Advance order is preserved (SHAs submitted in sequence 0..N-1).
+    """
+    shas = [f'sha{i:04d}' for i in range(n_merges)]
+    spans: list[tuple[str, str, float, float]] = []
+    advance_order: list[str] = []
+    peak_concurrency = 0
+
+    # Virtual-clock: per-runner free_at[runner_name] = virtual time when runner is free.
+    free_at: dict[str, float] = {}
+    virtual_now: list[float] = [0.0]  # mutable reference so closures can update
+
+    sem = asyncio.Semaphore(k)
+    in_flight: list[int] = [0]  # mutable counter
+
+    async def dispatch_one(sha: str) -> None:
+        async with sem:
+            in_flight[0] += 1
+            if in_flight[0] > peak_concurrency:
+                # update peak (use nonlocal-like list hack for Python 3.10 compat)
+                pass  # handled outside via shared list
+
+            result = await pool.dispatch(sha, _make_spec())
+
+            # Determine which runner handled this (from last merge_verify event)
+            verify_events = event_store.events_of(EventType.merge_verify)
+            runner_name = verify_events[-1][2].get('runner', 'local') if verify_events else 'local'
+            svc = service_secs.get(runner_name, 1.0)
+
+            # Virtual-clock: schedule on earliest-free server
+            start_vt = free_at.get(runner_name, 0.0)
+            end_vt = start_vt + svc
+            free_at[runner_name] = end_vt
+            if end_vt > virtual_now[0]:
+                virtual_now[0] = end_vt
+
+            spans.append((sha, runner_name, start_vt, end_vt))
+            advance_order.append(sha)
+
+            # Emit merge_heartbeat
+            remaining = n_merges - len(advance_order)
+            oldest_age = virtual_now[0] - (spans[0][2] if spans else 0.0)
+            event_store.emit(
+                EventType.merge_heartbeat,
+                task_id=None,
+                data={
+                    'depth': remaining,
+                    'oldest_age_secs': max(0.0, oldest_age),
+                    'head_of_line': shas[0],
+                    'verify_in_progress': in_flight[0],
+                },
+            )
+            in_flight[0] -= 1
+
+    tasks = [asyncio.create_task(dispatch_one(sha)) for sha in shas]
+    await asyncio.gather(*tasks)
+
+    # Compute peak concurrency from overlapping spans
+    peak = 0
+    for i, (_, _, s_a, e_a) in enumerate(spans):
+        concurrent = sum(
+            1 for _, _, s_b, e_b in spans if s_b < e_a and s_a < e_b
+        )
+        if concurrent > peak:
+            peak = concurrent
+
+    return WindowRun(
+        completed=len(advance_order),
+        spans=spans,
+        peak_concurrency=peak,
+        advance_order=advance_order,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step-1 (RED): TestThroughputHarness — verify that pool.dispatch emits
 # runner-tagged merge_verify events via run_backlog_window.
 # ---------------------------------------------------------------------------
