@@ -2857,3 +2857,79 @@ class TestBoundaryTableMcpSurface:
         assert status_train.get('state') == 'done', (
             f"Expected state='done' for train request, got: {status_train}"
         )
+
+    async def test_scenario_superseded_event_store_tier(
+        self, tmp_path: Path,
+    ) -> None:
+        """Superseded surface via event store (Tier 3) — post-restart durability.
+
+        Emit a real EventStore merge_finalized event with state='superseded' and
+        superseded_by='mr-train2'.  Build a FRESH server with an EMPTY
+        TerminalOutcomeRetention but the SAME event_store (simulating a restart /
+        ring eviction).
+
+        Assert merge_status(request_id='mr-absorbed2') returns:
+          - state == 'superseded'
+          - outcome == 'superseded'
+          - superseded_by == 'mr-train2'
+
+        RED: event_store.latest_merge_finalized drops superseded_by from its
+        returned dict, so _durable_terminal_state Tier 3 never threads it into
+        meta and the response never carries superseded_by.
+        """
+        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            EventStore,
+            EventType,
+        )
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InFlightMergeRegistry,
+            TerminalOutcomeRetention,
+        )
+
+        db_path = tmp_path / 'events-sup3.db'
+        event_store = EventStore(db_path=db_path, run_id='sup3')
+
+        ABSORBED_RID = 'mr-absorbed2'
+        TRAIN_RID = 'mr-train2'
+
+        # Emit a merge_finalized record for the absorbed request
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='task-absorbed2',
+            phase='merge',
+            data={
+                'request_id': ABSORBED_RID,
+                'branch': 'branch-absorbed2',
+                'state': 'superseded',
+                'snapshot_tip': None,
+                'merge_sha': None,
+                'superseded_by': TRAIN_RID,
+                'generation': 1,
+            },
+        )
+
+        # Build a FRESH server with empty retention (simulating restart / ring eviction)
+        # but the same event_store
+        fresh_retention = TerminalOutcomeRetention()
+        fresh_harness = _FakeHarness(retention=fresh_retention)
+        fresh_server = create_server(
+            EscalationQueue(tmp_path / 'esc-sup3'),
+            merge_queue=asyncio.Queue(),
+            orch_config=_make_orch_config(tmp_path / 'repo-sup3'),
+            event_store=event_store,
+            harness=fresh_harness,
+            merge_inflight_registry=InFlightMergeRegistry(),
+            startup_sweep=False,
+        )
+
+        # Assert absorbed request resolved from event store post-restart
+        status = await _call_merge_status(fresh_server, request_id=ABSORBED_RID)
+        assert status.get('state') == 'superseded', (
+            f"Expected state='superseded' from event store after restart, got: {status}"
+        )
+        assert status.get('outcome') == 'superseded', (
+            f"Expected outcome='superseded', got: {status}"
+        )
+        assert status.get('superseded_by') == TRAIN_RID, (
+            f"Expected superseded_by={TRAIN_RID!r}, got: {status}"
+        )
