@@ -356,6 +356,7 @@ class EventStore:
                 'state': data.get('state'),
                 'snapshot_tip': data.get('snapshot_tip'),
                 'merge_sha': data.get('merge_sha'),
+                'superseded_by': data.get('superseded_by'),
                 'finished_at': timestamp,
             }
         except Exception:

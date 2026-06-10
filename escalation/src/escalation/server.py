@@ -1196,11 +1196,14 @@ def create_server(
                 task_id=task_id,
             )
             if row is not None:
-                return _map_terminal_state(row['state']), {
+                es_meta: dict = {
                     'request_id': row['request_id'],
                     'outcome': row['state'],
                     'finished_at': row['finished_at'],
                 }
+                if row.get('superseded_by') is not None:
+                    es_meta['superseded_by'] = row['superseded_by']
+                return _map_terminal_state(row['state']), es_meta
 
         return None
 
