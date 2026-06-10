@@ -881,7 +881,7 @@ class TaskWorkflow:
         _shas = await asyncio.gather(*[
             self.git_ops.resolve_branch_sha(tid) for tid in _pre_ids
         ])
-        return [t for t, sha in zip(pre_filtered, _shas) if sha is not None]
+        return [t for t, sha in zip(pre_filtered, _shas, strict=True) if sha is not None]
 
     async def _maybe_form_train(self) -> bool:
         """β former: try to form a merge train for this task (PRD §7 β).
@@ -943,7 +943,7 @@ class TaskWorkflow:
             self.git_ops.get_changed_line_ranges(cid) for cid in _all_range_ids
         ])
         ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]] = {
-            cid: r for cid, r in zip(_all_range_ids, _range_results)
+            cid: r for cid, r in zip(_all_range_ids, _range_results, strict=True)
         }
 
         selected = _select_train_members(
