@@ -355,6 +355,28 @@ def compute_preexisting_main_break_fingerprint(
         return ''
 
 
+def _line_ranges_stackable(
+    ranges_a: dict[str, list[tuple[int, int]]],
+    ranges_b: dict[str, list[tuple[int, int]]],
+) -> bool:
+    """Return True iff tasks A and B are line-level stackable.
+
+    Two tasks are stackable iff no file they both touch has overlapping changed
+    line ranges relative to BASE (main).  Crate/file-disjointness is NOT
+    required for stackability — same file, different lines is fine (PRD §A.2).
+
+    Uses closed-interval intersection: range (s1,e1) intersects (s2,e2)
+    iff s1 <= e2 and s2 <= e1.
+    """
+    shared_files = set(ranges_a) & set(ranges_b)
+    for fname in shared_files:
+        for s1, e1 in ranges_a[fname]:
+            for s2, e2 in ranges_b[fname]:
+                if s1 <= e2 and s2 <= e1:
+                    return False
+    return True
+
+
 @dataclass
 class WorkflowMetrics:
     total_cost_usd: float = 0.0
