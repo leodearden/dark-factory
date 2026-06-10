@@ -685,6 +685,7 @@ class TestBuildMergeVerifySpec:
     def _make_config(self, *, verify_env=None, cold_timeout=None):
         config = MagicMock()
         config.verify_env = verify_env or {}
+        config.effective_verify_env = verify_env or {}
         config.merge_verify_cold_command_timeout_secs = cold_timeout
         config.verify_cold_command_timeout_secs = None
         return config
@@ -742,6 +743,7 @@ class TestBuildMergeVerifySpec:
         from orchestrator.verify_runner import build_merge_verify_spec
         config = MagicMock()
         config.verify_env = {}
+        config.effective_verify_env = {}
         config.merge_verify_cold_command_timeout_secs = None
         config.verify_cold_command_timeout_secs = 3600.0
         spec = build_merge_verify_spec(config, [], None)
@@ -751,6 +753,7 @@ class TestBuildMergeVerifySpec:
         from orchestrator.verify_runner import build_merge_verify_spec
         config = MagicMock()
         config.verify_env = {}
+        config.effective_verify_env = {}
         config.merge_verify_cold_command_timeout_secs = None
         config.verify_cold_command_timeout_secs = None
         spec = build_merge_verify_spec(config, [], None)
@@ -771,6 +774,29 @@ class TestBuildMergeVerifySpec:
             task_files,
         )
         assert spec_from_json(spec_to_json(spec)) == spec
+
+    def test_effective_verify_env_propagated_to_spec(self, monkeypatch, tmp_path):
+        """spec.verify_env carries the merged sccache backend from effective_verify_env.
+
+        Uses a real OrchestratorConfig (not MagicMock) so that effective_verify_env
+        is computed by the actual property; this exercises the κ wire end-to-end for
+        the remote/laptop path (build_merge_verify_spec reads effective_verify_env).
+        """
+        from orchestrator.config import OrchestratorConfig, SccacheConfig
+        from orchestrator.verify_runner import build_merge_verify_spec
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+
+        config = OrchestratorConfig(
+            verify_env={'RUSTC_WRAPPER': 'sccache'},
+            sccache=SccacheConfig(enabled=True, backend_env={'SCCACHE_REDIS': 'redis://orch:6379'}),
+        )
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.verify_env == {
+            'RUSTC_WRAPPER': 'sccache',
+            'SCCACHE_REDIS': 'redis://orch:6379',
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -3102,6 +3128,240 @@ class TestDriftDetectorPublicSurface:
     def test_all_new_iota_names_in_dunder_all(self):
         import orchestrator.verify_runner as vr_mod
         expected = {'DriftDetector', 'DriftVerdict', 'DriftCheckResult'}
+        missing = expected - set(vr_mod.__all__)
+        assert not missing, f"Missing from __all__: {sorted(missing)}"
+        for name in expected:
+            assert hasattr(vr_mod, name), f"__all__ lists {name!r} but attribute is absent"
+
+
+# ---------------------------------------------------------------------------
+# κ step-9: SccacheStats + parse_sccache_stats
+# ---------------------------------------------------------------------------
+
+_SCCACHE_STATS_REDIS = """\
+Sccache statistics
+    Compile requests    10
+    Cache hits          3
+    Cache hits (Rust)   3
+    Cache misses        1
+    Cache timeouts      0
+    Cache read errors   0
+    Forced recaches     0
+    Cache write errors  0
+    Cache location      Redis: redis://orch:6379
+    Cache size          0 bytes
+    Max cache size      10 GiB
+"""
+
+_SCCACHE_STATS_LOCAL = """\
+Sccache statistics
+    Compile requests    5
+    Cache hits          5
+    Cache hits (Rust)   5
+    Cache misses        0
+    Cache location      Local disk: /home/u/.cache/sccache
+"""
+
+
+class TestParseSccacheStats:
+    """parse_sccache_stats parses sccache --show-stats output into SccacheStats."""
+
+    def test_compile_requests_hits_misses_parsed(self):
+        from orchestrator.verify_runner import SccacheStats, parse_sccache_stats
+        stats = parse_sccache_stats(_SCCACHE_STATS_REDIS)
+        assert isinstance(stats, SccacheStats)
+        assert stats.compile_requests == 10
+        assert stats.cache_hits == 3
+        assert stats.cache_misses == 1
+
+    def test_cache_location_redis(self):
+        from orchestrator.verify_runner import parse_sccache_stats
+        stats = parse_sccache_stats(_SCCACHE_STATS_REDIS)
+        assert stats.cache_location.startswith('Redis')
+
+    def test_hit_rate_exact_arithmetic(self):
+        from orchestrator.verify_runner import parse_sccache_stats
+        stats = parse_sccache_stats(_SCCACHE_STATS_REDIS)
+        # hits=3, misses=1 → 3/(3+1) = 0.75 exactly
+        assert stats.hit_rate == 0.75
+
+    def test_is_shared_backend_true_for_redis(self):
+        from orchestrator.verify_runner import parse_sccache_stats
+        stats = parse_sccache_stats(_SCCACHE_STATS_REDIS)
+        assert stats.is_shared_backend is True
+
+    def test_remote_hit_rate_positive_for_redis(self):
+        from orchestrator.verify_runner import parse_sccache_stats
+        stats = parse_sccache_stats(_SCCACHE_STATS_REDIS)
+        assert stats.remote_hit_rate == 0.75
+        assert stats.remote_hits == 3
+
+    def test_local_disk_is_not_shared_backend(self):
+        from orchestrator.verify_runner import parse_sccache_stats
+        stats = parse_sccache_stats(_SCCACHE_STATS_LOCAL)
+        assert stats.is_shared_backend is False
+        assert stats.remote_hit_rate == 0.0
+        assert stats.remote_hits == 0
+
+    def test_local_disk_hit_rate_can_be_one(self):
+        """hit_rate for local disk may be 1.0 (no misses); remote_hit_rate is still 0."""
+        from orchestrator.verify_runner import parse_sccache_stats
+        stats = parse_sccache_stats(_SCCACHE_STATS_LOCAL)
+        assert stats.hit_rate == 1.0  # 5/(5+0)
+
+    def test_exact_label_guard_aggregate_not_rust_breakdown(self):
+        """cache_hits picks the 'Cache hits' aggregate, NOT 'Cache hits (Rust)'."""
+        from orchestrator.verify_runner import parse_sccache_stats
+        # blob has Cache hits = 3 but Cache hits (Rust) would also = 3 in this sample;
+        # if the parser mistook the Rust line for the aggregate it would give the same
+        # value — use a blob where they differ to make the guard meaningful.
+        blob = """\
+    Compile requests    10
+    Cache hits          7
+    Cache hits (Rust)   3
+    Cache misses        3
+    Cache location      Redis: redis://orch:6379
+"""
+        stats = parse_sccache_stats(blob)
+        assert stats.cache_hits == 7, (
+            "cache_hits must be 7 (the 'Cache hits' aggregate), not 3 ('Cache hits (Rust)')"
+        )
+
+    def test_hit_rate_zero_when_no_hits_no_misses(self):
+        """Denominator 0 → hit_rate 0.0 (no division by zero)."""
+        from orchestrator.verify_runner import parse_sccache_stats
+        blob = """\
+    Compile requests    0
+    Cache hits          0
+    Cache misses        0
+    Cache location      Redis: redis://orch:6379
+"""
+        stats = parse_sccache_stats(blob)
+        assert stats.hit_rate == 0.0
+
+
+# ---------------------------------------------------------------------------
+# κ step-11: capture_sccache_stats
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCaptureSccacheStats:
+    """capture_sccache_stats is async and uses the injected run callable."""
+
+    def _make_fake_run(self, responses):
+        """Return async callable that returns successive (rc, stdout, stderr) tuples."""
+        responses_queue = list(responses)
+        issued = []
+
+        async def fake_run(argv, *, cwd=None):
+            issued.append(argv)
+            return responses_queue.pop(0)
+
+        fake_run.issued = issued
+        return fake_run
+
+    async def test_parses_redis_stats_blob(self):
+        from orchestrator.verify_runner import SccacheStats, capture_sccache_stats
+        fake_run = self._make_fake_run([(0, _SCCACHE_STATS_REDIS, '')])
+        stats = await capture_sccache_stats(fake_run)
+        assert isinstance(stats, SccacheStats)
+        assert stats.remote_hit_rate > 0
+
+    async def test_exact_argv_issued(self):
+        from orchestrator.verify_runner import capture_sccache_stats
+        fake_run = self._make_fake_run([(0, _SCCACHE_STATS_REDIS, '')])
+        await capture_sccache_stats(fake_run)
+        assert fake_run.issued == [['sccache', '--show-stats']]
+
+    async def test_probe_ok_true_on_zero_rc(self):
+        """probe_ok is True when sccache --show-stats exits 0."""
+        from orchestrator.verify_runner import capture_sccache_stats
+        fake_run = self._make_fake_run([(0, _SCCACHE_STATS_REDIS, '')])
+        stats = await capture_sccache_stats(fake_run)
+        assert stats.probe_ok is True
+
+    async def test_probe_ok_false_on_nonzero_rc(self):
+        """probe_ok is False when sccache --show-stats exits non-zero (daemon absent).
+
+        This distinguishes a probe failure from a legitimately cold shared
+        cache (which would also yield all-zero stats but with probe_ok=True).
+        """
+        from orchestrator.verify_runner import SccacheStats, capture_sccache_stats
+        fake_run = self._make_fake_run([(127, '', 'sccache: not found')])
+        stats = await capture_sccache_stats(fake_run)
+        assert isinstance(stats, SccacheStats)
+        assert stats.probe_ok is False
+
+
+# ---------------------------------------------------------------------------
+# κ step-13: ColdWarmVerifyDelta
+# ---------------------------------------------------------------------------
+
+
+class TestColdWarmVerifyDelta:
+    """ColdWarmVerifyDelta — frozen value object with JSON codec."""
+
+    def test_speedup_exact_arithmetic(self):
+        from orchestrator.verify_runner import ColdWarmVerifyDelta
+        d = ColdWarmVerifyDelta(cold_secs=300.0, warm_secs=100.0)
+        assert d.speedup == 3.0  # exact: 300/100
+
+    def test_frozen(self):
+        from orchestrator.verify_runner import ColdWarmVerifyDelta
+        d = ColdWarmVerifyDelta(cold_secs=300.0, warm_secs=100.0)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            d.cold_secs = 999.0  # type: ignore[misc]
+
+    def test_to_dict_from_dict_round_trip(self):
+        from orchestrator.verify_runner import ColdWarmVerifyDelta
+        d = ColdWarmVerifyDelta(cold_secs=300.0, warm_secs=100.0)
+        assert ColdWarmVerifyDelta.from_dict(d.to_dict()) == d
+
+    def test_json_codec_round_trip(self):
+        from orchestrator.verify_runner import ColdWarmVerifyDelta, delta_from_json, delta_to_json
+        d = ColdWarmVerifyDelta(cold_secs=300.0, warm_secs=100.0)
+        assert delta_from_json(delta_to_json(d)) == d
+
+    def test_json_sort_keys(self):
+        """JSON output must have sort_keys=True (canonical form)."""
+        from orchestrator.verify_runner import ColdWarmVerifyDelta, delta_to_json
+        d = ColdWarmVerifyDelta(cold_secs=300.0, warm_secs=100.0)
+        serialised = delta_to_json(d)
+        parsed = json.loads(serialised)
+        assert list(parsed.keys()) == sorted(parsed.keys())
+
+    def test_warm_equal_cold_speedup_one(self):
+        """~1× warm expectation: speedup=1.0 when warm==cold (PRD G6, no threshold)."""
+        from orchestrator.verify_runner import ColdWarmVerifyDelta
+        d = ColdWarmVerifyDelta(cold_secs=200.0, warm_secs=200.0)
+        assert d.speedup == 1.0
+
+    def test_warm_zero_speedup_zero(self):
+        """warm_secs=0 returns 0.0 (guard, documented in docstring)."""
+        from orchestrator.verify_runner import ColdWarmVerifyDelta
+        d = ColdWarmVerifyDelta(cold_secs=300.0, warm_secs=0.0)
+        assert d.speedup == 0.0
+
+
+# ---------------------------------------------------------------------------
+# κ step-15: public-surface __all__ — κ additions present and importable
+# ---------------------------------------------------------------------------
+
+
+class TestSccacheKappaPublicSurface:
+    """All κ-added verify_runner public names are in __all__ and importable."""
+
+    def test_all_new_kappa_names_in_dunder_all(self):
+        import orchestrator.verify_runner as vr_mod
+        expected = {
+            'SccacheStats',
+            'parse_sccache_stats',
+            'capture_sccache_stats',
+            'ColdWarmVerifyDelta',
+            'delta_to_json',
+            'delta_from_json',
+        }
         missing = expected - set(vr_mod.__all__)
         assert not missing, f"Missing from __all__: {sorted(missing)}"
         for name in expected:

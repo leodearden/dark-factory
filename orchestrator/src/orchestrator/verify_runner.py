@@ -91,6 +91,13 @@ __all__ = [
     "DriftVerdict",
     "DriftCheckResult",
     "DriftDetector",
+    # κ additions
+    "SccacheStats",
+    "parse_sccache_stats",
+    "capture_sccache_stats",
+    "ColdWarmVerifyDelta",
+    "delta_to_json",
+    "delta_from_json",
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
@@ -295,7 +302,10 @@ def build_merge_verify_spec(
         verify_commands=verify_commands,
         unscoped_typecheck=UnscopedTypecheckSpec(commands=unscoped_commands, block_on_timeout=True),
         task_files=task_files,
-        verify_env=dict(config.verify_env) if config.verify_env else {},
+        # κ: read effective_verify_env (the single merge rule) so the spec shipped
+        # to the laptop carries the shared sccache backend even for direct-constructed
+        # (eval/test) configs that never call load_config.
+        verify_env=dict(config.effective_verify_env),
         cold_timeout_secs=float(cold_timeout),
         is_merge_verify=True,
     )
@@ -1417,3 +1427,207 @@ def render_parity_report(report: VerdictParityReport) -> str:
             lines.append(f"- `{sha}`")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# κ: SccacheStats + parse_sccache_stats + capture_sccache_stats
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SccacheStats:
+    """Parsed output of ``sccache --show-stats`` (κ signal: shared-backend hit rate).
+
+    Fields
+    ------
+    compile_requests:  Total compilation requests processed.
+    cache_hits:        Aggregate cache hits (NOT the per-language breakdown).
+    cache_misses:      Total cache misses.
+    cache_location:    Raw ``Cache location`` value from the stats output, e.g.
+                       ``"Redis: redis://orch:6379"`` or ``"Local disk: /path"``.
+    probe_ok:          True when the ``sccache --show-stats`` subprocess exited 0;
+                       False when the daemon was unreachable or returned non-zero.
+                       Defaults to True (parse_sccache_stats never sets it to False;
+                       capture_sccache_stats sets it based on the subprocess rc).
+
+    Properties
+    ----------
+    hit_rate:           cache_hits / (cache_hits + cache_misses); 0.0 when denominator 0.
+    is_shared_backend:  True when cache_location is non-empty and does NOT start with
+                        'local disk' (case-insensitive).  Makes remote_hit_rate > 0 a
+                        faithful proxy for "served by the shared backend."
+    remote_hit_rate:    hit_rate when is_shared_backend, else 0.0.
+    remote_hits:        cache_hits when is_shared_backend, else 0.
+    """
+
+    compile_requests: int
+    cache_hits: int
+    cache_misses: int
+    cache_location: str
+    probe_ok: bool = True
+
+    @property
+    def hit_rate(self) -> float:
+        denom = self.cache_hits + self.cache_misses
+        return self.cache_hits / denom if denom > 0 else 0.0
+
+    @property
+    def is_shared_backend(self) -> bool:
+        loc = self.cache_location.strip().lower()
+        return bool(loc) and not loc.startswith('local disk')
+
+    @property
+    def remote_hit_rate(self) -> float:
+        return self.hit_rate if self.is_shared_backend else 0.0
+
+    @property
+    def remote_hits(self) -> int:
+        return self.cache_hits if self.is_shared_backend else 0
+
+
+def parse_sccache_stats(output: str) -> SccacheStats:
+    """Parse the text output of ``sccache --show-stats`` into a SccacheStats.
+
+    Uses EXACT label matching so the ``Cache hits`` aggregate is not confused
+    with ``Cache hits (Rust)`` or other per-language breakdown lines.
+    """
+    compile_requests = 0
+    cache_hits = 0
+    cache_misses = 0
+    cache_location = ''
+
+    # Numeric labels: extract the LAST whitespace-delimited token as an integer.
+    # We require EXACT label == expected text (before the numeric column) so
+    # "Cache hits (Rust)" is never mistaken for "Cache hits".
+    def _extract_int(label_expected: str, s: str) -> int | None:
+        if not s.startswith(label_expected):
+            return None
+        # The remainder after the label must consist of EXACTLY ONE token and
+        # that token must be an integer.  This rejects both parenthesised
+        # variants ("Cache hits (Rust)") and suffix-word variants like
+        # "Compile requests executed   N" that also start with the expected
+        # prefix but carry extra words before the numeric column.
+        remainder = s[len(label_expected):]
+        if not remainder:
+            return None
+        toks = remainder.split()
+        if len(toks) != 1:
+            return None
+        try:
+            return int(toks[0])
+        except ValueError:
+            return None
+
+    for line in output.splitlines():
+        # Strip leading whitespace; skip blank lines.
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # ``Cache location`` is a string value — extract the remainder after label.
+        if stripped.startswith('Cache location'):
+            rest = stripped[len('Cache location'):].strip()
+            # Remove a leading colon if present (e.g. "Cache location      Redis: …")
+            if rest.startswith(':'):
+                rest = rest[1:].strip()
+            cache_location = rest
+            continue
+
+        v = _extract_int('Compile requests', stripped)
+        if v is not None:
+            compile_requests = v
+            continue
+
+        v = _extract_int('Cache hits', stripped)
+        if v is not None:
+            cache_hits = v
+            continue
+
+        v = _extract_int('Cache misses', stripped)
+        if v is not None:
+            cache_misses = v
+
+    return SccacheStats(
+        compile_requests=compile_requests,
+        cache_hits=cache_hits,
+        cache_misses=cache_misses,
+        cache_location=cache_location,
+    )
+
+
+async def capture_sccache_stats(
+    run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
+) -> SccacheStats:
+    """Probe the local sccache daemon and return a SccacheStats.
+
+    This is the operational hook for the κ signal ("sccache --show-stats after
+    a warm run").  Callers compute ``remote_hit_rate`` on the result to verify
+    that the shared backend is being used.
+
+    Parameters
+    ----------
+    run:
+        Injected async callable ``(argv, *, cwd=None) -> (rc, stdout, stderr)``.
+        Defaults to ``_default_subprocess_run`` for local capture; pass an
+        ssh-wrapping adapter for remote capture.
+    """
+    _run = run if run is not None else _default_subprocess_run
+    rc, stdout, _ = await _run(['sccache', '--show-stats'])
+    stats = parse_sccache_stats(stdout)
+    if rc != 0:
+        # Daemon absent or returned non-zero — surface the failure so callers
+        # can distinguish a probe error from a legitimately cold shared cache
+        # (which would also yield all-zero stats but with probe_ok=True).
+        return dataclasses.replace(stats, probe_ok=False)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# κ: ColdWarmVerifyDelta + delta_to_json / delta_from_json
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ColdWarmVerifyDelta:
+    """Cold-vs-warm laptop-verify wall-time delta (κ signal, PRD G6).
+
+    Records the measured cold/warm times and the derived speedup ratio.
+    Per PRD G6 the ~1× warm multiplier is an EXPECTATION, not a gate:
+    this type carries no threshold assertion.
+
+    Fields
+    ------
+    cold_secs:  Wall-clock time for a cold (no shared-cache) verify run.
+    warm_secs:  Wall-clock time for a warm (shared-cache) verify run.
+
+    Properties
+    ----------
+    speedup:    cold_secs / warm_secs; 0.0 when warm_secs == 0 (documented guard).
+    """
+
+    cold_secs: float
+    warm_secs: float
+
+    @property
+    def speedup(self) -> float:
+        """cold_secs / warm_secs; 0.0 when warm_secs == 0 (zero-guard, not inf)."""
+        if self.warm_secs == 0.0:
+            return 0.0
+        return self.cold_secs / self.warm_secs
+
+    def to_dict(self) -> dict:
+        return {'cold_secs': self.cold_secs, 'warm_secs': self.warm_secs}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ColdWarmVerifyDelta:
+        return cls(cold_secs=float(d['cold_secs']), warm_secs=float(d['warm_secs']))
+
+
+def delta_to_json(d: ColdWarmVerifyDelta) -> str:
+    """Serialize a ColdWarmVerifyDelta to a byte-canonical JSON string (sort_keys=True)."""
+    return json.dumps(d.to_dict(), sort_keys=True, ensure_ascii=False)
+
+
+def delta_from_json(s: str) -> ColdWarmVerifyDelta:
+    """Deserialize a ColdWarmVerifyDelta from a JSON string produced by delta_to_json."""
+    return ColdWarmVerifyDelta.from_dict(json.loads(s))

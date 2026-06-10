@@ -376,6 +376,44 @@ class EscalationConfig(BaseModel):
 from shared.config_models import AccountConfig, UsageCapConfig  # noqa: F401, E402
 
 
+class SccacheConfig(BaseModel):
+    """Shared sccache backend configuration (κ: the laptop warm multiplier).
+
+    sccache selects its backend entirely via environment variables:
+    - SCCACHE_REDIS           — Redis (LAN-local; PRD §10 Open Q1 suggestion)
+    - SCCACHE_MEMCACHED       — Memcached
+    - SCCACHE_BUCKET + SCCACHE_ENDPOINT — S3-compatible object store
+    - SCCACHE_GCS_BUCKET      — GCS bucket
+
+    Expressing the backend as a raw env-var mapping covers all four backends
+    with zero per-backend code and lets ops switch by editing config only.
+
+    ``enabled=True`` with an empty ``backend_env`` is rejected by the
+    model_validator so a half-configured knob fails fast at load time.
+    """
+
+    enabled: bool = Field(default=False)
+    backend_env: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode='after')
+    def _reject_enabled_with_empty_backend(self) -> 'SccacheConfig':
+        if self.enabled and not self.backend_env:
+            raise ValueError(
+                'SccacheConfig.enabled is True but backend_env is empty; '
+                'set at least one SCCACHE_* environment variable (e.g. '
+                '{SCCACHE_REDIS: redis://host:6379}) or set enabled: false.'
+            )
+        return self
+
+    def env_overrides(self) -> dict[str, str]:
+        """Return a copy of backend_env when enabled, else an empty dict.
+
+        Returns a COPY so callers can mutate the result without affecting
+        this model instance.
+        """
+        return dict(self.backend_env) if self.enabled else {}
+
+
 class GitConfig(BaseModel):
     """Git operations configuration."""
 
@@ -1197,6 +1235,11 @@ class OrchestratorConfig(BaseSettings):
     # Git
     git: GitConfig = Field(default_factory=GitConfig)
 
+    # κ: shared sccache backend (the laptop warm multiplier)
+    # An absent stanza in orchestrator.yaml yields the disabled default;
+    # no defaults.yaml edit is required.
+    sccache: SccacheConfig = Field(default_factory=SccacheConfig)
+
     # Usage cap handling
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
 
@@ -1239,6 +1282,24 @@ class OrchestratorConfig(BaseSettings):
                 'steward_completion_timeout in your orchestrator.yaml.'
             )
         return self
+
+    @property
+    def effective_verify_env(self) -> dict[str, str]:
+        """Merge sccache.env_overrides() with verify_env; verify_env wins on conflict.
+
+        This is the SINGLE merge rule for the shared sccache backend (κ).
+        Both consumers read through here:
+        - Local path: load_config folds this back into config.verify_env so that
+          run_scoped_verification (verify.py, OUT OF SCOPE) sees the backend.
+        - Remote/laptop path: build_merge_verify_spec reads this property directly
+          so the spec shipped over the wire carries the shared backend.
+
+        Distinct keys (RUSTC_WRAPPER in verify_env, SCCACHE_REDIS in backend_env)
+        simply union.  A shared key uses the verify_env value — an operator who
+        hand-sets a single SCCACHE_* var in verify_env beats the structured
+        shared-backend default without having to disable the whole knob.
+        """
+        return {**self.sccache.env_overrides(), **self.verify_env}
 
     @property
     def module_configs_or_empty(self) -> dict[str, ModuleConfig]:
@@ -1359,6 +1420,12 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
 
     os.environ['ORCH_CONFIG_PATH'] = str(config_path)
     config = OrchestratorConfig()
+    # κ: fold the shared sccache backend into verify_env so the LOCAL merge-verify
+    # path (run_scoped_verification in verify.py reads config.verify_env) points at
+    # the shared backend without requiring verify.py changes.  The assignment is
+    # idempotent w.r.t. effective_verify_env (it re-merges the same keys with
+    # verify_env winning), and is a no-op when sccache is disabled.
+    config.verify_env = config.effective_verify_env
     config._module_configs = _discover_module_configs(config.project_root)
     # Warn when a discovered config prefix is deeper than lock_depth: its test/lint
     # commands will run in full verification, but scheduler and workflow consumers

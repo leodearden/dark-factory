@@ -12,6 +12,7 @@ from orchestrator.config import (
     ConfigRequiredError,
     ModuleConfig,
     OrchestratorConfig,
+    SccacheConfig,
     TimeoutsConfig,
     _deep_merge,
     _discover_module_configs,
@@ -1009,3 +1010,130 @@ class TestMergeVerifyStormGuardFields:
     def test_max_concurrent_module_verifies_floor(self):
         with pytest.raises(ValidationError):
             OrchestratorConfig(max_concurrent_module_verifies=0)
+
+
+# ---------------------------------------------------------------------------
+# κ step-1: SccacheConfig
+# ---------------------------------------------------------------------------
+
+
+class TestSccacheConfig:
+    """SccacheConfig — κ shared sccache backend config model."""
+
+    def test_defaults(self):
+        sc = SccacheConfig()
+        assert sc.enabled is False
+        assert sc.backend_env == {}
+
+    def test_env_overrides_disabled_returns_empty(self):
+        sc = SccacheConfig()
+        assert sc.env_overrides() == {}
+
+    def test_env_overrides_enabled_returns_copy_of_backend_env(self):
+        sc = SccacheConfig(enabled=True, backend_env={'SCCACHE_REDIS': 'redis://h:6379'})
+        result = sc.env_overrides()
+        assert result == {'SCCACHE_REDIS': 'redis://h:6379'}
+        # mutating the return must not affect the model
+        result['EXTRA'] = 'x'
+        assert 'EXTRA' not in sc.backend_env
+
+    def test_env_overrides_redis_backend(self):
+        sc = SccacheConfig(enabled=True, backend_env={'SCCACHE_REDIS': 'redis://h:6379'})
+        assert sc.env_overrides() == {'SCCACHE_REDIS': 'redis://h:6379'}
+
+    def test_enabled_with_empty_backend_raises(self):
+        with pytest.raises(ValidationError):
+            SccacheConfig(enabled=True, backend_env={})
+
+    def test_enabled_with_empty_backend_explicit_empty_raises(self):
+        """enabled=True with no backend_env argument also raises (default is {})."""
+        with pytest.raises(ValidationError):
+            SccacheConfig(enabled=True)
+
+
+# ---------------------------------------------------------------------------
+# κ step-3: OrchestratorConfig sccache field + effective_verify_env
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorConfigSccache:
+    """OrchestratorConfig.sccache field and effective_verify_env property."""
+
+    def test_sccache_defaults_to_disabled(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        assert isinstance(config.sccache, SccacheConfig)
+        assert config.sccache.enabled is False
+
+    def test_effective_verify_env_equals_verify_env_when_disabled(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
+        assert config.effective_verify_env == config.verify_env
+
+    def test_effective_verify_env_merges_sccache_backend(self):
+        config = OrchestratorConfig(
+            verify_env={'RUSTC_WRAPPER': 'sccache'},
+            sccache=SccacheConfig(enabled=True, backend_env={'SCCACHE_REDIS': 'redis://h:6379'}),
+        )
+        assert config.effective_verify_env == {
+            'RUSTC_WRAPPER': 'sccache',
+            'SCCACHE_REDIS': 'redis://h:6379',
+        }
+
+    def test_verify_env_wins_on_key_conflict(self):
+        """verify_env values beat backend_env values on shared keys."""
+        config = OrchestratorConfig(
+            verify_env={'SCCACHE_REDIS': 'redis://override:1234'},
+            sccache=SccacheConfig(
+                enabled=True,
+                backend_env={'SCCACHE_REDIS': 'redis://default:6379'},
+            ),
+        )
+        assert config.effective_verify_env['SCCACHE_REDIS'] == 'redis://override:1234'
+
+
+# ---------------------------------------------------------------------------
+# κ step-5: load_config fold — sccache backend folded into verify_env
+# ---------------------------------------------------------------------------
+
+
+class TestLoadConfigSccacheFold:
+    """load_config folds sccache.env_overrides() into config.verify_env."""
+
+    def test_fold_adds_backend_to_verify_env(self, tmp_path):
+        cfg_path = tmp_path / 'orchestrator.yaml'
+        cfg_path.write_text(yaml.dump({
+            'verify_env': {'RUSTC_WRAPPER': 'sccache'},
+            'sccache': {
+                'enabled': True,
+                'backend_env': {'SCCACHE_REDIS': 'redis://orch:6379'},
+            },
+        }))
+        config = load_config(cfg_path)
+        # Both keys must appear in verify_env after fold
+        assert config.verify_env.get('RUSTC_WRAPPER') == 'sccache'
+        assert config.verify_env.get('SCCACHE_REDIS') == 'redis://orch:6379'
+
+    def test_fold_verify_env_wins_on_conflict(self, tmp_path):
+        """verify_env values survive the fold even when key is also in backend_env."""
+        cfg_path = tmp_path / 'orchestrator.yaml'
+        cfg_path.write_text(yaml.dump({
+            'verify_env': {'SCCACHE_REDIS': 'redis://explicit:1111'},
+            'sccache': {
+                'enabled': True,
+                'backend_env': {'SCCACHE_REDIS': 'redis://default:6379'},
+            },
+        }))
+        config = load_config(cfg_path)
+        assert config.verify_env['SCCACHE_REDIS'] == 'redis://explicit:1111'
+
+    def test_fold_no_op_when_sccache_disabled(self, tmp_path):
+        """When sccache is disabled, verify_env is unchanged."""
+        cfg_path = tmp_path / 'orchestrator.yaml'
+        cfg_path.write_text(yaml.dump({
+            'verify_env': {'RUSTC_WRAPPER': 'sccache'},
+        }))
+        config = load_config(cfg_path)
+        assert list(config.verify_env.keys()) == ['RUSTC_WRAPPER']
