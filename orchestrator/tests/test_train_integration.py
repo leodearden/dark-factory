@@ -29,17 +29,221 @@ step-2.  Until then, calling these helpers raises NameError → step-1 is RED.
 from __future__ import annotations
 
 import asyncio
+import shutil
+from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import patch
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
     GroupMergeRequest,
+    MergeOutcome,
     MergeRequest,
     MergeWorker,
 )
 from orchestrator.verify import run_scoped_verification
+
+# ---------------------------------------------------------------------------
+# Fixture constants
+# ---------------------------------------------------------------------------
+
+# Canonical location of the atomic_train cargo workspace fixture tree.
+_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "atomic_train"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures: cargo availability + shared CARGO_TARGET_DIR
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def cargo_or_skip():
+    """Skip when cargo is not installed on this machine.
+
+    Models conftest.py skip pattern.  skip≠fail: the gate exits 0 on
+    rust-less machines while providing full coverage where cargo exists.
+    """
+    if shutil.which("cargo") is None:
+        pytest.skip("cargo unavailable")
+
+
+@pytest.fixture(scope="module")
+def shared_cargo_target(tmp_path_factory):
+    """One tmp CARGO_TARGET_DIR shared by all tests in this module.
+
+    Compiling the trivial workspace once; incremental member builds are
+    sub-second, keeping the cargo invocations tractable.
+    """
+    return tmp_path_factory.mktemp("cargo_target")
+
+
+# ---------------------------------------------------------------------------
+# Helper: git-init a workspace repo seeded with the cargo fixture
+# ---------------------------------------------------------------------------
+
+
+async def seed_workspace_repo(tmp_path: Path) -> Path:
+    """Git-init a fresh repo, copy atomic_train fixture in, make initial commit.
+
+    Returns the repo Path (same as *tmp_path*).
+    """
+    repo = tmp_path
+    await _run(["git", "init", "-b", "main"], cwd=repo)
+    await _run(["git", "config", "user.email", "test@test.com"], cwd=repo)
+    await _run(["git", "config", "user.name", "Test"], cwd=repo)
+    shutil.copytree(str(_FIXTURE_ROOT), str(repo), dirs_exist_ok=True)
+    await _run(["git", "add", "-A"], cwd=repo)
+    await _run(["git", "commit", "-m", "initial workspace"], cwd=repo)
+    return repo
+
+
+# ---------------------------------------------------------------------------
+# Helper: create one stacked train member branch
+# ---------------------------------------------------------------------------
+
+
+async def make_stacked_member(
+    git_ops: GitOps,
+    name: str,
+    base_ref: str,
+    edit_fn: Callable[[Path], Any],
+) -> tuple[Path, str]:
+    """Create branch ``task/<name>`` off *base_ref*, apply *edit_fn*, commit.
+
+    Returns ``(worktree_path, head_sha)``.
+    """
+    full_branch = f"{git_ops.config.branch_prefix}{name}"
+    wt_path = git_ops.worktree_base / name
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    await _run(
+        ["git", "worktree", "add", "-b", full_branch, str(wt_path), base_ref],
+        cwd=git_ops.project_root,
+    )
+    await _run(["git", "config", "user.email", "test@test.com"], cwd=wt_path)
+    await _run(["git", "config", "user.name", "Test"], cwd=wt_path)
+
+    edit_fn(wt_path)
+
+    await git_ops.commit(wt_path, f"Add {name} task output")
+    _, head_sha, _ = await _run(["git", "rev-parse", "HEAD"], cwd=wt_path)
+    return wt_path, head_sha.strip()
+
+
+# ---------------------------------------------------------------------------
+# Helper: assemble a GroupMergeRequest
+# ---------------------------------------------------------------------------
+
+
+def build_group_merge_request(
+    *,
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    train_id: str,
+    member_names: list[str],
+    tip_name: str,
+    tip_worktree: Path,
+) -> GroupMergeRequest:
+    """Return a GroupMergeRequest wired with AsyncMock status_check / mark_member_done.
+
+    *member_names* must be ordered root-to-tip (inclusive).
+    status_check returns ``{name: 'merge-deferred'}`` for all members.
+    """
+    status_check = AsyncMock(
+        return_value={name: "merge-deferred" for name in member_names}
+    )
+    mark_member_done = AsyncMock()
+
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+
+    return GroupMergeRequest(
+        task_id=tip_name,
+        branch=tip_name,
+        worktree=tip_worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=future,
+        train_id=train_id,
+        member_task_ids=list(member_names),
+        tip_branch=tip_name,
+        tip_task_id=tip_name,
+        status_check=status_check,
+        mark_member_done=mark_member_done,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper: build OrchestratorConfig for cargo workspace train tests
+# ---------------------------------------------------------------------------
+
+
+def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
+    """Return OrchestratorConfig with cargo test --workspace --quiet as test_command.
+
+    Key settings:
+    - push_after_advance=False  (no real remote needed)
+    - test_command='cargo test --workspace --quiet'
+    - lint_command='true', type_check_command='true' (no-op)
+    - verify_env={'CARGO_TARGET_DIR': str(target_dir)} (shared incremental build cache)
+    - verify_command_timeout_secs=300
+    """
+    return OrchestratorConfig(
+        project_root=repo,
+        test_command="cargo test --workspace --quiet",
+        lint_command="true",
+        type_check_command="true",
+        verify_env={"CARGO_TARGET_DIR": str(target_dir)},
+        verify_command_timeout_secs=300.0,
+        git=GitConfig(
+            main_branch="main",
+            branch_prefix="task/",
+            remote="origin",
+            worktree_dir=".worktrees",
+            push_after_advance=False,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# _SpyEventStore: in-memory event capture
+# ---------------------------------------------------------------------------
+
+
+class _SpyEventStore:
+    """Minimal event store that collects emitted events for inspection.
+
+    Provides the same ``emit`` interface as EventStore but stores events
+    in-memory.  Adapted from test_atomic_train_merge.py:2260.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def emit(
+        self,
+        event_type: Any,
+        *,
+        task_id: Any = None,
+        phase: Any = None,
+        role: Any = None,
+        data: dict | None = None,
+        cost_usd: Any = None,
+        duration_ms: Any = None,
+    ) -> None:
+        self.events.append({
+            "event_type": str(event_type),
+            "task_id": task_id,
+            "data": data or {},
+        })
+
+    def by_type(self, event_type_str: str) -> list[dict]:
+        return [e for e in self.events if e["event_type"] == event_type_str]
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +283,6 @@ class TestTrainIntegrationB1B7:
         """
         repo = await seed_workspace_repo(tmp_path)
         config = make_train_config(repo, shared_cargo_target)
-        from orchestrator.git_ops import GitOps
         git_ops = GitOps(config.git, repo)
 
         # Anchor edits crate_a; tip edits crate_b — different crates → non-overlapping.
@@ -91,7 +294,6 @@ class TestTrainIntegrationB1B7:
             lib = wt / "crate_b" / "src" / "lib.rs"
             lib.write_text(lib.read_text() + "\npub fn b1_tip_output() -> u32 { 2 }\n")
 
-        from orchestrator.git_ops import _run
         _, main_sha, _ = await _run(["git", "rev-parse", "main"], cwd=repo)
         main_sha = main_sha.strip()
 
