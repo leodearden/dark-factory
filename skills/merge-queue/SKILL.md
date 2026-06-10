@@ -64,8 +64,9 @@ Parameters:
 
 The call returns with **either** a **terminal** status **or** a **non-terminal** status:
 
-- **Terminal at submit time** (`done`, `already_merged`, `conflict`, `blocked`, `unknown_branch`, `failed`): the merge resolved within the bounded wait. Jump straight to step 4.
+- **Terminal at submit time** (`done`, `already_merged`, `conflict`, `blocked`, `unknown_branch`, `failed`, `superseded`): the merge resolved within the bounded wait. Jump straight to step 4.
   - `already_merged` means the branch tip was already an ancestor of main — treat it the same as `done`.
+  - `superseded` means your request was absorbed into a coalesced train before it could be individually processed. The response includes `superseded_by: "<train_request_id>"`. Re-poll the train request immediately (step 4 / follow-the-train protocol below).
 
 - **Non-terminal** (`queued`, `attached`): the submission succeeded as **durable intent** — the merge worker has accepted the request and will process it. This is **not a failure**. The `request_id` in the response identifies your submission. Proceed to "Poll for completion" below.
   - `attached` means your submission was coalesced with an already-in-flight request for the same branch; you share that request's `request_id`.
@@ -82,7 +83,15 @@ mcp__escalation__merge_status(request_id="<request_id from submit>")
 
 **Live states** (`queued`, `verifying`, `gate`, `finalizing`) — keep polling.
 
-**Terminal states** (`done`, `conflict`, `blocked`, `abandoned`) — proceed to step 4.
+**Terminal states** (`done`, `conflict`, `blocked`, `abandoned`, `superseded`) — proceed to step 4.
+
+**`state: "superseded"`** — Your request was absorbed into a coalesced train. The response includes `superseded_by: "<train_request_id>"`. **Do NOT fall back to direct merge** — the train is already in flight and a direct merge would race it. Follow the train:
+
+```
+mcp__escalation__merge_status(request_id="<superseded_by value>")
+```
+
+Poll the train request with the same 15 s→60 s backoff until it reaches a terminal state (`done`, `conflict`, `blocked`, `abandoned`). Your absorbed branch lands when the train lands. Handle the train's terminal state per step 4.
 
 **`state: "unknown"`** — the orchestrator restarted and the retention ring no longer holds this request. The response includes `hint: "check git log main"`. Run:
 ```bash
@@ -123,6 +132,16 @@ The outcome arrives from either the submit call (terminal at submit time) or the
 **`unknown_branch`** — The branch ref does not exist in the target repository (surfaces from the submit call only). Likely causes: the branch name is wrong, the branch was deleted before submission, or the request was routed to the wrong repo's escalation MCP. Verify the branch exists locally (`git branch -a`) and that you're submitting to the correct escalation server.
 
 **`abandoned`** — The submission was cancelled via `merge_cancel` before it finished (surfaces from the poll loop). If the merge is still wanted, resubmit (go back to step 3); otherwise, no further action is needed.
+
+**`superseded`** — Your request was absorbed into a coalesced train (surfaces from either the submit call or the poll loop). The response includes `superseded_by: "<train_request_id>"`.
+
+**Critical: do NOT fall back to a direct merge or resubmit on `superseded`** — doing so would race the in-flight train that already carries your branch's work. Follow the train instead:
+
+1. Take the `superseded_by` value from the response.
+2. Poll `merge_status(request_id=<superseded_by>)` with the same 15 s→60 s backoff.
+3. When the train reaches a terminal state, handle it exactly as you would handle that status for your own request (e.g., `done` → update task status; `conflict` → resolve and resubmit your branch).
+
+Your absorbed branch lands when the train lands.
 
 ### 5. Abandoning a submission (merge_cancel)
 
@@ -170,5 +189,6 @@ After a successful direct merge:
 | Outcome `conflict` | Fix in worktree, resubmit |
 | Outcome `blocked` | Read reason, fix, resubmit |
 | Outcome `done` or `already_merged` | Update task status, clean up |
+| Outcome `superseded` | Re-poll `merge_status(superseded_by)` until terminal; do NOT direct-merge or resubmit |
 | Abandon a queued submission | `merge_cancel(request_id)` — the only explicit-cancellation path |
 | Unsure if orchestrator is running | Probe `get_pending_escalations()` — if it responds, use the queue |
