@@ -5714,3 +5714,59 @@ class TestRecoverRedMain:
         assert not any(c[:2] == ['sh', '-c'] for c in post_cmds), (
             f'Unexpected sh -c after failed update-ref with unmark unset; post: {post_cmds}'
         )
+
+    async def test_recover_syncs_working_tree_when_on_main(self, git_repo: Path):
+        """After a successful move, read-tree fires when project_root is on main.
+
+        Mirrors advance_main's post-advance sync (TestWorkingTreeSync).
+        """
+        ops = GitOps(
+            GitConfig(main_branch='main', branch_prefix='task/', push_after_advance=False),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+        # git_repo starts on main (git init -b main in _setup_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'rewound', f'Expected rewound, got {result!r}'
+        assert any(
+            c[:3] == ['git', 'read-tree', '-u'] for c in recorded
+        ), f'read-tree not called when on main; commands: {recorded}'
+
+    async def test_recover_skips_read_tree_when_not_on_main(self, git_repo: Path):
+        """read-tree is NOT called when project_root is not on main."""
+        ops = GitOps(
+            GitConfig(main_branch='main', branch_prefix='task/', push_after_advance=False),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        # Detach HEAD from main so symbolic-ref returns non-main
+        await _run(['git', 'checkout', '--detach', expected_main], cwd=git_repo)
+        # Now move main backward manually so the CAS can succeed
+        # (recover_red_main's update-ref uses expected_main as old-value;
+        # HEAD is detached so is_on_main will be False)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'rewound', f'Expected rewound, got {result!r}'
+        assert not any(
+            c[:3] == ['git', 'read-tree', '-u'] for c in recorded
+        ), f'read-tree called when not on main; commands: {recorded}'
