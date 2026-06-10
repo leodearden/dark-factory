@@ -5220,6 +5220,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ejected: list[str] = stack_result.ejected
 
         if len(survivors) < 2:
+            # Abort cleanly: record debounce sig; no buffer mutation, no future
+            # resolution, no event emitted.  Non-selected and ejected members
+            # remain in _lane_buffers with unresolved futures (they may yet join a
+            # future train when a new stackable partner arrives and re-arms the sig).
             self._last_coalesce_signature = frozenset(c.request_id for c in candidates)
             return False
 
