@@ -1930,6 +1930,7 @@ class TestMergeCancel:
                 self.request_id = request_id
                 self.state = state
                 self.finished_at = 1_700_000_000.0  # epoch float — normalised by _epoch_to_iso8601
+                self.superseded_by = None
 
         class FakeRetentionRing:
             def get(self, request_id: str):

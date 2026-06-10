@@ -1129,6 +1129,8 @@ def create_server(
             return 'conflict'
         if raw == 'abandoned':
             return 'abandoned'
+        if raw == 'superseded':
+            return 'superseded'
         # blocked / wip_halted / wip_recovery_no_advance / unmerged_state /
         # unknown_branch / error → blocked
         return 'blocked'
@@ -1177,11 +1179,14 @@ def create_server(
         if ring is not None and request_id is not None:
             rec = ring.get(request_id)
             if rec is not None:
-                return _map_terminal_state(rec.state), {
+                meta: dict = {
                     'request_id': rec.request_id,
                     'outcome': rec.state,
                     'finished_at': _epoch_to_iso8601(rec.finished_at),
                 }
+                if rec.superseded_by is not None:
+                    meta['superseded_by'] = rec.superseded_by
+                return _map_terminal_state(rec.state), meta
 
         # Tier 3: event store (supports all three lookup keys).
         if event_store is not None:
@@ -1265,13 +1270,16 @@ def create_server(
         durable = _durable_terminal_state(request_id, branch, task_id)
         if durable is not None:
             coarse_state, meta = durable
-            return {
+            resp: dict = {
                 'state': coarse_state,
                 'request_id': meta['request_id'],
                 'generation': 1,
                 'outcome': meta['outcome'],
                 'finished_at': meta['finished_at'],
             }
+            if meta.get('superseded_by') is not None:
+                resp['superseded_by'] = meta['superseded_by']
+            return resp
 
         # Tier 4: honest unknown
         return {
