@@ -192,7 +192,8 @@ class TestStartMergeWorkerCallsLivenessGuard:
 
             await h._start_merge_worker()
 
-        mock_guard.assert_called_once_with(h.config, merge_ahead_bound=1, num_hosts=1)
+        # task-1729: call site drops raw _k — heartbeat floor makes K irrelevant
+        mock_guard.assert_called_once_with(h.config)
 
 
 @pytest.mark.asyncio

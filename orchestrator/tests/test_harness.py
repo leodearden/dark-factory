@@ -16,7 +16,7 @@ import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
 from orchestrator.merge_queue import MergeLivenessConfigError
 
@@ -201,4 +201,37 @@ class TestHarnessMergeLivenessGuard:
         finally:
             # Explicit teardown: stop the worker and await the task so the test
             # cannot leave dangling asyncio tasks or open resources.
+            await harness._stop_merge_worker()
+
+    @pytest.mark.asyncio
+    async def test_crash_config_starts_worker(self, tmp_path: Path) -> None:
+        """K=2 config (one enabled runner) + cold_timeout=7200 must NOT raise.
+
+        Regression-lock: stays green under BOTH the old per-host model
+        (per_host = ceil(2/2) = 1 → worst_case = 7200 < 8100 → safe) and the
+        new heartbeat-floor model (floor = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE
+        = 600 < 8100 → safe).  Guards against a future refactor accidentally
+        re-coupling K to the liveness check.
+        """
+        r1 = VerifyRunnerConfig(name='r1', ssh_host='h1.local', git_remote='remote1')
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_runners=[r1],                           # → K = 1 + 1 = 2
+            merge_verify_cold_command_timeout_secs=7200,   # shipped default; safe under both models
+        )
+        harness = Harness(config)
+
+        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
+            pass
+
+        with patch(
+            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
+            _noop_run,
+        ):
+            # Must NOT raise MergeLivenessConfigError under either model
+            await harness._start_merge_worker()
+
+        try:
+            assert harness._merge_worker_task is not None
+        finally:
             await harness._stop_merge_worker()
