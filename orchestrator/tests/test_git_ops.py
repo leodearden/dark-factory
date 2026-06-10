@@ -5043,3 +5043,61 @@ class TestParseDiffLineRanges:
         fn = self._fn()
         result = fn(CANNED_DIFF_TWO_FILES)
         assert set(result.keys()) == {'src/foo.rs', 'src/bar.rs'}
+
+
+# ---------------------------------------------------------------------------
+# get_changed_line_ranges — async method unit tests (step-5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGetChangedLineRanges:
+    """Unit tests for GitOps.get_changed_line_ranges."""
+
+    async def test_invokes_correct_git_command(self, git_config, git_repo):
+        """Verify that git diff is called with main...ref --unified=0 --no-color."""
+        ops = GitOps(git_config, git_repo)
+        ref = 'task/123'
+
+        captured_cmds: list[list[str]] = []
+
+        async def mock_run(cmd, cwd=None):
+            captured_cmds.append(cmd)
+            return (0, CANNED_DIFF_TWO_FILES, '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            await ops.get_changed_line_ranges(ref)
+
+        assert len(captured_cmds) == 1
+        cmd = captured_cmds[0]
+        assert 'git' in cmd
+        assert 'diff' in cmd
+        assert f'{git_config.main_branch}...{ref}' in cmd
+        assert '--unified=0' in cmd
+        assert '--no-color' in cmd
+
+    async def test_returns_parsed_ranges(self, git_config, git_repo):
+        """Verify the returned dict matches parse_diff_line_ranges output."""
+        from orchestrator.git_ops import parse_diff_line_ranges
+        ops = GitOps(git_config, git_repo)
+        ref = 'task/456'
+
+        async def mock_run(cmd, cwd=None):
+            return (0, CANNED_DIFF_TWO_FILES, '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await ops.get_changed_line_ranges(ref)
+
+        expected = parse_diff_line_ranges(CANNED_DIFF_TWO_FILES)
+        assert result == expected
+
+    async def test_empty_diff_returns_empty_dict(self, git_config, git_repo):
+        ops = GitOps(git_config, git_repo)
+
+        async def mock_run(cmd, cwd=None):
+            return (0, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await ops.get_changed_line_ranges('task/789')
+
+        assert result == {}
