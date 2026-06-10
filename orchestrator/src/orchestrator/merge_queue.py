@@ -42,6 +42,7 @@ from orchestrator.verify import (
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     LocalRunner,
+    RemoteRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
     is_unscoped_gate_failure,
@@ -52,6 +53,38 @@ if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _build_remote_runners(
+    config: 'OrchestratorConfig',
+    cwd: 'str | Path',
+    *,
+    quarantine: 'set[str] | None' = None,
+) -> list[RemoteRunner]:
+    """Build the list of RemoteRunner instances from operator config (Lever C).
+
+    Returns REMOTES ONLY — the LocalRunner trust anchor is prepended by callers
+    since it needs call-specific arguments (worktree path, module configs, etc.).
+
+    Filters out disabled runners (enabled=False) and any runner whose name is in
+    the quarantine set (in-memory worker-level quarantine from DriftDetector).
+    quarantine=None is treated as an empty set (no quarantine).
+
+    _build_verify_runners passes main_branch=config.git.main_branch so the
+    remote host receives a freshness push before the merge-sha transport.
+    """
+    return [
+        RemoteRunner(
+            name=r.name,
+            ssh_host=r.ssh_host,
+            git_remote=r.git_remote,
+            cwd=cwd,
+            config_path=r.config_path,
+            main_branch=config.git.main_branch,
+        )
+        for r in config.enabled_verify_runners
+        if quarantine is None or r.name not in quarantine
+    ]
 
 
 @dataclass
