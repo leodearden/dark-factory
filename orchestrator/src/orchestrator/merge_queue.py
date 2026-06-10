@@ -5808,6 +5808,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     if counts_against_cap:
                         await self._merge_ahead_cap.acquire()
                     try:
+                        self._register_owned_merge_worktree(merge_result.merge_worktree)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=merge_result,
                             merge_wt=merge_result.merge_worktree,
@@ -6343,6 +6344,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # ('pre_rebased AND main unchanged', SpeculativeItem.skip_verify) does
                 # NOT hold; skipping verification would let semantically-unverified
                 # main commits land on the protected branch.  Always verify.
+                self._register_owned_merge_worktree(retry_result.merge_worktree)
                 return SpeculativeItem(
                     request=req, merge_result=retry_result,
                     merge_wt=retry_result.merge_worktree,
@@ -6465,6 +6467,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 and new_tree is not None
                 and new_tree == prev_merge_tree
             )
+        self._register_owned_merge_worktree(merge_result.merge_worktree)
         return SpeculativeItem(
             request=req, merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
