@@ -3234,7 +3234,6 @@ Output JSON matching the schema. Every task must appear in the output.
         from orchestrator.merge_queue import (
             _MERGE_AHEAD_BOUND,
             MergeLivenessConfigError,
-            PersistentWorktreeConfigError,
             SpeculativeMergeWorker,
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
