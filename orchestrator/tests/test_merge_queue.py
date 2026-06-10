@@ -18062,3 +18062,68 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         )
 
         await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_merger_registers_worktree_while_in_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig, caplog,
+    ):
+        """Merger registers the ephemeral worktree in the liveness ledger.
+
+        Drives a full worker.run() with a blocking fake verify.  While verify
+        is blocked the worktree must be in _owned_merge_worktrees.
+
+        RED because no _register_owned_merge_worktree call exists at the
+        _merger_loop success handoff yet.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'reg-test', 'reg.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Event that lets the test hold the verify open, and a separate
+        # event that fires when verify starts so we can sample the ledger.
+        verify_started = asyncio.Event()
+        verify_gate = asyncio.Event()
+
+        async def _blocking_verify(merge_wt, cfg, module_configs, **kwargs):
+            verify_started.set()
+            await verify_gate.wait()
+            return MagicMock(passed=True, summary='')
+
+        worker_task = asyncio.create_task(worker.run())
+        try:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                side_effect=_blocking_verify,
+            ):
+                req = _make_request('reg-test', 'reg-test', wt, config)
+                await queue.put(req)
+
+                # Wait until verify has started (worktree is merged + in-verify)
+                await asyncio.wait_for(verify_started.wait(), timeout=30)
+
+                # --- THE ASSERTION ---
+                # At this point the merger has succeeded and put a SpeculativeItem
+                # on the verifier queue.  The worktree must be registered.
+                ledger = worker._owned_merge_worktrees
+                assert len(ledger) >= 1, (
+                    f'_owned_merge_worktrees must be non-empty while verify is running; '
+                    f'got empty set'
+                )
+                wt_path = next(iter(ledger))
+                assert wt_path.name.startswith('_merge-'), (
+                    f'Ledger entry must be a _merge-* path; got {wt_path.name!r}'
+                )
+                assert wt_path.parent == git_ops.worktree_base, (
+                    f'Ledger entry must live under worktree_base; got {wt_path}'
+                )
+
+                # Unblock verify
+                verify_gate.set()
+                outcome = await asyncio.wait_for(req.result, timeout=30)
+                assert outcome.status == 'done', f'Expected done; got {outcome}'
+
+        finally:
+            await worker.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
