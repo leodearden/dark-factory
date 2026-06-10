@@ -364,3 +364,64 @@ class TestTrainCandidates:
         ids = [t['id'] for t in result]
         assert '201' in ids
         assert '210' not in ids
+
+
+# ---------------------------------------------------------------------------
+# step-13: _maybe_form_train guards — disabled / lone-task / already-member
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeFormTrainGuards:
+    """Unit tests for _maybe_form_train() guard conditions (PRD §A.3 / B8)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_former_disabled(self):
+        """When merge_train_former_enabled=False, returns False immediately.
+
+        No scheduler.update_task calls, no event emitted, self._train stays None.
+        """
+        fix = _make(former_enabled=False, get_tasks_return=[])
+        fix.wf.event_store = MagicMock()  # shouldn't be called
+
+        result = await fix.wf._maybe_form_train()
+
+        assert result is False
+        fix.scheduler.update_task.assert_not_called()
+        fix.wf.event_store.emit.assert_not_called()
+        assert fix.wf._train is None
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_lone_ready_task(self):
+        """Enabled but _train_candidates returns [] → returns False, self merges solo."""
+        fix = _make(
+            former_enabled=True,
+            # No other candidates — get_tasks returns only self
+            get_tasks_return=[{'id': '200', 'status': 'in-progress', 'metadata': {}}],
+        )
+        fix.wf.event_store = MagicMock()
+
+        result = await fix.wf._maybe_form_train()
+
+        assert result is False
+        fix.scheduler.update_task.assert_not_called()
+        assert fix.wf._train is None
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_already_train_member(self):
+        """If self._train is already set (task is a train member), return False immediately.
+
+        Double-forming must be prevented: the former must be a no-op when the
+        anchor is already in a train.
+        """
+        fix = _make(
+            former_enabled=True,
+            metadata={'train': {'id': 'train-existing', 'order': 0, 'members': ['200']}},
+            get_tasks_return=[{'id': '201', 'status': 'in-progress', 'metadata': {}}],
+        )
+        fix.wf.event_store = MagicMock()
+
+        result = await fix.wf._maybe_form_train()
+
+        assert result is False
+        fix.scheduler.update_task.assert_not_called()
+        fix.wf.event_store.emit.assert_not_called()
