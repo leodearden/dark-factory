@@ -467,3 +467,48 @@ class TestCompareThroughput:
         assert abs(delta.rate_delta - (0.8 - 0.4)) < 1e-9
         assert abs(delta.oldest_age_delta - (5.0 - 10.0)) < 1e-9
         assert delta.depth_delta == (2 - 4)
+
+
+# ---------------------------------------------------------------------------
+# Step-7 (RED): B1 local parity + B2 remote happy path provenance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunnerProvenance:
+    async def test_runner_provenance_local_only(self):
+        """B1: single-host window uses only the local runner."""
+        rec = _RecordingEventStore()
+        local_fake = _FakeRunner('local', is_local=True, service_secs=1.0)
+        pool = VerifyRunnerPool([local_fake], event_store=rec, task_id='b1')
+
+        run = await run_backlog_window(
+            pool, rec, n_merges=3, k=1,
+            service_secs={'local': 1.0},
+        )
+
+        report = summarize_throughput(rec.events, window_duration_secs=3.0)
+        assert run.completed == 3
+        assert report.runners_seen == {'local'}
+
+    async def test_runner_provenance_remote_happy_path(self):
+        """B2: two-host window exercises the laptop (remote) runner — happy path.
+
+        VerifyRunnerPool prefers the remote runner, so all dispatches in a
+        [local, laptop] pool go to laptop.  The assertion verifies the remote
+        happy path is exercised: 'laptop' appears in runners_seen.
+        """
+        rec = _RecordingEventStore()
+        local_fake = _FakeRunner('local', is_local=True, service_secs=1.0)
+        laptop_fake = _FakeRunner('laptop', is_local=False, service_secs=1.0)
+        pool = VerifyRunnerPool([local_fake, laptop_fake], event_store=rec, task_id='b2')
+
+        run = await run_backlog_window(
+            pool, rec, n_merges=4, k=2,
+            service_secs={'local': 1.0, 'laptop': 1.0},
+        )
+
+        report = summarize_throughput(rec.events, window_duration_secs=2.0)
+        assert run.completed == 4
+        # Pool always prefers remote runner → laptop used for all 4 dispatches
+        assert 'laptop' in report.runners_seen
