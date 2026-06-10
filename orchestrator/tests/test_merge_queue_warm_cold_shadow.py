@@ -320,6 +320,62 @@ class TestParsePerTestResults:
         result = parse_per_test_results(output)
         assert result == {"c1 t1": False, "c2 t2": False}
 
+    # --- Amendment: non-PASS nextest terminal statuses (suggestion 2) ---
+
+    def test_nextest_timeout_treated_as_failure(self) -> None:
+        """TIMEOUT is a non-PASS terminal status and must map to False."""
+        output = "        TIMEOUT [   5.000s] my-crate my::test::slow\n"
+        result = parse_per_test_results(output)
+        assert result.get("my-crate my::test::slow") is False
+
+    def test_nextest_sigsegv_treated_as_failure(self) -> None:
+        """SIGSEGV is a non-PASS terminal status and must map to False."""
+        output = "        SIGSEGV [   0.001s] my-crate crash::test\n"
+        result = parse_per_test_results(output)
+        assert result.get("my-crate crash::test") is False
+
+    def test_nextest_leak_treated_as_failure(self) -> None:
+        """LEAK is a non-PASS terminal status and must map to False."""
+        output = "        LEAK [   0.050s] my-crate leaky::test\n"
+        result = parse_per_test_results(output)
+        assert result.get("my-crate leaky::test") is False
+
+    # --- Amendment: libtest (plain cargo test) format support (suggestion 2) ---
+
+    def test_libtest_ok_format(self) -> None:
+        """Libtest 'test <path> ... ok' line is parsed as True."""
+        output = "test some::mod::test_name ... ok\n"
+        result = parse_per_test_results(output)
+        assert result.get("some::mod::test_name") is True
+
+    def test_libtest_failed_format(self) -> None:
+        """Libtest 'test <path> ... FAILED' line is parsed as False."""
+        output = "test other::test_b ... FAILED\n"
+        result = parse_per_test_results(output)
+        assert result.get("other::test_b") is False
+
+    def test_libtest_ignored_excluded(self) -> None:
+        """Libtest 'ignored' lines are excluded (not run = not a test result)."""
+        output = "test ignored::test ... ignored\n"
+        result = parse_per_test_results(output)
+        # 'ignored' is explicitly excluded to avoid spurious presence-divergences
+        assert "ignored::test" not in result
+
+    def test_libtest_mixed_with_build_noise(self) -> None:
+        """Libtest lines are parsed correctly from output with build noise."""
+        output = (
+            "running 3 tests\n"
+            "test alpha::test_one ... ok\n"
+            "test alpha::test_two ... FAILED\n"
+            "test beta::test_skip ... ignored\n"
+            "\ntest result: FAILED. 1 passed; 1 failed; 1 ignored\n"
+        )
+        result = parse_per_test_results(output)
+        assert result == {
+            "alpha::test_one": True,
+            "alpha::test_two": False,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Step-7: diff_per_test_results + ShadowCompareDiff
@@ -808,6 +864,64 @@ class TestRunShadowCompare:
             f'cold leg must be called with merge_commit; call_args={call_args}'
         )
 
+    # --- Amendment: inconclusive guard (suggestion 1) ---
+
+    @pytest.mark.asyncio
+    async def test_cold_empty_warm_nonempty_treated_as_inconclusive(
+        self, tmp_path: Path
+    ) -> None:
+        """Cold leg returning {} with non-empty warm is inconclusive, not divergence.
+
+        Regression guard for the false-positive scenario: a cold-side build
+        failure / OOM / infra hiccup returns {} from parse_per_test_results.
+        Without the inconclusive guard, diff_per_test_results(warm={…}, cold={})
+        puts every warm test into only_warm (has_divergence=True) and fires a
+        born-at-L2 CRITICAL alarm suggesting rollback — a false positive.
+
+        The correct behaviour: log a WARNING, emit no alarm, emit no parity-ok
+        event (result is indeterminate, not "OK").
+        """
+        warm = {'reify-core test::a': True, 'reify-core test::b': False}
+        cold: dict[str, bool] = {}  # simulates build failure / infra hiccup
+        q = _make_escalation_queue()
+        event_store = MagicMock()
+        req = _make_mock_req(tmp_path)
+
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify',
+            new=AsyncMock(return_value=cold),
+        ):
+            await _run_shadow_compare(
+                MagicMock(), req, 'sha123', warm, q, event_store
+            )
+
+        # No alarm — this is inconclusive, not a real warm/cold divergence
+        q.submit.assert_not_called()
+        # No parity-ok event either — we can't confirm parity if cold didn't run
+        event_store.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_both_empty_is_parity_ok(self, tmp_path: Path) -> None:
+        """Both warm and cold empty → no inconclusive guard (no warm tests to compare),
+        falls through to diff which finds no divergence → parity-ok event."""
+        warm: dict[str, bool] = {}
+        cold: dict[str, bool] = {}
+        q = _make_escalation_queue()
+        event_store = MagicMock()
+        req = _make_mock_req(tmp_path)
+
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify',
+            new=AsyncMock(return_value=cold),
+        ):
+            await _run_shadow_compare(
+                MagicMock(), req, 'sha', warm, q, event_store
+            )
+
+        # Both empty: diff has no divergence → parity-ok event (both agree on nothing)
+        q.submit.assert_not_called()
+        event_store.emit.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Step-13: _maybe_schedule_shadow_compare (non-blocking scheduler)
@@ -1015,6 +1129,66 @@ class TestMaybeScheduleShadowCompare:
             gate.set()
             for t in list(worker._shadow_compare_tasks):
                 await t
+
+    # --- Amendment: in-flight guard must still persist incremented counter (suggestion 3) ---
+
+    @pytest.mark.asyncio
+    async def test_in_flight_guard_persists_incremented_counter(
+        self, tmp_path: Path
+    ) -> None:
+        """Cadence counter must be persisted even when in-flight guard fires.
+
+        Regression guard: the original in-flight code path returned without
+        calling _save_shadow_compare_state, so the merge counter was silently
+        discarded.  This test verifies the counter is saved even when skipping
+        due to an in-flight task.
+        """
+        gate = asyncio.Event()
+
+        async def gated_shadow_compare(*args: object, **kwargs: object) -> None:
+            await gate.wait()
+
+        worker = _make_worker_stub(tmp_path)
+        req = MagicMock()
+        req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
+        warm = {'t1': True}
+
+        # First call: state at threshold (10 = due), spawns the in-flight task
+        state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
+        _save_shadow_compare_state(worker._shadow_state_path, state)
+
+        with patch(
+            'orchestrator.merge_queue._run_shadow_compare',
+            new=gated_shadow_compare,
+        ):
+            # First call: due → spawns task, resets counter to 0
+            await _maybe_schedule_shadow_compare(
+                worker, MagicMock(), req, 'sha', warm, None, None
+            )
+            assert len(worker._shadow_compare_tasks) == 1
+
+            # Manually set state to look "due" again (as if 10 more merges landed)
+            state2 = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
+            _save_shadow_compare_state(worker._shadow_state_path, state2)
+
+            # Second call while first is in-flight: skips scheduling but MUST
+            # increment and persist the counter (10 → 11)
+            await _maybe_schedule_shadow_compare(
+                worker, MagicMock(), req, 'sha2', warm, None, None
+            )
+
+            # Counter must have been incremented (10 → 11) even though in-flight
+            saved = _load_shadow_compare_state(worker._shadow_state_path)
+            assert saved.merges_since_last_shadow == 11, (
+                f"Expected 11 (incremented from 10), got "
+                f"{saved.merges_since_last_shadow} — in-flight guard must persist counter"
+            )
+            # Still only 1 task in flight
+            assert len(worker._shadow_compare_tasks) == 1
+
+        gate.set()
+        for t in list(worker._shadow_compare_tasks):
+            await t
 
 
 # ---------------------------------------------------------------------------

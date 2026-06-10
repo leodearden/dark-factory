@@ -5980,7 +5980,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # Parse per-test results from the warm verify for shadow compare.
                 # Only populated when _is_warm_path and on_result captured a result.
                 if _warm_capture:
-                    _warm_results = parse_per_test_results(_warm_capture[0].test_output)
+                    _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
+                    if not _warm_results and req.config.git.warm_verify_shadow_compare:
+                        logger.warning(
+                            'Task %s: warm verify produced no parseable test results '
+                            'for shadow compare (merge=%s) — the parser may not match '
+                            'the project verify command output format; shadow compare '
+                            'will be skipped for this landing',
+                            req.task_id,
+                            merge_commit[:8],
+                        )
             elif out.verify_skipped:
                 # Disk guard fired — run_scoped_verification was never called;
                 # log 'skipped' rather than 'passed=False' to avoid misleading
@@ -6547,36 +6556,77 @@ class ShadowCompareState:
     last_shadow_run_at: float = 0.0
 
 
-# Matches cargo-nextest human-output test result lines, e.g.:
-#   "        PASS [   0.045s] reify-core some::mod::test_a"
-#   "        FAIL [   1.200s] reify-eval other::test_b"
-# Capture groups: (1) PASS|FAIL, (2) crate name, (3) test path (rest of line)
+# ---------------------------------------------------------------------------
+# Per-test result parsers for the warm-vs-cold shadow compare.
+#
+# Two formats are supported so that the shadow compare works regardless of
+# which test runner the project's verify command uses:
+#
+#   cargo-nextest (reify's default):
+#       "        PASS [   0.045s] reify-core some::mod::test_a"
+#       "        FAIL [   1.200s] reify-eval other::test_b"
+#       "        TIMEOUT [  5.000s] crate slow::test"
+#       "        LEAK [   0.100s] crate leaky::test"
+#       "        SIGSEGV [  0.001s] crate crash::test"
+#   Groups: (1) status, (2) crate, (3) test_path
+#
+#   Rust libtest (plain `cargo test` output):
+#       "test some::mod::test_name ... ok"
+#       "test some::mod::test_name ... FAILED"
+#   Groups: (1) test_path, (2) status
+#
+# SKIP / ignored lines are intentionally excluded: a skipped/ignored test
+# is not "run" so treating it as present-but-failed would create spurious
+# only_warm / only_cold presence divergences between warm and cold runs.
+# ---------------------------------------------------------------------------
+
+# Matches cargo-nextest human-output test result lines.
+# Capture groups: (1) status, (2) crate name, (3) test path (rest of line)
 _NEXTEST_TEST_LINE_RE = re.compile(
-    r'^\s*(PASS|FAIL)\s+\[[^\]]*\]\s+(\S+)\s+(\S.*?)\s*$'
+    r'^\s*(PASS|FAIL|TIMEOUT|LEAK|SIGSEGV)\s+\[[^\]]*\]\s+(\S+)\s+(\S.*?)\s*$'
+)
+
+# Matches plain `cargo test` (libtest) result lines.
+# Capture groups: (1) test_path, (2) status ("ok" or "FAILED")
+_LIBTEST_TEST_LINE_RE = re.compile(
+    r'^test\s+(\S+)\s+\.\.\.\s+(ok|FAILED)\s*$'
 )
 
 
 def parse_per_test_results(test_output: str) -> dict[str, bool]:
-    """Parse cargo-nextest human output into a per-test pass/fail map.
+    """Parse test runner output into a per-test pass/fail map.
 
-    Scans *test_output* line by line and extracts lines that match the
-    nextest result format::
+    Supports two formats:
 
-        <whitespace> PASS|FAIL [<timing>] <crate> <test::path>
+    * **cargo-nextest** (reify's default merge-verify runner)::
 
-    The returned map key is ``"<crate> <test::path>"`` and the value is
-    ``True`` (PASS) or ``False`` (FAIL).  All other lines (build output,
-    summary footer, blank lines) are ignored.
+          <whitespace> PASS|FAIL|TIMEOUT|LEAK|SIGSEGV [<timing>] <crate> <path>
+
+      Key: ``"<crate> <test::path>"``, value: ``True`` iff status is ``PASS``.
+      TIMEOUT / LEAK / SIGSEGV are treated as failures (``False``).
+
+    * **libtest** (plain ``cargo test``)::
+
+          test <test::path> ... ok|FAILED
+
+      Key: ``"<test::path>"``, value: ``True`` iff status is ``ok``.
+
+    SKIP / ignored lines are excluded from both formats so they do not
+    introduce spurious presence-divergences in the shadow compare diff.
+
+    All other lines (build output, summary footer, blank lines) are ignored.
 
     Used by the warm-vs-cold shadow compare (PRD §10 invariant 6(b)) to
     capture per-test granularity so divergences can be named in the L2 alarm.
 
     Args:
-        test_output: Raw string output from a cargo-nextest verify run.
+        test_output: Raw string output from a verify run.
 
     Returns:
         ``dict[str, bool]`` mapping test id to pass status.  Empty dict for
-        empty/blank input or when no test lines are present.
+        empty/blank input or when no test lines are present.  A caller that
+        receives an empty dict from a genuine verify run should log a warning
+        — the parser may not match the project's verify command output format.
     """
     result: dict[str, bool] = {}
     for line in test_output.splitlines():
@@ -6584,6 +6634,11 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
         if m:
             status, crate, test_path = m.group(1), m.group(2), m.group(3)
             result[f"{crate} {test_path}"] = (status == 'PASS')
+            continue
+        m = _LIBTEST_TEST_LINE_RE.match(line)
+        if m:
+            test_path, status = m.group(1), m.group(2)
+            result[test_path] = (status == 'ok')
     return result
 
 
@@ -6797,6 +6852,13 @@ def _submit_shadow_divergence_escalation(
         return
 
     # Dedup: don't fire again while an open/pending alarm already exists.
+    # Global-dedup is intentional — matches DriftDetector's _DRIFT_SENTINEL pattern.
+    # A single open escalation suppresses ALL subsequent shadow-divergence alarms
+    # while it is unresolved.  The expectation is that divergences are investigated
+    # in sequence; a rollback recommendation implicitly covers subsequent same-area
+    # divergences.  If per-commit independent alarms are ever needed, incorporate
+    # the commit into the dedup key (e.g. make_id(f'{_WARM_COLD_SHADOW_SENTINEL}
+    # :{merge_commit[:8]}')) — but that change is out of scope for this task.
     if escalation_queue.has_open_l1(_WARM_COLD_SHADOW_SENTINEL):
         return
 
@@ -6951,6 +7013,24 @@ async def _run_shadow_compare(
         )
         return
 
+    # Inconclusive guard: if the cold leg produced NO test results but the warm
+    # run had results, treat this as inconclusive rather than divergence.
+    # An empty cold result usually signals a build/compile failure, OOM, or
+    # infra hiccup — not a genuine warm-pass/cold-fail flip.
+    # diff_per_test_results({warm tests…}, {}) would classify every warm test as
+    # only_warm (has_divergence=True), producing a false-positive born-at-L2 alarm
+    # that states "warm merge may be bad" when the cold side simply didn't run.
+    # This mirrors DriftDetector's INCONCLUSIVE path (avoids alarming on transport
+    # failure).  Neither alarm nor parity-ok event is emitted on inconclusive.
+    if not cold_results and warm_results:
+        logger.warning(
+            'Shadow compare inconclusive for %s: cold leg produced no parseable '
+            'test results (possible build/compile/infra failure in the throwaway '
+            'worktree); not alarming',
+            merge_commit[:8],
+        )
+        return
+
     diff = diff_per_test_results(warm_results, cold_results)
 
     if diff.has_divergence:
@@ -7037,9 +7117,13 @@ async def _maybe_schedule_shadow_compare(
         _save_shadow_compare_state(worker._shadow_state_path, state)
         return
 
-    # In-flight guard: skip if a shadow compare task is already running
+    # In-flight guard: skip if a shadow compare task is already running.
+    # Persist the incremented counter even on early-return so merges that
+    # land during an in-flight cold leg are still counted (amendment: fix
+    # cadence_counter_loss where the due-but-in-flight path did not persist).
     in_flight = [t for t in worker._shadow_compare_tasks if not t.done()]
     if in_flight:
+        _save_shadow_compare_state(worker._shadow_state_path, state)
         return
 
     # Due and no in-flight task: reset state + persist
