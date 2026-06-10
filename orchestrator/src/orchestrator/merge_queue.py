@@ -15,6 +15,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import json
 import logging
 import math
 import posixpath
@@ -6490,6 +6491,43 @@ class ShadowCompareState:
 
     merges_since_last_shadow: int = 0
     last_shadow_run_at: float = 0.0
+
+
+def _load_shadow_compare_state(path: Path) -> ShadowCompareState:
+    """Load the shadow compare cadence state from a JSON file.
+
+    Fail-safe: returns a default ``ShadowCompareState()`` on any error
+    (file not found, unreadable, unparseable JSON, or missing keys) so the
+    orchestrator never fails to start due to a corrupt state file.
+
+    Args:
+        path: Path to the JSON state file (typically
+            ``config.project_root/data/orchestrator/warm_verify_shadow.json``).
+
+    Returns:
+        The persisted state, or ``ShadowCompareState(0, 0.0)`` on any failure.
+    """
+    try:
+        data = json.loads(path.read_text())
+        return ShadowCompareState(
+            merges_since_last_shadow=int(data['merges_since_last_shadow']),
+            last_shadow_run_at=float(data['last_shadow_run_at']),
+        )
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return ShadowCompareState()
+
+
+def _save_shadow_compare_state(path: Path, state: ShadowCompareState) -> None:
+    """Persist the shadow compare cadence state to a JSON file.
+
+    Creates parent directories as needed.
+
+    Args:
+        path: Destination path for the JSON state file.
+        state: The :class:`ShadowCompareState` to serialise.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dataclasses.asdict(state)))
 
 
 def _shadow_compare_due(
