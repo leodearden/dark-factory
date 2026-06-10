@@ -70,6 +70,20 @@ class TrainPredecessor:
     branch: str
 
 
+@dataclass(frozen=True)
+class TrainStackResult:
+    """Result of stack_train_branches: which members survived and which were ejected.
+
+    survivors: member ids that were successfully rebased into the linear stack
+               (or are the anchor, which is always the base).
+    ejected:   member ids that conflicted during stacking and were dropped;
+               their branches are left clean (rebase aborted) so they can
+               merge solo.
+    """
+    survivors: list[str]
+    ejected: list[str]
+
+
 # Default commit-citation pattern for ``find_task_citation_commit``.
 #
 # Matches dark-factory / reify conventions on main:
@@ -1313,8 +1327,16 @@ class GitOps:
             return None
         return out
 
-    async def rebase_onto_main(self, worktree: Path) -> bool:
-        """Rebase the task branch in *worktree* onto current main.
+    async def rebase_onto_main(self, worktree: Path, onto: str | None = None) -> bool:
+        """Rebase the task branch in *worktree* onto *onto* (default: main).
+
+        When *onto* is None (the default), rebases onto the configured
+        ``main_branch`` — identical to the original behaviour, keeping all
+        existing callers byte-compatible.
+
+        When *onto* is provided (e.g. a sibling branch like ``task/123``),
+        rebases the branch in *worktree* onto that ref instead.  This is used
+        by ``stack_train_branches`` to chain members into a linear stack.
 
         Returns True on success.  On failure, aborts the rebase so the
         worktree is left in a clean state, and returns False.
@@ -1323,8 +1345,9 @@ class GitOps:
         outside the lock so multiple tasks can rebase concurrently in
         their own worktrees.
         """
+        target = onto if onto is not None else self.config.main_branch
         rc, _, err = await _run(
-            ['git', 'rebase', self.config.main_branch],
+            ['git', 'rebase', target],
             cwd=worktree,
         )
         if rc != 0:
@@ -1332,6 +1355,65 @@ class GitOps:
             logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
             return False
         return True
+
+    async def stack_train_branches(self, member_ids: list[str]) -> TrainStackResult:
+        """Materialize a linear branch stack for a merge-train formation.
+
+        The anchor (``member_ids[0]``) is always the stack base and always
+        survives — it is NOT rebased (the _do_train_merge tip-rebase at
+        merge time handles the anchor→main rebase).
+
+        Each successor member's worktree (``self.worktree_base / member_id``)
+        is rebased onto the last-surviving member's branch
+        (``self.config.branch_prefix + last_good_id``) via
+        ``rebase_onto_main(wt, onto=...)``.
+
+        On a clean rebase the member is appended to *survivors* and becomes
+        the new last-good predecessor for the next member.
+
+        On a rebase conflict the member is added to *ejected*; the last-good
+        predecessor is NOT advanced, so the next member re-links onto the last
+        survivor (re-link invariant).  The conflicting branch is left clean by
+        rebase_onto_main's ``git rebase --abort``.
+
+        A missing worktree directory is treated as an eject (defensive;
+        logged at WARNING level).
+
+        Args:
+            member_ids: Ordered list of member task ids, anchor first.
+
+        Returns:
+            TrainStackResult(survivors, ejected).
+        """
+        if not member_ids:
+            return TrainStackResult(survivors=[], ejected=[])
+
+        anchor_id = member_ids[0]
+        survivors: list[str] = [anchor_id]
+        ejected: list[str] = []
+        last_good_id = anchor_id
+
+        for member_id in member_ids[1:]:
+            wt_path = self.worktree_base / member_id
+            if not wt_path.is_dir():
+                logger.warning(
+                    'stack_train_branches: worktree %s not found for member %s — ejecting',
+                    wt_path, member_id,
+                )
+                ejected.append(member_id)
+                # Do not advance last_good_id — next member re-links onto last survivor.
+                continue
+
+            onto_branch = f'{self.config.branch_prefix}{last_good_id}'
+            success = await self.rebase_onto_main(wt_path, onto=onto_branch)
+            if success:
+                survivors.append(member_id)
+                last_good_id = member_id
+            else:
+                ejected.append(member_id)
+                # Do not advance last_good_id.
+
+        return TrainStackResult(survivors=survivors, ejected=ejected)
 
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         """Return True if *ancestor* is an ancestor of *descendant*."""

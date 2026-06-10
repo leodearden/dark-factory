@@ -21,6 +21,7 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.git_ops import TrainStackResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,11 @@ def _make(
     git_ops.config.main_branch = 'main'
     git_ops.resolve_branch_sha = AsyncMock(return_value='abc123')
     git_ops.get_changed_line_ranges = AsyncMock(return_value={})
+    # Default: stack_train_branches echoes all members as survivors (no ejects).
+    # Individual tests override this to control eject outcomes.
+    async def _default_stack(member_ids):
+        return TrainStackResult(survivors=list(member_ids), ejected=[])
+    git_ops.stack_train_branches = AsyncMock(side_effect=_default_stack)
 
     esc_queue = MagicMock()
     esc_queue.has_open_l1 = MagicMock(return_value=False)
@@ -634,3 +640,178 @@ class TestMaybeDeferAsTrainMember:
         mock_form.assert_called_once()
         # _enter_merge_deferred must NOT have been called.
         mock_defer.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# step-7 (γ): _maybe_form_train wires stack_train_branches, assigns metadata
+#              to SURVIVORS ONLY — ejected members get no train metadata
+# ---------------------------------------------------------------------------
+
+
+def _ip_task_with_ranges(id: str, ranges: dict) -> dict:
+    """Build an in-progress task dict with line-range metadata."""
+    return {'id': id, 'status': 'in-progress', 'metadata': {}, '_ranges': ranges}
+
+
+class TestMaybeFormTrainStackBranches:
+    """γ-wiring tests: _maybe_form_train calls stack_train_branches and uses survivors.
+
+    Currently RED: _maybe_form_train never calls stack_train_branches.
+    """
+
+    def _ranges_side_effect(self, table: dict):
+        async def _fn(ref):
+            return table.get(ref, {})
+        return _fn
+
+    @pytest.mark.asyncio
+    async def test_b5_signal_survivors_only_get_train_metadata(self):
+        """B5: metadata assigned to SURVIVORS only; ejected member gets no train metadata.
+
+        Setup:
+          - anchor 200, candidates 201 + 202
+          - stack_train_branches mocked: survivors=['200','201'], ejected=['202']
+
+        Expected:
+          - _maybe_form_train returns True
+          - update_task called for '200' and '201' (with train metadata)
+          - update_task NEVER called for '202' with train key
+          - self._train is truthy (anchor in train)
+          - train_formed event emitted with members=['200','201']
+        """
+        fix = _make(
+            task_id='200',
+            former_enabled=True,
+            max_members=3,
+            get_tasks_return=[_ip_task('201'), _ip_task('202')],
+        )
+        event_store = MagicMock()
+        fix.wf.event_store = event_store
+
+        # All candidates are line-range stackable (non-overlapping files).
+        fix.git_ops.get_changed_line_ranges = AsyncMock(
+            side_effect=self._ranges_side_effect({
+                '200': {'fileA.txt': [(1, 10)]},
+                '201': {'fileB.txt': [(1, 10)]},
+                '202': {'fileC.txt': [(1, 10)]},
+            })
+        )
+        # Override stack_train_branches: 202 is ejected.
+        fix.git_ops.stack_train_branches = AsyncMock(
+            return_value=TrainStackResult(survivors=['200', '201'], ejected=['202'])
+        )
+
+        result = await fix.wf._maybe_form_train()
+
+        assert result is True
+
+        # update_task must be called for 200 and 201 only.
+        calls = fix.scheduler.update_task.call_args_list
+        ids_with_train = [
+            c.args[0] for c in calls
+            if 'train' in (c.args[1] if c.args else {})
+        ]
+        assert set(ids_with_train) == {'200', '201'}, (
+            f'Expected train metadata for {{200, 201}}, got {set(ids_with_train)}'
+        )
+        # 202 must NEVER receive train metadata.
+        for c in calls:
+            if c.args[0] == '202':
+                assert 'train' not in (c.args[1] if c.args else {}), (
+                    'Ejected member 202 must not receive train metadata'
+                )
+
+        # self._train is truthy (anchor is in the surviving train).
+        assert fix.wf._train is not None
+
+        # train_formed event emitted with survivors in members.
+        event_store.emit.assert_called_once()
+        emit_call = event_store.emit.call_args
+        assert emit_call.args[0] is EventType.train_formed
+        data = emit_call.kwargs.get('data', {})
+        assert sorted(data.get('members', [])) == ['200', '201'], (
+            f"train_formed data['members'] must be ['200','201'], got {data.get('members')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_d4_abandon_when_only_anchor_survives(self):
+        """D4: if all successors are ejected (only anchor survives), return False.
+
+        Setup:
+          - anchor 200, candidates 201+202
+          - stack_train_branches mocked: survivors=['200'], ejected=['201','202']
+
+        Expected:
+          - _maybe_form_train returns False
+          - NO update_task call carries 'train' metadata
+          - event_store.emit NOT called with train_formed
+          - self._train is None (anchor falls through to solo merge)
+        """
+        fix = _make(
+            task_id='200',
+            former_enabled=True,
+            max_members=3,
+            get_tasks_return=[_ip_task('201'), _ip_task('202')],
+        )
+        event_store = MagicMock()
+        fix.wf.event_store = event_store
+
+        fix.git_ops.get_changed_line_ranges = AsyncMock(
+            side_effect=self._ranges_side_effect({
+                '200': {'fileA.txt': [(1, 10)]},
+                '201': {'fileB.txt': [(1, 10)]},
+                '202': {'fileC.txt': [(1, 10)]},
+            })
+        )
+        # All successors conflict → only anchor survives.
+        fix.git_ops.stack_train_branches = AsyncMock(
+            return_value=TrainStackResult(survivors=['200'], ejected=['201', '202'])
+        )
+
+        result = await fix.wf._maybe_form_train()
+
+        assert result is False, 'D4: must return False when < 2 survivors'
+
+        # No train metadata must be written.
+        for c in fix.scheduler.update_task.call_args_list:
+            payload = c.args[1] if c.args else {}
+            assert 'train' not in payload, (
+                'No update_task call should carry train metadata when formation is abandoned'
+            )
+
+        # No train_formed event.
+        for c in event_store.emit.call_args_list:
+            if c.args:
+                assert c.args[0] is not EventType.train_formed, (
+                    'train_formed event must NOT be emitted when formation is abandoned'
+                )
+
+        # Anchor must NOT have been placed in a train.
+        assert fix.wf._train is None, 'self._train must be None after D4 abandon'
+
+    @pytest.mark.asyncio
+    async def test_stack_train_branches_is_called_with_selected_members(self):
+        """stack_train_branches is called with the selected member list from _select_train_members."""
+        fix = _make(
+            task_id='200',
+            former_enabled=True,
+            max_members=3,
+            get_tasks_return=[_ip_task('201')],
+        )
+        fix.wf.event_store = MagicMock()
+
+        fix.git_ops.get_changed_line_ranges = AsyncMock(
+            side_effect=self._ranges_side_effect({
+                '200': {'fileA.txt': [(1, 10)]},
+                '201': {'fileB.txt': [(1, 10)]},
+            })
+        )
+        # Default echo mock (both survive).
+        await fix.wf._maybe_form_train()
+
+        fix.git_ops.stack_train_branches.assert_called_once()
+        call_args = fix.git_ops.stack_train_branches.call_args
+        member_ids = call_args.args[0] if call_args.args else call_args.kwargs.get('member_ids')
+        assert set(member_ids) == {'200', '201'}, (
+            f'stack_train_branches should be called with selected members, got {member_ids}'
+        )
