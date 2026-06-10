@@ -6799,6 +6799,126 @@ def _submit_shadow_divergence_escalation(
     escalation_queue.submit(esc)
 
 
+async def _run_cold_shadow_verify(
+    git_ops: GitOps,
+    req: 'MergeRequest',
+    merge_commit: str,
+    event_store: 'EventStore | None',
+) -> dict[str, bool]:
+    """Run a from-scratch cold verify on *merge_commit* in a throwaway worktree.
+
+    Creates an ephemeral ``_merge-<uuid>`` worktree at *merge_commit* via
+    :meth:`~orchestrator.git_ops.GitOps.create_throwaway_verify_worktree`,
+    runs the full merge verify (build_merge_verify_spec + VerifyRunnerPool
+    dispatch — the same execution path as ``_run_post_merge_verify``), parses
+    the per-test results from the output, and removes the throwaway worktree
+    in a ``finally`` block.
+
+    The throwaway worktree is NEVER the persistent warm ``_merge-verify`` path
+    — it has no retained ``target/`` warmth — ensuring a true from-scratch
+    cold verify (PRD §10 invariant 6(b)).
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that just warm-landed (provides config,
+            module_configs, task_files, task_id).
+        merge_commit: The merge commit SHA to verify cold.
+        event_store: Optional event store (passed to VerifyRunnerPool; None-safe).
+
+    Returns:
+        Per-test pass/fail map as returned by :func:`parse_per_test_results`.
+        Empty dict if the cold verify produced no parseable test output.
+    """
+    wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+    try:
+        task_files_tuple = (
+            tuple(req.task_files) if req.task_files is not None else None
+        )
+        spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+        pool = VerifyRunnerPool(
+            [LocalRunner(
+                wt, req.config, req.module_configs, task_files_tuple,
+                run_scoped=run_scoped_verification,
+                run_unscoped=_run_unscoped_typechecks,
+                task_id=req.task_id,
+            )],
+            event_store=event_store,
+            task_id=req.task_id,
+        )
+        verify = await pool.dispatch(merge_commit, spec)
+        return parse_per_test_results(verify.test_output or '')
+    finally:
+        await git_ops.cleanup_merge_worktree(wt)
+
+
+async def _run_shadow_compare(
+    git_ops: GitOps,
+    req: 'MergeRequest',
+    merge_commit: str,
+    warm_results: dict[str, bool],
+    escalation_queue: Any,
+    event_store: 'EventStore | None',
+) -> None:
+    """Compare warm vs cold verify results for *merge_commit* and alarm on divergence.
+
+    Implements PRD §10 invariant 6(b) DETECTIVE control:
+
+    1. Runs a cold verify on *merge_commit* via :func:`_run_cold_shadow_verify`
+       in a throwaway ``_merge-<uuid>`` worktree (off the serial lane).
+    2. Diffs the cold results against *warm_results* via :func:`diff_per_test_results`.
+    3. On per-test divergence: submits a born-at-L2 critical escalation via
+       :func:`_submit_shadow_divergence_escalation` naming the diverging tests
+       and explicitly stating the warm merge has ALREADY LANDED.
+    4. On agreement (no divergence): emits an :attr:`~orchestrator.event_store.EventType.verdict_parity_ok`
+       event (mirrors :class:`~orchestrator.verify_runner.DriftDetector`).
+
+    **Exception handling**: any exception from the cold leg is logged at WARNING
+    level and swallowed.  A shadow/detective control must never crash or stall
+    the merge worker — it runs off the critical serial lane via
+    ``asyncio.create_task`` (see :func:`_maybe_schedule_shadow_compare`).
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that warm-landed (provides config +
+             module_configs for the cold verify spec).
+        merge_commit: The just-landed merge commit SHA.
+        warm_results: Per-test pass/fail map captured from the warm verify run.
+        escalation_queue: Live escalation queue, or ``None`` (None-safe).
+        event_store: Optional event store for parity-ok event emission.
+    """
+    try:
+        cold_results = await _run_cold_shadow_verify(
+            git_ops, req, merge_commit, event_store
+        )
+    except Exception:
+        logger.warning(
+            'Shadow compare cold leg failed for %s — swallowing exception',
+            merge_commit[:8],
+            exc_info=True,
+        )
+        return
+
+    diff = diff_per_test_results(warm_results, cold_results)
+
+    if diff.has_divergence:
+        _submit_shadow_divergence_escalation(
+            escalation_queue, merge_commit, diff, warm_results, cold_results
+        )
+    else:
+        # Parity OK — emit event (mirrors DriftDetector.check verdict_parity_ok)
+        if event_store is not None:
+            event_store.emit(
+                EventType.verdict_parity_ok,
+                task_id=req.task_id,
+                data={
+                    'merge_commit': merge_commit,
+                    'shadow_compare': True,
+                    'warm_test_count': len(warm_results),
+                    'cold_test_count': len(cold_results),
+                },
+            )
+
+
 async def _acquire_warm_verify_worktree(
     git_ops: GitOps,
     req: MergeRequest,
