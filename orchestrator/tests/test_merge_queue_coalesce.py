@@ -1,13 +1,20 @@
-"""Tests for SpeculativeMergeWorker retroactive coalescing pass (task γ/1719).
+"""Tests for SpeculativeMergeWorker retroactive coalescing pass (task γ/1719)
+and merge-ready confidence gate (task δ/1720).
 
 Each TestClass maps to one plan step:
-  step-1:  TestConfigAndEventType   — new config knob + new EventType
-  step-3:  TestNoOpGuards           — early-return guards of _maybe_coalesce_waiting_singles
-  step-5:  TestCoreFormation        — happy-path coalesce: 3 disjoint singles → 1 train
-  step-7:  TestExclusionIdempotency — in-flight, detached, and GroupMergeRequest exclusions
-  step-9:  TestPartialStackability  — overlap, stack-conflict eject, survivors<2
-  step-11: TestDebounce             — signature-based deduplication
-  step-13: TestEndToEndWiring       — merger-loop wiring: coalesced train dispatched end-to-end
+  step-1:  TestConfigAndEventType        — new config knob + new EventType
+  step-3:  TestNoOpGuards                — early-return guards of _maybe_coalesce_waiting_singles
+  step-5:  TestCoreFormation             — happy-path coalesce: 3 disjoint singles → 1 train
+  step-7:  TestExclusionIdempotency      — in-flight, detached, and GroupMergeRequest exclusions
+  step-9:  TestPartialStackability       — overlap, stack-conflict eject, survivors<2
+  step-11: TestDebounce                  — signature-based deduplication
+  step-13: TestEndToEndWiring            — merger-loop wiring: coalesced train dispatched end-to-end
+
+Task δ/1720 additions (merge-ready confidence gate):
+  step-1:  TestMergeReadyPredicateSeam   — injectable predicate seam honored
+  step-3:  TestBlockedHistoryGate        — event-store blocked-history excludes candidate
+  step-5:  TestOneStrikeExclusion        — one-strike registry excludes candidate
+  step-7:  TestOneStrikeRecording        — derailed coalesce train marks its members
 """
 
 from __future__ import annotations
@@ -1145,3 +1152,87 @@ class TestEndToEndWiring:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ─── Task δ/1720 — merge-ready confidence gate ──────────────────────────────
+
+# ─── δ Step 1 ────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestMergeReadyPredicateSeam:
+    """δ step-1 (RED): injectable merge_ready_predicate seam is honored.
+
+    Build 3 disjoint-file stackable singles, inject a predicate that vetoes t2
+    with reason 'custom_reason'.  Asserts:
+      (a) returns True (train forms with the 2 eligible members)
+      (b) t2 NOT in train.member_task_ids; train == {p1, p3}
+      (c) req2.result NOT done() — excluded request stays unresolved
+      (d) t2 remains as a solo in the buffer
+      (e) train_coalesced event data['exclusions'] == [{request_id: req2.request_id,
+          reason: 'custom_reason'}]
+    """
+
+    async def test_predicate_excludes_one_member(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+
+        wt1 = await _make_branch_with_file(git_ops, 'p1', 'file_p1.py', 'p1 = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'p2', 'file_p2.py', 'p2 = 2\n')
+        wt3 = await _make_branch_with_file(git_ops, 'p3', 'file_p3.py', 'p3 = 3\n')
+
+        db_path = tmp_path / 'es_pred.db'
+        es = EventStore(db_path=db_path, run_id='run-pred-seam')
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops,
+            queue,
+            event_store=es,
+            train_callback_factory=_stub_factory(),
+            merge_ready_predicate=lambda req: 'custom_reason' if req.task_id == 'p2' else None,
+        )
+
+        req1 = _make_req('p1', 'task/p1', wt1, coalesce_config)
+        req2 = _make_req('p2', 'task/p2', wt2, coalesce_config)
+        req3 = _make_req('p3', 'task/p3', wt3, coalesce_config)
+        worker._lane_buffers['normal'].extend([req1, req2, req3])
+
+        result = await worker._maybe_coalesce_waiting_singles()
+
+        # (a) returns True — a train was formed
+        assert result is True, 'pass must form a train with the 2 eligible candidates'
+
+        buf = list(worker._lane_buffers['normal'])
+        trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
+
+        # (b) train contains exactly p1 + p3
+        assert len(trains) == 1, f'Expected 1 train; got {len(trains)}'
+        train = trains[0]
+        assert 'p2' not in train.member_task_ids, (
+            f'p2 must be excluded from train; members={train.member_task_ids}'
+        )
+        assert set(train.member_task_ids) == {'p1', 'p3'}, (
+            f'train must contain p1+p3; got {train.member_task_ids}'
+        )
+
+        # (c) excluded req2 future remains unresolved
+        assert not req2.result.done(), 'excluded req2 future must remain unresolved'
+
+        # (d) p2 stays as a solo in the buffer
+        solo_ids = [r.task_id for r in solos]
+        assert 'p2' in solo_ids, f'excluded p2 must remain as solo; buf ids={solo_ids}'
+
+        # (e) train_coalesced event carries the exclusion
+        events = _events_of_type(db_path, 'train_coalesced')
+        assert len(events) == 1
+        exc = events[0]['data'].get('exclusions', [])
+        assert len(exc) == 1, f'Expected 1 exclusion entry; got {exc}'
+        assert exc[0] == {'request_id': req2.request_id, 'reason': 'custom_reason'}, (
+            f'exclusion entry mismatch: {exc[0]}'
+        )
