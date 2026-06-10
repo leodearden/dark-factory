@@ -4295,6 +4295,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Separate from enqueued_at so verify_in_progress can report pure verify
         # time rather than total queue-wait time (useful for triage of stuck verifies).
         self._verify_started_at: float | None = None
+        # Persistent warm merge-verify worktree: counts verifying attempts so
+        # _safety_valve_due can fire the periodic cold-verify (PRD §10 invariant 6).
+        # Only incremented when not item.skip_verify; never reset so the counter
+        # covers the full worker lifetime (cross-submission).
+        self._verify_attempt_count: int = 0
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
         # Heartbeat: wall-clock time of last emission; initialised to 0.0 so the
@@ -5828,11 +5833,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # verify-start log so the log shows worktree=_merge-verify (the
         # user-observable persistence signal) and verify, advance_main, and
         # all cleanup_merge_worktree calls use the warm path.
-        # safety_valve_due=False here; step-18 wires the real predicate.
+        # PRD §10 invariant 6: every Nth verifying attempt bypasses the swap
+        # and runs a cold verify in the throwaway ephemeral worktree.
         if not item.skip_verify:
+            self._verify_attempt_count += 1
+            _due = _safety_valve_due(
+                self._verify_attempt_count,
+                req.config.git.persistent_merge_worktree_safety_valve_every_n,
+            )
             merge_wt = await _acquire_warm_verify_worktree(
                 self._git_ops, req, merge_wt, merge_commit,
-                safety_valve_due=False,
+                safety_valve_due=_due,
             )
 
         # ── Step 4: verify ────────────────────────────────────────────
@@ -6421,6 +6432,28 @@ class PersistentWorktreeConfigError(Exception):
     change (lower merge_ahead_bound back to 1 or disable
     ``git.persistent_merge_worktree``).
     """
+
+
+def _safety_valve_due(attempt_count: int, every_n: int) -> bool:
+    """Return True when the periodic cold-verify safety valve should fire.
+
+    The safety valve (PRD §10 invariant 6) bypasses the warm-worktree swap on
+    every Nth verifying serial attempt so that a true from-scratch cold verify
+    runs in a throwaway ephemeral worktree (target NOT retained).  A cold
+    failure on the serial lane surfaces through the existing verify-failure
+    escalation path.
+
+    Args:
+        attempt_count: The 1-based count of verifying attempts on this worker
+            (incremented in ``_verify_and_advance`` before calling this).
+        every_n: From ``config.git.persistent_merge_worktree_safety_valve_every_n``.
+            0 or negative → disabled (always returns False).
+
+    Returns:
+        True when the valve is enabled (``every_n > 0``) and
+        ``attempt_count`` is a positive multiple of ``every_n``.
+    """
+    return every_n > 0 and attempt_count > 0 and attempt_count % every_n == 0
 
 
 async def _acquire_warm_verify_worktree(
