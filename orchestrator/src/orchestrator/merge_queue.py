@@ -18,6 +18,7 @@ import dataclasses
 import json
 import logging
 import math
+import os
 import posixpath
 import re
 import shutil
@@ -30,7 +31,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
+from orchestrator.git_ops import (
+    PERSISTENT_MERGE_WORKTREE_NAME,
+    GitOps,
+    MergeResult,
+    WorktreeMissing,
+    _run,
+)
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
@@ -4657,6 +4664,101 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the last _maybe_coalesce_waiting_singles attempt (incl. no-viable-train
         # attempts).  Short-circuits when the waiting set is unchanged.
         self._last_coalesce_signature: frozenset[str] | None = None
+        # α liveness ledger: ephemeral _merge-<uuid> worktrees owned by THIS
+        # SpeculativeMergeWorker instance.  Touched every _heartbeat_loop tick
+        # so the stale-worktree reaper (coalesce_or_enqueue_merge_request) never
+        # reaps a live-owner worktree under Lever C prefer-remote.
+        #
+        # Scope on current main:
+        #   (a) PERSISTENT_MERGE_WORKTREE_NAME ('_merge-verify') is reset-in-place
+        #       per verify and already exempt from prune/find_inflight
+        #       (git_ops.py:2075) — guard in _register_owned_merge_worktree keeps
+        #       it out.
+        #   (b) Serial MergeWorker (:4062) holds ≤1 worktree whose build activity
+        #       refreshes mtime — out of ledger scope.
+        #   (c) Cold-shadow (_run_cold_shadow_verify :7670) and drift-check
+        #       (_run_drift_check :7912) _merge-* creators are short-lived local
+        #       executions — out of ledger scope.
+        #   (d) reverify_member_solo's _solo-* worktrees (git_ops.materialize_
+        #       member_solo) use a different prefix the reaper never scans
+        #       (git_ops.py:2069) — out of ledger scope.
+        #   (e) Coalesced GroupMergeRequest merge worktrees ARE in scope;
+        #       registered automatically at _merger_loop handoff (:5703).
+        self._owned_merge_worktrees: set[Path] = set()
+        # One-warning-per-path set: added when a non-ENOENT OSError is logged
+        # for a path; cleared on next successful touch or on ENOENT-drop so
+        # each new failure episode emits exactly one WARNING.
+        self._merge_wt_touch_warned: set[Path] = set()
+
+    # ── owned-worktree liveness ledger ───────────────────────────────────
+
+    def _register_owned_merge_worktree(self, wt: Path | None) -> None:
+        """Add *wt* to the liveness ledger.
+
+        No-ops for None and for the persistent warm worktree
+        (PERSISTENT_MERGE_WORKTREE_NAME = '_merge-verify'): the persistent
+        worktree is reset-in-place and already exempt from reaper scans
+        (git_ops.py:2075), so touching it would be meaningless.
+        The guard is also defence-in-depth against accidental registration.
+        """
+        if wt is None or wt.name == PERSISTENT_MERGE_WORKTREE_NAME:
+            return
+        self._owned_merge_worktrees.add(wt)
+
+    def _deregister_owned_merge_worktree(self, wt: Path | None) -> None:
+        """Remove *wt* from both ledger sets (idempotent)."""
+        if wt is None:
+            return
+        self._owned_merge_worktrees.discard(wt)
+        self._merge_wt_touch_warned.discard(wt)
+
+    async def _cleanup_owned_merge_worktree(self, wt: Path | None) -> None:
+        """Deregister *wt* then clean it up from disk.
+
+        Deregister-before-cleanup ensures a failed git cleanup cannot
+        immortalise a ledger entry (PRD §3 / design decision).
+        """
+        self._deregister_owned_merge_worktree(wt)
+        if wt is not None:
+            await self._git_ops.cleanup_merge_worktree(wt)
+
+    def _touch_owned_merge_worktrees(self) -> int:
+        """Touch (os.utime) every ledger path to refresh its mtime.
+
+        Called unconditionally every _heartbeat_loop tick so a live owner's
+        worktrees never age past ~1 poll period (~30 s; 360× inside the 10800 s
+        liveness window).  A dead owner stops calling this; its worktrees age
+        and are reaped exactly as before.
+
+        Mirrors the sync, clock-injectable pattern of _maybe_log_queue_heartbeat
+        so unit tests can drive it directly without running the async loop.
+
+        Returns:
+            Number of worktrees successfully touched this tick.
+        """
+        touched = 0
+        for p in list(self._owned_merge_worktrees):
+            try:
+                os.utime(p, None)
+            except FileNotFoundError:
+                self._deregister_owned_merge_worktree(p)
+                logger.info(
+                    'owned merge worktree %s gone (ENOENT) — dropped from liveness ledger', p
+                )
+                continue
+            except OSError as exc:
+                if p not in self._merge_wt_touch_warned:
+                    logger.warning(
+                        'failed to touch owned merge worktree %s for liveness heartbeat: %s',
+                        p, exc,
+                    )
+                    self._merge_wt_touch_warned.add(p)
+                continue
+            self._merge_wt_touch_warned.discard(p)
+            touched += 1
+        if touched:
+            logger.debug('touched %d owned merge worktree(s)', touched)
+        return touched
 
     # ── lane-buffer helpers ───────────────────────────────────────────────
 
