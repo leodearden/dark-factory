@@ -996,6 +996,32 @@ class TestMaybeScheduleShadowCompare:
         assert len(worker._shadow_compare_tasks) == 0
         assert not worker._shadow_state_path.exists()
 
+    # _shadow_state_path is None (bare-harness worker) + knob ON → no-op, no raise
+    def test_none_shadow_state_path_no_op(self, tmp_path: Path) -> None:
+        """When _shadow_state_path is None (bare-harness worker), the scheduler
+        must return immediately without raising, regardless of knob/warm settings.
+
+        RED on main: _load_shadow_compare_state(None) raises AttributeError
+        (None.read_text()) — not caught by its except tuple — when no None-guard
+        early-return is present.  This pins the consumer-side None-safety that
+        the Path|None field (task 1712, Step-2) requires.
+        """
+        worker = _make_worker_stub(tmp_path)
+        worker._shadow_state_path = None  # exercise the project_root-absent path
+
+        req = MagicMock()
+        # Knob ON + non-empty warm so knob/empty early-exits do NOT fire —
+        # the function must reach the None-guard to prove it's guarded.
+        req.config = _make_shadow_config(tmp_path, shadow_compare_on=True)
+
+        asyncio.run(
+            _maybe_schedule_shadow_compare(
+                worker, MagicMock(), req, 'sha', {'t1': True}, None, None
+            )
+        )
+
+        assert len(worker._shadow_compare_tasks) == 0
+
     # Knob ON + not due (count < every_n, nightly not elapsed) →
     # increments counter, persists, NO task
     def test_not_due_increments_counter_no_task(self, tmp_path: Path) -> None:

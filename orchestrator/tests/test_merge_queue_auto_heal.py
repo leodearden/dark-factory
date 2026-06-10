@@ -38,10 +38,38 @@ from orchestrator.workflow import (  # type: ignore[attr-defined]
 
 MAIN_SHA = 'deadbeef1234567890'
 
+# Fixed synthetic root for tests that hold no pytest tmp_path (pure-unit
+# registry checks that never reach shadow-persistence code paths).
+# ANY test that could reach _save_shadow_compare_state MUST pass its own
+# pytest tmp_path instead — _DEFAULT_FAKE_ROOT is a process-shared /tmp path
+# and writes would escape pytest's tmp_path isolation sandbox.
+_DEFAULT_FAKE_ROOT = Path('/tmp/df-test-root')
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirror test_workflow_main_health_routing.py)
 # ---------------------------------------------------------------------------
+
+
+def _make_mock_git_ops(project_root: Path | None = None) -> MagicMock:
+    """Return MagicMock(spec=GitOps) with project_root wired.
+
+    Using a wired project_root prevents bare-spec mocks from breaking when
+    SpeculativeMergeWorker.__init__ reads ``git_ops.project_root`` — which is an
+    instance attribute (git_ops.py:474) and therefore absent on a spec-only mock.
+
+    Pass the pytest ``tmp_path`` fixture wherever one is available.  The
+    ``_DEFAULT_FAKE_ROOT`` default is ONLY safe for pure-unit tests (e.g. registry
+    existence checks) that can never reach ``_save_shadow_compare_state`` — it is a
+    process-shared /tmp path and would escape pytest's isolation sandbox if
+    shadow-persistence were triggered.
+
+    Do NOT use this helper in tests that intentionally exercise the
+    project_root-absent / None path (e.g. TestSpeculativeWorkerBareHarnessContract).
+    """
+    mock = MagicMock(spec=GitOps)
+    mock.project_root = project_root if project_root is not None else _DEFAULT_FAKE_ROOT
+    return mock
 
 
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
@@ -68,7 +96,7 @@ def _make_workflow(config: OrchestratorConfig, worktree: Path, *, task_metadata:
         },
         modules=['lib'],
     )
-    git_ops = MagicMock(spec=GitOps)
+    git_ops = _make_mock_git_ops(config.project_root)
     git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock()
@@ -276,14 +304,42 @@ class TestMainHealthAutoHealRegistry:
 
     def test_merge_worker_exposes_registry(self) -> None:
         from orchestrator.merge_queue import MainHealthAutoHealRegistry, MergeWorker
-        git_ops = MagicMock(spec=GitOps)
+        git_ops = _make_mock_git_ops()
         worker = MergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         assert isinstance(worker.auto_heal_registry, MainHealthAutoHealRegistry)
 
     def test_speculative_merge_worker_exposes_registry(self) -> None:
         from orchestrator.merge_queue import MainHealthAutoHealRegistry, SpeculativeMergeWorker
+        git_ops = _make_mock_git_ops()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+        assert isinstance(worker.auto_heal_registry, MainHealthAutoHealRegistry)
+
+
+# ---------------------------------------------------------------------------
+# Task-1712: SpeculativeMergeWorker bare-harness constructibility contract
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeWorkerBareHarnessContract:
+    """SpeculativeMergeWorker must be constructible with a bare MagicMock(spec=GitOps).
+
+    Regression guard: task 1710 added an unconditional `git_ops.project_root`
+    access in __init__ which broke all bare-worker/bare-harness tests.  The
+    defensive fix (`getattr(git_ops, 'project_root', None)`) must keep
+    _shadow_state_path=None when project_root is absent, mirroring the
+    escalation_queue None-safety contract documented in the same constructor.
+    """
+
+    def test_bare_spec_mock_does_not_raise(self) -> None:
+        """Constructing with bare MagicMock(spec=GitOps) — NO project_root wired —
+        must NOT raise AttributeError."""
+        from orchestrator.merge_queue import MainHealthAutoHealRegistry, SpeculativeMergeWorker
+
+        # Intentionally bare: project_root is NOT set on this mock.
+        # This exercises the project_root-absent / None path in __init__.
         git_ops = MagicMock(spec=GitOps)
         worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+        assert worker._shadow_state_path is None
         assert isinstance(worker.auto_heal_registry, MainHealthAutoHealRegistry)
 
 
@@ -710,7 +766,7 @@ class TestAutoHealOwnerTiedResume:
         workflow.merge_queue = asyncio.Queue()
 
         # Use a REAL SpeculativeMergeWorker so _WipHaltMixin state is exercised
-        git_ops = MagicMock(spec=GitOps)
+        git_ops = _make_mock_git_ops(tmp_path)
         real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         workflow.merge_worker = real_worker
 
@@ -920,7 +976,7 @@ class TestAutoHealHaltOwnerIsDedupeParent:
 
         # Use a REAL SpeculativeMergeWorker so _WipHaltMixin lane-owner state is
         # exercised.
-        git_ops = MagicMock(spec=GitOps)
+        git_ops = _make_mock_git_ops(tmp_path)
         real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         workflow.merge_worker = real_worker
 
@@ -1067,7 +1123,7 @@ class TestAutoHealConcurrentSameSignature:
         config = _make_config(tmp_path)
 
         # Use a REAL SpeculativeMergeWorker so is_lane_halted reflects actual state
-        git_ops = MagicMock(spec=GitOps)
+        git_ops = _make_mock_git_ops(tmp_path)
         real_worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
 
         # ── Task A setup ─────────────────────────────────────────────────────

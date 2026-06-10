@@ -4439,9 +4439,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._shadow_compare_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Persisted cadence state path — under project_root/data/orchestrator/
         # so it survives orchestrator restarts and lives next to other data files.
-        self._shadow_state_path: Path = (
-            git_ops.project_root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
-        )
+        # None-safe (mirrors escalation_queue None-safety above) so bare-worker/
+        # bare-harness tests stay green without wiring project_root onto the mock.
+        # Production GitOps always has project_root, so the Path branch is always
+        # taken in production.
+        _root = getattr(git_ops, 'project_root', None)
+        self._shadow_state_path: Path | None = (
+            _root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
+        ) if _root is not None else None
         # Internal pipeline: Merger → Verifier
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
@@ -7269,6 +7274,12 @@ async def _maybe_schedule_shadow_compare(
     if not req.config.git.warm_verify_shadow_compare:
         return
     if not warm_results:
+        return
+    # None-safe: _shadow_state_path is None on bare-harness workers (mirrors the
+    # escalation_queue None-safety / bare-harness contract in __init__).
+    # _load_shadow_compare_state(None) raises AttributeError — not in its except
+    # tuple — so guard here to keep the Path|None type sound at call sites.
+    if worker._shadow_state_path is None:
         return
 
     # Load persisted cadence state (fail-safe: returns default on missing/corrupt)
