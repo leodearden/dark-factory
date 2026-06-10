@@ -4943,3 +4943,103 @@ class TestAcquireHostVerifyWorktree:
             )
         finally:
             await ops.cleanup_merge_worktree(wt3)
+
+
+# ---------------------------------------------------------------------------
+# parse_diff_line_ranges — pure function unit tests (step-3)
+# ---------------------------------------------------------------------------
+
+CANNED_DIFF_TWO_FILES = """\
+diff --git a/src/foo.rs b/src/foo.rs
+index aaaaaa..bbbbbb 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -10,3 +10,2 @@
+ context
+-deleted line 1
+-deleted line 2
++added replacement
+@@ -40,1 +41,1 @@
+-old single line
++new single line
+diff --git a/src/bar.rs b/src/bar.rs
+index cccccc..dddddd 100644
+--- a/src/bar.rs
++++ b/src/bar.rs
+@@ -5,2 +5,3 @@
+ context
+-removed line
++inserted a
++inserted b
++inserted c
+"""
+
+CANNED_DIFF_INSERTION_ONLY = """\
+diff --git a/src/baz.rs b/src/baz.rs
+index 000000..111111 100644
+--- a/src/baz.rs
++++ b/src/baz.rs
+@@ -7,0 +8,3 @@
++new line 1
++new line 2
++new line 3
+"""
+
+CANNED_DIFF_DELETION_ONLY = """\
+diff --git a/src/qux.rs b/src/qux.rs
+index 000000..111111 100644
+--- a/src/qux.rs
++++ b/src/qux.rs
+@@ -20,4 +20,0 @@
+-del 1
+-del 2
+-del 3
+-del 4
+"""
+
+
+class TestParseDiffLineRanges:
+    """Unit tests for parse_diff_line_ranges (pure function, no git invocation)."""
+
+    def _fn(self):
+        from orchestrator.git_ops import parse_diff_line_ranges
+        return parse_diff_line_ranges
+
+    def test_two_files_multi_hunk(self):
+        fn = self._fn()
+        result = fn(CANNED_DIFF_TWO_FILES)
+        # src/foo.rs: hunk @@ -10,3 → old_start=10, old_count=3 → (10, 12)
+        #             hunk @@ -40,1 → old_start=40, old_count=1 → (40, 40)
+        assert 'src/foo.rs' in result
+        assert (10, 12) in result['src/foo.rs']
+        assert (40, 40) in result['src/foo.rs']
+        # src/bar.rs: hunk @@ -5,2 → old_start=5, old_count=2 → (5, 6)
+        assert 'src/bar.rs' in result
+        assert (5, 6) in result['src/bar.rs']
+
+    def test_empty_diff_returns_empty_dict(self):
+        fn = self._fn()
+        assert fn('') == {}
+
+    def test_insertion_only_hunk_uses_anchor_range(self):
+        """@@ -7,0 +8,3 @@ (pure insertion) maps to a point range (7, 7)."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_INSERTION_ONLY)
+        assert 'src/baz.rs' in result
+        ranges = result['src/baz.rs']
+        # old_start=7, old_count=0 → point range (7, 7)
+        assert (7, 7) in ranges
+
+    def test_deletion_only_hunk_counted_on_old_side(self):
+        """@@ -20,4 +20,0 @@ maps to (20, 23)."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_DELETION_ONLY)
+        assert 'src/qux.rs' in result
+        ranges = result['src/qux.rs']
+        # old_start=20, old_count=4 → (20, 23)
+        assert (20, 23) in ranges
+
+    def test_no_unexpected_keys(self):
+        fn = self._fn()
+        result = fn(CANNED_DIFF_TWO_FILES)
+        assert set(result.keys()) == {'src/foo.rs', 'src/bar.rs'}
