@@ -1393,8 +1393,7 @@ async def _make_task_branch(
 
 def _make_smw_req(task_id: str, branch: str, worktree: Path, config: OrchestratorConfig) -> MergeRequest:
     """Build a MergeRequest for an integration test."""
-    loop = asyncio.get_event_loop()
-    fut: asyncio.Future[MergeOutcome] = loop.create_future()
+    fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
         branch=branch,
