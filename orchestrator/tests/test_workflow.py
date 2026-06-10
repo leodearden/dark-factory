@@ -45,6 +45,12 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
     config.project_root = tmp_path / 'proj'
+    # Immunise run()-path tests against _maybe_form_train MagicMock guard landmine
+    # (introduced by task 1705): mirror real OrchestratorConfig defaults so Guard 1
+    # (`not merge_train_former_enabled`) short-circuits before Guard 3
+    # (`merge_train_max_members < 2`) can raise `TypeError: MagicMock < int`.
+    config.merge_train_former_enabled = False
+    config.merge_train_max_members = 3
 
     scheduler = MagicMock()
     git_ops = MagicMock()
