@@ -3213,12 +3213,14 @@ async def reverify_member_solo(
 
     Returns a :class:`SoloVerifyResult`:
       - ``passed=True``  when ``_run_post_merge_verify`` returns ``None``.
+        The solo worktree and branch are **left intact** so that
+        ``_attribute_train_failure`` can call ``advance_main`` against the live
+        worktree without re-materialising it (keeps verify cost ≤N+1).
+        ``solo_wt`` and ``solo_branch`` are populated in the result for handoff.
       - ``passed=False`` when it returns a :class:`MergeOutcome`.
-
-    The solo worktree is always cleaned up (``git_ops.cleanup_merge_worktree``)
-    in a ``finally`` block.  :func:`_run_post_merge_verify` already cleans up
-    on failure paths — the ``finally`` is a defensive belt-and-braces guard so
-    that no solo worktree leaks even if the caller forgets to remove it.
+        Both the worktree (``cleanup_merge_worktree``) and the bare branch
+        (``git_ops.delete_solo_branch``) are torn down before returning.
+        A failer is never landed, so its solo is no longer needed.
 
     Args:
         git_ops:        GitOps instance for the current repo.
@@ -3247,38 +3249,49 @@ async def reverify_member_solo(
         result=asyncio.get_running_loop().create_future(),
     )
 
-    try:
-        outcome = await _run_post_merge_verify(
-            git_ops, req, solo_wt,
-            timeouts={},
-            enospc_retries={},
-            max_timeouts=3,
-            max_enospc=3,
-            event_store=event_store,
-            merge_sha=tip_sha,
-        )
-        if outcome is None:
-            return SoloVerifyResult(
-                member_id=member_id,
-                passed=True,
-                merge_sha=tip_sha,
-                reason='',
-                solo_wt=solo_wt,
-                solo_branch=solo_branch,
-            )
+    outcome = await _run_post_merge_verify(
+        git_ops, req, solo_wt,
+        timeouts={},
+        enospc_retries={},
+        max_timeouts=3,
+        max_enospc=3,
+        event_store=event_store,
+        merge_sha=tip_sha,
+    )
+    if outcome is None:
+        # Pass: hand off the live worktree+branch to _attribute_train_failure.
         return SoloVerifyResult(
             member_id=member_id,
-            passed=False,
-            merge_sha=None,
-            reason=outcome.reason,
+            passed=True,
+            merge_sha=tip_sha,
+            reason='',
             solo_wt=solo_wt,
             solo_branch=solo_branch,
         )
-    finally:
-        # Defensive cleanup: _run_post_merge_verify already cleans up on
-        # failure, but call again to guard against the pass path (where it
-        # does NOT remove the worktree) and any unexpected exception.
+
+    # Fail: tear down the solo worktree and branch — failer is never landed.
+    try:
         await git_ops.cleanup_merge_worktree(solo_wt)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            'reverify_member_solo: cleanup_merge_worktree failed for member %s',
+            member_id, exc_info=True,
+        )
+    try:
+        await git_ops.delete_solo_branch(solo_branch)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            'reverify_member_solo: delete_solo_branch failed for member %s',
+            member_id, exc_info=True,
+        )
+    return SoloVerifyResult(
+        member_id=member_id,
+        passed=False,
+        merge_sha=None,
+        reason=outcome.reason,
+        solo_wt=solo_wt,
+        solo_branch=solo_branch,
+    )
 
 
 async def _do_train_merge(
