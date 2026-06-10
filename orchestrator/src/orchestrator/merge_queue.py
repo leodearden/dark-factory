@@ -4077,6 +4077,17 @@ class MergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: skipping re-verification '
                 f'(pre-rebased, main unchanged)'
             )
+        # ── Persistent warm merge-verify worktree swap (PRD §10 κ) ──────
+        # Parity with SpeculativeMergeWorker._verify_and_advance: when the
+        # knob is ON and not due, swap the ephemeral merge_wt for the warm
+        # _merge-verify path before verify, advance_main, and cleanup.
+        # safety_valve_due=False here; step-18 wires the real predicate.
+        if not skip_verify:
+            merge_wt = await _acquire_warm_verify_worktree(
+                self._git_ops, req, merge_wt,
+                merge_result.merge_commit or '',
+                safety_valve_due=False,
+            )
         if not skip_verify:
             out = await _run_post_merge_verify(
                 self._git_ops, req, merge_wt,
@@ -5810,6 +5821,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         merge_commit = item.merge_result.merge_commit
         assert merge_commit is not None
         merge_commit = merge_commit.strip()
+
+        # ── Persistent warm merge-verify worktree swap (PRD §10 κ) ──────
+        # When the knob is ON and the safety valve isn't due, swap the
+        # ephemeral merge_wt for the fixed _merge-verify path BEFORE the
+        # verify-start log so the log shows worktree=_merge-verify (the
+        # user-observable persistence signal) and verify, advance_main, and
+        # all cleanup_merge_worktree calls use the warm path.
+        # safety_valve_due=False here; step-18 wires the real predicate.
+        if not item.skip_verify:
+            merge_wt = await _acquire_warm_verify_worktree(
+                self._git_ops, req, merge_wt, merge_commit,
+                safety_valve_due=False,
+            )
 
         # ── Step 4: verify ────────────────────────────────────────────
         if not item.skip_verify:
