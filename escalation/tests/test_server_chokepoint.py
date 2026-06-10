@@ -2934,6 +2934,94 @@ class TestBoundaryTableMcpSurface:
             f"Expected superseded_by={TRAIN_RID!r}, got: {status}"
         )
 
+    async def test_scenario_superseded_event_store_tier_branch_lookup(
+        self, tmp_path: Path,
+    ) -> None:
+        """Superseded surface via event store (Tier 3) — lookup by branch.
+
+        Mirrors test_scenario_superseded_event_store_tier but queries via
+        branch= instead of request_id=.  The event store supports all three
+        lookup keys; this exercises the realistic recovery scenario where the
+        absorbed branch's agent only holds the branch identifier, not the
+        original request_id.
+
+        Assert merge_status(branch='branch-absorbed3') returns:
+          - state == 'superseded'
+          - outcome == 'superseded'
+          - superseded_by == 'mr-train3-es'
+
+        Also verifies lookup by task_id= (the other non-request_id key).
+        """
+        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            EventStore,
+            EventType,
+        )
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InFlightMergeRegistry,
+            TerminalOutcomeRetention,
+        )
+
+        db_path = tmp_path / 'events-sup-branch.db'
+        event_store = EventStore(db_path=db_path, run_id='sup-branch')
+
+        ABSORBED_RID = 'mr-absorbed3'
+        ABSORBED_BRANCH = 'branch-absorbed3'
+        ABSORBED_TASK = 'task-absorbed3'
+        TRAIN_RID = 'mr-train3-es'
+
+        # Emit a merge_finalized record for the absorbed request
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id=ABSORBED_TASK,
+            phase='merge',
+            data={
+                'request_id': ABSORBED_RID,
+                'branch': ABSORBED_BRANCH,
+                'state': 'superseded',
+                'snapshot_tip': None,
+                'merge_sha': None,
+                'superseded_by': TRAIN_RID,
+                'generation': 1,
+            },
+        )
+
+        # Build a fresh server with empty retention (simulating restart / ring eviction)
+        fresh_retention = TerminalOutcomeRetention()
+        fresh_harness = _FakeHarness(retention=fresh_retention)
+        fresh_server = create_server(
+            EscalationQueue(tmp_path / 'esc-sup-branch'),
+            merge_queue=asyncio.Queue(),
+            orch_config=_make_orch_config(tmp_path / 'repo-sup-branch'),
+            event_store=event_store,
+            harness=fresh_harness,
+            merge_inflight_registry=InFlightMergeRegistry(),
+            startup_sweep=False,
+        )
+
+        # --- branch lookup ---
+        status_branch = await _call_merge_status(fresh_server, branch=ABSORBED_BRANCH)
+        assert status_branch.get('state') == 'superseded', (
+            f"branch lookup: expected state='superseded', got: {status_branch}"
+        )
+        assert status_branch.get('outcome') == 'superseded', (
+            f"branch lookup: expected outcome='superseded', got: {status_branch}"
+        )
+        assert status_branch.get('superseded_by') == TRAIN_RID, (
+            f"branch lookup: expected superseded_by={TRAIN_RID!r}, got: {status_branch}"
+        )
+
+        # --- task_id lookup ---
+        status_task = await _call_merge_status(fresh_server, task_id=ABSORBED_TASK)
+        assert status_task.get('state') == 'superseded', (
+            f"task_id lookup: expected state='superseded', got: {status_task}"
+        )
+        assert status_task.get('outcome') == 'superseded', (
+            f"task_id lookup: expected outcome='superseded', got: {status_task}"
+        )
+        assert status_task.get('superseded_by') == TRAIN_RID, (
+            f"task_id lookup: expected superseded_by={TRAIN_RID!r}, got: {status_task}"
+        )
+
     async def test_scenario_superseded_merge_request_bounded_wait(
         self, tmp_path: Path,
     ) -> None:

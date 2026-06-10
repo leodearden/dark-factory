@@ -1119,6 +1119,11 @@ def create_server(
 
     _MERGE_STATUS_UNKNOWN_HINT = 'check git log main'
 
+    # Optional fields that _durable_terminal_state threads into the meta dict
+    # when present and non-None.  Add future terminal-metadata fields here so
+    # every tier stays in sync automatically.
+    _OPTIONAL_TERMINAL_META_FIELDS: tuple[str, ...] = ('superseded_by',)
+
     def _epoch_to_iso8601(ts: float) -> str:
         """Convert an epoch-seconds float to an ISO-8601 UTC string (matches event-store format)."""
         return datetime.fromtimestamp(ts, tz=UTC).isoformat()
@@ -1186,8 +1191,10 @@ def create_server(
                     'outcome': rec.state,
                     'finished_at': _epoch_to_iso8601(rec.finished_at),
                 }
-                if rec.superseded_by is not None:
-                    meta['superseded_by'] = rec.superseded_by
+                for _f in _OPTIONAL_TERMINAL_META_FIELDS:
+                    _v = getattr(rec, _f, None)
+                    if _v is not None:
+                        meta[_f] = _v
                 return _map_terminal_state(rec.state), meta
 
         # Tier 3: event store (supports all three lookup keys).
@@ -1203,8 +1210,10 @@ def create_server(
                     'outcome': row['state'],
                     'finished_at': row['finished_at'],
                 }
-                if row.get('superseded_by') is not None:
-                    es_meta['superseded_by'] = row['superseded_by']
+                for _f in _OPTIONAL_TERMINAL_META_FIELDS:
+                    _v = row.get(_f)
+                    if _v is not None:
+                        es_meta[_f] = _v
                 return _map_terminal_state(row['state']), es_meta
 
         return None
