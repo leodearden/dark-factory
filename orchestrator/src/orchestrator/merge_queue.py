@@ -6834,16 +6834,24 @@ class MergeLivenessAssessment:
     Attributes:
         worst_case_secs: Computed worst-case time (seconds) a counted
             ``_merge-*`` worktree can legitimately remain queued without
-            having its mtime updated, under the given config.
+            having its mtime updated, under the given config.  Equals
+            ``ceil(merge_ahead_bound / num_hosts) * timeout_secs``.
         threshold_secs: Safety threshold (``safety_factor * liveness_secs``);
             the guard fires when ``worst_case_secs >= threshold_secs``.
         liveness_secs: The reaper's liveness window passed to the guard.
         timeout_secs: Effective per-command merge-verify cold timeout resolved
             from the config (the primary knob that drives the worst-case).
-        merge_ahead_bound: Injected (or defaulted) merge-ahead cap value.
+        merge_ahead_bound: Raw verify pool size K injected (or defaulted).
+            Kept as the raw value; the per-host division is applied inside
+            the guard (see :attr:`num_hosts`).
         max_verify_timeouts: Injected (or defaulted) consecutive-timeout
             limit; included for informational display in log messages.
         safe: True iff ``worst_case_secs < threshold_secs``.
+        num_hosts: Number of hosts across which the pool is distributed
+            (default 1).  ``worst_case_secs`` is derived from
+            ``ceil(merge_ahead_bound / num_hosts) * timeout_secs`` so that
+            operators can reconstruct the per-host arithmetic from the
+            assessment fields.
     """
 
     worst_case_secs: float
@@ -6853,12 +6861,14 @@ class MergeLivenessAssessment:
     merge_ahead_bound: int
     max_verify_timeouts: int
     safe: bool
+    num_hosts: int = 1
 
 
 def check_merge_liveness_margin(
     config: OrchestratorConfig,
     *,
     merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
+    num_hosts: int = 1,
     max_verify_timeouts: int = SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
     liveness_secs: float = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     safety_factor: float = 0.75,
@@ -6890,9 +6900,16 @@ def check_merge_liveness_margin(
 
     .. code-block:: text
 
-        worst_case = merge_ahead_bound * timeout
-        threshold  = safety_factor * liveness_secs
-        safe       = worst_case < threshold
+        per_host_bound = ceil(merge_ahead_bound / num_hosts)
+        worst_case     = per_host_bound * timeout
+        threshold      = safety_factor * liveness_secs
+        safe           = worst_case < threshold
+
+    When ``num_hosts=1`` (default), ``per_host_bound == merge_ahead_bound``
+    and behaviour is byte-identical to the pre-multi-host code.  With K
+    verify runners distributed across K hosts,
+    ``per_host_bound = ceil(K/K) = 1``, reducing ``worst_case`` back to a
+    single timeout and keeping startup safe.
 
     The formula uses a multiplier of 1 (not ``max_verify_timeouts + 1``)
     because each verify attempt creates and cleans up its own ``_merge-*``
@@ -6913,8 +6930,14 @@ def check_merge_liveness_margin(
 
     Args:
         config: Live per-project orchestrator config.
-        merge_ahead_bound: Override for :data:`_MERGE_AHEAD_BOUND` (injectable
-            for tests and future tuning).
+        merge_ahead_bound: Raw verify pool size K (injectable for tests and
+            future tuning; default :data:`_MERGE_AHEAD_BOUND`).  Stored as-is
+            on the returned assessment; the per-host division is applied
+            internally.
+        num_hosts: Number of hosts across which the K runners are distributed
+            (default 1, identical to pre-multi-host behaviour).  The per-host
+            bound is ``math.ceil(max(1, merge_ahead_bound) / max(1, num_hosts))``,
+            matching :func:`enforce_persistent_worktree_serial_lane`.
         max_verify_timeouts: Override for
             :attr:`SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS`
             (informational; not part of the worst-case formula).
@@ -6939,7 +6962,12 @@ def check_merge_liveness_margin(
         config, None, is_cold=True, is_merge_verify=True,
     )
 
-    worst_case_secs = merge_ahead_bound * timeout_secs
+    # Per-host bound: identical clamp to enforce_persistent_worktree_serial_lane.
+    # With num_hosts=1 (default), per_host_bound == merge_ahead_bound → byte-identical.
+    # With K runners across K hosts, ceil(K/K)=1 → worst_case = 1 * timeout → safe.
+    per_host_bound = math.ceil(max(1, merge_ahead_bound) / max(1, num_hosts))
+
+    worst_case_secs = per_host_bound * timeout_secs
     threshold_secs = safety_factor * liveness_secs
     safe = worst_case_secs < threshold_secs
 
@@ -6951,6 +6979,7 @@ def check_merge_liveness_margin(
         merge_ahead_bound=merge_ahead_bound,
         max_verify_timeouts=max_verify_timeouts,
         safe=safe,
+        num_hosts=num_hosts,
     )
 
     if not safe:
@@ -6960,13 +6989,15 @@ def check_merge_liveness_margin(
             '(%.0fs, threshold=%.0fs, factor=%.2f). '
             'Reduce merge_verify_cold_command_timeout_secs (currently %.0fs) '
             'or raise INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS '
-            '(merge_ahead_bound=%d, max_verify_timeouts=%d).',
+            '(merge_ahead_bound=%d, num_hosts=%d, per_host_bound=%d, max_verify_timeouts=%d).',
             worst_case_secs,
             liveness_secs,
             threshold_secs,
             safety_factor,
             timeout_secs,
             merge_ahead_bound,
+            num_hosts,
+            per_host_bound,
             max_verify_timeouts,
         )
 
