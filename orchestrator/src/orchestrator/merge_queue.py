@@ -5186,6 +5186,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if orch_config.merge_train_max_members < 2:
             return False
 
+        # ── Step-12: debounce ──────────────────────────────────────────────────
+        # Compute the candidate-set signature.  Short-circuit on an unchanged set
+        # so a steady stream of waiting singles does not re-run get_changed_line_ranges
+        # + stack_train_branches every merger tick.  Setting the signature BEFORE the
+        # selection/stack work means both the no-viable-train AND the successful-coalesce
+        # paths record the attempt — a composition change re-arms (new request_id in set
+        # → different frozenset → inequality → re-runs).
+        sig: frozenset[str] = frozenset(c.request_id for c in candidates)
+        if sig == self._last_coalesce_signature:
+            return False
+        self._last_coalesce_signature = sig
+
         # ── Step-6: core pass body ─────────────────────────────────────────────
         # SELECTION: fan out line-range fetches concurrently (one git subprocess
         # per candidate), then delegate to the greedy mutually-stackable selector.
@@ -5209,8 +5221,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             orch_config.merge_train_max_members,
         )
         if len(selected) < 2:
-            # Record attempt so an unchanged waiting set is not re-stacked next tick.
-            self._last_coalesce_signature = frozenset(c.request_id for c in candidates)
+            # Signature already recorded above; no further work needed.
             return False
 
         # STACK: rebase successors onto the previous survivor's branch.  Rebase
@@ -5220,11 +5231,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ejected: list[str] = stack_result.ejected
 
         if len(survivors) < 2:
-            # Abort cleanly: record debounce sig; no buffer mutation, no future
+            # Abort cleanly: sig already recorded; no buffer mutation, no future
             # resolution, no event emitted.  Non-selected and ejected members
             # remain in _lane_buffers with unresolved futures (they may yet join a
             # future train when a new stackable partner arrives and re-arms the sig).
-            self._last_coalesce_signature = frozenset(c.request_id for c in candidates)
             return False
 
         # BUILD GroupMergeRequest from the tip (last survivor) request.
