@@ -13,16 +13,19 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.merge_queue import MergeOutcome, SoloVerifyResult, TRAIN_VERIFY_FAILED_REASON_PREFIX
+from orchestrator.merge_queue import (
+    TRAIN_VERIFY_FAILED_REASON_PREFIX,
+    MergeOutcome,
+    SoloVerifyResult,
+)
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-
 
 # ---------------------------------------------------------------------------
 # Shared fixture helper (mirrors test_workflow_train_completion._make)
@@ -198,8 +201,6 @@ class TestDetectionWiring:
 
     async def test_untagged_blocked_routes_to_mark_blocked(self) -> None:
         """Non-tagged blocked outcome still routes to _mark_blocked (unaffected path)."""
-        from orchestrator.merge_queue import TRAIN_VERIFY_FAILED_REASON_PREFIX
-
         members = _train_members(train_id='T-attr2', tip_id='103')
         f = _make(
             task_id='103',
@@ -232,10 +233,7 @@ class TestDetectionWiring:
 
     async def test_train_incomplete_path_unaffected(self) -> None:
         """train_incomplete blocked outcome still returns None (park) — unaffected."""
-        from orchestrator.merge_queue import (
-            TRAIN_INCOMPLETE_REASON_PREFIX,
-            TRAIN_VERIFY_FAILED_REASON_PREFIX,
-        )
+        from orchestrator.merge_queue import TRAIN_INCOMPLETE_REASON_PREFIX
 
         members = _train_members(train_id='T-incomplete', tip_id='103')
         f = _make(
@@ -441,9 +439,8 @@ def _solo_pass_wt(member_id: str) -> SoloVerifyResult:
 class TestSomeFailAttribution:
     """Non-tip member fails solo → land passers, block offender; tip passer returns DONE."""
 
-    def _three_member_fixture(self, offender_id: str = '101') -> '_Fixture':
+    def _three_member_fixture(self, offender_id: str = '101') -> _Fixture:
         """3-member train; offender_id is the failer, others pass."""
-        members = _train_members(train_id='T-some-fail', tip_id='103')
         f = _make(
             task_id='103',
             metadata={'train': {'id': 'T-some-fail', 'order': 2,
@@ -616,7 +613,7 @@ class TestSomeFailAttribution:
 class TestEdgeMappings:
     """Edge cases: tip-as-offender, un-stack conflict, passer advance failure."""
 
-    def _fixture(self, task_id: str = '103') -> '_Fixture':
+    def _fixture(self, task_id: str = '103') -> _Fixture:
         f = _make(
             task_id=task_id,
             metadata={'train': {'id': 'T-edge', 'order': 2,
