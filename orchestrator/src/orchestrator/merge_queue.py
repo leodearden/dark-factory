@@ -42,7 +42,6 @@ from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
     _derive_task_files_from_git,
-    _resolve_verify_timeout,
     run_scoped_verification,
     run_verification,
     verify_failure_is_preexisting_on_main,
@@ -190,7 +189,36 @@ by the per-instance _heartbeat_interval_s (default 300 s).  Keeping the poll
 period short (30 s) means the first heartbeat fires within ~30 s of startup
 when depth > 0 (because _last_heartbeat_at is initialised to 0.0, making the
 rate-limit check pass immediately on the first poll), then subsequently no
-more often than _heartbeat_interval_s, without adding measurable overhead."""
+more often than _heartbeat_interval_s, without adding measurable overhead.
+
+This constant is also a multiplicand of the liveness-margin guard's heartbeat
+floor (see :data:`TOUCH_MISS_TOLERANCE`)."""
+
+TOUCH_MISS_TOLERANCE: int = 20
+"""Maximum number of consecutive _HEARTBEAT_POLL_S ticks a live worker's
+owned ``_merge-*`` worktrees are permitted to miss before their mtime would
+falsely age into the reaper window.
+
+**Derivation**
+
+The α owner-heartbeat (task 1728) touches every owned ``_merge-*`` worktree's
+mtime every :data:`_HEARTBEAT_POLL_S` seconds.  Under normal operation a
+worktree's mtime age is bounded by ~1 poll period (30 s).  A sustained
+event-loop stall (GIL contention, heavy I/O, OS scheduling jitter) can delay
+the heartbeat, but the stall budget is:
+
+    floor_secs = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE = 30 × 20 = 600 s
+
+**Margin calibration** (PRD §9, 10–60 band)
+
+    default_threshold = 0.75 × INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+                      = 0.75 × 10800 = 8100 s
+    margin = 8100 / 600 = 13.5× ≥ 3× (PRD minimum)
+
+20 is the PRD's running example ("e.g. 20 → 600 s floor").  The constant is
+read in the body of :func:`check_merge_liveness_margin` (not as a default
+argument) so that a harness-level test can monkeypatch it to force an
+over-budget verdict without requiring a low-liveness config."""
 
 AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
 """Kill-switch for the γ2 generation auto-chaining producer.
@@ -7095,117 +7123,99 @@ class MergeLivenessAssessment:
     All fields are informational; callers should treat :attr:`safe` as the
     primary decision bit and log/display the numeric fields for triage.
 
+    **Heartbeat-floor model (task 1729 / β)**
+
+    Since the α owner-heartbeat (task 1728) touches every owned ``_merge-*``
+    worktree every :data:`_HEARTBEAT_POLL_S` seconds, the worst frozen age
+    for a *live* worker's worktrees is bounded by the stall budget
+    ``_HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE``, independent of K,
+    cold timeout, or num_hosts.  The old ``timeout_secs / merge_ahead_bound /
+    num_hosts / max_verify_timeouts`` fields are therefore removed.
+
     Attributes:
-        worst_case_secs: Computed worst-case time (seconds) a counted
-            ``_merge-*`` worktree can legitimately remain queued without
-            having its mtime updated, under the given config.  Equals
-            ``ceil(merge_ahead_bound / num_hosts) * timeout_secs``.
+        worst_case_secs: Heartbeat floor — ``_HEARTBEAT_POLL_S ×
+            TOUCH_MISS_TOLERANCE`` (seconds); invariant across config.
         threshold_secs: Safety threshold (``safety_factor * liveness_secs``);
             the guard fires when ``worst_case_secs >= threshold_secs``.
         liveness_secs: The reaper's liveness window passed to the guard.
-        timeout_secs: Effective per-command merge-verify cold timeout resolved
-            from the config (the primary knob that drives the worst-case).
-        merge_ahead_bound: Raw verify pool size K injected (or defaulted).
-            Kept as the raw value; the per-host division is applied inside
-            the guard (see :attr:`num_hosts`).
-        max_verify_timeouts: Injected (or defaulted) consecutive-timeout
-            limit; included for informational display in log messages.
+        heartbeat_poll_secs: Value of :data:`_HEARTBEAT_POLL_S` at call time
+            (for diagnostics and monkeypatch verification).
+        touch_miss_tolerance: Value of :data:`TOUCH_MISS_TOLERANCE` at call
+            time (for diagnostics and monkeypatch verification).
+        safety_factor: Fraction of *liveness_secs* used as the threshold.
         safe: True iff ``worst_case_secs < threshold_secs``.
-        num_hosts: Number of hosts across which the pool is distributed
-            (default 1).  ``worst_case_secs`` is derived from
-            ``ceil(merge_ahead_bound / num_hosts) * timeout_secs`` so that
-            operators can reconstruct the per-host arithmetic from the
-            assessment fields.
     """
 
     worst_case_secs: float
     threshold_secs: float
     liveness_secs: float
-    timeout_secs: float
-    merge_ahead_bound: int
-    max_verify_timeouts: int
+    heartbeat_poll_secs: float
+    touch_miss_tolerance: int
+    safety_factor: float
     safe: bool
-    num_hosts: int = 1
 
 
 def check_merge_liveness_margin(
     config: OrchestratorConfig,
     *,
-    merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
-    num_hosts: int = 1,
-    max_verify_timeouts: int = SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
     liveness_secs: float = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     safety_factor: float = 0.75,
     logger: logging.Logger = logger,
 ) -> MergeLivenessAssessment:
-    """Evaluate whether the merge-verify cold timeout fits safely within the
-    reaper's liveness window and emit a WARNING when it does not.
+    """Evaluate whether the heartbeat floor fits safely within the reaper's
+    liveness window and emit a WARNING when it does not.
 
     Called once at orchestrator startup (from ``Harness._start_merge_worker``)
     against the live per-project :class:`OrchestratorConfig`.
 
-    **Physical model**
+    **Physical model (task 1729 / β — heartbeat-floor)**
 
-    With ``_MERGE_AHEAD_BOUND=N``, up to *N* counted ``_merge-*`` worktrees
-    can sit in the :class:`SpeculativeMergeWorker` verifier queue while the
-    verifier is busy with an earlier item.  Those queued worktrees have their
-    mtime frozen at merge time and are NOT updated until the verifier picks
-    them up.  The worst-case stale interval for a queued worktree is therefore
-    bounded by the longest a single verify can run — the cold merge-verify
-    timeout resolved from *config*.
+    The α owner-heartbeat (task 1728) touches every owned ``_merge-*``
+    worktree's mtime every :data:`_HEARTBEAT_POLL_S` seconds.  Under normal
+    operation a live worker's worktrees never age past ~1 poll period.  A
+    sustained event-loop stall (GIL contention, heavy I/O, OS scheduling
+    jitter) can delay the heartbeat, but the stall budget is:
 
-    The reaper in :func:`coalesce_or_enqueue_merge_request` treats any
-    ``_merge-*`` worktree whose mtime age exceeds
-    :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` as abandoned and reaps it.
-    A queued-but-legitimate worktree is indistinguishable from an abandoned
-    one once its mtime age exceeds that window.
+    .. code-block:: text
+
+        floor_secs = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE
+
+    K (verify pool size), cold timeout, and num_hosts drop out of the formula
+    because the heartbeat model makes them irrelevant: a live worker touches
+    its owned worktrees regardless of how many verifiers are in flight or how
+    long each verify takes.
 
     **Formula**
 
     .. code-block:: text
 
-        per_host_bound = ceil(merge_ahead_bound / num_hosts)
-        worst_case     = per_host_bound * timeout
-        threshold      = safety_factor * liveness_secs
-        safe           = worst_case < threshold
+        worst_case_secs = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE  # read as module globals
+        threshold_secs  = safety_factor × liveness_secs
+        safe            = worst_case_secs < threshold_secs
 
-    When ``num_hosts=1`` (default), ``per_host_bound == merge_ahead_bound``
-    and behaviour is byte-identical to the pre-multi-host code.  With K
-    verify runners distributed across K hosts,
-    ``per_host_bound = ceil(K/K) = 1``, reducing ``worst_case`` back to a
-    single timeout and keeping startup safe.
-
-    The formula uses a multiplier of 1 (not ``max_verify_timeouts + 1``)
-    because each verify attempt creates and cleans up its own ``_merge-*``
-    worktree; the per-task timeout-retry counter does not extend any single
-    worktree's on-disk lifetime.  ``max_verify_timeouts`` is carried in the
-    return value for operator context.
+    Both :data:`_HEARTBEAT_POLL_S` and :data:`TOUCH_MISS_TOLERANCE` are read
+    in the function body (not as default-argument values) so that a
+    harness-level test can monkeypatch either constant and have the change
+    reflected at call time.
 
     **Default calibration**
 
-    With ``safety_factor=0.75`` and ``liveness_secs=10800``:
+    With ``_HEARTBEAT_POLL_S=30``, ``TOUCH_MISS_TOLERANCE=20``,
+    ``safety_factor=0.75``, and ``liveness_secs=10800``:
+
+    - floor = 600 s
     - threshold = 8100 s
-    - A warm-only deployment (``verify_command_timeout_secs=1800``, no cold
-      overrides) resolves timeout=1800 s → worst_case=1800 s < 8100 s → safe
-      (guard silent).
-    - The shipped ``defaults.yaml`` (``merge_verify_cold_command_timeout_secs
-      =7200``) resolves timeout=7200 s → worst_case=7200 s < 8100 s → safe
-      (guard silent).
+    - margin = 13.5× ≥ 3× (PRD minimum)
+    - All shipped configs (including ``merge_verify_cold_command_timeout_secs
+      =9000``) are now safe because cold timeout no longer feeds the formula.
 
     Args:
-        config: Live per-project orchestrator config.
-        merge_ahead_bound: Raw verify pool size K (injectable for tests and
-            future tuning; default :data:`_MERGE_AHEAD_BOUND`).  Stored as-is
-            on the returned assessment; the per-host division is applied
-            internally.
-        num_hosts: Number of hosts across which the K runners are distributed
-            (default 1, identical to pre-multi-host behaviour).  The per-host
-            bound is ``math.ceil(max(1, merge_ahead_bound) / max(1, num_hosts))``,
-            matching :func:`enforce_persistent_worktree_serial_lane`.
-        max_verify_timeouts: Override for
-            :attr:`SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS`
-            (informational; not part of the worst-case formula).
+        config: Live per-project orchestrator config.  Kept as the first
+            positional parameter for call-signature stability; the heartbeat
+            floor does not read config fields.
         liveness_secs: Override for :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`.
+            The corrective operator lever: raise this to widen the safety
+            threshold.
         safety_factor: Fraction of *liveness_secs* that constitutes the
             "comfortably below" threshold.  Default 0.75.
         logger: Logger to use for the WARNING (default: module logger, captured
@@ -7215,23 +7225,13 @@ def check_merge_liveness_margin(
         :class:`MergeLivenessAssessment` with all computed values and the
         ``safe`` verdict.
     """
-    # Resolve the effective per-command merge-verify cold timeout.
-    # Merge worktrees are always cold (merge_queue.py:379-384), so we pass
-    # is_cold=True and is_merge_verify=True to get the full cold cascade:
-    #   merge_verify_cold_command_timeout_secs
-    #   → verify_cold_command_timeout_secs
-    #   → verify_command_timeout_secs (warm fallback)
-    # module_config=None: no per-module override exists at startup.
-    timeout_secs = _resolve_verify_timeout(
-        config, None, is_cold=True, is_merge_verify=True,
-    )
+    # Heartbeat-floor formula.  Read _HEARTBEAT_POLL_S and TOUCH_MISS_TOLERANCE
+    # as module globals here (not as default-arg values) so that monkeypatching
+    # either constant inside a test is reflected at call time.
+    _poll = _HEARTBEAT_POLL_S
+    _tolerance = TOUCH_MISS_TOLERANCE
 
-    # Per-host bound: identical clamp to enforce_persistent_worktree_serial_lane.
-    # With num_hosts=1 (default), per_host_bound == merge_ahead_bound → byte-identical.
-    # With K runners across K hosts, ceil(K/K)=1 → worst_case = 1 * timeout → safe.
-    per_host_bound = math.ceil(max(1, merge_ahead_bound) / max(1, num_hosts))
-
-    worst_case_secs = per_host_bound * timeout_secs
+    worst_case_secs = _poll * _tolerance
     threshold_secs = safety_factor * liveness_secs
     safe = worst_case_secs < threshold_secs
 
@@ -7239,51 +7239,47 @@ def check_merge_liveness_margin(
         worst_case_secs=worst_case_secs,
         threshold_secs=threshold_secs,
         liveness_secs=liveness_secs,
-        timeout_secs=timeout_secs,
-        merge_ahead_bound=merge_ahead_bound,
-        max_verify_timeouts=max_verify_timeouts,
+        heartbeat_poll_secs=_poll,
+        touch_miss_tolerance=_tolerance,
+        safety_factor=safety_factor,
         safe=safe,
-        num_hosts=num_hosts,
     )
 
     if not safe:
         logger.warning(
-            'check_merge_liveness_margin: queued _merge-* worktree worst-case '
-            'age (%.0fs) is not comfortably below the reaper liveness window '
-            '(%.0fs, threshold=%.0fs, factor=%.2f). '
-            'Reduce merge_verify_cold_command_timeout_secs (currently %.0fs) '
-            'or raise INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS '
-            '(merge_ahead_bound=%d, num_hosts=%d, per_host_bound=%d, max_verify_timeouts=%d).',
+            'check_merge_liveness_margin: heartbeat floor (%.0fs = '
+            'heartbeat_poll=%.0fs × touch_miss_tolerance=%d) is not '
+            'comfortably below the reaper liveness threshold '
+            '(%.0fs, factor=%.2f, liveness=%.0fs). '
+            'Raise INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS or lower '
+            'TOUCH_MISS_TOLERANCE to reduce the floor.',
             worst_case_secs,
-            liveness_secs,
+            _poll,
+            _tolerance,
             threshold_secs,
             safety_factor,
-            timeout_secs,
-            merge_ahead_bound,
-            num_hosts,
-            per_host_bound,
-            max_verify_timeouts,
+            liveness_secs,
         )
 
     return assessment
 
 
 class MergeLivenessConfigError(Exception):
-    """Raised by :func:`enforce_merge_liveness_margin` when the configured
-    merge-ahead bound × cold-verify timeout exceeds the reaper liveness
-    threshold, indicating that startup should be refused.
+    """Raised by :func:`enforce_merge_liveness_margin` when the heartbeat
+    floor (``_HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE``) is not comfortably
+    below the reaper liveness threshold, indicating that startup should be
+    refused.
 
-    The exception message contains the numeric details (worst_case, threshold,
-    timeout, bound) for operator triage.
+    The exception message names the heartbeat model and the corrective levers
+    (raise :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` or lower
+    :data:`TOUCH_MISS_TOLERANCE`) for operator triage.  Cold timeout and
+    merge-ahead bound are NOT named because the heartbeat model decouples them.
     """
 
 
 def enforce_merge_liveness_margin(
     config: OrchestratorConfig,
     *,
-    merge_ahead_bound: int = _MERGE_AHEAD_BOUND,
-    num_hosts: int = 1,
-    max_verify_timeouts: int = SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
     liveness_secs: float = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     safety_factor: float = 0.75,
     logger: logging.Logger = logger,
@@ -7295,16 +7291,11 @@ def enforce_merge_liveness_margin(
     the assessment is ``not safe``, causing startup to be refused.
 
     Args:
-        config: Live per-project orchestrator config.
-        merge_ahead_bound: Raw verify pool size K.  Forwarded verbatim to
-            :func:`check_merge_liveness_margin`; the per-host division
-            ``ceil(K/num_hosts)`` is applied there.
-        num_hosts: Number of hosts across which the K runners are distributed
-            (default 1 → behaviour byte-identical to pre-multi-host code).
-            Forwarded verbatim to :func:`check_merge_liveness_margin`.
-        max_verify_timeouts: Override for
-            :attr:`SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS`.
+        config: Live per-project orchestrator config.  Forwarded verbatim to
+            :func:`check_merge_liveness_margin`.
         liveness_secs: Override for :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`.
+            The corrective operator lever: raise this to widen the safety
+            threshold.
         safety_factor: Fraction of *liveness_secs* that constitutes the
             threshold.  Default 0.75.
         logger: Logger forwarded to :func:`check_merge_liveness_margin`.
@@ -7313,28 +7304,25 @@ def enforce_merge_liveness_margin(
         :class:`MergeLivenessAssessment` when the config is safe.
 
     Raises:
-        :exc:`MergeLivenessConfigError`: When ``worst_case_secs >= threshold_secs``.
+        :exc:`MergeLivenessConfigError`: When ``worst_case_secs >= threshold_secs``
+            (i.e. heartbeat floor ≥ threshold).
     """
     assessment = check_merge_liveness_margin(
         config,
-        merge_ahead_bound=merge_ahead_bound,
-        num_hosts=num_hosts,
-        max_verify_timeouts=max_verify_timeouts,
         liveness_secs=liveness_secs,
         safety_factor=safety_factor,
         logger=logger,
     )
     if not assessment.safe:
-        _per_host = math.ceil(max(1, assessment.merge_ahead_bound) / max(1, num_hosts))
         raise MergeLivenessConfigError(
-            f'enforce_merge_liveness_margin: startup refused — queued _merge-* '
-            f'worktree worst-case age ({assessment.worst_case_secs:.0f}s) is not '
-            f'below the reaper liveness threshold ({assessment.threshold_secs:.0f}s, '
+            f'enforce_merge_liveness_margin: startup refused — heartbeat floor '
+            f'({assessment.worst_case_secs:.0f}s = heartbeat_poll='
+            f'{assessment.heartbeat_poll_secs:.0f}s × touch_miss_tolerance='
+            f'{assessment.touch_miss_tolerance}) is not below the reaper '
+            f'liveness threshold ({assessment.threshold_secs:.0f}s, '
             f'factor={safety_factor:.2f}, liveness={assessment.liveness_secs:.0f}s). '
-            f'Reduce merge_verify_cold_command_timeout_secs (currently '
-            f'{assessment.timeout_secs:.0f}s) or lower merge_ahead_bound '
-            f'(currently {assessment.merge_ahead_bound}, num_hosts={num_hosts}, '
-            f'per_host_bound={_per_host}).'
+            f'Raise INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS or lower '
+            f'TOUCH_MISS_TOLERANCE to reduce the floor.'
         )
     return assessment
 
