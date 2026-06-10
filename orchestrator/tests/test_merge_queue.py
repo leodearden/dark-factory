@@ -17889,6 +17889,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
              cleared on success).
         """
         import os as _os
+
         import orchestrator.merge_queue as mq_mod
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -18013,6 +18014,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         RED because _heartbeat_loop does not call _touch_owned_merge_worktrees yet.
         """
         import os as _os
+
         import orchestrator.merge_queue as mq_mod
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -18107,8 +18109,8 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
                 # on the verifier queue.  The worktree must be registered.
                 ledger = worker._owned_merge_worktrees
                 assert len(ledger) >= 1, (
-                    f'_owned_merge_worktrees must be non-empty while verify is running; '
-                    f'got empty set'
+                    '_owned_merge_worktrees must be non-empty while verify is running; '
+                    'got empty set'
                 )
                 wt_path = next(iter(ledger))
                 assert wt_path.name.startswith('_merge-'), (
