@@ -24,6 +24,8 @@ This file starts with shared scaffolding only (pre-1).
 from __future__ import annotations
 
 import asyncio
+import collections
+import contextlib
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1741,3 +1743,179 @@ class TestSingleHostSerialByteIdentical:
         )
         assert 'sha.py' in main_files, 'Item A file not on main'
         assert 'shb.py' in main_files, 'Item B file not on main'
+
+
+# ---------------------------------------------------------------------------
+# step-17 RED: OVERLAP SIGNAL
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOverlapSignal:
+    """Two-host overlap: both verifies enter before either is released.
+
+    RED (step-17) until step-18 GREEN wires the fill loop to continue
+    dispatching while a verify slot is free.
+
+    RED markers:
+    1. gate_b_entered times out — N+1 is NOT dispatched while N is verifying
+       (serial blocking-get path finalizes N before fetching N+1).
+    2. Peak _inflight length == 1 (never 2 simultaneously in serial mode).
+
+    GREEN after step-18: dispatch-fill loop continues picking up N+1 while N
+    is still running → both gates enter → peak == 2 → submission-order finalize
+    confirmed even when N+1's verify completes first.
+    """
+
+    class _TrackingDeque(collections.deque):  # type: ignore[type-arg]
+        """deque subclass that records peak length via append tracking."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.max_len: int = 0
+
+        def append(self, item: Any) -> None:  # type: ignore[override]
+            super().append(item)
+            if len(self) > self.max_len:
+                self.max_len = len(self)
+
+        def appendleft(self, item: Any) -> None:  # type: ignore[override]
+            super().appendleft(item)
+            if len(self) > self.max_len:
+                self.max_len = len(self)
+
+    async def test_both_verifies_enter_before_either_released(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """N+1 starts verifying while N is still in-flight (concurrent overlap).
+
+        RED: gate_b_entered times out (N+1 not dispatched until N finalizes).
+        GREEN (step-18): both gates enter → overlap confirmed → submission-order
+        finalize confirmed (N lands first even when N+1 verify completes first).
+        """
+        import collections as _col
+        import contextlib
+
+        # ── Gated verifies ─────────────────────────────────────────────────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+
+        # Remote runner (N+1's verify host) — gated on gate_b
+        gated_remote = _gated_runner(gate_b_release, gate_b_entered, name='laptop')
+
+        # Local verify (N's verify host) — gated via run_scoped_verification patch
+        async def _gated_local_verify(*args: Any, **kwargs: Any) -> MagicMock:
+            gate_a_entered.set()
+            await gate_a_release.wait()
+            return MagicMock(passed=True, summary='', test_output='', lint_output='',
+                             type_output='', category='')
+
+        # ── Branches ───────────────────────────────────────────────────────
+        wt_a = await _make_branch_with_file(git_ops, 'task/ov-a', 'ov_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/ov-b', 'ov_b.py', 'b = 2\n')
+
+        # ── Worker setup ───────────────────────────────────────────────────
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        # Replace _inflight with a tracking deque (captures peak length)
+        tracked = self._TrackingDeque()
+        worker._inflight = tracked  # type: ignore[assignment]
+
+        # Inject two-host allocator: local + gated_remote
+        _inject_two_host_allocator(worker, gated_remote)
+
+        loop = asyncio.get_event_loop()
+        req_a = MergeRequest(
+            task_id='ov-a', branch='task/ov-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='ov-b', branch='task/ov-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local_verify):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Submit both requests; merger will process them while verifier runs
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # N (local) should enter its gated verify quickly
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # While N is STILL verifying (gate_a NOT released), N+1 should ALSO
+            # start verifying (remote slot is free → dispatch-fill overlap).
+            # RED: times out — serial loop only dispatches N+1 after N finalizes.
+            # GREEN (step-18): concurrent fill → gate_b_entered fires quickly.
+            try:
+                await asyncio.wait_for(gate_b_entered.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                # Cleanup: release gates so worker can drain cleanly
+                gate_a_release.set()
+                gate_b_release.set()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(req_a.result, timeout=10.0)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(req_b.result, timeout=10.0)
+                await worker.stop()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker_task, timeout=5.0)
+                pytest.fail(
+                    'OVERLAP not observed: gate_b timed out while gate_a was set. '
+                    'RED: serial blocking-get path finalizes N before fetching N+1 '
+                    '— N+1 only dispatched after N fully completes. '
+                    'GREEN (step-18): blocking-get path loops back to fill → '
+                    'dispatch-fill picks up N+1 to remote slot while N is in-flight.'
+                )
+
+            # ── Both verifies entered — overlap confirmed ──────────────────
+            # gate_a is still blocking, gate_b is still blocking → true overlap
+            assert gate_a_entered.is_set(), 'N (local) gate not entered'
+            assert gate_b_entered.is_set(), 'N+1 (remote) gate not entered'
+            assert not gate_a_release.is_set(), 'gate_a already released (test bug)'
+            assert not gate_b_release.is_set(), 'gate_b already released (test bug)'
+
+            # Peak _inflight == 2: both entries in deque before head was popped
+            # RED: max_len == 1 (N appended, popped, finalized; then N+1 appended)
+            # GREEN: max_len == 2 (N appended, N+1 appended, then head popped)
+            assert tracked.max_len == 2, (
+                f'Expected peak _inflight length 2 (both entries before popleft), '
+                f'got {tracked.max_len}. '
+                'RED: serial dispatch never fills two slots simultaneously. '
+                'GREEN (step-18): fill loop appends N then N+1 before any popleft.'
+            )
+
+            # ── Submission-order finalize: release N+1 FIRST ──────────────
+            # Even though N+1's verify finishes before N's, main must advance N first.
+            gate_b_release.set()   # N+1 (remote) verify completes first
+            gate_a_release.set()   # N (local) verify completes second
+
+            # Both should resolve 'done'
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+
+        await worker.stop()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        assert outcome_a.status == 'done', f'N: expected done, got {outcome_a}'
+        assert outcome_b.status == 'done', f'N+1: expected done, got {outcome_b}'
+
+        # Both files on main (submission order preserved)
+        from orchestrator.git_ops import _run as _git_run
+        _, main_files, _ = await _git_run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'ov_a.py' in main_files, 'N (ov_a.py) not on main'
+        assert 'ov_b.py' in main_files, 'N+1 (ov_b.py) not on main'
