@@ -11267,6 +11267,7 @@ class TestRunPostMergeVerify:
             )
 
         assert result is None
+        assert mock_disk_guard.await_args is not None
         call_kwargs = mock_disk_guard.await_args.kwargs
         assert call_kwargs['keep_worktrees'] == {l1, l2}
 
