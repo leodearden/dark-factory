@@ -3366,6 +3366,30 @@ class InflightEntry:
     status: str | None = None               # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE
 
 
+@dataclass
+class InflightVerifyResult:
+    """Result returned by SpeculativeMergeWorker._run_inflight_verify.
+
+    Fields
+    ------
+    outcome     : None if verification passed; MergeOutcome if it failed/was skipped.
+    merge_wt    : the (possibly warm-swapped) merge worktree path; may be None if
+                  the verify was aborted/dropped before starting.
+    warm_results: dict[str, bool] of per-test results from warm verify (for shadow compare);
+                  empty dict if the warm path was not taken.
+    status      : None on normal completion; sentinel string for special cases:
+                  'DROPPED'           — sole-waiter abandoned; merge_wt cleaned
+                  'REQUEUED'          — operator halt; req re-queued on _queue
+                  'RUNNER_UNAVAILABLE' — remote runner raised RunnerUnavailable;
+                                        merge_wt NOT cleaned (will be re-dispatched)
+    """
+
+    outcome: MergeOutcome | None
+    merge_wt: Path | None
+    warm_results: dict[str, bool] = dataclasses.field(default_factory=dict)
+    status: str | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
+
+
 class _TrainMergeHost(Protocol):
     """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
 
@@ -6731,6 +6755,130 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
         if not req.result.done():
             req.result.set_result(outcome)
+
+    async def _run_inflight_verify(
+        self,
+        item: SpeculativeItem,
+        lease: Any,  # HostLease
+    ) -> InflightVerifyResult:
+        """Run the verify portion for one in-flight item.
+
+        This is the VERIFY HALF of _verify_and_advance (the CAS half is
+        _finalize_inflight).  Warm-swap and _run_post_merge_verify are run
+        here; CAS advance_main and lease release are deferred to _finalize_inflight.
+
+        LOCAL lease (lease.is_local=True):
+            Warm-swap runs: _verify_attempt_count incremented,
+            _acquire_warm_verify_worktree called, runner=None so the internal
+            LocalRunner sees the POST-swap merge_wt (byte-identical single-host
+            path).
+
+        REMOTE lease (lease.is_local=False):
+            No warm-swap, no _verify_attempt_count increment.
+            _run_post_merge_verify(runner=lease.runner) dispatches on the
+            injected RemoteRunner.
+
+        Returns an InflightVerifyResult; does NOT resolve req.result (that is
+        _finalize_inflight's job) except on exception (error path resolves
+        immediately so the item does not stall the queue).
+
+        Note: the abort-poll loop (abandon / operator-halt polling) is added
+        in step-8; this step-6 version awaits the verify directly.
+        """
+        req = item.request
+        merge_wt = item.merge_wt
+        assert merge_wt is not None
+        assert item.merge_result is not None
+        merge_commit = item.merge_result.merge_commit
+        assert merge_commit is not None
+        merge_commit = merge_commit.strip()
+
+        _warm_results: dict[str, bool] = {}
+        _is_warm_path = False
+
+        if lease.is_local:
+            # ── LOCAL path: persistent warm-merge-verify worktree swap ────
+            # Mirrors _verify_and_advance (PRD §10 κ): increment the attempt
+            # counter, check the safety valve, swap to the warm persistent
+            # path if eligible, deregister the ephemeral worktree if swapped.
+            self._verify_attempt_count += 1
+            _due = _safety_valve_due(
+                self._verify_attempt_count,
+                req.config.git.persistent_merge_worktree_safety_valve_every_n,
+            )
+            merge_wt = await _acquire_warm_verify_worktree(
+                self._git_ops, req, merge_wt, merge_commit,
+                safety_valve_due=_due,
+            )
+            assert merge_wt is not None
+            if merge_wt is not item.merge_wt:
+                self._deregister_owned_merge_worktree(item.merge_wt)
+            _is_warm_path = (
+                req.config.git.persistent_merge_worktree
+                and not _due
+            )
+
+        self._verify_item = item
+        self._verify_phase = 'verifying'
+        self._verify_started_at = time.time()
+        logger.info(
+            f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
+            f'worktree={merge_wt.name})'
+        )
+
+        _warm_capture: list[VerifyResult] = []
+        try:
+            verify_task = asyncio.ensure_future(_run_post_merge_verify(
+                self._git_ops, req, merge_wt,
+                timeouts=self._post_merge_verify_timeouts,
+                enospc_retries=self._post_merge_verify_enospc_retries,
+                max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+                max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                event_store=self._event_store,
+                merge_sha=merge_commit,
+                on_result=_warm_capture.append if _is_warm_path else None,
+                quarantine=self._runner_quarantine,
+                keep_worktrees=set(self._owned_merge_worktrees),
+                runner=None if lease.is_local else lease.runner,
+            ))
+            out = await verify_task
+        except Exception as exc:
+            logger.info(
+                f'Task {req.task_id}: verify end '
+                f'(merge={merge_commit[:8]}, error)'
+            )
+            await self._cleanup_owned_merge_worktree(merge_wt)
+            err_outcome = MergeOutcome('blocked', reason=f'Verification error: {exc}')
+            if not req.result.done():
+                req.result.set_result(err_outcome)
+            return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
+
+        if out is None:
+            logger.info(
+                f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                f'passed=True)'
+            )
+            if _warm_capture:
+                _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
+                if not _warm_results and req.config.git.warm_verify_shadow_compare:
+                    _alarm_warm_shadow_unparseable(
+                        self._escalation_queue,
+                        merge_commit,
+                        _warm_capture[0].test_output or '',
+                    )
+            return InflightVerifyResult(outcome=None, merge_wt=merge_wt, warm_results=_warm_results)
+
+        if out.verify_skipped:
+            logger.info(
+                f'Task {req.task_id}: verify skipped: low disk '
+                f'(merge={merge_commit[:8]})'
+            )
+        else:
+            logger.info(
+                f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                f'passed=False)'
+            )
+        return InflightVerifyResult(outcome=out, merge_wt=merge_wt)
 
     async def _verify_and_advance(self, item: SpeculativeItem) -> bool:
         """Run verification + CAS advance for one item.
