@@ -4222,6 +4222,79 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    # ── Incident 4502 guard: pre_rebased + main unchanged must still run the ─
+    # ── merge gate (dropping the skip-reverification fast path, task #1724) ──
+
+    async def test_pre_rebased_main_unchanged_runs_merge_gate_speculative(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Incident 4502: pre_rebased=True with main unchanged must run the merge-gate
+        verify.  A red merge-gate verify must block the landing; the file must NOT
+        land on main.
+
+        Faithful reproduction of the reify-4502 RED-MAIN escape:
+          - single pre_rebased=True request submitted while main stays at M0
+          - spy returns passed=False whenever the task's file is present, simulating
+            the broad merge gate catching what the narrow task-level verify missed
+          - asserts the SAFETY CONSEQUENCE (no file on main), not merely call counts
+
+        RED on current code: skip_verify=True (pre_rebased AND main unchanged) →
+        _run_post_merge_verify bypassed → outcome='done' → file lands on main →
+        all three assertions fail.
+        GREEN after step-2: skip_verify=False → verify runs → passed=False →
+        outcome='blocked' → file NOT on main.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'mg-spec', 'file_mg_spec.py', 'mg = 1\n',
+        )
+
+        verify_call_count = 0
+
+        async def red_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
+            nonlocal verify_call_count
+            verify_call_count += 1
+            # Simulate a broad merge-gate failure whenever the task's file is
+            # present (the narrow task-level verify had passed; the merge gate
+            # catches what the task-level verify missed — the 4502 scenario).
+            if 'file_mg_spec.py' in {f.name for f in merge_wt.iterdir() if f.is_file()}:
+                return MagicMock(passed=False, timed_out=False, summary='merge-gate RED')
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=red_verify):
+            req = _make_request('mg-spec', 'mg-spec', wt, config, pre_rebased=True)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        # (a) Merge-gate verify must have been called >= 1 time.
+        assert verify_call_count >= 1, (
+            f'run_scoped_verification must be called when pre_rebased=True and '
+            f'main is unchanged (merge-gate verify must NOT be skipped); '
+            f'got {verify_call_count} call(s).  This is the reify-4502 escape path.'
+        )
+
+        # (b) Outcome must NOT be done — verify was red, the landing must be blocked.
+        assert outcome.status != 'done', (
+            f'pre_rebased=True request with a red merge-gate verify must NOT '
+            f'land as "done"; got status={outcome.status!r}.  '
+            f'This is the reify-4502 RED-MAIN escape: a red tree advanced main.'
+        )
+
+        # (c) The file must NOT be on main — red tree must never advance.
+        rc, _, _ = await _run(
+            ['git', 'show', 'main:file_mg_spec.py'], cwd=git_ops.project_root,
+        )
+        assert rc != 0, (
+            'file_mg_spec.py must NOT be on main when the merge-gate verify is '
+            'red — a red tree advanced main (reify-4502 RED-MAIN escape).'
+        )
+
+        await worker.stop()
+        await worker_task
+
     # ── Mechanism 2 × chain-invalidation: speculative follower (task 1646 amend) ─
 
     async def test_speculative_follower_chain_invalidated_after_pickup_rebase(
