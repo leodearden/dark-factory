@@ -173,6 +173,58 @@ def _watchdog_thread_loop(stop_event: threading.Event, interval: float) -> None:
             return
 
 
+# Module-level handles for the dedicated watchdog heartbeat thread.
+# Both are None when the thread is not running.
+_watchdog_thread: threading.Thread | None = None
+_watchdog_stop_event: threading.Event | None = None
+
+
+def _start_watchdog_thread(interval: float = _WATCHDOG_INTERVAL) -> bool:
+    """Start the dedicated systemd watchdog heartbeat thread.
+
+    Returns True if a new thread was started, False if one is already running
+    or if NOTIFY_SOCKET is unset (no systemd integration active).
+
+    Idempotent: a second call while the thread is alive returns False without
+    side effects.  Mirrors the _arm_force_exit idempotency pattern.
+
+    The spawned thread is a daemon so it can never block interpreter exit even
+    if join times out (consistent with _arm_force_exit's daemon Timer).
+    """
+    global _watchdog_thread, _watchdog_stop_event
+    if _watchdog_thread is not None and _watchdog_thread.is_alive():
+        return False
+    if not os.environ.get('NOTIFY_SOCKET'):
+        return False
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_watchdog_thread_loop,
+        args=(stop_event, interval),
+        name='fused-memory-sd-watchdog',
+        daemon=True,
+    )
+    t.start()
+    _watchdog_thread = t
+    _watchdog_stop_event = stop_event
+    return True
+
+
+def _stop_watchdog_thread(join_timeout: float = 2.0) -> None:
+    """Stop the dedicated systemd watchdog heartbeat thread.
+
+    Sets the stop event so the thread exits at its next Event.wait() and
+    joins it (bounded by join_timeout).  Clears both module refs to None so
+    a subsequent _start_watchdog_thread() can start fresh (restartable).
+    """
+    global _watchdog_thread, _watchdog_stop_event
+    if _watchdog_stop_event is not None:
+        _watchdog_stop_event.set()
+    if _watchdog_thread is not None:
+        _watchdog_thread.join(timeout=join_timeout)
+    _watchdog_thread = None
+    _watchdog_stop_event = None
+
+
 async def _run_shielded(
     name: str,
     coro_factory: Callable[[], Awaitable[Any]],
