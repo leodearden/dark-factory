@@ -3277,7 +3277,7 @@ class SpeculativeItem:
     merge_wt: Path | None             # Merge worktree (if merge succeeded)
     base_sha: str                      # main SHA at merge time (actual or speculative)
     speculative: bool                  # True → merged against pending N's SHA
-    skip_verify: bool                  # True → pre_rebased and main unchanged
+    skip_verify: bool                  # Retained but always False for single-task items (task-1724); trains still set True
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
     already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
@@ -6285,10 +6285,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._verify_item = item
 
                 # ── Immediate outcome (already_merged / conflict / blocked) ─
-                # GroupMergeRequest/train items (skip_verify=True +
-                # immediate_outcome set) always reach this branch; they never
-                # enter _run_post_merge_verify, so the sole-waiter mid-verify
-                # orphan window fixed in task 1681 does not apply to trains.
+                # GroupMergeRequest/train items (immediate_outcome set) always
+                # reach this branch; they never enter _run_post_merge_verify, so
+                # the sole-waiter mid-verify orphan window fixed in task 1681
+                # does not apply to trains.  (skip_verify is retained on the
+                # SpeculativeItem dataclass but is always False for single-task
+                # items after task-1724; it is not honoured by _verify_and_advance.)
                 # A soft-cancel on the group-merge consumer falls to the blanket
                 # fut.cancel() via workflow.py:675 _await_cancellable (no
                 # on_soft_cancel detach hook attached), which is the accepted
@@ -6643,119 +6645,118 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # path was not taken (safety-valve or knob off) and short-circuits
         # without scheduling a cold leg.
         _warm_results: dict[str, bool] = {}
-        if True:  # unconditional — task-1724: skip_verify never bypasses the gate
-            self._verify_phase = 'verifying'
-            self._verify_started_at = time.time()  # wall-clock verify start for triage
-            logger.info(
-                f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
-                f'worktree={merge_wt.name})'
-            )
-            # Capture the VerifyResult via on_result callback on the genuine warm
-            # path (persistent_merge_worktree on, safety valve not due) to provide
-            # per-test results to the shadow compare scheduler.
-            _warm_capture: list[VerifyResult] = []
-            _is_warm_path = (
-                req.config.git.persistent_merge_worktree
-                and not _due
-            )
-            try:
-                # Wrap _run_post_merge_verify in an abort-poll loop so that a
-                # sole-waiter detach() (pf.cancel() → req.result.cancelled())
-                # landing mid-verify aborts the wasted compute instead of
-                # burning one full 10-40 min cycle (task 1681 fix-2).
-                # Poll cost: one cheap req.result.cancelled() check per interval.
-                verify_task = asyncio.ensure_future(_run_post_merge_verify(
-                    self._git_ops, req, merge_wt,
-                    timeouts=self._post_merge_verify_timeouts,
-                    enospc_retries=self._post_merge_verify_enospc_retries,
-                    max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
-                    max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-                    event_store=self._event_store,
-                    merge_sha=merge_commit,
-                    on_result=_warm_capture.append if _is_warm_path else None,
-                    quarantine=self._runner_quarantine,
-                ))
-                while True:
-                    done, _ = await asyncio.wait(
-                        {verify_task},
-                        timeout=self.VERIFY_ABANDON_POLL_SECS,
+        self._verify_phase = 'verifying'
+        self._verify_started_at = time.time()  # wall-clock verify start for triage
+        logger.info(
+            f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
+            f'worktree={merge_wt.name})'
+        )
+        # Capture the VerifyResult via on_result callback on the genuine warm
+        # path (persistent_merge_worktree on, safety valve not due) to provide
+        # per-test results to the shadow compare scheduler.
+        _warm_capture: list[VerifyResult] = []
+        _is_warm_path = (
+            req.config.git.persistent_merge_worktree
+            and not _due
+        )
+        try:
+            # Wrap _run_post_merge_verify in an abort-poll loop so that a
+            # sole-waiter detach() (pf.cancel() → req.result.cancelled())
+            # landing mid-verify aborts the wasted compute instead of
+            # burning one full 10-40 min cycle (task 1681 fix-2).
+            # Poll cost: one cheap req.result.cancelled() check per interval.
+            verify_task = asyncio.ensure_future(_run_post_merge_verify(
+                self._git_ops, req, merge_wt,
+                timeouts=self._post_merge_verify_timeouts,
+                enospc_retries=self._post_merge_verify_enospc_retries,
+                max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+                max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                event_store=self._event_store,
+                merge_sha=merge_commit,
+                on_result=_warm_capture.append if _is_warm_path else None,
+                quarantine=self._runner_quarantine,
+            ))
+            while True:
+                done, _ = await asyncio.wait(
+                    {verify_task},
+                    timeout=self.VERIFY_ABANDON_POLL_SECS,
+                )
+                if verify_task in done:
+                    out = verify_task.result()
+                    break
+                # Abort trigger 1 — sole-waiter gave up (future cancelled):
+                # DROP the request (checked first so a gave-up waiter wins
+                # over the operator-halt re-queue below when both hold).
+                if self._request_abandoned(req):
+                    verify_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await verify_task
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    return False
+                # Abort trigger 2 — operator halt: terminate the in-flight
+                # verify (CancelledError propagates into _run_cmd, which kills
+                # the verify subprocess) and RE-QUEUE the merge for re-verify
+                # after un-halt.  req.result is left pending so the waiting
+                # workflow keeps waiting; per-task retry counters are untouched
+                # (a transient operator halt is not a verify failure).
+                if self._operator_halt.is_set():
+                    logger.warning(
+                        'Task %s: operator halt — aborting in-flight verify '
+                        'and re-queuing merge for re-verify after un-halt',
+                        req.task_id,
                     )
-                    if verify_task in done:
-                        out = verify_task.result()
-                        break
-                    # Abort trigger 1 — sole-waiter gave up (future cancelled):
-                    # DROP the request (checked first so a gave-up waiter wins
-                    # over the operator-halt re-queue below when both hold).
-                    if self._request_abandoned(req):
-                        verify_task.cancel()
-                        with contextlib.suppress(BaseException):
-                            await verify_task
-                        await self._cleanup_owned_merge_worktree(merge_wt)
-                        return False
-                    # Abort trigger 2 — operator halt: terminate the in-flight
-                    # verify (CancelledError propagates into _run_cmd, which kills
-                    # the verify subprocess) and RE-QUEUE the merge for re-verify
-                    # after un-halt.  req.result is left pending so the waiting
-                    # workflow keeps waiting; per-task retry counters are untouched
-                    # (a transient operator halt is not a verify failure).
-                    if self._operator_halt.is_set():
-                        logger.warning(
-                            'Task %s: operator halt — aborting in-flight verify '
-                            'and re-queuing merge for re-verify after un-halt',
-                            req.task_id,
-                        )
-                        verify_task.cancel()
-                        with contextlib.suppress(BaseException):
-                            await verify_task
-                        await self._cleanup_owned_merge_worktree(merge_wt)
-                        self._queue.put_nowait(req)
-                        return False
-            except Exception as exc:
-                logger.info(
-                    f'Task {req.task_id}: verify end '
-                    f'(merge={merge_commit[:8]}, error)'
-                )
-                await self._cleanup_owned_merge_worktree(merge_wt)
-                if not req.result.done():
-                    req.result.set_result(MergeOutcome(
-                        'blocked', reason=f'Verification error: {exc}',
-                    ))
-                return False
-            if out is None:
-                logger.info(
-                    f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
-                    f'passed=True)'
-                )
-                # Parse per-test results from the warm verify for shadow compare.
-                # Only populated when _is_warm_path and on_result captured a result.
-                if _warm_capture:
-                    _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
-                    if not _warm_results and req.config.git.warm_verify_shadow_compare:
-                        # Fail-closed: if tests ran but we parsed nothing, the
-                        # shadow-compare detective is silently inert — raise a
-                        # born-at-L2 alarm instead of silently skipping.
-                        _alarm_warm_shadow_unparseable(
-                            self._escalation_queue,
-                            merge_commit,
-                            _warm_capture[0].test_output or '',
-                        )
-            elif out.verify_skipped:
-                # Disk guard fired — run_scoped_verification was never called;
-                # log 'skipped' rather than 'passed=False' to avoid misleading
-                # post-mortem triage of merge-queue stalls (2026-06-01).
-                logger.info(
-                    f'Task {req.task_id}: verify skipped: low disk '
-                    f'(merge={merge_commit[:8]})'
-                )
-                self._resolve_or_drop_abandoned(req, out)
-                return False
-            else:
-                logger.info(
-                    f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
-                    f'passed=False)'
-                )
-                self._resolve_or_drop_abandoned(req, out)
-                return False
+                    verify_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await verify_task
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    self._queue.put_nowait(req)
+                    return False
+        except Exception as exc:
+            logger.info(
+                f'Task {req.task_id}: verify end '
+                f'(merge={merge_commit[:8]}, error)'
+            )
+            await self._cleanup_owned_merge_worktree(merge_wt)
+            if not req.result.done():
+                req.result.set_result(MergeOutcome(
+                    'blocked', reason=f'Verification error: {exc}',
+                ))
+            return False
+        if out is None:
+            logger.info(
+                f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                f'passed=True)'
+            )
+            # Parse per-test results from the warm verify for shadow compare.
+            # Only populated when _is_warm_path and on_result captured a result.
+            if _warm_capture:
+                _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
+                if not _warm_results and req.config.git.warm_verify_shadow_compare:
+                    # Fail-closed: if tests ran but we parsed nothing, the
+                    # shadow-compare detective is silently inert — raise a
+                    # born-at-L2 alarm instead of silently skipping.
+                    _alarm_warm_shadow_unparseable(
+                        self._escalation_queue,
+                        merge_commit,
+                        _warm_capture[0].test_output or '',
+                    )
+        elif out.verify_skipped:
+            # Disk guard fired — run_scoped_verification was never called;
+            # log 'skipped' rather than 'passed=False' to avoid misleading
+            # post-mortem triage of merge-queue stalls (2026-06-01).
+            logger.info(
+                f'Task {req.task_id}: verify skipped: low disk '
+                f'(merge={merge_commit[:8]})'
+            )
+            self._resolve_or_drop_abandoned(req, out)
+            return False
+        else:
+            logger.info(
+                f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                f'passed=False)'
+            )
+            self._resolve_or_drop_abandoned(req, out)
+            return False
 
         # Short-circuit: if abandonment landed while (or just as) verify
         # completed, skip the expensive advance-main CAS loop and

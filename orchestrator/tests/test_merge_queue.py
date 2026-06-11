@@ -1619,7 +1619,7 @@ class TestMergeWorker:
             verify_call_count += 1
             if 'file_mg_serial.py' in {f.name for f in merge_wt.iterdir() if f.is_file()}:
                 return MagicMock(passed=False, timed_out=False, summary='merge-gate RED')
-            return MagicMock(passed=True, summary='')
+            return MagicMock(passed=True, timed_out=False, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue)
@@ -4108,21 +4108,16 @@ class TestSpeculativeMergeWorker:
     ):
         """Mechanism 2: a pre_rebased N+1 is verified after a main_advanced re-merge.
 
-        N is mid-verify (gated).  N+1 is built against M0 with skip_verify=True
-        (pre_rebased=True, main unchanged at build time — build-time fast path).
+        N is mid-verify (gated).  N+1 is built against M0 with skip_verify=False
+        (task-1724: the build-time skip fast path is removed entirely).
         When N advances main M0→M1, the verifier picks up N+1 (base_sha=M0 != M1)
-        and re-merges it with force_verify=True (Mechanism 2 main_advanced path).
-        skip_verify is forced False despite pre_rebased=True; verification MUST run.
+        and re-merges it (Mechanism 2 main_advanced path); verification runs
+        unconditionally (task-1724: no force_verify needed).
 
         Assertions:
           (1) speculative_discard event with reason='main_advanced' in EventStore.
-          (2) N+1 is verified EXACTLY ONCE on the re-merged tree (not skipped).
+          (2) N+1 is verified EXACTLY ONCE on the re-merged tree.
           (3) Both files land on main; both outcomes 'done'.
-
-        RED after step-2 (before step-4): the call site calls _remerge without
-        force_verify, so main_advanced re-merge of a pre_rebased item yields
-        skip_verify=True → verify skipped → verify mock never called for N+1's
-        file → assertion (2) fails.
         """
         db_path = tmp_path / 'events_pre_rebased.db'
         event_store = EventStore(db_path=db_path, run_id='test-pre-rebased-fv')
@@ -4150,14 +4145,14 @@ class TestSpeculativeMergeWorker:
 
         with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=tracking_verify):
             req_n = _make_request('rb-n', 'rb-n', wt_n, config)
-            # pre_rebased=True: build-time fast path would set skip_verify=True (main M0)
+            # pre_rebased=True: task-1724 removed the build-time skip_verify=True fast path
             req_n1 = _make_request('rb-n1', 'rb-n1', wt_n1, config, pre_rebased=True)
 
             # Submit N and wait for it to be mid-verify.
             await queue.put(req_n)
             await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
 
-            # Submit N+1; main still M0, so the merger builds it with skip_verify=True.
+            # Submit N+1; main still M0; task-1724: built with skip_verify=False (skip removed).
             await queue.put(req_n1)
 
             # Wait for N+1 to land in the verifier queue (base_sha == M0, main still M0).
@@ -4171,7 +4166,7 @@ class TestSpeculativeMergeWorker:
 
             # Release the gate — N verify completes, advances main M0→M1.
             # Verifier picks up N+1 (base_sha==M0 != M1), detects main_advanced,
-            # and must re-merge with force_verify=True so skip_verify=False.
+            # and re-merges it; verification runs unconditionally (task-1724).
             gate_open.set()
             outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
@@ -4203,7 +4198,7 @@ class TestSpeculativeMergeWorker:
         n1_verify_calls = [fs for fs in verify_worktrees if 'file_rb_n1.py' in fs]
         assert len(n1_verify_calls) == 1, (
             f'N+1 (pre_rebased=True) must be verified exactly once after '
-            f'main_advanced re-merge (force_verify must override skip_verify); '
+            f'main_advanced re-merge (unconditional verify, task-1724); '
             f'got {len(n1_verify_calls)} verify call(s) with file_rb_n1.py. '
             f'verify_worktrees={verify_worktrees!r}'
         )
@@ -4251,7 +4246,7 @@ class TestSpeculativeMergeWorker:
             # catches what the task-level verify missed — the 4502 scenario).
             if 'file_mg_spec.py' in {f.name for f in merge_wt.iterdir() if f.is_file()}:
                 return MagicMock(passed=False, timed_out=False, summary='merge-gate RED')
-            return MagicMock(passed=True, summary='')
+            return MagicMock(passed=True, timed_out=False, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
@@ -4442,24 +4437,18 @@ class TestSpeculativeMergeWorker:
         """RED: pre_rebased N+2 chain_invalidated re-merge must invoke verify.
 
         Same scenario as test_speculative_follower_chain_invalidated_after_pickup_rebase
-        except N+2 is submitted with pre_rebased=True.  On chain_invalidated,
-        _remerge receives force_verify=False; the non-force skip computation
-        (req.pre_rebased AND pre_merge_sha==actual_main) is a tautology when
-        _remerge always merges against current main → skip_verify=True →
-        _verify_and_advance bypasses _run_post_merge_verify entirely.
+        except N+2 is submitted with pre_rebased=True.  task-1724 removed the
+        skip_verify mechanism entirely: _remerge always returns skip_verify=False
+        and _verify_and_advance verifies unconditionally.
 
         The chain_invalidated re-merge against an advanced main produces a NEW tree
-        (M2 now includes N's and N+1's commits) that was never verified.  Fix #1687
-        keys the skip on the actual merged TREE SHA: tree changed vs. the original
-        merge → skip_verify forced False.
+        (M2 now includes N's and N+1's commits) that was never verified; this test
+        confirms the merge gate runs before advance_main on the new tree.
 
         Assertion (A): run_scoped_verification is called exactly ONCE on N+2's
         re-merged tree, and that tree contains file_pr_n.py, file_pr_n1.py AND
         file_pr_n2.py — proving _run_post_merge_verify ran before advance_main.
         All outcomes 'done'; all files land on main.
-
-        RED on current code: skip_verify=True → verify never called → verify count
-        for N+2 is 0 → 'verified exactly once' assertion fails.
         """
         db_path = tmp_path / 'events_1687a.db'
         event_store = EventStore(db_path=db_path, run_id='test-1687a')
@@ -10465,16 +10454,16 @@ class TestSpeculationRaceRetry:
         )
 
     @pytest.mark.asyncio
-    async def test_remerge_force_verify_overrides_skip_verify(
+    async def test_remerge_always_returns_skip_verify_false(
         self,
         git_ops: GitOps,
         config: OrchestratorConfig,
     ):
-        """task-1724: _remerge always returns skip_verify=False.
+        """task-1724: _remerge always returns skip_verify=False (unconditionally fail-closed).
 
-        The force_verify/prev_skip_verify/prev_merge_tree parameters are removed.
+        The force_verify/prev_skip_verify/prev_merge_tree parameters were removed.
         _remerge(req, None) with pre_rebased=True and main unchanged yields
-        skip_verify=False (unconditionally fail-closed).
+        skip_verify=False regardless of request state.
         """
         wt = await _make_branch_with_file(
             git_ops, 'fv-a', 'file_fv_a.py', 'a = 1\n',
@@ -10501,38 +10490,30 @@ class TestSpeculationRaceRetry:
 
 
 # ---------------------------------------------------------------------------
-# TestRemergeTreePinnedSkip — task #1687 unit-level regression locks
+# TestRemergeAlwaysVerifies — task-1724 unit-level regression locks
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestRemergeTreePinnedSkip:
-    """Unit-level locks for the tree-SHA-pinned skip_verify fix (task #1687).
+class TestRemergeAlwaysVerifies:
+    """Unit-level locks asserting _remerge always returns skip_verify=False (task-1724).
 
-    Calls _remerge() directly on a non-running SpeculativeMergeWorker.
-    Both 'chain_invalidated' and 'previous_failed' funnel through the same
-    _remerge(force_verify=False) gate, so these cases cover both reasons.
-    Complements the e2e step-1 tests by pinning the skip decision at the
-    unit level with fully deterministic inputs.
+    task-1724 removed the tree-SHA-pinned skip optimisation (originally task #1687).
+    _remerge() now unconditionally returns skip_verify=False; _verify_and_advance
+    always runs the merge gate.  These tests pin that invariant at the unit level
+    with fully deterministic inputs, complementing the e2e regression guards.
     """
 
-    async def test_noop_remerge_preserves_skip(
+    async def test_remerge_skip_verify_always_false(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """(a) No-op re-merge: even when tree is unchanged, skip_verify must be False.
+        """_remerge always returns skip_verify=False regardless of tree state.
 
-        task-1724: the tree-SHA-pinned skip is removed entirely.  A re-merge whose
-        tree equals the previously-verified tree must STILL run the merge gate —
+        task-1724 removed the tree-SHA-pinned skip entirely.  A re-merge whose
+        tree equals a previously-verified tree must STILL run the merge gate —
         the skip was unsound (it treated a narrower task-level verify as equivalent
-        to the full merge gate).
-
-        The call keeps the OLD kwargs shape (force_verify=False, prev_skip_verify=True,
-        prev_merge_tree=T1) so the test is RED on current code: current _remerge
-        returns skip_verify=True for a no-op re-merge with those kwargs.
-        In step-6 the kwargs are removed and the call is simplified to _remerge(req, None).
-
-        RED on current code: returns skip_verify=True → assertion fails.
-        GREEN after step-6: skip_verify always False.
+        to the full merge gate).  This test covers the no-op case (pre_rebased=True,
+        main unchanged) as well as the fail-closed unconditional contract.
         """
         wt = await _make_branch_with_file(git_ops, 'tp-a', 'file_tp_a.py', 'a = 1\n')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -10566,58 +10547,21 @@ class TestRemergeTreePinnedSkip:
         if item.merge_wt:
             await git_ops.cleanup_merge_worktree(item.merge_wt)
 
-    async def test_tree_change_forces_verify(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ) -> None:
-        """(b) Tree-changing re-merge: sibling landed → new tree → skip_verify=False.
-
-        task-1724: skip_verify is always False regardless of tree equality.
-        This test confirms the tree-changing case continues to return False
-        (it always did; the simplification only affects the no-op case).
-        """
-        wt = await _make_branch_with_file(git_ops, 'tp-b', 'file_tp_b.py', 'b = 1\n')
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
-        req = _make_request('tp-b', 'tp-b', wt, config, pre_rebased=True)
-
-        # Advance main with a sibling commit before re-merging.
-        (git_ops.project_root / 'sibling_tp_b.py').write_text('sibling = 1\n')
-        await _run(['git', 'add', 'sibling_tp_b.py'], cwd=git_ops.project_root)
-        await _run(
-            ['git', '-c', 'user.email=t@t.com', '-c', 'user.name=T',
-             'commit', '-m', 'sibling for tp-b'],
-            cwd=git_ops.project_root,
-        )
-
-        # task-1724: simplified to _remerge(req, None) — no kwargs.
-        item = await worker._remerge(req, None)
-        if item.merge_wt:
-            await git_ops.cleanup_merge_worktree(item.merge_wt)
-
-        assert item.immediate_outcome is None, (
-            f'Expected flowing item; got {item.immediate_outcome}'
-        )
-        assert item.skip_verify is False, (
-            f'Tree-changing re-merge: expected skip_verify=False; '
-            f'got skip_verify={item.skip_verify}.'
-        )
-
     async def test_fail_closed_default(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """(c) No anchor → fail-closed default → skip_verify=False.
+        """(b) Minimal call → always fail-closed → skip_verify=False.
 
-        _remerge called without prev_skip_verify/prev_merge_tree (the defaults
-        False/None) must fail closed: verify rather than trust a proxy flag.
-        In production the dispatch site always threads the anchor; the default
-        is a library-contract safety backstop.
+        _remerge(req, None) is the canonical production call shape after task-1724.
+        The prev_skip_verify/prev_merge_tree parameters were removed; skip_verify
+        is structurally always False on the return value.
         """
         wt = await _make_branch_with_file(git_ops, 'tp-c', 'file_tp_c.py', 'c = 1\n')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
         req = _make_request('tp-c', 'tp-c', wt, config, pre_rebased=True)
 
-        item = await worker._remerge(req, None)  # no anchor — fail-closed default
+        item = await worker._remerge(req, None)
         if item.merge_wt:
             await git_ops.cleanup_merge_worktree(item.merge_wt)
 
