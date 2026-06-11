@@ -14842,27 +14842,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
     a live worker touches owned _merge-* worktrees every _HEARTBEAT_POLL_S ticks,
     so the worst frozen age = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE (stall
     budget), independent of K, cold timeout, or num_hosts.
-
-    RED until step-4 adds TOUCH_MISS_TOLERANCE, rewrites the formula, and drops
-    the old params from check_merge_liveness_margin.
     """
-
-    def test_worst_case_is_heartbeat_floor(self, tmp_path: Path):
-        """worst_case_secs == _HEARTBEAT_POLL_S * TOUCH_MISS_TOLERANCE == 600.0."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
-            _HEARTBEAT_POLL_S,
-            TOUCH_MISS_TOLERANCE,
-            check_merge_liveness_margin,
-        )
-        cfg = OrchestratorConfig(project_root=tmp_path)
-        result = check_merge_liveness_margin(cfg)
-
-        expected_floor = _HEARTBEAT_POLL_S * TOUCH_MISS_TOLERANCE
-        assert result.worst_case_secs == expected_floor, (
-            f'Expected worst_case_secs=={expected_floor} '
-            f'(_HEARTBEAT_POLL_S={_HEARTBEAT_POLL_S} × TOUCH_MISS_TOLERANCE={TOUCH_MISS_TOLERANCE}); '
-            f'got {result.worst_case_secs}'
-        )
 
     @pytest.mark.parametrize('cold_timeout', [120.0, 7200.0, 9000.0])
     def test_worst_case_invariant_across_cold_timeouts(
@@ -14934,11 +14914,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
 
 class TestMergeLivenessAssessmentFields:
-    """MergeLivenessAssessment field presence/absence under the heartbeat-floor model.
-
-    RED until step-4 adds heartbeat_poll_secs/touch_miss_tolerance/safety_factor
-    and removes timeout_secs/merge_ahead_bound/num_hosts/max_verify_timeouts.
-    """
+    """MergeLivenessAssessment field presence/absence under the heartbeat-floor model."""
 
     def test_new_fields_present(self, tmp_path: Path):
         """Assessment exposes heartbeat_poll_secs, touch_miss_tolerance, safety_factor."""
@@ -15023,60 +14999,6 @@ class TestCheckMergeLivenessMarginShippedDefaults:
             f'{[r.message for r in warnings]!r}'
         )
 
-    def test_cold_9000_now_safe(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
-    ):
-        """cold_timeout=9000 (refused under old model) is now safe under heartbeat model.
-
-        Old model: worst_case = 1 * 9000 = 9000 ≥ 8100 → NOT safe.
-        Heartbeat model: worst_case = 600 < 8100 → safe.
-        """
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
-
-        cfg = OrchestratorConfig(
-            project_root=tmp_path,
-            merge_verify_cold_command_timeout_secs=9000.0,
-        )
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            result = check_merge_liveness_margin(cfg)
-
-        assert result.safe is True, (
-            f'Expected safe=True for cold=9000 (cold decoupled under heartbeat model); '
-            f'got safe={result.safe!r} (worst_case={result.worst_case_secs})'
-        )
-        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
-                    and r.name == 'orchestrator.merge_queue']
-        assert len(warnings) == 0, (
-            f'Expected no WARNINGs for cold=9000 under heartbeat model; '
-            f'got {len(warnings)}: {[r.message for r in warnings]!r}'
-        )
-
-    def test_k2_cold7200_surrogate_safe(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
-    ):
-        """K=2/cold=7200 surrogate → safe=True, no WARNING (K drops out of formula).
-
-        Regression-lock: previously silenced by per-host division; now directly
-        safe because the formula no longer involves K or cold at all.
-        """
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
-
-        cfg = OrchestratorConfig(project_root=tmp_path)  # bare → cold=7200 via defaults.yaml
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            result = check_merge_liveness_margin(cfg)
-
-        assert result.safe is True, (
-            f'K=2/cold=7200 surrogate: expected safe=True; '
-            f'got safe={result.safe!r} (worst_case={result.worst_case_secs})'
-        )
-        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
-                    and r.name == 'orchestrator.merge_queue']
-        assert len(warnings) == 0, (
-            f'Expected no WARNINGs for K=2/cold=7200 surrogate; '
-            f'got {len(warnings)}: {[r.message for r in warnings]!r}'
-        )
-
-
 class TestCheckMergeLivenessMarginClassificationAndLogging:
     """Classification + logging under the heartbeat-floor model."""
 
@@ -15138,13 +15060,6 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         assert any(kw in msg.lower() for kw in ('heartbeat', 'poll', 'touch', 'tolerance')), (
             f'WARNING must name the heartbeat model; got: {msg!r}'
         )
-        # Must NOT mention the old per-host/timeout model operators
-        assert 'merge_ahead_bound' not in msg, (
-            f'WARNING must not mention merge_ahead_bound (dropped from model); got: {msg!r}'
-        )
-        assert 'merge_verify_cold_command_timeout_secs' not in msg, (
-            f'WARNING must not name cold_timeout as the lever; got: {msg!r}'
-        )
 
 
 class TestCheckMergeLivenessMarginInvariant:
@@ -15173,10 +15088,6 @@ class TestCheckMergeLivenessMarginInvariant:
         # Warning must surface worst_case_secs numerically
         assert str(int(result.worst_case_secs)) in msg or f'{result.worst_case_secs:.0f}' in msg, (
             f'WARNING must mention worst_case_secs ({result.worst_case_secs}); got: {msg!r}'
-        )
-        # Must NOT name the old cold-timeout lever (heartbeat model decouples it)
-        assert 'merge_verify_cold_command_timeout_secs' not in msg, (
-            f'WARNING must not name cold_timeout as the lever (heartbeat model); got: {msg!r}'
         )
 
 

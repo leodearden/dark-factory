@@ -172,8 +172,6 @@ class TestHarnessMergeLivenessGuard:
 
         Old model: worst_case = 1 × 9000 = 9000 ≥ 8100 → refused.
         Heartbeat model: worst_case = 600 < 8100 → safe → worker starts.
-
-        RED until step-4 re-derives the formula (floor replaces bound × timeout).
         """
         config = OrchestratorConfig(
             project_root=tmp_path,
@@ -264,9 +262,6 @@ class TestHarnessMergeLivenessGuard:
         Demonstrates that the heartbeat-floor lever is TOUCH_MISS_TOLERANCE (not
         cold_timeout or K).  A test can force an over-budget verdict by raising
         the tolerance constant so floor = _HEARTBEAT_POLL_S × 1000 = 30000 > 8100.
-
-        RED until step-4 adds TOUCH_MISS_TOLERANCE and the formula reads it
-        in-body (not as a default arg) so monkeypatching is observable.
         """
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)

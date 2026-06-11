@@ -81,7 +81,8 @@ class TestHarnessKFromConfig:
         Asserts:
           (a) SpeculativeMergeWorker(speculation_depth=3)
           (b) enforce_persistent_worktree_serial_lane(..., merge_ahead_bound=3, num_hosts=3)
-          (c) enforce_merge_liveness_margin(..., merge_ahead_bound=3)
+          (c) enforce_merge_liveness_margin(config) — config only, no kwargs
+              (task-1729 drops raw _k: heartbeat floor makes K irrelevant to the liveness guard)
 
         RED until step-12 wires K from config.enabled_verify_runners.
         """
