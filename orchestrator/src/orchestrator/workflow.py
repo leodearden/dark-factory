@@ -1953,9 +1953,9 @@ class TaskWorkflow:
             # otherwise so an agent's update_task(status='done') bypass doesn't
             # GC unmerged work). Skips externally-managed worktrees (eval mode).
             await self._maybe_cleanup_done_worktree()
-            # Cleanup per-task config dir
-            if self._config_dir:
-                self._config_dir.cleanup()
+            # Cleanup per-task config dir (preserve-aware — skips when circuit
+            # breaker tripped so the dir is available for forensic analysis).
+            self._cleanup_config_dir()
 
     def _resolve_module_configs(self, modules: list[str] | None = None) -> list[ModuleConfig]:
         """Collect ModuleConfigs for this task's modules.
@@ -3784,6 +3784,33 @@ class TaskWorkflow:
                         return WorkflowOutcome.DONE
 
         return WorkflowOutcome.DONE
+
+    def _cleanup_config_dir(self) -> None:
+        """Preserve-aware wrapper around ``TaskConfigDir.cleanup()``.
+
+        Called from ``run()``'s finally block instead of inlining the
+        ``if self._config_dir: self._config_dir.cleanup()`` pattern.
+        Extraction makes the preserve-skip behaviour unit-testable (task 1739).
+
+        Behaviour:
+        - ``self._config_dir is None`` → no-op (dir was never created).
+        - ``self._preserve_config_dir is True`` → skip cleanup and log a
+          warning naming the preserved path and the zero-output-hang reason,
+          so the on-call engineer knows the dir is intentional.
+        - Otherwise → ``self._config_dir.cleanup()`` (normal path).
+        """
+        if not self._config_dir:
+            return
+        if self._preserve_config_dir:
+            logger.warning(
+                'Task %s: config dir preserved for forensic analysis '
+                '(reason: %s) → %s',
+                self.task_id,
+                ZERO_OUTPUT_HANG_REASON,
+                self._config_dir.path,
+            )
+            return
+        self._config_dir.cleanup()
 
     def _capture_zero_output_evidence(self, result: AgentResult, iteration: int) -> None:
         """Persist forensic evidence for a zero-output CLI timeout to .task/.
