@@ -2203,14 +2203,24 @@ class TestSpeculativeMergeWorker:
     async def test_verifier_exception_releases_speculation_slot(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """_verify_and_advance raising must resolve N's Future and release the slot.
+        """_run_inflight_verify raising must resolve N's Future and release the slot.
 
-        Without the try/except/finally fix: the verifier loop crashes before
-        calling _speculation_slot.set() and before resolving N's Future, causing
-        both a deadlock (merger blocked waiting for slot) and a hung Future.
+        γ structural note: the γ restructuring replaced _verify_and_advance (the old
+        single-method verify+CAS) with _dispatch_item + _run_inflight_verify + _finalize_inflight.
+        The new _verifier_loop no longer calls _verify_and_advance; it calls
+        _run_inflight_verify via asyncio.ensure_future, awaits the task in
+        _finalize_inflight, and catches unexpected exceptions in the finalize-head
+        error handler in _verifier_loop.
 
-        With the fix: except clause resolves N's Future as 'blocked' with a
-        'Verifier error' reason; finally clause always sets _speculation_slot.
+        Injection point change (γ): patch _run_inflight_verify to raise on the first
+        call (equivalent to the old _verify_and_advance raising).  The exception
+        escapes _finalize_inflight → caught by _verifier_loop's finalize-head handler.
+
+        Without the handler: exception propagates to _verifier_task, queue stops,
+        N's Future never resolves (hang), N+1 deadlocks waiting for the slot.
+
+        With the handler: resolves N's Future as 'blocked' with 'Verifier error' reason;
+        _finalize_inflight's finally always releases the lease and _speculation_slot.
         """
         wt_n = await _make_branch_with_file(
             git_ops, 'vex-n', 'file_vex_n.py', 'n = 1\n',
@@ -2223,18 +2233,19 @@ class TestSpeculativeMergeWorker:
         worker = SpeculativeMergeWorker(git_ops, queue)
         worker_task = asyncio.create_task(worker.run())
 
-        # Capture original before replacing with mock
-        original_vaa = worker._verify_and_advance
+        # γ: patch _run_inflight_verify (the verify half of the new split) instead of
+        # _verify_and_advance (which is now only a compat shim not called by the loop).
+        original_riv = worker._run_inflight_verify
         call_count = 0
 
-        async def mock_vaa(item):  # type: ignore[no-untyped-def]
+        async def mock_riv(item, lease):  # type: ignore[no-untyped-def]
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise RuntimeError('Unexpected verifier error')
-            return await original_vaa(item)
+            return await original_riv(item, lease)
 
-        worker._verify_and_advance = mock_vaa  # type: ignore[method-assign]
+        worker._run_inflight_verify = mock_riv  # type: ignore[method-assign]
 
         with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
             req_n = _make_request('vex-n', 'vex-n', wt_n, config)
@@ -2256,9 +2267,9 @@ class TestSpeculativeMergeWorker:
 
         # _speculation_slot must have a free permit after all items drain.
         # Yield several event-loop iterations so:
-        #   (1) _verify_and_advance completes any awaits it makes after setting
-        #       req.result (the test resumes on a yield inside that function);
-        #   (2) the verifier's finally block runs and releases the slot;
+        #   (1) _run_inflight_verify completes any awaits it makes after raising
+        #       (the task future resolves with the exception);
+        #   (2) _finalize_inflight's finally block runs and releases the slot;
         #   (3) the merger acquires the just-released permit for its next
         #       look-ahead, finds the queue empty, and releases it again;
         #   (4) the merger blocks at _acquire_next_request() — slot is free.
