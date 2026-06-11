@@ -733,6 +733,7 @@ class Scheduler:
         # by the cap-exhaust escalation report.  Both are process-local — an
         # orchestrator restart is an acceptable implicit reset.
         self._requeue_counts: dict[str, int] = {}
+        self._transient_requeue_counts: dict[str, int] = {}
         self._requeue_history: dict[str, list[RequeueRecord]] = {}
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
@@ -3184,17 +3185,30 @@ class Scheduler:
         run_id: str,
         cost_usd: float,
     ) -> int:
-        """Append a requeue record and return the new cumulative count.
+        """Append a requeue record and return the new *genuine* cumulative count.
 
-        Called by the harness from ``_run_slot`` when a workflow returns
-        ``WorkflowOutcome.REQUEUED``.  The returned count is compared against
-        ``config.requeue_cap`` to decide whether to trigger cap exhaustion.
+        Transient API requeues (HTTP 5xx "agent API error" summaries, classified
+        by ``is_transient_api_requeue``) are routed to ``_transient_requeue_counts``
+        and do NOT increment the genuine ``_requeue_counts`` that feeds
+        ``config.requeue_cap``.  Genuine requeues behave exactly as before.
+        The record is appended to ``_requeue_history`` either way so the
+        cap-exhaust report shows the full attempt timeline.
+        ``RequeueRecord.attempt`` is the overall chronological index
+        (``len(history) + 1``) across both buckets, so the timeline is
+        monotonic when genuine and transient records interleave.
+        Returns the genuine count (0 for a transient requeue).
         """
-        count = self._requeue_counts.get(task_id, 0) + 1
-        self._requeue_counts[task_id] = count
-        self._requeue_history.setdefault(task_id, []).append(
+        history = self._requeue_history.setdefault(task_id, [])
+        overall_attempt = len(history) + 1
+        if is_transient_api_requeue(reason):
+            t_count = self._transient_requeue_counts.get(task_id, 0) + 1
+            self._transient_requeue_counts[task_id] = t_count
+        else:
+            g_count = self._requeue_counts.get(task_id, 0) + 1
+            self._requeue_counts[task_id] = g_count
+        history.append(
             RequeueRecord(
-                attempt=count,
+                attempt=overall_attempt,
                 phase=phase,
                 reason=reason,
                 detail=detail,
@@ -3203,15 +3217,20 @@ class Scheduler:
                 timestamp=time.time(),
             )
         )
-        return count
+        return self._requeue_counts.get(task_id, 0)
+
+    def transient_requeue_count(self, task_id: str) -> int:
+        """Return the number of transient API requeues recorded for *task_id*."""
+        return self._transient_requeue_counts.get(task_id, 0)
 
     def clear_requeue_count(self, task_id: str) -> None:
-        """Clear the requeue counter and history for *task_id*.
+        """Clear the requeue counters and history for *task_id*.
 
         Invoked on a DONE outcome (task recovered) and at the end of
         ``trigger_retry_cap_exhausted`` (human-resolution starts from zero).
         """
         self._requeue_counts.pop(task_id, None)
+        self._transient_requeue_counts.pop(task_id, None)
         self._requeue_history.pop(task_id, None)
 
     async def trigger_retry_cap_exhausted(

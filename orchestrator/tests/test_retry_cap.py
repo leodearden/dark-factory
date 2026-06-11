@@ -114,6 +114,45 @@ class TestIsTransientApiRequeue:
 # --- Counter mechanics --------------------------------------------------------
 
 
+class TestDualCounter:
+    """record_requeue routes transient (5xx API) and genuine requeues to separate counters."""
+
+    _529_REASON = 'Planning failed: agent API error: HTTP 529'
+
+    def _record_transient(self, scheduler: Scheduler, task_id: str = 't1') -> int:
+        return scheduler.record_requeue(
+            task_id,
+            phase='plan',
+            reason=self._529_REASON,
+            detail=self._529_REASON,
+            run_id='run-abc',
+            cost_usd=1.0,
+        )
+
+    def test_transient_does_not_touch_genuine_counter(self, scheduler: Scheduler):
+        count = self._record_transient(scheduler)
+        assert count == 0  # genuine count is 0
+        assert 't1' not in scheduler._requeue_counts
+        assert scheduler._transient_requeue_counts['t1'] == 1
+        assert len(scheduler._requeue_history['t1']) == 1
+        assert scheduler.transient_requeue_count('t1') == 1
+
+    def test_mixed_sequence_genuine_transient_genuine(self, scheduler: Scheduler):
+        # genuine → transient → genuine  →  returns 1, 1, 2
+        c1 = _record_one(scheduler)
+        c2 = self._record_transient(scheduler)
+        c3 = _record_one(scheduler)
+        assert (c1, c2, c3) == (1, 1, 2)
+        assert scheduler._requeue_counts['t1'] == 2
+        assert scheduler._transient_requeue_counts['t1'] == 1
+        history = scheduler._requeue_history['t1']
+        assert len(history) == 3
+        assert [r.attempt for r in history] == [1, 2, 3]
+
+    def test_transient_requeue_count_unknown_task_returns_zero(self, scheduler: Scheduler):
+        assert scheduler.transient_requeue_count('no-such-task') == 0
+
+
 class TestCounter:
     def test_record_requeue_increments_per_task(self, scheduler: Scheduler):
         assert _record_one(scheduler, 't1') == 1
