@@ -6941,36 +6941,88 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Run the CAS advance_main + post-advance work for one in-flight item.
 
         This is the FINALIZE HALF of _verify_and_advance (the VERIFY HALF is
-        _run_inflight_verify).  It assumes the verify has already passed
-        (entry.merge_wt is the verified worktree; entry.item carries the merge
-        commit).  Non-pass paths (fail/PASSTHROUGH/sentinel) are handled in
-        step-14 (_finalize_inflight extension).
+        _run_inflight_verify).  Handles all entry kinds in one flat try/finally:
 
-        After the head resolves (advanced or not):
-        - await self._host_allocator.release(entry.lease)  [skip if None]
-        - release _speculation_slot iff entry.was_speculative
-        - set self._n_failed = not advanced
+          PASSTHROUGH   — immediate_outcome (conflict/already_merged/blocked):
+                          deliver in submission order (respecting already_delivered),
+                          set _n_failed from outcome.status.
+          FAIL/skip     — vr.outcome is not None: clean merge_wt, resolve req,
+                          _n_failed=True, return False.
+          DROPPED       — sole-waiter abandoned: cancel_and_release, _n_failed=True.
+          REQUEUED      — operator halt (item already back on _queue):
+                          cancel_and_release, _n_failed=True.
+          PASS          — vr.outcome is None (or verify_task=None for compat shim):
+                          CAS advance_main loop.
+
+        Lease release and speculation-slot release happen in the single finally:
+          · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED)
+          · _cancel_release=False → release              (FAIL/PASS)
+          · _skip_release=True    → no allocator call    (PASSTHROUGH: lease is None)
+        _n_failed is carried in _n_failed_val (None → defer to 'not advanced').
 
         Returns True iff main was advanced successfully, False otherwise.
 
-        warm_results are passed as {} in this step-12 implementation
-        (shadow compare scheduler short-circuits on empty dict); they will be
-        threaded through InflightEntry.warm_results in a follow-up step.
+        warm_results are passed as {} in this implementation (shadow compare
+        scheduler short-circuits on empty dict); threading warm_results through
+        InflightEntry.warm_results is deferred.
         """
         item = entry.item
         req = item.request
-        merge_wt = entry.merge_wt
-        assert merge_wt is not None
-        assert item.merge_result is not None
-        merge_commit = item.merge_result.merge_commit
-        assert merge_commit is not None
-        merge_commit = merge_commit.strip()
-
-        # warm_results from the warm-verify path — empty here (see docstring).
-        _warm_results: dict[str, bool] = {}
 
         advanced = False
+        _skip_release = False     # True → no allocator call (passthrough / no lease)
+        _cancel_release = False   # True → cancel_and_release; False → release
+        _n_failed_val = None      # None → defer to 'not advanced' in finally (PASS path)
+
         try:
+            # ── (b) PASSTHROUGH ─────────────────────────────────────────────
+            # immediate_outcome entries (conflict/already_merged/blocked) with no
+            # real verify task; deliver in submission order.
+            if entry.passthrough_outcome is not None:
+                if not item.already_delivered and not req.result.done():
+                    req.result.set_result(entry.passthrough_outcome)
+                # Mirrors original verifier-loop line :6473:
+                #   n_failed = item.immediate_outcome.status not in ('done', 'already_merged')
+                _n_failed_val = (
+                    entry.passthrough_outcome.status not in ('done', 'already_merged')
+                )
+                _skip_release = True  # passthrough entries have no lease
+                return entry.passthrough_outcome.status in ('done', 'already_merged')
+
+            # ── Await verify task (if any) ───────────────────────────────────
+            # verify_task=None means PASS was pre-established (compat shim /
+            # step-12 tests where entry is constructed with a known-pass worktree).
+            vr: InflightVerifyResult | None = None
+            if entry.verify_task is not None:
+                vr = await entry.verify_task
+
+            # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
+            if vr is not None and vr.status in ('DROPPED', 'REQUEUED'):
+                _cancel_release = True
+                _n_failed_val = True  # abandon / operator-halt → chain stale
+                return False
+
+            # ── (a) FAIL / skip ──────────────────────────────────────────────
+            if vr is not None and vr.outcome is not None:
+                fail_merge_wt = vr.merge_wt
+                if fail_merge_wt is not None:
+                    await self._cleanup_owned_merge_worktree(fail_merge_wt)
+                self._resolve_or_drop_abandoned(req, vr.outcome)
+                _n_failed_val = True
+                return False
+
+            # ── PASS: CAS advance_main ───────────────────────────────────────
+            # Reached when verify passed (vr.outcome is None) or verify_task=None.
+            merge_wt = entry.merge_wt if vr is None else vr.merge_wt
+            assert merge_wt is not None
+            assert item.merge_result is not None
+            merge_commit = item.merge_result.merge_commit
+            assert merge_commit is not None
+            merge_commit = merge_commit.strip()
+
+            # warm_results from the warm-verify path — empty here (see docstring).
+            _warm_results: dict[str, bool] = {}
+
             # Short-circuit: if abandonment landed while verify completed,
             # skip the expensive CAS loop (mirrors _verify_and_advance :6934).
             if self._request_abandoned(req):
@@ -7172,14 +7224,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'{self.MAX_CAS_RETRIES}), retrying'
                 )
                 _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+
         finally:
-            # Always: release the host lease, release the speculation slot iff
-            # speculative, and update the chain-invalidation flag.
-            if entry.lease is not None and self._host_allocator is not None:
-                await self._host_allocator.release(entry.lease)
+            # Always: release the host lease (unless passthrough / already skipped),
+            # release the speculation slot iff speculative, and update _n_failed.
+            if not _skip_release and entry.lease is not None and self._host_allocator is not None:
+                if _cancel_release:
+                    await self._host_allocator.cancel_and_release(entry.lease)
+                else:
+                    await self._host_allocator.release(entry.lease)
             if entry.was_speculative:
                 self._speculation_slot.release()
-            self._n_failed = not advanced
+            # _n_failed_val is set by non-PASS branches; None means use 'not advanced'
+            # (the PASS-path semantics: True when CAS failed, False when advanced).
+            self._n_failed = _n_failed_val if _n_failed_val is not None else not advanced
 
     async def _verify_and_advance(self, item: SpeculativeItem) -> bool:
         """Run verification + CAS advance for one item.
