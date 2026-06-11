@@ -27,6 +27,10 @@ from test_merge_queue_coalesce import (
     _gated_verify,
     _make_branch_with_file,
     _make_req,
+    coalesce_config,
+    git_config,
+    git_ops,
+    git_repo,
 )
 
 if TYPE_CHECKING:
@@ -34,54 +38,36 @@ if TYPE_CHECKING:
     from orchestrator.git_ops import GitOps
 
 
-# ─── Fixtures ────────────────────────────────────────────────────────────────
+# ─── Test helpers ─────────────────────────────────────────────────────────────
 
 
-async def _setup_repo(repo: Path) -> None:
-    from orchestrator.git_ops import _run
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+def _task_targeted_gate(
+    target_task_id: str,
+    gate_release: asyncio.Event,
+    gate_entered: asyncio.Event,
+):
+    """Context manager that gates LocalRunner.run_merge_verify for a specific task.
 
+    Unlike _gated_verify (blocks the FIRST call positionally, regardless of
+    which request it is), this blocks only when LocalRunner._task_id ==
+    target_task_id.  All other tasks receive an immediate passed=True result.
 
-@pytest.fixture
-def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    A dispatch-order change therefore produces a deterministic TimeoutError
+    (gate_entered never fires) rather than deadlocking by blocking the wrong
+    request (train instead of solo → train never lands → mark_done never fires
+    → all_done/train_done never set → the release condition never triggers).
+    """
+    from unittest.mock import MagicMock, patch
 
+    from orchestrator.verify_runner import LocalRunner
 
-@pytest.fixture
-def git_config():
-    from orchestrator.config import GitConfig
-    return GitConfig(
-        main_branch='main',
-        branch_prefix='task/',
-        remote='origin',
-        worktree_dir='.worktrees',
-        push_after_advance=False,
-    )
+    async def _patched(self_runner, merge_sha, spec):
+        if self_runner._task_id == target_task_id:
+            gate_entered.set()
+            await gate_release.wait()
+        return MagicMock(passed=True, summary='', test_output=None)
 
-
-@pytest.fixture
-def git_ops(git_config, git_repo: Path):
-    from orchestrator.git_ops import GitOps
-    return GitOps(git_config, git_repo)
-
-
-@pytest.fixture
-def coalesce_config(git_repo: Path, git_config) -> OrchestratorConfig:
-    """Config with merge_train_coalesce_enabled=True."""
-    from orchestrator.config import OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=git_repo,
-        git=git_config,
-        merge_train_coalesce_enabled=True,
-    )
+    return patch.object(LocalRunner, 'run_merge_verify', _patched)
 
 
 # ─── Scenario 1 ─────────────────────────────────────────────────────────────
@@ -374,6 +360,10 @@ class TestScenario2:
       (d) after gate_release the 2-member train lands; s21/s22 files on main
       (e) s23 stays in the worker queue as a solo MergeRequest (not a GroupMergeRequest)
 
+    Integration-gate invariant (beyond TestPartialStackability unit coverage):
+    the worker.run() path correctly leaves the solo in the queue rather than
+    absorbing it — verified here at the full SpeculativeMergeWorker level.
+
     GREEN (step-4): s23 now adds file_overlap.py (same filename as s21) so
     parse_diff_line_ranges maps it to (0,0) on file_overlap.py — same as s21's
     range — and _line_ranges_stackable returns False.  The coalescing pass forms
@@ -387,7 +377,6 @@ class TestScenario2:
         tmp_path: Path,
     ):
         import contextlib
-        from unittest.mock import patch
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
@@ -443,10 +432,7 @@ class TestScenario2:
         gate_release = asyncio.Event()
         gate_entered = asyncio.Event()
 
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            _gated_verify(gate_release, gate_entered),
-        ):
+        with _task_targeted_gate('ig_s23', gate_release, gate_entered):
             worker_task = asyncio.create_task(worker.run())
 
             await asyncio.wait_for(gate_entered.wait(), timeout=60)
@@ -539,6 +525,10 @@ class TestScenario3:
       (d) after gate_release the 2-member train lands; s32/s33 files on main
       (e) s31 resolves independently after worker.stop() (never 'superseded')
 
+    Integration-gate invariant (beyond TestBlockedHistoryGate unit coverage):
+    the exclusion reason propagates into the emitted train_coalesced event
+    data['exclusions'] when driven through worker.run() end-to-end.
+
     GREEN (step-6): es.emit(merge_finalized, state='blocked') for s31 is
     seeded before the worker starts.  The branch 'ig_s31' in the event data
     matches req1.branch so _default_coalesce_exclusion_reason returns
@@ -555,7 +545,6 @@ class TestScenario3:
         tmp_path: Path,
     ):
         import contextlib
-        from unittest.mock import patch
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
@@ -623,10 +612,7 @@ class TestScenario3:
         gate_release = asyncio.Event()
         gate_entered = asyncio.Event()
 
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            _gated_verify(gate_release, gate_entered),
-        ):
+        with _task_targeted_gate('ig_s31', gate_release, gate_entered):
             worker_task = asyncio.create_task(worker.run())
 
             await asyncio.wait_for(gate_entered.wait(), timeout=60)
@@ -699,6 +685,11 @@ class TestScenario4:
       req_in_flight: MergeRequest set on worker._inflight_req (absent from buffer)
       req_cancelled: MergeRequest whose future is pre-cancelled (remains in buffer)
       req4a, req4b: two live disjoint stackable singles (eligible)
+
+    Integration-gate invariant (beyond TestExclusionIdempotency unit coverage):
+    the structural exclusion (in-flight/cancelled) filtering is verified at the
+    direct _maybe_coalesce_waiting_singles() call level with real EventStore +
+    factory, establishing that the pass correctly classifies each candidate type.
 
     Driver: direct _inflight_req + _lane_buffers manipulation → call
     _maybe_coalesce_waiting_singles() with real EventStore + factory.
