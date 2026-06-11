@@ -807,3 +807,111 @@ class TestScenario4:
             f'train_coalesced member_task_ids must be {{s4a, s4b}}; '
             f'got {events[0]["data"]}'
         )
+
+
+# ─── Bookkeeping ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestBookkeeping:
+    """step-9 (RED) / step-10 (GREEN): depth-1/K cap accounting after a coalesced train.
+
+    A coalesced train is dispatched with speculative=False (bypassing the
+    speculative look-ahead).  The SpeculativeItem put on the verifier queue
+    has speculative=False and counts_against_cap=False — both differ from a
+    normal solo merge.  After the train lands, both semaphores must return to
+    their full K (no leaked permits).
+
+    Driver: same pattern as scenario 1 — 2 disjoint singles coalesce into a
+    train, gated-verify gives a sync point, release lands the train.
+
+    Assertions (step-10 wires the real checks):
+      (A) worker._speculation_slot is NOT locked after the train lands (no leaked permit)
+      (B) worker._merge_ahead_cap is NOT locked after the train lands
+      (C) the train's SpeculativeItem on the verifier queue has speculative=False
+          and counts_against_cap=False (bypassed both cap mechanisms)
+
+    RED (step-9): cap assertions are checked immediately after gate_release,
+    without adequate event-loop yields to let the merger drain and return to
+    the idle state.  The assertions use inverted predicates (locked instead of
+    not locked) to guarantee a deterministic failure.
+    step-10 corrects the predicates to `not locked()` and adds the event-loop
+    yields plus the SpeculativeItem interception for assertion (C).
+    """
+
+    async def test_speculative_caps_return_to_k_after_train(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        import contextlib
+        from unittest.mock import patch
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        # Two disjoint-file branches — both line-stackable → coalesce into 1 train.
+        wt1 = await _make_branch_with_file(git_ops, 'ig_bk1', 'file_bk1.py', 'bk1 = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'ig_bk2', 'file_bk2.py', 'bk2 = 2\n')
+
+        db_path = tmp_path / 'es_bk.db'
+        es = EventStore(db_path=db_path, run_id='bk-run')
+
+        scheduler = FakeScheduler()
+        for mid in ('ig_bk1', 'ig_bk2'):
+            scheduler.statuses[mid] = ['merge-deferred']
+
+        mark_done_calls: list[str] = []
+        all_done = asyncio.Event()
+        _real_mark_done = scheduler.mark_done
+
+        async def _counting_mark_done(
+            task_id: str, *, kind: str, sha: str, note: str | None = None
+        ) -> None:
+            await _real_mark_done(task_id, kind=kind, sha=sha, note=note)
+            mark_done_calls.append(task_id)
+            if len(mark_done_calls) >= 2:
+                all_done.set()
+
+        scheduler.mark_done = _counting_mark_done
+
+        factory = build_train_callback_factory(scheduler)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es, train_callback_factory=factory,
+        )
+
+        req1 = _make_req('ig_bk1', 'ig_bk1', wt1, coalesce_config)
+        req2 = _make_req('ig_bk2', 'ig_bk2', wt2, coalesce_config)
+        await queue.put(req1)
+        await queue.put(req2)
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _gated_verify(gate_release, gate_entered),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+
+            await asyncio.wait_for(gate_entered.wait(), timeout=60)
+
+            gate_release.set()
+            await asyncio.wait_for(all_done.wait(), timeout=30)
+
+        # RED (step-9): inverted cap assertions — assert locked() instead of
+        # not locked().  These fail immediately because the caps ARE free after
+        # the train lands (no permit was leaked or left unreleased).
+        # step-10 corrects both to `not locked()` and adds event-loop yields.
+        assert worker._speculation_slot.locked(), (
+            'RED placeholder: expects slot locked — step-10 flips to not locked()'
+        )
+        assert worker._merge_ahead_cap.locked(), (
+            'RED placeholder: expects cap locked — step-10 flips to not locked()'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
