@@ -6437,16 +6437,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 # Continue filling only if another slot is free (real verify entries
                 # consume a host slot, so check free_host_count).
+                # Also stop filling if we just dispatched from _redispatch and it is
+                # now empty: cascade-recovery items should proceed to FINALIZE-HEAD
+                # rather than blocking on _verifier_queue.get() waiting for new work
+                # (which would deadlock when the queue is empty after a cascade).
                 allocator = self._ensure_host_allocator(entry.item.request.config)
-                if allocator.free_host_count() == 0:
+                if allocator.free_host_count() == 0 or (
+                    not is_from_verifier_queue and not self._redispatch
+                ):
                     fill_done = True
                     break
 
             # ── (b) FINALIZE-HEAD ──────────────────────────────────────────────
             if self._inflight:
                 head = self._inflight.popleft()
+                _head_advanced = False
                 try:
-                    await self._finalize_inflight(head)
+                    _head_advanced = await self._finalize_inflight(head)
                 except BaseException as exc:
                     if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
                         req = head.item.request
@@ -6463,6 +6470,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         self._n_failed = True
                     else:
                         raise
+
+                # HEAD-FAILURE CASCADE (γ step-20): when the head fails, abort
+                # all downstream in-flight verifies, re-merge each item onto
+                # actual main, and front-queue the re-merged items on _redispatch
+                # for strictly-ordered re-dispatch.
+                #
+                # This preserves chain-invalidation under overlap: a speculative
+                # N+1 that launched against N's (not-yet-landed) merge commit is
+                # now stale.  We cancel it (remote cancel_verify), re-merge it
+                # against actual main, and re-verify it so the correct commit
+                # lands.  Main still advances in submission order (N never landed
+                # → N+1 re-merges and advances as the new head).
+                if not _head_advanced and self._inflight:
+                    _allocator = self._host_allocator
+                    _downstream = list(self._inflight)
+                    self._inflight.clear()
+                    for _entry in _downstream:
+                        if _entry.verify_task is not None:
+                            _entry.verify_task.cancel()
+                            with contextlib.suppress(BaseException):
+                                await _entry.verify_task
+                        if _entry.lease is not None and _allocator is not None:
+                            await _allocator.cancel_and_release(_entry.lease)
+                        if _entry.merge_wt is not None:
+                            with contextlib.suppress(BaseException):
+                                await self._cleanup_owned_merge_worktree(
+                                    _entry.merge_wt
+                                )
+                        if _entry.was_speculative:
+                            self._speculation_slot.release()
+                        _remerged = await self._remerge(
+                            _entry.item.request,
+                            _entry.item.started_monotonic,
+                        )
+                        self._redispatch.append(_remerged)
+                    # Signal dispatch that any not-yet-dispatched followers also
+                    # need re-merge (chain_invalidated guard in _dispatch_item).
+                    self._remerge_occurred = True
             else:
                 # Nothing dispatched (no items in queue or no host yet free after
                 # putting item back).  Block on the next item from the queue.
