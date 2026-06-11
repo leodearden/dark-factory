@@ -5119,6 +5119,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 position=len(entries),
             ))
 
+        # 1b. Additional in-flight entries (multi-host only).
+        # With single-host _inflight has ≤1 entry (already covered by _verify_item).
+        # With multi-host there may be more — surface them as 'verifying' entries.
+        # De-duplicate by task_id so the head is never double-counted regardless
+        # of which item _verify_item currently points to.
+        _snapshot_seen_task_ids = {e['task_id'] for e in entries}
+        for _infl in self._inflight:
+            _infl_req = _infl.item.request
+            if _infl_req.task_id not in _snapshot_seen_task_ids:
+                entries.append(_entry(
+                    _infl_req,
+                    _infl.phase or 'verifying',
+                    worktree_path=_infl.merge_wt,
+                    position=len(entries),
+                ))
+                _snapshot_seen_task_ids.add(_infl_req.task_id)
+
         # 2. Awaiting-verify items from the verifier queue (skip None sentinel)
         # Accessing asyncio.Queue._queue (the internal deque) directly — a CPython
         # implementation detail.  Safe here: snapshot() is synchronous, runs under
@@ -5339,6 +5356,39 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         item.request.result.set_result(shutdown)
             except asyncio.QueueEmpty:
                 break
+
+        # Drain _inflight: cancel every background verify task, clean owned
+        # merge worktrees, release host leases, and resolve pending futures.
+        # Done BEFORE sending sentinels so _verifier_loop sees an empty deque
+        # when the None sentinel arrives — no CancelledError mid-finalize.
+        # Futures are resolved first (before task cancel) so there's no window
+        # where the task is cancelled but the future is still pending.
+        for _ie in list(self._inflight):
+            _ie_req = _ie.item.request
+            if not _ie_req.result.done():
+                _ie_req.result.set_result(shutdown)
+            if _ie.verify_task is not None and not _ie.verify_task.done():
+                _ie.verify_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await _ie.verify_task
+            if _ie.merge_wt is not None:
+                with contextlib.suppress(BaseException):
+                    await self._cleanup_owned_merge_worktree(_ie.merge_wt)
+            if _ie.lease is not None and self._host_allocator is not None:
+                with contextlib.suppress(BaseException):
+                    await self._host_allocator.cancel_and_release(_ie.lease)
+            if _ie.was_speculative:
+                self._speculation_slot.release()
+        self._inflight.clear()
+
+        # Drain _redispatch: items pending re-dispatch after a cascade.
+        while self._redispatch:
+            _rd = self._redispatch.popleft()
+            if not _rd.request.result.done():
+                _rd.request.result.set_result(shutdown)
+            if _rd.merge_wt is not None:
+                with contextlib.suppress(BaseException):
+                    await self._cleanup_owned_merge_worktree(_rd.merge_wt)
 
         # Send sentinels to unblock both loops
         await self._queue.put(None)  # type: ignore[arg-type]
