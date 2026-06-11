@@ -19,7 +19,7 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import RemoteRunner
+from orchestrator.verify_runner import HostAllocator, RemoteRunner
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -321,6 +321,64 @@ class TestRunPostMergeVerifyPoolWiring:
 
 
 @pytest.mark.asyncio
+class TestRunPostMergeVerifyLocalOnly:
+    """β step-17: _run_post_merge_verify is LOCAL-ONLY for all direct callers (decision 6)."""
+
+    async def test_post_merge_verify_dispatches_to_local_not_remote(self, tmp_path):
+        """With enabled_verify_runners set, the verify still dispatches to 'local' (β decision 6).
+
+        This is the inversion of the shipped prefer-remote behaviour.  Before β the pool
+        included the remote, so the emitted runner was 'laptop'.  After β the pool is
+        local-only: the remote is NEVER dispatched from _run_post_merge_verify directly.
+
+        Fails on current main (today routes to 'laptop') — RED for step-17.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        emitted = []
+        from orchestrator.event_store import EventStore
+
+        class FakeEventStore(EventStore):
+            def __init__(self):
+                object.__init__(self)
+
+            def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
+                emitted.append({'event_type': event_type, 'data': data or {}})
+
+        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
+             patch('orchestrator.merge_queue.run_scoped_verification',
+                   new=AsyncMock(return_value=_make_pass_result())):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=FakeEventStore(),
+                merge_sha='abc123',
+            )
+
+        assert outcome is None  # verify passed
+        merge_verify_events = [
+            e for e in emitted
+            if hasattr(e['event_type'], 'value') and e['event_type'].value == 'merge_verify'
+        ]
+        assert len(merge_verify_events) >= 1
+        # β decision 6: must be 'local', NOT 'laptop'
+        assert merge_verify_events[0]['data']['runner'] == 'local', (
+            "β: _run_post_merge_verify must dispatch to 'local' even when verify_runners is set "
+            f"(got: {merge_verify_events[0]['data']['runner']!r})"
+        )
+
+
+@pytest.mark.asyncio
 class TestColdShadowVerifyLocalOnly:
     """_run_cold_shadow_verify stays local-only even when verify_runners are configured."""
 
@@ -396,8 +454,28 @@ class TestRunDriftCheck:
 
         return FakeES()
 
+    def _make_fake_remote(self, name='laptop', *, pass_result=None, fail_result=None):
+        """Build a fake RemoteRunner-like for allocator tests."""
+        remote = MagicMock()
+        remote.name = name
+        remote.is_local = False
+        if fail_result is not None:
+            remote.run_merge_verify = AsyncMock(return_value=fail_result)
+        else:
+            remote.run_merge_verify = AsyncMock(return_value=pass_result or _make_pass_result())
+        return remote
+
+    def _make_allocator(self, fake_remote, *, quarantine_set=None):
+        """Build a HostAllocator pre-loaded with fake_remote (β step-21 test harness)."""
+        q = quarantine_set if quarantine_set is not None else set()
+        return HostAllocator([fake_remote], quarantine=q)
+
     async def test_agree_emits_verdict_parity_ok(self, tmp_path):
-        """When local and remote agree, a verdict_parity_ok event is emitted."""
+        """When local and remote agree, a verdict_parity_ok event is emitted.
+
+        β step-21: uses HostAllocator instead of patching _build_remote_runners.
+        Passes allocator= to _run_drift_check — fails RED (param not yet present).
+        """
         from orchestrator.merge_queue import _run_drift_check
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
@@ -405,26 +483,30 @@ class TestRunDriftCheck:
         git_ops = _make_git_ops_mock()
         eq = self._make_fake_escalation_queue()
         es = self._make_fake_event_store()
-        quarantine_set = set()
+        quarantine_set: set[str] = set()
 
         pass_result = _make_pass_result()
-        fake_remote = MagicMock()
-        fake_remote.name = 'laptop'
-        fake_remote.is_local = False
-        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        fake_remote = self._make_fake_remote('laptop', pass_result=pass_result)
+        allocator = self._make_allocator(fake_remote, quarantine_set=quarantine_set)
 
-        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
-             patch('orchestrator.merge_queue.run_scoped_verification',
+        with patch('orchestrator.merge_queue.run_scoped_verification',
                    new=AsyncMock(return_value=pass_result)):
             await _run_drift_check(
                 git_ops, req, 'abc123', eq, es, quarantine_set,
+                allocator=allocator,
             )
 
-        parity_events = [e for e in es._emitted if hasattr(e['type'], 'value') and e['type'].value == 'verdict_parity_ok']
+        parity_events = [
+            e for e in es._emitted
+            if hasattr(e['type'], 'value') and e['type'].value == 'verdict_parity_ok'
+        ]
         assert len(parity_events) >= 1
 
     async def test_agree_throwaway_worktree_created_and_cleaned(self, tmp_path):
-        """A throwaway worktree is created and cleaned up."""
+        """A throwaway worktree is created and cleaned up.
+
+        β step-21: uses HostAllocator + allocator= kwarg to _run_drift_check.
+        """
         from orchestrator.merge_queue import _run_drift_check
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
@@ -432,23 +514,24 @@ class TestRunDriftCheck:
         git_ops = _make_git_ops_mock()
         pass_result = _make_pass_result()
 
-        fake_remote = MagicMock()
-        fake_remote.name = 'laptop'
-        fake_remote.is_local = False
-        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        fake_remote = self._make_fake_remote('laptop', pass_result=pass_result)
+        allocator = self._make_allocator(fake_remote)
 
-        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
-             patch('orchestrator.merge_queue.run_scoped_verification',
+        with patch('orchestrator.merge_queue.run_scoped_verification',
                    new=AsyncMock(return_value=pass_result)):
             await _run_drift_check(
                 git_ops, req, 'abc123', None, None, set(),
+                allocator=allocator,
             )
 
         git_ops.create_throwaway_verify_worktree.assert_called_once_with('abc123')
         git_ops.cleanup_merge_worktree.assert_called_once()
 
     async def test_diverge_submits_escalation_and_quarantines(self, tmp_path):
-        """When local passes but remote fails (divergence), escalation is submitted + remote quarantined."""
+        """When local passes but remote fails (divergence), escalation submitted + remote quarantined.
+
+        β step-21: uses HostAllocator + allocator= kwarg; quarantine propagates to shared set.
+        """
         from orchestrator.merge_queue import _run_drift_check
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
@@ -456,24 +539,23 @@ class TestRunDriftCheck:
         git_ops = _make_git_ops_mock()
         eq = self._make_fake_escalation_queue()
         es = self._make_fake_event_store()
-        quarantine_set = set()
+        quarantine_set: set[str] = set()
 
         pass_result = _make_pass_result()
-        fail_result = VerifyResult(passed=False, test_output='FAIL', lint_output='', type_output='', summary='fail')
+        fail_result = VerifyResult(
+            passed=False, test_output='FAIL', lint_output='', type_output='', summary='fail',
+        )
+        fake_remote = self._make_fake_remote('laptop', fail_result=fail_result)
+        allocator = self._make_allocator(fake_remote, quarantine_set=quarantine_set)
 
-        fake_remote = MagicMock()
-        fake_remote.name = 'laptop'
-        fake_remote.is_local = False
-        fake_remote.run_merge_verify = AsyncMock(return_value=fail_result)
-
-        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
-             patch('orchestrator.merge_queue.run_scoped_verification',
+        with patch('orchestrator.merge_queue.run_scoped_verification',
                    new=AsyncMock(return_value=pass_result)):
             await _run_drift_check(
                 git_ops, req, 'abc123', eq, es, quarantine_set,
+                allocator=allocator,
             )
 
-        # Remote must be quarantined
+        # Remote must be quarantined in the shared set
         assert 'laptop' in quarantine_set
         # Escalation must have been submitted
         assert eq.submit.called
