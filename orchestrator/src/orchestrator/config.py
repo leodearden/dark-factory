@@ -780,6 +780,21 @@ class OrchestratorConfig(BaseSettings):
     # out-of-scope or cap-exhausted suggestions still flow through the
     # existing escalate_suggestions path.
     max_amendment_rounds: int = Field(default=1)
+    # Circuit-breaker threshold for consecutive fresh-invocation zero-output
+    # timeouts (timed_out=True, turns=0, cost_usd=0.0).  After this many
+    # consecutive such timeouts the orchestrator fast-fails to BLOCKED with an
+    # infra_issue category instead of burning the full max_execute_iterations
+    # budget (~3.3h at 10 iterations × 20 min each).  Default 2 leaves one
+    # free retry to absorb a single transient infra blip while still catching
+    # the deterministic-wedge pattern observed in reify-4429 (10/10 hung).
+    max_consecutive_zero_output_timeouts: int = Field(default=2, ge=1)
+    # Whether to recycle (cleanup + recreate) the per-task TaskConfigDir
+    # between sub-threshold zero-output retries.  Per-task CLI state is the
+    # prime suspect for deterministic wedges; turns==0 means the destroyed
+    # session did no work, so discarding it cannot lose progress and aligns
+    # with crash-recovery semantics.  Disabled on the final tripping iteration
+    # (that dir is preserved for forensics regardless of this flag).
+    recycle_config_dir_on_zero_output: bool = Field(default=True)
 
     # Completion judge — opt-in loop-exit hint after each implementer iteration.
     # Default False: production orchestrator runs unaffected. Eval runner
