@@ -17,7 +17,6 @@ import time
 from typing import Any
 from unittest.mock import patch
 
-
 # ---------------------------------------------------------------------------
 # Step-1: loop-independence test for _watchdog_thread_loop
 # ---------------------------------------------------------------------------
