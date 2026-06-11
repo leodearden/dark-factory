@@ -683,3 +683,123 @@ class TestScenario3:
             f's31 must not be superseded by the coalescing pass; '
             f'got {outcome_s31!r}'
         )
+
+
+# ─── Scenario 4 ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestScenario4:
+    """step-7 (RED) / step-8 (GREEN): in-flight + detached-waiter exclusion.
+
+    The coalescing pass filters candidates via:
+      not req.result.done()    — absorbed or otherwise resolved
+      not req.result.cancelled()  — detached waiter
+      not isinstance(req, GroupMergeRequest)
+    Plus structural exclusion: _inflight_req is absent from _lane_buffers.
+
+    Setup:
+      req_in_flight: MergeRequest set on worker._inflight_req (absent from buffer)
+      req_cancelled: MergeRequest whose future is pre-cancelled (remains in buffer)
+      req4a, req4b: two live disjoint stackable singles (eligible)
+
+    Driver: direct _inflight_req + _lane_buffers manipulation → call
+    _maybe_coalesce_waiting_singles() with real EventStore + factory.
+
+    Assertions:
+      (a) req_in_flight's future is UNRESOLVED after the pass (not touched)
+      (b) req_in_flight's task_id is NOT in the train's member_task_ids
+      (c) req_cancelled's future remains CANCELLED — set_result never called
+      (d) req_cancelled still in _lane_buffers (not absorbed)
+      (e) train forms from req4a + req4b only; exactly 2 members
+      (f) train_coalesced event records only req4a + req4b in member_task_ids
+
+    RED (step-7): no _inflight_req assignment and no future cancellation →
+    all 4 items in the buffer are live candidates → all 4 coalesce into a
+    4-member train → assertion (a) fails (req_in_flight resolved 'superseded')
+    and assertion (c) fails (req_cancelled resolved 'superseded').
+    step-8 moves req_in_flight to _inflight_req (absent from buffer) and
+    cancels req_cancelled.result before calling the pass.
+    """
+
+    async def test_inflight_and_cancelled_excluded(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        from orchestrator.event_store import EventStore
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+
+        # Four disjoint-file branches (all mutually line-stackable).
+        wt_inf = await _make_branch_with_file(git_ops, 'ig_inf', 'file_inf.py',   'inf = 0\n')
+        wt_can = await _make_branch_with_file(git_ops, 'ig_can', 'file_can.py',   'can = 0\n')
+        wt_4a  = await _make_branch_with_file(git_ops, 'ig_s4a', 'file_s4a.py',   's4a = 1\n')
+        wt_4b  = await _make_branch_with_file(git_ops, 'ig_s4b', 'file_s4b.py',   's4b = 2\n')
+
+        db_path = tmp_path / 'es_s4.db'
+        es = EventStore(db_path=db_path, run_id='s4-run')
+
+        scheduler = FakeScheduler()
+        for mid in ('ig_s4a', 'ig_s4b'):
+            scheduler.statuses[mid] = ['merge-deferred']
+
+        factory = build_train_callback_factory(scheduler)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es, train_callback_factory=factory,
+        )
+
+        req_in_flight = _make_req('ig_inf', 'ig_inf', wt_inf, coalesce_config)
+        req_cancelled = _make_req('ig_can', 'ig_can', wt_can, coalesce_config)
+        req4a         = _make_req('ig_s4a', 'ig_s4a', wt_4a,  coalesce_config)
+        req4b         = _make_req('ig_s4b', 'ig_s4b', wt_4b,  coalesce_config)
+
+        # RED: no _inflight_req assignment and no future cancellation.
+        # All 4 requests are live candidates in the buffer → all 4 coalesce
+        # into a 4-member train → assertions (a) and (c) fail.
+        # step-8 fixes:
+        #   worker._inflight_req = req_in_flight  (absent from buffer)
+        #   req_cancelled.result.cancel()          (excluded by cancelled() check)
+        worker._lane_buffers['normal'].extend([req_in_flight, req_cancelled, req4a, req4b])
+
+        result = await worker._maybe_coalesce_waiting_singles()
+        assert result is True, 'pass must form a train from the eligible candidates'
+
+        # (a) req_in_flight's future must be UNRESOLVED (not absorbed by the pass).
+        assert not req_in_flight.result.done(), (
+            'in-flight request future must remain unresolved; '
+            'it must not be absorbed into the train'
+        )
+
+        # (b) req_in_flight's task_id absent from the formed train.
+        buf = list(worker._lane_buffers['normal'])
+        trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
+        assert len(trains) == 1, f'Expected 1 train; got {len(trains)}'
+        assert 'ig_inf' not in trains[0].member_task_ids, (
+            f'in-flight task must not be in the train; members={trains[0].member_task_ids}'
+        )
+
+        # (c) req_cancelled's future must remain CANCELLED (set_result never called).
+        assert req_cancelled.result.cancelled(), (
+            'cancelled future must remain cancelled — set_result must not be called on it'
+        )
+
+        # (d) req_cancelled still in buffer (not removed by the pass).
+        solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
+        assert any(r.task_id == 'ig_can' for r in solos), (
+            f'cancelled request must remain in the buffer; solos={[r.task_id for r in solos]}'
+        )
+
+        # (e) Train has exactly 2 members: req4a + req4b.
+        assert set(trains[0].member_task_ids) == {'ig_s4a', 'ig_s4b'}, (
+            f'train must contain only s4a+s4b; got {trains[0].member_task_ids}'
+        )
+
+        # (f) train_coalesced event records only s4a + s4b in member_task_ids.
+        events = _events_of_type(db_path, 'train_coalesced')
+        assert len(events) == 1, f'Expected 1 train_coalesced event; got {len(events)}'
+        assert set(events[0]['data'].get('member_task_ids', [])) == {'ig_s4a', 'ig_s4b'}, (
+            f'train_coalesced member_task_ids must be {{s4a, s4b}}; '
+            f'got {events[0]["data"]}'
+        )
