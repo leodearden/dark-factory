@@ -11140,6 +11140,92 @@ class TestRunPostMergeVerify:
             f'unexpected failure_cause_hint: {result.failure_cause_hint!r}'  # type: ignore[attr-defined]
         )
 
+    async def test_keep_worktrees_forwarded_to_disk_guard(self) -> None:
+        """keep_worktrees is forwarded verbatim to _ensure_verify_disk_space."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        l1 = Path('/fake/_merge-l1')
+        l2 = Path('/fake/_merge-l2')
+
+        mock_disk_guard = AsyncMock(return_value=None)
+        passed_result = MagicMock(passed=True, summary='', timed_out=False)
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', mock_disk_guard),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_result)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                keep_worktrees={l1, l2},
+            )
+
+        assert result is None
+        call_kwargs = mock_disk_guard.await_args.kwargs
+        assert call_kwargs['keep_worktrees'] == {l1, l2}
+
+    async def test_enospc_retry_prunes_with_keep_set_union(self) -> None:
+        """ENOSPC retry passes keep = {merge_wt} | keep_worktrees to prune."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = Path('/fake/_merge-active')
+        l1 = Path('/fake/_merge-l1')
+        l2 = Path('/fake/_merge-l2')
+        enospc_retries: dict[str, int] = {}
+
+        enospc_result = _enospc_verify_result()
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=enospc_result),
+            ),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+                keep_worktrees={l1, l2},
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        call_kwargs = git_ops.prune_stale_merge_worktrees.await_args.kwargs
+        assert call_kwargs['keep'] == {merge_wt, l1, l2}
+
+    async def test_default_enospc_retry_keeps_only_merge_wt(self) -> None:
+        """Default keep_worktrees=None → ENOSPC retry keep == {merge_wt} (regression)."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = Path('/fake/_merge-active')
+        enospc_retries: dict[str, int] = {}
+
+        enospc_result = _enospc_verify_result()
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=enospc_result),
+            ),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        call_kwargs = git_ops.prune_stale_merge_worktrees.await_args.kwargs
+        assert call_kwargs['keep'] == {merge_wt}
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests
