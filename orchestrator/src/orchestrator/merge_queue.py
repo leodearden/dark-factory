@@ -6501,6 +6501,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             )
                             if self._pending_verifier_get.done():
                                 # A new item arrived first → dispatch it.
+                                # Guard against cancelled getter (stop() race):
+                                # treat cancelled as nothing-arrived → fall
+                                # through to FINALIZE-HEAD instead.
+                                if self._pending_verifier_get.cancelled():
+                                    self._pending_verifier_get = None
+                                    fill_done = True
+                                    break
                                 item = self._pending_verifier_get.result()
                                 self._pending_verifier_get = None
                                 is_from_verifier_queue = True
@@ -6717,7 +6724,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if self._pending_verifier_get is not None:
                     _pvg = self._pending_verifier_get
                     self._pending_verifier_get = None
-                    item = await _pvg
+                    try:
+                        item = await _pvg
+                    except asyncio.CancelledError:
+                        # Getter was cancelled (stop() ordering race); re-fetch
+                        # via a fresh get so no queue item is lost.
+                        item = await self._verifier_queue.get()
                 else:
                     item = await self._verifier_queue.get()
                 if item is None:
@@ -7406,7 +7418,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 )
                         await _maybe_schedule_shadow_compare(
                             self, self._git_ops, req, merge_commit,
-                            _warm_results, self._escalation_queue, self._event_store,
+                            warm_results=_warm_results,
+                            escalation_queue=self._escalation_queue,
+                            event_store=self._event_store,
                         )
                         await _maybe_run_drift_check(
                             self, self._git_ops, req, merge_commit,

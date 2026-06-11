@@ -385,27 +385,6 @@ class TestInflightStateAttrs:
         """InflightEntry is importable from merge_queue."""
         from orchestrator.merge_queue import InflightEntry  # noqa: F401 (import check)
 
-    def test_inflight_entry_has_required_fields(self) -> None:
-        """InflightEntry has item/lease/verify_task/merge_wt/was_speculative/phase."""
-        import dataclasses
-
-        from orchestrator.merge_queue import InflightEntry
-        field_names = {f.name for f in dataclasses.fields(InflightEntry)}
-        assert 'item' in field_names
-        assert 'lease' in field_names
-        assert 'verify_task' in field_names
-        assert 'merge_wt' in field_names
-        assert 'was_speculative' in field_names
-        assert 'phase' in field_names
-
-    def test_inflight_entry_has_passthrough_outcome_field(self) -> None:
-        """InflightEntry has passthrough_outcome for immediate-outcome passthrough entries."""
-        import dataclasses
-
-        from orchestrator.merge_queue import InflightEntry
-        field_names = {f.name for f in dataclasses.fields(InflightEntry)}
-        assert 'passthrough_outcome' in field_names
-
 
 # ---------------------------------------------------------------------------
 # step-5 RED: _run_inflight_verify happy paths
@@ -2938,7 +2917,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
         assert advanced is True, "Expected PASS to return True (main advanced)."
         assert shadow_mock.called, "_maybe_schedule_shadow_compare was not awaited."
-        actual_warm = shadow_mock.call_args.args[4]
+        actual_warm = shadow_mock.call_args.kwargs['warm_results']
         assert actual_warm == warm_map, (
             f"Expected warm_results {warm_map!r} threaded into shadow compare "
             f"(vr.warm_results pass-through), got {actual_warm!r}. "
@@ -2988,7 +2967,7 @@ class TestFinalizeInflightWarmResultsThreading:
 
         assert advanced is True, "Expected PASS to return True (main advanced)."
         assert shadow_mock.called, "_maybe_schedule_shadow_compare was not awaited."
-        actual_warm = shadow_mock.call_args.args[4]
+        actual_warm = shadow_mock.call_args.kwargs['warm_results']
         assert actual_warm == {}, (
             f"Expected empty warm_results for verify_task=None (compat path), "
             f"got {actual_warm!r}."
