@@ -8,10 +8,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
+from pydantic import ValidationError
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import RequeueRecord, Scheduler
+from orchestrator.scheduler import RequeueRecord, Scheduler, is_transient_api_requeue
 
 # --- Fixtures -----------------------------------------------------------------
 
@@ -65,7 +66,91 @@ def _record_one(
     )
 
 
+# --- Config: transient_requeue_cap field -------------------------------------
+
+
+class TestTransientRequeueCapConfig:
+    def test_default_is_10(self, tmp_path: Path):
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        assert cfg.transient_requeue_cap == 10
+
+    def test_zero_raises_validation_error(self, tmp_path: Path):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(project_root=tmp_path, transient_requeue_cap=0)
+
+
+# --- is_transient_api_requeue predicate --------------------------------------
+
+
+class TestIsTransientApiRequeue:
+    @pytest.mark.parametrize('reason', [
+        'Planning failed: agent API error: HTTP 529',
+        'agent API error: HTTP 500',
+        'agent API error: HTTP 503',
+        'agent API error: HTTP 599',
+    ])
+    def test_true_for_5xx(self, reason: str):
+        assert is_transient_api_requeue(reason) is True
+
+    @pytest.mark.parametrize('reason', [
+        'agent API error: HTTP 400',
+        'agent API error: HTTP 401',
+        'agent API error: HTTP 429',
+        'architect returned empty output',
+        None,
+        '',
+    ])
+    def test_false_for_non_transient(self, reason):
+        assert is_transient_api_requeue(reason) is False
+
+    def test_producer_classifier_contract(self):
+        """Pin the cross-module marker: classify_agent_failure(HTTP 529) -> is_transient."""
+        from shared.cli_invoke import AgentResult, classify_agent_failure
+        result = AgentResult(success=False, output='', api_error_status=529)
+        cls = classify_agent_failure(result)
+        assert is_transient_api_requeue(f'Planning failed: {cls.summary}') is True
+
+
 # --- Counter mechanics --------------------------------------------------------
+
+
+class TestDualCounter:
+    """record_requeue routes transient (5xx API) and genuine requeues to separate counters."""
+
+    _529_REASON = 'Planning failed: agent API error: HTTP 529'
+
+    def _record_transient(self, scheduler: Scheduler, task_id: str = 't1') -> int:
+        return scheduler.record_requeue(
+            task_id,
+            phase='plan',
+            reason=self._529_REASON,
+            detail=self._529_REASON,
+            run_id='run-abc',
+            cost_usd=1.0,
+        )
+
+    def test_transient_does_not_touch_genuine_counter(self, scheduler: Scheduler):
+        count = self._record_transient(scheduler)
+        assert count == 0  # genuine count is 0
+        assert 't1' not in scheduler._requeue_counts
+        assert scheduler._transient_requeue_counts['t1'] == 1
+        assert len(scheduler._requeue_history['t1']) == 1
+        assert scheduler.transient_requeue_count('t1') == 1
+
+    def test_mixed_sequence_genuine_transient_genuine(self, scheduler: Scheduler):
+        # genuine → transient → genuine  →  returns 1, 1, 2
+        c1 = _record_one(scheduler)
+        c2 = self._record_transient(scheduler)
+        c3 = _record_one(scheduler)
+        assert (c1, c2, c3) == (1, 1, 2)
+        assert scheduler._requeue_counts['t1'] == 2
+        assert scheduler._transient_requeue_counts['t1'] == 1
+        history = scheduler._requeue_history['t1']
+        assert len(history) == 3
+        assert [r.attempt for r in history] == [1, 2, 3]
+
+    def test_transient_requeue_count_unknown_task_returns_zero(self, scheduler: Scheduler):
+        assert scheduler.transient_requeue_count('no-such-task') == 0
 
 
 class TestCounter:
@@ -104,6 +189,19 @@ class TestCounter:
         assert 't1' not in scheduler._requeue_history
         # Next requeue starts from 1 again.
         assert _record_one(scheduler, 't1') == 1
+
+    def test_clear_also_clears_transient_counter(self, scheduler: Scheduler):
+        _529 = 'Planning failed: agent API error: HTTP 529'
+        scheduler.record_requeue(
+            't1', phase='plan', reason=_529, detail=_529, run_id='r', cost_usd=1.0,
+        )
+        _record_one(scheduler, 't1')
+        assert scheduler.transient_requeue_count('t1') == 1
+        scheduler.clear_requeue_count('t1')
+        assert 't1' not in scheduler._requeue_counts
+        assert 't1' not in scheduler._requeue_history
+        assert 't1' not in scheduler._transient_requeue_counts
+        assert scheduler.transient_requeue_count('t1') == 0
 
 
 # --- trigger_retry_cap_exhausted ---------------------------------------------
@@ -255,6 +353,46 @@ class TestTriggerRetryCapExhausted:
 
         assert len(queue.submitted) == 1
 
+    @pytest.mark.asyncio
+    async def test_explicit_cap_param_overrides_config(
+        self, scheduler: Scheduler, tmp_path: Path
+    ):
+        """Passing cap=10 overrides config.requeue_cap (3) in report, event, escalation."""
+        scheduler.set_task_status = AsyncMock()
+        emitted: list[tuple] = []
+
+        class _FakeEventStore:
+            def emit(self, event_type, **kwargs) -> None:
+                emitted.append((event_type, kwargs))
+
+        scheduler.event_store = _FakeEventStore()  # type: ignore[assignment]
+        queue = _StubEscalationQueue()
+        for i in range(3):
+            _record_one(scheduler, 't1', reason=f'r{i}', cost_usd=1.0)
+
+        report_path = await scheduler.trigger_retry_cap_exhausted(
+            't1',
+            run_id='run-abc',
+            cost_usd=3.0,
+            escalation_queue=queue,
+            reports_dir=tmp_path / 'reports',
+            cap=10,
+        )
+
+        # Report file must show cap=10
+        assert report_path is not None and report_path.exists()
+        body = report_path.read_text()
+        assert 'Cap:** 10' in body
+
+        # Event data must carry cap=10
+        cap_events = [kw for (et, kw) in emitted if et == EventType.retry_cap_exhausted]
+        assert len(cap_events) == 1
+        assert cap_events[0]['data']['cap'] == 10
+
+        # Escalation summary must reference cap=10
+        assert len(queue.submitted) == 1
+        assert 'cap=10' in queue.submitted[0].summary
+
 
 # --- Harness-level integration -----------------------------------------------
 
@@ -270,6 +408,21 @@ def _build_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2
         steward_cost_usd=steward_cost_usd,
         block_reason='architect returned empty output',
         block_detail='see iteration log',
+        block_phase='plan',
+    )
+
+
+def _build_529_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2.5):
+    from orchestrator.harness import TaskReport
+
+    return TaskReport(
+        task_id='t1',
+        title='T1',
+        outcome=outcome,
+        cost_usd=cost_usd,
+        steward_cost_usd=steward_cost_usd,
+        block_reason='Planning failed: agent API error: HTTP 529',
+        block_detail='transient provider overload',
         block_phase='plan',
     )
 
@@ -398,3 +551,113 @@ class TestHarnessIntegration:
             )
         # Cap fired on the 3rd call — returned False despite the exception.
         assert result is False
+
+
+# --- Harness dual-ceiling integration ----------------------------------------
+
+
+class TestHarnessDualCeiling:
+    """_apply_retry_cap enforces both genuine and transient ceilings."""
+
+    def _make(self, tmp_path):
+        from orchestrator.config import OrchestratorConfig
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            max_per_module=1,
+            requeue_cap=3,
+            transient_requeue_cap=2,
+        )
+        return _make_harness(cfg)
+
+    @pytest.mark.asyncio
+    async def test_transient_does_not_fire_genuine_cap(self, tmp_path):
+        from orchestrator.workflow import WorkflowOutcome
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        # 1st transient REQUEUED — no trigger, genuine counter stays empty
+        r1 = await harness._apply_retry_cap(
+            't1', _build_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert r1 is True
+        assert trigger.await_count == 0
+        assert 't1' not in harness.scheduler._requeue_counts
+        assert harness.scheduler._transient_requeue_counts['t1'] == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_cap_fires_at_transient_ceiling(self, tmp_path):
+        from orchestrator.workflow import WorkflowOutcome
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        # 1st transient — no trigger
+        await harness._apply_retry_cap(
+            't1', _build_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert trigger.await_count == 0
+
+        # 2nd transient — hits transient_requeue_cap=2, trigger fires with cap=2
+        r2 = await harness._apply_retry_cap(
+            't1', _build_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert r2 is False
+        assert trigger.await_count == 1
+        call = trigger.await_args
+        assert call is not None
+        assert call.kwargs.get('cap') == 2
+
+    @pytest.mark.asyncio
+    async def test_genuine_cap_unaffected_by_transient_counts(self, tmp_path):
+        from orchestrator.workflow import WorkflowOutcome
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        # 3 genuine requeues must fire at cap=3 regardless of transient state
+        for _ in range(2):
+            await harness._apply_retry_cap(
+                't2', _build_report(WorkflowOutcome.REQUEUED), True,
+            )
+        assert trigger.await_count == 0
+
+        r3 = await harness._apply_retry_cap(
+            't2', _build_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert r3 is False
+        assert trigger.await_count == 1
+        call = trigger.await_args
+        assert call is not None
+        assert call.kwargs.get('cap') == 3
+
+    @pytest.mark.asyncio
+    async def test_both_caps_simultaneous_genuine_takes_precedence(self, tmp_path):
+        """When both ceilings fire on the same call, genuine cap takes precedence.
+
+        Scenario: transient count is already at transient_requeue_cap (2) AND
+        genuine count is at requeue_cap-1 (2).  The next genuine requeue pushes
+        genuine_exhausted=True and transient_exhausted=True simultaneously.
+        The harness must choose hit_cap = requeue_cap (3), not transient_requeue_cap (2),
+        so the escalation correctly identifies the genuine ceiling as the one that fired.
+        """
+        from orchestrator.workflow import WorkflowOutcome
+        harness = self._make(tmp_path)  # requeue_cap=3, transient_requeue_cap=2
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        # Pre-seed: transient counter already at transient ceiling, genuine at cap-1.
+        # We bypass _apply_retry_cap to avoid earlier cap firings.
+        harness.scheduler._transient_requeue_counts['t1'] = 2  # at transient_requeue_cap
+        harness.scheduler._requeue_counts['t1'] = 2            # one below requeue_cap
+
+        # Final genuine requeue: genuine→3 (= requeue_cap), transient stays at 2 (= transient_cap).
+        r = await harness._apply_retry_cap(
+            't1', _build_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert r is False
+        assert trigger.await_count == 1
+        call = trigger.await_args
+        assert call is not None
+        # genuine_exhausted=True takes priority; cap must be requeue_cap (3), not transient (2)
+        assert call.kwargs.get('cap') == 3

@@ -3080,7 +3080,17 @@ Output JSON matching the schema. Every task must appear in the output.
                 run_id=self._run_id,
                 cost_usd=attempt_cost,
             )
-            if count >= self.config.requeue_cap:
+            genuine_exhausted = count >= self.config.requeue_cap
+            transient_exhausted = (
+                self.scheduler.transient_requeue_count(task_id)
+                >= self.config.transient_requeue_cap
+            )
+            if genuine_exhausted or transient_exhausted:
+                hit_cap = (
+                    self.config.requeue_cap
+                    if genuine_exhausted
+                    else self.config.transient_requeue_cap
+                )
                 history = list(
                     self.scheduler._requeue_history.get(task_id, ())
                 )
@@ -3091,6 +3101,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         run_id=self._run_id,
                         cost_usd=cumulative_cost,
                         escalation_queue=self._escalation_queue,
+                        cap=hit_cap,
                     )
                 except Exception:
                     logger.exception(

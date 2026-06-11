@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from collections import deque
 from collections.abc import Callable
@@ -60,6 +61,7 @@ __all__ = [
     'extract_rejection',
     'extract_structured_rejection',
     'is_transient_rejection',
+    'is_transient_api_requeue',
 ]
 
 
@@ -251,6 +253,39 @@ def is_transient_rejection(rejection: str | None) -> bool:
     if not rejection:
         return False
     return any(name in rejection for name in TRANSIENT_ERROR_TYPES)
+
+
+# Marker produced solely by shared.cli_invoke.classify_agent_failure for
+# AgentFailureKind.API_ERROR (cli_invoke.py:362-366).  The planning and
+# execution phases write it into block_reason (workflow.py:2222/2298);
+# _run_simple_task (workflow.py:2599) uses it only as an internal REQUEUED
+# fall-through sentinel and does NOT write block_reason directly — that is
+# done later by the architect phase (workflow.py:2222/2298).
+_API_ERROR_REASON_RE = re.compile(r'agent API error: HTTP (\d{3})')
+
+
+def is_transient_api_requeue(reason: str | None) -> bool:
+    """True when *reason* encodes a transient server-side (HTTP 5xx) API error.
+
+    Matches the ``"agent API error: HTTP <status>"`` marker (present in
+    block_reason regardless of workflow phase) and classifies HTTP 5xx
+    (500-599, including 529 Overloaded) as transient.  HTTP 4xx (client/auth
+    errors) and non-API reasons return False and still count against
+    ``requeue_cap``.
+
+    Note: HTTP 429 (rate-limit / too-many-requests) is intentionally
+    classified as non-transient.  Unlike a server-side 5xx overload that
+    resolves on its own, a 429 signals a quota or rate-limiting configuration
+    problem that benefits from human review.  To change this policy, also
+    update the ``test_false_for_non_transient`` parametrize list and the
+    design decision in plan.json.
+    """
+    if not reason:
+        return False
+    m = _API_ERROR_REASON_RE.search(reason)
+    if m is None:
+        return False
+    return 500 <= int(m.group(1)) <= 599
 
 
 @dataclass(frozen=True)
@@ -708,6 +743,7 @@ class Scheduler:
         # by the cap-exhaust escalation report.  Both are process-local — an
         # orchestrator restart is an acceptable implicit reset.
         self._requeue_counts: dict[str, int] = {}
+        self._transient_requeue_counts: dict[str, int] = {}
         self._requeue_history: dict[str, list[RequeueRecord]] = {}
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
@@ -3159,17 +3195,30 @@ class Scheduler:
         run_id: str,
         cost_usd: float,
     ) -> int:
-        """Append a requeue record and return the new cumulative count.
+        """Append a requeue record and return the new *genuine* cumulative count.
 
-        Called by the harness from ``_run_slot`` when a workflow returns
-        ``WorkflowOutcome.REQUEUED``.  The returned count is compared against
-        ``config.requeue_cap`` to decide whether to trigger cap exhaustion.
+        Transient API requeues (HTTP 5xx "agent API error" summaries, classified
+        by ``is_transient_api_requeue``) are routed to ``_transient_requeue_counts``
+        and do NOT increment the genuine ``_requeue_counts`` that feeds
+        ``config.requeue_cap``.  Genuine requeues behave exactly as before.
+        The record is appended to ``_requeue_history`` either way so the
+        cap-exhaust report shows the full attempt timeline.
+        ``RequeueRecord.attempt`` is the overall chronological index
+        (``len(history) + 1``) across both buckets, so the timeline is
+        monotonic when genuine and transient records interleave.
+        Returns the genuine count (0 for a transient requeue).
         """
-        count = self._requeue_counts.get(task_id, 0) + 1
-        self._requeue_counts[task_id] = count
-        self._requeue_history.setdefault(task_id, []).append(
+        history = self._requeue_history.setdefault(task_id, [])
+        overall_attempt = len(history) + 1
+        if is_transient_api_requeue(reason):
+            t_count = self._transient_requeue_counts.get(task_id, 0) + 1
+            self._transient_requeue_counts[task_id] = t_count
+        else:
+            g_count = self._requeue_counts.get(task_id, 0) + 1
+            self._requeue_counts[task_id] = g_count
+        history.append(
             RequeueRecord(
-                attempt=count,
+                attempt=overall_attempt,
                 phase=phase,
                 reason=reason,
                 detail=detail,
@@ -3178,15 +3227,20 @@ class Scheduler:
                 timestamp=time.time(),
             )
         )
-        return count
+        return self._requeue_counts.get(task_id, 0)
+
+    def transient_requeue_count(self, task_id: str) -> int:
+        """Return the number of transient API requeues recorded for *task_id*."""
+        return self._transient_requeue_counts.get(task_id, 0)
 
     def clear_requeue_count(self, task_id: str) -> None:
-        """Clear the requeue counter and history for *task_id*.
+        """Clear the requeue counters and history for *task_id*.
 
         Invoked on a DONE outcome (task recovered) and at the end of
         ``trigger_retry_cap_exhausted`` (human-resolution starts from zero).
         """
         self._requeue_counts.pop(task_id, None)
+        self._transient_requeue_counts.pop(task_id, None)
         self._requeue_history.pop(task_id, None)
 
     async def trigger_retry_cap_exhausted(
@@ -3197,6 +3251,7 @@ class Scheduler:
         cost_usd: float,
         escalation_queue=None,
         reports_dir: Path | None = None,
+        cap: int | None = None,
     ) -> Path | None:
         """Handle cap exhaustion: write report, set blocked, submit L1 escalation.
 
@@ -3210,13 +3265,25 @@ class Scheduler:
                 escalation step is skipped (tests inject a stub or None).
             reports_dir: Where to write the markdown report.  Defaults to
                 ``<project_root>/data/orchestrator/retry_cap_reports/``.
+            cap: The cap that actually fired.  Defaults to
+                ``config.requeue_cap`` (backward compatible).  Pass
+                ``config.transient_requeue_cap`` when the transient ceiling
+                fired so the report/event/escalation show the correct cap.
 
         Returns the report path written, or None when writing fails.
         """
         history = list(self._requeue_history.get(task_id, ()))
-        cap = self.config.requeue_cap
+        cap = cap if cap is not None else self.config.requeue_cap
         n_attempts = len(history)
         last_reason = history[-1].reason if history else 'unknown'
+        # Per-bucket breakdown for human-readable reports/escalations so the
+        # triaging engineer sees which ceiling fired and how many of each kind
+        # accumulated (avoids the misleading "10 iterations (cap=10)" when only
+        # 8 were transient but total history also includes genuine ones).
+        n_transient = sum(
+            1 for r in history if is_transient_api_requeue(r.reason)
+        )
+        n_genuine = n_attempts - n_transient
 
         if reports_dir is None:
             reports_dir = (
@@ -3271,11 +3338,13 @@ class Scheduler:
                 from escalation.models import Escalation
                 summary = (
                     f'Retry cap hit: {n_attempts} REQUEUED iterations '
-                    f'(cap={cap}); last reason: {last_reason[:120]}'
+                    f'({n_genuine} genuine/{n_transient} transient, cap={cap}); '
+                    f'last reason: {last_reason[:120]}'
                 )
                 detail_lines = [
                     f'Task {task_id} exceeded requeue cap after {n_attempts} '
-                    f'REQUEUED outcomes (cap={cap}).',
+                    f'REQUEUED outcomes '
+                    f'({n_genuine} genuine, {n_transient} transient; cap={cap}).',
                     f'Run: {run_id}',
                     f'Cost-to-date: ${cost_usd:.2f}',
                     f'Last reason: {last_reason}',

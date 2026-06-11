@@ -49,6 +49,10 @@ max_failure_signature_repeat: 3
 # returns empty output every time, steward classes it as transient).
 # Process-local; orchestrator restart resets it.
 requeue_cap: 3
+# Higher ceiling for transient external-API (HTTP 529/5xx) REQUEUEDs that are
+# exempt from requeue_cap.  Guards against unbounded retry on a persistent
+# provider outage.  Process-local; orchestrator restart resets it.
+transient_requeue_cap: 10
 
 # Verification timeouts
 verify_command_timeout_secs: 1800
