@@ -3331,6 +3331,41 @@ class SpeculativeItem:
     counts_against_cap: bool = False  # True for non-speculative, non-train successful merges (Mechanism 1)
 
 
+@dataclass
+class InflightEntry:
+    """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
+
+    One entry per item that has been dispatched to a host and has a background
+    asyncio verify task running (or a passthrough/sentinel that needs serial
+    finalization in submission order).
+
+    Fields
+    ------
+    item           : the SpeculativeItem being verified
+    lease          : the HostLease held for this verify (None for passthroughs)
+    verify_task    : the asyncio.Task wrapping _run_inflight_verify (None for passthroughs)
+    merge_wt       : the merge worktree path (may have been warm-swapped by _run_inflight_verify)
+    was_speculative: True if item.speculative was True at dispatch time (for slot release)
+    phase          : current phase string for snapshot() observability
+    passthrough_outcome: set for immediate-outcome entries (conflict/already_merged/skip_verify)
+                         that are enqueued without a real verify task so finalize can deliver
+                         them in submission order
+    verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
+    status         : optional sentinel string ('DROPPED', 'REQUEUED', 'RUNNER_UNAVAILABLE')
+                     returned by _run_inflight_verify to signal special handling by _finalize_inflight
+    """
+
+    item: SpeculativeItem
+    lease: Any | None                       # HostLease | None
+    verify_task: asyncio.Task | None        # type: ignore[type-arg]
+    merge_wt: Path | None
+    was_speculative: bool
+    phase: str
+    passthrough_outcome: MergeOutcome | None = None
+    verify_result: VerifyResult | None = None  # None = pass; VerifyResult = fail/skip
+    status: str | None = None               # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE
+
+
 class _TrainMergeHost(Protocol):
     """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
 
@@ -4725,6 +4760,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # None until first _ensure_host_allocator(config) call — lazily built
         # because config arrives per-MergeRequest, not at __init__ time.
         self._host_allocator: HostAllocator | None = None
+        # γ in-flight deque: ordered list of InflightEntry objects dispatched to hosts.
+        # Finalized strictly in submission order (head-first).  Empty when single-host
+        # (finalize drains before the next dispatch) → byte-identical serial behaviour.
+        self._inflight: collections.deque[InflightEntry] = collections.deque()
+        # γ front-priority re-dispatch deque: re-merged/re-dispatched items (chain-
+        # invalidation + RunnerUnavailable) go here and are drained before _verifier_queue
+        # so they are re-verified in submission order ahead of newer arrivals.
+        self._redispatch: collections.deque[SpeculativeItem] = collections.deque()
+        # γ cross-iteration state promoted from loop-locals: set by finalize after
+        # each head result; read by dispatch to decide chain re-merge.
+        # Single-host: byte-identical (deque is always empty at dispatch point).
+        self._n_failed: bool = False
+        self._remerge_occurred: bool = False
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
         # Heartbeat: wall-clock time of last emission; initialised to 0.0 so the
