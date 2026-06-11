@@ -897,6 +897,19 @@ class OrchestratorConfig(BaseSettings):
             'resolution starts from zero.'
         ),
     )
+    transient_requeue_cap: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            'Higher ceiling for WorkflowOutcome.REQUEUED iterations caused by '
+            'transient external-API failures (HTTP 529/5xx "agent API error" '
+            'summaries).  These are exempt from `requeue_cap` and counted '
+            'separately in `_transient_requeue_counts`.  Guards against '
+            'unbounded retry on a persistent provider outage.  Process-local; '
+            'orchestrator restart resets it.  Cleared alongside the genuine '
+            'counter on DONE or cap-exhaust.'
+        ),
+    )
     snapshot_min_write_interval_secs: float = Field(
         default=0.25,
         ge=0.0,

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
+from pydantic import ValidationError
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
@@ -63,6 +64,19 @@ def _record_one(
         run_id=run_id,
         cost_usd=cost_usd,
     )
+
+
+# --- Config: transient_requeue_cap field -------------------------------------
+
+
+class TestTransientRequeueCapConfig:
+    def test_default_is_10(self, tmp_path: Path):
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        assert cfg.transient_requeue_cap == 10
+
+    def test_zero_raises_validation_error(self, tmp_path: Path):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(project_root=tmp_path, transient_requeue_cap=0)
 
 
 # --- Counter mechanics --------------------------------------------------------
