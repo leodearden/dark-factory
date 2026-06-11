@@ -13,6 +13,7 @@ All tests are RED until step-8 (circuit breaker + routing) is implemented.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -23,6 +24,7 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from shared.config_dir import TaskConfigDir
 
 
 # ---------------------------------------------------------------------------
@@ -335,3 +337,78 @@ class TestExecuteVerifyReviewLoopZeroOutputRouting:
         assert called_category == 'infra_issue', (
             f'Expected category="infra_issue", got: {called_category!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-9 RED test: _capture_zero_output_evidence
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureZeroOutputEvidence:
+    """_capture_zero_output_evidence writes a JSON evidence file under artifacts.root.
+
+    Fails RED because _capture_zero_output_evidence does not exist yet (step-10
+    will implement it).
+    """
+
+    def test_evidence_file_created_under_artifacts_root(self, tmp_path: Path):
+        """Evidence JSON file is written at artifacts.root/zero_output_evidence-iter{N}.json.
+
+        Builds a workflow with a real TaskConfigDir containing sentinel files, calls
+        _capture_zero_output_evidence, and asserts the file exists and contains the
+        expected fields: stderr_tail, proc_tree, config_dir path, config_dir_listing
+        with the sentinel files.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+
+        # Build a real TaskConfigDir with sentinel files
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        sentinel_a = config_dir.path / 'sentinel_a.txt'
+        sentinel_a.write_text('hello')
+        sentinel_b = config_dir.path / 'sentinel_b.json'
+        sentinel_b.write_text('{}')
+        wf._config_dir = config_dir  # type: ignore[attr-defined]
+
+        # AgentResult carrying evidence fields
+        result = AgentResult(
+            success=False,
+            output='Agent produced no output',
+            timed_out=True,
+            turns=0,
+            cost_usd=0.0,
+            duration_ms=1_200_000,
+            stderr='boom-tail error log line\n',
+            proc_tree='snapshot_process_group(99999): 1 process(es) in group:\n  pid=99999 ppid=1 state=D wchan=hrtimer_nanosleep comm=sleep\n',
+        )
+
+        iteration = 3
+        wf._capture_zero_output_evidence(result, iteration)  # type: ignore[attr-defined]
+
+        evidence_path = wf.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
+        assert evidence_path.exists(), (
+            f'Expected evidence file at {evidence_path} but it does not exist'
+        )
+
+        data = json.loads(evidence_path.read_text())
+
+        # Core scalar fields
+        assert data.get('iteration') == iteration, f'iteration mismatch: {data!r}'
+        assert data.get('timed_out') is True, f'timed_out mismatch: {data!r}'
+        assert data.get('turns') == 0, f'turns mismatch: {data!r}'
+
+        # stderr_tail and proc_tree propagated
+        assert 'boom-tail' in data.get('stderr_tail', ''), (
+            f'Expected "boom-tail" in stderr_tail: {data!r}'
+        )
+        assert 'hrtimer_nanosleep' in data.get('proc_tree', ''), (
+            f'Expected proc_tree content in evidence: {data!r}'
+        )
+
+        # Config dir path and listing
+        assert data.get('config_dir'), f'Expected config_dir path in evidence: {data!r}'
+        listing = data.get('config_dir_listing', [])
+        assert listing, f'Expected non-empty config_dir_listing in evidence: {data!r}'
+        listing_str = str(listing)
+        assert 'sentinel_a.txt' in listing_str or any(
+            'sentinel_a' in entry for entry in listing
+        ), f'Expected sentinel_a.txt in config_dir_listing: {listing!r}'
