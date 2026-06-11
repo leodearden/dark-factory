@@ -15,11 +15,13 @@ RED until step-12 replaces ``_k = _MERGE_AHEAD_BOUND`` with
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.config import VerifyRunnerConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
 
 # ---------------------------------------------------------------------------
@@ -149,3 +151,123 @@ class TestHarnessKFromConfig:
         # (c) enforce_merge_liveness_margin called with self.config ONLY (no bound/hosts kwargs;
         #     task-1729 drops raw _k — heartbeat floor makes K irrelevant to the liveness guard)
         mock_liveness.assert_called_once_with(mock_orch_config)
+
+
+# ---------------------------------------------------------------------------
+# TestStartMergeWorkerK2LivenessRepro — γ integration gate (task 1730)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStartMergeWorkerK2LivenessRepro:
+    """K=2 startup repro through the REAL liveness guard (γ integration gate).
+
+    Drives _start_merge_worker end-to-end with the actual
+    enforce_merge_liveness_margin against the 2026-06-10 crash config
+    (one enabled verify_runner → K=2, cold_timeout_secs=7200).
+
+    Patch set: ONLY SpeculativeMergeWorker / asyncio.create_task /
+    _build_service_restart_coordinator.  Both guards run REAL.
+
+    GREEN on current main (α+β merged).
+    RED against pre-β formula: encoded via config-independence assertion —
+    worst_case_secs==600 for cold_timeout 7200 AND 9000, i.e. cold timeout
+    no longer drives the verdict (the β property that fixes the crash).
+    """
+
+    async def test_k2_startup_passes_real_liveness_guard(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """K=2, cold_timeout=7200 passes the real enforce_merge_liveness_margin.
+
+        The exact operator config that crashed pre-β is now safe because the
+        heartbeat-floor formula (worst_case = _HEARTBEAT_POLL_S ×
+        TOUCH_MISS_TOLERANCE = 600 s) decouples from cold timeout and K.
+        """
+        from orchestrator.merge_queue import check_merge_liveness_margin
+
+        # Exact 2026-06-10 crash config: one enabled verify_runner → K=2,
+        # cold_timeout=7200.  Pre-β the formula scaled with cold_timeout×K and
+        # raised MergeLivenessConfigError; post-β the floor is constant at 600 s.
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_runners=[VerifyRunnerConfig(
+                name='laptop',
+                ssh_host='leo-laptop',
+                git_remote='leo-laptop',
+            )],
+            merge_verify_cold_command_timeout_secs=7200,
+            git=GitConfig(
+                persistent_merge_worktree=True,
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+            ),
+        )
+
+        h = _build_harness(config)
+
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+             patch.object(h, '_build_service_restart_coordinator',
+                          return_value=MagicMock()), \
+             patch('asyncio.create_task', return_value=MagicMock()), \
+             caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+
+            # Use plain MagicMock for run (not AsyncMock): asyncio.create_task is
+            # mocked, so run() never needs to produce a real awaitable coroutine.
+            # Using AsyncMock would create an unawaited coroutine when create_task
+            # is mocked away, triggering the project's "error:coroutine.*was never
+            # awaited" filterwarnings rule.
+            mock_smw = MagicMock()
+            mock_smw_cls.return_value = mock_smw
+
+            # (1) No exception raised — the crash-loop repro now passes.
+            # enforce_merge_liveness_margin raises MergeLivenessConfigError when
+            # worst_case_secs >= threshold_secs; clean return proves the real guard
+            # accepted this config.  (A raised error would propagate and fail the test.)
+            await h._start_merge_worker()
+
+        # (2) SpeculativeMergeWorker called once with speculation_depth=2 (K = 1 + 1)
+        mock_smw_cls.assert_called_once()
+        smw_kwargs = mock_smw_cls.call_args[1]
+        assert smw_kwargs['speculation_depth'] == 2, (
+            f'Expected speculation_depth=2 (K=1+1 verify_runner), '
+            f'got {smw_kwargs.get("speculation_depth")!r}'
+        )
+
+        # (3) 'Speculative merge worker started' in caplog
+        assert 'Speculative merge worker started' in caplog.text, (
+            f'Expected startup log in caplog; got: {caplog.text!r}'
+        )
+
+        # (4) Serial-lane guard at K=2/num_hosts=2 → per_host=ceil(2/2)=1 → no raise.
+        # Proven implicitly by clean completion above with persistent_merge_worktree=True
+        # (the guard early-returns only when the knob is off; here it runs and passes).
+        # This regression-holds the 1692 seam: num_hosts=K keeps per-host bound = 1.
+
+        # β property — config-independence of worst_case_secs.
+        # Pre-β formula: worst_case = cold_timeout × bound / num_hosts (K-coupled) →
+        #   7200 × 2 / ... >> threshold → MergeLivenessConfigError → crash loop.
+        # Post-β formula: worst_case = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE = 600 s
+        #   → invariant across cold_timeout and K.
+        cfg_9000 = OrchestratorConfig(
+            project_root=tmp_path,
+            merge_verify_cold_command_timeout_secs=9000,
+        )
+        result_7200 = check_merge_liveness_margin(config)
+        result_9000 = check_merge_liveness_margin(cfg_9000)
+
+        assert result_7200.worst_case_secs == 600.0, (
+            f'Expected heartbeat floor=600 s for cold_timeout=7200; '
+            f'got {result_7200.worst_case_secs}'
+        )
+        assert result_9000.worst_case_secs == 600.0, (
+            'cold timeout must not feed worst_case_secs (β property that fixes the crash); '
+            f'cfg_7200 floor={result_7200.worst_case_secs}, '
+            f'cfg_9000 floor={result_9000.worst_case_secs}'
+        )
+        assert result_7200.safe is True
+        assert result_9000.safe is True
