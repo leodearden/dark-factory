@@ -16,9 +16,14 @@ StartLimitBurst=10
 # NotifyAccess=all — ExecStart is `uv run ...` which spawns python as a
 # child; the child is the notifier, not the main PID, so NotifyAccess=main
 # would reject us.
+# WatchdogSec=120: the WATCHDOG=1 ping is sent by a dedicated OS thread
+# (_watchdog_thread_loop, task 1731) every 10s, independent of asyncio loop
+# scheduling.  120s is belt-and-suspenders headroom — the primary guard is
+# the dedicated thread, not this timeout.  (Was 30s; old on-loop coroutine
+# was silenced by a busy/blocked loop and caused ~6-8 SIGABRTs/day.)
 Type=notify
 NotifyAccess=all
-WatchdogSec=30
+WatchdogSec=120
 WorkingDirectory=/home/leo/src/dark-factory
 ExecStart=/home/leo/.local/bin/uv run --project fused-memory \
   python -m fused_memory.server.main \
