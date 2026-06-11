@@ -16,6 +16,7 @@ Tests are grouped per plan step:
   step-19 RED     — CHAIN-INVALIDATION UNDER OVERLAP
   step-21 RED     — operator-halt aborts all in-flight + RUNNER_UNAVAILABLE quarantine
   step-23 RED     — stop() drains inflight + snapshot() surfaces inflight entries
+  step-27 RED     — warm_results threading into shadow compare
 
 NOTE: Individual test classes are added in their respective RED steps.
 This file starts with shared scaffolding only (pre-1).
@@ -2713,4 +2714,175 @@ class TestSnapshotInflight:
         assert snap['verify_in_progress']['task_id'] == 'snap-vip-a', (
             f"verify_in_progress['task_id'] should be 'snap-vip-a' (head), "
             f"got {snap['verify_in_progress'].get('task_id')!r}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-27 RED: warm_results threading into shadow compare
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeInflightWarmResultsThreading:
+    """_finalize_inflight PASS branch must thread vr.warm_results into
+    _maybe_schedule_shadow_compare instead of passing a hardcoded empty dict.
+
+    RED until step-28 GREEN replaces:
+        _warm_results: dict[str, bool] = {}
+    with:
+        _warm_results = vr.warm_results if vr is not None else {}
+
+    (merge_queue.py ~:7218-7219 in the PASS branch of _finalize_inflight)
+    """
+
+    async def _make_merged_item(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+        content: str,
+    ):
+        from orchestrator.merge_queue import SpeculativeItem
+
+        wt = await _make_branch_with_file(git_ops, branch, filename, content)
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id=branch,
+            branch=branch,
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            lane='normal',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success and merge_result.merge_commit
+        base_sha = await git_ops.get_main_sha()
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+        return req, item
+
+    def _make_mock_allocator(self):
+        """Return a MagicMock with async release/cancel_and_release."""
+        alloc = MagicMock()
+        alloc.release = AsyncMock()
+        alloc.cancel_and_release = AsyncMock()
+        return alloc
+
+    async def test_warm_results_threaded_into_shadow_compare(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """PASS entry with a completed verify_task carrying warm_results must
+        pass those warm_results to _maybe_schedule_shadow_compare at arg[4].
+
+        RED: the PASS branch hardcodes _warm_results = {} so the captured arg
+        at index 4 is always {} regardless of vr.warm_results.
+        """
+        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'wr-thread-a', 'wra.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        # Build a completed future resolving to a passing InflightVerifyResult
+        # with a non-empty warm_results map — the data the shadow compare needs.
+        loop = asyncio.get_event_loop()
+        vr_future: asyncio.Future[InflightVerifyResult] = loop.create_future()
+        warm_map = {'crate::test_x': True, 'crate::test_y': False}
+        vr_future.set_result(
+            InflightVerifyResult(
+                outcome=None,
+                merge_wt=item.merge_wt,
+                warm_results=warm_map,
+            )
+        )
+
+        entry = InflightEntry(
+            item=item,
+            lease=lease,
+            verify_task=vr_future,
+            merge_wt=item.merge_wt,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+        shadow_mock = AsyncMock()
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch('orchestrator.merge_queue._maybe_schedule_shadow_compare', shadow_mock),
+        ):
+            advanced = await worker._finalize_inflight(entry)
+
+        assert advanced is True, "Expected PASS to return True (main advanced)."
+        assert shadow_mock.called, "_maybe_schedule_shadow_compare was not awaited."
+        actual_warm = shadow_mock.call_args.args[4]
+        assert actual_warm == warm_map, (
+            f"Expected warm_results {warm_map!r} threaded into shadow compare "
+            f"(vr.warm_results pass-through), got {actual_warm!r}. "
+            f"This is RED because _finalize_inflight hardcodes _warm_results = {{}}."
+        )
+
+    async def test_warm_results_empty_for_compat_shim_path(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Compat-shim path: verify_task=None → _maybe_schedule_shadow_compare
+        receives {} (the 'vr is None → else {}' branch).
+
+        This test pins byte-identical compat-shim behaviour: _verify_and_advance
+        builds InflightEntries with verify_task=None from a LOCAL lease where
+        warm_results came from the local _run_inflight_verify path already stored
+        in vr; without a verify_task there is no vr, so {} is correct.
+        """
+        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'wr-compat-b', 'wrb.py', 'y=2\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        # verify_task=None: pre-established PASS (compat shim / old-style pass).
+        entry = InflightEntry(
+            item=item,
+            lease=lease,
+            verify_task=None,
+            merge_wt=item.merge_wt,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+        shadow_mock = AsyncMock()
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch('orchestrator.merge_queue._maybe_schedule_shadow_compare', shadow_mock),
+        ):
+            advanced = await worker._finalize_inflight(entry)
+
+        assert advanced is True, "Expected PASS to return True (main advanced)."
+        assert shadow_mock.called, "_maybe_schedule_shadow_compare was not awaited."
+        actual_warm = shadow_mock.call_args.args[4]
+        assert actual_warm == {}, (
+            f"Expected empty warm_results for verify_task=None (compat path), "
+            f"got {actual_warm!r}."
         )
