@@ -605,6 +605,7 @@ class TestHarnessDualCeiling:
         assert r2 is False
         assert trigger.await_count == 1
         call = trigger.await_args
+        assert call is not None
         assert call.kwargs.get('cap') == 2
 
     @pytest.mark.asyncio
@@ -627,4 +628,5 @@ class TestHarnessDualCeiling:
         assert r3 is False
         assert trigger.await_count == 1
         call = trigger.await_args
+        assert call is not None
         assert call.kwargs.get('cap') == 3
