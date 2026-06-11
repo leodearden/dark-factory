@@ -2800,23 +2800,29 @@ class TestFinalizeInflightWarmResultsThreading:
 
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
 
-        # Build a completed future resolving to a passing InflightVerifyResult
-        # with a non-empty warm_results map — the data the shadow compare needs.
-        loop = asyncio.get_event_loop()
-        vr_future: asyncio.Future[InflightVerifyResult] = loop.create_future()
+        # Build a real asyncio.Task (not just a Future) wrapping a coroutine that
+        # immediately returns a passing InflightVerifyResult with a non-empty
+        # warm_results map — the data the shadow compare needs.
         warm_map = {'crate::test_x': True, 'crate::test_y': False}
-        vr_future.set_result(
-            InflightVerifyResult(
+        merge_wt_cap = item.merge_wt  # capture for closure
+
+        async def _immediate_vr() -> InflightVerifyResult:
+            return InflightVerifyResult(
                 outcome=None,
-                merge_wt=item.merge_wt,
+                merge_wt=merge_wt_cap,
                 warm_results=warm_map,
             )
-        )
+
+        vr_task: asyncio.Task[InflightVerifyResult] = asyncio.ensure_future(_immediate_vr())
+        # Drain the event loop so the task has already completed before we pass
+        # it to _finalize_inflight (mirrors how real dispatch works: the task
+        # finishes before finalize awaits the deque head).
+        await asyncio.sleep(0)
 
         entry = InflightEntry(
             item=item,
             lease=lease,
-            verify_task=vr_future,
+            verify_task=vr_task,
             merge_wt=item.merge_wt,
             was_speculative=False,
             phase='verifying',

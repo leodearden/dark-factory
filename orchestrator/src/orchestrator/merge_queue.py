@@ -7129,9 +7129,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Returns True iff main was advanced successfully, False otherwise.
 
-        warm_results are passed as {} in this implementation (shadow compare
-        scheduler short-circuits on empty dict); threading warm_results through
-        InflightEntry.warm_results is deferred.
+        warm_results are taken from vr.warm_results (the per-test map returned
+        by _run_inflight_verify) and threaded into _maybe_schedule_shadow_compare,
+        restoring the same-candidate warm-vs-cold shadow compare (PRD §10 invariant
+        6b).  When verify_task is None (compat shim / pre-established pass) there is
+        no vr, so warm_results defaults to {}, matching the pre-refactor behaviour.
         """
         item = entry.item
         req = item.request
@@ -7215,8 +7217,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             assert merge_commit is not None
             merge_commit = merge_commit.strip()
 
-            # warm_results from the warm-verify path — empty here (see docstring).
-            _warm_results: dict[str, bool] = {}
+            # Thread warm_results from the warm-verify path through to
+            # _maybe_schedule_shadow_compare so the same-candidate shadow compare
+            # fires.  When vr is None (verify_task=None compat path) there is no
+            # warm run, so default to {} — matching pre-refactor behaviour.
+            _warm_results: dict[str, bool] = vr.warm_results if vr is not None else {}
 
             # Short-circuit: if abandonment landed while verify completed,
             # skip the expensive CAS loop (mirrors _verify_and_advance :6934).
