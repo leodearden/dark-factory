@@ -1588,6 +1588,76 @@ class TestMergeWorker:
             f'merge_sha is not a hex string: {result.merge_sha!r}'
         )
 
+    # ── Incident 4502 guard (serial path): pre_rebased + main unchanged must ─
+    # ── still run the merge gate (task #1724) ────────────────────────────────
+
+    async def test_pre_rebased_main_unchanged_runs_merge_gate_serial(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Incident 4502: MergeWorker._do_merge pre_rebased=True with main unchanged
+        must run the merge-gate verify.  A red merge-gate verify must block the
+        landing; the file must NOT land on main.
+
+        Serial path equivalent of
+        TestSpeculativeMergeWorker.test_pre_rebased_main_unchanged_runs_merge_gate_speculative.
+
+        RED on current code: _do_merge computes skip_verify=(req.pre_rebased AND
+        merge_result.pre_merge_sha==main_sha) → True when main is unchanged →
+        _run_post_merge_verify bypassed → outcome='done' → file lands on main →
+        all three assertions fail.
+        GREEN after step-4: skip_verify computation removed → verify always runs
+        → passed=False → outcome='blocked' → file NOT on main.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'mg-serial', 'file_mg_serial.py', 'mg = 1\n',
+        )
+
+        verify_call_count = 0
+
+        async def red_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
+            nonlocal verify_call_count
+            verify_call_count += 1
+            if 'file_mg_serial.py' in {f.name for f in merge_wt.iterdir() if f.is_file()}:
+                return MagicMock(passed=False, timed_out=False, summary='merge-gate RED')
+            return MagicMock(passed=True, summary='')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=red_verify):
+            req = _make_request('mg-serial', 'mg-serial', wt, config, pre_rebased=True)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+        # (a) Merge-gate verify must have been called >= 1 time.
+        assert verify_call_count >= 1, (
+            f'MergeWorker: run_scoped_verification must be called when '
+            f'pre_rebased=True and main is unchanged (merge gate must NOT be '
+            f'skipped); got {verify_call_count} call(s).  Reify-4502 serial escape.'
+        )
+
+        # (b) Outcome must NOT be done — red verify must block the landing.
+        assert outcome.status != 'done', (
+            f'MergeWorker: pre_rebased=True request with a red merge-gate verify '
+            f'must NOT land as "done"; got status={outcome.status!r}.  '
+            f'Reify-4502 RED-MAIN escape via the serial path.'
+        )
+
+        # (c) The file must NOT be on main — red tree must never advance.
+        rc, _, _ = await _run(
+            ['git', 'show', 'main:file_mg_serial.py'], cwd=git_ops.project_root,
+        )
+        assert rc != 0, (
+            'file_mg_serial.py must NOT be on main when the merge-gate verify is '
+            'red — a red tree advanced main via MergeWorker (reify-4502 serial escape).'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers for speculative tests
