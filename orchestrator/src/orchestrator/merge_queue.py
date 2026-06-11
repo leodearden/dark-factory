@@ -52,6 +52,7 @@ from orchestrator.verify_runner import (
     HostAllocator,
     LocalRunner,
     RemoteRunner,
+    RunnerUnavailable,
     VerifyRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
@@ -6883,6 +6884,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merge_wt=None,
                         status='REQUEUED',
                     )
+        except RunnerUnavailable:
+            # Remote transport failure: do NOT clean merge_wt — the item will
+            # be re-dispatched on a free host (local fallback) with its worktree
+            # intact.  _finalize_inflight calls quarantine_and_release so the
+            # dead remote is quarantined before the re-dispatch.
+            logger.warning(
+                'Task %s: remote runner unavailable (merge=%s) — '
+                'will re-dispatch on another host',
+                req.task_id, merge_commit[:8],
+            )
+            return InflightVerifyResult(
+                outcome=None,
+                merge_wt=merge_wt,
+                status='RUNNER_UNAVAILABLE',
+            )
         except Exception as exc:
             logger.info(
                 f'Task {req.task_id}: verify end '
