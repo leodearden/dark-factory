@@ -882,7 +882,7 @@ class TestB6EnospcPrune:
 class TestB7SingleHostNewPath:
     """B7: single-host config routes through _dispatch_item/_finalize_inflight, serial semantics."""
 
-    async def test_b7_single_host_no_runners_routes_through_new_path_byte_identical(
+    async def test_b7_single_host_no_runners_routes_through_new_path_serial_order(
         self,
         git_ops: Any,
         git_repo: Path,
@@ -963,12 +963,12 @@ class TestB7SingleHostNewPath:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        # (1) All items routed through new _dispatch_item / _finalize_inflight
-        assert dispatch_count[0] >= 3, (
-            f'Expected ≥3 _dispatch_item calls (one per item), got {dispatch_count[0]}'
+        # (1) All items routed through new _dispatch_item / _finalize_inflight: exactly once each
+        assert dispatch_count[0] == 3, (
+            f'Expected exactly 3 _dispatch_item calls (one per item), got {dispatch_count[0]}'
         )
-        assert finalize_count[0] >= 3, (
-            f'Expected ≥3 _finalize_inflight calls (one per item), got {finalize_count[0]}'
+        assert finalize_count[0] == 3, (
+            f'Expected exactly 3 _finalize_inflight calls (one per item), got {finalize_count[0]}'
         )
 
         # (2) Peak in-flight == 1 (single-host: at most one verify simultaneously)
@@ -976,7 +976,7 @@ class TestB7SingleHostNewPath:
             f'Expected peak _inflight ≤1 for single-host, got {tracked.max_len}'
         )
 
-        # (3) All items resolve done with byte-identical serial semantics
+        # (3) All items resolve done
         assert outcome_a.status == 'done', f'A expected done, got {outcome_a}'
         assert outcome_b.status == 'done', f'B expected done, got {outcome_b}'
         assert outcome_c.status == 'done', f'C expected done, got {outcome_c}'
@@ -1033,8 +1033,13 @@ class TestB8HeartbeatAdvancesWorktrees:
             queued_2: _mtime(queued_2),
         }
 
-        # Advance the clock minimally so mtime changes are observable
-        await asyncio.sleep(0.01)
+        # Pin each directory to a known past mtime so the assertion is deterministic
+        # regardless of filesystem mtime granularity (avoids wall-clock sleep races on
+        # coarse-mtime CI mounts where os.utime(p, None) within a short sleep may land
+        # on the same granularity bucket as the initial stat).
+        past_time = initial_mtimes[in_flight_a] - 2.0
+        for p in initial_mtimes:
+            os.utime(p, (past_time, past_time))
 
         # Drive one heartbeat tick directly
         touched = worker._touch_owned_merge_worktrees()
@@ -1042,10 +1047,10 @@ class TestB8HeartbeatAdvancesWorktrees:
         # (1) All 4 registered worktrees were touched
         assert touched == 4, f'Expected 4 worktrees touched, got {touched}'
 
-        # (2) Every mtime advanced
-        for p, old_mtime in initial_mtimes.items():
+        # (2) Every mtime advanced past the pinned past_time
+        for p in initial_mtimes:
             new_mtime = _mtime(p)
-            assert new_mtime > old_mtime, (
+            assert new_mtime > past_time, (
                 f'Expected mtime to advance for {p.name}: '
-                f'old={old_mtime:.6f} new={new_mtime:.6f}'
+                f'pinned={past_time:.6f} new={new_mtime:.6f}'
             )
