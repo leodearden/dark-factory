@@ -813,7 +813,7 @@ class TestScenario4:
 
 @pytest.mark.asyncio
 class TestBookkeeping:
-    """step-9 (RED) / step-10 (GREEN): depth-1/K cap accounting after a coalesced train.
+    """step-10 (GREEN): depth-1/K cap accounting after a coalesced train.
 
     A coalesced train is dispatched with speculative=False (bypassing the
     speculative look-ahead).  The SpeculativeItem put on the verifier queue
@@ -830,12 +830,10 @@ class TestBookkeeping:
       (C) the train's SpeculativeItem on the verifier queue has speculative=False
           and counts_against_cap=False (bypassed both cap mechanisms)
 
-    RED (step-9): cap assertions are checked immediately after gate_release,
-    without adequate event-loop yields to let the merger drain and return to
-    the idle state.  The assertions use inverted predicates (locked instead of
-    not locked) to guarantee a deterministic failure.
-    step-10 corrects the predicates to `not locked()` and adds the event-loop
-    yields plus the SpeculativeItem interception for assertion (C).
+    GREEN (step-10): predicates corrected to not locked(); event-loop yields
+    added before the assertions; SpeculativeItem intercepted via wrapping
+    worker._verifier_queue.put() to capture the train's item and assert its
+    speculative=False / counts_against_cap=False.
     """
 
     async def test_speculative_caps_return_to_k_after_train(
@@ -882,6 +880,16 @@ class TestBookkeeping:
             git_ops, queue, event_store=es, train_callback_factory=factory,
         )
 
+        # (C) Intercept verifier queue puts to capture the train's SpeculativeItem.
+        # Wrap the actual put() so the item is captured for assertion while still
+        # going through to the real verifier.
+        captured_items: list = []
+        _orig_put = worker._verifier_queue.put
+        async def _capturing_put(item, **_kw):
+            captured_items.append(item)
+            return await _orig_put(item)
+        worker._verifier_queue.put = _capturing_put  # type: ignore[method-assign]
+
         req1 = _make_req('ig_bk1', 'ig_bk1', wt1, coalesce_config)
         req2 = _make_req('ig_bk2', 'ig_bk2', wt2, coalesce_config)
         await queue.put(req1)
@@ -901,15 +909,49 @@ class TestBookkeeping:
             gate_release.set()
             await asyncio.wait_for(all_done.wait(), timeout=30)
 
-        # RED (step-9): inverted cap assertions — assert locked() instead of
-        # not locked().  These fail immediately because the caps ARE free after
-        # the train lands (no permit was leaked or left unreleased).
-        # step-10 corrects both to `not locked()` and adds event-loop yields.
-        assert worker._speculation_slot.locked(), (
-            'RED placeholder: expects slot locked — step-10 flips to not locked()'
+        # Yield several event-loop iterations so the verifier's finally block
+        # runs, the merger drains to idle, and any look-ahead slot is released.
+        # Mirror the pattern from test_merge_queue.py:2194.
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # (A) _speculation_slot must NOT be locked — no permit leaked.
+        # For depth=1 (K=1), not locked() ↔ value == 1.
+        assert not worker._speculation_slot.locked(), (
+            '_speculation_slot must be unlocked after the train lands; '
+            'a coalesced train bypasses the speculative look-ahead so no '
+            'permit should be left acquired'
         )
-        assert worker._merge_ahead_cap.locked(), (
-            'RED placeholder: expects cap locked — step-10 flips to not locked()'
+
+        # (B) _merge_ahead_cap must NOT be locked — no cap was acquired/leaked.
+        # The train's SpeculativeItem has counts_against_cap=False (the
+        # GroupMergeRequest continue fires before the acquire site), so the
+        # verifier never releases it either.  Both sides are clean.
+        assert not worker._merge_ahead_cap.locked(), (
+            '_merge_ahead_cap must be unlocked after the train lands; '
+            'trains are structurally exempt from Mechanism 1 (counts_against_cap=False)'
+        )
+
+        # (C) The train's SpeculativeItem: speculative=False, counts_against_cap=False.
+        # A GroupMergeRequest is dispatched with speculative=False (bypasses look-ahead)
+        # and counts_against_cap defaults to False (never acquired _merge_ahead_cap).
+        from orchestrator.merge_queue import GroupMergeRequest
+        train_items = [
+            item for item in captured_items
+            if isinstance(getattr(item, 'request', None), GroupMergeRequest)
+        ]
+        assert len(train_items) == 1, (
+            f'Expected exactly 1 GroupMergeRequest SpeculativeItem on the verifier queue; '
+            f'got {len(train_items)} (total captured: {len(captured_items)})'
+        )
+        train_item = train_items[0]
+        assert not train_item.speculative, (
+            f'Train SpeculativeItem.speculative must be False (bypasses look-ahead); '
+            f'got {train_item.speculative!r}'
+        )
+        assert not train_item.counts_against_cap, (
+            f'Train SpeculativeItem.counts_against_cap must be False (exempt from Mechanism 1); '
+            f'got {train_item.counts_against_cap!r}'
         )
 
         await worker.stop()
