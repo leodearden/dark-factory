@@ -6937,6 +6937,250 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
         return InflightVerifyResult(outcome=out, merge_wt=merge_wt)
 
+    async def _finalize_inflight(self, entry: InflightEntry) -> bool:
+        """Run the CAS advance_main + post-advance work for one in-flight item.
+
+        This is the FINALIZE HALF of _verify_and_advance (the VERIFY HALF is
+        _run_inflight_verify).  It assumes the verify has already passed
+        (entry.merge_wt is the verified worktree; entry.item carries the merge
+        commit).  Non-pass paths (fail/PASSTHROUGH/sentinel) are handled in
+        step-14 (_finalize_inflight extension).
+
+        After the head resolves (advanced or not):
+        - await self._host_allocator.release(entry.lease)  [skip if None]
+        - release _speculation_slot iff entry.was_speculative
+        - set self._n_failed = not advanced
+
+        Returns True iff main was advanced successfully, False otherwise.
+
+        warm_results are passed as {} in this step-12 implementation
+        (shadow compare scheduler short-circuits on empty dict); they will be
+        threaded through InflightEntry.warm_results in a follow-up step.
+        """
+        item = entry.item
+        req = item.request
+        merge_wt = entry.merge_wt
+        assert merge_wt is not None
+        assert item.merge_result is not None
+        merge_commit = item.merge_result.merge_commit
+        assert merge_commit is not None
+        merge_commit = merge_commit.strip()
+
+        # warm_results from the warm-verify path — empty here (see docstring).
+        _warm_results: dict[str, bool] = {}
+
+        advanced = False
+        try:
+            # Short-circuit: if abandonment landed while verify completed,
+            # skip the expensive CAS loop (mirrors _verify_and_advance :6934).
+            if self._request_abandoned(req):
+                await self._cleanup_owned_merge_worktree(merge_wt)
+                return False
+
+            # ── Step 5: CAS advance_main ──────────────────────────────────
+            self._verify_phase = 'finalizing'
+            current_sha = merge_commit
+            while True:
+                result = await self._git_ops.advance_main(
+                    current_sha, merge_wt,
+                    branch=req.branch,
+                    max_attempts=req.config.max_advance_attempts,
+                    expected_main=item.base_sha,
+                    reverify_on_rebase=True,
+                )
+
+                if result == 'advanced':
+                    self._gate_retries.pop(req.task_id, None)
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    outcome = await _finalize_advanced_merge(
+                        self._git_ops, req, self._event_store,
+                        merge_commit_fallback=merge_commit,
+                        base_sha=item.base_sha,
+                        started_monotonic=item.started_monotonic,
+                        cas_retries=self._cas_retries,
+                        timeouts=self._post_merge_verify_timeouts,
+                        enospc_retries=self._post_merge_verify_enospc_retries,
+                        log_label=' (speculative)',
+                        chain_ctx=_GenerationChainContext(
+                            queue=self._queue,
+                            counts=self._generation_chain_counts,
+                            max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+                        ),
+                        merged_branch_tip=item.merged_branch_tip,
+                    )
+                    self._resolve_or_drop_abandoned(req, outcome)
+                    if outcome.status == 'done':
+                        if (
+                            outcome.merge_sha is not None
+                            and self._on_merge_landed is not None
+                        ):
+                            try:
+                                await self._on_merge_landed(
+                                    req.task_id, item.base_sha, outcome.merge_sha
+                                )
+                            except Exception:
+                                logger.warning(
+                                    'on_merge_landed hook raised for task %s; ignoring (fail-open)',
+                                    req.task_id,
+                                    exc_info=True,
+                                )
+                        await _maybe_schedule_shadow_compare(
+                            self, self._git_ops, req, merge_commit,
+                            _warm_results, self._escalation_queue, self._event_store,
+                        )
+                        await _maybe_run_drift_check(
+                            self, self._git_ops, req, merge_commit,
+                        )
+                    advanced = True
+                    return True
+
+                if result == 'rebased_pending_reverify':
+                    rebased_sha = getattr(self._git_ops, '_last_advanced_sha', None)
+                    rebased_from = getattr(self._git_ops, '_rebased_from', None)
+                    rebased_onto = getattr(self._git_ops, '_rebased_onto', None)
+                    if rebased_sha is None or rebased_from is None or rebased_onto is None:
+                        raise AssertionError(
+                            f'advance_main returned rebased_pending_reverify but '
+                            f'side-channel attributes are not all set (task '
+                            f'{req.task_id}): _last_advanced_sha={rebased_sha!r}, '
+                            f'_rebased_from={rebased_from!r}, '
+                            f'_rebased_onto={rebased_onto!r}'
+                        )
+
+                    self._verify_phase = 'gate_reverify'
+                    gate = await _reverify_rebased_tree(
+                        self._git_ops, req, merge_wt,
+                        rebased_from=rebased_from,
+                        rebased_onto=rebased_onto,
+                        timeouts=self._post_merge_verify_timeouts,
+                        enospc_retries=self._post_merge_verify_enospc_retries,
+                        max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+                        max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                        merge_sha=rebased_sha,
+                        keep_worktrees=set(self._owned_merge_worktrees),
+                    )
+                    if gate is not None:
+                        if not req.result.done():
+                            req.result.set_result(gate)
+                        return False
+
+                    current_sha = rebased_sha
+                    gate_total = self._gate_retries.get(req.task_id, 0) + 1
+                    self._gate_retries[req.task_id] = gate_total
+                    if gate_total > self.MAX_CAS_RETRIES:
+                        self._gate_retries.pop(req.task_id, None)
+                        logger.warning(
+                            'Task %s: gate retry limit exhausted after gate '
+                            'cleared (%d attempts)',
+                            req.task_id, self.MAX_CAS_RETRIES,
+                        )
+                        _emit_merge_attempt(
+                            self._event_store, req.task_id, 'cas_exhausted',
+                            attempt=gate_total,
+                            duration_ms=_elapsed_ms(item.started_monotonic),
+                        )
+                        await self._cleanup_owned_merge_worktree(merge_wt)
+                        if not req.result.done():
+                            req.result.set_result(MergeOutcome(
+                                'blocked',
+                                reason=(
+                                    f'Gate retry limit exhausted after '
+                                    f'{self.MAX_CAS_RETRIES} attempts for task '
+                                    f'{req.task_id}'
+                                ),
+                            ))
+                        return False
+
+                    item = SpeculativeItem(
+                        request=item.request,
+                        merge_result=item.merge_result,
+                        merge_wt=item.merge_wt,
+                        base_sha=rebased_onto,
+                        speculative=item.speculative,
+                        skip_verify=item.skip_verify,
+                        started_monotonic=item.started_monotonic,
+                    )
+                    logger.info(
+                        'Task %s: gate cleared (disjoint or green re-verify); '
+                        'advancing with rebased SHA %s (gate attempt %d/%d)',
+                        req.task_id, rebased_sha[:8],
+                        gate_total, self.MAX_CAS_RETRIES,
+                    )
+                    _emit_merge_attempt(
+                        self._event_store, req.task_id, 'gate_retry',
+                        attempt=gate_total,
+                        duration_ms=_elapsed_ms(item.started_monotonic),
+                    )
+                    self._verify_phase = 'finalizing'
+                    continue
+
+                if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    if result in ('unmerged_state', 'pop_conflict_no_advance'):
+                        self._cas_retries.pop(req.task_id, None)
+                        self._gate_retries.pop(req.task_id, None)
+                    return False
+                if result != 'cas_failed':
+                    self._gate_retries.pop(req.task_id, None)
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    outcome = await _map_advance_failure(
+                        self._git_ops, result,
+                        task_id=req.task_id,
+                        merge_commit_fallback=merge_commit,
+                        halt=self.halt_for_wip,
+                        unhalt=self.unhalt_wip,
+                        cas_retries=self._cas_retries,
+                    )
+                    if not req.result.done():
+                        req.result.set_result(outcome)
+                    return False
+
+                # result == 'cas_failed' — transient, retry with limit
+                total = self._cas_retries.get(req.task_id, 0) + 1
+                self._cas_retries[req.task_id] = total
+                if total > self.MAX_CAS_RETRIES:
+                    self._cas_retries.pop(req.task_id, None)
+                    self._gate_retries.pop(req.task_id, None)
+                    logger.warning(
+                        f'Task {req.task_id}: CAS retry limit exhausted '
+                        f'({self.MAX_CAS_RETRIES} attempts)'
+                    )
+                    _emit_merge_attempt(self._event_store, req.task_id, 'cas_exhausted', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    if not req.result.done():
+                        req.result.set_result(MergeOutcome(
+                            'blocked',
+                            reason=(
+                                f'CAS retry limit exhausted after '
+                                f'{self.MAX_CAS_RETRIES} attempts for task {req.task_id}'
+                            ),
+                        ))
+                    return False
+
+                # Update base_sha to current main for retry
+                item = SpeculativeItem(
+                    request=item.request,
+                    merge_result=item.merge_result,
+                    merge_wt=item.merge_wt,
+                    base_sha=await self._git_ops.get_main_sha(),
+                    speculative=item.speculative,
+                    skip_verify=item.skip_verify,
+                    started_monotonic=item.started_monotonic,
+                )
+                logger.info(
+                    f'Task {req.task_id}: CAS failed (attempt {total}/'
+                    f'{self.MAX_CAS_RETRIES}), retrying'
+                )
+                _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+        finally:
+            # Always: release the host lease, release the speculation slot iff
+            # speculative, and update the chain-invalidation flag.
+            if entry.lease is not None and self._host_allocator is not None:
+                await self._host_allocator.release(entry.lease)
+            if entry.was_speculative:
+                self._speculation_slot.release()
+            self._n_failed = not advanced
+
     async def _verify_and_advance(self, item: SpeculativeItem) -> bool:
         """Run verification + CAS advance for one item.
 
