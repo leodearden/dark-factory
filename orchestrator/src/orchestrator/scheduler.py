@@ -3276,6 +3276,14 @@ class Scheduler:
         cap = cap if cap is not None else self.config.requeue_cap
         n_attempts = len(history)
         last_reason = history[-1].reason if history else 'unknown'
+        # Per-bucket breakdown for human-readable reports/escalations so the
+        # triaging engineer sees which ceiling fired and how many of each kind
+        # accumulated (avoids the misleading "10 iterations (cap=10)" when only
+        # 8 were transient but total history also includes genuine ones).
+        n_transient = sum(
+            1 for r in history if is_transient_api_requeue(r.reason)
+        )
+        n_genuine = n_attempts - n_transient
 
         if reports_dir is None:
             reports_dir = (
@@ -3330,11 +3338,13 @@ class Scheduler:
                 from escalation.models import Escalation
                 summary = (
                     f'Retry cap hit: {n_attempts} REQUEUED iterations '
-                    f'(cap={cap}); last reason: {last_reason[:120]}'
+                    f'({n_genuine} genuine/{n_transient} transient, cap={cap}); '
+                    f'last reason: {last_reason[:120]}'
                 )
                 detail_lines = [
                     f'Task {task_id} exceeded requeue cap after {n_attempts} '
-                    f'REQUEUED outcomes (cap={cap}).',
+                    f'REQUEUED outcomes '
+                    f'({n_genuine} genuine, {n_transient} transient; cap={cap}).',
                     f'Run: {run_id}',
                     f'Cost-to-date: ${cost_usd:.2f}',
                     f'Last reason: {last_reason}',

@@ -630,3 +630,34 @@ class TestHarnessDualCeiling:
         call = trigger.await_args
         assert call is not None
         assert call.kwargs.get('cap') == 3
+
+    @pytest.mark.asyncio
+    async def test_both_caps_simultaneous_genuine_takes_precedence(self, tmp_path):
+        """When both ceilings fire on the same call, genuine cap takes precedence.
+
+        Scenario: transient count is already at transient_requeue_cap (2) AND
+        genuine count is at requeue_cap-1 (2).  The next genuine requeue pushes
+        genuine_exhausted=True and transient_exhausted=True simultaneously.
+        The harness must choose hit_cap = requeue_cap (3), not transient_requeue_cap (2),
+        so the escalation correctly identifies the genuine ceiling as the one that fired.
+        """
+        from orchestrator.workflow import WorkflowOutcome
+        harness = self._make(tmp_path)  # requeue_cap=3, transient_requeue_cap=2
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        # Pre-seed: transient counter already at transient ceiling, genuine at cap-1.
+        # We bypass _apply_retry_cap to avoid earlier cap firings.
+        harness.scheduler._transient_requeue_counts['t1'] = 2  # at transient_requeue_cap
+        harness.scheduler._requeue_counts['t1'] = 2            # one below requeue_cap
+
+        # Final genuine requeue: genuine→3 (= requeue_cap), transient stays at 2 (= transient_cap).
+        r = await harness._apply_retry_cap(
+            't1', _build_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert r is False
+        assert trigger.await_count == 1
+        call = trigger.await_args
+        assert call is not None
+        # genuine_exhausted=True takes priority; cap must be requeue_cap (3), not transient (2)
+        assert call.kwargs.get('cap') == 3
