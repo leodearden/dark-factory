@@ -3718,7 +3718,9 @@ class TaskWorkflow:
             # (~20 min/iteration × threshold) with no chance of progress.
             if is_zero_output_timeout(result):
                 consecutive_zero_output += 1
-                # Evidence capture (step-10 wires _capture_zero_output_evidence here).
+                # Capture forensic evidence for every zero-output timeout (best-effort;
+                # the helper suppresses all I/O errors internally).
+                self._capture_zero_output_evidence(result, self.metrics.execute_iterations)
                 if consecutive_zero_output >= self.config.max_consecutive_zero_output_timeouts:
                     self._zero_output_hang_info = {
                         'reason': ZERO_OUTPUT_HANG_REASON,
@@ -3782,6 +3784,58 @@ class TaskWorkflow:
                         return WorkflowOutcome.DONE
 
         return WorkflowOutcome.DONE
+
+    def _capture_zero_output_evidence(self, result: AgentResult, iteration: int) -> None:
+        """Persist forensic evidence for a zero-output CLI timeout to .task/.
+
+        Called on EVERY zero-output timeout in ``_execute_iterations`` (before
+        the threshold check) so both sub-threshold and tripping occurrences
+        are captured.  Writes to ``artifacts.root`` which outlives the per-task
+        ``TaskConfigDir`` cleanup and the BLOCKED worktree (not GC'd since the
+        task is not DONE).
+
+        Best-effort: any I/O failure is caught and logged rather than
+        propagated — evidence capture must never crash the iteration loop.
+        """
+        if not self.artifacts:
+            return
+        try:
+            # Build config_dir listing (relative paths as strings).
+            config_dir_str: str | None = None
+            config_dir_listing: list[str] = []
+            if self._config_dir is not None:
+                config_dir_str = str(self._config_dir.path)
+                try:
+                    config_dir_listing = [
+                        str(p.relative_to(self._config_dir.path))
+                        for p in self._config_dir.path.rglob('*')
+                    ]
+                except OSError:
+                    config_dir_listing = ['<listing failed>']
+
+            evidence = {
+                'iteration': iteration,
+                'duration_ms': result.duration_ms,
+                'timed_out': result.timed_out,
+                'turns': result.turns,
+                'cost_usd': result.cost_usd,
+                'subtype': result.subtype,
+                'stderr_tail': (result.stderr or '')[-4000:],
+                'proc_tree': result.proc_tree,
+                'config_dir': config_dir_str,
+                'config_dir_listing': config_dir_listing,
+            }
+            evidence_path = self.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
+            evidence_path.write_text(json.dumps(evidence, indent=2))
+            logger.info(
+                'Task %s: zero-output evidence written → %s',
+                self.task_id, evidence_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: failed to write zero-output evidence (iteration=%d): %s',
+                self.task_id, iteration, exc,
+            )
 
     async def _run_completion_judge(
         self, iteration_log: list[dict]
