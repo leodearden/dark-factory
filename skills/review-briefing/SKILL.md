@@ -11,6 +11,11 @@ Code structure, module paths, function signatures, call chains — `/review` dis
 
 **Rule of thumb:** If you can discover it alone from the code, don't put it in the briefing.
 
+## Standing project invariants (record in every briefing, enforce in every review)
+
+- **TODO tracking invariant** — every real TODO in the codebase (TODO/FIXME/HACK comment markers, and stub idioms like Rust `todo!()`/`unimplemented!()`) must be tracked by a specific **non-terminal** task whose brief names resolving that TODO as a completion condition. A TODO merely *citing* a task id is not tracked — the cited task's brief must actually cover it ("TODO-cites-task ≠ tracked"). A TODO whose tracking task is now `done`/`cancelled` while the marker still applies is **orphaned** and must be re-attached to a live task or re-filed. When creating or updating a briefing, record this invariant under `conventions`; treat untracked/orphaned TODOs surfaced during validation as `known_gaps` candidates until a task owns them.
+- **Deferred-task invariant** — a task must never sit in `deferred` status without a concrete, actionable "flip to pending" condition recorded on the task. If the gate is dependency-shaped, express it as dependency edges and keep the task `pending` (the scheduler respects deps; `deferred` quarantines). Human judgment gates follow the escalate-on-dispatch SOP instead of deferral: file the task `pending` with correct deps and a brief that, on dispatch, immediately escalates the decision to the human with concrete evidence — judgment gates are used sparingly, justified by nontrivial risk, and must present concrete information to weigh between alternatives (A/B, go/no-go). A `deferred` task without a recorded trigger is quarantine rot: nobody polls it.
+
 ## Parse invocation
 
 ```
@@ -30,6 +35,8 @@ Quick structural check against the existing `review/briefing.yaml`:
 2. **Removed subprojects** — briefing references subprojects that no longer exist
 3. **Task references** — each `known_gaps[].tracking` task ID exists in the task tree
 4. **Known gap staleness** — tasks referenced in `known_gaps` that are now `done`
+5. **TODO tracking invariant** — sweep the codebase for TODO/FIXME/HACK markers and `todo!()`/`unimplemented!()` stubs; each real one must map to a non-terminal task briefed to resolve it. Report untracked markers and orphaned ones (tracking task `done`/`cancelled` but the marker still applies)
+6. **Deferred-task invariant** — every `deferred` task in the task tree records a concrete, actionable flip-to-pending condition; report deferred tasks whose only gate is dependency-shaped (should be `pending` + dep edges) or whose recorded condition has already fired
 
 Output: pass/fail with specifics. Offer to fix.
 
