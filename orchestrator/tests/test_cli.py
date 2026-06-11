@@ -1031,3 +1031,429 @@ def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
     # Core assertion: acquire_host_verify_worktree called; _create_merge_worktree NOT
     mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
     mock_git_ops._create_merge_worktree.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 1732 step-9 — verify-merge --request-id pgid lifecycle + back-compat
+# ---------------------------------------------------------------------------
+
+
+def test_verify_merge_request_id_pgid_lifecycle(tmp_path, monkeypatch):
+    """verify-merge --request-id writes pgid file during run, removes it on exit.
+
+    Injects start_own_process_group as a spy; mocks all IO so no real git/build
+    work happens. Checks file existence mid-run via the mocked
+    run_merge_verify_on_worktree coroutine.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.verify_cancel import pgid_file
+
+    FAKE_PGID = 77777
+    FAKE_REQUEST_ID = 'test-req-1732'
+    known_json = '{"passed": true, "results": []}'
+
+    # worktree_base that GitOps would compute
+    fake_worktree_base = tmp_path / '.worktrees'
+
+    # --- Mock GitOps ---
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    # --- Mock config ---
+    from orchestrator.config import OrchestratorConfig
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # --- Spy on start_own_process_group ---
+    sopg_calls = []
+
+    def fake_sopg():
+        sopg_calls.append(True)
+        return FAKE_PGID
+
+    monkeypatch.setattr(cli_module, 'start_own_process_group', fake_sopg)
+
+    # --- Mock verify_runner helpers; capture pgid file existence mid-run ---
+    pgf = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
+    file_existed_mid_run = []
+
+    async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
+        file_existed_mid_run.append(pgf.exists())
+        result = MagicMock()
+        return result
+
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr('orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify)
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+        '--request-id', FAKE_REQUEST_ID,
+    ])
+
+    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+    assert known_json in r.output
+
+    # start_own_process_group must have been called once
+    assert len(sopg_calls) == 1, 'start_own_process_group must be called once with --request-id'
+
+    # pgid file must have existed during the run
+    assert file_existed_mid_run == [True], (
+        f'pgid file was not present mid-run; file_existed_mid_run={file_existed_mid_run!r}'
+    )
+
+    # pgid file must be removed after normal exit
+    assert not pgf.exists(), f'pgid file must be removed on normal exit; still present at {pgf}'
+
+
+def test_verify_merge_no_request_id_back_compat(tmp_path, monkeypatch):
+    """Without --request-id, start_own_process_group is NOT called and no pgid file created.
+
+    Verifies today's exact behavior is unchanged (back-compat).
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    # --- Mock GitOps ---
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    # --- Mock config ---
+    from orchestrator.config import OrchestratorConfig
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # --- Spy on start_own_process_group to ensure it is NOT called ---
+    sopg_calls = []
+
+    def fake_sopg():
+        sopg_calls.append(True)
+        return 99999
+
+    monkeypatch.setattr(cli_module, 'start_own_process_group', fake_sopg)
+
+    # --- Mock verify_runner helpers ---
+    known_json = '{"passed": false, "results": []}'
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.run_merge_verify_on_worktree',
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+    ])
+
+    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+
+    # start_own_process_group must NOT have been called (no --request-id)
+    assert sopg_calls == [], (
+        'start_own_process_group must NOT be called without --request-id'
+    )
+
+    # No .merge_verify_pgids directory should have been created
+    from orchestrator.verify_cancel import PGID_DIR_NAME
+    pgid_dir_path = tmp_path / '.worktrees' / PGID_DIR_NAME
+    assert not pgid_dir_path.exists(), (
+        f'.merge_verify_pgids directory created without --request-id: {pgid_dir_path}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 1732 step-11 — cancel-verify subcommand (CliRunner)
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_verify_unknown_id_exits_0(tmp_path, monkeypatch):
+    """(a) Unknown request id (no pgid file present) -> exit 0 (idempotent)."""
+    from unittest.mock import MagicMock
+
+    from orchestrator.config import OrchestratorConfig
+
+    # Minimal config: project_root -> tmp_path (worktree_base = tmp_path/.worktrees)
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # GitOps mock returning a worktree_base that has no pgid file
+    fake_worktree_base = tmp_path / '.worktrees'
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    r = CliRunner().invoke(main, [
+        'cancel-verify',
+        '--request-id', 'nonexistent-req',
+        '--config', str(cfg_file),
+    ])
+    assert r.exit_code == 0, (
+        f'expected exit_code 0 for unknown id, got {r.exit_code}; output={r.output!r}'
+    )
+
+
+def test_cancel_verify_rc_wiring(tmp_path, monkeypatch):
+    """(b) cancel_request spy: CLI passes pgid_file path and exits with exactly that rc."""
+    from unittest.mock import MagicMock
+
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.verify_cancel import pgid_file
+
+    FAKE_REQUEST_ID = 'wiring-test-req'
+    EXPECTED_RC = 42  # unusual value to prove propagation
+
+    fake_worktree_base = tmp_path / '.worktrees'
+    expected_path = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
+
+    cancel_calls = []
+
+    def fake_cancel_request(path, **kwargs):
+        cancel_calls.append(path)
+        return EXPECTED_RC
+
+    monkeypatch.setattr(cli_module, 'cancel_request', fake_cancel_request)
+
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    r = CliRunner().invoke(main, [
+        'cancel-verify',
+        '--request-id', FAKE_REQUEST_ID,
+        '--config', str(cfg_file),
+    ])
+
+    # RC propagated correctly
+    assert r.exit_code == EXPECTED_RC, (
+        f'expected exit_code {EXPECTED_RC}, got {r.exit_code}; output={r.output!r}'
+    )
+    # Path derivation: cancel_request was called with the right pgid_file path
+    assert len(cancel_calls) == 1, f'cancel_request called {len(cancel_calls)} times'
+    assert cancel_calls[0] == expected_path, (
+        f'cancel_request called with wrong path: {cancel_calls[0]} != {expected_path}'
+    )
+
+
+def test_cancel_verify_real_impl_dead_pgid(tmp_path, monkeypatch):
+    """(c) Real pgid file with a dead pgid -> exit 0, file removed."""
+    from unittest.mock import MagicMock
+
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.verify_cancel import pgid_file, write_pgid_file
+
+    FAKE_REQUEST_ID = 'dead-pgid-req'
+    # Use pid 1 (init) as the "dead" pgid — we can't kill it, but with a dead
+    # process we instead use a non-existent high pid that raises ProcessLookupError.
+    # We'll write a nonsense high pid that definitely doesn't exist.
+    NONEXISTENT_PID = 2 ** 22  # well above /proc/sys/kernel/pid_max on most systems
+
+    fake_worktree_base = tmp_path / '.worktrees'
+    pgf = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
+    write_pgid_file(pgf, NONEXISTENT_PID)
+
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    r = CliRunner().invoke(main, [
+        'cancel-verify',
+        '--request-id', FAKE_REQUEST_ID,
+        '--config', str(cfg_file),
+    ])
+
+    assert r.exit_code == 0, (
+        f'expected exit_code 0 for dead pgid, got {r.exit_code}; output={r.output!r}'
+    )
+    assert not pgf.exists(), f'pgid file must be removed after successful cancel; still at {pgf}'
+
+
+# ---------------------------------------------------------------------------
+# Task 1732 step-13 (part 2) — end-to-end: real subprocess cancel capstone
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_file_cli(path: 'Path', timeout: float = 10.0, interval: float = 0.1) -> bool:
+    """Poll until *path* exists or *timeout* expires. Return True if found."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(interval)
+    return False
+
+
+@pytest.mark.timeout(30)
+def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
+    """End-to-end: real subprocess 'verify-merge --request-id X' is killed by cancel-verify.
+
+    Spawns a real 'orchestrator verify-merge --request-id X' subprocess with a
+    long-running sleep spec.  Polls for the pgid file that verify-merge writes
+    after os.setsid().  Calls 'cancel-verify --request-id X' via CliRunner
+    (in-process, monkeypatched load_config).  Asserts:
+
+    * cancel-verify exits 0
+    * pgid file is removed by cancel_request
+    * verify-merge subprocess exits within seconds (SIGKILL delivered)
+    * the recorded pgid group is gone (os.killpg raises ESRCH) after wait()
+    """
+    import errno
+    import os
+    import subprocess as subprocess_mod
+    import sys
+
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.git_ops import GitOps
+    from orchestrator.verify_cancel import pgid_file
+    from orchestrator.verify_runner import (
+        MergeVerifySpec,
+        UnscopedTypecheckSpec,
+        VerifyCommand,
+        spec_to_json,
+    )
+
+    # --- Set up a real git repo ---
+    repo, head_sha = _setup_verify_repo(tmp_path)
+
+    # --- Write minimal config YAML (project_root -> repo) ---
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text(f'project_root: {repo}\n')
+
+    # --- Spec with a long-running sleep test command ---
+    spec = MergeVerifySpec(
+        verify_commands=(VerifyCommand('mod', test_command='sleep 300'),),
+        unscoped_typecheck=UnscopedTypecheckSpec(
+            commands=(VerifyCommand('mod', type_check_command='true'),),
+            block_on_timeout=True,
+        ),
+        task_files=('mod/test_x.py',),
+        verify_env={},
+        cold_timeout_secs=300.0,
+    )
+
+    REQUEST_ID = 'e2e-cancel-test'
+
+    # --- Derive the expected pgid file path (same derivation as verify-merge uses) ---
+    config_obj = OrchestratorConfig(project_root=repo)
+    _git_ops = GitOps(config_obj.git, repo)
+    pgf = pgid_file(_git_ops.worktree_base, REQUEST_ID)
+
+    # --- Spawn verify-merge as a real subprocess ---
+    # Set PYTHONPATH so the subprocess imports from the worktree's src (not the
+    # editable-install main-checkout), ensuring it uses the task-branch code.
+    worktree_src = str(Path(__file__).parent.parent / 'src')
+    env = dict(os.environ)
+    existing_pp = env.get('PYTHONPATH', '')
+    env['PYTHONPATH'] = f'{worktree_src}:{existing_pp}' if existing_pp else worktree_src
+    # Remove ORCH_PROJECT_ROOT so it does not override the YAML's project_root.
+    # The _isolate_orch_config autouse fixture sets ORCH_PROJECT_ROOT=<pytest
+    # tmp_path>, and pydantic-settings env_settings has higher priority than
+    # yaml_settings.  Without this removal the subprocess would use the pytest
+    # tmp_path as project_root instead of the test's git repo, causing git
+    # worktree operations to fail with "not a git repository".
+    env.pop('ORCH_PROJECT_ROOT', None)
+
+    child = subprocess_mod.Popen(
+        [sys.executable, '-c', 'from orchestrator.cli import main; main()',
+         'verify-merge',
+         '--sha', head_sha,
+         '--spec', spec_to_json(spec),
+         '--config', str(cfg_file),
+         '--request-id', REQUEST_ID],
+        env=env,
+        stdout=subprocess_mod.PIPE,
+        stderr=subprocess_mod.PIPE,
+    )
+
+    pgid_val = None
+    try:
+        # --- Poll for the pgid file (written before asyncio.run) ---
+        if not _wait_for_file_cli(pgf, timeout=15):
+            _debug_stdout, _debug_stderr = child.communicate(timeout=5) if child.poll() is not None else (b'', b'')
+            pytest.fail(
+                f'verify-merge did not write pgid file within 15s '
+                f'(subprocess poll={child.poll()!r})\n'
+                f'STDOUT: {_debug_stdout.decode()[:2000]!r}\n'
+                f'STDERR: {_debug_stderr.decode()[:2000]!r}'
+            )
+
+        # Save pgid BEFORE cancel-verify removes the file
+        pgid_val = int(pgf.read_text().strip())
+
+        # --- Cancel via CliRunner (in-process, monkeypatched load_config) ---
+        monkeypatch.setattr(cli_module, 'load_config', lambda _: config_obj)
+        r = CliRunner().invoke(main, [
+            'cancel-verify',
+            '--request-id', REQUEST_ID,
+            '--config', str(cfg_file),
+        ])
+
+        assert r.exit_code == 0, (
+            f'cancel-verify expected exit 0, got {r.exit_code}; '
+            f'output={r.output!r}'
+        )
+        assert not pgf.exists(), (
+            'pgid file must be removed by cancel-verify on success'
+        )
+
+        # --- verify-merge subprocess must exit within seconds ---
+        try:
+            child.wait(timeout=10)
+        except subprocess_mod.TimeoutExpired:
+            pytest.fail(
+                'verify-merge subprocess did not exit within 10s after cancel-verify'
+            )
+
+        # --- Process group must be gone after the subprocess is reaped ---
+        # child.wait() above reaped the zombie; pgid == pid after setsid, so
+        # there should be no processes left in the group.
+        try:
+            os.killpg(pgid_val, 0)
+            pytest.fail(
+                f'verify-merge pgid group {pgid_val} still alive after cancel-verify'
+            )
+        except (ProcessLookupError, OSError) as exc:
+            if hasattr(exc, 'errno') and exc.errno == errno.EPERM:
+                pytest.fail(f'pgid group {pgid_val}: got EPERM (unexpected)')
+            # ESRCH → group is gone — expected
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
