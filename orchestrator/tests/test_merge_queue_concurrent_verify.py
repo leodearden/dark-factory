@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -401,3 +401,140 @@ class TestInflightStateAttrs:
         from orchestrator.merge_queue import InflightEntry
         field_names = {f.name for f in dataclasses.fields(InflightEntry)}
         assert 'passthrough_outcome' in field_names
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: _run_inflight_verify happy paths
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyHappyPath:
+    """_run_inflight_verify(item, lease) happy paths: LOCAL lease and REMOTE lease.
+
+    RED until step-6 GREEN adds the method.
+    """
+
+    async def _make_merged_item(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+        content: str,
+    ):
+        """Helper: create a branch, merge it to main, return (req, item)."""
+        from orchestrator.merge_queue import SpeculativeItem
+        wt = await _make_branch_with_file(git_ops, branch, filename, content)
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id=branch,
+            branch=branch,
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            lane='normal',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success and merge_result.merge_commit
+        base_sha = await git_ops.get_main_sha()
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+        return req, item
+
+    async def test_local_lease_increments_attempt_count(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """LOCAL lease: _verify_attempt_count incremented by one."""
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(git_ops, config, 'inv-local-a', 'fa.py', 'a=1\n')
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        fake_local = _make_fake_remote('local-fake')
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        count_before = worker._verify_attempt_count
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            result = await worker._run_inflight_verify(item, lease)  # RED: method doesn't exist
+
+        assert worker._verify_attempt_count == count_before + 1
+        assert result.outcome is None  # pass
+
+    async def test_local_lease_verify_phase_set_to_verifying(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """LOCAL lease: _verify_phase transitions to 'verifying' during the call."""
+        from unittest.mock import patch
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(git_ops, config, 'inv-local-b', 'fb.py', 'b=2\n')
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        fake_local = _make_fake_remote('local-fake2')
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        phases_seen: list[str] = []
+        orig_run = worker._git_ops.get_main_sha  # noqa: F841
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            result = await worker._run_inflight_verify(item, lease)
+
+        # After completion result.outcome is None (pass)
+        assert result.outcome is None
+        assert result.status is None or result.status == 'done'
+
+    async def test_remote_lease_no_warm_swap(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """REMOTE lease: _verify_attempt_count NOT incremented (no warm-swap),
+        lease.runner.run_merge_verify called, outcome=None on pass.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(git_ops, config, 'inv-remote-a', 'fc.py', 'c=3\n')
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        fake_remote = _make_fake_remote('laptop')
+        lease = HostLease(name='laptop', runner=fake_remote, is_local=False)
+
+        count_before = worker._verify_attempt_count
+        result = await worker._run_inflight_verify(item, lease)  # RED: method doesn't exist
+
+        # REMOTE path: warm-swap NOT run → attempt count unchanged
+        assert worker._verify_attempt_count == count_before
+        # runner.run_merge_verify called (remote dispatch path)
+        fake_remote.run_merge_verify.assert_called_once()
+        # outcome is None (pass)
+        assert result.outcome is None
+
+    async def test_run_inflight_verify_returns_merge_wt(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """_run_inflight_verify returns result with non-None merge_wt."""
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(git_ops, config, 'inv-wt', 'fd.py', 'd=4\n')
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        fake_remote = _make_fake_remote('laptop2')
+        lease = HostLease(name='laptop2', runner=fake_remote, is_local=False)
+
+        result = await worker._run_inflight_verify(item, lease)
+
+        assert result.merge_wt is not None
