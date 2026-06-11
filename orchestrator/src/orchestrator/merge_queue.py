@@ -5211,6 +5211,22 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 ),
             }
 
+        # occupancy: per-host in-flight breakdown for heartbeat and dashboard consumers.
+        _by_host = {
+            _infl.lease.name: _infl.item.request.task_id
+            for _infl in self._inflight
+            if _infl.lease is not None
+        }
+        _hosts_total = (
+            len(self._host_allocator.host_names)
+            if self._host_allocator is not None else 1
+        )
+        occupancy = {
+            'hosts_total': _hosts_total,
+            'hosts_busy': len(_by_host),
+            'by_host': _by_host,
+        }
+
         return {
             'entries': entries,
             'depth': len(entries),
@@ -5218,6 +5234,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'verify_in_progress': verify_in_progress,
             'is_wip_halted': self.is_wip_halted,
             'halt_owner_esc_id': self.halt_owner_esc_id,
+            'occupancy': occupancy,
         }
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
@@ -5248,11 +5265,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'age_secs': head['age_secs'],
         }
 
+        occ = snap['occupancy']
+        _occ_suffix = ''
+        if occ['by_host']:
+            _host_parts = ' '.join(
+                f'{h}={tid}' for h, tid in occ['by_host'].items()
+            )
+            _occ_suffix = (
+                f' | verifying {occ["hosts_busy"]}/{occ["hosts_total"]} hosts: '
+                f'{_host_parts}'
+            )
+
         logger.info(
             'merge queue heartbeat: %d in pipeline, oldest age=%.0fs, '
-            'head=task %s (state=%s, age=%.0fs)',
+            'head=task %s (state=%s, age=%.0fs)%s',
             snap['depth'], oldest_age,
             head['task_id'], head['state'], head['age_secs'],
+            _occ_suffix,
         )
 
         if self._event_store is not None:
@@ -5265,6 +5294,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'oldest_age_secs': oldest_age,
                     'head_of_line': head_of_line,
                     'verify_in_progress': snap['verify_in_progress'],
+                    'occupancy': occ,
                 },
             )
 
