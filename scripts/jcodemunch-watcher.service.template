@@ -4,6 +4,24 @@ After=network.target
 
 [Service]
 Type=simple
+# inotify-exhaustion fix (2026-06-11): watch-claude uses watchfiles.awatch
+# (recursive=True, no filter — watcher.py:229), and inotify costs one watch PER
+# DIRECTORY regardless of any event-level filter (the Rust notify crate registers
+# watches before filtering). With dozens of full worktrees nested under the
+# watched repos (~712k fs entries) one process held 523,811 / 524,288 of
+# fs.inotify.max_user_watches, ENOSPC-failing every other inotify consumer on
+# the host (L2 watcher, editors). The watcher passes force_polling unset, so
+# watchfiles honors these env vars: FORCE_POLLING switches the backend to
+# stat-polling — ZERO inotify watches (verified in the pinned env: 60-dir tree
+# → 61 watches default, 0 with the env set). 30s poll delay keeps the stat-walk
+# load trivial; index freshness only needs ~minutes anyway (debounce is already
+# 2s, worktree-discovery poll 5s).
+Environment=WATCHFILES_FORCE_POLLING=true
+Environment=WATCHFILES_POLL_DELAY_MS=30000
+# Initial index peaked at 6.2G RSS (2026-06-11). Cap so a runaway can't starve
+# the host: throttle at 8G, hard-kill at 12G (Restart=always recovers).
+MemoryHigh=8G
+MemoryMax=12G
 # PyPI was quarantined 2026-05-30 (admin review #308) and restored 2026-06-11.
 # Back on PyPI with an EXACT pin — supply-chain history means no floating
 # versions: bump deliberately after verifying the sdist matches the upstream git
