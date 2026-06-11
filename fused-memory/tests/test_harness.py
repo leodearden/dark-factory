@@ -3442,6 +3442,109 @@ async def test_recover_stale_runs_reaps_dead_owner_with_stale_heartbeat(
     )
 
 
+@pytest.mark.asyncio
+async def test_recover_stale_runs_suppresses_escalation_for_dead_owner_shielded(
+    journal, event_buffer, mock_memory_service,
+):
+    """_recover_stale_runs must NOT emit recon_stale_run for dead_owner_shielded
+    (task 1731 noise fix), but must still escalate for handed_off.
+
+    Scenario A — dead_owner_shielded (same iid, stale heartbeat):
+        Recovery must complete (status=failed, StaleRunRecovery) but
+        harness._escalate must NOT be called with category 'recon_stale_run'.
+
+    Scenario B — handed_off (different iid, live lock on current instance):
+        harness._escalate MUST be called with category 'recon_stale_run'.
+    """
+    # ── Scenario A: dead_owner_shielded — escalation must be suppressed ──────
+
+    harness_a = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness_a._escalate = MagicMock()
+
+    project_a = 'project-dead-owner'
+    cutoff_a = harness_a.config.stale_run_recovery_seconds  # 1800s
+
+    run_a = ReconciliationRun(
+        id='run-a-dead-owner',
+        project_id=project_a,
+        run_type=RunType.full,
+        trigger_reason='unit-test-noise',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff_a * 2),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run_a)
+
+    acquired_a = await event_buffer.mark_run_active(project_a)
+    assert acquired_a is True
+
+    # Backdate heartbeat_at past the cutoff → dead_owner_shielded
+    dead_heartbeat_a = (
+        datetime.now(UTC) - timedelta(seconds=cutoff_a + 100)
+    ).isoformat()
+    async with event_buffer._txn() as db:
+        await db.execute(
+            'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
+            (dead_heartbeat_a, project_a),
+        )
+
+    await harness_a._recover_stale_runs()
+
+    # Recovery must have completed normally
+    after_a = await journal.get_run('run-a-dead-owner')
+    assert after_a is not None
+    assert after_a.status == RunStatus.failed, (
+        'dead_owner_shielded orphan must still be reaped'
+    )
+    err_a = after_a.stage_reports.get('_error')
+    assert isinstance(err_a, dict)
+    assert err_a.get('error_type') == 'StaleRunRecovery'
+
+    # Escalation must NOT have been emitted for dead_owner_shielded
+    for call in harness_a._escalate.call_args_list:
+        category = call.args[0] if call.args else call.kwargs.get('category')
+        assert category != 'recon_stale_run', (
+            f'recon_stale_run escalation must be suppressed for dead_owner_shielded; '
+            f'got _escalate call with category={category!r}'
+        )
+
+    # ── Scenario B: handed_off — escalation must still fire ─────────────────
+
+    harness_b = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness_b._escalate = MagicMock()
+
+    project_b = 'project-handed-off'
+    cutoff_b = harness_b.config.stale_run_recovery_seconds
+
+    run_b = ReconciliationRun(
+        id='run-b-handed-off',
+        project_id=project_b,
+        run_type=RunType.full,
+        trigger_reason='unit-test-noise',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff_b * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance',  # different from event_buffer.instance_id
+    )
+    await journal.start_run(run_b)
+
+    # Acquire the lock with the LIVE instance — so lock_holder != run.instance_id
+    # → disposition = handed_off
+    acquired_b = await event_buffer.mark_run_active(project_b)
+    assert acquired_b is True
+
+    await harness_b._recover_stale_runs()
+
+    # handed_off MUST escalate with recon_stale_run
+    recon_calls_b = [
+        call for call in harness_b._escalate.call_args_list
+        if (call.args[0] if call.args else call.kwargs.get('category')) == 'recon_stale_run'
+    ]
+    assert len(recon_calls_b) >= 1, (
+        'handed_off orphan must still emit a recon_stale_run escalation; '
+        f'got _escalate calls: {harness_b._escalate.call_args_list}'
+    )
+
+
 # ── build_stale_run_diagnostics unit tests ────────────────────────────────────
 
 

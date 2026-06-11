@@ -384,3 +384,71 @@ and pass after either remediation above.
   case; nothing in the code relies on the reaper releasing the lock
   synchronously. Verified by checking every caller of `mark_run_complete`
   and every reader of `reconciliation_locks`.
+
+---
+
+## Addendum 2026-06-11 — watchdog-kill orphan class (task 1731)
+
+### Failure mode (distinct from the lock-theft bug above)
+
+This is a **separate** orphan class that was incorrectly surfaced as
+`recon_stale_run` escalations:
+
+- `fused-memory.service` is `Type=notify` with `WatchdogSec=30`.
+- The `WATCHDOG=1` ping was an **on-loop asyncio coroutine**
+  (`_watchdog_heartbeat`, `main.py`), sharing the event loop with all
+  reconciliation work, the MCP server, and the curator.
+- When the loop was starved or blocked for >30 s, systemd missed 3
+  consecutive pings and issued a **SIGABRT to the whole process** (~6–8×/day).
+- In-flight `ReconciliationRun` rows were orphaned mid-run; a fresh instance's
+  reaper later recovered them with `disposition=dead_owner_shielded` (same
+  `instance_id`, heartbeat older than the 1800 s cutoff).
+
+**This is not a lock-theft or data-integrity event.** It is a predictable
+consequence of an operational hard-kill: the same instance that started the
+run was killed before it could complete or unlock.  The ~2226 s run age in
+the forensic escalations is a recovery-math artifact (SIGABRT time +
+inter-startup gap + harness boot), not a reify-kill or coordinator anomaly.
+
+### Forensic escalation IDs
+
+- `esc-recon-a5de337e-1`
+- `esc-recon-89f4303c-1`
+
+Both carry `disposition=dead_owner_shielded` and are now understood to be
+watchdog-SIGABRT orphans.
+
+### Fixes (task 1731, committed 2026-06-11)
+
+1. **PRIMARY — dedicated-thread WATCHDOG heartbeat** (`main.py`).
+   Replaced the on-loop `_watchdog_heartbeat()` coroutine + `asyncio.Task`
+   with a dedicated daemon OS thread (`_watchdog_thread_loop` +
+   `_start_watchdog_thread` / `_stop_watchdog_thread`).  The thread pings
+   `_sd_notify('WATCHDOG=1')` every `_WATCHDOG_INTERVAL` (10 s) using
+   `threading.Event.wait()` as a stoppable sleep — independent of asyncio
+   loop scheduling.  A busy or blocked loop can no longer silence the
+   heartbeat.
+
+2. **PALLIATIVE — `WatchdogSec` 30 → 120 s** in both committed unit files
+   (`scripts/fused-memory.service.template` and
+   `fused-memory/fused-memory.service.example-systemd-config`).
+   Belt-and-suspenders headroom now that the dedicated thread is the primary
+   guard.  The **installed unit** (`~/.config/systemd/user/fused-memory.service`)
+   must be updated out-of-band by the operator (`WatchdogSec=30` → `120`,
+   then `systemctl --user daemon-reload`).
+
+3. **NOISE — suppress `recon_stale_run` escalation for `dead_owner_shielded`**
+   (`reconciliation/harness.py`, `_recover_stale_runs`).
+   When `diag['disposition'] == 'dead_owner_shielded'`, the escalation is
+   skipped and a `logger.info` is emitted instead.  Recovery, journal
+   `_error`, `restore_drained`, and the `WARNING` log are unchanged so the
+   event stays observable in logs/journal without filing a noisy
+   integrity-looking alert.  All other dispositions (`handed_off`, `live`,
+   `no_lock`, `pre_migration`) continue to escalate.
+
+### SECONDARY (deferred)
+
+Profiling and eliminating the specific >30 s event-loop stalls that triggered
+the watchdog in the first place is a follow-up investigation.  The PRIMARY fix
+makes the watchdog robust regardless of loop state, so this work is decoupled
+from task 1731 and tracked separately.

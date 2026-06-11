@@ -72,9 +72,12 @@ _CLEANUP_STEP_TIMEOUT = 5.0
 # +harness_cancel(25)+memory_close(5)+journal_close(5) = 55s; +20s headroom = 75.
 _FORCE_EXIT_BUDGET = 75.0
 
-# systemd watchdog heartbeat interval. Must be comfortably less than
-# WatchdogSec in the unit file (we use 30s there) so a single missed tick
-# doesn't trigger a restart.
+# systemd watchdog heartbeat interval. The dedicated OS thread
+# (_watchdog_thread_loop, task 1731 root-cause fix) pings every
+# _WATCHDOG_INTERVAL independent of asyncio loop scheduling, so a
+# busy/blocked loop cannot delay the ping past WatchdogSec.
+# WatchdogSec=120 in the committed unit template; this interval is
+# intentionally 12× smaller to give plenty of margin.
 _WATCHDOG_INTERVAL = 10.0
 
 # Periodic WAL TRUNCATE checkpoint interval. The 2026-05-13 incident
@@ -154,6 +157,88 @@ def _cancel_force_exit() -> None:
     if _shutdown_watchdog is not None:
         _shutdown_watchdog.cancel()
         _shutdown_watchdog = None
+
+
+def _watchdog_thread_loop(stop_event: threading.Event, interval: float) -> None:
+    """Drive the systemd WATCHDOG=1 heartbeat from a dedicated OS thread.
+
+    Runs on its own thread so a busy/blocked asyncio loop cannot delay the
+    heartbeat past WatchdogSec (task 1731 root-cause fix).
+
+    Pings _sd_notify('WATCHDOG=1') immediately on entry, then uses
+    Event.wait(interval) as a stoppable sleep — stop_event.set() ends the
+    loop promptly during shutdown with no busy-wait and no up-to-interval
+    shutdown delay.
+
+    Any unexpected exception from _sd_notify is caught, logged, and the
+    loop continues — a single failed ping is observable in logs/journal
+    but does not silently kill the heartbeat thread (which would
+    re-introduce the SIGABRT regression this fix targets).
+    Note: _sd_notify already swallows OSError internally; this guard
+    catches anything unexpected that escapes it.
+    """
+    while True:
+        try:
+            _sd_notify('WATCHDOG=1')
+        except Exception:
+            logger.exception(
+                'Unexpected exception in watchdog heartbeat thread; '
+                'heartbeat ping lost, continuing (task 1731)',
+            )
+        if stop_event.wait(interval):
+            return
+
+
+# Module-level handles for the dedicated watchdog heartbeat thread.
+# Both are None when the thread is not running.
+_watchdog_thread: threading.Thread | None = None
+_watchdog_stop_event: threading.Event | None = None
+
+
+def _start_watchdog_thread(interval: float = _WATCHDOG_INTERVAL) -> bool:
+    """Start the dedicated systemd watchdog heartbeat thread.
+
+    Returns True if a new thread was started, False if one is already running
+    or if NOTIFY_SOCKET is unset (no systemd integration active).
+
+    Idempotent: a second call while the thread is alive returns False without
+    side effects.  Mirrors the _arm_force_exit idempotency pattern.
+
+    The spawned thread is a daemon so it can never block interpreter exit even
+    if join times out (consistent with _arm_force_exit's daemon Timer).
+    """
+    global _watchdog_thread, _watchdog_stop_event
+    if _watchdog_thread is not None and _watchdog_thread.is_alive():
+        return False
+    if not os.environ.get('NOTIFY_SOCKET'):
+        return False
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_watchdog_thread_loop,
+        args=(stop_event, interval),
+        name='fused-memory-sd-watchdog',
+        daemon=True,
+    )
+    t.start()
+    _watchdog_thread = t
+    _watchdog_stop_event = stop_event
+    return True
+
+
+def _stop_watchdog_thread(join_timeout: float = 2.0) -> None:
+    """Stop the dedicated systemd watchdog heartbeat thread.
+
+    Sets the stop event so the thread exits at its next Event.wait() and
+    joins it (bounded by join_timeout).  Clears both module refs to None so
+    a subsequent _start_watchdog_thread() can start fresh (restartable).
+    """
+    global _watchdog_thread, _watchdog_stop_event
+    if _watchdog_stop_event is not None:
+        _watchdog_stop_event.set()
+    if _watchdog_thread is not None:
+        _watchdog_thread.join(timeout=join_timeout)
+    _watchdog_thread = None
+    _watchdog_stop_event = None
 
 
 async def _run_shielded(
@@ -793,7 +878,6 @@ async def run_server():
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
 
-    watchdog_task: asyncio.Task[None] | None = None
     # recon_report_state already initialized above (PRD γ, task 1546 step-12)
     server: Any | None = None  # primary uvicorn.Server
     recon_server: Any | None = None  # uvicorn.Server for the 2nd port
@@ -857,15 +941,12 @@ async def run_server():
                 _make_operator_stop_callback(server, recon_server),
             )
 
-            # Systemd watchdog heartbeat: ping every _WATCHDOG_INTERVAL so a
-            # wedged asyncio loop (no ticks) triggers a restart via
-            # WatchdogSec in the unit file. No-op when NOTIFY_SOCKET unset.
-            async def _watchdog_heartbeat() -> None:
-                while True:
-                    _sd_notify('WATCHDOG=1')
-                    await asyncio.sleep(_WATCHDOG_INTERVAL)
-
-            watchdog_task = asyncio.create_task(_watchdog_heartbeat())
+            # Systemd watchdog heartbeat: dedicated OS thread pings every
+            # _WATCHDOG_INTERVAL independent of asyncio loop scheduling
+            # (task 1731 root-cause fix — on-loop coroutine was silenced by
+            # a busy loop, causing systemd SIGABRT ~6-8x/day). No-op when
+            # NOTIFY_SOCKET unset.
+            _start_watchdog_thread()
 
             await recon_report_state.start_reaper()
             logger.info(
@@ -926,10 +1007,7 @@ async def run_server():
             recon_server.should_exit = True
             with contextlib.suppress(BaseException):
                 await recon_server.shutdown()
-        if watchdog_task is not None:
-            watchdog_task.cancel()
-            with contextlib.suppress(BaseException):
-                await watchdog_task
+        _stop_watchdog_thread()
         if janitor_task is not None:
             janitor_task.cancel()
             with contextlib.suppress(BaseException):
