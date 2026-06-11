@@ -24,7 +24,7 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -541,6 +541,7 @@ async def _ensure_verify_disk_space(
     merge_wt: Path,
     min_free_bytes: int,
     task_id: str,
+    keep_worktrees: Collection[Path] | None = None,
 ) -> str | None:
     """Pre-verify disk guard.  Returns a blocked-reason string (prefixed with
     ``TRANSIENT_INFRA_REASON_PREFIX``) when free space on *merge_wt*'s volume
@@ -577,7 +578,8 @@ async def _ensure_verify_disk_space(
         'pruning stale _merge-* worktrees before verify',
         task_id, free / gib, min_free_bytes / gib,
     )
-    pruned = await git_ops.prune_stale_merge_worktrees(keep=merge_wt)
+    keep = {merge_wt, *(keep_worktrees or ())}
+    pruned = await git_ops.prune_stale_merge_worktrees(keep=keep)
     try:
         free = shutil.disk_usage(merge_wt).free
     except OSError as exc:
