@@ -1870,6 +1870,7 @@ async def _reverify_rebased_tree(
     max_timeouts: int,
     max_enospc: int,
     merge_sha: str = '',
+    keep_worktrees: Collection[Path] | None = None,
 ) -> MergeOutcome | None:
     """Shared gate for the disjoint-delta re-verify check.
 
@@ -1905,6 +1906,10 @@ async def _reverify_rebased_tree(
         The current main SHA the branch was rebased onto.
     timeouts / enospc_retries / max_timeouts / max_enospc:
         Forwarded verbatim to ``_run_post_merge_verify``.
+    keep_worktrees:
+        Additional worktrees to protect from disk-guard pruning — forwarded
+        verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
+        legacy single-keep behaviour (only ``merge_wt`` is protected).
     """
     overlap = await _rebase_delta_touched_overlap(
         req.worktree, rebased_from, rebased_onto, git_ops,
@@ -1934,6 +1939,7 @@ async def _reverify_rebased_tree(
         max_timeouts=max_timeouts,
         max_enospc=max_enospc,
         merge_sha=merge_sha,
+        keep_worktrees=keep_worktrees,
     )
 
 
@@ -6978,6 +6984,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                     merge_sha=rebased_sha,
+                    keep_worktrees=set(self._owned_merge_worktrees),
                 )
                 if gate is not None:
                     # Overlapping delta, verify failed (or disk guard fired).
