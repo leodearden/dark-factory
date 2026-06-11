@@ -18620,3 +18620,363 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             await worker.stop()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestSnapshotInflightCollection — task-1736 (ε) steps 1/3
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSnapshotInflightCollection:
+    """ε: snapshot() surfaces ordered in-flight collection with host + age fields."""
+
+    async def test_snapshot_inflight_ordered_host_age(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ) -> None:
+        """snapshot() emits per-entry host, verify_started_at, verify_age_secs head-first.
+
+        RED: InflightEntry has no started_at field (TypeError on construction).
+        """
+        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.verify_runner import HostLease
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        now = time.time()
+        fake_runner = MagicMock()
+
+        req_a = _make_request('snap-a', 'snap-a', wt, config)
+        item_a = SpeculativeItem(
+            request=req_a, merge_result=None, merge_wt=wt / 'a',
+            base_sha='dead' * 10, speculative=False, skip_verify=False,
+        )
+        lease_local = HostLease(name='local', runner=fake_runner, is_local=True)
+        entry_a = InflightEntry(
+            item=item_a, lease=lease_local, verify_task=None, merge_wt=wt / 'a',
+            was_speculative=False, phase='verifying',
+            started_at=now - 5.0,  # RED: no started_at field on InflightEntry yet
+        )
+
+        req_b = _make_request('snap-b', 'snap-b', wt, config)
+        item_b = SpeculativeItem(
+            request=req_b, merge_result=None, merge_wt=wt / 'b',
+            base_sha='dead' * 10, speculative=False, skip_verify=False,
+        )
+        lease_remote = HostLease(name='laptop', runner=fake_runner, is_local=False)
+        entry_b = InflightEntry(
+            item=item_b, lease=lease_remote, verify_task=None, merge_wt=wt / 'b',
+            was_speculative=False, phase='verifying',
+            started_at=now - 2.0,
+        )
+
+        worker._inflight.append(entry_a)
+        worker._inflight.append(entry_b)
+
+        snap = worker.snapshot()
+        verifying = [e for e in snap['entries'] if e['state'] == 'verifying']
+
+        assert len(verifying) >= 2, f'Expected >=2 verifying entries; got: {verifying}'
+        assert verifying[0]['task_id'] == 'snap-a', 'Head entry must be snap-a'
+        assert verifying[1]['task_id'] == 'snap-b', 'Second entry must be snap-b'
+        assert verifying[0]['host'] == 'local', (
+            f"Head host must be 'local'; got: {verifying[0].get('host')}"
+        )
+        assert verifying[1]['host'] == 'laptop', (
+            f"Second host must be 'laptop'; got: {verifying[1].get('host')}"
+        )
+        assert verifying[0].get('verify_age_secs') is not None, (
+            'Head entry must have verify_age_secs'
+        )
+        assert verifying[0]['verify_age_secs'] >= 0.0
+        assert verifying[0].get('verify_started_at') is not None, (
+            'Head entry must have verify_started_at'
+        )
+
+    async def test_snapshot_no_phantom_when_inflight_empty(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ) -> None:
+        """verify_in_progress is None when _inflight empty, even if _verify_item is stale.
+
+        RED (step-3): current snapshot reads _verify_item for verify_in_progress,
+        producing a phantom non-None entry when _verify_item is never cleared.
+        """
+        from orchestrator.merge_queue import SpeculativeItem
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        req_stale = _make_request('phantom', 'phantom', wt, config)
+        item_stale = SpeculativeItem(
+            request=req_stale, merge_result=None, merge_wt=None,
+            base_sha='dead' * 10, speculative=False, skip_verify=False,
+        )
+        worker._verify_item = item_stale   # stale, never cleared -- the gamma latent bug
+        worker._verify_phase = 'verifying'
+        # _inflight is EMPTY
+
+        snap = worker.snapshot()
+
+        assert snap['verify_in_progress'] is None, (
+            f'verify_in_progress must be None when _inflight empty; '
+            f'got: {snap["verify_in_progress"]}'
+        )
+        phantom_entries = [e for e in snap['entries'] if e.get('state') == 'verifying']
+        assert len(phantom_entries) == 0, (
+            f'No verifying entries when _inflight empty; got: {phantom_entries}'
+        )
+
+    async def test_snapshot_verify_in_progress_mirrors_deque_head(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ) -> None:
+        """verify_in_progress.task_id matches the _inflight HEAD (not the singular field).
+
+        RED (step-3): verify_in_progress reads _verify_item (singular), so it is
+        None when _verify_item is not set, even if _inflight is non-empty.
+        """
+        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.verify_runner import HostLease
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        now = time.time()
+        fake_runner = MagicMock()
+
+        req_head = _make_request('head-task', 'head-task', wt, config)
+        item_head = SpeculativeItem(
+            request=req_head, merge_result=None, merge_wt=wt,
+            base_sha='dead' * 10, speculative=False, skip_verify=False,
+        )
+        entry_head = InflightEntry(
+            item=item_head,
+            lease=HostLease(name='local', runner=fake_runner, is_local=True),
+            verify_task=None, merge_wt=wt, was_speculative=False, phase='verifying',
+            started_at=now,
+        )
+
+        req_second = _make_request('second-task', 'second-task', wt, config)
+        item_second = SpeculativeItem(
+            request=req_second, merge_result=None, merge_wt=wt,
+            base_sha='dead' * 10, speculative=False, skip_verify=False,
+        )
+        entry_second = InflightEntry(
+            item=item_second,
+            lease=HostLease(name='laptop', runner=fake_runner, is_local=False),
+            verify_task=None, merge_wt=wt, was_speculative=False, phase='verifying',
+            started_at=now,
+        )
+
+        worker._inflight.append(entry_head)
+        worker._inflight.append(entry_second)
+
+        snap = worker.snapshot()
+
+        assert snap['head_of_line'] == 'head-task', (
+            f"head_of_line must be 'head-task'; got: {snap['head_of_line']}"
+        )
+        vip = snap['verify_in_progress']
+        assert vip is not None, (
+            'verify_in_progress must be non-None when _inflight is non-empty'
+        )
+        assert vip['task_id'] == 'head-task', (
+            f"verify_in_progress.task_id must be 'head-task'; got: {vip['task_id']}"
+        )
+
+        # Existing entry keys must still be present on in-flight entries
+        head_entry = snap['entries'][0]
+        for key in ('task_id', 'branch', 'state', 'enqueued_at', 'age_secs',
+                    'position', 'waiter_alive', 'worktree', 'pre_rebased', 'request_id', 'lane'):
+            assert key in head_entry, f'Entry key {key!r} missing from in-flight entry'
+
+
+# ---------------------------------------------------------------------------
+# TestHeartbeatOccupancy -- task-1736 (epsilon) step-5
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHeartbeatOccupancy:
+    """epsilon: heartbeat log line + event carry per-host in-flight occupancy."""
+
+    async def test_heartbeat_carries_occupancy(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps, caplog,
+    ) -> None:
+        """_maybe_log_queue_heartbeat + snapshot() carry occupancy with by_host mapping.
+
+        RED: snapshot has no 'occupancy' key; heartbeat line/event have no occupancy.
+        """
+        import json as _json
+        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.verify_runner import HostAllocator, HostLease
+
+        db_path = tmp_path / 'occ.db'
+        event_store = EventStore(db_path=db_path, run_id='occ-test')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker._heartbeat_interval_s = 1.0
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        now = time.time()
+        fake_runner = MagicMock()
+
+        # Allocator with local + laptop (hosts_total = 2)
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        worker._host_allocator = HostAllocator([fake_remote])
+
+        req_a = _make_request('hb-local', 'hb-local', wt, config)
+        item_a = SpeculativeItem(
+            request=req_a, merge_result=None, merge_wt=wt,
+            base_sha='dead' * 10, speculative=False, skip_verify=False,
+        )
+        entry_a = InflightEntry(
+            item=item_a,
+            lease=HostLease(name='local', runner=fake_runner, is_local=True),
+            verify_task=None, merge_wt=wt, was_speculative=False, phase='verifying',
+            started_at=now - 10.0,
+        )
+
+        req_b = _make_request('hb-laptop', 'hb-laptop', wt, config)
+        item_b = SpeculativeItem(
+            request=req_b, merge_result=None, merge_wt=wt,
+            base_sha='dead' * 10, speculative=False, skip_verify=False,
+        )
+        entry_b = InflightEntry(
+            item=item_b,
+            lease=HostLease(name='laptop', runner=fake_runner, is_local=False),
+            verify_task=None, merge_wt=wt, was_speculative=False, phase='verifying',
+            started_at=now - 5.0,
+        )
+
+        worker._inflight.append(entry_a)
+        worker._inflight.append(entry_b)
+
+        t0 = time.time()
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            result = worker._maybe_log_queue_heartbeat(t0)
+
+        assert result is True, 'Heartbeat must fire when depth > 0'
+
+        hb_records = [r for r in caplog.records if 'heartbeat' in r.message.lower()]
+        assert len(hb_records) >= 1, (
+            f'Expected heartbeat log; got: {[r.message for r in caplog.records]}'
+        )
+        msg = hb_records[0].message
+        assert 'local' in msg, f"Log must mention 'local' host; got: {msg!r}"
+        assert 'laptop' in msg, f"Log must mention 'laptop' host; got: {msg!r}"
+        assert 'hb-local' in msg, f"Log must mention task 'hb-local'; got: {msg!r}"
+        assert 'hb-laptop' in msg, f"Log must mention task 'hb-laptop'; got: {msg!r}"
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT json_extract(data, '$.occupancy') "
+            "FROM events WHERE event_type = 'merge_heartbeat'"
+        ).fetchone()
+        conn.close()
+        assert row is not None and row[0] is not None, (
+            f'merge_heartbeat event must have occupancy field; row={row}'
+        )
+        occ = _json.loads(row[0])
+        assert occ['hosts_total'] == 2, f"hosts_total must be 2; got: {occ}"
+        assert occ['hosts_busy'] == 2, f"hosts_busy must be 2; got: {occ}"
+        assert occ['by_host'].get('local') == 'hb-local', (
+            f"by_host[local] must be 'hb-local'; got: {occ['by_host']}"
+        )
+        assert occ['by_host'].get('laptop') == 'hb-laptop', (
+            f"by_host[laptop] must be 'hb-laptop'; got: {occ['by_host']}"
+        )
+
+        snap = worker.snapshot()
+        assert 'occupancy' in snap, f"snapshot must have 'occupancy' key; keys={list(snap)}"
+        socc = snap['occupancy']
+        assert socc['hosts_total'] == 2
+        assert socc['hosts_busy'] == 2
+        assert socc['by_host'] == {'local': 'hb-local', 'laptop': 'hb-laptop'}
+
+
+# ---------------------------------------------------------------------------
+# TestEntryPhaseDuringFinalize -- task-1736 (epsilon) step-7
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEntryPhaseDuringFinalize:
+    """epsilon: entry.phase is updated to 'finalizing' during _finalize_inflight."""
+
+    async def test_entry_phase_set_to_finalizing_before_advance_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """entry.phase == 'finalizing' when advance_main is called in _finalize_inflight.
+
+        RED: _finalize_inflight sets self._verify_phase='finalizing' but NOT entry.phase,
+        so entry.phase stays 'verifying' (stale dispatch-time value).
+        """
+        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.verify_runner import HostLease
+
+        branch = 'ep-finalize-a'
+        wt = await _make_branch_with_file(git_ops, branch, 'ep_a.py', 'x=1\n')
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id=branch, branch=branch, worktree=wt, pre_rebased=False,
+            task_files=None, module_configs=[], config=config,
+            result=loop.create_future(), lane='normal',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success and merge_result.merge_commit
+
+        base_sha = await git_ops.get_main_sha()
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        mock_allocator = MagicMock()
+        mock_allocator.release = AsyncMock()
+        mock_allocator.cancel_and_release = AsyncMock()
+        worker._host_allocator = mock_allocator
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = InflightEntry(
+            item=item, lease=lease, verify_task=None,
+            merge_wt=item.merge_wt, was_speculative=False, phase='verifying',
+            started_at=time.time(), verify_result=None, passthrough_outcome=None, status=None,
+        )
+
+        captured_phase: list[str] = []
+        original_advance = git_ops.advance_main
+
+        async def _capturing_advance(*args, **kwargs):
+            captured_phase.append(entry.phase)
+            return await original_advance(*args, **kwargs)
+
+        git_ops.advance_main = _capturing_advance
+        try:
+            with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+                advanced = await worker._finalize_inflight(entry)
+        finally:
+            git_ops.advance_main = original_advance
+
+        assert advanced is True, f'Expected True (advanced); got: {advanced}'
+        assert len(captured_phase) >= 1, 'advance_main must have been called at least once'
+        assert captured_phase[0] == 'finalizing', (
+            f"entry.phase at advance_main must be 'finalizing'; got: {captured_phase[0]!r}"
+        )
