@@ -413,7 +413,6 @@ class TestEnsureHostAllocator:
 
     def test_returns_host_allocator_with_remote_for_enabled_runner(self, tmp_path):
         """With enabled_verify_runners=['laptop'], allocator.host_names includes 'laptop'."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
         from orchestrator.verify_runner import HostAllocator
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
@@ -439,8 +438,6 @@ class TestEnsureHostAllocator:
 
     def test_shared_quarantine_set_is_worker_quarantine(self, tmp_path):
         """Mutating the allocator's quarantine set is visible in worker._runner_quarantine."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
-
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         worker = self._make_worker(project_root=tmp_path)
 

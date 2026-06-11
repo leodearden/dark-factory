@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Fake runners (no real I/O, no real subprocess)
 # ---------------------------------------------------------------------------
@@ -116,7 +115,6 @@ class TestHostAllocatorConstructionAsync:
         def factory():
             return sentinel
 
-        from orchestrator.verify_runner import HostAllocator
         alloc = self._make_allocator()
         lease = await alloc.acquire(factory)
         assert lease is not None
@@ -184,10 +182,11 @@ class TestHostAllocatorAcquireRelease:
         alloc = self._make_allocator()
         assert alloc.free_host_count() == 3
         l1 = await alloc.acquire(self._local_factory)
+        assert l1 is not None
         assert alloc.free_host_count() == 2
-        l2 = await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory)
         assert alloc.free_host_count() == 1
-        l3 = await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory)
         assert alloc.free_host_count() == 0
 
         # release local → local slot freed → prefer-local again
@@ -198,7 +197,8 @@ class TestHostAllocatorAcquireRelease:
         """After releasing the local slot, the next acquire again returns local."""
         alloc = self._make_allocator()
         local_lease = await alloc.acquire(self._local_factory)
-        remote_lease = await alloc.acquire(self._local_factory)
+        assert local_lease is not None
+        await alloc.acquire(self._local_factory)
         await alloc.release(local_lease)
 
         # Local slot freed — next acquire should prefer local
@@ -211,6 +211,7 @@ class TestHostAllocatorAcquireRelease:
         """Double-release is a no-op — no error, slot stays FREE."""
         alloc = self._make_allocator()
         lease = await alloc.acquire(self._local_factory)
+        assert lease is not None
         await alloc.release(lease)
         await alloc.release(lease)  # idempotent
         assert alloc.free_host_count() == 3
@@ -252,6 +253,7 @@ class TestHostAllocatorQuarantine:
         alloc = self._make_allocator()
         await alloc.acquire(self._local_factory)           # local
         remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        assert remote_lease is not None
         before = alloc.free_host_count()
         await alloc.quarantine_and_release(remote_lease)
         assert alloc.free_host_count() == before + 1
@@ -262,6 +264,7 @@ class TestHostAllocatorQuarantine:
         alloc = self._make_allocator(shared_quarantine=shared_q)
         await alloc.acquire(self._local_factory)           # local
         remote_a_lease = await alloc.acquire(self._local_factory)  # remoteA
+        assert remote_a_lease is not None
         await alloc.quarantine_and_release(remote_a_lease)  # quarantine remoteA
 
         # Next acquire (local still busy) should return remoteB, not remoteA
@@ -282,6 +285,7 @@ class TestHostAllocatorQuarantine:
         shared_q: set[str] = set()
         alloc = self._make_allocator(shared_quarantine=shared_q)
         local_lease = await alloc.acquire(self._local_factory)
+        assert local_lease is not None
         await alloc.quarantine_and_release(local_lease)
 
         assert 'local' not in shared_q
@@ -362,6 +366,7 @@ class TestHostAllocatorCancelRelease:
 
         await alloc.acquire(self._local_factory)    # local
         remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        assert remote_lease is not None
         await alloc.cancel_and_release(remote_lease)
 
         # Still local-busy; remoteA should be acquirable
@@ -404,6 +409,7 @@ class TestHostAllocatorCancelFail:
 
         await alloc.acquire(self._local_factory)
         remote_lease = await alloc.acquire(self._local_factory)
+        assert remote_lease is not None
 
         async def noop_sleep(_: float) -> None:
             pass
@@ -431,6 +437,7 @@ class TestHostAllocatorCancelFail:
 
         await alloc.acquire(self._local_factory)
         remote_lease = await alloc.acquire(self._local_factory)  # remoteA
+        assert remote_lease is not None
 
         # We'll run cancel_and_release in a task so we can probe mid-flight
         # Use a sleep that lets us observe the parked state
@@ -459,6 +466,7 @@ class TestHostAllocatorCancelFail:
 
         await alloc.acquire(self._local_factory)
         remote_lease = await alloc.acquire(self._local_factory)
+        assert remote_lease is not None
 
         async def noop_sleep(_: float) -> None:
             pass
@@ -481,6 +489,7 @@ class TestHostAllocatorCancelFail:
 
         await alloc.acquire(self._local_factory)
         remote_lease = await alloc.acquire(self._local_factory)
+        assert remote_lease is not None
 
         async def noop_sleep(_: float) -> None:
             pass

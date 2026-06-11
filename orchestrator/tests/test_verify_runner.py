@@ -3671,7 +3671,7 @@ class TestRemoteRunnerCancelVerify:
             run=fake_run,
             id_factory=lambda: 'req-42',
         )
-        runner._calls_tracking = calls
+        runner._calls = calls
         return runner
 
     async def test_cancel_verify_no_inflight_returns_zero_no_ssh(self):
@@ -3679,7 +3679,7 @@ class TestRemoteRunnerCancelVerify:
         runner = self._make_runner()
         rc = await runner.cancel_verify()
         assert rc == 0
-        ssh_calls = [c for c in runner._calls_tracking if c[0] == 'ssh']
+        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
         assert len(ssh_calls) == 0
 
     async def test_cancel_verify_issues_correct_argv(self):
@@ -3690,7 +3690,7 @@ class TestRemoteRunnerCancelVerify:
         runner._inflight_request_id = 'req-42'
         await runner.cancel_verify()
 
-        ssh_calls = [c for c in runner._calls_tracking if c[0] == 'ssh']
+        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
         assert len(ssh_calls) == 1
         argv = ssh_calls[0]
 
@@ -3711,7 +3711,7 @@ class TestRemoteRunnerCancelVerify:
         runner._inflight_request_id = 'req-42'
         await runner.cancel_verify()
 
-        ssh_calls = [c for c in runner._calls_tracking if c[0] == 'ssh']
+        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
         remote_cmd = ssh_calls[0][-1]
         parsed = _shlex.split(remote_cmd)
         cfg_idx = parsed.index('--config')
@@ -3730,7 +3730,7 @@ class TestRemoteRunnerCancelVerify:
         result = await runner.probe_clean()
         assert result is True
 
-        ssh_calls = [c for c in runner._calls_tracking if c[0] == 'ssh']
+        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
         assert len(ssh_calls) == 1
         remote_cmd = ssh_calls[0][-1]
         assert 'pgrep' in remote_cmd
