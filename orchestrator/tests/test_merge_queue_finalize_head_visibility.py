@@ -33,11 +33,10 @@ from orchestrator.merge_queue import (
     InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
-    SpeculativeMergeWorker,
     SpeculativeItem,
+    SpeculativeMergeWorker,
 )
 from orchestrator.verify_runner import HostLease
-
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -417,7 +416,6 @@ class TestFinalizingHeadLifecycle:
         content: str,
     ):
         """Build a real merged item so _finalize_inflight's merge_result path works."""
-        from orchestrator.git_ops import _run as _git_run
         from orchestrator.merge_queue import SpeculativeItem
 
         # Create branch with file
