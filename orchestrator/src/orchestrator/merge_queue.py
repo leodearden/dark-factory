@@ -7354,6 +7354,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         6b).  When verify_task is None (compat shim / pre-established pass) there is
         no vr, so warm_results defaults to {}, matching the pre-refactor behaviour.
         """
+        # Finalize-head observability: set _finalizing_head so snapshot() surfaces
+        # this entry while we await entry.verify_task.  There is no await between
+        # _inflight.popleft() (caller) and this assignment (asyncio single-loop),
+        # so the field's set window exactly covers the invisible finalize gap.
+        # Cleared at the end of the inner finally below — covers all return / exception paths.
+        self._finalizing_head = entry
+
         item = entry.item
         req = item.request
 
@@ -7675,6 +7682,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # _n_failed_val is set by non-PASS branches; None means use 'not advanced'
             # (the PASS-path semantics: True when CAS failed, False when advanced).
             self._n_failed = _n_failed_val if _n_failed_val is not None else not advanced
+            # Clear finalize-head observability window — covers all return/exception paths.
+            self._finalizing_head = None
 
     async def _dispatch_item(
         self,

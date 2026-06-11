@@ -90,7 +90,6 @@ def _make_req(
     git_repo: Path,
 ) -> MergeRequest:
     """Build a minimal MergeRequest with a fresh event-loop future."""
-    loop = asyncio.get_event_loop()
     return MergeRequest(
         task_id=task_id,
         branch=branch,
@@ -99,7 +98,7 @@ def _make_req(
         task_files=None,
         module_configs=[],
         config=config,
-        result=loop.create_future(),
+        result=asyncio.get_running_loop().create_future(),
         lane='normal',
     )
 
@@ -426,7 +425,6 @@ class TestFinalizingHeadLifecycle:
         (worktree / filename).write_text(content)
         await git_ops.commit(worktree, f'Add {filename}')
 
-        loop = asyncio.get_event_loop()
         req = MergeRequest(
             task_id=branch,
             branch=branch,
@@ -435,7 +433,7 @@ class TestFinalizingHeadLifecycle:
             task_files=None,
             module_configs=[],
             config=config,
-            result=loop.create_future(),
+            result=asyncio.get_running_loop().create_future(),
             lane='normal',
         )
         merge_result = await git_ops.merge_to_main(worktree, branch)
