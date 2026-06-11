@@ -4769,6 +4769,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # so snapshot() can surface it between queue-pop and _inflight append.
         # Cleared to None immediately after _remerge() returns.
         self._remerging_item: MergeRequest | None = None
+        # Finalize-head window observability: set to the InflightEntry that was
+        # popped from _inflight by popleft() and passed to _finalize_inflight().
+        # Without this, the head is invisible to snapshot() for the entire
+        # duration of `await entry.verify_task` inside _finalize_inflight —
+        # the same transient-window pattern as _remerging_item and _inflight_req.
+        # Set at the top of _finalize_inflight; cleared in its finally clause.
+        self._finalizing_head: InflightEntry | None = None
         # Persistent warm merge-verify worktree: counts verifying attempts so
         # _safety_valve_due can fire the periodic cold-verify (PRD §10 invariant 6).
         # Only incremented when not item.skip_verify; never reset so the counter
@@ -5143,6 +5150,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'verify_started_at': None,
                 'verify_age_secs': None,
             }
+
+        # 0. Finalize-head window: item popped from _inflight for finalization but
+        # not yet complete.  Prepended at position 0 so it remains head-of-line —
+        # it is the submission-order head.  Mirrors _remerging_item (section 1b)
+        # and _inflight_req (section 3) — same transient-window side-field pattern.
+        if self._finalizing_head is not None:
+            _fh = self._finalizing_head
+            _fh_req = _fh.item.request
+            _fh_host = _fh.lease.name if _fh.lease is not None else None
+            _e0 = _entry(
+                _fh_req,
+                _fh.phase or 'verifying',
+                worktree_path=_fh.merge_wt,
+                position=0,
+            )
+            _e0['host'] = _fh_host
+            _e0['verify_started_at'] = _fh.started_at
+            _e0['verify_age_secs'] = (
+                max(0.0, now - _fh.started_at)
+                if _fh.started_at is not None else None
+            )
+            entries.append(_e0)
 
         # 1. In-flight verify entries: iterate self._inflight head-first.
         # self._inflight is the sole source of truth for concurrent-verify state.
