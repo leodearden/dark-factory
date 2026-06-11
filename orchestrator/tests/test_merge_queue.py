@@ -8121,12 +8121,15 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
 
-        # Pre-seed two fake paths in the ledger before the merge is processed.
+        # Pre-seed two fake paths in the ledger BEFORE the worker task is
+        # started, so there is no implicit ordering assumption on the queue
+        # being empty when the assignment fires.
         p1 = git_ops.worktree_base / '_merge-fake-p1'
         p2 = git_ops.worktree_base / '_merge-fake-p2'
         worker._owned_merge_worktrees = {p1, p2}
+
+        worker_task = asyncio.create_task(worker.run())
 
         captured: dict = {}
 

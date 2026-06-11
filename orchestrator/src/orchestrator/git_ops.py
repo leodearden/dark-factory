@@ -2108,6 +2108,12 @@ class GitOps:
         (PRD §10 invariant 4).
         """
         removed: list[str] = []
+        if isinstance(keep, (str, bytes)):
+            raise TypeError(
+                f'prune_stale_merge_worktrees: keep must be a Path, '
+                f'Collection[Path], or None — got {type(keep).__name__!r}; '
+                f'wrap in Path(...) if a string path was intended'
+            )
         if keep is None:
             keep_resolved: set[Path] = set()
         elif isinstance(keep, Path):

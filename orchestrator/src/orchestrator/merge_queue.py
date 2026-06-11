@@ -722,6 +722,13 @@ async def _run_post_merge_verify(
             ``set(worker._owned_merge_worktrees)`` from
             :class:`SpeculativeMergeWorker` to protect all in-flight + queued
             speculative worktrees (PRD §5 decision 5).
+
+            **Snapshot timing:** The caller's keep-set is a one-shot snapshot
+            taken at dispatch.  Worktrees registered into the ledger *after*
+            this snapshot is taken are not protected by prunes triggered inside
+            this call — they rely on the heartbeat mtime / grace-period
+            mechanism to avoid premature removal in the residual window between
+            snapshot capture and prune execution.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
