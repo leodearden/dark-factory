@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import RequeueRecord, Scheduler
+from orchestrator.scheduler import RequeueRecord, Scheduler, is_transient_api_requeue
 
 # --- Fixtures -----------------------------------------------------------------
 
@@ -77,6 +77,38 @@ class TestTransientRequeueCapConfig:
     def test_zero_raises_validation_error(self, tmp_path: Path):
         with pytest.raises(ValidationError):
             OrchestratorConfig(project_root=tmp_path, transient_requeue_cap=0)
+
+
+# --- is_transient_api_requeue predicate --------------------------------------
+
+
+class TestIsTransientApiRequeue:
+    @pytest.mark.parametrize('reason', [
+        'Planning failed: agent API error: HTTP 529',
+        'agent API error: HTTP 500',
+        'agent API error: HTTP 503',
+        'agent API error: HTTP 599',
+    ])
+    def test_true_for_5xx(self, reason: str):
+        assert is_transient_api_requeue(reason) is True
+
+    @pytest.mark.parametrize('reason', [
+        'agent API error: HTTP 400',
+        'agent API error: HTTP 401',
+        'agent API error: HTTP 429',
+        'architect returned empty output',
+        None,
+        '',
+    ])
+    def test_false_for_non_transient(self, reason):
+        assert is_transient_api_requeue(reason) is False
+
+    def test_producer_classifier_contract(self):
+        """Pin the cross-module marker: classify_agent_failure(HTTP 529) -> is_transient."""
+        from shared.cli_invoke import AgentResult, classify_agent_failure
+        result = AgentResult(success=False, output='', api_error_status=529)
+        cls = classify_agent_failure(result)
+        assert is_transient_api_requeue(f'Planning failed: {cls.summary}') is True
 
 
 # --- Counter mechanics --------------------------------------------------------

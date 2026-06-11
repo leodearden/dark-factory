@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from collections import deque
 from collections.abc import Callable
@@ -60,6 +61,7 @@ __all__ = [
     'extract_rejection',
     'extract_structured_rejection',
     'is_transient_rejection',
+    'is_transient_api_requeue',
 ]
 
 
@@ -251,6 +253,29 @@ def is_transient_rejection(rejection: str | None) -> bool:
     if not rejection:
         return False
     return any(name in rejection for name in TRANSIENT_ERROR_TYPES)
+
+
+# Marker produced solely by shared.cli_invoke.classify_agent_failure for
+# AgentFailureKind.API_ERROR (cli_invoke.py:362-366).  All phases wrap it
+# verbatim into block_reason (workflow.py:2222/2298/2599).
+_API_ERROR_REASON_RE = re.compile(r'agent API error: HTTP (\d{3})')
+
+
+def is_transient_api_requeue(reason: str | None) -> bool:
+    """True when *reason* encodes a transient server-side (HTTP 5xx) API error.
+
+    Matches the ``"agent API error: HTTP <status>"`` marker (present in
+    block_reason regardless of workflow phase) and classifies HTTP 5xx
+    (500-599, including 529 Overloaded) as transient.  HTTP 4xx (client/auth
+    errors) and non-API reasons return False and still count against
+    ``requeue_cap``.
+    """
+    if not reason:
+        return False
+    m = _API_ERROR_REASON_RE.search(reason)
+    if m is None:
+        return False
+    return 500 <= int(m.group(1)) <= 599
 
 
 @dataclass(frozen=True)
