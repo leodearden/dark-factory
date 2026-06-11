@@ -15,6 +15,13 @@ import click
 from dotenv import load_dotenv
 
 from orchestrator.config import ConfigRequiredError, load_config
+from orchestrator.verify_cancel import (
+    cancel_request,
+    pgid_file,
+    remove_pgid_file,
+    start_own_process_group,
+    write_pgid_file,
+)
 
 load_dotenv()  # loads .env into os.environ (e.g. CLAUDE_OAUTH_TOKEN_A/B)
 
@@ -284,7 +291,16 @@ def status(config_path: Path | None):
               help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
                    'is set). Selects the target project — sets project_root and '
                    'fused_memory.project_id.')
-def verify_merge(sha: str, spec_json: str, config_path: Path | None):
+@click.option('--request-id', default=None,
+              help='Optional request ID for cancellation support (task 1732 α).  '
+                   'When provided: joins a new process group via setsid, writes the pgid to '
+                   '<worktree_base>/.merge_verify_pgids/<request-id> at startup, and removes '
+                   'it on exit (normal or exceptional).  A concurrent '
+                   '``orchestrator cancel-verify --request-id X`` can then kill the entire '
+                   'descendant tree (including start_new_session build escapes).  '
+                   'Absent → today\'s exact behavior, back-compat.  '
+                   'RemoteRunner wiring is deferred to tasks β/γ.')
+def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id: str | None):
     """Run the merge-verify bundle at a given SHA and emit a VerifyResult JSON to stdout.
 
     Materialises a detached worktree at --sha, runs the same scoped + unscoped
@@ -299,6 +315,14 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None):
     mirroring κ invariants 1–6 on the laptop host.  The periodic from-scratch
     safety valve (invariant 6) is driven by a disk-persistent per-host attempt
     counter so it fires correctly even across stateless CLI invocations.
+
+    When ``--request-id`` is supplied, the subcommand also calls ``os.setsid``
+    (via :func:`~orchestrator.verify_cancel.start_own_process_group`) to join a
+    new process group and writes its pgid to
+    ``<worktree_base>/.merge_verify_pgids/<request-id>``.  The file is removed
+    on exit.  A concurrent ``orchestrator cancel-verify --request-id X`` reads
+    the file and kills the full descendant tree (capturing ``start_new_session``
+    build escapes via a ``/proc`` PPID walk) plus a ``killpg`` backstop.
 
     Consumer: RemoteRunner (δ) parses stdout as a VerifyResult.
     """
@@ -321,6 +345,15 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None):
         click.echo(f'Error: invalid --spec: {e}', err=True)
         sys.exit(1)
 
+    # Cancellation support: write pgid file before starting work so that a
+    # concurrent `cancel-verify --request-id X` can locate and kill this process.
+    pgf: Path | None = None
+    if request_id is not None:
+        git_ops_for_path = GitOps(config.git, config.project_root)
+        pgf = pgid_file(git_ops_for_path.worktree_base, request_id)
+        pgid = start_own_process_group()
+        write_pgid_file(pgf, pgid)
+
     async def _run():
         git_ops = GitOps(config.git, config.project_root)
         wt = await git_ops.acquire_host_verify_worktree(sha)
@@ -334,6 +367,10 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None):
     except Exception as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
+    finally:
+        # Always remove the pgid file so cancel-verify knows this run is done.
+        if pgf is not None:
+            remove_pgid_file(pgf)
 
     click.echo(result_to_json(result))
 
