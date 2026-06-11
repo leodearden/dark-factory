@@ -111,3 +111,10 @@ extension of an already-greenlit lever.
 - A waiting single with a recent verify failure → **excluded** from the train, merges solo.
 - The in-flight/verifying request is **never** absorbed; a request whose waiter detached
   mid-pass is skipped without resolving its (already-cancelled) future.
+
+## Enablement note
+
+`merge_train_coalesce_enabled` activation for reify is folded into integration gate ζ/1722
+(user-authorized 2026-06-10 — merge throughput remains the bottleneck; no soak gate required).
+dark-factory keeps the default (`false`) in its own `orchestrator/config.yaml`; reify opts in
+via its `orchestrator.yaml` alongside `merge_train_former_enabled: true`.
