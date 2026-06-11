@@ -8159,18 +8159,21 @@ async def _run_drift_check(
     escalation_queue: Any,
     event_store: EventStore | None,
     quarantine_set: set[str],
+    *,
+    allocator: HostAllocator | None = None,
 ) -> None:
     """Drift detective control: run DriftDetector.check in a throwaway worktree.
 
     Mirrors ``_run_cold_shadow_verify`` / ``_run_shadow_compare`` as an
     off-serial-lane detective control (spawned via :func:`_maybe_run_drift_check`).
     Creates a throwaway verify worktree, builds a 2-host pool (local trust-anchor
-    + eligible remote from config), runs :meth:`~orchestrator.verify_runner.DriftDetector.check`,
+    + eligible remote), runs :meth:`~orchestrator.verify_runner.DriftDetector.check`,
     and propagates any quarantined remote name into *quarantine_set* (the worker-
     level shared set consulted by ``_run_post_merge_verify``).
 
     Exceptions are caught and logged so this detective control never crashes the
-    worker.  ``cleanup_merge_worktree`` is called in a ``finally`` block.
+    worker.  ``cleanup_merge_worktree`` and allocator slot releases are always
+    called in the ``finally`` block.
 
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
@@ -8179,14 +8182,19 @@ async def _run_drift_check(
         escalation_queue: Live escalation queue (None-safe: passed to DriftDetector).
         event_store: Optional event store (None-safe: passed to DriftDetector).
         quarantine_set: Worker-level mutable set; quarantined remote names are
-            added here so subsequent ``_run_post_merge_verify`` dispatches
-            skip the diverged remote (in-memory protection until restart).
+            added here so subsequent dispatches skip the diverged remote.
+        allocator: Worker-lifetime :class:`~orchestrator.verify_runner.HostAllocator`
+            (β decision 5).  When provided, both host slots are acquired via the
+            allocator and released in the finally block.  Fallback to the legacy
+            ``_build_remote_runners`` pool when ``None`` (backward-compatible).
     """
     # wt is initialised before the try so the finally guard (`if wt is not None`)
     # is safe even when create_throwaway_verify_worktree itself raises.  Moving the
     # creation inside the try ensures the docstring contract ("Exceptions are caught
     # and logged") holds for all failure modes — disk-full / git errors included.
     wt = None
+    local_lease = None
+    remote_lease = None
     try:
         wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
         task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
@@ -8197,16 +8205,52 @@ async def _run_drift_check(
             if derived:
                 task_files_tuple = tuple(derived)
         spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
-        pool = VerifyRunnerPool(
-            [LocalRunner(
-                wt, req.config, req.module_configs, task_files_tuple,
-                run_scoped=run_scoped_verification,
-                run_unscoped=_run_unscoped_typechecks,
+
+        if allocator is not None:
+            # β decision 5: acquire both hosts through the allocator so slot
+            # accounting is respected (≤1 verify-merge per host at any time).
+            # The local runner is built lazily inside the factory so the
+            # throwaway worktree path is constructed only when the slot is free.
+            _ttf = task_files_tuple  # capture for closure
+
+            def _local_factory() -> LocalRunner:
+                return LocalRunner(
+                    wt, req.config, req.module_configs, _ttf,
+                    run_scoped=run_scoped_verification,
+                    run_unscoped=_run_unscoped_typechecks,
+                    task_id=req.task_id,
+                )
+
+            local_lease = allocator._acquire_local(_local_factory)
+            remote_lease = allocator._acquire_remote()
+            if local_lease is None or remote_lease is None:
+                logger.debug(
+                    'Drift check skipped for task %s: host slots unavailable '
+                    '(local_free=%s, remote_free=%s)',
+                    req.task_id,
+                    local_lease is not None,
+                    remote_lease is not None,
+                )
+                return
+            pool = VerifyRunnerPool(
+                [local_lease.runner, remote_lease.runner],
+                event_store=event_store,
                 task_id=req.task_id,
-            ), *_build_remote_runners(req.config, wt, quarantine=quarantine_set)],
-            event_store=event_store,
-            task_id=req.task_id,
-        )
+            )
+        else:
+            # Legacy fallback: build fresh pool via _build_remote_runners (no
+            # slot accounting — used when allocator is not threaded in yet).
+            pool = VerifyRunnerPool(
+                [LocalRunner(
+                    wt, req.config, req.module_configs, task_files_tuple,
+                    run_scoped=run_scoped_verification,
+                    run_unscoped=_run_unscoped_typechecks,
+                    task_id=req.task_id,
+                ), *_build_remote_runners(req.config, wt, quarantine=quarantine_set)],
+                event_store=event_store,
+                task_id=req.task_id,
+            )
+
         # Cadence is already enforced upstream in _maybe_run_drift_check
         # (_drift_land_count % every_n gate).  DriftDetector.should_sample is
         # never called on this path, so omitting every_n_lands here keeps a
@@ -8231,6 +8275,11 @@ async def _run_drift_check(
             exc_info=True,
         )
     finally:
+        if allocator is not None:
+            if local_lease is not None:
+                await allocator.release(local_lease)
+            if remote_lease is not None:
+                await allocator.release(remote_lease)
         if wt is not None:
             await git_ops.cleanup_merge_worktree(wt)
 
@@ -8269,6 +8318,7 @@ async def _maybe_run_drift_check(
             git_ops, req, merge_commit,
             worker._escalation_queue, worker._event_store,
             worker._runner_quarantine,
+            allocator=worker._ensure_host_allocator(req.config),
         )
         _task = asyncio.create_task(_coro)
         if not isinstance(_task, asyncio.Task):
