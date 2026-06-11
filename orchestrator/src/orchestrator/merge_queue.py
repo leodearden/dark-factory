@@ -6782,8 +6782,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _finalize_inflight's job) except on exception (error path resolves
         immediately so the item does not stall the queue).
 
-        Note: the abort-poll loop (abandon / operator-halt polling) is added
-        in step-8; this step-6 version awaits the verify directly.
+        Abort-poll: wraps the inner verify in a VERIFY_ABANDON_POLL_SECS poll
+        loop so sole-waiter abandon and operator-halt can abort mid-verify.
+        Abandon-wins ordering matches _verify_and_advance: abandon (trigger 1)
+        is checked before halt (trigger 2) when both land simultaneously.
         """
         req = item.request
         merge_wt = item.merge_wt
@@ -6841,7 +6843,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
             ))
-            out = await verify_task
+            while True:
+                done, _ = await asyncio.wait(
+                    {verify_task},
+                    timeout=self.VERIFY_ABANDON_POLL_SECS,
+                )
+                if verify_task in done:
+                    out = verify_task.result()
+                    break
+                # Abort trigger 1 — sole-waiter gave up (future cancelled):
+                # DROP the request.  Checked first so a gave-up waiter wins
+                # over the operator-halt re-queue when both hold simultaneously.
+                if self._request_abandoned(req):
+                    verify_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await verify_task
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    return InflightVerifyResult(
+                        outcome=None,
+                        merge_wt=None,
+                        status='DROPPED',
+                    )
+                # Abort trigger 2 — operator halt: terminate the in-flight
+                # verify and RE-QUEUE the merge for re-verify after un-halt.
+                # req.result is left pending; per-task retry counters untouched.
+                if self._operator_halt.is_set():
+                    logger.warning(
+                        'Task %s: operator halt — aborting in-flight verify '
+                        'and re-queuing merge for re-verify after un-halt',
+                        req.task_id,
+                    )
+                    verify_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await verify_task
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    self._queue.put_nowait(req)
+                    return InflightVerifyResult(
+                        outcome=None,
+                        merge_wt=None,
+                        status='REQUEUED',
+                    )
         except Exception as exc:
             logger.info(
                 f'Task {req.task_id}: verify end '
