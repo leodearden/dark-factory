@@ -289,6 +289,7 @@ class TestTerminateProcessGroup:
                 return 0
 
         await terminate_process_group(FakeProc(), fake_pgid, grace_secs=0.1)  # type: ignore[arg-type]
+        assert calls == []
 
 
 class TestSnapshotProcessGroup:
@@ -345,4 +346,3 @@ class TestSnapshotProcessGroup:
         assert isinstance(result_invalid, str), (
             f'Expected str, got {type(result_invalid)}'
         )
-        assert calls == []
