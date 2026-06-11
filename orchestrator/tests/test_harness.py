@@ -271,6 +271,5 @@ class TestHarnessMergeLivenessGuard:
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
 
-        with patch('orchestrator.merge_queue.TOUCH_MISS_TOLERANCE', 1000):
-            with pytest.raises(MergeLivenessConfigError):
-                await harness._start_merge_worker()
+        with patch('orchestrator.merge_queue.TOUCH_MISS_TOLERANCE', 1000), pytest.raises(MergeLivenessConfigError):
+            await harness._start_merge_worker()
