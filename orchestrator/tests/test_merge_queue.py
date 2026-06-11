@@ -8105,6 +8105,109 @@ class TestEnospcTransientInfraRetry:
             await worker_task
 
 
+@pytest.mark.asyncio
+class TestSpeculativeMergeWorkerLedgerAwarePrune:
+    """SpeculativeMergeWorker passes a ledger snapshot as keep_worktrees and the
+    end-to-end prune removes only the orphan."""
+
+    async def test_worker_passes_ledger_snapshot_to_post_merge_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Worker passes keep_worktrees = snapshot of _owned_merge_worktrees;
+        the snapshot is a distinct object (copy, not live reference)."""
+        wt = await _make_branch_with_file(
+            git_ops, 'ledger-snap', 'snap.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Pre-seed two fake paths in the ledger before the merge is processed.
+        p1 = git_ops.worktree_base / '_merge-fake-p1'
+        p2 = git_ops.worktree_base / '_merge-fake-p2'
+        worker._owned_merge_worktrees = {p1, p2}
+
+        captured: dict = {}
+
+        async def _recording_verify(*args, **kwargs):
+            captured.update(kwargs)
+            return None  # verify passes
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _recording_verify):
+            req = _make_request('ledger-snap', 'ledger-snap', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'unexpected: {outcome}'
+        # The worker must have forwarded keep_worktrees.
+        assert 'keep_worktrees' in captured, (
+            'expected keep_worktrees kwarg passed to _run_post_merge_verify'
+        )
+        kw = captured['keep_worktrees']
+        # p1 and p2 were in the ledger before the merge was processed.
+        assert p1 in kw, f'p1 not in keep_worktrees: {kw}'
+        assert p2 in kw, f'p2 not in keep_worktrees: {kw}'
+        # Must be a snapshot copy, not the live ledger reference.
+        assert kw is not worker._owned_merge_worktrees, (
+            'keep_worktrees must be a snapshot copy, not the live ledger set'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_disk_pressure_prune_removes_only_orphan_through_worker(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """End-to-end: disk guard fires, real prune runs, only the orphan is
+        removed; all ledger worktrees survive."""
+        wt = await _make_branch_with_file(
+            git_ops, 'e2e-prune', 'e2e.py', 'y = 2\n',
+        )
+
+        # Two extra _merge-* worktrees: they're in the ledger (simulating
+        # other in-flight verifies) and must survive the prune.
+        keep_a, _ = await git_ops._create_merge_worktree()
+        keep_b, _ = await git_ops._create_merge_worktree()
+        # Orphan: real git worktree, NOT registered in the ledger.
+        orphan, _ = await git_ops._create_merge_worktree()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Register keep_a / keep_b in the ledger; orphan is NOT registered.
+        worker._register_owned_merge_worktree(keep_a)
+        worker._register_owned_merge_worktree(keep_b)
+
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        mock_verify = AsyncMock(return_value=passing)
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
+            patch(
+                'orchestrator.merge_queue.shutil.disk_usage',
+                side_effect=[_usage(2 * _GIB), _usage(15 * _GIB)],
+            ),
+        ):
+            req = _make_request('e2e-prune', 'e2e-prune', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'unexpected: {outcome}'
+        # Only the orphan should be gone; both ledger worktrees survive.
+        assert not orphan.exists(), 'orphan must be pruned by disk guard'
+        assert keep_a.exists(), 'keep_a must survive (in ledger)'
+        assert keep_b.exists(), 'keep_b must survive (in ledger)'
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
 # ---------------------------------------------------------------------------
 # A2 (cont.): pre-verify disk guard
 # ---------------------------------------------------------------------------
