@@ -5964,11 +5964,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         self._inflight_req = None
                         continue
 
-                    skip_verify = (
-                        req.pre_rebased
-                        and merge_result.pre_merge_sha is not None
-                        and merge_result.pre_merge_sha == base_for_merge
-                    )
                     # Mechanism 1: cap non-speculative build-ahead.
                     # Trains (continue before this) and immediate-outcome guards
                     # (all return above) never reach this site, so `not speculative`
@@ -5982,7 +5977,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             request=req, merge_result=merge_result,
                             merge_wt=merge_result.merge_worktree,
                             base_sha=base_for_merge, speculative=speculative,
-                            skip_verify=skip_verify,
+                            skip_verify=False,  # task-1724: always run merge-gate verify
                             started_monotonic=t0,
                             merged_branch_tip=branch_head,  # γ2: branch tip at merge time
                             counts_against_cap=counts_against_cap,
@@ -6689,36 +6684,37 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # all cleanup_merge_worktree calls use the warm path.
         # PRD §10 invariant 6: every Nth verifying attempt bypasses the swap
         # and runs a cold verify in the throwaway ephemeral worktree.
-        if not item.skip_verify:
-            self._verify_attempt_count += 1
-            _due = _safety_valve_due(
-                self._verify_attempt_count,
-                req.config.git.persistent_merge_worktree_safety_valve_every_n,
-            )
-            merge_wt = await _acquire_warm_verify_worktree(
-                self._git_ops, req, merge_wt, merge_commit,
-                safety_valve_due=_due,
-            )
-            assert merge_wt is not None  # input was non-None; warm or unchanged
-            # Warm-swap: if _acquire_warm_verify_worktree returned the
-            # persistent _merge-verify path instead of the ephemeral
-            # item.merge_wt, the helper already removed item.merge_wt from
-            # disk.  Deregister it from the liveness ledger now so the
-            # ghost is cleared immediately (no need to wait for the touch
-            # loop's ENOENT self-heal).  If no swap occurred, merge_wt IS
-            # item.merge_wt and the cleanup calls below deregister it via
-            # _cleanup_owned_merge_worktree.
-            if merge_wt is not item.merge_wt:
-                self._deregister_owned_merge_worktree(item.merge_wt)
+        # task-1724: verification is unconditional (skip_verify is never honored
+        # here — the merge gate always runs before advance_main).
+        self._verify_attempt_count += 1
+        _due = _safety_valve_due(
+            self._verify_attempt_count,
+            req.config.git.persistent_merge_worktree_safety_valve_every_n,
+        )
+        merge_wt = await _acquire_warm_verify_worktree(
+            self._git_ops, req, merge_wt, merge_commit,
+            safety_valve_due=_due,
+        )
+        assert merge_wt is not None  # input was non-None; warm or unchanged
+        # Warm-swap: if _acquire_warm_verify_worktree returned the
+        # persistent _merge-verify path instead of the ephemeral
+        # item.merge_wt, the helper already removed item.merge_wt from
+        # disk.  Deregister it from the liveness ledger now so the
+        # ghost is cleared immediately (no need to wait for the touch
+        # loop's ENOENT self-heal).  If no swap occurred, merge_wt IS
+        # item.merge_wt and the cleanup calls below deregister it via
+        # _cleanup_owned_merge_worktree.
+        if merge_wt is not item.merge_wt:
+            self._deregister_owned_merge_worktree(item.merge_wt)
 
         # ── Step 4: verify ────────────────────────────────────────────
         # PRD §10 invariant 6(b): warm per-test results captured here for the
         # same-candidate shadow compare scheduled in the 'done' block below.
         # Initialised empty so the shadow compare scheduler sees {} if the warm
-        # path was not taken (skip_verify, safety-valve, or knob off) and
-        # short-circuits without scheduling a cold leg.
+        # path was not taken (safety-valve or knob off) and short-circuits
+        # without scheduling a cold leg.
         _warm_results: dict[str, bool] = {}
-        if not item.skip_verify:
+        if True:  # unconditional — task-1724: skip_verify never bypasses the gate
             self._verify_phase = 'verifying'
             self._verify_started_at = time.time()  # wall-clock verify start for triage
             logger.info(
@@ -6831,11 +6827,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 self._resolve_or_drop_abandoned(req, out)
                 return False
-        else:
-            logger.info(
-                f'Task {req.task_id}: skipping re-verification '
-                f'(pre-rebased, main unchanged)'
-            )
 
         # Short-circuit: if abandonment landed while (or just as) verify
         # completed, skip the expensive advance-main CAS loop and
