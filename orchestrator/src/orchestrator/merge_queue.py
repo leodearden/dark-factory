@@ -5194,21 +5194,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 continue
             entries.append(_entry(req, 'queued', worktree_path=None, position=len(entries)))
 
+        # verify_in_progress: derived from the deque head so it is always current
+        # and correctly returns None when the deque is empty (fixing the latent γ
+        # phantom where _verify_item was set but never cleared after first verify).
         verify_in_progress = None
-        if self._verify_item is not None:
-            vi = self._verify_item
-            verify_age: float | None = (
-                max(0.0, now - self._verify_started_at)
-                if self._verify_started_at is not None else None
-            )
+        if self._inflight:
+            _head = self._inflight[0]
             verify_in_progress = {
-                'task_id': vi.request.task_id,
-                # age_secs: total time since this request was enqueued (queue wait
-                # + verify time).  Use verify_age_secs for pure verification time.
-                'age_secs': max(0.0, now - vi.request.enqueued_at),
-                # verify_age_secs: time elapsed since 'verifying' phase started
-                # (None when still remerging / before first verify call).
-                'verify_age_secs': verify_age,
+                'task_id': _head.item.request.task_id,
+                # age_secs: total time since enqueued (queue wait + verify time).
+                'age_secs': max(0.0, now - _head.item.request.enqueued_at),
+                # verify_age_secs: time elapsed since dispatch (≈ verify start).
+                'verify_age_secs': (
+                    max(0.0, now - _head.started_at)
+                    if _head.started_at is not None else None
+                ),
             }
 
         return {
