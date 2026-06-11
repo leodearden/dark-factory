@@ -695,6 +695,7 @@ async def _run_post_merge_verify(
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
     quarantine: set[str] | None = None,
+    keep_worktrees: Collection[Path] | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -714,6 +715,13 @@ async def _run_post_merge_verify(
             :class:`MergeWorker` call sites byte-identical.  Used by
             :class:`SpeculativeMergeWorker` to capture warm per-test results
             for PRD §10 invariant 6(b) shadow compare.
+        keep_worktrees: Additional worktrees to protect during any disk-pressure
+            prune triggered inside this verify run (pre-verify guard and ENOSPC
+            retry).  Default ``None`` keeps the legacy single-keep behaviour
+            (only *merge_wt* is protected).  Pass
+            ``set(worker._owned_merge_worktrees)`` from
+            :class:`SpeculativeMergeWorker` to protect all in-flight + queued
+            speculative worktrees (PRD §5 decision 5).
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -721,6 +729,7 @@ async def _run_post_merge_verify(
     disk_reason = await _ensure_verify_disk_space(
         git_ops, merge_wt,
         req.config.merge_verify_min_free_disk_bytes, req.task_id,
+        keep_worktrees=keep_worktrees,
     )
     if disk_reason is not None:
         await git_ops.cleanup_merge_worktree(merge_wt)
@@ -778,7 +787,8 @@ async def _run_post_merge_verify(
         prior_enospc = enospc_retries.get(req.task_id, 0)
         if prior_enospc < max_enospc:
             enospc_retries[req.task_id] = prior_enospc + 1
-            pruned = await git_ops.prune_stale_merge_worktrees(keep=merge_wt)
+            enospc_keep = {merge_wt, *(keep_worktrees or ())}
+            pruned = await git_ops.prune_stale_merge_worktrees(keep=enospc_keep)
             logger.warning(
                 'Task %s: post-merge verify hit ENOSPC; pruned %d '
                 'stale merge worktree(s), retrying verify once',
