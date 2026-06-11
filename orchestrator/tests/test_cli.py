@@ -1181,3 +1181,124 @@ def test_verify_merge_no_request_id_back_compat(tmp_path, monkeypatch):
     assert not pgid_dir_path.exists(), (
         f'.merge_verify_pgids directory created without --request-id: {pgid_dir_path}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 1732 step-11 — cancel-verify subcommand (CliRunner)
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_verify_unknown_id_exits_0(tmp_path, monkeypatch):
+    """(a) Unknown request id (no pgid file present) -> exit 0 (idempotent)."""
+    from unittest.mock import MagicMock
+
+    from orchestrator.config import OrchestratorConfig
+
+    # Minimal config: project_root -> tmp_path (worktree_base = tmp_path/.worktrees)
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # GitOps mock returning a worktree_base that has no pgid file
+    fake_worktree_base = tmp_path / '.worktrees'
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    r = CliRunner().invoke(main, [
+        'cancel-verify',
+        '--request-id', 'nonexistent-req',
+        '--config', str(cfg_file),
+    ])
+    assert r.exit_code == 0, (
+        f'expected exit_code 0 for unknown id, got {r.exit_code}; output={r.output!r}'
+    )
+
+
+def test_cancel_verify_rc_wiring(tmp_path, monkeypatch):
+    """(b) cancel_request spy: CLI passes pgid_file path and exits with exactly that rc."""
+    from unittest.mock import MagicMock
+
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.verify_cancel import PGID_DIR_NAME, pgid_file
+
+    FAKE_REQUEST_ID = 'wiring-test-req'
+    EXPECTED_RC = 42  # unusual value to prove propagation
+
+    fake_worktree_base = tmp_path / '.worktrees'
+    expected_path = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
+
+    cancel_calls = []
+
+    def fake_cancel_request(path, **kwargs):
+        cancel_calls.append(path)
+        return EXPECTED_RC
+
+    monkeypatch.setattr(cli_module, 'cancel_request', fake_cancel_request)
+
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    r = CliRunner().invoke(main, [
+        'cancel-verify',
+        '--request-id', FAKE_REQUEST_ID,
+        '--config', str(cfg_file),
+    ])
+
+    # RC propagated correctly
+    assert r.exit_code == EXPECTED_RC, (
+        f'expected exit_code {EXPECTED_RC}, got {r.exit_code}; output={r.output!r}'
+    )
+    # Path derivation: cancel_request was called with the right pgid_file path
+    assert len(cancel_calls) == 1, f'cancel_request called {len(cancel_calls)} times'
+    assert cancel_calls[0] == expected_path, (
+        f'cancel_request called with wrong path: {cancel_calls[0]} != {expected_path}'
+    )
+
+
+def test_cancel_verify_real_impl_dead_pgid(tmp_path, monkeypatch):
+    """(c) Real pgid file with a dead pgid -> exit 0, file removed."""
+    from unittest.mock import MagicMock
+
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.verify_cancel import PGID_DIR_NAME, pgid_file, write_pgid_file
+
+    FAKE_REQUEST_ID = 'dead-pgid-req'
+    # Use pid 1 (init) as the "dead" pgid — we can't kill it, but with a dead
+    # process we instead use a non-existent high pid that raises ProcessLookupError.
+    # We'll write a nonsense high pid that definitely doesn't exist.
+    NONEXISTENT_PID = 2 ** 22  # well above /proc/sys/kernel/pid_max on most systems
+
+    fake_worktree_base = tmp_path / '.worktrees'
+    pgf = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
+    write_pgid_file(pgf, NONEXISTENT_PID)
+
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    r = CliRunner().invoke(main, [
+        'cancel-verify',
+        '--request-id', FAKE_REQUEST_ID,
+        '--config', str(cfg_file),
+    ])
+
+    assert r.exit_code == 0, (
+        f'expected exit_code 0 for dead pgid, got {r.exit_code}; output={r.output!r}'
+    )
+    assert not pgf.exists(), f'pgid file must be removed after successful cancel; still at {pgf}'
