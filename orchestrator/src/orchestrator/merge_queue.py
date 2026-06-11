@@ -4388,49 +4388,37 @@ class MergeWorker(_WipHaltMixin):
             )
             return MergeOutcome('blocked', reason=reason)
 
-        # 4. Verify (skip if pre-rebased and main unchanged)
+        # 4. Verify — task-1724: unconditional, skip_verify path removed
         merge_wt = merge_result.merge_worktree
         assert merge_wt is not None
-        skip_verify = (
-            req.pre_rebased
-            and merge_result.pre_merge_sha is not None
-            and merge_result.pre_merge_sha == main_sha
-        )
-        if skip_verify:
-            logger.info(
-                f'Task {req.task_id}: skipping re-verification '
-                f'(pre-rebased, main unchanged)'
-            )
         # ── Persistent warm merge-verify worktree swap (PRD §10 κ) ──────
         # Parity with SpeculativeMergeWorker._verify_and_advance: increment the
         # per-worker verify counter and compute the safety-valve predicate so
         # every Nth verifying attempt runs a from-scratch cold verify in a
         # throwaway worktree (PRD §10 invariant 6).
         # merge_result.merge_commit is non-None (asserted at line 4044 above).
-        if not skip_verify:
-            self._verify_attempt_count += 1
-            _due = _safety_valve_due(
-                self._verify_attempt_count,
-                req.config.git.persistent_merge_worktree_safety_valve_every_n,
-            )
-            merge_wt = await _acquire_warm_verify_worktree(
-                self._git_ops, req, merge_wt,
-                merge_result.merge_commit,  # non-None; assert at 4044 above
-                safety_valve_due=_due,
-            )
-            assert merge_wt is not None  # input was non-None; warm or unchanged
-        if not skip_verify:
-            out = await _run_post_merge_verify(
-                self._git_ops, req, merge_wt,
-                timeouts=self._post_merge_verify_timeouts,
-                enospc_retries=self._post_merge_verify_enospc_retries,
-                max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
-                max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-                event_store=self._event_store,
-                merge_sha=merge_result.merge_commit or '',
-            )
-            if out is not None:
-                return out
+        self._verify_attempt_count += 1
+        _due = _safety_valve_due(
+            self._verify_attempt_count,
+            req.config.git.persistent_merge_worktree_safety_valve_every_n,
+        )
+        merge_wt = await _acquire_warm_verify_worktree(
+            self._git_ops, req, merge_wt,
+            merge_result.merge_commit,  # non-None; assert at 4044 above
+            safety_valve_due=_due,
+        )
+        assert merge_wt is not None  # input was non-None; warm or unchanged
+        out = await _run_post_merge_verify(
+            self._git_ops, req, merge_wt,
+            timeouts=self._post_merge_verify_timeouts,
+            enospc_retries=self._post_merge_verify_enospc_retries,
+            max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+            max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+            event_store=self._event_store,
+            merge_sha=merge_result.merge_commit or '',
+        )
+        if out is not None:
+            return out
 
         # 5. CAS advance_main
         assert merge_result.merge_commit is not None
