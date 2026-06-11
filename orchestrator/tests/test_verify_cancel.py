@@ -9,6 +9,7 @@ Steps covered:
   6 (impl)  cancel_request
   7 (test)  start_own_process_group setsid + fallback
   8 (impl)  start_own_process_group
+  13 (test) real-process capstone: setsid + start_new_session escape tree reaped
 """
 
 from pathlib import Path
@@ -318,3 +319,129 @@ class TestStartOwnProcessGroup:
 
         # Must not raise; must return the current group
         assert result == 99999
+
+
+# ---------------------------------------------------------------------------
+# Step-13 (part 1): real-process capstone — setsid + start_new_session escapes
+# ---------------------------------------------------------------------------
+
+# Script that runs as the root process:
+#   1. os.setsid() to join a new session
+#   2. Write its pgid (== its pid after setsid) to argv[1]
+#   3. Spawn a child with start_new_session=True (escapes root's group)
+#   4. The child spawns a grandchild sleeper also with start_new_session=True
+#   5. Both root and child sleep 300s (simulating a long build)
+_ESCAPE_TREE_SCRIPT = '''\
+import os, sys, subprocess, time
+
+pgid_file = sys.argv[1]
+os.setsid()
+pgid = os.getpgrp()  # == os.getpid() after setsid
+
+with open(pgid_file, 'w') as f:
+    f.write(str(pgid))
+
+# Spawn child with start_new_session=True (escapes our process group)
+child_script = """
+import subprocess, time, sys
+# Grandchild sleeper — also start_new_session=True (another escape)
+gc = subprocess.Popen(
+    [sys.executable, '-c', 'import time; time.sleep(300)'],
+    start_new_session=True,
+)
+# Write grandchild pid so parent can track it
+with open(sys.argv[1], 'w') as f:
+    f.write(str(gc.pid))
+time.sleep(300)
+"""
+child_pid_file = pgid_file + '.child'
+child = subprocess.Popen(
+    [sys.executable, '-c', child_script, child_pid_file],
+    start_new_session=True,
+)
+# Give child time to spawn the grandchild and write its pid file
+time.sleep(300)
+'''
+
+
+def _is_running(pid: int) -> bool:
+    """Return True if *pid* is still alive (os.kill(pid, 0) succeeds)."""
+    import os
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def _wait_for_file(path, timeout=10.0, interval=0.1):
+    """Poll until *path* exists or *timeout* expires. Return True if found."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(interval)
+    return False
+
+
+@pytest.mark.timeout(30)
+def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
+    """cancel_request reaps root AND start_new_session-escaped descendants.
+
+    Spawns a real process tree:
+      root (setsid) -> child (start_new_session) -> grandchild (start_new_session)
+
+    All three are in DIFFERENT process groups (start_new_session creates a new
+    group for each child), so a naive killpg(root_group) would only kill root.
+    cancel_request must reap all three via the /proc PPID walk.
+    """
+    import os
+    import sys
+    import time
+
+    from orchestrator.verify_cancel import cancel_request, write_pgid_file
+
+    pgid_file_path = tmp_path / 'root.pgid'
+
+    # Spawn root process
+    root_proc = __import__('subprocess').Popen(
+        [sys.executable, '-c', _ESCAPE_TREE_SCRIPT, str(pgid_file_path)],
+    )
+    root_pid = root_proc.pid
+
+    # Wait for root to write its pgid file (means setsid + child spawned)
+    assert _wait_for_file(pgid_file_path, timeout=10), (
+        'root process did not write pgid file within 10s'
+    )
+
+    # Give the child a moment to spawn the grandchild
+    time.sleep(0.5)
+
+    # Take a PPID snapshot to find escaped descendants BEFORE killing
+    from orchestrator.verify_cancel import collect_descendants, read_ppid_map
+    ppid_map = read_ppid_map()
+    pgid = int(pgid_file_path.read_text().strip())
+    all_pids = collect_descendants(pgid, ppid_map) | {pgid}
+
+    # Verify the tree is alive before cancelling
+    assert _is_running(pgid), f'root pid {pgid} not running before cancel'
+
+    # Run cancel_request (uses real /proc walk internally)
+    rc = cancel_request(pgid_file_path)
+
+    # Allow a brief window for processes to be reaped
+    time.sleep(0.5)
+
+    assert rc == 0, f'cancel_request returned {rc}, expected 0'
+    assert not pgid_file_path.exists(), 'pgid file must be removed on success'
+
+    # All tracked pids (including start_new_session escapes) must be dead
+    still_alive = [pid for pid in all_pids if _is_running(pid)]
+    assert still_alive == [], (
+        f'These pids survived cancel_request (start_new_session escapes not reaped?): '
+        f'{still_alive}'
+    )
+
+    # Clean up root_proc (it's been killed, but we need to reap the zombie)
+    root_proc.wait(timeout=5)
