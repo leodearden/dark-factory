@@ -6337,8 +6337,38 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         item = self._verifier_queue.get_nowait()
                         is_from_verifier_queue = True
                     except asyncio.QueueEmpty:
-                        fill_done = True
-                        break
+                        # Multi-host fill-ahead: when real verify tasks are
+                        # STILL RUNNING (not done) AND a host slot is free,
+                        # block for the next queue item so dispatch-fill
+                        # launches N+1 to the free slot while N verifies.
+                        # Single-host: free_host_count()==0 when the local
+                        # slot is held → else branch, break immediately →
+                        # byte-identical to prior serial behaviour.
+                        # Guard: only block while in-flight tasks are running;
+                        # once they are done the head needs to be finalized,
+                        # not more items fetched.
+                        _has_running_inflight = any(
+                            e.verify_task is not None and not e.verify_task.done()
+                            for e in self._inflight
+                        )
+                        if (
+                            _has_running_inflight
+                            and self._host_allocator is not None
+                            and self._host_allocator.free_host_count() > 0
+                        ):
+                            # Block while current verify(s) run in background.
+                            item = await self._verifier_queue.get()
+                            is_from_verifier_queue = True
+                            if item is None:
+                                # Shutdown during fill: drain and exit.
+                                while self._inflight:
+                                    _hd = self._inflight.popleft()
+                                    await self._finalize_inflight(_hd)
+                                return
+                            # Fall through with item to dispatch below.
+                        else:
+                            fill_done = True
+                            break
 
                 if item is None:
                     # Shutdown sentinel: drain remaining in-flight entries, then exit.
@@ -6469,23 +6499,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._redispatch.appendleft(item_back)
                     continue
 
+                # Passthrough: finalize inline (no host slot held, never blocks
+                # on a verify task) then restart the outer loop.
+                if entry.verify_task is None:
+                    try:
+                        await self._finalize_inflight(entry)
+                    except BaseException as exc:
+                        if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
+                            req_pt = entry.item.request
+                            logger.exception(
+                                'Task %s: unexpected passthrough finalize error '
+                                '(blocking-get path)', req_pt.task_id,
+                            )
+                            if not req_pt.result.done():
+                                req_pt.result.set_result(MergeOutcome(
+                                    'blocked', reason=f'Verifier error: {exc}',
+                                ))
+                            self._n_failed = True
+                        else:
+                            raise
+                    continue  # restart outer loop → fill loop picks up next item
+
+                # Real verify entry: append to _inflight and loop back to fill.
+                # The fill loop will block for the next item if a host slot is
+                # free (multi-host overlap) OR break immediately (single-host,
+                # free_host_count()==0) → FINALIZE-HEAD processes the head.
                 self._inflight.append(entry)
-                head = self._inflight.popleft()
-                try:
-                    await self._finalize_inflight(head)
-                except BaseException as exc:
-                    if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                        req = head.item.request
-                        logger.exception(
-                            'Task %s: unexpected finalize error (blocking-get path)', req.task_id
-                        )
-                        if not req.result.done():
-                            req.result.set_result(MergeOutcome(
-                                'blocked', reason=f'Verifier error: {exc}',
-                            ))
-                        self._n_failed = True
-                    else:
-                        raise
+                continue  # restart outer loop
 
     async def _build_merge_failure_diagnostic(
         self,
