@@ -52,6 +52,7 @@ from orchestrator.verify_runner import (
     HostAllocator,
     LocalRunner,
     RemoteRunner,
+    VerifyRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
     is_unscoped_gate_failure,
@@ -697,6 +698,7 @@ async def _run_post_merge_verify(
     on_result: Callable[[VerifyResult], None] | None = None,
     quarantine: set[str] | None = None,
     keep_worktrees: Collection[Path] | None = None,
+    runner: VerifyRunner | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -761,24 +763,36 @@ async def _run_post_merge_verify(
 
     spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
-    # β decision 6: LOCAL-ONLY pool for all direct callers of _run_post_merge_verify
-    # (MergeWorker._do_merge, _reverify_rebased_tree, reverify_member_solo,
-    # _do_train_merge — recovery/train paths stay on the trust anchor and out of
-    # slot accounting).  Remote dispatch is handled by γ's concurrent acquire/release
-    # path via HostAllocator.  The `quarantine` parameter is reserved/unused here;
-    # it remains in the signature so existing call sites stay byte-identical.
-    # _run_cold_shadow_verify was already LOCAL-ONLY (cold trust-anchor design decision).
-    _ = quarantine  # reserved/unused — LOCAL-ONLY pool below
-    pool = VerifyRunnerPool(
-        [LocalRunner(
-            merge_wt, req.config, req.module_configs, task_files_tuple,
-            run_scoped=run_scoped_verification,
-            run_unscoped=_run_unscoped_typechecks,
+    # γ decision 4: additive runner= param selects the verify host.
+    # runner=None (default) → LOCAL-ONLY pool, byte-identical to β (all legacy
+    # callers: MergeWorker._do_merge, _reverify_rebased_tree, reverify_member_solo,
+    # _do_train_merge, _run_cold_shadow_verify — recovery/train paths stay on the
+    # trust anchor and out of slot accounting).
+    # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
+    # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
+    # The `quarantine` parameter is reserved/unused here; it remains in the signature
+    # so existing call sites stay byte-identical.
+    _ = quarantine  # reserved/unused
+    if runner is not None:
+        # Remote path: build a single-runner pool from the injected runner.
+        # Warm-swap runs only for LOCAL leases (caller's responsibility).
+        pool = VerifyRunnerPool(
+            [runner],
+            event_store=event_store,
             task_id=req.task_id,
-        )],
-        event_store=event_store,
-        task_id=req.task_id,
-    )
+        )
+    else:
+        # Local path: LOCAL-ONLY pool — byte-identical to β.
+        pool = VerifyRunnerPool(
+            [LocalRunner(
+                merge_wt, req.config, req.module_configs, task_files_tuple,
+                run_scoped=run_scoped_verification,
+                run_unscoped=_run_unscoped_typechecks,
+                task_id=req.task_id,
+            )],
+            event_store=event_store,
+            task_id=req.task_id,
+        )
 
     # max_retries=0: post-merge verify hangs are usually deterministic
     # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
