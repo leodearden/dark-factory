@@ -3600,12 +3600,34 @@ class TaskWorkflow:
     async def _execute_iterations(self) -> WorkflowOutcome:
         """Run implementer iterations until plan is complete."""
         assert self.worktree is not None and self.artifacts is not None
-        # Zero-output hang circuit breaker: reset each time _execute_iterations
-        # is entered.  Counts CONSECUTIVE zero-output CLI timeouts; any non-zero-
-        # output result resets it.  Threshold: config.max_consecutive_zero_output_timeouts.
+        # Zero-output hang circuit breaker: reset all circuit-breaker state each
+        # time _execute_iterations is entered so that a re-entry within a single
+        # run cannot inherit stale _zero_output_hang_info from a prior pass and
+        # mis-route a later unrelated BLOCKED outcome to infra_issue.
+        # Counts CONSECUTIVE zero-output CLI timeouts; any non-zero-output result
+        # resets it.  Threshold: config.max_consecutive_zero_output_timeouts.
         consecutive_zero_output = 0
+        self._zero_output_hang_info = None
+        self._preserve_config_dir = False
         while self.artifacts.get_pending_steps():
             if self.metrics.execute_iterations >= self.config.max_execute_iterations:
+                # Iteration cap reached.  If the most-recent batch of iterations
+                # were all zero-output timeouts (consecutive_zero_output > 0),
+                # classify this as infra_issue rather than the generic
+                # 'Execution iterations exhausted' — this handles the edge case
+                # where max_consecutive_zero_output_timeouts > max_execute_iterations
+                # so the circuit-breaker threshold is never reached inside the loop
+                # but the pattern is still clearly an infra hang.
+                if consecutive_zero_output > 0:
+                    self._zero_output_hang_info = {
+                        'reason': ZERO_OUTPUT_HANG_REASON,
+                        'detail': (
+                            f'consecutive_zero_output={consecutive_zero_output} '
+                            f'at_iteration_cap=True '
+                            f'iteration={self.metrics.execute_iterations} '
+                            f'evidence: .task/zero_output_evidence-iter*.json'
+                        ),
+                    }
                 return WorkflowOutcome.BLOCKED
 
             # Inter-iteration rebase: keep the task branch close to main
