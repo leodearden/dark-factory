@@ -3241,6 +3241,7 @@ class Scheduler:
         cost_usd: float,
         escalation_queue=None,
         reports_dir: Path | None = None,
+        cap: int | None = None,
     ) -> Path | None:
         """Handle cap exhaustion: write report, set blocked, submit L1 escalation.
 
@@ -3254,11 +3255,15 @@ class Scheduler:
                 escalation step is skipped (tests inject a stub or None).
             reports_dir: Where to write the markdown report.  Defaults to
                 ``<project_root>/data/orchestrator/retry_cap_reports/``.
+            cap: The cap that actually fired.  Defaults to
+                ``config.requeue_cap`` (backward compatible).  Pass
+                ``config.transient_requeue_cap`` when the transient ceiling
+                fired so the report/event/escalation show the correct cap.
 
         Returns the report path written, or None when writing fails.
         """
         history = list(self._requeue_history.get(task_id, ()))
-        cap = self.config.requeue_cap
+        cap = cap if cap is not None else self.config.requeue_cap
         n_attempts = len(history)
         last_reason = history[-1].reason if history else 'unknown'
 

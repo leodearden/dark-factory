@@ -353,6 +353,46 @@ class TestTriggerRetryCapExhausted:
 
         assert len(queue.submitted) == 1
 
+    @pytest.mark.asyncio
+    async def test_explicit_cap_param_overrides_config(
+        self, scheduler: Scheduler, tmp_path: Path
+    ):
+        """Passing cap=10 overrides config.requeue_cap (3) in report, event, escalation."""
+        scheduler.set_task_status = AsyncMock()
+        emitted: list[tuple] = []
+
+        class _FakeEventStore:
+            def emit(self, event_type, **kwargs) -> None:
+                emitted.append((event_type, kwargs))
+
+        scheduler.event_store = _FakeEventStore()  # type: ignore[assignment]
+        queue = _StubEscalationQueue()
+        for i in range(3):
+            _record_one(scheduler, 't1', reason=f'r{i}', cost_usd=1.0)
+
+        report_path = await scheduler.trigger_retry_cap_exhausted(
+            't1',
+            run_id='run-abc',
+            cost_usd=3.0,
+            escalation_queue=queue,
+            reports_dir=tmp_path / 'reports',
+            cap=10,
+        )
+
+        # Report file must show cap=10
+        assert report_path is not None and report_path.exists()
+        body = report_path.read_text()
+        assert 'Cap:** 10' in body
+
+        # Event data must carry cap=10
+        cap_events = [kw for (et, kw) in emitted if et == EventType.retry_cap_exhausted]
+        assert len(cap_events) == 1
+        assert cap_events[0]['data']['cap'] == 10
+
+        # Escalation summary must reference cap=10
+        assert len(queue.submitted) == 1
+        assert 'cap=10' in queue.submitted[0].summary
+
 
 # --- Harness-level integration -----------------------------------------------
 
