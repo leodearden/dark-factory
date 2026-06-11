@@ -14850,8 +14850,8 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
     def test_worst_case_is_heartbeat_floor(self, tmp_path: Path):
         """worst_case_secs == _HEARTBEAT_POLL_S * TOUCH_MISS_TOLERANCE == 600.0."""
         from orchestrator.merge_queue import (  # noqa: PLC0415
-            TOUCH_MISS_TOLERANCE,
             _HEARTBEAT_POLL_S,
+            TOUCH_MISS_TOLERANCE,
             check_merge_liveness_margin,
         )
         cfg = OrchestratorConfig(project_root=tmp_path)
@@ -14870,8 +14870,8 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
     ):
         """worst_case_secs is identical regardless of merge_verify_cold_command_timeout_secs."""
         from orchestrator.merge_queue import (  # noqa: PLC0415
-            TOUCH_MISS_TOLERANCE,
             _HEARTBEAT_POLL_S,
+            TOUCH_MISS_TOLERANCE,
             check_merge_liveness_margin,
         )
         cfg = OrchestratorConfig(
@@ -15000,8 +15000,8 @@ class TestCheckMergeLivenessMarginShippedDefaults:
     ):
         """Bare OrchestratorConfig (no overrides) → safe=True, no WARNING."""
         from orchestrator.merge_queue import (  # noqa: PLC0415
-            TOUCH_MISS_TOLERANCE,
             _HEARTBEAT_POLL_S,
+            TOUCH_MISS_TOLERANCE,
             check_merge_liveness_margin,
         )
         cfg = OrchestratorConfig(project_root=tmp_path)

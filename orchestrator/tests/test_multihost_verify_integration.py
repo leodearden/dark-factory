@@ -48,7 +48,6 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.merge_queue import (
-    INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     PersistentWorktreeConfigError,
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
