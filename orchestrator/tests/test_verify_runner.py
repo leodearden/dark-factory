@@ -3490,3 +3490,356 @@ class TestRemoteRunnerMainBranchPush:
         )
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
+
+
+# ---------------------------------------------------------------------------
+# β step-11: RemoteRunner --request-id threading + _inflight_request_id lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerRequestId:
+    """run_merge_verify passes --request-id <id> appended to the ssh argv."""
+
+    def _make_runner_and_calls(self, *, config_path=None):
+        """Return (runner, calls) where calls tracks (argv, cwd) pairs."""
+        calls = []
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append((argv[:], cwd))
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(expected), '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            config_path=config_path,
+            run=fake_run,
+            id_factory=lambda: 'fixed-id',
+        )
+        return runner, calls
+
+    async def test_request_id_in_remote_cmd(self):
+        """ssh remote command contains --request-id fixed-id (appended)."""
+        import shlex as _shlex
+
+        runner, calls = self._make_runner_and_calls()
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        ssh_call = next(c for c in calls if c[0][0] == 'ssh')
+        remote_cmd = ssh_call[0][-1]
+        parsed = _shlex.split(remote_cmd)
+
+        rid_idx = parsed.index('--request-id')
+        assert parsed[rid_idx + 1] == 'fixed-id'
+
+    async def test_request_id_same_as_push_ref_id(self):
+        """--request-id value equals the id in the push ref (abc123:refs/merge-verify/<id>)."""
+        import shlex as _shlex
+
+        runner, calls = self._make_runner_and_calls()
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        push_call = next(
+            c for c in calls
+            if c[0][0] == 'git' and len(c[0]) > 3 and 'refs/merge-verify/' in c[0][3]
+        )
+        ref_part = push_call[0][3]
+        push_id = ref_part.split('/')[-1]
+
+        ssh_call = next(c for c in calls if c[0][0] == 'ssh')
+        parsed = _shlex.split(ssh_call[0][-1])
+        rid_idx = parsed.index('--request-id')
+        ssh_id = parsed[rid_idx + 1]
+
+        assert push_id == ssh_id == 'fixed-id'
+
+    async def test_existing_positional_args_unchanged(self):
+        """parsed[:4] still == ['orchestrator', 'verify-merge', '--sha', 'abc123']."""
+        import shlex as _shlex
+
+        runner, calls = self._make_runner_and_calls()
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        ssh_call = next(c for c in calls if c[0][0] == 'ssh')
+        parsed = _shlex.split(ssh_call[0][-1])
+        assert parsed[:4] == ['orchestrator', 'verify-merge', '--sha', 'abc123']
+
+    async def test_request_id_appended_after_spec(self):
+        """--request-id appears after --spec (appended at end)."""
+        import shlex as _shlex
+
+        runner, calls = self._make_runner_and_calls()
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        ssh_call = next(c for c in calls if c[0][0] == 'ssh')
+        parsed = _shlex.split(ssh_call[0][-1])
+
+        spec_idx = parsed.index('--spec')
+        rid_idx = parsed.index('--request-id')
+        assert rid_idx > spec_idx, '--request-id must be appended after --spec'
+
+    async def test_request_id_with_config_path(self):
+        """--request-id is still appended after --config when config_path is set."""
+        import shlex as _shlex
+
+        runner, calls = self._make_runner_and_calls(config_path='/etc/orch.yaml')
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        ssh_call = next(c for c in calls if c[0][0] == 'ssh')
+        parsed = _shlex.split(ssh_call[0][-1])
+
+        cfg_idx = parsed.index('--config')
+        rid_idx = parsed.index('--request-id')
+        assert rid_idx > cfg_idx, '--request-id must come after --config'
+
+    async def test_inflight_request_id_cleared_after_return(self):
+        """_inflight_request_id is None after run_merge_verify returns."""
+        runner, _ = self._make_runner_and_calls()
+        assert runner._inflight_request_id is None
+        await runner.run_merge_verify('abc123', _make_spec())
+        assert runner._inflight_request_id is None
+
+    async def test_inflight_request_id_cleared_after_exception(self):
+        """_inflight_request_id is cleared in the finally even on RunnerUnavailable."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        calls = []
+
+        async def fail_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[0] == 'git' and len(argv) > 3 and 'refs/merge-verify/' in argv[3]:
+                return (1, '', 'push rejected')
+            return (0, '', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fail_run,
+            id_factory=lambda: 'fail-id',
+        )
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+        assert runner._inflight_request_id is None
+
+
+# ---------------------------------------------------------------------------
+# β step-13: RemoteRunner.cancel_verify() and probe_clean()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerCancelVerify:
+    """cancel_verify() issues ssh cancel-verify; probe_clean() issues ssh pgrep."""
+
+    def _make_runner(self, *, config_path=None, cancel_rc=0, probe_rc=1):
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[0] == 'ssh':
+                if 'pgrep' in argv[-1]:
+                    return (probe_rc, '', '')
+                return (cancel_rc, '', '')
+            return (0, '', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            config_path=config_path,
+            run=fake_run,
+            id_factory=lambda: 'req-42',
+        )
+        runner._calls_tracking = calls
+        return runner
+
+    async def test_cancel_verify_no_inflight_returns_zero_no_ssh(self):
+        """cancel_verify() with _inflight_request_id=None returns 0 without issuing ssh."""
+        runner = self._make_runner()
+        rc = await runner.cancel_verify()
+        assert rc == 0
+        ssh_calls = [c for c in runner._calls_tracking if c[0] == 'ssh']
+        assert len(ssh_calls) == 0
+
+    async def test_cancel_verify_issues_correct_argv(self):
+        """cancel_verify() issues ssh BatchMode/ConnectTimeout cancel-verify --request-id."""
+        import shlex as _shlex
+
+        runner = self._make_runner(cancel_rc=0)
+        runner._inflight_request_id = 'req-42'
+        await runner.cancel_verify()
+
+        ssh_calls = [c for c in runner._calls_tracking if c[0] == 'ssh']
+        assert len(ssh_calls) == 1
+        argv = ssh_calls[0]
+
+        assert 'BatchMode=yes' in argv
+        assert 'laptop.local' in argv
+
+        remote_cmd = argv[-1]
+        parsed = _shlex.split(remote_cmd)
+        assert 'cancel-verify' in parsed
+        rid_idx = parsed.index('--request-id')
+        assert parsed[rid_idx + 1] == 'req-42'
+
+    async def test_cancel_verify_appends_config_when_set(self):
+        """cancel_verify() appends --config <path> when config_path is set."""
+        import shlex as _shlex
+
+        runner = self._make_runner(config_path='/etc/orch.yaml', cancel_rc=0)
+        runner._inflight_request_id = 'req-42'
+        await runner.cancel_verify()
+
+        ssh_calls = [c for c in runner._calls_tracking if c[0] == 'ssh']
+        remote_cmd = ssh_calls[0][-1]
+        parsed = _shlex.split(remote_cmd)
+        cfg_idx = parsed.index('--config')
+        assert parsed[cfg_idx + 1] == '/etc/orch.yaml'
+
+    async def test_cancel_verify_returns_ssh_rc(self):
+        """cancel_verify() returns the ssh return code."""
+        runner = self._make_runner(cancel_rc=1)
+        runner._inflight_request_id = 'req-42'
+        rc = await runner.cancel_verify()
+        assert rc == 1
+
+    async def test_probe_clean_true_when_pgrep_rc_is_1(self):
+        """probe_clean() issues ssh pgrep -f verify-merge; rc==1 (no match) → True."""
+        runner = self._make_runner(probe_rc=1)
+        result = await runner.probe_clean()
+        assert result is True
+
+        ssh_calls = [c for c in runner._calls_tracking if c[0] == 'ssh']
+        assert len(ssh_calls) == 1
+        remote_cmd = ssh_calls[0][-1]
+        assert 'pgrep' in remote_cmd
+        assert 'verify-merge' in remote_cmd
+
+    async def test_probe_clean_false_when_pgrep_rc_is_0(self):
+        """probe_clean() rc==0 (process running) → False."""
+        runner = self._make_runner(probe_rc=0)
+        result = await runner.probe_clean()
+        assert result is False
+
+    async def test_probe_clean_false_when_pgrep_rc_is_2(self):
+        """probe_clean() rc>=2 (error) → False (conservative: stay parked)."""
+        runner = self._make_runner(probe_rc=2)
+        result = await runner.probe_clean()
+        assert result is False
+
+    async def test_probe_clean_false_on_oserror(self):
+        """probe_clean() on OSError → False (fail-safe)."""
+        async def raising_run(argv, *, cwd=None):
+            raise OSError('connection refused')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=raising_run,
+        )
+        result = await runner.probe_clean()
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# β step-15: RemoteRunner _last_pushed_main_sha dedup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerMainBranchDedup:
+    """_last_pushed_main_sha dedup: skip main push when main sha is unchanged."""
+
+    def _make_runner_with_tracking(self, rev_parse_shas):
+        """Return (runner, push_counts) keyed by 'main' and 'merge'."""
+        push_counts: dict[str, int] = {'main': 0, 'merge': 0}
+        rev_parse_iter = iter(rev_parse_shas)
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'git' and argv[1] == 'rev-parse':
+                sha = next(rev_parse_iter, 'sha-stable')
+                return (0, sha, '')
+            if argv[0] == 'git' and argv[1] == 'push':
+                ref = argv[3] if len(argv) > 3 else ''
+                if 'refs/heads/' in ref:
+                    push_counts['main'] += 1
+                elif 'refs/merge-verify/' in ref:
+                    push_counts['merge'] += 1
+                return (0, '', '')
+            if argv[0] == 'ssh':
+                return (0, result_to_json(expected), '')
+            return (0, '', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            main_branch='main',
+            run=fake_run,
+            id_factory=lambda: 'did',
+        )
+        return runner, push_counts
+
+    async def test_first_call_fires_main_push(self):
+        """First call always fires the main push (no cached sha)."""
+        runner, push_counts = self._make_runner_with_tracking(['sha-v1', 'sha-v1'])
+        await runner.run_merge_verify('abc123', _make_spec())
+        assert push_counts['main'] == 1
+
+    async def test_second_call_same_sha_skips_main_push(self):
+        """Second call with unchanged main sha → main push skipped (dedup)."""
+        runner, push_counts = self._make_runner_with_tracking(['sha-v1', 'sha-v1'])
+        await runner.run_merge_verify('abc123', _make_spec())
+        await runner.run_merge_verify('def456', _make_spec())
+        assert push_counts['main'] == 1
+
+    async def test_second_call_different_sha_fires_main_push_again(self):
+        """When rev-parse returns a new sha, main push fires again."""
+        runner, push_counts = self._make_runner_with_tracking(['sha-v1', 'sha-v2'])
+        await runner.run_merge_verify('abc123', _make_spec())
+        await runner.run_merge_verify('def456', _make_spec())
+        assert push_counts['main'] == 2
+
+    async def test_merge_sha_push_always_fires(self):
+        """Load-bearing merge-sha push fires on every call regardless."""
+        runner, push_counts = self._make_runner_with_tracking(['sha-v1', 'sha-v1'])
+        await runner.run_merge_verify('abc123', _make_spec())
+        await runner.run_merge_verify('def456', _make_spec())
+        assert push_counts['merge'] == 2
+
+    async def test_without_main_branch_no_rev_parse(self):
+        """main_branch=None → no rev-parse (existing behaviour unchanged)."""
+        rev_parse_called = [0]
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'git' and argv[1] == 'rev-parse':
+                rev_parse_called[0] += 1
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(expected), '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            main_branch=None,
+            run=fake_run,
+            id_factory=lambda: 'nomain',
+        )
+        await runner.run_merge_verify('abc123', _make_spec())
+        assert rev_parse_called[0] == 0
