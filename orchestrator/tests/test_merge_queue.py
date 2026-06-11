@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -20,6 +21,7 @@ from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.merge_queue import (
+    INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     MERGE_LANES,
     TRAIN_INCOMPLETE_REASON_PREFIX,
     TRAIN_PARTIAL_FLIP_REASON_PREFIX,
@@ -9864,9 +9866,6 @@ class TestReaperHeartbeatLivenessBoundary:
         os.utime(root, (now, now)) reproduces the state α's per-tick
         _heartbeat_loop guarantees for a live owner.
         """
-        import os
-        from orchestrator.merge_queue import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
-
         branch = 'hb-live-owner-branch'
         wt = await _make_branch_with_file(
             git_ops, branch, 'hb_live.py', 'x = 1\n',
