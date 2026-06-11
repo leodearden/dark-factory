@@ -337,3 +337,67 @@ class TestRunPostMergeVerifyRunnerParam:
         ]
         assert len(merge_verify_events) >= 1
         assert merge_verify_events[0]['data']['runner'] == 'laptop'
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED: InflightEntry dataclass + new instance attrs
+# ---------------------------------------------------------------------------
+
+
+class TestInflightStateAttrs:
+    """SpeculativeMergeWorker exposes _inflight/_redispatch/_n_failed/_remerge_occurred.
+    InflightEntry dataclass is importable from merge_queue.
+
+    RED until step-4 GREEN adds the dataclass and initialises the attrs.
+    """
+
+    def _make_worker(self, git_ops: GitOps) -> SpeculativeMergeWorker:
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        return SpeculativeMergeWorker(git_ops, q)
+
+    def test_inflight_is_empty_deque(self, git_ops: GitOps) -> None:
+        """_inflight starts as an empty collections.deque."""
+        import collections
+        worker = self._make_worker(git_ops)
+        assert isinstance(worker._inflight, collections.deque)
+        assert len(worker._inflight) == 0
+
+    def test_redispatch_is_empty_deque(self, git_ops: GitOps) -> None:
+        """_redispatch starts as an empty collections.deque."""
+        import collections
+        worker = self._make_worker(git_ops)
+        assert isinstance(worker._redispatch, collections.deque)
+        assert len(worker._redispatch) == 0
+
+    def test_n_failed_is_false(self, git_ops: GitOps) -> None:
+        """_n_failed starts False."""
+        worker = self._make_worker(git_ops)
+        assert worker._n_failed is False
+
+    def test_remerge_occurred_is_false(self, git_ops: GitOps) -> None:
+        """_remerge_occurred starts False."""
+        worker = self._make_worker(git_ops)
+        assert worker._remerge_occurred is False
+
+    def test_inflight_entry_importable(self) -> None:
+        """InflightEntry is importable from merge_queue."""
+        from orchestrator.merge_queue import InflightEntry  # noqa: F401 (import check)
+
+    def test_inflight_entry_has_required_fields(self) -> None:
+        """InflightEntry has item/lease/verify_task/merge_wt/was_speculative/phase."""
+        import dataclasses
+        from orchestrator.merge_queue import InflightEntry
+        field_names = {f.name for f in dataclasses.fields(InflightEntry)}
+        assert 'item' in field_names
+        assert 'lease' in field_names
+        assert 'verify_task' in field_names
+        assert 'merge_wt' in field_names
+        assert 'was_speculative' in field_names
+        assert 'phase' in field_names
+
+    def test_inflight_entry_has_passthrough_outcome_field(self) -> None:
+        """InflightEntry has passthrough_outcome for immediate-outcome passthrough entries."""
+        import dataclasses
+        from orchestrator.merge_queue import InflightEntry
+        field_names = {f.name for f in dataclasses.fields(InflightEntry)}
+        assert 'passthrough_outcome' in field_names
