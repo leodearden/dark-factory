@@ -385,6 +385,106 @@ class TestRunPostMergeVerifyLocalOnly:
         )
 
 
+# ---------------------------------------------------------------------------
+# step-19: SpeculativeMergeWorker._ensure_host_allocator — RED
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureHostAllocator:
+    """β step-19: SpeculativeMergeWorker._ensure_host_allocator(config) — RED.
+
+    Lazily builds a worker-lifetime HostAllocator from _build_remote_runners
+    with a stable cwd (git_ops.project_root), sharing self._runner_quarantine.
+    """
+
+    def _make_worker(self, *, project_root=None):
+        """Build a minimal SpeculativeMergeWorker with optional project_root."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        git_ops = _make_git_ops_mock()
+        if project_root is not None:
+            git_ops.project_root = project_root
+        else:
+            # No project_root on the mock (bare-worker tests must not raise).
+            del git_ops.project_root
+        return SpeculativeMergeWorker(
+            git_ops=git_ops,
+            queue=__import__('asyncio').Queue(),
+        )
+
+    def test_returns_host_allocator_with_remote_for_enabled_runner(self, tmp_path):
+        """With enabled_verify_runners=['laptop'], allocator.host_names includes 'laptop'."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostAllocator
+
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        worker = self._make_worker(project_root=tmp_path)
+
+        allocator = worker._ensure_host_allocator(config)
+
+        assert isinstance(allocator, HostAllocator)
+        assert 'laptop' in allocator.host_names
+        assert 'local' in allocator.host_names
+
+    def test_remotes_built_with_stable_cwd_project_root(self, tmp_path):
+        """RemoteRunners in the allocator are built with cwd == git_ops.project_root."""
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        worker = self._make_worker(project_root=tmp_path)
+
+        allocator = worker._ensure_host_allocator(config)
+
+        # Find the RemoteRunner for 'laptop' via its lease
+        lease = allocator.acquire_remote('laptop')
+        assert lease is not None
+        assert str(lease.runner._cwd) == str(tmp_path)
+
+    def test_shared_quarantine_set_is_worker_quarantine(self, tmp_path):
+        """Mutating the allocator's quarantine set is visible in worker._runner_quarantine."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        worker = self._make_worker(project_root=tmp_path)
+
+        allocator = worker._ensure_host_allocator(config)
+
+        # Seed the allocator's set and verify it matches worker._runner_quarantine
+        allocator._quarantine.add('some-host')
+        assert 'some-host' in worker._runner_quarantine
+
+    def test_idempotent_same_instance_on_second_call(self, tmp_path):
+        """_ensure_host_allocator returns the SAME instance on repeated calls."""
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        worker = self._make_worker(project_root=tmp_path)
+
+        first = worker._ensure_host_allocator(config)
+        second = worker._ensure_host_allocator(config)
+        assert first is second
+
+    def test_none_safe_empty_runners(self, tmp_path):
+        """With enabled_verify_runners=[], allocator has only the local slot (no crash)."""
+        from orchestrator.verify_runner import HostAllocator
+
+        config = _make_config(verify_runners=[])
+        worker = self._make_worker(project_root=tmp_path)
+
+        allocator = worker._ensure_host_allocator(config)
+
+        assert isinstance(allocator, HostAllocator)
+        assert allocator.host_names == ['local']
+
+    def test_none_safe_no_project_root(self):
+        """With no git_ops.project_root, allocator builds (no remotes) without raising."""
+        from orchestrator.verify_runner import HostAllocator
+
+        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        worker = self._make_worker(project_root=None)
+
+        allocator = worker._ensure_host_allocator(config)
+
+        assert isinstance(allocator, HostAllocator)
+        # No project_root → no remotes (cwd unavailable)
+        assert allocator.host_names == ['local']
+
+
 @pytest.mark.asyncio
 class TestColdShadowVerifyLocalOnly:
     """_run_cold_shadow_verify stays local-only even when verify_runners are configured."""
