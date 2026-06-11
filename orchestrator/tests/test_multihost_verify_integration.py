@@ -48,7 +48,6 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.merge_queue import (
-    INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     PersistentWorktreeConfigError,
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
@@ -853,15 +852,6 @@ def _make_liveness_config(
     )
 
 
-# Timeouts chosen so bound=2 straddles the safety threshold deterministically.
-# threshold = 0.75 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
-# worst_case = merge_ahead_bound * timeout_secs
-# safe = worst_case < threshold
-_B8_THRESHOLD = 0.75 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS   # e.g. 8100
-_B8_BIG_TIMEOUT = _B8_THRESHOLD / 2 + 100.0     # worst_case > threshold for bound=2
-_B8_SMALL_TIMEOUT = _B8_THRESHOLD / 4 - 10.0    # worst_case < threshold for bound=2
-
-
 # ---------------------------------------------------------------------------
 # Step-17 (RED): B7 per-host warmth guard + B8 liveness-margin guard
 # ---------------------------------------------------------------------------
@@ -875,9 +865,9 @@ class TestStartupGuards:
           - num_hosts=2, bound=2 → ceil(2/2)=1 ≤ 1 → no raise
           - num_hosts=1, bound=2 → ceil(2/1)=2 > 1 → raises PersistentWorktreeConfigError
 
-        B8 — check_merge_liveness_margin with bound=2:
-          - BIG cold_timeout → worst_case ≥ threshold → safe=False
-          - SMALL cold_timeout → worst_case < threshold → safe=True
+        B8 — check_merge_liveness_margin (heartbeat-floor model, task-1729 β):
+          - injected liveness_secs=600 → threshold=450 ≤ floor=600 → safe=False
+          - shipped default liveness → threshold=8100 > floor=600 → safe=True
         """
         # --- B7 ---
         cfg_persistent = _make_persistent_config(tmp_path)
@@ -897,19 +887,20 @@ class TestStartupGuards:
                 cfg_persistent, merge_ahead_bound=2, num_hosts=1
             )
 
-        # --- B8 ---
-        cfg_big = _make_liveness_config(tmp_path, cold_timeout_secs=_B8_BIG_TIMEOUT)
-        assessment_big = check_merge_liveness_margin(cfg_big, merge_ahead_bound=2)
-        assert assessment_big.safe is False, (
-            f'expected safe=False for timeout={_B8_BIG_TIMEOUT}, '
-            f'worst_case={assessment_big.worst_case_secs}, threshold={assessment_big.threshold_secs}'
+        # --- B8 (heartbeat-floor model) ---
+        # low liveness_secs → threshold ≤ floor → safe=False
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        assessment_low = check_merge_liveness_margin(cfg, liveness_secs=600.0)
+        assert assessment_low.safe is False, (
+            f'expected safe=False for liveness_secs=600 (threshold=450 ≤ floor=600); '
+            f'worst_case={assessment_low.worst_case_secs}, threshold={assessment_low.threshold_secs}'
         )
 
-        cfg_small = _make_liveness_config(tmp_path, cold_timeout_secs=_B8_SMALL_TIMEOUT)
-        assessment_small = check_merge_liveness_margin(cfg_small, merge_ahead_bound=2)
-        assert assessment_small.safe is True, (
-            f'expected safe=True for timeout={_B8_SMALL_TIMEOUT}, '
-            f'worst_case={assessment_small.worst_case_secs}, threshold={assessment_small.threshold_secs}'
+        # default liveness_secs → threshold=8100 > floor=600 → safe=True
+        assessment_default = check_merge_liveness_margin(cfg)
+        assert assessment_default.safe is True, (
+            f'expected safe=True for default liveness (threshold=8100 > floor=600); '
+            f'worst_case={assessment_default.worst_case_secs}, threshold={assessment_default.threshold_secs}'
         )
 
 

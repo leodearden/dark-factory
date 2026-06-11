@@ -16,7 +16,7 @@ import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
 from orchestrator.merge_queue import MergeLivenessConfigError
 
@@ -155,25 +155,44 @@ class TestHarnessExternalDepBlockWiring:
 # ---------------------------------------------------------------------------
 
 class TestHarnessMergeLivenessGuard:
-    """Harness._start_merge_worker must be FAIL-CLOSED on an over-budget config.
+    """Harness._start_merge_worker must be FAIL-CLOSED on an over-budget liveness config.
 
-    At default bound (K=1) and cold timeout 9000 s:
-      worst_case = 1 × 9000 = 9000 ≥ threshold (0.75 × 10800 = 8100) → NOT safe.
-    At default bound and default cold timeout (7200 s):
-      worst_case = 1 × 7200 = 7200 < 8100 → safe → worker starts.
+    Heartbeat-floor model (task-1729 β):
+      worst_case = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE = 600 s (invariant)
+      threshold  = safety_factor × INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS = 8100 s
+      safe = 600 < 8100 → True  (cold timeout is irrelevant; K is irrelevant).
+
+    Over-budget lever: monkeypatch TOUCH_MISS_TOLERANCE to a large value so that
+    floor = 30 × 1000 = 30000 ≥ 8100 → refuses startup.
     """
 
     @pytest.mark.asyncio
-    async def test_over_budget_config_raises_at_startup(self, tmp_path: Path) -> None:
-        """Over-budget config (cold_timeout=9000, bound=1) must raise MergeLivenessConfigError."""
+    async def test_cold_9000_now_starts_cleanly(self, tmp_path: Path) -> None:
+        """cold_timeout=9000 (refused by old model) must start cleanly under heartbeat model.
+
+        Old model: worst_case = 1 × 9000 = 9000 ≥ 8100 → refused.
+        Heartbeat model: worst_case = 600 < 8100 → safe → worker starts.
+        """
         config = OrchestratorConfig(
             project_root=tmp_path,
             merge_verify_cold_command_timeout_secs=9000,
         )
         harness = Harness(config)
 
-        with pytest.raises(MergeLivenessConfigError):
+        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
+            pass
+
+        with patch(
+            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
+            _noop_run,
+        ):
+            # Must NOT raise MergeLivenessConfigError under heartbeat model
             await harness._start_merge_worker()
+
+        try:
+            assert harness._merge_worker_task is not None
+        finally:
+            await harness._stop_merge_worker()
 
     @pytest.mark.asyncio
     async def test_in_budget_config_starts_worker(self, tmp_path: Path) -> None:
@@ -202,3 +221,50 @@ class TestHarnessMergeLivenessGuard:
             # Explicit teardown: stop the worker and await the task so the test
             # cannot leave dangling asyncio tasks or open resources.
             await harness._stop_merge_worker()
+
+    @pytest.mark.asyncio
+    async def test_crash_config_starts_worker(self, tmp_path: Path) -> None:
+        """K=2 config (one enabled runner) + cold_timeout=7200 must NOT raise.
+
+        Regression-lock: stays green under BOTH the old per-host model
+        (per_host = ceil(2/2) = 1 → worst_case = 7200 < 8100 → safe) and the
+        new heartbeat-floor model (floor = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE
+        = 600 < 8100 → safe).  Guards against a future refactor accidentally
+        re-coupling K to the liveness check.
+        """
+        r1 = VerifyRunnerConfig(name='r1', ssh_host='h1.local', git_remote='remote1')
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_runners=[r1],                           # → K = 1 + 1 = 2
+            merge_verify_cold_command_timeout_secs=7200,   # shipped default; safe under both models
+        )
+        harness = Harness(config)
+
+        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
+            pass
+
+        with patch(
+            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
+            _noop_run,
+        ):
+            # Must NOT raise MergeLivenessConfigError under either model
+            await harness._start_merge_worker()
+
+        try:
+            assert harness._merge_worker_task is not None
+        finally:
+            await harness._stop_merge_worker()
+
+    @pytest.mark.asyncio
+    async def test_over_budget_via_low_tolerance_raises(self, tmp_path: Path) -> None:
+        """Monkeypatching TOUCH_MISS_TOLERANCE=1000 → floor=30000 ≥ 8100 → raises.
+
+        Demonstrates that the heartbeat-floor lever is TOUCH_MISS_TOLERANCE (not
+        cold_timeout or K).  A test can force an over-budget verdict by raising
+        the tolerance constant so floor = _HEARTBEAT_POLL_S × 1000 = 30000 > 8100.
+        """
+        config = OrchestratorConfig(project_root=tmp_path)
+        harness = Harness(config)
+
+        with patch('orchestrator.merge_queue.TOUCH_MISS_TOLERANCE', 1000), pytest.raises(MergeLivenessConfigError):
+            await harness._start_merge_worker()
