@@ -412,3 +412,62 @@ class TestCaptureZeroOutputEvidence:
         assert 'sentinel_a.txt' in listing_str or any(
             'sentinel_a' in entry for entry in listing
         ), f'Expected sentinel_a.txt in config_dir_listing: {listing!r}'
+
+
+# ---------------------------------------------------------------------------
+# Step-11 RED tests: _cleanup_config_dir
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupConfigDir:
+    """_cleanup_config_dir is a preserve-aware wrapper around config_dir.cleanup().
+
+    Case A: _preserve_config_dir=True  → cleanup is SKIPPED  → path still exists.
+    Case B: _preserve_config_dir=False → cleanup runs         → path is gone.
+    Case C: _config_dir is None        → no-op, no exception.
+
+    All tests fail RED because _cleanup_config_dir does not exist yet (step-12
+    implements it).
+    """
+
+    def test_preserve_flag_true_skips_cleanup(self, tmp_path: Path):
+        """When _preserve_config_dir=True, _cleanup_config_dir() must NOT delete the dir."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        sentinel = config_dir.path / 'keep_me.txt'
+        sentinel.write_text('preserve test')
+        wf._config_dir = config_dir  # type: ignore[attr-defined]
+        wf._preserve_config_dir = True  # type: ignore[attr-defined]
+
+        wf._cleanup_config_dir()  # type: ignore[attr-defined]
+
+        assert config_dir.path.exists(), (
+            f'_cleanup_config_dir() must skip cleanup when _preserve_config_dir=True; '
+            f'path was deleted: {config_dir.path}'
+        )
+        assert sentinel.exists(), 'Sentinel file must survive when cleanup is skipped'
+
+    def test_preserve_flag_false_performs_cleanup(self, tmp_path: Path):
+        """When _preserve_config_dir=False, _cleanup_config_dir() deletes the dir."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        sentinel = config_dir.path / 'remove_me.txt'
+        sentinel.write_text('cleanup test')
+        wf._config_dir = config_dir  # type: ignore[attr-defined]
+        wf._preserve_config_dir = False  # type: ignore[attr-defined]
+
+        wf._cleanup_config_dir()  # type: ignore[attr-defined]
+
+        assert not config_dir.path.exists(), (
+            f'_cleanup_config_dir() must remove config dir when _preserve_config_dir=False; '
+            f'path still exists: {config_dir.path}'
+        )
+
+    def test_none_config_dir_is_noop(self, tmp_path: Path):
+        """When _config_dir is None, _cleanup_config_dir() is a no-op and never raises."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._config_dir = None  # type: ignore[attr-defined]
+        wf._preserve_config_dir = False  # type: ignore[attr-defined]
+
+        # Must not raise
+        wf._cleanup_config_dir()  # type: ignore[attr-defined]
