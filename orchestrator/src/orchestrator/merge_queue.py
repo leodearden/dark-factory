@@ -6761,6 +6761,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     merge_sha=merge_commit,
                     on_result=_warm_capture.append if _is_warm_path else None,
                     quarantine=self._runner_quarantine,
+                    keep_worktrees=set(self._owned_merge_worktrees),
                 ))
                 while True:
                     done, _ = await asyncio.wait(
