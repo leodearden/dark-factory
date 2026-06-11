@@ -29,6 +29,7 @@ from shared.cli_invoke import (
     classify_agent_failure,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    is_zero_output_timeout,
 )
 from shared.testing import make_gate_mock
 
@@ -2175,3 +2176,131 @@ class TestSchemaToolDenied:
         parsed = _parse_claude_output(result)
         assert parsed.success is False
         assert parsed.schema_tool_denied is False
+
+
+# ── _run_subprocess proc_tree capture on timeout ──────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessProcTree:
+    """_run_subprocess captures a process-group snapshot in proc_tree on timeout.
+
+    Fails RED because _SubprocessResult has no proc_tree field and
+    snapshot_process_group is not yet called in the timeout handler.
+    """
+
+    @pytest.mark.timeout(15)
+    async def test_proc_tree_populated_on_real_timeout(self, tmp_path):
+        """A real hanging child's process group is snapshotted in proc_tree on timeout.
+
+        Drives _run_subprocess with 'sleep 30' and a short timeout_seconds.
+        Asserts result.timed_out=True AND result.proc_tree is non-empty and
+        references the sleep child (by comm name 'sleep' appearing in the snapshot).
+        """
+        result = await _run_subprocess(
+            ['sleep', '30'],
+            cwd=tmp_path,
+            env=dict(os.environ),
+            model='opus',
+            timeout_seconds=0.3,
+        )
+        assert result.timed_out is True
+        # proc_tree must exist as a field and be non-empty
+        assert result.proc_tree, (
+            f'Expected non-empty proc_tree in _SubprocessResult, got: {result.proc_tree!r}'
+        )
+        # The snapshot should reference the sleep child
+        assert 'sleep' in result.proc_tree, (
+            f'Expected "sleep" in proc_tree, got: {result.proc_tree!r}'
+        )
+
+
+# ── _parse_claude_output proc_tree propagation ────────────────────────────────
+
+
+class TestParseClaudeOutputProcTree:
+    """_parse_claude_output propagates proc_tree from _SubprocessResult onto AgentResult.
+
+    Fails RED because neither _SubprocessResult nor AgentResult has a proc_tree
+    field yet.
+    """
+
+    @pytest.mark.parametrize('stdout,returncode', [
+        ('', 1),
+        ('not-json', 1),
+        (_CLAUDE_VALID_JSON_STDOUT, 0),
+    ], ids=['empty_stdout', 'json_decode_error', 'normal_parse'])
+    def test_proc_tree_propagated_on_all_parse_paths(self, stdout, returncode):
+        """proc_tree is copied to AgentResult on every _parse_claude_output return path."""
+        tree = 'snapshot_process_group(55555): 1 process(es) in group:\n  pid=55555 ppid=1 state=S wchan=hrtimer_nanosleep comm=sleep\n'
+        sub = _SubprocessResult(
+            stdout=stdout, stderr='', returncode=returncode,
+            duration_ms=100, timed_out=True, proc_tree=tree,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.proc_tree == tree, (
+            f'Expected proc_tree to be propagated, got: {agent.proc_tree!r}'
+        )
+
+    def test_proc_tree_defaults_empty_when_not_set(self):
+        """proc_tree is empty string by default (no proc_tree on _SubprocessResult)."""
+        sub = _SubprocessResult(stdout='', stderr='', returncode=1,
+                                duration_ms=10, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.proc_tree == ''
+
+
+class TestIsZeroOutputTimeout:
+    """Unit tests for the is_zero_output_timeout() predicate.
+
+    This predicate captures the fresh-invocation wedge condition first observed
+    in reify-4429 (2026-06-11): the CLI subprocess hangs for the full
+    invocation_timeout producing zero output.  The same three-field condition
+    is used by the task-1532 resume-variant wedge guard
+    (invoke_with_cap_retry:644-648).
+    """
+
+    def _zero_output_result(self) -> AgentResult:
+        """Build a canonical zero-output timed-out AgentResult."""
+        return AgentResult(
+            success=False,
+            output='Agent produced no output',
+            timed_out=True,
+            turns=0,
+            cost_usd=0.0,
+            duration_ms=1_200_000,
+        )
+
+    def test_true_for_canonical_zero_output_timeout(self):
+        """timed_out=True, turns=0, cost_usd=0.0 → True."""
+        result = self._zero_output_result()
+        assert is_zero_output_timeout(result) is True
+
+    def test_false_when_not_timed_out(self):
+        """timed_out=False makes it a normal (non-wedged) result."""
+        result = self._zero_output_result()
+        result.timed_out = False
+        assert is_zero_output_timeout(result) is False
+
+    def test_false_when_turns_nonzero(self):
+        """turns>0 means the CLI did real agentic work — not a zero-output wedge."""
+        result = self._zero_output_result()
+        result.turns = 1
+        assert is_zero_output_timeout(result) is False
+
+    def test_false_when_cost_nonzero(self):
+        """cost_usd>0.0 means tokens were consumed — not a zero-output wedge."""
+        result = self._zero_output_result()
+        result.cost_usd = 0.01
+        assert is_zero_output_timeout(result) is False
+
+    def test_false_for_successful_result(self):
+        """A successful result is definitionally not a zero-output wedge."""
+        result = AgentResult(
+            success=True,
+            output='Done!',
+            timed_out=False,
+            turns=5,
+            cost_usd=0.25,
+        )
+        assert is_zero_output_timeout(result) is False

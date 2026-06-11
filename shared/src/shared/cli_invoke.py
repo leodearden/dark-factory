@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
 # that never set ANTHROPIC_BASE_URL can still import shared.cli_invoke.
-from shared.proc_group import terminate_process_group
+from shared.proc_group import snapshot_process_group, terminate_process_group
 
 try:
     from shared.vllm_bridge import VllmBridge as _VllmBridgeRuntime
@@ -123,6 +123,7 @@ __all__ = [
     'classify_agent_failure',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    'is_zero_output_timeout',
 ]
 
 
@@ -216,6 +217,13 @@ class AgentResult:
       cli_invoke deny-list no longer permits the schema tool), NOT a flaky
       candidate.  ``success`` stays False (NOT salvaged); callers should raise a
       loud, un-suppressed escalation so the deny-list gets fixed.
+    - ``proc_tree``: human-readable snapshot of the subprocess process group
+      captured by ``snapshot_process_group(pgid)`` at the top of the
+      ``TimeoutError`` handler in ``_run_subprocess`` — i.e. while the wedged
+      children are still alive and their ``/proc`` entries are readable.
+      Empty string when the invocation did not time out.  Persisted to
+      ``.task/zero_output_evidence-iter{N}.json`` by the workflow's
+      ``_capture_zero_output_evidence`` helper (task 1739).
     """
 
     success: bool
@@ -236,6 +244,31 @@ class AgentResult:
     schema_salvaged: bool = False
     schema_tool_denied: bool = False
     api_error_status: int | None = None
+    proc_tree: str = ''
+
+
+def is_zero_output_timeout(result: AgentResult) -> bool:
+    """Return True when *result* is a fresh-invocation zero-output CLI wedge.
+
+    The three-field condition (timed_out=True, turns=0, cost_usd=0.0) means
+    the subprocess hung for the full invocation_timeout and produced no output
+    — the CLI never executed any agentic work.
+
+    This predicate is the single canonical definition shared by:
+
+    - The RESUME-variant wedge guard in ``invoke_with_cap_retry`` (~line 644,
+      task 1532): clears the wedged ``resume_session_id`` so the cap-retry
+      loop does not re-resume an orphaned provider session.
+
+    - The FRESH-invocation circuit breaker in ``workflow._execute_iterations``
+      (task 1739): fast-fails to BLOCKED after
+      ``config.max_consecutive_zero_output_timeouts`` consecutive such results
+      instead of burning the full ``max_execute_iterations`` budget (~3.3h).
+
+    Root cause observed: reify-4429 (2026-06-11) — 10/10 implementer
+    iterations hung pre-first-turn with no recoverable session state.
+    """
+    return result.timed_out and result.turns == 0 and result.cost_usd == 0.0
 
 
 class AgentFailureKind(enum.StrEnum):
@@ -407,6 +440,7 @@ class _SubprocessResult:
     returncode: int
     duration_ms: int
     timed_out: bool = False
+    proc_tree: str = ''
 
 
 async def invoke_claude_agent(
@@ -642,9 +676,7 @@ async def invoke_with_cap_retry(
                 # on the very next iteration.  At most one extra full-timeout
                 # (~configured_timeout_ms) is incurred before the cap is re-detected.
                 if (
-                    result.timed_out
-                    and result.turns == 0
-                    and result.cost_usd == 0.0
+                    is_zero_output_timeout(result)
                     and invoke_kwargs.get('resume_session_id')
                 ):
                     logger.warning(
@@ -939,6 +971,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             stderr=result.stderr,
             timed_out=result.timed_out,
             duration_ms=result.duration_ms,
+            proc_tree=result.proc_tree,
         )
 
     try:
@@ -950,6 +983,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             subtype='text_output',
             stderr=result.stderr,
             timed_out=result.timed_out,
+            proc_tree=result.proc_tree,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -1026,6 +1060,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         schema_salvaged=schema_salvaged,
         schema_tool_denied=schema_tool_denied,
         api_error_status=api_error_status,
+        proc_tree=result.proc_tree,
     )
 
 
@@ -1067,6 +1102,11 @@ async def _run_subprocess(
                 timeout=timeout_seconds,
             )
         except TimeoutError:
+            # Snapshot the process group FIRST — before terminate() — while the
+            # wedged children are still alive and their /proc entries readable.
+            # This is the sole place where pgid is in scope and the group is
+            # guaranteed live; after the kill the snapshot would be empty/stale.
+            proc_tree = snapshot_process_group(pgid)
             # Graceful shutdown: SIGTERM first, then SIGKILL after grace period.
             # SIGTERM lets the Claude CLI flush its final JSON output to stdout
             # (including session_id and token counts) before exiting.
@@ -1109,6 +1149,7 @@ async def _run_subprocess(
                 returncode=proc.returncode if proc.returncode is not None else 1,
                 duration_ms=duration_ms,
                 timed_out=True,
+                proc_tree=proc_tree,
             )
     except asyncio.CancelledError:
         # Orchestrator shutdown path: the awaiting task was cancelled. Kill the

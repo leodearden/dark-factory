@@ -27,6 +27,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
     invoke_with_cap_retry,
+    is_zero_output_timeout,
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
@@ -227,6 +228,11 @@ class _BriefingLike(Protocol):
     ) -> str: ...
 
 logger = logging.getLogger(__name__)
+
+# Reason string used when the fresh-invocation zero-output circuit breaker trips.
+# Mirrors the _inherited_break_info pattern: set by _execute_iterations, consumed
+# at the BLOCKED route in _execute_verify_review_loop (task 1739).
+ZERO_OUTPUT_HANG_REASON = 'infra: zero-output CLI hang (consecutive fresh-invocation timeouts)'
 
 
 class WorkflowState(enum.Enum):
@@ -547,6 +553,16 @@ class TaskWorkflow:
         # from main (preexisting break).  Read at the call site (run()) to route
         # _mark_blocked with dedupe_fingerprint instead of the generic reason.
         self._inherited_break_info: dict | None = None
+        # Set by the zero-output circuit breaker in _execute_iterations when
+        # max_consecutive_zero_output_timeouts consecutive fresh-invocation
+        # timeouts are detected.  Read by _execute_verify_review_loop to route
+        # _mark_blocked with the distinct infra_issue reason instead of the
+        # generic 'Execution iterations exhausted' (task 1739).
+        self._zero_output_hang_info: dict | None = None
+        # When True, the finally-block config-dir cleanup is skipped so the
+        # preserved dir can be used for forensic analysis.  Set alongside
+        # _zero_output_hang_info when the circuit breaker trips (task 1739).
+        self._preserve_config_dir: bool = False
         # Per-run history of (category, normalised cause_hint) tuples for the
         # signature-repetition guard.  Ephemeral — intentionally not persisted
         # in task metadata because the verify loop is wholly within one
@@ -1937,9 +1953,9 @@ class TaskWorkflow:
             # otherwise so an agent's update_task(status='done') bypass doesn't
             # GC unmerged work). Skips externally-managed worktrees (eval mode).
             await self._maybe_cleanup_done_worktree()
-            # Cleanup per-task config dir
-            if self._config_dir:
-                self._config_dir.cleanup()
+            # Cleanup per-task config dir (preserve-aware — skips when circuit
+            # breaker tripped so the dir is available for forensic analysis).
+            self._cleanup_config_dir()
 
     def _resolve_module_configs(self, modules: list[str] | None = None) -> list[ModuleConfig]:
         """Collect ModuleConfigs for this task's modules.
@@ -3454,6 +3470,17 @@ class TaskWorkflow:
             if exec_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
             if exec_outcome == WorkflowOutcome.BLOCKED:
+                # Zero-output hang: use the distinct infra_issue reason instead
+                # of the generic 'Execution iterations exhausted' so the escalation
+                # is classified correctly and ops can distinguish deterministic
+                # CLI wedges from real task failures (task 1739).
+                if self._zero_output_hang_info is not None:
+                    info = self._zero_output_hang_info
+                    return await self._mark_blocked(
+                        info['reason'],
+                        detail=info['detail'],
+                        category='infra_issue',
+                    )
                 return await self._mark_blocked('Execution iterations exhausted')
 
             # VERIFY + DEBUGFIX loop
@@ -3573,8 +3600,34 @@ class TaskWorkflow:
     async def _execute_iterations(self) -> WorkflowOutcome:
         """Run implementer iterations until plan is complete."""
         assert self.worktree is not None and self.artifacts is not None
+        # Zero-output hang circuit breaker: reset all circuit-breaker state each
+        # time _execute_iterations is entered so that a re-entry within a single
+        # run cannot inherit stale _zero_output_hang_info from a prior pass and
+        # mis-route a later unrelated BLOCKED outcome to infra_issue.
+        # Counts CONSECUTIVE zero-output CLI timeouts; any non-zero-output result
+        # resets it.  Threshold: config.max_consecutive_zero_output_timeouts.
+        consecutive_zero_output = 0
+        self._zero_output_hang_info = None
+        self._preserve_config_dir = False
         while self.artifacts.get_pending_steps():
             if self.metrics.execute_iterations >= self.config.max_execute_iterations:
+                # Iteration cap reached.  If the most-recent batch of iterations
+                # were all zero-output timeouts (consecutive_zero_output > 0),
+                # classify this as infra_issue rather than the generic
+                # 'Execution iterations exhausted' — this handles the edge case
+                # where max_consecutive_zero_output_timeouts > max_execute_iterations
+                # so the circuit-breaker threshold is never reached inside the loop
+                # but the pattern is still clearly an infra hang.
+                if consecutive_zero_output > 0:
+                    self._zero_output_hang_info = {
+                        'reason': ZERO_OUTPUT_HANG_REASON,
+                        'detail': (
+                            f'consecutive_zero_output={consecutive_zero_output} '
+                            f'at_iteration_cap=True '
+                            f'iteration={self.metrics.execute_iterations} '
+                            f'evidence: .task/zero_output_evidence-iter*.json'
+                        ),
+                    }
                 return WorkflowOutcome.BLOCKED
 
             # Inter-iteration rebase: keep the task branch close to main
@@ -3680,6 +3733,51 @@ class TaskWorkflow:
                     f'{self.metrics.execute_iterations} failed'
                 )
 
+            # --- Zero-output hang circuit breaker ---
+            # Detect consecutive fresh-invocation CLI hangs (reify-4429 pattern):
+            # the subprocess produced ZERO output for the full timeout, meaning
+            # the CLI never started real work.  Retrying identically burns time
+            # (~20 min/iteration × threshold) with no chance of progress.
+            if is_zero_output_timeout(result):
+                consecutive_zero_output += 1
+                # Capture forensic evidence for every zero-output timeout (best-effort;
+                # the helper suppresses all I/O errors internally).
+                self._capture_zero_output_evidence(result, self.metrics.execute_iterations)
+                if consecutive_zero_output >= self.config.max_consecutive_zero_output_timeouts:
+                    self._zero_output_hang_info = {
+                        'reason': ZERO_OUTPUT_HANG_REASON,
+                        'detail': (
+                            f'consecutive_zero_output={consecutive_zero_output} '
+                            f'iteration={self.metrics.execute_iterations} '
+                            f'duration_ms={result.duration_ms} '
+                            f'subtype={result.subtype!r} '
+                            f'evidence: .task/zero_output_evidence-iter*.json'
+                        ),
+                    }
+                    self._preserve_config_dir = True
+                    logger.error(
+                        'Task %s: zero-output hang circuit breaker tripped after %d '
+                        'consecutive fresh-invocation timeouts — blocking as infra_issue',
+                        self.task_id, consecutive_zero_output,
+                    )
+                    return WorkflowOutcome.BLOCKED
+                logger.warning(
+                    'Task %s: zero-output CLI timeout (%d/%d consecutive) — '
+                    'will retry; recycling config dir if enabled',
+                    self.task_id, consecutive_zero_output,
+                    self.config.max_consecutive_zero_output_timeouts,
+                )
+                # Optional mitigation: discard the wedged session state so the
+                # next iteration starts with a clean CLAUDE_CONFIG_DIR.  Safe
+                # because turns==0 — the destroyed session did no real work.
+                # The tripping iteration's dir is preserved (see above).
+                if self.config.recycle_config_dir_on_zero_output:
+                    self._recycle_config_dir()
+                continue  # skip judge on zero-output; increment next iteration
+            else:
+                # Non-zero-output result: reset the consecutive counter.
+                consecutive_zero_output = 0
+
             # --- Judge: decide whether to exit early (ζ) ---
             # Opt-in via config.judge_after_each_iteration (default False).
             # Eval mode flips it on per-task. Failures fall through silently
@@ -3714,6 +3812,116 @@ class TaskWorkflow:
                         return WorkflowOutcome.DONE
 
         return WorkflowOutcome.DONE
+
+    def _recycle_config_dir(self) -> None:
+        """Tear down the current TaskConfigDir and create a fresh one in place.
+
+        Called between sub-threshold zero-output CLI timeouts when
+        ``config.recycle_config_dir_on_zero_output`` is True.  Per-task
+        session state (CLAUDE_CONFIG_DIR) is the prime deterministic-wedge
+        suspect; because ``turns==0`` the destroyed session did no real work,
+        so discarding it cannot lose progress — it aligns with crash-recovery
+        semantics (resuming a wedged empty session would only re-hang).
+
+        The tripping iteration's config dir is NOT recycled: that dir is
+        preserved for forensic analysis via ``_preserve_config_dir=True``.
+
+        Guards on ``self._config_dir`` and ``self.worktree`` so the method is
+        a no-op when called before either is initialised (defensive, should
+        not occur in practice).
+        """
+        if not self._config_dir or not self.worktree:
+            return
+        old_path = self._config_dir.path
+        self._config_dir.cleanup()
+        self._config_dir = TaskConfigDir(
+            self.task_id,
+            base_dir=self.worktree / '.task',
+        )
+        logger.warning(
+            'Task %s: recycled TaskConfigDir for zero-output-hang mitigation '
+            '(%s → %s)',
+            self.task_id, old_path, self._config_dir.path,
+        )
+
+    def _cleanup_config_dir(self) -> None:
+        """Preserve-aware wrapper around ``TaskConfigDir.cleanup()``.
+
+        Called from ``run()``'s finally block instead of inlining the
+        ``if self._config_dir: self._config_dir.cleanup()`` pattern.
+        Extraction makes the preserve-skip behaviour unit-testable (task 1739).
+
+        Behaviour:
+        - ``self._config_dir is None`` → no-op (dir was never created).
+        - ``self._preserve_config_dir is True`` → skip cleanup and log a
+          warning naming the preserved path and the zero-output-hang reason,
+          so the on-call engineer knows the dir is intentional.
+        - Otherwise → ``self._config_dir.cleanup()`` (normal path).
+        """
+        if not self._config_dir:
+            return
+        if self._preserve_config_dir:
+            logger.warning(
+                'Task %s: config dir preserved for forensic analysis '
+                '(reason: %s) → %s',
+                self.task_id,
+                ZERO_OUTPUT_HANG_REASON,
+                self._config_dir.path,
+            )
+            return
+        self._config_dir.cleanup()
+
+    def _capture_zero_output_evidence(self, result: AgentResult, iteration: int) -> None:
+        """Persist forensic evidence for a zero-output CLI timeout to .task/.
+
+        Called on EVERY zero-output timeout in ``_execute_iterations`` (before
+        the threshold check) so both sub-threshold and tripping occurrences
+        are captured.  Writes to ``artifacts.root`` which outlives the per-task
+        ``TaskConfigDir`` cleanup and the BLOCKED worktree (not GC'd since the
+        task is not DONE).
+
+        Best-effort: any I/O failure is caught and logged rather than
+        propagated — evidence capture must never crash the iteration loop.
+        """
+        if not self.artifacts:
+            return
+        try:
+            # Build config_dir listing (relative paths as strings).
+            config_dir_str: str | None = None
+            config_dir_listing: list[str] = []
+            if self._config_dir is not None:
+                config_dir_str = str(self._config_dir.path)
+                try:
+                    config_dir_listing = [
+                        str(p.relative_to(self._config_dir.path))
+                        for p in self._config_dir.path.rglob('*')
+                    ]
+                except OSError:
+                    config_dir_listing = ['<listing failed>']
+
+            evidence = {
+                'iteration': iteration,
+                'duration_ms': result.duration_ms,
+                'timed_out': result.timed_out,
+                'turns': result.turns,
+                'cost_usd': result.cost_usd,
+                'subtype': result.subtype,
+                'stderr_tail': (result.stderr or '')[-4000:],
+                'proc_tree': result.proc_tree,
+                'config_dir': config_dir_str,
+                'config_dir_listing': config_dir_listing,
+            }
+            evidence_path = self.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
+            evidence_path.write_text(json.dumps(evidence, indent=2))
+            logger.info(
+                'Task %s: zero-output evidence written → %s',
+                self.task_id, evidence_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: failed to write zero-output evidence (iteration=%d): %s',
+                self.task_id, iteration, exc,
+            )
 
     async def _run_completion_judge(
         self, iteration_log: list[dict]

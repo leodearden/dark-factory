@@ -67,8 +67,103 @@ import contextlib
 import logging
 import os
 import signal
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def snapshot_process_group(pgid: int) -> str:
+    """Return a human-readable snapshot of all processes in process group *pgid*.
+
+    Walks ``/proc`` to find processes whose process-group id matches *pgid*,
+    then formats one line per process with pid, ppid, state, wchan (the kernel
+    function the process is currently blocked in), and comm (executable name).
+
+    Designed to be called from ``_run_subprocess``'s ``TimeoutError`` handler
+    **before** ``proc.terminate()`` / ``terminate_process_group`` — at that
+    point the wedged child processes are still alive and their ``/proc`` entries
+    are readable.  After the kill the group may vanish mid-iteration; all I/O
+    is wrapped in try/except so this function *never* raises.
+
+    Returns a non-empty diagnostic string (with a header row) when at least one
+    process belongs to *pgid*, or a benign "no processes found" note otherwise.
+
+    Linux-specific: depends on ``/proc/<pid>/stat``, ``/proc/<pid>/wchan``,
+    and ``/proc/<pid>/comm``.  The whole ``proc_group`` module already relies on
+    Linux semantics (``os.killpg`` / ``os.getpgrp``), so this is acceptable.
+    """
+    try:
+        return _snapshot_process_group_unsafe(pgid)
+    except Exception:
+        # Belt-and-suspenders: if the outer try fails (unusual /proc layout,
+        # permissions, or unexpected exception), return a diagnostic string
+        # rather than propagating.
+        return f'snapshot_process_group({pgid}): unexpected error — see logs'
+
+
+def _snapshot_process_group_unsafe(pgid: int) -> str:
+    """Implement snapshot_process_group; may raise — caller wraps in try/except."""
+    if pgid <= 0:
+        return f'snapshot_process_group({pgid}): pgid <= 0 — no snapshot taken'
+
+    proc_dir = Path('/proc')
+    if not proc_dir.exists():
+        return f'snapshot_process_group({pgid}): /proc not available'
+
+    rows: list[str] = []
+    try:
+        entries = list(proc_dir.iterdir())
+    except OSError:
+        return f'snapshot_process_group({pgid}): could not list /proc'
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+
+        # Read /proc/<pid>/stat to get pgrp (field 5, 1-indexed), ppid (4), state (3).
+        # stat format: "pid (comm) state ppid pgrp ..."
+        try:
+            stat_text = (entry / 'stat').read_text()
+        except OSError:
+            continue
+
+        # Parse: find the closing ')' of the comm field to handle spaces/parens in names.
+        try:
+            rparen = stat_text.rfind(')')
+            if rparen < 0:
+                continue
+            tail = stat_text[rparen + 2:]  # skip ') '
+            fields = tail.split()
+            # fields[0]=state, [1]=ppid, [2]=pgrp, [3]=session, ...
+            state = fields[0]
+            ppid = int(fields[1])
+            pgrp = int(fields[2])
+        except (IndexError, ValueError):
+            continue
+
+        if pgrp != pgid:
+            continue
+
+        # Read comm (short executable name, capped at 15 chars by the kernel).
+        try:
+            comm = (entry / 'comm').read_text().strip()
+        except OSError:
+            comm = '?'
+
+        # Read wchan (kernel function the task is blocked in, or '0' when running).
+        try:
+            wchan = (entry / 'wchan').read_text().strip()
+        except OSError:
+            wchan = '?'
+
+        rows.append(f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm}')
+
+    if not rows:
+        return f'snapshot_process_group({pgid}): no processes found in group'
+
+    header = f'snapshot_process_group({pgid}): {len(rows)} process(es) in group:'
+    return '\n'.join([header] + rows)
 
 
 def _unsafe_pgid_reason(pgid: int, proc_pid: int | None) -> str | None:
