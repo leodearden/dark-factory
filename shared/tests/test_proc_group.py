@@ -12,7 +12,7 @@ import signal
 
 import pytest
 
-from shared.proc_group import terminate_process_group
+from shared.proc_group import snapshot_process_group, terminate_process_group
 
 
 async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) -> bool:
@@ -289,4 +289,60 @@ class TestTerminateProcessGroup:
                 return 0
 
         await terminate_process_group(FakeProc(), fake_pgid, grace_secs=0.1)  # type: ignore[arg-type]
+
+
+class TestSnapshotProcessGroup:
+    """Tests for snapshot_process_group(pgid) — /proc-based process-group snapshot.
+
+    The helper is called inside _run_subprocess's TimeoutError handler to
+    capture which processes were alive in the wedged CLI's process group
+    just before SIGTERM/SIGKILL.  It must never raise and must return a
+    useful string for any pgid value.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_real_child_appears_in_snapshot(self, tmp_path):
+        """Snapshot of a live child's pgid returns non-empty string mentioning the child.
+
+        Spawn a real 'sleep 30' child with start_new_session=True so it
+        leads its own process group (pgid == pid).  Call
+        snapshot_process_group(pgid) while it is alive and assert:
+        - the returned string is non-empty
+        - it contains the child pid (as str) or the comm 'sleep'
+        """
+        proc = await asyncio.create_subprocess_exec(
+            'sleep', '30',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+        try:
+            snapshot = snapshot_process_group(pgid)
+            assert snapshot, f'Expected non-empty snapshot for pgid={pgid}'
+            assert str(pgid) in snapshot or 'sleep' in snapshot, (
+                f'Expected child pid {pgid} or comm "sleep" in snapshot:\n{snapshot}'
+            )
+        finally:
+            proc.kill()
+            await proc.wait()
+
+    def test_invalid_pgid_never_raises(self):
+        """snapshot_process_group on an unused/invalid pgid returns a benign string.
+
+        Two sub-cases:
+        - a very large pgid (999_999_999) unlikely to exist
+        - pgid <= 1 (invalid by convention)
+        Neither should raise.
+        """
+        result_large = snapshot_process_group(999_999_999)
+        assert isinstance(result_large, str), (
+            f'Expected str, got {type(result_large)}'
+        )
+
+        result_invalid = snapshot_process_group(0)
+        assert isinstance(result_invalid, str), (
+            f'Expected str, got {type(result_invalid)}'
+        )
         assert calls == []
