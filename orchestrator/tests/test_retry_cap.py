@@ -412,6 +412,21 @@ def _build_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2
     )
 
 
+def _build_529_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2.5):
+    from orchestrator.harness import TaskReport
+
+    return TaskReport(
+        task_id='t1',
+        title='T1',
+        outcome=outcome,
+        cost_usd=cost_usd,
+        steward_cost_usd=steward_cost_usd,
+        block_reason='Planning failed: agent API error: HTTP 529',
+        block_detail='transient provider overload',
+        block_phase='plan',
+    )
+
+
 def _make_harness(config: OrchestratorConfig):
     """Minimal Harness instance for calling _apply_retry_cap directly."""
     from orchestrator.harness import Harness
@@ -536,3 +551,80 @@ class TestHarnessIntegration:
             )
         # Cap fired on the 3rd call — returned False despite the exception.
         assert result is False
+
+
+# --- Harness dual-ceiling integration ----------------------------------------
+
+
+class TestHarnessDualCeiling:
+    """_apply_retry_cap enforces both genuine and transient ceilings."""
+
+    def _make(self, tmp_path):
+        from orchestrator.config import OrchestratorConfig
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            max_per_module=1,
+            requeue_cap=3,
+            transient_requeue_cap=2,
+        )
+        return _make_harness(cfg)
+
+    @pytest.mark.asyncio
+    async def test_transient_does_not_fire_genuine_cap(self, tmp_path):
+        from orchestrator.workflow import WorkflowOutcome
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        # 1st transient REQUEUED — no trigger, genuine counter stays empty
+        r1 = await harness._apply_retry_cap(
+            't1', _build_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert r1 is True
+        assert trigger.await_count == 0
+        assert 't1' not in harness.scheduler._requeue_counts
+        assert harness.scheduler._transient_requeue_counts['t1'] == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_cap_fires_at_transient_ceiling(self, tmp_path):
+        from orchestrator.workflow import WorkflowOutcome
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        # 1st transient — no trigger
+        await harness._apply_retry_cap(
+            't1', _build_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert trigger.await_count == 0
+
+        # 2nd transient — hits transient_requeue_cap=2, trigger fires with cap=2
+        r2 = await harness._apply_retry_cap(
+            't1', _build_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert r2 is False
+        assert trigger.await_count == 1
+        call = trigger.await_args
+        assert call.kwargs.get('cap') == 2
+
+    @pytest.mark.asyncio
+    async def test_genuine_cap_unaffected_by_transient_counts(self, tmp_path):
+        from orchestrator.workflow import WorkflowOutcome
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        # 3 genuine requeues must fire at cap=3 regardless of transient state
+        for _ in range(2):
+            await harness._apply_retry_cap(
+                't2', _build_report(WorkflowOutcome.REQUEUED), True,
+            )
+        assert trigger.await_count == 0
+
+        r3 = await harness._apply_retry_cap(
+            't2', _build_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert r3 is False
+        assert trigger.await_count == 1
+        call = trigger.await_args
+        assert call.kwargs.get('cap') == 3
