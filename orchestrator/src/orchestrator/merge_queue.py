@@ -5273,6 +5273,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             for _infl in self._inflight
             if _infl.lease is not None
         }
+        # Include the finalizing head (if any) — it is the submission-order head
+        # and its host slot is still occupied while _finalize_inflight awaits.
+        # Inserted head-first so 'local' leads the dict, matching position 0 in entries.
+        if self._finalizing_head is not None and self._finalizing_head.lease is not None:
+            _fh_name = self._finalizing_head.lease.name
+            _fh_tid = self._finalizing_head.item.request.task_id
+            _by_host = {_fh_name: _fh_tid, **_by_host}
         _hosts_total = (
             len(self._host_allocator.host_names)
             if self._host_allocator is not None else 1
