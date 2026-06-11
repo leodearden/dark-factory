@@ -634,6 +634,7 @@ class TestCaptureEvidenceLoopWiring:
         outcome = await wf._execute_iterations()
 
         assert outcome == WorkflowOutcome.BLOCKED
+        assert wf.artifacts is not None
 
         # Two iterations ran (threshold=2), so two evidence files must exist.
         iter1_path = wf.artifacts.root / 'zero_output_evidence-iter1.json'

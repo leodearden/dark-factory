@@ -369,7 +369,7 @@ class TestSnapshotProcessGroup:
         snapshot_process_group must never raise.
         """
         from pathlib import Path
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
 
         # Patch Path.exists so /proc reports as not existing
         original_exists = Path.exists
@@ -410,7 +410,7 @@ class TestSnapshotProcessGroup:
         against a hand-crafted synthetic stat line.
         """
         from pathlib import Path
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
 
         # Synthetic pgid we want to match
         target_pgid = 77777
