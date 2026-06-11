@@ -1047,7 +1047,7 @@ def test_verify_merge_request_id_pgid_lifecycle(tmp_path, monkeypatch):
     """
     from unittest.mock import AsyncMock, MagicMock
 
-    from orchestrator.verify_cancel import PGID_DIR_NAME, pgid_file
+    from orchestrator.verify_cancel import pgid_file
 
     FAKE_PGID = 77777
     FAKE_REQUEST_ID = 'test-req-1732'
@@ -1222,7 +1222,7 @@ def test_cancel_verify_rc_wiring(tmp_path, monkeypatch):
     from unittest.mock import MagicMock
 
     from orchestrator.config import OrchestratorConfig
-    from orchestrator.verify_cancel import PGID_DIR_NAME, pgid_file
+    from orchestrator.verify_cancel import pgid_file
 
     FAKE_REQUEST_ID = 'wiring-test-req'
     EXPECTED_RC = 42  # unusual value to prove propagation
@@ -1270,7 +1270,7 @@ def test_cancel_verify_real_impl_dead_pgid(tmp_path, monkeypatch):
     from unittest.mock import MagicMock
 
     from orchestrator.config import OrchestratorConfig
-    from orchestrator.verify_cancel import PGID_DIR_NAME, pgid_file, write_pgid_file
+    from orchestrator.verify_cancel import pgid_file, write_pgid_file
 
     FAKE_REQUEST_ID = 'dead-pgid-req'
     # Use pid 1 (init) as the "dead" pgid — we can't kill it, but with a dead

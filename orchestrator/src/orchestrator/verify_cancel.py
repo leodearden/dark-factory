@@ -50,6 +50,7 @@ normal checkout sync — no separate deploy step required.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import signal
@@ -114,10 +115,8 @@ def write_pgid_file(path: Path, pgid: int) -> None:
 
 def remove_pgid_file(path: Path) -> None:
     """Remove *path* if it exists; silently a no-op when absent (idempotent)."""
-    try:
+    with contextlib.suppress(FileNotFoundError):
         path.unlink()
-    except FileNotFoundError:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -304,10 +303,8 @@ def cancel_request(
             failed = True  # live but unkillable
 
     # Step 5: killpg backstop (suppresses errors — group may already be gone)
-    try:
+    with contextlib.suppress(ProcessLookupError, OSError):
         killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, OSError):
-        pass
 
     # Step 6: decide outcome
     if failed:
