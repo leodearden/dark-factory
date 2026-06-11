@@ -1,4 +1,15 @@
-"""Tests for orchestrator.verify_cancel — pgid-file path/lifecycle, descendant walk, cancel_request."""
+"""Tests for orchestrator.verify_cancel — pgid-file path/lifecycle, descendant walk, cancel_request.
+
+Steps covered:
+  1 (test)  pgid-file path & lifecycle
+  2 (impl)  verify_cancel module created
+  3 (test)  collect_descendants — pure BFS with ppid_map injection
+  4 (impl)  read_ppid_map + collect_descendants
+  5 (test)  cancel_request — injected spies, all contract cases
+  6 (impl)  cancel_request
+  7 (test)  start_own_process_group setsid + fallback
+  8 (impl)  start_own_process_group
+"""
 
 from pathlib import Path
 
@@ -86,3 +97,51 @@ class TestPgidFileLifecycle:
         assert path.exists()
         remove_pgid_file(path)
         assert not path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Step-3: collect_descendants — pure BFS over an injected ppid_map
+# ---------------------------------------------------------------------------
+
+
+class TestCollectDescendants:
+    """Pure collect_descendants(root, ppid_map) with injected ppid maps."""
+
+    def _cd(self, root, ppid_map):
+        from orchestrator.verify_cancel import collect_descendants
+        return collect_descendants(root, ppid_map)
+
+    def test_simple_chain(self):
+        # root=100 -> 200 -> 300
+        ppid_map = {200: 100, 300: 200}
+        assert self._cd(100, ppid_map) == {200, 300}
+
+    def test_tree_with_sibling(self):
+        # root=100 -> {200, 201}; 200 -> 300; unrelated 999->1
+        ppid_map = {200: 100, 201: 100, 300: 200, 999: 1}
+        result = self._cd(100, ppid_map)
+        assert result == {200, 201, 300}
+        assert 999 not in result
+        assert 100 not in result  # root excluded
+
+    def test_missing_root_returns_empty(self):
+        ppid_map = {200: 100, 300: 200}
+        # root=999 has no children in the map
+        assert self._cd(999, ppid_map) == set()
+
+    def test_cyclic_map_does_not_loop(self):
+        # Synthetic cycle: 200->100, 100->200 (nonsensical but must terminate)
+        ppid_map = {100: 200, 200: 100, 300: 100}
+        # Should terminate and return descendants without infinite loop
+        result = self._cd(100, ppid_map)
+        assert isinstance(result, set)
+        assert 100 not in result  # root never included
+
+    def test_empty_map_returns_empty(self):
+        assert self._cd(42, {}) == set()
+
+    def test_root_not_in_result(self):
+        ppid_map = {200: 100}
+        result = self._cd(100, ppid_map)
+        assert 100 not in result
+        assert 200 in result
