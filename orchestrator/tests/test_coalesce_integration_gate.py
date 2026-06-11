@@ -519,3 +519,153 @@ class TestScenario2:
             f's23 must not be superseded by the coalescing pass; '
             f'got {outcome_s23!r}'
         )
+
+
+# ─── Scenario 3 ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestScenario3:
+    """step-5 (RED) / step-6 (GREEN): confidence-gate exclusion through the worker.
+
+    Three disjoint-file branches are pre-enqueued.  One member (s31) has a
+    prior blocked merge outcome recorded in the EventStore (δ's
+    _default_coalesce_exclusion_reason reads it and returns a non-None reason).
+    The coalescing pass forms a 2-member train from the two clean members (s32
+    + s33) and leaves s31 solo in the buffer.
+
+    Assertions:
+      (a) train_coalesced event member_task_ids == {s32, s33} (s31 excluded)
+      (b) exclusions list has exactly 1 entry for s31's request_id with a
+          reason that contains 'blocked'
+      (c) s31's future is UNRESOLVED at gate_entered — it was NOT absorbed
+      (d) after gate_release the 2-member train lands; s32/s33 files on main
+      (e) s31 resolves independently after worker.stop() (never 'superseded')
+
+    RED (step-5): no blocked-history seed → default predicate returns None for
+    all 3 → all 3 coalesce into a 3-member train → assertion (a) fails because
+    member_task_ids == {s31, s32, s33} and assertion (b) fails because
+    exclusions == [].
+    step-6 adds the es.emit(blocked merge_finalized for s31) before the worker
+    starts and wires the full gated-verify driver to make it GREEN.
+    """
+
+    async def test_confidence_gate_excludes_blocked_member(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        import contextlib
+        from unittest.mock import patch
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.merge_queue import MergeOutcome, SpeculativeMergeWorker
+
+        # Three disjoint-file branches — all mutually line-stackable.
+        wt1 = await _make_branch_with_file(git_ops, 'ig_s31', 'file_s31.py', 's31 = 1\n')
+        wt2 = await _make_branch_with_file(git_ops, 'ig_s32', 'file_s32.py', 's32 = 2\n')
+        wt3 = await _make_branch_with_file(git_ops, 'ig_s33', 'file_s33.py', 's33 = 3\n')
+
+        db_path = tmp_path / 'es_s3.db'
+        es = EventStore(db_path=db_path, run_id='s3-run')
+
+        # RED: no blocked-history seed for s31.
+        # step-6 adds: es.emit(EventType.merge_finalized, task_id='ig_s31', ...)
+        # with data={'branch': 'ig_s31', 'state': 'blocked', ...} so that
+        # _default_coalesce_exclusion_reason sees a recent blocked terminal and
+        # excludes s31 from the coalescing pass.
+
+        scheduler = FakeScheduler()
+        for mid in ('ig_s31', 'ig_s32', 'ig_s33'):
+            scheduler.statuses[mid] = ['merge-deferred']
+
+        # Collect mark_done calls for the 2-member train (s32 + s33).
+        mark_done_calls: list[str] = []
+        train_done = asyncio.Event()
+        _real_mark_done = scheduler.mark_done
+
+        async def _counting_mark_done(
+            task_id: str, *, kind: str, sha: str, note: str | None = None
+        ) -> None:
+            await _real_mark_done(task_id, kind=kind, sha=sha, note=note)
+            mark_done_calls.append(task_id)
+            if len(mark_done_calls) >= 2:  # 2-member train
+                train_done.set()
+
+        scheduler.mark_done = _counting_mark_done
+
+        factory = build_train_callback_factory(scheduler)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es, train_callback_factory=factory,
+        )
+
+        req1 = _make_req('ig_s31', 'ig_s31', wt1, coalesce_config)
+        req2 = _make_req('ig_s32', 'ig_s32', wt2, coalesce_config)
+        req3 = _make_req('ig_s33', 'ig_s33', wt3, coalesce_config)
+        await queue.put(req1)
+        await queue.put(req2)
+        await queue.put(req3)
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _gated_verify(gate_release, gate_entered),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+
+            await asyncio.wait_for(gate_entered.wait(), timeout=60)
+
+            # (c) s31's future must be UNRESOLVED at gate_entered — excluded, not absorbed.
+            assert not req1.result.done(), (
+                's31 must remain solo (future unresolved at gate_entered); '
+                'expected s31 NOT absorbed into the train'
+            )
+
+            # (a) train_coalesced event member_task_ids == {s32, s33} (excludes s31).
+            events = _events_of_type(db_path, 'train_coalesced')
+            assert len(events) == 1, f'Expected 1 train_coalesced event; got {len(events)}'
+            event_data = events[0]['data']
+            assert set(event_data.get('member_task_ids', [])) == {'ig_s32', 'ig_s33'}, (
+                f'train_coalesced member_task_ids must be {{s32, s33}}; got {event_data}'
+            )
+
+            # (b) exclusions list has exactly 1 entry for s31 with a 'blocked' reason.
+            exc = event_data.get('exclusions', [])
+            assert len(exc) == 1, f'Expected 1 exclusion entry for s31; got {exc}'
+            assert exc[0]['request_id'] == req1.request_id, (
+                f"exclusions[0].request_id must be req1's; got {exc[0]['request_id']!r}"
+            )
+            assert 'blocked' in exc[0]['reason'], (
+                f"exclusions[0].reason must contain 'blocked'; got {exc[0]['reason']!r}"
+            )
+
+            # Wait for the 2-member train to land, then release the gate.
+            await asyncio.wait_for(train_done.wait(), timeout=30)
+            gate_release.set()
+
+        # (d) s32 and s33 files on main after the train lands.
+        from orchestrator.git_ops import _run
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'file_s32.py' in main_files, 'file_s32.py (s32) must be on main'
+        assert 'file_s33.py' in main_files, 'file_s33.py (s33) must be on main'
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        # (e) s31 resolved independently after stop (never 'superseded').
+        assert req1.result.done(), (
+            's31 result must be resolved after worker.stop()'
+        )
+        outcome_s31 = req1.result.result()
+        assert outcome_s31.status != 'superseded', (
+            f's31 must not be superseded by the coalescing pass; '
+            f'got {outcome_s31!r}'
+        )
