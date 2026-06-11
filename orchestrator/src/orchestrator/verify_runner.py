@@ -98,6 +98,9 @@ __all__ = [
     "ColdWarmVerifyDelta",
     "delta_to_json",
     "delta_from_json",
+    # β additions
+    "HostLease",
+    "HostAllocator",
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
@@ -643,6 +646,9 @@ class RemoteRunner:
         # the per-call round-trip is acceptable at current merge cadences.
         # Filed as a follow-up: cache runners and wire deduplication.
         self._last_pushed_main_sha: str | None = None
+        # β: track the in-flight request-id so cancel_verify() can issue a targeted cancel.
+        # Set to request_id just before the load-bearing push; cleared in the finally.
+        self._inflight_request_id: str | None = None
 
     async def health(self) -> bool:
         """Best-effort health probe: ``ssh <host> true``.
@@ -677,89 +683,170 @@ class RemoteRunner:
         request_id = self._id_factory()
         ref = f'refs/merge-verify/{request_id}'
 
-        # Step 0 (best-effort): if main_branch is set, push it FIRST so the remote
-        # has a fresh view of main.  This also makes the subsequent merge-sha push
-        # thin (objects already present on the remote).  A non-zero rc or OSError
-        # is logged at WARNING and swallowed — a non-fast-forward must not abort
-        # the verify.  The merge-sha push that follows is the load-bearing transport.
-        if self._main_branch:
+        # β: Track the in-flight request-id for cancel_verify().  Cleared in the
+        # outer finally so it is always reset even when RunnerUnavailable is raised
+        # before the inner try/finally (e.g. on merge-sha push failure).
+        self._inflight_request_id = request_id
+        try:
+            # Step 0 (best-effort): if main_branch is set, push it FIRST so the remote
+            # has a fresh view of main.  A non-zero rc or OSError is logged at WARNING
+            # and swallowed — a non-fast-forward must not abort the verify.
+            #
+            # β dedup: resolve the local main tip via `git rev-parse` (network-free).
+            # When the resolved sha matches _last_pushed_main_sha the push is skipped —
+            # the remote already has this main sha, so the push is redundant.
+            if self._main_branch:
+                # Resolve local main tip (network-free)
+                resolved_main_sha: str | None = None
+                try:
+                    rev_rc, rev_stdout, _ = await self._run(
+                        ['git', 'rev-parse', self._main_branch],
+                        cwd=self._cwd,
+                    )
+                    if rev_rc == 0:
+                        resolved_main_sha = rev_stdout.strip() or None
+                except OSError:
+                    pass  # rev-parse failed; push unconditionally below
+
+                # Skip push when sha is unchanged (dedup)
+                if resolved_main_sha is None or resolved_main_sha != self._last_pushed_main_sha:
+                    try:
+                        main_rc, _, main_stderr = await self._run(
+                            ['git', 'push', self._git_remote,
+                             f'{self._main_branch}:refs/heads/{self._main_branch}'],
+                            cwd=self._cwd,
+                        )
+                        if main_rc == 0:
+                            if resolved_main_sha is not None:
+                                self._last_pushed_main_sha = resolved_main_sha
+                        else:
+                            import logging as _logging
+                            _logging.getLogger(__name__).warning(
+                                'RemoteRunner %r: best-effort main push of %r to %r failed '
+                                '(rc=%d): %s — continuing with merge-sha push',
+                                self.name, self._main_branch, self._git_remote, main_rc, main_stderr,
+                            )
+                    except OSError as exc:
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(
+                            'RemoteRunner %r: best-effort main push failed with OSError: %s'
+                            ' — continuing',
+                            self.name, exc,
+                        )
+
+            # Step 1: push the merge sha to the remote (load-bearing transport)
             try:
-                main_rc, _, main_stderr = await self._run(
-                    ['git', 'push', self._git_remote,
-                     f'{self._main_branch}:refs/heads/{self._main_branch}'],
+                push_rc, _push_out, push_stderr = await self._run(
+                    ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],
                     cwd=self._cwd,
                 )
-                if main_rc != 0:
-                    import logging as _logging
-                    _logging.getLogger(__name__).warning(
-                        'RemoteRunner %r: best-effort main push of %r to %r failed '
-                        '(rc=%d): %s — continuing with merge-sha push',
-                        self.name, self._main_branch, self._git_remote, main_rc, main_stderr,
+            except OSError as exc:
+                raise RunnerUnavailable(f'git push spawn failed: {exc}') from exc
+
+            if push_rc != 0:
+                raise RunnerUnavailable(
+                    f'git push {self._git_remote} {merge_sha}:{ref} failed'
+                    f' (rc={push_rc}): {push_stderr}'
+                )
+
+            # Push succeeded — clean up the ref on return (best-effort, in finally)
+            try:
+                # Step 2: build and issue the ssh command.
+                # --request-id is APPENDED so parsed[:4] stays back-compat.
+                argv = [
+                    'orchestrator', 'verify-merge',
+                    '--sha', merge_sha,
+                    '--spec', spec_to_json(spec),
+                ]
+                if self._config_path:
+                    argv += ['--config', self._config_path]
+                argv += ['--request-id', request_id]
+                remote_cmd = ' '.join(shlex.quote(a) for a in argv)
+
+                try:
+                    ssh_rc, ssh_stdout, ssh_stderr = await self._run(
+                        ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                         self._ssh_host, remote_cmd],
                     )
-            except OSError as exc:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    'RemoteRunner %r: best-effort main push failed with OSError: %s — continuing',
-                    self.name, exc,
-                )
+                except OSError as exc:
+                    raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
 
-        # Step 1: push the merge sha to the remote (load-bearing transport)
-        try:
-            push_rc, _push_out, push_stderr = await self._run(
-                ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],
-                cwd=self._cwd,
-            )
-        except OSError as exc:
-            raise RunnerUnavailable(f'git push spawn failed: {exc}') from exc
+                if ssh_rc != 0:
+                    raise RunnerUnavailable(
+                        f'ssh {self._ssh_host} exited {ssh_rc}: {ssh_stderr}'
+                    )
 
-        if push_rc != 0:
-            raise RunnerUnavailable(
-                f'git push {self._git_remote} {merge_sha}:{ref} failed'
-                f' (rc={push_rc}): {push_stderr}'
-            )
+                # Step 3: parse the host's stdout
+                # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
+                # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
+                try:
+                    return result_from_json(ssh_stdout)
+                except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+                    raise RunnerUnavailable(
+                        f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
+                    ) from exc
 
-        # Push succeeded — clean up the ref on return (best-effort, in finally)
-        try:
-            # Step 2: build and issue the ssh command
-            argv = [
-                'orchestrator', 'verify-merge',
-                '--sha', merge_sha,
-                '--spec', spec_to_json(spec),
-            ]
-            if self._config_path:
-                argv += ['--config', self._config_path]
-            remote_cmd = ' '.join(shlex.quote(a) for a in argv)
-
-            try:
-                ssh_rc, ssh_stdout, ssh_stderr = await self._run(
-                    ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                     self._ssh_host, remote_cmd],
-                )
-            except OSError as exc:
-                raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
-
-            if ssh_rc != 0:
-                raise RunnerUnavailable(
-                    f'ssh {self._ssh_host} exited {ssh_rc}: {ssh_stderr}'
-                )
-
-            # Step 3: parse the host's stdout
-            # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
-            # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
-            try:
-                return result_from_json(ssh_stdout)
-            except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
-                raise RunnerUnavailable(
-                    f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
-                ) from exc
+            finally:
+                # Best-effort ref cleanup — never alters returned result nor masks exceptions
+                with contextlib.suppress(Exception):
+                    await self._run(
+                        ['git', 'push', self._git_remote, '--delete', ref],
+                        cwd=self._cwd,
+                    )
 
         finally:
-            # Best-effort ref cleanup — never alters the returned result nor masks exceptions
-            with contextlib.suppress(Exception):
-                await self._run(
-                    ['git', 'push', self._git_remote, '--delete', ref],
-                    cwd=self._cwd,
-                )
+            # Always clear the in-flight tracker so cancel_verify is idempotent after return
+            self._inflight_request_id = None
+
+    async def cancel_verify(self) -> int:
+        """Cancel the in-flight verify-merge on the remote host.
+
+        Returns 0 immediately (idempotent) when _inflight_request_id is None —
+        matches α's contract: cancel an unknown/finished id exits 0.
+
+        Otherwise issues:
+            ssh -o BatchMode=yes -o ConnectTimeout=10 <host>
+                orchestrator cancel-verify --request-id <id> [--config <path>]
+
+        Returns the ssh return code.  An OSError (host unreachable) returns a
+        non-zero sentinel so the caller treats it as a cancel failure.
+        """
+        if self._inflight_request_id is None:
+            return 0
+        cmd_parts = [
+            'orchestrator', 'cancel-verify',
+            '--request-id', self._inflight_request_id,
+        ]
+        if self._config_path:
+            cmd_parts += ['--config', self._config_path]
+        remote_cmd = ' '.join(shlex.quote(a) for a in cmd_parts)
+        try:
+            rc, _, _ = await self._run(
+                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                 self._ssh_host, remote_cmd]
+            )
+            return rc
+        except OSError:
+            return 1  # non-zero → caller treats as cancel failure
+
+    async def probe_clean(self) -> bool:
+        """Probe whether any verify-merge is still running on the remote host.
+
+        Issues: ssh -o BatchMode=yes -o ConnectTimeout=10 <host> pgrep -f verify-merge
+
+        Returns:
+            True  — rc == 1 (pgrep found no match; host is clean)
+            False — rc == 0 (process still running) or rc >= 2 (error / ssh failure)
+                    Conservative: any non-1 rc keeps the slot PARKED.
+        """
+        try:
+            rc, _, _ = await self._run(
+                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                 self._ssh_host, 'pgrep -f verify-merge']
+            )
+            return rc == 1
+        except Exception:
+            return False  # fail-safe: stay PARKED on any transport error
 
 
 # ---------------------------------------------------------------------------
@@ -1672,3 +1759,192 @@ def delta_to_json(d: ColdWarmVerifyDelta) -> str:
 def delta_from_json(s: str) -> ColdWarmVerifyDelta:
     """Deserialize a ColdWarmVerifyDelta from a JSON string produced by delta_to_json."""
     return ColdWarmVerifyDelta.from_dict(json.loads(s))
+
+
+# ---------------------------------------------------------------------------
+# β: HostLease + HostAllocator — per-host slots, prefer-local-when-free, cancel-aware release
+# ---------------------------------------------------------------------------
+
+# Slot state constants
+_SLOT_FREE = 'FREE'
+_SLOT_BUSY = 'BUSY'
+_SLOT_PARKED = 'PARKED'   # cancel-fail path: held + non-acquirable, pending pgrep probe
+
+
+@dataclass(frozen=True)
+class HostLease:
+    """A held slot for a verify-host.  Returned by HostAllocator.acquire().
+
+    Fields
+    ------
+    name      : host name (matches RemoteRunner.name, or 'local' for the local slot)
+    runner    : the VerifyRunner instance assigned to this slot
+    is_local  : True when name == 'local' (LocalRunner)
+    """
+
+    name: str
+    runner: Any
+    is_local: bool
+
+
+class HostAllocator:
+    """Worker-lifetime host allocator: one slot per host, prefer-local-when-free.
+
+    Selection policy (β decision 1): prefer local as the trust anchor; remotes
+    take overflow only when local is busy.  This inverts VerifyRunnerPool's
+    shipped prefer-remote offload policy — the allocator engages local for
+    single-item serial windows (β) and lets γ push overflow to remotes.
+
+    Slot states
+    -----------
+    FREE   : slot is available for acquisition
+    BUSY   : slot is held by an in-flight verify
+    PARKED : cancel-fail path — held + non-acquirable, pending pgrep probe
+
+    PARKED is distinct from the shared _runner_quarantine set (which is permanent
+    until worker restart).  PARKED is transient — cleared when probe_clean() →
+    True or when max_attempts is exhausted (in which case the slot stays PARKED).
+
+    Shared quarantine
+    -----------------
+    The quarantine set is passed by reference so HostAllocator-driven
+    (RunnerUnavailable) and DriftDetector-driven quarantines share one
+    source of truth with the worker's _runner_quarantine set.
+    """
+
+    def __init__(
+        self,
+        remote_runners: list,
+        *,
+        quarantine: set[str] | None = None,
+        local_name: str = 'local',
+    ) -> None:
+        self._local_name = local_name
+        # Preserve insertion order: remote runners keyed by name
+        self._remote_runners: dict[str, Any] = {r.name: r for r in remote_runners}
+        # Slot state per host name (local first, then remotes in declaration order)
+        self._slots: dict[str, str] = {local_name: _SLOT_FREE}
+        for r in remote_runners:
+            self._slots[r.name] = _SLOT_FREE
+        # Shared quarantine — by-reference so mutations are visible to the caller
+        self._quarantine: set[str] = quarantine if quarantine is not None else set()
+
+    @property
+    def host_names(self) -> list[str]:
+        """All managed host names in declaration order (local first, then remotes)."""
+        return list(self._slots.keys())
+
+    def free_host_count(self) -> int:
+        """Number of FREE slots."""
+        return sum(1 for s in self._slots.values() if s == _SLOT_FREE)
+
+    def is_busy(self, name: str) -> bool:
+        """True when the slot for *name* is BUSY or PARKED (not FREE)."""
+        return self._slots.get(name, _SLOT_FREE) != _SLOT_FREE
+
+    def acquire_local(self, factory: Any) -> HostLease | None:
+        """Try to acquire the local slot.  Returns None if the slot is not FREE."""
+        if self._slots[self._local_name] == _SLOT_FREE:
+            runner = factory()
+            self._slots[self._local_name] = _SLOT_BUSY
+            return HostLease(name=self._local_name, runner=runner, is_local=True)
+        return None
+
+    def acquire_remote(self) -> HostLease | None:
+        """Acquire the first FREE, non-quarantined, non-PARKED remote slot."""
+        for name, runner in self._remote_runners.items():
+            if self._slots[name] == _SLOT_FREE and name not in self._quarantine:
+                self._slots[name] = _SLOT_BUSY
+                return HostLease(name=name, runner=runner, is_local=False)
+        return None
+
+    async def acquire(self, local_factory: Any) -> HostLease | None:
+        """Acquire a host slot, preferring local.
+
+        Policy (β decision 1): prefer local when free; overflow to first
+        available remote (not quarantined, not PARKED); return None when all
+        slots are BUSY/PARKED.
+        """
+        local = self.acquire_local(local_factory)
+        if local is not None:
+            return local
+        return self.acquire_remote()
+
+    async def release(self, lease: HostLease) -> None:
+        """Release a held slot back to FREE.  Idempotent."""
+        current = self._slots.get(lease.name)
+        if current in (_SLOT_BUSY, _SLOT_PARKED):
+            self._slots[lease.name] = _SLOT_FREE
+
+    async def quarantine_and_release(self, lease: HostLease) -> None:
+        """Add a remote host to the shared quarantine set and free its slot.
+
+        For a local lease only the slot is freed — local is the trust anchor
+        and is never added to the shared quarantine set.
+
+        Note: intentionally not yet called from production code in β — wiring
+        is staged for γ (task 1735, concurrent dispatch loop).  It is exercised
+        by :class:`TestHostAllocatorQuarantine` unit tests.
+        """
+        if not lease.is_local:
+            self._quarantine.add(lease.name)
+        await self.release(lease)
+
+    async def cancel_and_release(
+        self,
+        lease: HostLease,
+        *,
+        sleep: Any | None = None,
+        max_attempts: int = 10,
+    ) -> bool:
+        """Cancel an in-flight verify and release the slot.
+
+        Local lease:
+            Release the slot immediately and return True.
+
+        Remote lease:
+            await lease.runner.cancel_verify()
+            rc == 0  → release the slot, return True   (clean cancel)
+            rc != 0  → PARK the slot (held + non-acquirable) and poll
+                       lease.runner.probe_clean() until clean or max_attempts
+                       exhausted.  Un-park + free the slot when probe returns
+                       True.  Return False on the cancel-fail path regardless
+                       of probe outcome.
+
+        Parameters
+        ----------
+        sleep       : injected async sleep callable (defaults to asyncio.sleep).
+                      Tests pass a no-op to drive the probe loop synchronously.
+        max_attempts: maximum number of probe polls before giving up (slot stays
+                      PARKED on exhaustion).
+
+        Note: intentionally not yet called from production code in β — wiring
+        is staged for γ (task 1735, concurrent dispatch loop).  It is exercised
+        by :class:`TestHostAllocatorCancelRelease` and
+        :class:`TestHostAllocatorCancelFail` unit tests.
+        """
+        if sleep is None:
+            import asyncio as _asyncio
+            sleep = _asyncio.sleep
+
+        if lease.is_local:
+            await self.release(lease)
+            return True
+
+        rc = await lease.runner.cancel_verify()
+        if rc == 0:
+            await self.release(lease)
+            return True
+
+        # Cancel failed: PARK the slot and poll until the host is clean
+        self._slots[lease.name] = _SLOT_PARKED
+        for attempt in range(max_attempts):
+            clean = await lease.runner.probe_clean()
+            if clean:
+                self._slots[lease.name] = _SLOT_FREE
+                return False
+            if attempt < max_attempts - 1:
+                await sleep(1.0)
+
+        # max_attempts exhausted — slot remains PARKED (non-acquirable)
+        return False
