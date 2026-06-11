@@ -471,3 +471,121 @@ class TestCleanupConfigDir:
 
         # Must not raise
         wf._cleanup_config_dir()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Step-13 RED tests: _recycle_config_dir + loop wiring
+# ---------------------------------------------------------------------------
+
+
+class TestRecycleConfigDir:
+    """_recycle_config_dir() cleans the current TaskConfigDir and creates a fresh one.
+
+    Unit case: sentinel file is gone after recycle; self._config_dir is a new
+    instance pointing to a fresh (now-empty) directory.
+
+    Loop wiring cases: with recycle_config_dir_on_zero_output=True,
+    _recycle_config_dir is called exactly threshold-1 times (sub-threshold only);
+    with recycle_config_dir_on_zero_output=False it is never called.
+
+    All tests fail RED because _recycle_config_dir does not exist yet (step-14
+    implements it).
+    """
+
+    def test_recycle_removes_sentinel_and_creates_fresh_dir(self, tmp_path: Path):
+        """After _recycle_config_dir(), the old sentinel is gone and self._config_dir
+        points to a fresh (existing) TaskConfigDir directory.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        old_config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        sentinel = old_config_dir.path / 'old_sentinel.txt'
+        sentinel.write_text('stale session state')
+        old_path = old_config_dir.path
+        wf._config_dir = old_config_dir  # type: ignore[attr-defined]
+
+        wf._recycle_config_dir()  # type: ignore[attr-defined]
+
+        # Old sentinel must be gone (old dir cleaned up)
+        assert not sentinel.exists(), (
+            f'Sentinel must be removed after recycle, but still exists: {sentinel}'
+        )
+
+        # self._config_dir must be a new instance
+        new_config_dir = wf._config_dir  # type: ignore[attr-defined]
+        assert new_config_dir is not old_config_dir, (
+            'self._config_dir must be replaced with a new TaskConfigDir instance'
+        )
+
+        # New dir must exist (TaskConfigDir creates it on __init__)
+        assert new_config_dir.path.exists(), (
+            f'New config dir must exist after recycle: {new_config_dir.path}'
+        )
+
+        # Both must share the same task_id in the directory name
+        assert wf.task_id in str(new_config_dir.path), (
+            f'New config dir path must contain task_id {wf.task_id!r}: '
+            f'{new_config_dir.path}'
+        )
+
+        # Old path must differ from new (or at minimum the sentinel is gone)
+        # TaskConfigDir uses a fixed name derived from task_id so paths match —
+        # the important invariant is that the OLD CONTENTS are gone.
+        assert not old_path.exists() or not sentinel.exists(), (
+            'Old sentinel must be gone after recycle'
+        )
+
+
+@pytest.mark.asyncio
+class TestRecycleConfigDirLoopWiring:
+    """_recycle_config_dir is called on sub-threshold zero-output timeouts when
+    recycle_config_dir_on_zero_output=True, and NOT called on the tripping iteration
+    or when the flag is False.
+
+    threshold=3 → sub-threshold iterations are 1 and 2 (2 recycles expected),
+    iteration 3 trips the breaker (no recycle on trip).
+    """
+
+    async def test_recycle_called_on_subthreshold_iterations(self, tmp_path: Path):
+        """With threshold=3 and recycle=True, _recycle_config_dir is called exactly
+        threshold-1 = 2 times (on sub-threshold timeouts), NOT on the tripping one.
+        """
+        from unittest.mock import patch
+
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=10,
+            max_consecutive_zero_output_timeouts=3,
+            recycle_config_dir_on_zero_output=True,
+        )
+        _stub_iteration_helpers(wf, _zero_output_agent_result())
+
+        with patch.object(wf, '_recycle_config_dir') as mock_recycle:
+            outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # 3 zero-output calls: call 1 → recycle, call 2 → recycle, call 3 → trip (no recycle)
+        assert mock_recycle.call_count == 2, (
+            f'Expected 2 recycle calls (threshold-1), got {mock_recycle.call_count}'
+        )
+
+    async def test_recycle_not_called_when_flag_false(self, tmp_path: Path):
+        """With recycle_config_dir_on_zero_output=False, _recycle_config_dir is
+        never called regardless of how many zero-output timeouts occur.
+        """
+        from unittest.mock import patch
+
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=10,
+            max_consecutive_zero_output_timeouts=2,
+            recycle_config_dir_on_zero_output=False,
+        )
+        _stub_iteration_helpers(wf, _zero_output_agent_result())
+
+        with patch.object(wf, '_recycle_config_dir') as mock_recycle:
+            outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert mock_recycle.call_count == 0, (
+            f'Expected 0 recycle calls when flag=False, got {mock_recycle.call_count}'
+        )
