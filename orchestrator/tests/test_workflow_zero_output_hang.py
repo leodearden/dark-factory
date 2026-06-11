@@ -15,17 +15,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
+from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-from shared.config_dir import TaskConfigDir
-
 
 # ---------------------------------------------------------------------------
 # Shared harness
@@ -360,6 +359,7 @@ class TestCaptureZeroOutputEvidence:
         with the sentinel files.
         """
         wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
 
         # Build a real TaskConfigDir with sentinel files
         config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
@@ -433,6 +433,7 @@ class TestCleanupConfigDir:
     def test_preserve_flag_true_skips_cleanup(self, tmp_path: Path):
         """When _preserve_config_dir=True, _cleanup_config_dir() must NOT delete the dir."""
         wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
         config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
         sentinel = config_dir.path / 'keep_me.txt'
         sentinel.write_text('preserve test')
@@ -450,6 +451,7 @@ class TestCleanupConfigDir:
     def test_preserve_flag_false_performs_cleanup(self, tmp_path: Path):
         """When _preserve_config_dir=False, _cleanup_config_dir() deletes the dir."""
         wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
         config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
         sentinel = config_dir.path / 'remove_me.txt'
         sentinel.write_text('cleanup test')
@@ -497,6 +499,7 @@ class TestRecycleConfigDir:
         points to a fresh (existing) TaskConfigDir directory.
         """
         wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
         old_config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
         sentinel = old_config_dir.path / 'old_sentinel.txt'
         sentinel.write_text('stale session state')
