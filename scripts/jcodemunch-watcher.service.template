@@ -13,11 +13,13 @@ Type=simple
 # the host (L2 watcher, editors). The watcher passes force_polling unset, so
 # watchfiles honors these env vars: FORCE_POLLING switches the backend to
 # stat-polling — ZERO inotify watches (verified in the pinned env: 60-dir tree
-# → 61 watches default, 0 with the env set). 30s poll delay keeps the stat-walk
-# load trivial; index freshness only needs ~minutes anyway (debounce is already
-# 2s, worktree-discovery poll 5s).
+# → 61 watches default, 0 with the env set).
+# Poll delay 300s: at 30s the ~137 per-folder poller threads (one stat-walk of
+# the whole tree each, ignore patterns NOT honored) averaged 337% CPU
+# (measured over a full cycle, 2026-06-11). 5min change-detection latency is
+# fine for indexing — the 2s debounce only batches events after detection.
 Environment=WATCHFILES_FORCE_POLLING=true
-Environment=WATCHFILES_POLL_DELAY_MS=30000
+Environment=WATCHFILES_POLL_DELAY_MS=300000
 # Initial index peaked at 6.2G RSS (2026-06-11). Cap so a runaway can't starve
 # the host: throttle at 8G, hard-kill at 12G (Restart=always recovers).
 MemoryHigh=8G
