@@ -190,6 +190,19 @@ class TestCounter:
         # Next requeue starts from 1 again.
         assert _record_one(scheduler, 't1') == 1
 
+    def test_clear_also_clears_transient_counter(self, scheduler: Scheduler):
+        _529 = 'Planning failed: agent API error: HTTP 529'
+        scheduler.record_requeue(
+            't1', phase='plan', reason=_529, detail=_529, run_id='r', cost_usd=1.0,
+        )
+        _record_one(scheduler, 't1')
+        assert scheduler.transient_requeue_count('t1') == 1
+        scheduler.clear_requeue_count('t1')
+        assert 't1' not in scheduler._requeue_counts
+        assert 't1' not in scheduler._requeue_history
+        assert 't1' not in scheduler._transient_requeue_counts
+        assert scheduler.transient_requeue_count('t1') == 0
+
 
 # --- trigger_retry_cap_exhausted ---------------------------------------------
 
