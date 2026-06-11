@@ -2892,3 +2892,176 @@ class TestFinalizeInflightWarmResultsThreading:
             f"Expected empty warm_results for verify_task=None (compat path), "
             f"got {actual_warm!r}."
         )
+
+
+# ---------------------------------------------------------------------------
+# amend: RUNNER_UNAVAILABLE on HEAD — cascade re-merges speculative downstream
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunnerUnavailableHeadCascade:
+    """RUNNER_UNAVAILABLE on the HEAD triggers the head-failure cascade.
+
+    When _finalize_inflight(N) returns False because N's verify returned
+    RUNNER_UNAVAILABLE, the _verifier_loop's head-failure cascade must fire
+    for any downstream speculative entries still in _inflight.
+
+    The downstream entry (N+1) is NOT left in _inflight with a stale
+    speculative commit — the cascade is the correctness mechanism.
+    This test directly confirms:
+      · cascade cancels N+1's in-flight verify
+      · cascade re-merges N+1 onto actual main
+      · both N (re-merged) and N+1 (re-merged) eventually land 'done'
+      · quarantine_and_release is called for the lease whose verify failed
+
+    See the RUNNER_UNAVAILABLE comment in _finalize_inflight for the
+    design rationale.
+    """
+
+    async def test_ru_head_cascade_reruns_speculative_downstream(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """N's verify raises RunnerUnavailable while N+1 (speculative) is in-flight.
+
+        The head-failure cascade must cancel N+1, re-merge both N and N+1, and
+        eventually resolve both 'done' in submission order.
+
+        RunnerUnavailable is raised from run_scoped_verification (patched) so that
+        both items can go through the local verify path; the cascade and quarantine
+        behaviour is identical regardless of whether the failure comes from a local
+        or remote runner (quarantine_and_release with is_local=True just frees the
+        slot without adding to _runner_quarantine).
+        """
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        # ── N's verify: gated, then raises RunnerUnavailable ─────────────────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+
+        # ── N+1's remote verify: gated, then passes ───────────────────────────
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='remote-b')
+
+        # Track calls to run_scoped_verification:
+        #   call 0: N (gated, raises RunnerUnavailable after gate)
+        #   call 1+: re-dispatched N and N+1 via local fallback (pass immediately)
+        _local_calls: list[int] = [0]
+
+        async def _local_verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # N's initial verify: wait for gate then raise RunnerUnavailable
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                raise RunnerUnavailable('simulated host failure for cascade test')
+            # Re-dispatched verifies (N and N+1 after cascade re-merge): pass
+            return MagicMock(
+                passed=True,
+                summary='ok',
+                test_output='ok',
+                lint_output='',
+                type_output='',
+                category='',
+                timed_out=False,
+                verify_skipped=False,
+            )
+
+        # ── Branches ─────────────────────────────────────────────────────────
+        wt_a = await _make_branch_with_file(git_ops, 'task/rucascade-a', 'rucascade_a.py', 'a=1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/rucascade-b', 'rucascade_b.py', 'b=2\n')
+
+        # ── Worker + two-host allocator ───────────────────────────────────────
+        # N gets the LOCAL slot (prefer-local), N+1 gets the REMOTE slot.
+        # When N's local verify raises RunnerUnavailable, _finalize_inflight
+        # calls quarantine_and_release on N's local lease (which just frees the
+        # local slot since is_local=True bypasses runner quarantine).
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        loop = asyncio.get_event_loop()
+        req_a = MergeRequest(
+            task_id='rucascade-a', branch='task/rucascade-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='rucascade-b', branch='task/rucascade-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        outcome_a: MergeOutcome | None = None
+        outcome_b: MergeOutcome | None = None
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _local_verify_side_effect):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for N's local verify to enter AND N+1's remote verify to enter.
+            # This confirms both are in-flight simultaneously.
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # Both verifies are now in-flight.  Release N's gate → RunnerUnavailable.
+            # _finalize_inflight(N) returns False → head-failure cascade fires:
+            #   · N+1's verify task is cancelled (cascade calls cancel_and_release)
+            #   · N+1 is re-merged onto actual main
+            #   · both N and N+1 are re-dispatched via _redispatch
+            gate_a_release.set()
+
+            # Release N+1's gate so the (possibly still-running) gated task
+            # can unblock even if cancel() arrives slightly late.
+            gate_b_release.set()
+
+            # Wait for both to resolve.
+            with contextlib.suppress(TimeoutError):
+                outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            with contextlib.suppress(TimeoutError):
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── N (RUNNER_UNAVAILABLE head): must land 'done' after re-dispatch ──
+        assert outcome_a is not None and outcome_a.status == 'done', (
+            f'Expected N (RUNNER_UNAVAILABLE head) to resolve "done" after '
+            f're-merge re-dispatch, got {outcome_a!r}. '
+            'The head-failure cascade should re-merge N onto actual main '
+            'and re-dispatch it for a clean verify.'
+        )
+
+        # ── N+1 (speculative downstream): must land 'done' after cascade ─────
+        assert outcome_b is not None and outcome_b.status == 'done', (
+            f'Expected N+1 (speculative downstream) to resolve "done" after '
+            f'cascade re-merge re-dispatch, got {outcome_b!r}. '
+            'If the cascade did not fire, N+1 would stay in _inflight with a '
+            'stale speculative commit and eventually fail CAS or time out.'
+        )
+
+        # ── Cascade called cancel_and_release for N+1's remote lease ─────────
+        gated_remote.cancel_verify.assert_called()
+
+        # ── Main has both files (submission order preserved) ──────────────────
+        from orchestrator.git_ops import _run as _git_run
+        _, main_files, _ = await _git_run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'rucascade_a.py' in main_files, (
+            'N (rucascade_a.py) must be on main after re-merge/re-verify'
+        )
+        assert 'rucascade_b.py' in main_files, (
+            'N+1 (rucascade_b.py) must be on main after cascade re-merge/re-verify'
+        )

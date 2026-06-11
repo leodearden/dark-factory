@@ -3340,6 +3340,21 @@ class InflightEntry:
     asyncio verify task running (or a passthrough/sentinel that needs serial
     finalization in submission order).
 
+    Ordering invariant
+    ------------------
+    The deque head is always finalized before the next entry is processed.
+    This guarantees that main is advanced in SUBMISSION ORDER regardless of
+    which background verify task finishes first.
+
+    This invariant covers main-advancement ordering; it does NOT guarantee
+    that result-Future delivery is strictly ordered across item types.
+    Passthrough entries (verify_task=None, immediate_outcome set) are finalized
+    INLINE during DISPATCH-FILL — meaning a later passthrough can resolve its
+    Future before an earlier real-verify entry resolves its Future.  Because
+    passthroughs never advance main (they are conflict / already_merged / skip),
+    this does not violate the main-advancement order guarantee.  No known
+    consumer depends on strict cross-item Future-resolution ordering.
+
     Fields
     ------
     item           : the SpeculativeItem being verified
@@ -3347,7 +3362,8 @@ class InflightEntry:
     verify_task    : the asyncio.Task wrapping _run_inflight_verify (None for passthroughs)
     merge_wt       : the merge worktree path (may have been warm-swapped by _run_inflight_verify)
     was_speculative: True if item.speculative was True at dispatch time (for slot release)
-    phase          : current phase string for snapshot() observability
+    phase          : current phase string for snapshot() observability (per-entry source of
+                     truth for multi-host; _verify_phase is the single-host compat field)
     passthrough_outcome: set for immediate-outcome entries (conflict/already_merged/skip_verify)
                          that are enqueued without a real verify task so finalize can deliver
                          them in submission order
@@ -6478,6 +6494,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # decided: finalize them inline so _n_failed is updated before the
                 # next dispatch.  This preserves the old serial loop's ordering where
                 # n_failed was visible to the very next pickup.
+                #
+                # Ordering note: passthroughs finalized inline here can resolve
+                # their result-Future BEFORE an earlier real-verify entry in
+                # _inflight resolves its Future.  The InflightEntry submission-order
+                # invariant covers main-ADVANCEMENT ordering (CAS is sequential),
+                # not cross-item Future-resolution ordering.  Passthroughs never
+                # advance main (they are conflict/already_merged/skip_verify), so
+                # inline finalization does not violate the advancement order contract.
+                # No consumer depends on strict cross-item Future-delivery ordering.
                 if entry.verify_task is None:
                     try:
                         await self._finalize_inflight(entry)
@@ -6965,39 +6990,55 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         _warm_results: dict[str, bool] = {}
         _is_warm_path = False
-
-        if lease.is_local:
-            # ── LOCAL path: persistent warm-merge-verify worktree swap ────
-            # Mirrors _verify_and_advance (PRD §10 κ): increment the attempt
-            # counter, check the safety valve, swap to the warm persistent
-            # path if eligible, deregister the ephemeral worktree if swapped.
-            self._verify_attempt_count += 1
-            _due = _safety_valve_due(
-                self._verify_attempt_count,
-                req.config.git.persistent_merge_worktree_safety_valve_every_n,
-            )
-            merge_wt = await _acquire_warm_verify_worktree(
-                self._git_ops, req, merge_wt, merge_commit,
-                safety_valve_due=_due,
-            )
-            assert merge_wt is not None
-            if merge_wt is not item.merge_wt:
-                self._deregister_owned_merge_worktree(item.merge_wt)
-            _is_warm_path = (
-                req.config.git.persistent_merge_worktree
-                and not _due
-            )
-
-        self._verify_item = item
-        self._verify_phase = 'verifying'
-        self._verify_started_at = time.time()
-        logger.info(
-            f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
-            f'worktree={merge_wt.name})'
-        )
-
         _warm_capture: list[VerifyResult] = []
+
         try:
+            if lease.is_local:
+                # ── LOCAL path: persistent warm-merge-verify worktree swap ──
+                # Mirrors _verify_and_advance (PRD §10 κ): increment the attempt
+                # counter, check the safety valve, swap to the warm persistent
+                # path if eligible, deregister the ephemeral worktree if swapped.
+                #
+                # Moved inside try: if _acquire_warm_verify_worktree raises (it is
+                # a git I/O operation that can fail), the except Exception handler
+                # below cleans merge_wt and returns a 'blocked' InflightVerifyResult.
+                # Before this fix the exception escaped uncaught, was re-raised in
+                # _finalize_inflight via `await entry.verify_task`, and reached the
+                # _verifier_loop finalize-head BaseException handler — which resolved
+                # the future as 'blocked' but did NOT clean the ephemeral merge
+                # worktree (a regression vs. the old _verifier_loop except clause).
+                self._verify_attempt_count += 1
+                _due = _safety_valve_due(
+                    self._verify_attempt_count,
+                    req.config.git.persistent_merge_worktree_safety_valve_every_n,
+                )
+                merge_wt = await _acquire_warm_verify_worktree(
+                    self._git_ops, req, merge_wt, merge_commit,
+                    safety_valve_due=_due,
+                )
+                assert merge_wt is not None
+                if merge_wt is not item.merge_wt:
+                    self._deregister_owned_merge_worktree(item.merge_wt)
+                _is_warm_path = (
+                    req.config.git.persistent_merge_worktree
+                    and not _due
+                )
+
+            # NOTE: _verify_item/_verify_phase/_verify_started_at are
+            # SINGLE-HOST observability fields.  Under multi-host overlap,
+            # concurrent _run_inflight_verify coroutines overwrite them
+            # (last-writer wins).  They are single-host-authoritative for
+            # snapshot() verify_in_progress reporting; for multi-host the
+            # per-entry InflightEntry.phase field is the authoritative source
+            # of truth (snapshot() section 1b reads it for non-head entries).
+            self._verify_item = item
+            self._verify_phase = 'verifying'
+            self._verify_started_at = time.time()
+            logger.info(
+                f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
+                f'worktree={merge_wt.name})'
+            )
+
             verify_task = asyncio.ensure_future(_run_post_merge_verify(
                 self._git_ops, req, merge_wt,
                 timeouts=self._post_merge_verify_timeouts,
@@ -7186,6 +7227,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # serial-local rather than stalling.  Not a chain failure: _n_failed
             # stays False (the merge is still a valid candidate; it just needs
             # re-verify on a healthy host).
+            #
+            # Downstream speculative entries in _inflight correctness:
+            # This function returns False, so _verifier_loop's head-failure
+            # cascade (`if not _head_advanced and self._inflight:`) fires for
+            # any downstream speculative entries.  The cascade cancels each
+            # downstream verify task, cleans its worktree, re-merges it against
+            # actual main (via _remerge), and front-queues it on _redispatch in
+            # submission order.  After the cascade, _inflight is empty and all
+            # re-merged items are on _redispatch in the correct order.
+            # Downstream entries do NOT remain in _inflight with stale commits;
+            # the cascade is the correctness mechanism, not the CAS backstop alone.
             if vr is not None and vr.status == 'RUNNER_UNAVAILABLE':
                 _skip_release = True   # quarantine_and_release handles the lease
                 _n_failed_val = False  # not a chain failure
@@ -7193,6 +7245,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     await self._host_allocator.quarantine_and_release(entry.lease)
                 # Re-merge against actual main and front-insert into _redispatch
                 # so the item is retried before any newer queue arrivals.
+                # The head-failure cascade (fired because this returns False) will
+                # handle any downstream entries still in _inflight.
                 _remerged_ru = await self._remerge(
                     entry.item.request, entry.item.started_monotonic,
                 )
