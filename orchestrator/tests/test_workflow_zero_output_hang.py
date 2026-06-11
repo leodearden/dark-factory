@@ -592,3 +592,67 @@ class TestRecycleConfigDirLoopWiring:
         assert mock_recycle.call_count == 0, (
             f'Expected 0 recycle calls when flag=False, got {mock_recycle.call_count}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Amendment tests: evidence-file loop wiring (Suggestion 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCaptureEvidenceLoopWiring:
+    """_capture_zero_output_evidence is called on EVERY zero-output timeout inside
+    _execute_iterations (before the threshold check), so distinct per-iteration
+    evidence files are written for both sub-threshold and tripping occurrences.
+
+    This verifies the wiring between the circuit-breaker counter and the evidence
+    helper — the property explicitly called out in the design: 'captured on EVERY
+    zero-output timeout, before the threshold check'.
+    """
+
+    async def test_evidence_files_written_for_every_zero_output_timeout(
+        self, tmp_path: Path
+    ):
+        """With threshold=2, two zero-output timeouts must produce two distinct
+        evidence files (zero_output_evidence-iter1.json and iter2.json) under
+        artifacts.root.
+
+        Evidence files are created before the circuit breaker trips so that even
+        the sub-threshold timeout (iteration 1) leaves a forensic record.
+        """
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=10,
+            max_consecutive_zero_output_timeouts=2,
+            recycle_config_dir_on_zero_output=False,
+        )
+        _stub_iteration_helpers(wf, _zero_output_agent_result())
+        # Wire up a real TaskConfigDir so _capture_zero_output_evidence can write
+        from shared.config_dir import TaskConfigDir as _TCD
+        wf._config_dir = _TCD(wf.task_id, base_dir=wf.artifacts.root)  # type: ignore[attr-defined]
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # Two iterations ran (threshold=2), so two evidence files must exist.
+        iter1_path = wf.artifacts.root / 'zero_output_evidence-iter1.json'
+        iter2_path = wf.artifacts.root / 'zero_output_evidence-iter2.json'
+        assert iter1_path.exists(), (
+            f'Evidence file for iteration 1 missing: {iter1_path}\n'
+            f'artifacts.root contents: {list(wf.artifacts.root.iterdir())}'
+        )
+        assert iter2_path.exists(), (
+            f'Evidence file for iteration 2 missing: {iter2_path}\n'
+            f'artifacts.root contents: {list(wf.artifacts.root.iterdir())}'
+        )
+
+        # Each file must contain valid JSON with iteration numbers matching
+        data1 = json.loads(iter1_path.read_text())
+        data2 = json.loads(iter2_path.read_text())
+        assert data1.get('iteration') == 1, f'iter1 evidence has wrong iteration: {data1!r}'
+        assert data2.get('iteration') == 2, f'iter2 evidence has wrong iteration: {data2!r}'
+
+        # Both must record a zero-output timeout
+        assert data1.get('timed_out') is True
+        assert data2.get('timed_out') is True
