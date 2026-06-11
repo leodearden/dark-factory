@@ -1031,3 +1031,153 @@ def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
     # Core assertion: acquire_host_verify_worktree called; _create_merge_worktree NOT
     mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
     mock_git_ops._create_merge_worktree.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 1732 step-9 — verify-merge --request-id pgid lifecycle + back-compat
+# ---------------------------------------------------------------------------
+
+
+def test_verify_merge_request_id_pgid_lifecycle(tmp_path, monkeypatch):
+    """verify-merge --request-id writes pgid file during run, removes it on exit.
+
+    Injects start_own_process_group as a spy; mocks all IO so no real git/build
+    work happens. Checks file existence mid-run via the mocked
+    run_merge_verify_on_worktree coroutine.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.verify_cancel import PGID_DIR_NAME, pgid_file
+
+    FAKE_PGID = 77777
+    FAKE_REQUEST_ID = 'test-req-1732'
+    known_json = '{"passed": true, "results": []}'
+
+    # worktree_base that GitOps would compute
+    fake_worktree_base = tmp_path / '.worktrees'
+
+    # --- Mock GitOps ---
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    # --- Mock config ---
+    from orchestrator.config import OrchestratorConfig
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # --- Spy on start_own_process_group ---
+    sopg_calls = []
+
+    def fake_sopg():
+        sopg_calls.append(True)
+        return FAKE_PGID
+
+    monkeypatch.setattr(cli_module, 'start_own_process_group', fake_sopg)
+
+    # --- Mock verify_runner helpers; capture pgid file existence mid-run ---
+    pgf = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
+    file_existed_mid_run = []
+
+    async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
+        file_existed_mid_run.append(pgf.exists())
+        result = MagicMock()
+        return result
+
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr('orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify)
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+        '--request-id', FAKE_REQUEST_ID,
+    ])
+
+    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+    assert known_json in r.output
+
+    # start_own_process_group must have been called once
+    assert len(sopg_calls) == 1, 'start_own_process_group must be called once with --request-id'
+
+    # pgid file must have existed during the run
+    assert file_existed_mid_run == [True], (
+        f'pgid file was not present mid-run; file_existed_mid_run={file_existed_mid_run!r}'
+    )
+
+    # pgid file must be removed after normal exit
+    assert not pgf.exists(), f'pgid file must be removed on normal exit; still present at {pgf}'
+
+
+def test_verify_merge_no_request_id_back_compat(tmp_path, monkeypatch):
+    """Without --request-id, start_own_process_group is NOT called and no pgid file created.
+
+    Verifies today's exact behavior is unchanged (back-compat).
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    # --- Mock GitOps ---
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    # --- Mock config ---
+    from orchestrator.config import OrchestratorConfig
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # --- Spy on start_own_process_group to ensure it is NOT called ---
+    sopg_calls = []
+
+    def fake_sopg():
+        sopg_calls.append(True)
+        return 99999
+
+    monkeypatch.setattr(cli_module, 'start_own_process_group', fake_sopg)
+
+    # --- Mock verify_runner helpers ---
+    known_json = '{"passed": false, "results": []}'
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.run_merge_verify_on_worktree',
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+    ])
+
+    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+
+    # start_own_process_group must NOT have been called (no --request-id)
+    assert sopg_calls == [], (
+        'start_own_process_group must NOT be called without --request-id'
+    )
+
+    # No .merge_verify_pgids directory should have been created
+    from orchestrator.verify_cancel import PGID_DIR_NAME
+    pgid_dir_path = tmp_path / '.worktrees' / PGID_DIR_NAME
+    assert not pgid_dir_path.exists(), (
+        f'.merge_verify_pgids directory created without --request-id: {pgid_dir_path}'
+    )
