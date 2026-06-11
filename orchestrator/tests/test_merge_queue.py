@@ -8057,6 +8057,25 @@ class TestPruneStaleMergeWorktrees:
         assert not b.exists()
         assert task_wt.exists()
 
+    async def test_keep_set_protects_all_members_removes_only_orphan(
+        self, git_ops: GitOps,
+    ):
+        """Passing a SET of paths to keep= protects all members; only the
+        orphan (outside the set) is removed.  Task worktrees are never touched
+        regardless of the keep-set."""
+        keep_a, _ = await git_ops._create_merge_worktree()
+        keep_b, _ = await git_ops._create_merge_worktree()
+        orphan, _ = await git_ops._create_merge_worktree()
+        task_wt = (await git_ops.create_worktree('task-live')).path
+
+        removed = await git_ops.prune_stale_merge_worktrees(keep={keep_a, keep_b})
+
+        assert len(removed) == 1
+        assert not orphan.exists()
+        assert keep_a.exists()
+        assert keep_b.exists()
+        assert task_wt.exists()
+
 
 @pytest.mark.asyncio
 class TestEnospcTransientInfraRetry:
@@ -8139,6 +8158,209 @@ class TestEnospcTransientInfraRetry:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+@pytest.mark.asyncio
+class TestSpeculativeMergeWorkerLedgerAwarePrune:
+    """SpeculativeMergeWorker passes a ledger snapshot as keep_worktrees and the
+    end-to-end prune removes only the orphan."""
+
+    async def test_worker_passes_ledger_snapshot_to_post_merge_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Worker passes keep_worktrees = snapshot of _owned_merge_worktrees;
+        the snapshot is a distinct object (copy, not live reference)."""
+        wt = await _make_branch_with_file(
+            git_ops, 'ledger-snap', 'snap.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Pre-seed two fake paths in the ledger BEFORE the worker task is
+        # started, so there is no implicit ordering assumption on the queue
+        # being empty when the assignment fires.
+        p1 = git_ops.worktree_base / '_merge-fake-p1'
+        p2 = git_ops.worktree_base / '_merge-fake-p2'
+        worker._owned_merge_worktrees = {p1, p2}
+
+        worker_task = asyncio.create_task(worker.run())
+
+        captured: dict = {}
+
+        async def _recording_verify(*args, **kwargs):
+            captured.update(kwargs)
+            return None  # verify passes
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _recording_verify):
+            req = _make_request('ledger-snap', 'ledger-snap', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'unexpected: {outcome}'
+        # The worker must have forwarded keep_worktrees.
+        assert 'keep_worktrees' in captured, (
+            'expected keep_worktrees kwarg passed to _run_post_merge_verify'
+        )
+        kw = captured['keep_worktrees']
+        # p1 and p2 were in the ledger before the merge was processed.
+        assert p1 in kw, f'p1 not in keep_worktrees: {kw}'
+        assert p2 in kw, f'p2 not in keep_worktrees: {kw}'
+        # Must be a snapshot copy, not the live ledger reference.
+        assert kw is not worker._owned_merge_worktrees, (
+            'keep_worktrees must be a snapshot copy, not the live ledger set'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_disk_pressure_prune_removes_only_orphan_through_worker(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """End-to-end: disk guard fires, real prune runs, only the orphan is
+        removed; all ledger worktrees survive."""
+        wt = await _make_branch_with_file(
+            git_ops, 'e2e-prune', 'e2e.py', 'y = 2\n',
+        )
+
+        # Two extra _merge-* worktrees: they're in the ledger (simulating
+        # other in-flight verifies) and must survive the prune.
+        keep_a, _ = await git_ops._create_merge_worktree()
+        keep_b, _ = await git_ops._create_merge_worktree()
+        # Orphan: real git worktree, NOT registered in the ledger.
+        orphan, _ = await git_ops._create_merge_worktree()
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Register keep_a / keep_b in the ledger; orphan is NOT registered.
+        worker._register_owned_merge_worktree(keep_a)
+        worker._register_owned_merge_worktree(keep_b)
+
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        mock_verify = AsyncMock(return_value=passing)
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', mock_verify),
+            patch(
+                'orchestrator.merge_queue.shutil.disk_usage',
+                side_effect=[_usage(2 * _GIB), _usage(15 * _GIB)],
+            ),
+        ):
+            req = _make_request('e2e-prune', 'e2e-prune', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'unexpected: {outcome}'
+        # Only the orphan should be gone; both ledger worktrees survive.
+        assert not orphan.exists(), 'orphan must be pruned by disk guard'
+        assert keep_a.exists(), 'keep_a must survive (in ledger)'
+        assert keep_b.exists(), 'keep_b must survive (in ledger)'
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    # -- Overlap helpers (mirrored from TestSpeculativeMergeWorkerGate) -------
+
+    # 20-line shared base file; branch edits line1 (top), main edits line18
+    # (bottom) — non-adjacent so the rebase is always a clean 3-way merge.
+    _SHARED_BASE: str = ''.join(f'line{i}\n' for i in range(20))
+
+    async def _setup_overlap_branch_for_gate(
+        self,
+        git_ops: GitOps,
+        branch_name: str,
+        config: OrchestratorConfig,
+    ) -> tuple[Path, MergeRequest]:
+        """Commit shared.py on main, then create a branch editing line1."""
+        (git_ops.project_root / 'shared.py').write_text(self._SHARED_BASE)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', f'Add shared.py for {branch_name}'],
+            cwd=git_ops.project_root,
+        )
+        branch_wt = (await git_ops.create_worktree(branch_name)).path
+        (branch_wt / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line1\n', 'line1\nbranch-edit\n')
+        )
+        await git_ops.commit(branch_wt, f'Branch {branch_name}: edit top of shared.py')
+        req = _make_request(branch_name, branch_name, branch_wt, config)
+        return branch_wt, req
+
+    async def test_gate_reverify_passes_ledger_snapshot(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Worker passes keep_worktrees=set(self._owned_merge_worktrees) to
+        _reverify_rebased_tree; snapshot is a distinct object.
+
+        RED: 'keep_worktrees' not in captured kwargs (call site doesn't pass it).
+        GREEN after step-10 adds keep_worktrees=set(self._owned_merge_worktrees)
+        to the _reverify_rebased_tree call at the gate_reverify site.
+        """
+        branch = 'gate-ledger-snap'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        _, req = await self._setup_overlap_branch_for_gate(git_ops, branch, config)
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None, (
+            f'_remerge must succeed; got {item.immediate_outcome!r}'
+        )
+
+        # Seed two fake paths in the ledger.
+        p1 = git_ops.worktree_base / '_merge-fake-gate-p1'
+        p2 = git_ops.worktree_base / '_merge-fake-gate-p2'
+        worker._owned_merge_worktrees = {p1, p2}
+
+        # Move main: edit line18 (bottom) — produces overlapping delta so that
+        # advance_main returns rebased_pending_reverify and _reverify_rebased_tree
+        # is called.
+        (git_ops.project_root / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: gate-ledger-snap overlap'],
+            cwd=git_ops.project_root,
+        )
+
+        captured_kw: dict = {}
+
+        async def _capture_reverify(*args, **kwargs):
+            captured_kw.update(kwargs)
+            return MergeOutcome('blocked', reason='gate-reverify captured by test')
+
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=passing),
+            ),
+            patch(
+                'orchestrator.merge_queue._reverify_rebased_tree',
+                side_effect=_capture_reverify,
+            ),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert not advanced, 'Expected False (gate blocked the merge)'
+        # RED: 'keep_worktrees' not in captured_kw because call site omits it.
+        assert 'keep_worktrees' in captured_kw, (
+            'expected keep_worktrees kwarg passed to _reverify_rebased_tree; '
+            f'captured kwargs: {list(captured_kw.keys())!r}'
+        )
+        kw = captured_kw['keep_worktrees']
+        assert p1 in kw, f'p1 not in keep_worktrees: {kw!r}'
+        assert p2 in kw, f'p2 not in keep_worktrees: {kw!r}'
+        # Must be a snapshot copy, not the live ledger reference.
+        assert kw is not worker._owned_merge_worktrees, (
+            'keep_worktrees must be a snapshot copy, not the live ledger set'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -8231,6 +8453,43 @@ class TestEnsureVerifyDiskSpace:
         # Pruned once (free was low), but the re-check stat failed → fail open.
         assert reason is None
         gops.prune_stale_merge_worktrees.assert_awaited_once()
+
+    async def test_keep_worktrees_unioned_with_merge_wt_forwarded_to_prune(
+        self, tmp_path: Path,
+    ):
+        """keep_worktrees is unioned with merge_wt and the combined set is
+        forwarded to prune_stale_merge_worktrees as the keep= argument."""
+        gops = self._git_ops(pruned=[])
+        merge_wt = tmp_path / '_merge-active'
+        l1 = tmp_path / '_merge-l1'
+        l2 = tmp_path / '_merge-l2'
+        with patch(
+            'orchestrator.merge_queue.shutil.disk_usage',
+            side_effect=[_usage(2 * _GIB), _usage(15 * _GIB)],
+        ):
+            reason = await _ensure_verify_disk_space(
+                gops, merge_wt, 10 * _GIB, 't1', keep_worktrees={l1, l2},
+            )
+        assert reason is None
+        call_kwargs = gops.prune_stale_merge_worktrees.await_args.kwargs
+        assert call_kwargs['keep'] == {merge_wt, l1, l2}
+
+    async def test_default_keep_worktrees_prunes_only_merge_wt(
+        self, tmp_path: Path,
+    ):
+        """Default keep_worktrees=None → keep-set == {merge_wt} (regression)."""
+        gops = self._git_ops(pruned=[])
+        merge_wt = tmp_path / '_merge-active'
+        with patch(
+            'orchestrator.merge_queue.shutil.disk_usage',
+            side_effect=[_usage(2 * _GIB), _usage(15 * _GIB)],
+        ):
+            reason = await _ensure_verify_disk_space(
+                gops, merge_wt, 10 * _GIB, 't1',
+            )
+        assert reason is None
+        call_kwargs = gops.prune_stale_merge_worktrees.await_args.kwargs
+        assert call_kwargs['keep'] == {merge_wt}
 
 
 @pytest.mark.asyncio
@@ -11036,6 +11295,93 @@ class TestRunPostMergeVerify:
             f'unexpected failure_cause_hint: {result.failure_cause_hint!r}'  # type: ignore[attr-defined]
         )
 
+    async def test_keep_worktrees_forwarded_to_disk_guard(self) -> None:
+        """keep_worktrees is forwarded verbatim to _ensure_verify_disk_space."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+        l1 = Path('/fake/_merge-l1')
+        l2 = Path('/fake/_merge-l2')
+
+        mock_disk_guard = AsyncMock(return_value=None)
+        passed_result = MagicMock(passed=True, summary='', timed_out=False)
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', mock_disk_guard),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=passed_result)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                keep_worktrees={l1, l2},
+            )
+
+        assert result is None
+        assert mock_disk_guard.await_args is not None
+        call_kwargs = mock_disk_guard.await_args.kwargs
+        assert call_kwargs['keep_worktrees'] == {l1, l2}
+
+    async def test_enospc_retry_prunes_with_keep_set_union(self) -> None:
+        """ENOSPC retry passes keep = {merge_wt} | keep_worktrees to prune."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = Path('/fake/_merge-active')
+        l1 = Path('/fake/_merge-l1')
+        l2 = Path('/fake/_merge-l2')
+        enospc_retries: dict[str, int] = {}
+
+        enospc_result = _enospc_verify_result()
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=enospc_result),
+            ),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+                keep_worktrees={l1, l2},
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        call_kwargs = git_ops.prune_stale_merge_worktrees.await_args.kwargs
+        assert call_kwargs['keep'] == {merge_wt, l1, l2}
+
+    async def test_default_enospc_retry_keeps_only_merge_wt(self) -> None:
+        """Default keep_worktrees=None → ENOSPC retry keep == {merge_wt} (regression)."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = Path('/fake/_merge-active')
+        enospc_retries: dict[str, int] = {}
+
+        enospc_result = _enospc_verify_result()
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=enospc_result),
+            ),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=enospc_retries,
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        call_kwargs = git_ops.prune_stale_merge_worktrees.await_args.kwargs
+        assert call_kwargs['keep'] == {merge_wt}
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests
@@ -12651,6 +12997,112 @@ class TestReverifyRebasedTree:
         )
         # _run_post_merge_verify cleans up merge_wt on failure
         assert not merge_wt.exists(), 'merge_wt must be cleaned up after red verify'
+
+    async def test_keep_worktrees_forwarded_to_run_post_merge_verify(self) -> None:
+        """keep_worktrees kwarg must be forwarded verbatim to _run_post_merge_verify.
+
+        RED: TypeError because the parameter doesn't exist yet.
+        GREEN after step-10 adds keep_worktrees param and forwards it.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        git_ops = MagicMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
+        req = MagicMock()
+        req.task_id = 'task-reverify-kw'
+        req.task_files = None
+        req.module_configs = []
+        req.config.merge_verify_min_free_disk_bytes = 1024
+        req.config.merge_verify_workspace = False
+        req.config.verify_env = {}
+        req.config.merge_verify_cold_command_timeout_secs = None
+        req.config.verify_cold_command_timeout_secs = None
+        merge_wt = MagicMock()
+
+        l1 = Path('/fake/_merge-live1')
+        l2 = Path('/fake/_merge-live2')
+        captured_kw: dict = {}
+
+        async def capture_pmpv(_git_ops, _req, _merge_wt, **kwargs):
+            captured_kw.update(kwargs)
+            return None  # verify passes
+
+        with (
+            patch('orchestrator.merge_queue._rebase_delta_touched_overlap',
+                  AsyncMock(return_value=['shared.py'])),
+            patch('orchestrator.merge_queue._run_post_merge_verify',
+                  side_effect=capture_pmpv),
+        ):
+            result = await _reverify_rebased_tree(
+                git_ops, req, merge_wt,
+                rebased_from='a' * 40,
+                rebased_onto='b' * 40,
+                timeouts={},
+                enospc_retries={},
+                max_timeouts=3,
+                max_enospc=1,
+                keep_worktrees={l1, l2},  # RED: TypeError until step-10
+            )
+
+        assert result is None, f'expected None (green verify), got {result!r}'
+        assert 'keep_worktrees' in captured_kw, (
+            'keep_worktrees not forwarded to _run_post_merge_verify'
+        )
+        assert captured_kw['keep_worktrees'] == {l1, l2}, (
+            f"keep_worktrees forwarded incorrectly: {captured_kw['keep_worktrees']!r}"
+        )
+
+    async def test_default_keep_worktrees_forwards_none(self) -> None:
+        """Without keep_worktrees, _run_post_merge_verify receives keep_worktrees=None
+        (legacy single-keep = {merge_wt} behaviour unchanged).
+
+        Regression guard: after step-10 adds keep_worktrees to the signature,
+        the default None must be forwarded (not omitted).
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        git_ops = MagicMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
+        req = MagicMock()
+        req.task_id = 'task-reverify-kw-default'
+        req.task_files = None
+        req.module_configs = []
+        req.config.merge_verify_min_free_disk_bytes = 1024
+        req.config.merge_verify_workspace = False
+        req.config.verify_env = {}
+        req.config.merge_verify_cold_command_timeout_secs = None
+        req.config.verify_cold_command_timeout_secs = None
+        merge_wt = MagicMock()
+
+        captured_kw: dict = {}
+
+        async def capture_pmpv(_git_ops, _req, _merge_wt, **kwargs):
+            captured_kw.update(kwargs)
+            return None  # verify passes
+
+        with (
+            patch('orchestrator.merge_queue._rebase_delta_touched_overlap',
+                  AsyncMock(return_value=['shared.py'])),
+            patch('orchestrator.merge_queue._run_post_merge_verify',
+                  side_effect=capture_pmpv),
+        ):
+            result = await _reverify_rebased_tree(
+                git_ops, req, merge_wt,
+                rebased_from='a' * 40,
+                rebased_onto='b' * 40,
+                timeouts={},
+                enospc_retries={},
+                max_timeouts=3,
+                max_enospc=1,
+                # No keep_worktrees — regression test
+            )
+
+        assert result is None, f'expected None (green verify), got {result!r}'
+        assert captured_kw.get('keep_worktrees') is None, (
+            f'default keep_worktrees must be None; got {captured_kw.get("keep_worktrees")!r}'
+        )
 
 
 # ---------------------------------------------------------------------------

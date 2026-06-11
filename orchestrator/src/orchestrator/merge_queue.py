@@ -24,7 +24,7 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -541,6 +541,7 @@ async def _ensure_verify_disk_space(
     merge_wt: Path,
     min_free_bytes: int,
     task_id: str,
+    keep_worktrees: Collection[Path] | None = None,
 ) -> str | None:
     """Pre-verify disk guard.  Returns a blocked-reason string (prefixed with
     ``TRANSIENT_INFRA_REASON_PREFIX``) when free space on *merge_wt*'s volume
@@ -577,7 +578,8 @@ async def _ensure_verify_disk_space(
         'pruning stale _merge-* worktrees before verify',
         task_id, free / gib, min_free_bytes / gib,
     )
-    pruned = await git_ops.prune_stale_merge_worktrees(keep=merge_wt)
+    keep = {merge_wt, *(keep_worktrees or ())}
+    pruned = await git_ops.prune_stale_merge_worktrees(keep=keep)
     try:
         free = shutil.disk_usage(merge_wt).free
     except OSError as exc:
@@ -693,6 +695,7 @@ async def _run_post_merge_verify(
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
     quarantine: set[str] | None = None,
+    keep_worktrees: Collection[Path] | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -712,6 +715,20 @@ async def _run_post_merge_verify(
             :class:`MergeWorker` call sites byte-identical.  Used by
             :class:`SpeculativeMergeWorker` to capture warm per-test results
             for PRD §10 invariant 6(b) shadow compare.
+        keep_worktrees: Additional worktrees to protect during any disk-pressure
+            prune triggered inside this verify run (pre-verify guard and ENOSPC
+            retry).  Default ``None`` keeps the legacy single-keep behaviour
+            (only *merge_wt* is protected).  Pass
+            ``set(worker._owned_merge_worktrees)`` from
+            :class:`SpeculativeMergeWorker` to protect all in-flight + queued
+            speculative worktrees (PRD §5 decision 5).
+
+            **Snapshot timing:** The caller's keep-set is a one-shot snapshot
+            taken at dispatch.  Worktrees registered into the ledger *after*
+            this snapshot is taken are not protected by prunes triggered inside
+            this call — they rely on the heartbeat mtime / grace-period
+            mechanism to avoid premature removal in the residual window between
+            snapshot capture and prune execution.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -719,6 +736,7 @@ async def _run_post_merge_verify(
     disk_reason = await _ensure_verify_disk_space(
         git_ops, merge_wt,
         req.config.merge_verify_min_free_disk_bytes, req.task_id,
+        keep_worktrees=keep_worktrees,
     )
     if disk_reason is not None:
         await git_ops.cleanup_merge_worktree(merge_wt)
@@ -776,7 +794,8 @@ async def _run_post_merge_verify(
         prior_enospc = enospc_retries.get(req.task_id, 0)
         if prior_enospc < max_enospc:
             enospc_retries[req.task_id] = prior_enospc + 1
-            pruned = await git_ops.prune_stale_merge_worktrees(keep=merge_wt)
+            enospc_keep = {merge_wt, *(keep_worktrees or ())}
+            pruned = await git_ops.prune_stale_merge_worktrees(keep=enospc_keep)
             logger.warning(
                 'Task %s: post-merge verify hit ENOSPC; pruned %d '
                 'stale merge worktree(s), retrying verify once',
@@ -1851,6 +1870,7 @@ async def _reverify_rebased_tree(
     max_timeouts: int,
     max_enospc: int,
     merge_sha: str = '',
+    keep_worktrees: Collection[Path] | None = None,
 ) -> MergeOutcome | None:
     """Shared gate for the disjoint-delta re-verify check.
 
@@ -1886,6 +1906,10 @@ async def _reverify_rebased_tree(
         The current main SHA the branch was rebased onto.
     timeouts / enospc_retries / max_timeouts / max_enospc:
         Forwarded verbatim to ``_run_post_merge_verify``.
+    keep_worktrees:
+        Additional worktrees to protect from disk-guard pruning — forwarded
+        verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
+        legacy single-keep behaviour (only ``merge_wt`` is protected).
     """
     overlap = await _rebase_delta_touched_overlap(
         req.worktree, rebased_from, rebased_onto, git_ops,
@@ -1915,6 +1939,7 @@ async def _reverify_rebased_tree(
         max_timeouts=max_timeouts,
         max_enospc=max_enospc,
         merge_sha=merge_sha,
+        keep_worktrees=keep_worktrees,
     )
 
 
@@ -6675,6 +6700,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 merge_sha=merge_commit,
                 on_result=_warm_capture.append if _is_warm_path else None,
                 quarantine=self._runner_quarantine,
+                keep_worktrees=set(self._owned_merge_worktrees),
             ))
             while True:
                 done, _ = await asyncio.wait(
@@ -6879,6 +6905,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                     merge_sha=rebased_sha,
+                    keep_worktrees=set(self._owned_merge_worktrees),
                 )
                 if gate is not None:
                     # Overlapping delta, verify failed (or disk guard fired).
