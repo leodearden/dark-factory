@@ -169,9 +169,22 @@ def _watchdog_thread_loop(stop_event: threading.Event, interval: float) -> None:
     Event.wait(interval) as a stoppable sleep — stop_event.set() ends the
     loop promptly during shutdown with no busy-wait and no up-to-interval
     shutdown delay.
+
+    Any unexpected exception from _sd_notify is caught, logged, and the
+    loop continues — a single failed ping is observable in logs/journal
+    but does not silently kill the heartbeat thread (which would
+    re-introduce the SIGABRT regression this fix targets).
+    Note: _sd_notify already swallows OSError internally; this guard
+    catches anything unexpected that escapes it.
     """
     while True:
-        _sd_notify('WATCHDOG=1')
+        try:
+            _sd_notify('WATCHDOG=1')
+        except Exception:
+            logger.exception(
+                'Unexpected exception in watchdog heartbeat thread; '
+                'heartbeat ping lost, continuing (task 1731)',
+            )
         if stop_event.wait(interval):
             return
 

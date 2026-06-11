@@ -11,6 +11,8 @@ the process 120s before SIGABRT (was 30s — too tight with the old on-loop desi
 
 from pathlib import Path
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -101,9 +103,6 @@ class TestSystemdUnitMem0Telemetry:
 # ---------------------------------------------------------------------------
 # WatchdogSec contract — task 1731 palliative
 # ---------------------------------------------------------------------------
-
-import pytest  # noqa: E402
-
 
 @pytest.mark.parametrize("unit_path,label", [
     (

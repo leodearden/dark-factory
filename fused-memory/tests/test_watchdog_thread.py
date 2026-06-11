@@ -230,3 +230,45 @@ class TestWatchdogThreadLifecycle:
 
         # Cleanup
         self._reset_module_refs(main)
+
+
+# ---------------------------------------------------------------------------
+# run_server wiring guard (source-inspection test)
+# ---------------------------------------------------------------------------
+
+class TestRunServerWatchdogWiring:
+    """Verify that run_server is wired to the dedicated-thread watchdog helpers
+    and that the old on-loop coroutine/Task wiring has been removed.
+
+    A future refactor could silently drop the _start/_stop calls without any
+    existing unit test failing — this assertion catches that regression without
+    requiring a full run_server integration harness (which needs uvicorn +
+    sockets + config).
+    """
+
+    def test_run_server_calls_thread_helpers(self) -> None:
+        """run_server source must call _start_watchdog_thread() and
+        _stop_watchdog_thread(), and must NOT contain the old on-loop
+        _watchdog_heartbeat coroutine or watchdog_task Task wiring."""
+        import inspect  # noqa: PLC0415
+
+        import fused_memory.server.main as main  # noqa: PLC0415
+
+        source = inspect.getsource(main.run_server)
+
+        assert '_start_watchdog_thread' in source, (
+            "run_server must call _start_watchdog_thread() — "
+            "watchdog wiring to dedicated thread is missing (task 1731)"
+        )
+        assert '_stop_watchdog_thread' in source, (
+            "run_server must call _stop_watchdog_thread() in its finally block — "
+            "watchdog cleanup wiring is missing (task 1731)"
+        )
+        assert '_watchdog_heartbeat' not in source, (
+            "run_server must NOT define/call _watchdog_heartbeat — "
+            "the old on-loop asyncio coroutine heartbeat was removed in task 1731"
+        )
+        assert 'watchdog_task' not in source, (
+            "run_server must NOT reference watchdog_task — "
+            "the old asyncio.Task heartbeat wiring was removed in task 1731"
+        )
