@@ -27,10 +27,10 @@ from test_merge_queue_coalesce import (
     _gated_verify,
     _make_branch_with_file,
     _make_req,
-    coalesce_config,
-    git_config,
-    git_ops,
-    git_repo,
+    coalesce_config,  # noqa: F401 — re-export: pytest fixture used by test methods
+    git_config,  # noqa: F401 — re-export: transitive fixture dep of coalesce_config/git_ops
+    git_ops,  # noqa: F401 — re-export: pytest fixture used by test methods
+    git_repo,  # noqa: F401 — re-export: transitive fixture dep of coalesce_config/git_ops
 )
 
 if TYPE_CHECKING:
@@ -101,8 +101,8 @@ class TestScenario1:
 
     async def test_three_singles_coalesce_end_to_end(
         self,
-        git_ops: GitOps,
-        coalesce_config: OrchestratorConfig,
+        git_ops: GitOps,  # noqa: F811 — pytest injects the re-exported fixture
+        coalesce_config: OrchestratorConfig,  # noqa: F811
         tmp_path: Path,
     ):
         import contextlib
@@ -372,8 +372,8 @@ class TestScenario2:
 
     async def test_partial_stackability_overlap_keeps_solo(
         self,
-        git_ops: GitOps,
-        coalesce_config: OrchestratorConfig,
+        git_ops: GitOps,  # noqa: F811
+        coalesce_config: OrchestratorConfig,  # noqa: F811
         tmp_path: Path,
     ):
         import contextlib
@@ -540,8 +540,8 @@ class TestScenario3:
 
     async def test_confidence_gate_excludes_blocked_member(
         self,
-        git_ops: GitOps,
-        coalesce_config: OrchestratorConfig,
+        git_ops: GitOps,  # noqa: F811
+        coalesce_config: OrchestratorConfig,  # noqa: F811
         tmp_path: Path,
     ):
         import contextlib
@@ -710,8 +710,8 @@ class TestScenario4:
 
     async def test_inflight_and_cancelled_excluded(
         self,
-        git_ops: GitOps,
-        coalesce_config: OrchestratorConfig,
+        git_ops: GitOps,  # noqa: F811
+        coalesce_config: OrchestratorConfig,  # noqa: F811
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore
@@ -827,8 +827,8 @@ class TestBookkeeping:
 
     async def test_speculative_caps_return_to_k_after_train(
         self,
-        git_ops: GitOps,
-        coalesce_config: OrchestratorConfig,
+        git_ops: GitOps,  # noqa: F811
+        coalesce_config: OrchestratorConfig,  # noqa: F811
         tmp_path: Path,
     ):
         import contextlib
