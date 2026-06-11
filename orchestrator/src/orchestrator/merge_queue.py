@@ -5250,22 +5250,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # (phase='passthrough') produce None here — no verify task is running.
         # Includes 'phase' so consumers can distinguish verifying vs. gate_reverify
         # vs. finalizing without misreading the presence of this field.
+        # Prefer _finalizing_head when set — it is the true submission-order head
+        # (popped from _inflight); self._inflight[0] is the SECOND entry during
+        # the finalize window and would misreport the verifying head.
         verify_in_progress = None
-        if self._inflight:
-            _head = self._inflight[0]
-            if _head.phase in {'verifying', 'gate_reverify', 'finalizing'}:
-                verify_in_progress = {
-                    'task_id': _head.item.request.task_id,
-                    'phase': _head.phase,
-                    # age_secs: total time since enqueued (queue wait + verify time).
-                    'age_secs': max(0.0, now - _head.item.request.enqueued_at),
-                    # verify_age_secs: time since dispatch (includes host acquisition).
-                    # This is NOT pure verify time — see started_at on InflightEntry.
-                    'verify_age_secs': (
-                        max(0.0, now - _head.started_at)
-                        if _head.started_at is not None else None
-                    ),
-                }
+        _vip_head = self._finalizing_head if self._finalizing_head is not None else (
+            self._inflight[0] if self._inflight else None
+        )
+        if _vip_head is not None and _vip_head.phase in {'verifying', 'gate_reverify', 'finalizing'}:
+            verify_in_progress = {
+                'task_id': _vip_head.item.request.task_id,
+                'phase': _vip_head.phase,
+                # age_secs: total time since enqueued (queue wait + verify time).
+                'age_secs': max(0.0, now - _vip_head.item.request.enqueued_at),
+                # verify_age_secs: time since dispatch (includes host acquisition).
+                # This is NOT pure verify time — see started_at on InflightEntry.
+                'verify_age_secs': (
+                    max(0.0, now - _vip_head.started_at)
+                    if _vip_head.started_at is not None else None
+                ),
+            }
 
         # occupancy: per-host in-flight breakdown for heartbeat and dashboard consumers.
         _by_host = {
