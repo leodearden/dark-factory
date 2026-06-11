@@ -705,12 +705,31 @@ class ReconciliationHarness:
                 f"instance={diag['instance_id']} age={diag['age_seconds']:.0f}s "
                 f"disposition={diag['disposition']}"
             )
-            self._escalate(
-                'recon_stale_run',
-                run.id,
-                f'Run stale (>{cutoff}s, lock expired), recovered',
-                detail,
-            )
+            if diag['disposition'] == 'dead_owner_shielded':
+                # Operational-restart noise: same-owner orphan whose heartbeat
+                # is older than the liveness cutoff — provably from a prior
+                # process incarnation that was hard-killed (e.g. watchdog SIGABRT,
+                # task 1731).  A fresh instance's reaper is recovering its orphan;
+                # that is expected behaviour, not an integrity finding.  Suppress
+                # the recon_stale_run escalation; recovery, journal _error, and
+                # the warning log above remain so the event stays observable in
+                # logs/journal without filing a noisy alert.
+                logger.info(
+                    'recon_stale_run suppressed: dead_owner_shielded orphan recovered '
+                    '(operational kill/restart, task 1731)',
+                    extra={
+                        'run_id': run.id,
+                        'project_id': run.project_id,
+                        'age_seconds': diag['age_seconds'],
+                    },
+                )
+            else:
+                self._escalate(
+                    'recon_stale_run',
+                    run.id,
+                    f'Run stale (>{cutoff}s, lock expired), recovered',
+                    detail,
+                )
 
     # ── Deferred write replay ─────────────────────────────────────────
 
