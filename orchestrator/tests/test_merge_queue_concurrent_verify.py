@@ -1085,3 +1085,500 @@ class TestFinalizeInflightPass:
 
         # Slot value unchanged (no release)
         assert worker._speculation_slot._value == slot_value_before
+
+
+# ---------------------------------------------------------------------------
+# step-13 RED: _finalize_inflight non-pass paths
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeInflightNonPass:
+    """_finalize_inflight non-pass paths: FAIL, PASSTHROUGH, DROPPED, REQUEUED.
+
+    RED until step-14 GREEN extends _finalize_inflight.
+    """
+
+    # ------------------------------------------------------------------
+    # Shared helpers (duplicated from TestFinalizeInflightPass for isolation)
+    # ------------------------------------------------------------------
+
+    async def _make_merged_item(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+        content: str,
+    ):
+        from orchestrator.merge_queue import SpeculativeItem
+
+        wt = await _make_branch_with_file(git_ops, branch, filename, content)
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id=branch,
+            branch=branch,
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            lane='normal',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success and merge_result.merge_commit
+        base_sha = await git_ops.get_main_sha()
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+        return req, item
+
+    def _make_passthrough_item(
+        self,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+        outcome: MergeOutcome,
+        already_delivered: bool = False,
+    ):
+        """Build a SpeculativeItem with immediate_outcome (no real merge)."""
+        from orchestrator.merge_queue import SpeculativeItem
+
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id='pt-task',
+            branch='pt-branch',
+            worktree=git_repo / 'pt-wt',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            lane='normal',
+        )
+        item = SpeculativeItem(
+            request=req,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='deadbeef' * 5,
+            speculative=False,
+            skip_verify=False,
+            immediate_outcome=outcome,
+            already_delivered=already_delivered,
+        )
+        return req, item
+
+    def _make_mock_allocator(self):
+        """Return a MagicMock with async release/cancel_and_release."""
+        alloc = MagicMock()
+        alloc.release = AsyncMock()
+        alloc.cancel_and_release = AsyncMock()
+        return alloc
+
+    def _make_fail_entry(self, item, lease, fail_outcome, merge_wt_val):
+        """Build an InflightEntry with a verify_task that returns a FAIL result."""
+        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
+
+        async def _fake_fail_verify():
+            return InflightVerifyResult(
+                outcome=fail_outcome,
+                merge_wt=merge_wt_val,
+                status=None,
+            )
+
+        verify_task = asyncio.ensure_future(_fake_fail_verify())
+        return InflightEntry(
+            item=item,
+            lease=lease,
+            verify_task=verify_task,
+            merge_wt=merge_wt_val,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+    def _make_sentinel_entry(self, item, lease, sentinel_status, merge_wt_val=None):
+        """Build an InflightEntry with a verify_task returning a DROPPED/REQUEUED sentinel."""
+        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
+
+        async def _fake_sentinel_verify():
+            return InflightVerifyResult(
+                outcome=None,
+                merge_wt=merge_wt_val,
+                status=sentinel_status,
+            )
+
+        verify_task = asyncio.ensure_future(_fake_sentinel_verify())
+        return InflightEntry(
+            item=item,
+            lease=lease,
+            verify_task=verify_task,
+            merge_wt=merge_wt_val,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+    # ------------------------------------------------------------------
+    # (a) FAIL path
+    # ------------------------------------------------------------------
+
+    async def test_finalize_fail_returns_false(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """FAIL verify outcome → _finalize_inflight returns False.
+
+        RED: current step-12 code ignores verify_task and runs CAS → returns True.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'fail-a', 'fa.py', 'a=1\n',
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        fail_outcome = MergeOutcome('blocked', reason='test verify fail')
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_fail_entry(item, lease, fail_outcome, item.merge_wt)
+
+        result = await worker._finalize_inflight(entry)
+        assert result is False  # RED: current code returns True
+
+    async def test_finalize_fail_resolves_req_with_fail_outcome(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """FAIL outcome → req.result resolved with the fail MergeOutcome.
+
+        RED: current code advances main and resolves with 'done'.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'fail-b', 'fb.py', 'b=2\n',
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        fail_outcome = MergeOutcome('blocked', reason='verify error')
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_fail_entry(item, lease, fail_outcome, item.merge_wt)
+
+        await worker._finalize_inflight(entry)
+        assert req.result.done()
+        assert req.result.result().status == 'blocked'
+
+    async def test_finalize_fail_releases_lease(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """FAIL outcome → allocator.release called with the lease.
+
+        RED: current code may call release (in finally), but wrong behavior before that.
+        This test verifies lease is released specifically for the fail path.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'fail-c', 'fc.py', 'c=3\n',
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        mock_alloc = self._make_mock_allocator()
+        worker._host_allocator = mock_alloc
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        fail_outcome = MergeOutcome('blocked', reason='fail')
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_fail_entry(item, lease, fail_outcome, item.merge_wt)
+
+        try:
+            await worker._finalize_inflight(entry)
+        except Exception:
+            pass  # may raise in RED state; we care about release
+        mock_alloc.release.assert_called_once_with(lease)
+
+    async def test_finalize_fail_sets_n_failed_true(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """FAIL outcome → self._n_failed = True.
+
+        RED: current code sets _n_failed = not advanced = False (wrong).
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'fail-d', 'fd.py', 'd=4\n',
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._n_failed = False  # start at False to detect the change
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        fail_outcome = MergeOutcome('blocked', reason='fail')
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_fail_entry(item, lease, fail_outcome, item.merge_wt)
+
+        try:
+            await worker._finalize_inflight(entry)
+        except Exception:
+            pass
+        assert worker._n_failed is True  # RED: current code sets False
+
+    # ------------------------------------------------------------------
+    # (b) PASSTHROUGH path (immediate_outcome / conflict / already_merged)
+    # ------------------------------------------------------------------
+
+    async def test_finalize_passthrough_conflict_resolves_req(
+        self, git_repo: Path, git_config: GitConfig, config: OrchestratorConfig,
+    ) -> None:
+        """PASSTHROUGH (conflict) → req.result resolved with the passthrough outcome.
+
+        RED: current code asserts merge_wt is not None → AssertionError.
+        """
+        from orchestrator.merge_queue import InflightEntry
+
+        conflict_outcome = MergeOutcome('conflict', reason='merge conflict')
+        req, item = self._make_passthrough_item(
+            git_repo, git_config, config, conflict_outcome, already_delivered=False,
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            GitOps(git_config, git_repo), q,
+        )
+        worker._host_allocator = self._make_mock_allocator()
+
+        entry = InflightEntry(
+            item=item,
+            lease=None,
+            verify_task=None,
+            merge_wt=None,
+            was_speculative=False,
+            phase='passthrough',
+            passthrough_outcome=conflict_outcome,
+        )
+        await worker._finalize_inflight(entry)  # RED: raises AssertionError
+        assert req.result.done()
+        assert req.result.result().status == 'conflict'
+
+    async def test_finalize_passthrough_n_failed_true_for_conflict(
+        self, git_repo: Path, git_config: GitConfig, config: OrchestratorConfig,
+    ) -> None:
+        """PASSTHROUGH conflict → _n_failed = True (conflict is not 'done'/'already_merged').
+
+        RED: current code raises AssertionError before reaching _n_failed.
+        """
+        from orchestrator.merge_queue import InflightEntry
+
+        conflict_outcome = MergeOutcome('conflict', reason='conflict')
+        req, item = self._make_passthrough_item(
+            git_repo, git_config, config, conflict_outcome,
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(GitOps(git_config, git_repo), q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._n_failed = False
+
+        entry = InflightEntry(
+            item=item, lease=None, verify_task=None, merge_wt=None,
+            was_speculative=False, phase='passthrough',
+            passthrough_outcome=conflict_outcome,
+        )
+        try:
+            await worker._finalize_inflight(entry)
+        except Exception:
+            pass
+        assert worker._n_failed is True
+
+    async def test_finalize_passthrough_n_failed_false_for_already_merged(
+        self, git_repo: Path, git_config: GitConfig, config: OrchestratorConfig,
+    ) -> None:
+        """PASSTHROUGH already_merged → _n_failed = False (chain not broken).
+
+        RED: same AssertionError as above.
+        """
+        from orchestrator.merge_queue import InflightEntry
+
+        am_outcome = MergeOutcome('already_merged')
+        req, item = self._make_passthrough_item(
+            git_repo, git_config, config, am_outcome,
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(GitOps(git_config, git_repo), q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._n_failed = True  # start True to detect reset
+
+        entry = InflightEntry(
+            item=item, lease=None, verify_task=None, merge_wt=None,
+            was_speculative=False, phase='passthrough',
+            passthrough_outcome=am_outcome,
+        )
+        try:
+            await worker._finalize_inflight(entry)
+        except Exception:
+            pass
+        assert worker._n_failed is False  # already_merged → not n_failed
+
+    async def test_finalize_passthrough_already_delivered_skips_resolve(
+        self, git_repo: Path, git_config: GitConfig, config: OrchestratorConfig,
+    ) -> None:
+        """PASSTHROUGH with already_delivered=True → req.result NOT set by finalize.
+
+        RED: current code raises AssertionError before reaching the delivery check.
+        """
+        from orchestrator.merge_queue import InflightEntry
+
+        conflict_outcome = MergeOutcome('conflict', reason='conflict')
+        req, item = self._make_passthrough_item(
+            git_repo, git_config, config, conflict_outcome, already_delivered=True,
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(GitOps(git_config, git_repo), q)
+        worker._host_allocator = self._make_mock_allocator()
+
+        entry = InflightEntry(
+            item=item, lease=None, verify_task=None, merge_wt=None,
+            was_speculative=False, phase='passthrough',
+            passthrough_outcome=conflict_outcome,
+        )
+        # req.result must NOT be set because already_delivered=True
+        try:
+            await worker._finalize_inflight(entry)
+        except Exception:
+            pass
+        # already_delivered means the merger already set the result OOB
+        assert not req.result.done()
+
+    # ------------------------------------------------------------------
+    # (c) DROPPED / REQUEUED sentinel paths
+    # ------------------------------------------------------------------
+
+    async def test_finalize_dropped_calls_cancel_and_release(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """DROPPED sentinel → allocator.cancel_and_release(lease) called.
+
+        RED: current code raises AssertionError (merge_wt=None).
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'drop-a', 'da.py', 'a=1\n',
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        mock_alloc = self._make_mock_allocator()
+        worker._host_allocator = mock_alloc
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_sentinel_entry(item, lease, 'DROPPED', merge_wt_val=None)
+
+        try:
+            await worker._finalize_inflight(entry)
+        except Exception:
+            pass
+        mock_alloc.cancel_and_release.assert_called_once_with(lease)
+
+    async def test_finalize_dropped_sets_n_failed_true(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """DROPPED sentinel → _n_failed = True (chain stale: sole waiter abandoned).
+
+        RED: current code raises before reaching _n_failed.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'drop-b', 'db.py', 'b=2\n',
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._n_failed = False
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_sentinel_entry(item, lease, 'DROPPED', merge_wt_val=None)
+
+        try:
+            await worker._finalize_inflight(entry)
+        except Exception:
+            pass
+        assert worker._n_failed is True
+
+    async def test_finalize_dropped_returns_false(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """DROPPED sentinel → _finalize_inflight returns False.
+
+        RED: current code raises before returning.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'drop-c', 'dc.py', 'c=3\n',
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_sentinel_entry(item, lease, 'DROPPED', merge_wt_val=None)
+
+        result = await worker._finalize_inflight(entry)
+        assert result is False  # RED: current code raises AssertionError
+
+    async def test_finalize_requeued_returns_false(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """REQUEUED sentinel → _finalize_inflight returns False.
+
+        RED: current code raises AssertionError (merge_wt=None).
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'requeue-a', 'ra.py', 'a=1\n',
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_sentinel_entry(item, lease, 'REQUEUED', merge_wt_val=None)
+
+        result = await worker._finalize_inflight(entry)
+        assert result is False  # RED: current raises AssertionError
+
+    async def test_finalize_requeued_calls_cancel_and_release(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """REQUEUED sentinel → allocator.cancel_and_release(lease) called.
+
+        RED: current code raises before cancel_and_release.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'requeue-b', 'rb.py', 'b=2\n',
+        )
+        q = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        mock_alloc = self._make_mock_allocator()
+        worker._host_allocator = mock_alloc
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_sentinel_entry(item, lease, 'REQUEUED', merge_wt_val=None)
+
+        try:
+            await worker._finalize_inflight(entry)
+        except Exception:
+            pass
+        mock_alloc.cancel_and_release.assert_called_once_with(lease)
