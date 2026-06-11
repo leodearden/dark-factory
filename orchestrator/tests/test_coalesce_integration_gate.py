@@ -689,7 +689,7 @@ class TestScenario3:
 
 @pytest.mark.asyncio
 class TestScenario4:
-    """step-7 (RED) / step-8 (GREEN): in-flight + detached-waiter exclusion.
+    """step-8 (GREEN): in-flight + detached-waiter exclusion.
 
     The coalescing pass filters candidates via:
       not req.result.done()    — absorbed or otherwise resolved
@@ -713,12 +713,10 @@ class TestScenario4:
       (e) train forms from req4a + req4b only; exactly 2 members
       (f) train_coalesced event records only req4a + req4b in member_task_ids
 
-    RED (step-7): no _inflight_req assignment and no future cancellation →
-    all 4 items in the buffer are live candidates → all 4 coalesce into a
-    4-member train → assertion (a) fails (req_in_flight resolved 'superseded')
-    and assertion (c) fails (req_cancelled resolved 'superseded').
-    step-8 moves req_in_flight to _inflight_req (absent from buffer) and
-    cancels req_cancelled.result before calling the pass.
+    GREEN (step-8): req_in_flight is set on worker._inflight_req and NOT placed
+    in _lane_buffers (structural exclusion: absent from buffer).
+    req_cancelled.result.cancel() is called before the pass so the cancelled()
+    check filters it out.  Only req4a+req4b are eligible → 2-member train.
     """
 
     async def test_inflight_and_cancelled_excluded(
@@ -755,13 +753,19 @@ class TestScenario4:
         req4a         = _make_req('ig_s4a', 'ig_s4a', wt_4a,  coalesce_config)
         req4b         = _make_req('ig_s4b', 'ig_s4b', wt_4b,  coalesce_config)
 
-        # RED: no _inflight_req assignment and no future cancellation.
-        # All 4 requests are live candidates in the buffer → all 4 coalesce
-        # into a 4-member train → assertions (a) and (c) fail.
-        # step-8 fixes:
-        #   worker._inflight_req = req_in_flight  (absent from buffer)
-        #   req_cancelled.result.cancel()          (excluded by cancelled() check)
-        worker._lane_buffers['normal'].extend([req_in_flight, req_cancelled, req4a, req4b])
+        # GREEN (step-8): req_in_flight is in _inflight_req — NOT in the buffer.
+        # Structural exclusion: _maybe_coalesce_waiting_singles only scans
+        # _lane_buffers['normal']; _inflight_req is invisible to the pass.
+        worker._inflight_req = req_in_flight
+
+        # Simulate a detached waiter: cancel req_cancelled's future before
+        # adding it to the buffer.  The cancelled() filter skips it during
+        # candidate selection, and set_result is never called on it.
+        req_cancelled.result.cancel()
+        assert req_cancelled.result.cancelled(), 'precondition: future must be cancelled'
+
+        # Lane buffer: cancelled request + 2 live singles (req_in_flight is absent).
+        worker._lane_buffers['normal'].extend([req_cancelled, req4a, req4b])
 
         result = await worker._maybe_coalesce_waiting_singles()
         assert result is True, 'pass must form a train from the eligible candidates'
