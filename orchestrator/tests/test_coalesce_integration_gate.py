@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-
 from _workflow_helpers import FakeScheduler
 from test_merge_queue_coalesce import (
     _events_of_type,
@@ -126,7 +125,6 @@ class TestScenario1:
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
         from orchestrator.merge_queue import (
-            GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
             enqueue_merge_request,
@@ -393,7 +391,7 @@ class TestScenario2:
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
+        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         # Three branches:
         #   s21: adds file_overlap.py → old-side point range (0,0) on file_overlap.py
@@ -471,7 +469,7 @@ class TestScenario2:
                 f'train_id must start with "coalesce-"; got {train_id!r}'
             )
             assert req2.result.result().superseded_by == train_id, (
-                f's22 must be absorbed into the same train as s21'
+                's22 must be absorbed into the same train as s21'
             )
 
             # (c) train_coalesced event member_task_ids == {{s21, s22}}.
@@ -561,7 +559,7 @@ class TestScenario3:
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import MergeOutcome, SpeculativeMergeWorker
+        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         # Three disjoint-file branches — all mutually line-stackable.
         wt1 = await _make_branch_with_file(git_ops, 'ig_s31', 'file_s31.py', 's31 = 1\n')
