@@ -186,8 +186,6 @@ class TestStartMergeWorkerK2LivenessRepro:
         heartbeat-floor formula (worst_case = _HEARTBEAT_POLL_S ×
         TOUCH_MISS_TOLERANCE = 600 s) decouples from cold timeout and K.
         """
-        from orchestrator.merge_queue import check_merge_liveness_margin
-
         # Exact 2026-06-10 crash config: one enabled verify_runner → K=2,
         # cold_timeout=7200.  Pre-β the formula scaled with cold_timeout×K and
         # raised MergeLivenessConfigError; post-β the floor is constant at 600 s.
@@ -247,27 +245,5 @@ class TestStartMergeWorkerK2LivenessRepro:
         # Proven implicitly by clean completion above with persistent_merge_worktree=True
         # (the guard early-returns only when the knob is off; here it runs and passes).
         # This regression-holds the 1692 seam: num_hosts=K keeps per-host bound = 1.
-
-        # β property — config-independence of worst_case_secs.
-        # Pre-β formula: worst_case = cold_timeout × bound / num_hosts (K-coupled) →
-        #   7200 × 2 / ... >> threshold → MergeLivenessConfigError → crash loop.
-        # Post-β formula: worst_case = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE = 600 s
-        #   → invariant across cold_timeout and K.
-        cfg_9000 = OrchestratorConfig(
-            project_root=tmp_path,
-            merge_verify_cold_command_timeout_secs=9000,
-        )
-        result_7200 = check_merge_liveness_margin(config)
-        result_9000 = check_merge_liveness_margin(cfg_9000)
-
-        assert result_7200.worst_case_secs == 600.0, (
-            f'Expected heartbeat floor=600 s for cold_timeout=7200; '
-            f'got {result_7200.worst_case_secs}'
-        )
-        assert result_9000.worst_case_secs == 600.0, (
-            'cold timeout must not feed worst_case_secs (β property that fixes the crash); '
-            f'cfg_7200 floor={result_7200.worst_case_secs}, '
-            f'cfg_9000 floor={result_9000.worst_case_secs}'
-        )
-        assert result_7200.safe is True
-        assert result_9000.safe is True
+        # The β config-independence property (worst_case_secs invariant across cold
+        # timeouts) is owned by TestMergeLivenessMargin in test_merge_queue.py.
