@@ -105,10 +105,14 @@ def write_pgid_file(path: Path, pgid: int) -> None:
     """Atomically write *pgid* to *path*, creating parent directories first.
 
     Uses a sibling tmp file + ``os.replace`` for atomicity so a concurrent
-    reader never sees a partial write.
+    reader never sees a partial write.  The temp name is derived additively
+    (``path.name + '.tmp'``) rather than with ``path.with_suffix('.tmp')``:
+    ``with_suffix`` replaces from the *last* dot, so request-ids containing
+    dots (e.g. ``'1.2.3'``) would produce colliding tmp names (``'1.tmp'``)
+    and defeat the atomicity guarantee for concurrent runs.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix('.tmp')
+    tmp = path.parent / (path.name + '.tmp')
     tmp.write_text(str(pgid))
     os.replace(tmp, path)
 
@@ -224,6 +228,7 @@ def cancel_request(
     ppid_map_provider=read_ppid_map,
     kill=os.kill,
     killpg=os.killpg,
+    failed_pids_out: list | None = None,
 ) -> int:
     """Cancel the verify-merge identified by the pgid file at *path*.
 
@@ -248,7 +253,9 @@ def cancel_request(
     4. ``SIGKILL`` every target (descendants ∪ {pgid}):
 
        * ``ProcessLookupError`` → already dead, counts as success.
-       * ``PermissionError`` → live process we cannot kill; record failure.
+       * ``PermissionError`` → live process we cannot kill; record failure
+         and append the pid to *failed_pids_out* (if provided) so the
+         caller can emit an actionable diagnostic.
 
     5. ``killpg(pgid, SIGKILL)`` backstop — suppresses ``OSError`` /
        ``ProcessLookupError`` (group may already be gone).
@@ -256,6 +263,14 @@ def cancel_request(
     6. If any live process could not be killed → return 1 and **retain** the
        pgid file (lets a retry or β's quarantine probe act on it).
        Otherwise remove the file and return 0.
+
+    Parameters
+    ----------
+    failed_pids_out:
+        Optional list to which pids that raised ``PermissionError`` on
+        ``SIGKILL`` are appended.  Useful for callers that want to emit a
+        human-readable diagnostic.  Pass ``[]`` (an empty list) and inspect
+        it after the call.
 
     Return value
     ------------
@@ -281,6 +296,17 @@ def cancel_request(
         remove_pgid_file(path)
         return 0
 
+    # NOTE — stale-file / PID-reuse window:
+    # If verify-merge dies without running its finally-block (hard crash, OOM,
+    # host reset) the pgid file is left on disk.  After the original process is
+    # gone the OS may recycle that pid/pgid for an unrelated process; a later
+    # cancel_request call would then SIGKILL the wrong process.
+    # The window is bounded: modern kernels recycle pids slowly (default
+    # pid_max = 32768), and the stale file is cleaned up by the next successful
+    # cancel-verify or on host reboot.  A future β hardening: stamp a boot-id
+    # alongside the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate
+    # it here before killing.
+
     # Step 2: snapshot PPID map BEFORE any kills (invariant: snapshot precedes kill).
     # Killing the root reparents its survivors to init, severing the /proc parent
     # chain — the snapshot MUST capture the full tree first.
@@ -301,6 +327,8 @@ def cancel_request(
             pass  # already dead — success
         except PermissionError:
             failed = True  # live but unkillable
+            if failed_pids_out is not None:
+                failed_pids_out.append(pid)
 
     # Step 5: killpg backstop (suppresses errors — group may already be gone)
     with contextlib.suppress(ProcessLookupError, OSError):

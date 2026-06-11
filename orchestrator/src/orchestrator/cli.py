@@ -352,17 +352,21 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         click.echo(f'Error: invalid --spec: {e}', err=True)
         sys.exit(1)
 
+    # Construct GitOps once; reused for both pgid-path derivation (when --request-id
+    # is set) and the async worktree acquisition inside _run().  GitOps.__init__ is
+    # side-effect-free so constructing it here is safe in all paths.
+    git_ops = GitOps(config.git, config.project_root)
+
     # Cancellation support: write pgid file before starting work so that a
     # concurrent `cancel-verify --request-id X` can locate and kill this process.
     pgf: Path | None = None
     if request_id is not None:
-        git_ops_for_path = GitOps(config.git, config.project_root)
-        pgf = pgid_file(git_ops_for_path.worktree_base, request_id)
+        pgf = pgid_file(git_ops.worktree_base, request_id)
         pgid = start_own_process_group()
         write_pgid_file(pgf, pgid)
 
     async def _run():
-        git_ops = GitOps(config.git, config.project_root)
+        # git_ops closed over from outer scope — same instance, no redundant construction.
         wt = await git_ops.acquire_host_verify_worktree(sha)
         try:
             return await run_merge_verify_on_worktree(wt, config, spec, merge_sha=sha)
@@ -426,7 +430,14 @@ def cancel_verify(request_id: str, config_path: Path | None):
 
     git_ops = GitOps(config.git, config.project_root)
     pgf = pgid_file(git_ops.worktree_base, request_id)
-    rc = cancel_request(pgf)
+    failed_pids: list[int] = []
+    rc = cancel_request(pgf, failed_pids_out=failed_pids)
+    for pid in failed_pids:
+        click.echo(
+            f'cancel-verify: PermissionError: could not SIGKILL pid {pid} '
+            f'(process alive but kill refused) — retry or escalate manually',
+            err=True,
+        )
     sys.exit(rc)
 
 
