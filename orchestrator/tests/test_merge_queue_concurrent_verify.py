@@ -1582,3 +1582,162 @@ class TestFinalizeInflightNonPass:
         except Exception:
             pass
         mock_alloc.cancel_and_release.assert_called_once_with(lease)
+
+
+# ---------------------------------------------------------------------------
+# step-15 RED: SINGLE-HOST serial byte-identical via the restructured loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSingleHostSerialByteIdentical:
+    """SINGLE-HOST serial byte-identical via the restructured _verifier_loop.
+
+    RED until step-16 GREEN restructures _verifier_loop, adds _dispatch_item,
+    and makes _verify_and_advance a thin compat shim.
+
+    The two structural tests (test_dispatch_item_method_exists and
+    test_verifier_loop_sets_n_failed_via_instance_attr) are the RED markers.
+    The end-to-end tests document the byte-identical oracle that must stay
+    green before and after the restructuring.
+    """
+
+    # ------------------------------------------------------------------
+    # RED marker 1: _dispatch_item must exist on the class
+    # ------------------------------------------------------------------
+
+    async def test_dispatch_item_method_exists(self, git_ops: GitOps) -> None:
+        """_dispatch_item is a callable on SpeculativeMergeWorker.
+
+        RED: method not yet added (step-16 adds it).
+        GREEN: step-16 adds _dispatch_item.
+        """
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        assert callable(getattr(worker, '_dispatch_item', None)), (
+            '_dispatch_item not found on SpeculativeMergeWorker — '
+            'restructured loop not yet added (step-16). '
+            'RED: None (missing). GREEN: callable after step-16.'
+        )
+
+    # ------------------------------------------------------------------
+    # RED marker 2: _verifier_loop must update self._n_failed on the instance
+    # ------------------------------------------------------------------
+
+    async def test_verifier_loop_sets_n_failed_via_instance_attr(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Restructured _verifier_loop sets self._n_failed (not just a loop-local).
+
+        The OLD _verifier_loop keeps n_failed as a loop-local variable and
+        NEVER writes to self._n_failed.  The NEW loop delegates to
+        _finalize_inflight which always sets self._n_failed in its finally.
+
+        Use an immediate_outcome CONFLICT token to trigger the non-done path:
+          - conflict.status='conflict' → _n_failed_val=True in _finalize_inflight
+          - OLD: self._n_failed stays False (never set by old loop)
+          - NEW: self._n_failed becomes True after finalize
+
+        RED: old loop never writes self._n_failed → stays False after conflict.
+        GREEN: step-16 restructured loop → _finalize_inflight sets self._n_failed=True.
+        """
+        from orchestrator.merge_queue import SpeculativeItem
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        req = _make_request('nf-conflict', 'nf-conflict', git_ops.project_root, config)
+        conflict_outcome = MergeOutcome('conflict', reason='merge conflict')
+
+        token = SpeculativeItem(
+            request=req,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='deadbeef',
+            speculative=False,
+            skip_verify=False,
+            immediate_outcome=conflict_outcome,
+            already_delivered=False,
+        )
+
+        await worker._verifier_queue.put(token)
+        await worker._verifier_queue.put(None)  # sentinel
+
+        # Drive _verifier_loop directly (same pattern as existing 3514/3571/3605 tests)
+        await worker._verifier_loop()
+
+        # OLD: self._n_failed stays False (loop-local n_failed only)
+        # NEW: _finalize_inflight sets self._n_failed=True for conflict status
+        assert worker._n_failed is True, (
+            '_n_failed should be True after a conflict token. '
+            'OLD _verifier_loop never updates self._n_failed (loop-local only). '
+            'NEW restructured loop uses _finalize_inflight which sets self._n_failed. '
+            'RED: stays False with old loop. GREEN: True after step-16.'
+        )
+
+    # ------------------------------------------------------------------
+    # Byte-identical oracle: end-to-end run with two real items (no verify_runners)
+    # ------------------------------------------------------------------
+
+    async def test_single_host_two_items_both_done(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Single-host config + two real items → both resolve done, main advanced in order.
+
+        This test is the byte-identical oracle: it must stay GREEN both before
+        (old serial loop) and after (new dispatch-fill + finalize-head) step-16.
+
+        Submission order: N is submitted first and must land on main first.
+        Both items use real git repos so advance_main genuinely runs.
+        """
+        wt_a = await _make_branch_with_file(git_ops, 'task/sh-a', 'sha.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/sh-b', 'shb.py', 'b = 2\n')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker_task = asyncio.create_task(worker.run())
+
+        loop = asyncio.get_event_loop()
+        req_a = MergeRequest(
+            task_id='sh-a',
+            branch='task/sh-a',
+            worktree=wt_a,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='sh-b',
+            branch='task/sh-b',
+            worktree=wt_b,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            lane='normal',
+        )
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await q.put(req_a)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=30)
+            await q.put(req_b)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=30)
+
+        await worker.stop()
+        await worker_task
+
+        assert outcome_a.status == 'done', f'Item A: expected done, got {outcome_a}'
+        assert outcome_b.status == 'done', f'Item B: expected done, got {outcome_b}'
+
+        # Both files must be on main
+        from orchestrator.git_ops import _run as _git_run
+        _, main_files, _ = await _git_run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'sha.py' in main_files, 'Item A file not on main'
+        assert 'shb.py' in main_files, 'Item B file not on main'
