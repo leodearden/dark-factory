@@ -375,6 +375,54 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     click.echo(result_to_json(result))
 
 
+@main.command('cancel-verify')
+@click.option('--request-id', required=True,
+              help='Request ID passed to the verify-merge invocation to cancel.')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — determines worktree_base for '
+                   'the pgid-file lookup.')
+def cancel_verify(request_id: str, config_path: Path | None):
+    """Kill the verify-merge process tree identified by --request-id and exit 0.
+
+    Reads the pgid file at
+    ``<worktree_base>/.merge_verify_pgids/<request-id>`` (written by
+    ``verify-merge --request-id``), snapshots the ``/proc`` PPID map, and
+    ``SIGKILL``\\s every descendant plus a ``killpg`` backstop.  This reaps the
+    entire process tree including ``start_new_session`` build-command escapes
+    (which leave ``verify-merge``'s process group but remain its descendants in
+    the ``/proc`` parent chain).
+
+    **Idempotent**: exits 0 when the file is absent (already cancelled or never
+    started), when the content is corrupt, or when all processes are already
+    dead.  Exits non-zero only when a live process could not be killed
+    (``SIGKILL`` raised ``PermissionError``); in that case the pgid file is
+    retained so a retry can act on it.
+
+    pgid-file directory: ``<worktree_base>/.merge_verify_pgids`` — host-side,
+    per-project, never pruned/git-cleaned (mirrors the
+    ``.merge_verify_host_attempts`` counter precedent).  ``worktree_base`` is
+    derived via ``GitOps(config.git, config.project_root).worktree_base``.
+
+    Cross-host rollout: both the server and the laptop host run the ``df``
+    checkout, so landing this command on ``main`` ships the contract to the
+    laptop via its normal checkout sync.
+    """
+    from orchestrator.git_ops import GitOps
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+
+    git_ops = GitOps(config.git, config.project_root)
+    pgf = pgid_file(git_ops.worktree_base, request_id)
+    rc = cancel_request(pgf)
+    sys.exit(rc)
+
+
 @main.command('eval')
 @click.option('--task', 'task_path', type=click.Path(exists=True, path_type=Path),
               default=None, help='Path to a single task JSON file')
