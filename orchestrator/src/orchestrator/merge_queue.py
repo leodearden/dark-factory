@@ -6486,11 +6486,42 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     _allocator = self._host_allocator
                     _downstream = list(self._inflight)
                     self._inflight.clear()
+
+                    # Detect whether the head failure was due to operator halt
+                    # (REQUEUED sentinel).  In that case downstream tasks will
+                    # also detect halt via their abort-polls and self-requeue;
+                    # we must NOT _remerge them.  If we cancel a downstream task
+                    # before its abort-poll fires, we manually requeue its req.
+                    _head_was_requeued = False
+                    if head.verify_task is not None and head.verify_task.done():
+                        try:
+                            _hvt = head.verify_task.result()
+                            _head_was_requeued = (
+                                getattr(_hvt, 'status', None) == 'REQUEUED'
+                            )
+                        except BaseException:
+                            pass
+
                     for _entry in _downstream:
+                        _entry_status: str | None = None
                         if _entry.verify_task is not None:
                             _entry.verify_task.cancel()
                             with contextlib.suppress(BaseException):
                                 await _entry.verify_task
+                            # Peek at the completed result to detect REQUEUED
+                            # (operator-halt): the request is already back on
+                            # _queue via the abort-poll; _remerge must be skipped
+                            # to avoid a duplicate re-dispatch.
+                            if (
+                                _entry.verify_task.done()
+                                and not _entry.verify_task.cancelled()
+                            ):
+                                try:
+                                    _vt_res = _entry.verify_task.result()
+                                    if hasattr(_vt_res, 'status'):
+                                        _entry_status = _vt_res.status
+                                except BaseException:
+                                    pass
                         if _entry.lease is not None and _allocator is not None:
                             await _allocator.cancel_and_release(_entry.lease)
                         if _entry.merge_wt is not None:
@@ -6500,6 +6531,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 )
                         if _entry.was_speculative:
                             self._speculation_slot.release()
+                        # REQUEUED: abort-poll already put req on _queue → skip.
+                        if _entry_status == 'REQUEUED':
+                            continue
+                        # Head was REQUEUED (operator halt) and we cancelled this
+                        # downstream task before its abort-poll could requeue it:
+                        # manually put the req on _queue so stop() can resolve it.
+                        if (
+                            _head_was_requeued
+                            and _entry.verify_task is not None
+                            and _entry.verify_task.cancelled()
+                        ):
+                            _entry_req = _entry.item.request
+                            if not _entry_req.result.done():
+                                self._queue.put_nowait(_entry_req)
+                            continue
                         _remerged = await self._remerge(
                             _entry.item.request,
                             _entry.item.started_monotonic,
@@ -7067,6 +7113,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if vr is not None and vr.status in ('DROPPED', 'REQUEUED'):
                 _cancel_release = True
                 _n_failed_val = True  # abandon / operator-halt → chain stale
+                return False
+
+            # ── (d) RUNNER_UNAVAILABLE ───────────────────────────────────────
+            # Remote runner died.  Quarantine the host (so acquire() skips it)
+            # and re-dispatch the item on any free host — degrading gracefully to
+            # serial-local rather than stalling.  Not a chain failure: _n_failed
+            # stays False (the merge is still a valid candidate; it just needs
+            # re-verify on a healthy host).
+            if vr is not None and vr.status == 'RUNNER_UNAVAILABLE':
+                _skip_release = True   # quarantine_and_release handles the lease
+                _n_failed_val = False  # not a chain failure
+                if entry.lease is not None and self._host_allocator is not None:
+                    await self._host_allocator.quarantine_and_release(entry.lease)
+                # Re-merge against actual main and front-insert into _redispatch
+                # so the item is retried before any newer queue arrivals.
+                _remerged_ru = await self._remerge(
+                    entry.item.request, entry.item.started_monotonic,
+                )
+                self._redispatch.appendleft(_remerged_ru)
                 return False
 
             # ── (a) FAIL / skip ──────────────────────────────────────────────

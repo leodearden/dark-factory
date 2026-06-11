@@ -2098,3 +2098,249 @@ class TestChainInvalidationUnderOverlap:
         assert 'ci_a.py' not in main_files, (
             'N (ci_a.py) must NOT be on main (verify failed)'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-21 RED: OPERATOR-HALT aborts all in-flight + RUNNER_UNAVAILABLE quarantine
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHaltAndUnavailable:
+    """step-21 RED tests: halt aborts all in-flight; RUNNER_UNAVAILABLE quarantine.
+
+    RED until step-22 GREEN:
+      (a) cascade incorrectly re-merges REQUEUED items (each item self-requeues
+          via abort-poll, but the head-failure cascade fires and re-merges them)
+      (b) RUNNER_UNAVAILABLE falls through to PASS path; host not quarantined
+    """
+
+    async def test_operator_halt_aborts_all_inflight(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """OPERATOR-HALT aborts both in-flight verifies and requeues both requests.
+
+        After halt each _run_inflight_verify abort-poll detects _operator_halt
+        and returns REQUEUED (req already back on _queue).  The head-failure
+        cascade MUST NOT re-merge REQUEUED items — they are already handled.
+
+        RED: cascade fires for N+1 (because N's finalize returns False for
+        REQUEUED), calls _remerge(req_b) and puts the re-merged item in
+        _redispatch.  We detect this by spying on _remerge.
+        GREEN (step-22): cascade skips REQUEUED entries; _remerge is never
+        called; both reqs land on _queue exactly once and are resolved cleanly.
+        """
+        import contextlib
+
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+
+        # N's local verify: gated (passes when released)
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            gate_a_entered.set()
+            await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # N+1's remote verify: gated (passes when released)
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='laptop',
+        )
+
+        wt_a = await _make_branch_with_file(git_ops, 'task/halt-a', 'halt_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/halt-b', 'halt_b.py', 'b = 2\n')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, gated_remote)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
+
+        loop = asyncio.get_event_loop()
+        req_a = MergeRequest(
+            task_id='halt-a', branch='task/halt-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='halt-b', branch='task/halt-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        # Spy on _remerge to detect incorrect cascade re-merges.
+        _original_remerge = worker._remerge
+        remerge_task_ids: list[str] = []
+
+        async def _spy_remerge(req: Any, started_mono: Any) -> Any:
+            remerge_task_ids.append(req.task_id)
+            return await _original_remerge(req, started_mono)
+
+        worker._remerge = _spy_remerge  # type: ignore[method-assign]
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for both verifies to enter (true concurrent overlap)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # Set operator halt — both abort-polls fire within 0.01s
+            worker._operator_halt.set()
+
+            # Give abort-polls time to fire and requeue
+            await asyncio.sleep(0.15)
+
+            # Release gates so the leaked inner tasks can complete (harmlessly)
+            gate_a_release.set()
+            gate_b_release.set()
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # Both futures should be resolved (by stop()→shutdown, not by double-dispatch)
+        assert req_a.result.done(), 'req_a.result should be resolved by stop()'
+        assert req_b.result.done(), 'req_b.result should be resolved by stop()'
+
+        # cancel_verify should be called for the remote runner (N+1's lease).
+        gated_remote.cancel_verify.assert_called()
+
+        # ── RED: cascade incorrectly calls _remerge for REQUEUED N+1 ───────────
+        assert remerge_task_ids == [], (
+            f'Expected no _remerge calls after halt (each item self-requeues), '
+            f'but _remerge was called for: {remerge_task_ids!r}. '
+            'RED: head-failure cascade fires for REQUEUED N+1 and calls _remerge. '
+            'GREEN (step-22): cascade skips REQUEUED entries.'
+        )
+
+    async def test_runner_unavailable_quarantine_fallback(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """RUNNER_UNAVAILABLE mid-overlap: host quarantined, item re-dispatched on LOCAL.
+
+        N (local) verifies successfully.  N+1's remote runner raises
+        RunnerUnavailable.  _finalize_inflight must call quarantine_and_release
+        (adding the dead runner's name to _runner_quarantine) and re-dispatch
+        the item on the local fallback so it eventually resolves 'done'.
+
+        RED: RUNNER_UNAVAILABLE falls through to the PASS path in
+        _finalize_inflight.  advance_main succeeds with the unverified merge
+        commit (req_b resolves 'done' BUT without verification) and the runner
+        is NOT quarantined.
+        GREEN (step-22): quarantine_and_release is called, runner name appears
+        in _runner_quarantine, item is re-dispatched on local, req_b resolves
+        'done' after a proper re-verify.
+        """
+        from orchestrator.verify_runner import RunnerUnavailable
+        import contextlib
+
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+
+        # N's local verify: gated (passes when released)
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            gate_a_entered.set()
+            await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # N+1's remote runner: gates on entered, then raises RunnerUnavailable
+        async def _unavailable_side(*args: Any, **kwargs: Any) -> Any:
+            gate_b_entered.set()
+            # Simulate a transient network failure after entering
+            raise RunnerUnavailable('host unreachable')
+
+        dead_remote = MagicMock()
+        dead_remote.name = 'dead-laptop'
+        dead_remote.is_local = False
+        dead_remote.run_merge_verify = AsyncMock(side_effect=_unavailable_side)
+        dead_remote.cancel_verify = AsyncMock(return_value=0)
+        dead_remote.probe_clean = AsyncMock(return_value=True)
+
+        wt_a = await _make_branch_with_file(git_ops, 'task/unav-a', 'unav_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/unav-b', 'unav_b.py', 'b = 2\n')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, dead_remote)
+
+        loop = asyncio.get_event_loop()
+        req_a = MergeRequest(
+            task_id='unav-a', branch='task/unav-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='unav-b', branch='task/unav-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for both verifies to enter
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # N+1's runner already raised RunnerUnavailable (no gate; fires immediately)
+            # Release N's gate so it can complete
+            gate_a_release.set()
+
+            # Wait for both to resolve
+            try:
+                outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            except asyncio.TimeoutError:
+                outcome_a = None
+                outcome_b = None
+            finally:
+                await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # N should resolve 'done' (local verify passed)
+        assert outcome_a is not None and outcome_a.status == 'done', (
+            f'Expected N to resolve "done", got {outcome_a!r}'
+        )
+
+        # N+1 should also resolve 'done' (re-dispatched on local fallback)
+        assert outcome_b is not None and outcome_b.status == 'done', (
+            f'Expected N+1 to resolve "done" after re-dispatch on local, got {outcome_b!r}. '
+            'RED: RUNNER_UNAVAILABLE falls through to PASS → unverified advance.'
+        )
+
+        # ── RED: dead runner not quarantined ─────────────────────────────────
+        assert dead_remote.name in worker._runner_quarantine, (
+            f'Expected dead_remote.name={dead_remote.name!r} to be in '
+            f'_runner_quarantine={worker._runner_quarantine!r}. '
+            'RED: _finalize_inflight falls through to PASS for RUNNER_UNAVAILABLE '
+            '— quarantine_and_release is never called. '
+            'GREEN (step-22): RUNNER_UNAVAILABLE handled explicitly; '
+            'quarantine_and_release called, runner quarantined.'
+        )
