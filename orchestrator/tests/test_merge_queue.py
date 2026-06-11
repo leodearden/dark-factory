@@ -8210,6 +8210,103 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
 
+    # -- Overlap helpers (mirrored from TestSpeculativeMergeWorkerGate) -------
+
+    # 20-line shared base file; branch edits line1 (top), main edits line18
+    # (bottom) — non-adjacent so the rebase is always a clean 3-way merge.
+    _SHARED_BASE: str = ''.join(f'line{i}\n' for i in range(20))
+
+    async def _setup_overlap_branch_for_gate(
+        self,
+        git_ops: GitOps,
+        branch_name: str,
+        config: OrchestratorConfig,
+    ) -> tuple[Path, 'MergeRequest']:
+        """Commit shared.py on main, then create a branch editing line1."""
+        (git_ops.project_root / 'shared.py').write_text(self._SHARED_BASE)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', f'Add shared.py for {branch_name}'],
+            cwd=git_ops.project_root,
+        )
+        branch_wt = (await git_ops.create_worktree(branch_name)).path
+        (branch_wt / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line1\n', 'line1\nbranch-edit\n')
+        )
+        await git_ops.commit(branch_wt, f'Branch {branch_name}: edit top of shared.py')
+        req = _make_request(branch_name, branch_name, branch_wt, config)
+        return branch_wt, req
+
+    async def test_gate_reverify_passes_ledger_snapshot(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Worker passes keep_worktrees=set(self._owned_merge_worktrees) to
+        _reverify_rebased_tree; snapshot is a distinct object.
+
+        RED: 'keep_worktrees' not in captured kwargs (call site doesn't pass it).
+        GREEN after step-10 adds keep_worktrees=set(self._owned_merge_worktrees)
+        to the _reverify_rebased_tree call at the gate_reverify site.
+        """
+        branch = 'gate-ledger-snap'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        _, req = await self._setup_overlap_branch_for_gate(git_ops, branch, config)
+        item = await worker._remerge(req, None)
+        assert item.immediate_outcome is None, (
+            f'_remerge must succeed; got {item.immediate_outcome!r}'
+        )
+
+        # Seed two fake paths in the ledger.
+        p1 = git_ops.worktree_base / '_merge-fake-gate-p1'
+        p2 = git_ops.worktree_base / '_merge-fake-gate-p2'
+        worker._owned_merge_worktrees = {p1, p2}
+
+        # Move main: edit line18 (bottom) — produces overlapping delta so that
+        # advance_main returns rebased_pending_reverify and _reverify_rebased_tree
+        # is called.
+        (git_ops.project_root / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: gate-ledger-snap overlap'],
+            cwd=git_ops.project_root,
+        )
+
+        captured_kw: dict = {}
+
+        async def _capture_reverify(*args, **kwargs):
+            captured_kw.update(kwargs)
+            return MergeOutcome('blocked', reason='gate-reverify captured by test')
+
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=passing),
+            ),
+            patch(
+                'orchestrator.merge_queue._reverify_rebased_tree',
+                side_effect=_capture_reverify,
+            ),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert not advanced, 'Expected False (gate blocked the merge)'
+        # RED: 'keep_worktrees' not in captured_kw because call site omits it.
+        assert 'keep_worktrees' in captured_kw, (
+            'expected keep_worktrees kwarg passed to _reverify_rebased_tree; '
+            f'captured kwargs: {list(captured_kw.keys())!r}'
+        )
+        kw = captured_kw['keep_worktrees']
+        assert p1 in kw, f'p1 not in keep_worktrees: {kw!r}'
+        assert p2 in kw, f'p2 not in keep_worktrees: {kw!r}'
+        # Must be a snapshot copy, not the live ledger reference.
+        assert kw is not worker._owned_merge_worktrees, (
+            'keep_worktrees must be a snapshot copy, not the live ledger set'
+        )
+
 
 # ---------------------------------------------------------------------------
 # A2 (cont.): pre-verify disk guard
@@ -12948,6 +13045,112 @@ class TestReverifyRebasedTree:
         )
         # _run_post_merge_verify cleans up merge_wt on failure
         assert not merge_wt.exists(), 'merge_wt must be cleaned up after red verify'
+
+    async def test_keep_worktrees_forwarded_to_run_post_merge_verify(self) -> None:
+        """keep_worktrees kwarg must be forwarded verbatim to _run_post_merge_verify.
+
+        RED: TypeError because the parameter doesn't exist yet.
+        GREEN after step-10 adds keep_worktrees param and forwards it.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        git_ops = MagicMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
+        req = MagicMock()
+        req.task_id = 'task-reverify-kw'
+        req.task_files = None
+        req.module_configs = []
+        req.config.merge_verify_min_free_disk_bytes = 1024
+        req.config.merge_verify_workspace = False
+        req.config.verify_env = {}
+        req.config.merge_verify_cold_command_timeout_secs = None
+        req.config.verify_cold_command_timeout_secs = None
+        merge_wt = MagicMock()
+
+        l1 = Path('/fake/_merge-live1')
+        l2 = Path('/fake/_merge-live2')
+        captured_kw: dict = {}
+
+        async def capture_pmpv(_git_ops, _req, _merge_wt, **kwargs):
+            captured_kw.update(kwargs)
+            return None  # verify passes
+
+        with (
+            patch('orchestrator.merge_queue._rebase_delta_touched_overlap',
+                  AsyncMock(return_value=['shared.py'])),
+            patch('orchestrator.merge_queue._run_post_merge_verify',
+                  side_effect=capture_pmpv),
+        ):
+            result = await _reverify_rebased_tree(
+                git_ops, req, merge_wt,
+                rebased_from='a' * 40,
+                rebased_onto='b' * 40,
+                timeouts={},
+                enospc_retries={},
+                max_timeouts=3,
+                max_enospc=1,
+                keep_worktrees={l1, l2},  # RED: TypeError until step-10
+            )
+
+        assert result is None, f'expected None (green verify), got {result!r}'
+        assert 'keep_worktrees' in captured_kw, (
+            'keep_worktrees not forwarded to _run_post_merge_verify'
+        )
+        assert captured_kw['keep_worktrees'] == {l1, l2}, (
+            f"keep_worktrees forwarded incorrectly: {captured_kw['keep_worktrees']!r}"
+        )
+
+    async def test_default_keep_worktrees_forwards_none(self) -> None:
+        """Without keep_worktrees, _run_post_merge_verify receives keep_worktrees=None
+        (legacy single-keep = {merge_wt} behaviour unchanged).
+
+        Regression guard: after step-10 adds keep_worktrees to the signature,
+        the default None must be forwarded (not omitted).
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        git_ops = MagicMock()
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
+        req = MagicMock()
+        req.task_id = 'task-reverify-kw-default'
+        req.task_files = None
+        req.module_configs = []
+        req.config.merge_verify_min_free_disk_bytes = 1024
+        req.config.merge_verify_workspace = False
+        req.config.verify_env = {}
+        req.config.merge_verify_cold_command_timeout_secs = None
+        req.config.verify_cold_command_timeout_secs = None
+        merge_wt = MagicMock()
+
+        captured_kw: dict = {}
+
+        async def capture_pmpv(_git_ops, _req, _merge_wt, **kwargs):
+            captured_kw.update(kwargs)
+            return None  # verify passes
+
+        with (
+            patch('orchestrator.merge_queue._rebase_delta_touched_overlap',
+                  AsyncMock(return_value=['shared.py'])),
+            patch('orchestrator.merge_queue._run_post_merge_verify',
+                  side_effect=capture_pmpv),
+        ):
+            result = await _reverify_rebased_tree(
+                git_ops, req, merge_wt,
+                rebased_from='a' * 40,
+                rebased_onto='b' * 40,
+                timeouts={},
+                enospc_retries={},
+                max_timeouts=3,
+                max_enospc=1,
+                # No keep_worktrees — regression test
+            )
+
+        assert result is None, f'expected None (green verify), got {result!r}'
+        assert captured_kw.get('keep_worktrees') is None, (
+            f'default keep_worktrees must be None; got {captured_kw.get("keep_worktrees")!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
