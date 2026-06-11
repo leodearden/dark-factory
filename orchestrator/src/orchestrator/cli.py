@@ -324,6 +324,13 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     the file and kills the full descendant tree (capturing ``start_new_session``
     build escapes via a ``/proc`` PPID walk) plus a ``killpg`` backstop.
 
+    **pgid-file directory**: ``<worktree_base>/.merge_verify_pgids`` —
+    host-side, per-project, never pruned or git-cleaned (mirrors the
+    ``.merge_verify_host_attempts`` counter precedent at the same path).
+    ``worktree_base`` is ``GitOps(config.git, config.project_root).worktree_base``.
+    Both hosts run the ``df`` checkout, so landing ``--request-id`` support on
+    ``main`` ships the contract to the laptop via its normal checkout sync.
+
     Consumer: RemoteRunner (δ) parses stdout as a VerifyResult.
     """
     from orchestrator.git_ops import GitOps

@@ -436,12 +436,16 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     assert rc == 0, f'cancel_request returned {rc}, expected 0'
     assert not pgid_file_path.exists(), 'pgid file must be removed on success'
 
+    # Reap root_proc zombie BEFORE checking alive status.
+    # cancel_request kills root with SIGKILL, which makes it a zombie (state 'Z')
+    # until its parent (this test process) calls wait().  os.kill(pid, 0) returns
+    # success for zombies — they are still in /proc — so the alive check below
+    # would incorrectly report root as alive if we don't wait first.
+    root_proc.wait(timeout=5)
+
     # All tracked pids (including start_new_session escapes) must be dead
     still_alive = [pid for pid in all_pids if _is_running(pid)]
     assert still_alive == [], (
         f'These pids survived cancel_request (start_new_session escapes not reaped?): '
         f'{still_alive}'
     )
-
-    # Clean up root_proc (it's been killed, but we need to reap the zombie)
-    root_proc.wait(timeout=5)

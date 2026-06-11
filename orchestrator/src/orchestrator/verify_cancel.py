@@ -234,6 +234,8 @@ def cancel_request(
 
        * ``FileNotFoundError`` → nothing to cancel; return 0.
        * Non-integer content → corrupt file; remove it and return 0.
+       * Parsed value ≤ 0 → nonsensical pgid (0 kills the caller's group;
+         negatives are invalid); treat as corrupt, remove, return 0.
 
     2. **Snapshot first**: call *ppid_map_provider* to get the full ``/proc``
        PPID map *before* sending any signal.  Killing the root reparents
@@ -274,12 +276,22 @@ def cancel_request(
         remove_pgid_file(path)
         return 0
 
-    # Step 2: snapshot PPID map BEFORE any kills (invariant: snapshot precedes kill)
+    if pgid <= 0:
+        # Parseable but nonsensical (0 would kill the caller's group; negatives are
+        # invalid).  Treat as corrupt: remove and exit clean.
+        remove_pgid_file(path)
+        return 0
+
+    # Step 2: snapshot PPID map BEFORE any kills (invariant: snapshot precedes kill).
+    # Killing the root reparents its survivors to init, severing the /proc parent
+    # chain — the snapshot MUST capture the full tree first.
     ppid_map = ppid_map_provider()
 
-    # Step 3: collect every descendant (start_new_session escapes included)
+    # Step 3: collect every descendant (start_new_session escapes included).
+    # collect_descendants excludes root, so we union in {pgid} to kill it explicitly —
+    # without this, the root would only be hit by the killpg backstop (step 5).
     descendants = collect_descendants(pgid, ppid_map)
-    targets = descendants | {pgid}
+    targets = descendants | {pgid}  # root always explicit in the kill set
 
     # Step 4: SIGKILL every target
     failed = False

@@ -1382,6 +1382,13 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
     env = dict(os.environ)
     existing_pp = env.get('PYTHONPATH', '')
     env['PYTHONPATH'] = f'{worktree_src}:{existing_pp}' if existing_pp else worktree_src
+    # Remove ORCH_PROJECT_ROOT so it does not override the YAML's project_root.
+    # The _isolate_orch_config autouse fixture sets ORCH_PROJECT_ROOT=<pytest
+    # tmp_path>, and pydantic-settings env_settings has higher priority than
+    # yaml_settings.  Without this removal the subprocess would use the pytest
+    # tmp_path as project_root instead of the test's git repo, causing git
+    # worktree operations to fail with "not a git repository".
+    env.pop('ORCH_PROJECT_ROOT', None)
 
     child = subprocess_mod.Popen(
         [sys.executable, '-c', 'from orchestrator.cli import main; main()',
