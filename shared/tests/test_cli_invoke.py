@@ -2175,6 +2175,7 @@ class TestSchemaToolDenied:
         ])
         parsed = _parse_claude_output(result)
         assert parsed.success is False
+        assert parsed.schema_tool_denied is False
 
 
 class TestIsZeroOutputTimeout:
@@ -2231,4 +2232,3 @@ class TestIsZeroOutputTimeout:
             cost_usd=0.25,
         )
         assert is_zero_output_timeout(result) is False
-        assert parsed.schema_tool_denied is False

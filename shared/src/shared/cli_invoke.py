@@ -123,6 +123,7 @@ __all__ = [
     'classify_agent_failure',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    'is_zero_output_timeout',
 ]
 
 
@@ -236,6 +237,30 @@ class AgentResult:
     schema_salvaged: bool = False
     schema_tool_denied: bool = False
     api_error_status: int | None = None
+
+
+def is_zero_output_timeout(result: AgentResult) -> bool:
+    """Return True when *result* is a fresh-invocation zero-output CLI wedge.
+
+    The three-field condition (timed_out=True, turns=0, cost_usd=0.0) means
+    the subprocess hung for the full invocation_timeout and produced no output
+    — the CLI never executed any agentic work.
+
+    This predicate is the single canonical definition shared by:
+
+    - The RESUME-variant wedge guard in ``invoke_with_cap_retry`` (~line 644,
+      task 1532): clears the wedged ``resume_session_id`` so the cap-retry
+      loop does not re-resume an orphaned provider session.
+
+    - The FRESH-invocation circuit breaker in ``workflow._execute_iterations``
+      (task 1739): fast-fails to BLOCKED after
+      ``config.max_consecutive_zero_output_timeouts`` consecutive such results
+      instead of burning the full ``max_execute_iterations`` budget (~3.3h).
+
+    Root cause observed: reify-4429 (2026-06-11) — 10/10 implementer
+    iterations hung pre-first-turn with no recoverable session state.
+    """
+    return result.timed_out and result.turns == 0 and result.cost_usd == 0.0
 
 
 class AgentFailureKind(enum.StrEnum):
@@ -642,9 +667,7 @@ async def invoke_with_cap_retry(
                 # on the very next iteration.  At most one extra full-timeout
                 # (~configured_timeout_ms) is incurred before the cap is re-detected.
                 if (
-                    result.timed_out
-                    and result.turns == 0
-                    and result.cost_usd == 0.0
+                    is_zero_output_timeout(result)
                     and invoke_kwargs.get('resume_session_id')
                 ):
                     logger.warning(
