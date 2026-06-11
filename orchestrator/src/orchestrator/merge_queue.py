@@ -3302,7 +3302,7 @@ class SpeculativeItem:
     merge_wt: Path | None             # Merge worktree (if merge succeeded)
     base_sha: str                      # main SHA at merge time (actual or speculative)
     speculative: bool                  # True → merged against pending N's SHA
-    skip_verify: bool                  # True → pre_rebased and main unchanged
+    skip_verify: bool                  # Retained but always False for single-task items (task-1724); trains still set True
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
     already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
@@ -4413,49 +4413,37 @@ class MergeWorker(_WipHaltMixin):
             )
             return MergeOutcome('blocked', reason=reason)
 
-        # 4. Verify (skip if pre-rebased and main unchanged)
+        # 4. Verify — task-1724: unconditional, skip_verify path removed
         merge_wt = merge_result.merge_worktree
         assert merge_wt is not None
-        skip_verify = (
-            req.pre_rebased
-            and merge_result.pre_merge_sha is not None
-            and merge_result.pre_merge_sha == main_sha
-        )
-        if skip_verify:
-            logger.info(
-                f'Task {req.task_id}: skipping re-verification '
-                f'(pre-rebased, main unchanged)'
-            )
         # ── Persistent warm merge-verify worktree swap (PRD §10 κ) ──────
         # Parity with SpeculativeMergeWorker._verify_and_advance: increment the
         # per-worker verify counter and compute the safety-valve predicate so
         # every Nth verifying attempt runs a from-scratch cold verify in a
         # throwaway worktree (PRD §10 invariant 6).
         # merge_result.merge_commit is non-None (asserted at line 4044 above).
-        if not skip_verify:
-            self._verify_attempt_count += 1
-            _due = _safety_valve_due(
-                self._verify_attempt_count,
-                req.config.git.persistent_merge_worktree_safety_valve_every_n,
-            )
-            merge_wt = await _acquire_warm_verify_worktree(
-                self._git_ops, req, merge_wt,
-                merge_result.merge_commit,  # non-None; assert at 4044 above
-                safety_valve_due=_due,
-            )
-            assert merge_wt is not None  # input was non-None; warm or unchanged
-        if not skip_verify:
-            out = await _run_post_merge_verify(
-                self._git_ops, req, merge_wt,
-                timeouts=self._post_merge_verify_timeouts,
-                enospc_retries=self._post_merge_verify_enospc_retries,
-                max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
-                max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-                event_store=self._event_store,
-                merge_sha=merge_result.merge_commit or '',
-            )
-            if out is not None:
-                return out
+        self._verify_attempt_count += 1
+        _due = _safety_valve_due(
+            self._verify_attempt_count,
+            req.config.git.persistent_merge_worktree_safety_valve_every_n,
+        )
+        merge_wt = await _acquire_warm_verify_worktree(
+            self._git_ops, req, merge_wt,
+            merge_result.merge_commit,  # non-None; assert at 4044 above
+            safety_valve_due=_due,
+        )
+        assert merge_wt is not None  # input was non-None; warm or unchanged
+        out = await _run_post_merge_verify(
+            self._git_ops, req, merge_wt,
+            timeouts=self._post_merge_verify_timeouts,
+            enospc_retries=self._post_merge_verify_enospc_retries,
+            max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+            max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+            event_store=self._event_store,
+            merge_sha=merge_result.merge_commit or '',
+        )
+        if out is not None:
+            return out
 
         # 5. CAS advance_main
         assert merge_result.merge_commit is not None
@@ -5989,11 +5977,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         self._inflight_req = None
                         continue
 
-                    skip_verify = (
-                        req.pre_rebased
-                        and merge_result.pre_merge_sha is not None
-                        and merge_result.pre_merge_sha == base_for_merge
-                    )
                     # Mechanism 1: cap non-speculative build-ahead.
                     # Trains (continue before this) and immediate-outcome guards
                     # (all return above) never reach this site, so `not speculative`
@@ -6007,7 +5990,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             request=req, merge_result=merge_result,
                             merge_wt=merge_result.merge_worktree,
                             base_sha=base_for_merge, speculative=speculative,
-                            skip_verify=skip_verify,
+                            skip_verify=False,  # task-1724: always run merge-gate verify
                             started_monotonic=t0,
                             merged_branch_tip=branch_head,  # γ2: branch tip at merge time
                             counts_against_cap=counts_against_cap,
@@ -6309,16 +6292,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # operators can distinguish it from normal verification.
                     self._verify_item = item
                     self._verify_phase = 'remerging'
-                    # Capture the original skip_verify and resolved merge tree
-                    # BEFORE cleaning the stale worktree.  _remerge uses them to
-                    # key the new skip_verify decision on the actual TREE SHA
-                    # rather than the pre_rebased proxy flag (task #1687 fix).
-                    prev_skip_verify = item.skip_verify
-                    prev_merge_tree: str | None = None
-                    if item.merge_result and item.merge_result.merge_commit:
-                        prev_merge_tree = await _resolve_commit_tree(
-                            self._git_ops, item.merge_result.merge_commit,
-                        )
                     # Clean up the stale merge worktree (deregister-before-cleanup).
                     if item.merge_wt:
                         await self._cleanup_owned_merge_worktree(item.merge_wt)
@@ -6330,27 +6303,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         f'Task {req.task_id}: discarding stale merge '
                         f'({remerge_reason}), re-merging against actual main'
                     )
-                    # force_verify=True for 'main_advanced' (same as the
-                    # speculation-race retry: main advanced → invariant broken →
-                    # always verify).
-                    # force_verify=False for 'chain_invalidated'/'previous_failed':
-                    # skip is keyed on tree-SHA equality instead of the
-                    # pre_rebased proxy (prev_skip_verify + prev_merge_tree).
-                    item = await self._remerge(
-                        req, item.started_monotonic,
-                        force_verify=(remerge_reason == 'main_advanced'),
-                        prev_skip_verify=prev_skip_verify,
-                        prev_merge_tree=prev_merge_tree,
-                    )
+                    # task-1724: all re-merges always verify (skip_verify removed).
+                    item = await self._remerge(req, item.started_monotonic)
                     # Update _verify_item to the freshly re-merged item; phase stays
                     # 'remerging' until _verify_and_advance transitions it.
                     self._verify_item = item
 
                 # ── Immediate outcome (already_merged / conflict / blocked) ─
-                # GroupMergeRequest/train items (skip_verify=True +
-                # immediate_outcome set) always reach this branch; they never
-                # enter _run_post_merge_verify, so the sole-waiter mid-verify
-                # orphan window fixed in task 1681 does not apply to trains.
+                # GroupMergeRequest/train items (immediate_outcome set) always
+                # reach this branch; they never enter _run_post_merge_verify, so
+                # the sole-waiter mid-verify orphan window fixed in task 1681
+                # does not apply to trains.  (skip_verify is retained on the
+                # SpeculativeItem dataclass but is always False for single-task
+                # items after task-1724; it is not honoured by _verify_and_advance.)
                 # A soft-cancel on the group-merge consumer falls to the blanket
                 # fut.cancel() via workflow.py:675 _await_cancellable (no
                 # on_soft_cancel detach hook attached), which is the accepted
@@ -6453,30 +6418,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self,
         req: MergeRequest,
         started_monotonic: float | None,
-        *,
-        force_verify: bool = False,
-        prev_skip_verify: bool = False,
-        prev_merge_tree: str | None = None,
     ) -> SpeculativeItem:
         """Re-merge a request against actual main after speculation invalidation.
 
-        ``force_verify`` overrides the skip_verify computation in the normal-success
-        return.  Set True for 'main_advanced': main advanced since the branch was
-        pre-rebased, so the skip invariant does not hold.  Always verify.
-
-        For chain-invalidation re-merges ('previous_failed' / 'chain_invalidated')
-        ``force_verify=False`` is passed and the skip decision is pinned to the
-        actual merged TREE SHA:
-
-        * ``prev_skip_verify=False`` → always verify (default / fail-closed).
-        * ``prev_skip_verify=True`` and ``prev_merge_tree`` is the tree SHA of the
-          item's original merge commit: skip re-verification only when the re-merged
-          tree SHA equals ``prev_merge_tree`` (a genuine no-op re-merge that
-          produces the same tree).  Any tree change → ``skip_verify=False``.
-
-        Fail-closed: if either tree SHA cannot be resolved (git error), verify.
-        The dispatch site captures ``prev_skip_verify``/``prev_merge_tree`` from the
-        item before cleaning its stale merge worktree and passes them here.
+        task-1724: skip_verify is unconditionally False on every success path —
+        the merge gate always runs before advance_main regardless of pre_rebased
+        or tree-SHA equality.  The force_verify/prev_skip_verify/prev_merge_tree
+        parameters and tree-equality cascade are removed.
         """
         actual_main = await self._git_ops.get_main_sha()
         merge_result = await self._git_ops.merge_to_main(
@@ -6638,34 +6586,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 failure_diagnostic=diag,
                 started_monotonic=started_monotonic,
             )
-        # When force_verify is set (main_advanced re-merge), skip_verify is
-        # unconditionally False — same 'Always verify' rule as the race-retry
-        # success return above:  main advanced since the branch was pre-rebased,
-        # so the invariant ('pre_rebased AND main unchanged') does not hold and
-        # verification must run.
-        if force_verify:
-            skip_verify = False
-        elif not prev_skip_verify:
-            # Fail-closed default: no verified-tree anchor → always verify.
-            skip_verify = False
-        else:
-            # prev_skip_verify=True: skip ONLY if the re-merged tree is identical
-            # to the previously verified tree (a genuine no-op re-merge).  Any
-            # tree-changing re-merge (e.g. chain_invalidated after a sibling
-            # landed) yields a new unverified tree → skip_verify=False.
-            new_tree = await _resolve_commit_tree(
-                self._git_ops, merge_result.merge_commit,  # type: ignore[arg-type]
-            )
-            skip_verify = (
-                prev_merge_tree is not None
-                and new_tree is not None
-                and new_tree == prev_merge_tree
-            )
+        # task-1724: merge gate always runs — skip_verify is unconditionally False.
         self._register_owned_merge_worktree(merge_result.merge_worktree)
         return SpeculativeItem(
             request=req, merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
-            base_sha=actual_main, speculative=False, skip_verify=skip_verify,
+            base_sha=actual_main, speculative=False, skip_verify=False,
             started_monotonic=started_monotonic,
         )
 
@@ -6714,154 +6640,149 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # all cleanup_merge_worktree calls use the warm path.
         # PRD §10 invariant 6: every Nth verifying attempt bypasses the swap
         # and runs a cold verify in the throwaway ephemeral worktree.
-        if not item.skip_verify:
-            self._verify_attempt_count += 1
-            _due = _safety_valve_due(
-                self._verify_attempt_count,
-                req.config.git.persistent_merge_worktree_safety_valve_every_n,
-            )
-            merge_wt = await _acquire_warm_verify_worktree(
-                self._git_ops, req, merge_wt, merge_commit,
-                safety_valve_due=_due,
-            )
-            assert merge_wt is not None  # input was non-None; warm or unchanged
-            # Warm-swap: if _acquire_warm_verify_worktree returned the
-            # persistent _merge-verify path instead of the ephemeral
-            # item.merge_wt, the helper already removed item.merge_wt from
-            # disk.  Deregister it from the liveness ledger now so the
-            # ghost is cleared immediately (no need to wait for the touch
-            # loop's ENOENT self-heal).  If no swap occurred, merge_wt IS
-            # item.merge_wt and the cleanup calls below deregister it via
-            # _cleanup_owned_merge_worktree.
-            if merge_wt is not item.merge_wt:
-                self._deregister_owned_merge_worktree(item.merge_wt)
+        # task-1724: verification is unconditional (skip_verify is never honored
+        # here — the merge gate always runs before advance_main).
+        self._verify_attempt_count += 1
+        _due = _safety_valve_due(
+            self._verify_attempt_count,
+            req.config.git.persistent_merge_worktree_safety_valve_every_n,
+        )
+        merge_wt = await _acquire_warm_verify_worktree(
+            self._git_ops, req, merge_wt, merge_commit,
+            safety_valve_due=_due,
+        )
+        assert merge_wt is not None  # input was non-None; warm or unchanged
+        # Warm-swap: if _acquire_warm_verify_worktree returned the
+        # persistent _merge-verify path instead of the ephemeral
+        # item.merge_wt, the helper already removed item.merge_wt from
+        # disk.  Deregister it from the liveness ledger now so the
+        # ghost is cleared immediately (no need to wait for the touch
+        # loop's ENOENT self-heal).  If no swap occurred, merge_wt IS
+        # item.merge_wt and the cleanup calls below deregister it via
+        # _cleanup_owned_merge_worktree.
+        if merge_wt is not item.merge_wt:
+            self._deregister_owned_merge_worktree(item.merge_wt)
 
         # ── Step 4: verify ────────────────────────────────────────────
         # PRD §10 invariant 6(b): warm per-test results captured here for the
         # same-candidate shadow compare scheduled in the 'done' block below.
         # Initialised empty so the shadow compare scheduler sees {} if the warm
-        # path was not taken (skip_verify, safety-valve, or knob off) and
-        # short-circuits without scheduling a cold leg.
+        # path was not taken (safety-valve or knob off) and short-circuits
+        # without scheduling a cold leg.
         _warm_results: dict[str, bool] = {}
-        if not item.skip_verify:
-            self._verify_phase = 'verifying'
-            self._verify_started_at = time.time()  # wall-clock verify start for triage
-            logger.info(
-                f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
-                f'worktree={merge_wt.name})'
-            )
-            # Capture the VerifyResult via on_result callback on the genuine warm
-            # path (persistent_merge_worktree on, safety valve not due) to provide
-            # per-test results to the shadow compare scheduler.
-            _warm_capture: list[VerifyResult] = []
-            _is_warm_path = (
-                req.config.git.persistent_merge_worktree
-                and not _due
-            )
-            try:
-                # Wrap _run_post_merge_verify in an abort-poll loop so that a
-                # sole-waiter detach() (pf.cancel() → req.result.cancelled())
-                # landing mid-verify aborts the wasted compute instead of
-                # burning one full 10-40 min cycle (task 1681 fix-2).
-                # Poll cost: one cheap req.result.cancelled() check per interval.
-                verify_task = asyncio.ensure_future(_run_post_merge_verify(
-                    self._git_ops, req, merge_wt,
-                    timeouts=self._post_merge_verify_timeouts,
-                    enospc_retries=self._post_merge_verify_enospc_retries,
-                    max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
-                    max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-                    event_store=self._event_store,
-                    merge_sha=merge_commit,
-                    on_result=_warm_capture.append if _is_warm_path else None,
-                    quarantine=self._runner_quarantine,
-                    keep_worktrees=set(self._owned_merge_worktrees),
-                ))
-                while True:
-                    done, _ = await asyncio.wait(
-                        {verify_task},
-                        timeout=self.VERIFY_ABANDON_POLL_SECS,
+        self._verify_phase = 'verifying'
+        self._verify_started_at = time.time()  # wall-clock verify start for triage
+        logger.info(
+            f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
+            f'worktree={merge_wt.name})'
+        )
+        # Capture the VerifyResult via on_result callback on the genuine warm
+        # path (persistent_merge_worktree on, safety valve not due) to provide
+        # per-test results to the shadow compare scheduler.
+        _warm_capture: list[VerifyResult] = []
+        _is_warm_path = (
+            req.config.git.persistent_merge_worktree
+            and not _due
+        )
+        try:
+            # Wrap _run_post_merge_verify in an abort-poll loop so that a
+            # sole-waiter detach() (pf.cancel() → req.result.cancelled())
+            # landing mid-verify aborts the wasted compute instead of
+            # burning one full 10-40 min cycle (task 1681 fix-2).
+            # Poll cost: one cheap req.result.cancelled() check per interval.
+            verify_task = asyncio.ensure_future(_run_post_merge_verify(
+                self._git_ops, req, merge_wt,
+                timeouts=self._post_merge_verify_timeouts,
+                enospc_retries=self._post_merge_verify_enospc_retries,
+                max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+                max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                event_store=self._event_store,
+                merge_sha=merge_commit,
+                on_result=_warm_capture.append if _is_warm_path else None,
+                quarantine=self._runner_quarantine,
+                keep_worktrees=set(self._owned_merge_worktrees),
+            ))
+            while True:
+                done, _ = await asyncio.wait(
+                    {verify_task},
+                    timeout=self.VERIFY_ABANDON_POLL_SECS,
+                )
+                if verify_task in done:
+                    out = verify_task.result()
+                    break
+                # Abort trigger 1 — sole-waiter gave up (future cancelled):
+                # DROP the request (checked first so a gave-up waiter wins
+                # over the operator-halt re-queue below when both hold).
+                if self._request_abandoned(req):
+                    verify_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await verify_task
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    return False
+                # Abort trigger 2 — operator halt: terminate the in-flight
+                # verify (CancelledError propagates into _run_cmd, which kills
+                # the verify subprocess) and RE-QUEUE the merge for re-verify
+                # after un-halt.  req.result is left pending so the waiting
+                # workflow keeps waiting; per-task retry counters are untouched
+                # (a transient operator halt is not a verify failure).
+                if self._operator_halt.is_set():
+                    logger.warning(
+                        'Task %s: operator halt — aborting in-flight verify '
+                        'and re-queuing merge for re-verify after un-halt',
+                        req.task_id,
                     )
-                    if verify_task in done:
-                        out = verify_task.result()
-                        break
-                    # Abort trigger 1 — sole-waiter gave up (future cancelled):
-                    # DROP the request (checked first so a gave-up waiter wins
-                    # over the operator-halt re-queue below when both hold).
-                    if self._request_abandoned(req):
-                        verify_task.cancel()
-                        with contextlib.suppress(BaseException):
-                            await verify_task
-                        await self._cleanup_owned_merge_worktree(merge_wt)
-                        return False
-                    # Abort trigger 2 — operator halt: terminate the in-flight
-                    # verify (CancelledError propagates into _run_cmd, which kills
-                    # the verify subprocess) and RE-QUEUE the merge for re-verify
-                    # after un-halt.  req.result is left pending so the waiting
-                    # workflow keeps waiting; per-task retry counters are untouched
-                    # (a transient operator halt is not a verify failure).
-                    if self._operator_halt.is_set():
-                        logger.warning(
-                            'Task %s: operator halt — aborting in-flight verify '
-                            'and re-queuing merge for re-verify after un-halt',
-                            req.task_id,
-                        )
-                        verify_task.cancel()
-                        with contextlib.suppress(BaseException):
-                            await verify_task
-                        await self._cleanup_owned_merge_worktree(merge_wt)
-                        self._queue.put_nowait(req)
-                        return False
-            except Exception as exc:
-                logger.info(
-                    f'Task {req.task_id}: verify end '
-                    f'(merge={merge_commit[:8]}, error)'
-                )
-                await self._cleanup_owned_merge_worktree(merge_wt)
-                if not req.result.done():
-                    req.result.set_result(MergeOutcome(
-                        'blocked', reason=f'Verification error: {exc}',
-                    ))
-                return False
-            if out is None:
-                logger.info(
-                    f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
-                    f'passed=True)'
-                )
-                # Parse per-test results from the warm verify for shadow compare.
-                # Only populated when _is_warm_path and on_result captured a result.
-                if _warm_capture:
-                    _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
-                    if not _warm_results and req.config.git.warm_verify_shadow_compare:
-                        # Fail-closed: if tests ran but we parsed nothing, the
-                        # shadow-compare detective is silently inert — raise a
-                        # born-at-L2 alarm instead of silently skipping.
-                        _alarm_warm_shadow_unparseable(
-                            self._escalation_queue,
-                            merge_commit,
-                            _warm_capture[0].test_output or '',
-                        )
-            elif out.verify_skipped:
-                # Disk guard fired — run_scoped_verification was never called;
-                # log 'skipped' rather than 'passed=False' to avoid misleading
-                # post-mortem triage of merge-queue stalls (2026-06-01).
-                logger.info(
-                    f'Task {req.task_id}: verify skipped: low disk '
-                    f'(merge={merge_commit[:8]})'
-                )
-                self._resolve_or_drop_abandoned(req, out)
-                return False
-            else:
-                logger.info(
-                    f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
-                    f'passed=False)'
-                )
-                self._resolve_or_drop_abandoned(req, out)
-                return False
+                    verify_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await verify_task
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    self._queue.put_nowait(req)
+                    return False
+        except Exception as exc:
+            logger.info(
+                f'Task {req.task_id}: verify end '
+                f'(merge={merge_commit[:8]}, error)'
+            )
+            await self._cleanup_owned_merge_worktree(merge_wt)
+            if not req.result.done():
+                req.result.set_result(MergeOutcome(
+                    'blocked', reason=f'Verification error: {exc}',
+                ))
+            return False
+        if out is None:
+            logger.info(
+                f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                f'passed=True)'
+            )
+            # Parse per-test results from the warm verify for shadow compare.
+            # Only populated when _is_warm_path and on_result captured a result.
+            if _warm_capture:
+                _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
+                if not _warm_results and req.config.git.warm_verify_shadow_compare:
+                    # Fail-closed: if tests ran but we parsed nothing, the
+                    # shadow-compare detective is silently inert — raise a
+                    # born-at-L2 alarm instead of silently skipping.
+                    _alarm_warm_shadow_unparseable(
+                        self._escalation_queue,
+                        merge_commit,
+                        _warm_capture[0].test_output or '',
+                    )
+        elif out.verify_skipped:
+            # Disk guard fired — run_scoped_verification was never called;
+            # log 'skipped' rather than 'passed=False' to avoid misleading
+            # post-mortem triage of merge-queue stalls (2026-06-01).
+            logger.info(
+                f'Task {req.task_id}: verify skipped: low disk '
+                f'(merge={merge_commit[:8]})'
+            )
+            self._resolve_or_drop_abandoned(req, out)
+            return False
         else:
             logger.info(
-                f'Task {req.task_id}: skipping re-verification '
-                f'(pre-rebased, main unchanged)'
+                f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                f'passed=False)'
             )
+            self._resolve_or_drop_abandoned(req, out)
+            return False
 
         # Short-circuit: if abandonment landed while (or just as) verify
         # completed, skip the expensive advance-main CAS loop and

@@ -63,4 +63,17 @@ Per-leaf capability→evidence bindings (G3+G6 mechanized). Evidence verified on
 | B8 heartbeat-under-overlap regression | 1728 ledger + touch loop landed (`:4787-4806`, `:5104`); γ-1730 boundary tests exist as precedent | PASS wired |
 | No numeric throughput floor asserted in any leaf | PRD §5 decision 8 — live measurement deferred to ops checklist | PASS (floor branch n/a) |
 
+## η — Automated Lever C activation (added 2026-06-11, user-authorized restarts)
+
+| Capability asserted by the signal | Evidence | Verdict |
+|---|---|---|
+| Reify orchestrator unit exists and is the restart target | `systemctl --user list-units` → `orchestrator-reify.service` loaded/active (checked 2026-06-11) | PASS wired |
+| Reify escalation port for quiet-window polling | grep:`/home/leo/src/reify/orchestrator.yaml:179` `port: 8100`; python-urllib JSON-RPC shim is the documented MCP fallback (curl broken on host) | PASS wired |
+| Staged `verify_runners` block with concrete values | grep:`/home/leo/src/reify/orchestrator.yaml:115-140` (runner block :119-133, drift cadence :133, sccache :135+) | PASS wired |
+| Laptop transport + installed CLI wrapper | proven during provisioning (`docs/verdict-parity-report.md`; `/usr/local/bin/orchestrator` wrapper, push/ssh both ways) | PASS wired |
+| Overlap code + cancel contract on main at activation time | producers: tasks α–ζ — all upstream of η | PASS producer upstream |
+| Startup-clean assertion observable | grep:`harness.py:3391` 'Speculative merge worker started'; `MergeLivenessConfigError` (merge_queue.py) | PASS wired |
+| K=2 config-parse assertion | grep:`config.py:1411` `enabled_verify_runners` property | PASS wired |
+| 'first runner=laptop event' | explicitly NON-GATING (traffic-dependent; G6) — reported only | PASS (not asserted) |
+
 No FAIL bindings. Batch clear to queue.
