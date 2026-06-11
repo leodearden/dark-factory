@@ -432,10 +432,10 @@ class TestEnsureHostAllocator:
 
         allocator = worker._ensure_host_allocator(config)
 
-        # Find the RemoteRunner for 'laptop' via its lease
-        lease = allocator.acquire_remote('laptop')
-        assert lease is not None
-        assert str(lease.runner._cwd) == str(tmp_path)
+        # Access the cached runner directly via the internal registry
+        assert 'laptop' in allocator._remote_runners
+        runner = allocator._remote_runners['laptop']
+        assert str(runner._cwd) == str(tmp_path)
 
     def test_shared_quarantine_set_is_worker_quarantine(self, tmp_path):
         """Mutating the allocator's quarantine set is visible in worker._runner_quarantine."""

@@ -49,6 +49,7 @@ from orchestrator.verify import (
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     DriftDetector,
+    HostAllocator,
     LocalRunner,
     RemoteRunner,
     VerifyRunnerPool,
@@ -4705,6 +4706,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # divergence would go undetected — defeating the safety control.
         # Mirrors the _shadow_compare_tasks pattern (see :func:`_maybe_schedule_shadow_compare`).
         self._drift_check_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # β worker-lifetime host allocator (one slot per host, prefer-local).
+        # None until first _ensure_host_allocator(config) call — lazily built
+        # because config arrives per-MergeRequest, not at __init__ time.
+        self._host_allocator: HostAllocator | None = None
         # Can be overridden in tests for fast shutdown (see stop()).
         self._shutdown_timeout: float = 5.0
         # Heartbeat: wall-clock time of last emission; initialised to 0.0 so the
@@ -4768,6 +4773,40 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # for a path; cleared on next successful touch or on ENOENT-drop so
         # each new failure episode emits exactly one WARNING.
         self._merge_wt_touch_warned: set[Path] = set()
+
+    # ── β host allocator ──────────────────────────────────────────────────
+
+    def _ensure_host_allocator(self, config: 'OrchestratorConfig') -> HostAllocator:
+        """Lazily build and cache the worker-lifetime HostAllocator.
+
+        Called on first use (config arrives per-MergeRequest; not available at
+        __init__ time).  The allocator is built once and reused for the worker's
+        lifetime so RemoteRunner instances are CACHED — enabling the
+        ``_last_pushed_main_sha`` dedup across consecutive calls.
+
+        Stable cwd: objects are shared across worktrees so the merge-sha push
+        is valid from ``git_ops.project_root`` regardless of which worktree
+        built the merge commit.  None-safe: when ``git_ops`` has no
+        ``project_root`` (bare-worker/bare-harness tests) the allocator is
+        built with an empty remote list.
+
+        The allocator shares ``self._runner_quarantine`` by reference so
+        HostAllocator-driven (RunnerUnavailable) and DriftDetector-driven
+        quarantines share one source of truth.
+        """
+        if self._host_allocator is not None:
+            return self._host_allocator
+        project_root = getattr(self._git_ops, 'project_root', None)
+        if project_root is not None:
+            remotes = _build_remote_runners(
+                config, project_root, quarantine=self._runner_quarantine
+            )
+        else:
+            remotes = []
+        self._host_allocator = HostAllocator(
+            remotes, quarantine=self._runner_quarantine
+        )
+        return self._host_allocator
 
     # ── owned-worktree liveness ledger ───────────────────────────────────
 
