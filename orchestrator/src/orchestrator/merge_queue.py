@@ -5151,27 +5151,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'verify_age_secs': None,
             }
 
+        def _infl_entry(infl: InflightEntry, position: int) -> dict:
+            """Build an entry dict for an in-flight (or finalizing) entry.
+
+            Fills host/verify_started_at/verify_age_secs — fields shared by
+            section 0 (_finalizing_head) and section 1 (_inflight loop).
+            """
+            e = _entry(
+                infl.item.request,
+                infl.phase or 'verifying',
+                worktree_path=infl.merge_wt,
+                position=position,
+            )
+            e['host'] = infl.lease.name if infl.lease is not None else None
+            e['verify_started_at'] = infl.started_at
+            e['verify_age_secs'] = (
+                max(0.0, now - infl.started_at)
+                if infl.started_at is not None else None
+            )
+            return e
+
         # 0. Finalize-head window: item popped from _inflight for finalization but
         # not yet complete.  Prepended at position 0 so it remains head-of-line —
         # it is the submission-order head.  Mirrors _remerging_item (section 1b)
         # and _inflight_req (section 3) — same transient-window side-field pattern.
         if self._finalizing_head is not None:
-            _fh = self._finalizing_head
-            _fh_req = _fh.item.request
-            _fh_host = _fh.lease.name if _fh.lease is not None else None
-            _e0 = _entry(
-                _fh_req,
-                _fh.phase or 'verifying',
-                worktree_path=_fh.merge_wt,
-                position=0,
-            )
-            _e0['host'] = _fh_host
-            _e0['verify_started_at'] = _fh.started_at
-            _e0['verify_age_secs'] = (
-                max(0.0, now - _fh.started_at)
-                if _fh.started_at is not None else None
-            )
-            entries.append(_e0)
+            entries.append(_infl_entry(self._finalizing_head, 0))
 
         # 1. In-flight verify entries: iterate self._inflight head-first.
         # self._inflight is the sole source of truth for concurrent-verify state.
@@ -5180,21 +5185,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Each entry carries host (from lease.name), started_at (dispatch time ≈
         # verify start), and phase (per-entry authoritative source under multi-host).
         for _infl in self._inflight:
-            _infl_req = _infl.item.request
-            _host = _infl.lease.name if _infl.lease is not None else None
-            _e = _entry(
-                _infl_req,
-                _infl.phase or 'verifying',
-                worktree_path=_infl.merge_wt,
-                position=len(entries),
-            )
-            _e['host'] = _host
-            _e['verify_started_at'] = _infl.started_at
-            _e['verify_age_secs'] = (
-                max(0.0, now - _infl.started_at)
-                if _infl.started_at is not None else None
-            )
-            entries.append(_e)
+            entries.append(_infl_entry(_infl, len(entries)))
 
         # 1b. Remerge-window entry: item popped from queue and being remerged
         # but not yet appended to _inflight.  Without this, the item is invisible
@@ -5254,10 +5245,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # (popped from _inflight); self._inflight[0] is the SECOND entry during
         # the finalize window and would misreport the verifying head.
         verify_in_progress = None
-        _vip_head = self._finalizing_head if self._finalizing_head is not None else (
-            self._inflight[0] if self._inflight else None
+        _verify_phases = {'verifying', 'gate_reverify', 'finalizing'}
+        _fh = self._finalizing_head
+        # Prefer _finalizing_head only when its phase qualifies — a passthrough
+        # finalize entry would otherwise mask a genuinely-verifying _inflight[0].
+        _vip_head = (
+            _fh if _fh is not None and _fh.phase in _verify_phases
+            else (self._inflight[0] if self._inflight else None)
         )
-        if _vip_head is not None and _vip_head.phase in {'verifying', 'gate_reverify', 'finalizing'}:
+        if _vip_head is not None and _vip_head.phase in _verify_phases:
             verify_in_progress = {
                 'task_id': _vip_head.item.request.task_id,
                 'phase': _vip_head.phase,
@@ -7354,13 +7350,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         6b).  When verify_task is None (compat shim / pre-established pass) there is
         no vr, so warm_results defaults to {}, matching the pre-refactor behaviour.
         """
-        # Finalize-head observability: set _finalizing_head so snapshot() surfaces
-        # this entry while we await entry.verify_task.  There is no await between
-        # _inflight.popleft() (caller) and this assignment (asyncio single-loop),
-        # so the field's set window exactly covers the invisible finalize gap.
-        # Cleared at the end of the inner finally below — covers all return / exception paths.
-        self._finalizing_head = entry
-
         item = entry.item
         req = item.request
 
@@ -7370,6 +7359,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _n_failed_val = None      # None → defer to 'not advanced' in finally (PASS path)
 
         try:
+            # Finalize-head observability: set _finalizing_head so snapshot() surfaces
+            # this entry while we await entry.verify_task.  There is no await between
+            # _inflight.popleft() (caller) and this assignment (asyncio single-loop),
+            # so the field's set window exactly covers the invisible finalize gap.
+            # Set/clear are structurally symmetric (both inside this try/finally), so a
+            # future edit adding a throwing statement before the try cannot leave
+            # _finalizing_head permanently stale.
+            self._finalizing_head = entry
+
             # ── Pre-dispatch sentinels (abandon / operator-halt) ─────────────────────
             # Handled inline in _dispatch_item: merge_wt already cleaned, req already
             # re-queued (REQUEUED_PREDISPATCH) or result already done (ABANDONED_PREDISPATCH).
