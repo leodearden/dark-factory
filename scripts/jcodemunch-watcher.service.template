@@ -32,13 +32,18 @@ CPUWeight=30
 # tag (1.108.54 verified identical modulo CRLF, 2026-06-11) and INDEX_VERSION is
 # unchanged (v16 — no forced re-index). The v2.x git tags are an OLDER/divergent
 # line (index-schema v8) despite the higher semver — do NOT pin 2.x.
-# --poll-interval 300 (default 5): the repos-poller both discovers new worktrees
-# AND restarts crashed watch tasks each cycle. The git_root_identity collision
-# ("Index <owner>/<repo> already exists") crashes the watch task for every
-# worktree sharing an identity (219 of ~250 folders on 2026-06-11 — the
-# reify-build swarm), so at 5s the crash->restart->re-index loop burned ~2 cores
-# sustained. 300s divides that by 60; new-worktree indexing latency of ~5min is
-# fine (file-watch debounce is separate and unaffected).
+# --poll-interval 300 (default 5): discovery cadence for new/removed worktrees
+# (also rate-limits the per-cycle `git worktree list` subprocesses).
+#
+# REPO SELECTION WARNING (2026-06-11): do NOT include a repo whose worktrees
+# share one git_root identity en masse (e.g. reify's ~220-tree warm-build/eval
+# swarm, all "leodearden/reify"). Every initial index fails with "Index already
+# exists" — but _watch_single does NOT raise on that, it keeps watching anyway.
+# Net effect: hundreds of permanently-unindexable trees get stat-polled forever
+# and every build-churn change event triggers a doomed re-index attempt (was
+# the bulk of 154% steady-state CPU). Coverage lost by excluding them is ~nil:
+# identity-sharing worktrees could only clobber the shared index with random
+# branch state (known upstream wart).
 ExecStart=__UV_PATH__x --python 3.12 --from "jcodemunch-mcp[watch]==1.108.54" \
   jcodemunch-mcp watch-claude \
   --poll-interval 300 \
