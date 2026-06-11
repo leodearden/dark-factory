@@ -3745,6 +3745,12 @@ class TaskWorkflow:
                     self.task_id, consecutive_zero_output,
                     self.config.max_consecutive_zero_output_timeouts,
                 )
+                # Optional mitigation: discard the wedged session state so the
+                # next iteration starts with a clean CLAUDE_CONFIG_DIR.  Safe
+                # because turns==0 — the destroyed session did no real work.
+                # The tripping iteration's dir is preserved (see above).
+                if self.config.recycle_config_dir_on_zero_output:
+                    self._recycle_config_dir()
                 continue  # skip judge on zero-output; increment next iteration
             else:
                 # Non-zero-output result: reset the consecutive counter.
@@ -3784,6 +3790,37 @@ class TaskWorkflow:
                         return WorkflowOutcome.DONE
 
         return WorkflowOutcome.DONE
+
+    def _recycle_config_dir(self) -> None:
+        """Tear down the current TaskConfigDir and create a fresh one in place.
+
+        Called between sub-threshold zero-output CLI timeouts when
+        ``config.recycle_config_dir_on_zero_output`` is True.  Per-task
+        session state (CLAUDE_CONFIG_DIR) is the prime deterministic-wedge
+        suspect; because ``turns==0`` the destroyed session did no real work,
+        so discarding it cannot lose progress — it aligns with crash-recovery
+        semantics (resuming a wedged empty session would only re-hang).
+
+        The tripping iteration's config dir is NOT recycled: that dir is
+        preserved for forensic analysis via ``_preserve_config_dir=True``.
+
+        Guards on ``self._config_dir`` and ``self.worktree`` so the method is
+        a no-op when called before either is initialised (defensive, should
+        not occur in practice).
+        """
+        if not self._config_dir or not self.worktree:
+            return
+        old_path = self._config_dir.path
+        self._config_dir.cleanup()
+        self._config_dir = TaskConfigDir(
+            self.task_id,
+            base_dir=self.worktree / '.task',
+        )
+        logger.warning(
+            'Task %s: recycled TaskConfigDir for zero-output-hang mitigation '
+            '(%s → %s)',
+            self.task_id, old_path, self._config_dir.path,
+        )
 
     def _cleanup_config_dir(self) -> None:
         """Preserve-aware wrapper around ``TaskConfigDir.cleanup()``.
