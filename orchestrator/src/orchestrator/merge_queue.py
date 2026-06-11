@@ -760,16 +760,20 @@ async def _run_post_merge_verify(
 
     spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
-    # Construct a per-call pool.  When Lever C is on (enabled_verify_runners
-    # non-empty), include remote runners after the LocalRunner trust anchor.
-    # _run_cold_shadow_verify stays LOCAL-ONLY (see design decision: cold trust-anchor).
+    # β decision 6: LOCAL-ONLY pool for all direct callers of _run_post_merge_verify
+    # (MergeWorker._do_merge, _reverify_rebased_tree, reverify_member_solo,
+    # _do_train_merge — recovery/train paths stay on the trust anchor and out of
+    # slot accounting).  Remote dispatch is handled by γ's concurrent acquire/release
+    # path via HostAllocator.  The `quarantine` parameter is reserved/unused here;
+    # it remains in the signature so existing call sites stay byte-identical.
+    # _run_cold_shadow_verify was already LOCAL-ONLY (cold trust-anchor design decision).
     pool = VerifyRunnerPool(
         [LocalRunner(
             merge_wt, req.config, req.module_configs, task_files_tuple,
             run_scoped=run_scoped_verification,
             run_unscoped=_run_unscoped_typechecks,
             task_id=req.task_id,
-        ), *_build_remote_runners(req.config, merge_wt, quarantine=quarantine)],
+        )],
         event_store=event_store,
         task_id=req.task_id,
     )

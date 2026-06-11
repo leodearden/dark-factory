@@ -208,7 +208,11 @@ class TestRunPostMergeVerifyPoolWiring:
     """_run_post_merge_verify builds a multi-runner pool when verify_runners are configured."""
 
     async def test_pool_includes_remote_runner(self, tmp_path):
-        """With an enabled verify_runner, the pool dispatches to the remote."""
+        """β decision 6: _run_post_merge_verify is LOCAL-ONLY even when verify_runners configured.
+
+        The remote is NOT in the pool (slot accounting is γ's job).
+        Runner in the merge_verify event must be 'local'.
+        """
         from orchestrator.merge_queue import _run_post_merge_verify
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
@@ -230,7 +234,9 @@ class TestRunPostMergeVerifyPoolWiring:
             def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
                 emitted.append({'event_type': event_type, 'data': data or {}})
 
-        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]):
+        with patch('orchestrator.merge_queue._build_remote_runners', return_value=[fake_remote]), \
+             patch('orchestrator.merge_queue.run_scoped_verification',
+                   new=AsyncMock(return_value=_make_pass_result())):
             outcome = await _run_post_merge_verify(
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
@@ -242,7 +248,8 @@ class TestRunPostMergeVerifyPoolWiring:
         assert outcome is None  # verify passed
         merge_verify_events = [e for e in emitted if hasattr(e['event_type'], 'value') and e['event_type'].value == 'merge_verify']
         assert len(merge_verify_events) >= 1
-        assert merge_verify_events[0]['data']['runner'] == 'laptop'
+        # β decision 6: local-only pool — remote never dispatched directly
+        assert merge_verify_events[0]['data']['runner'] == 'local'
 
     async def test_dispatching_host_derives_task_files_when_enabled_runners(self, tmp_path):
         """With enabled runner + task_files=None, derivation runs on dispatching host."""
