@@ -7424,7 +7424,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     async def _dispatch_item(
         self,
         item: SpeculativeItem,
-    ) -> 'InflightEntry | None':
+    ) -> InflightEntry | None:
         """Apply pickup logic and dispatch one item to a host verify slot.
 
         Returns an InflightEntry on success (to be appended to self._inflight),
@@ -7605,6 +7605,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _req_for_factory = req
 
         def _local_factory() -> LocalRunner:
+            assert _item_for_factory.merge_wt is not None, \
+                'dispatch path: merge_wt must be non-None for a real item'
             return LocalRunner(
                 _item_for_factory.merge_wt,
                 _req_for_factory.config,
@@ -7659,6 +7661,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _req_for_factory = req
 
         def _local_factory() -> LocalRunner:
+            assert _item_for_factory.merge_wt is not None, \
+                'shim path: merge_wt must be non-None for a real item'
             return LocalRunner(
                 _item_for_factory.merge_wt,
                 _req_for_factory.config,

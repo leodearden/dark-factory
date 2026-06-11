@@ -27,17 +27,16 @@ import asyncio
 import collections
 import contextlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest, MergeOutcome, SpeculativeMergeWorker
+from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator
-
 
 # ---------------------------------------------------------------------------
 # (a) Temp-repo GitOps + branch-with-file builders
@@ -104,7 +103,7 @@ def _make_request(
     worktree: Path,
     config: OrchestratorConfig,
     pre_rebased: bool = False,
-    lane: str = 'normal',
+    lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
     """Build a MergeRequest with a fresh Future for the running event loop."""
     try:
@@ -254,7 +253,6 @@ class TestRunPostMergeVerifyRunnerParam:
     """
 
     def _make_git_ops_mock(self) -> MagicMock:
-        from unittest.mock import patch as _patch
         mock = MagicMock()
         mock.get_main_sha = AsyncMock(return_value='main-sha')
         mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
@@ -284,8 +282,9 @@ class TestRunPostMergeVerifyRunnerParam:
 
     async def test_runner_none_uses_local_runner_byte_identical(self, tmp_path: Path) -> None:
         """runner=None (default) → LocalRunner pool, byte-identical to today."""
-        from orchestrator.merge_queue import _run_post_merge_verify
         from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
 
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
         req = _make_request('t2', 'task/t2', tmp_path, config)
@@ -307,8 +306,8 @@ class TestRunPostMergeVerifyRunnerParam:
 
     async def test_merge_verify_event_carries_runner_name_when_remote(self, tmp_path: Path) -> None:
         """merge_verify event runner field == injected runner's name, not 'local'."""
-        from orchestrator.merge_queue import _run_post_merge_verify
         from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import _run_post_merge_verify
 
         fake_remote = _make_fake_remote('laptop')
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
@@ -388,6 +387,7 @@ class TestInflightStateAttrs:
     def test_inflight_entry_has_required_fields(self) -> None:
         """InflightEntry has item/lease/verify_task/merge_wt/was_speculative/phase."""
         import dataclasses
+
         from orchestrator.merge_queue import InflightEntry
         field_names = {f.name for f in dataclasses.fields(InflightEntry)}
         assert 'item' in field_names
@@ -400,6 +400,7 @@ class TestInflightStateAttrs:
     def test_inflight_entry_has_passthrough_outcome_field(self) -> None:
         """InflightEntry has passthrough_outcome for immediate-outcome passthrough entries."""
         import dataclasses
+
         from orchestrator.merge_queue import InflightEntry
         field_names = {f.name for f in dataclasses.fields(InflightEntry)}
         assert 'passthrough_outcome' in field_names
@@ -479,6 +480,7 @@ class TestRunInflightVerifyHappyPath:
     ) -> None:
         """LOCAL lease: _verify_phase transitions to 'verifying' during the call."""
         from unittest.mock import patch
+
         from orchestrator.verify_runner import HostLease
 
         req, item = await self._make_merged_item(git_ops, config, 'inv-local-b', 'fb.py', 'b=2\n')
@@ -489,7 +491,6 @@ class TestRunInflightVerifyHappyPath:
         fake_local.is_local = True
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
-        phases_seen: list[str] = []
         orig_run = worker._git_ops.get_main_sha  # noqa: F841
 
         with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
@@ -1301,10 +1302,8 @@ class TestFinalizeInflightNonPass:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
         entry = self._make_fail_entry(item, lease, fail_outcome, item.merge_wt)
 
-        try:
+        with contextlib.suppress(Exception):
             await worker._finalize_inflight(entry)
-        except Exception:
-            pass  # may raise in RED state; we care about release
         mock_alloc.release.assert_called_once_with(lease)
 
     async def test_finalize_fail_sets_n_failed_true(
@@ -1329,10 +1328,8 @@ class TestFinalizeInflightNonPass:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
         entry = self._make_fail_entry(item, lease, fail_outcome, item.merge_wt)
 
-        try:
+        with contextlib.suppress(Exception):
             await worker._finalize_inflight(entry)
-        except Exception:
-            pass
         assert worker._n_failed is True  # RED: current code sets False
 
     # ------------------------------------------------------------------
@@ -1394,10 +1391,8 @@ class TestFinalizeInflightNonPass:
             was_speculative=False, phase='passthrough',
             passthrough_outcome=conflict_outcome,
         )
-        try:
+        with contextlib.suppress(Exception):
             await worker._finalize_inflight(entry)
-        except Exception:
-            pass
         assert worker._n_failed is True
 
     async def test_finalize_passthrough_n_failed_false_for_already_merged(
@@ -1423,10 +1418,8 @@ class TestFinalizeInflightNonPass:
             was_speculative=False, phase='passthrough',
             passthrough_outcome=am_outcome,
         )
-        try:
+        with contextlib.suppress(Exception):
             await worker._finalize_inflight(entry)
-        except Exception:
-            pass
         assert worker._n_failed is False  # already_merged → not n_failed
 
     async def test_finalize_passthrough_already_delivered_skips_resolve(
@@ -1452,10 +1445,8 @@ class TestFinalizeInflightNonPass:
             passthrough_outcome=conflict_outcome,
         )
         # req.result must NOT be set because already_delivered=True
-        try:
+        with contextlib.suppress(Exception):
             await worker._finalize_inflight(entry)
-        except Exception:
-            pass
         # already_delivered means the merger already set the result OOB
         assert not req.result.done()
 
@@ -1483,10 +1474,8 @@ class TestFinalizeInflightNonPass:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
         entry = self._make_sentinel_entry(item, lease, 'DROPPED', merge_wt_val=None)
 
-        try:
+        with contextlib.suppress(Exception):
             await worker._finalize_inflight(entry)
-        except Exception:
-            pass
         mock_alloc.cancel_and_release.assert_called_once_with(lease)
 
     async def test_finalize_dropped_sets_n_failed_true(
@@ -1509,10 +1498,8 @@ class TestFinalizeInflightNonPass:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
         entry = self._make_sentinel_entry(item, lease, 'DROPPED', merge_wt_val=None)
 
-        try:
+        with contextlib.suppress(Exception):
             await worker._finalize_inflight(entry)
-        except Exception:
-            pass
         assert worker._n_failed is True
 
     async def test_finalize_dropped_returns_false(
@@ -1579,10 +1566,8 @@ class TestFinalizeInflightNonPass:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
         entry = self._make_sentinel_entry(item, lease, 'REQUEUED', merge_wt_val=None)
 
-        try:
+        with contextlib.suppress(Exception):
             await worker._finalize_inflight(entry)
-        except Exception:
-            pass
         mock_alloc.cancel_and_release.assert_called_once_with(lease)
 
 
@@ -1797,7 +1782,6 @@ class TestOverlapSignal:
         GREEN (step-18): both gates enter → overlap confirmed → submission-order
         finalize confirmed (N lands first even when N+1 verify completes first).
         """
-        import collections as _col
         import contextlib
 
         # ── Gated verifies ─────────────────────────────────────────────────
@@ -1859,7 +1843,7 @@ class TestOverlapSignal:
             # GREEN (step-18): concurrent fill → gate_b_entered fires quickly.
             try:
                 await asyncio.wait_for(gate_b_entered.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Cleanup: release gates so worker can drain cleanly
                 gate_a_release.set()
                 gate_b_release.set()
@@ -2063,10 +2047,8 @@ class TestChainInvalidationUnderOverlap:
             # Wait for N+1 to resolve:
             # GREEN: cascade → re-merge → re-verify → 'done' (fast)
             # RED: deadlock → TimeoutError → outcome_b stays None
-            try:
+            with contextlib.suppress(TimeoutError):
                 outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
-            except asyncio.TimeoutError:
-                pass  # RED: expected deadlock
 
             await worker.stop()
 
@@ -2248,8 +2230,9 @@ class TestHaltAndUnavailable:
         in _runner_quarantine, item is re-dispatched on local, req_b resolves
         'done' after a proper re-verify.
         """
-        from orchestrator.verify_runner import RunnerUnavailable
         import contextlib
+
+        from orchestrator.verify_runner import RunnerUnavailable
 
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
@@ -2315,7 +2298,7 @@ class TestHaltAndUnavailable:
             try:
                 outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
                 outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 outcome_a = None
                 outcome_b = None
             finally:
@@ -2399,7 +2382,7 @@ class TestStopDrainsInflight:
         verify_task_b = asyncio.ensure_future(_gated_verify_b())
 
         # Build two fake SpeculativeItems with fresh futures.
-        loop = asyncio.get_event_loop()
+        asyncio.get_event_loop()
         req_a = _make_request('stop-a', 'task/stop-a', git_ops.project_root, config)
         req_b = _make_request('stop-b', 'task/stop-b', git_ops.project_root, config)
 
