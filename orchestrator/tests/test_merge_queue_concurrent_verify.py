@@ -740,3 +740,113 @@ class TestRunInflightVerifyAbortPoll:
         # GREEN: req put_nowait onto _queue (which is worker._queue == q)
         # RED: _queue is empty
         assert not q.empty(), 'req should be back on _queue after halt'  # RED: fails
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED: _run_inflight_verify with RUNNER_UNAVAILABLE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyRunnerUnavailable:
+    """_run_inflight_verify with a REMOTE lease whose run_merge_verify raises
+    RunnerUnavailable → returns status=RUNNER_UNAVAILABLE, merge_wt NOT cleaned.
+
+    RED until step-10 GREEN catches RunnerUnavailable separately.
+    """
+
+    async def _make_merged_item(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+        content: str,
+    ):
+        from orchestrator.merge_queue import SpeculativeItem
+
+        wt = await _make_branch_with_file(git_ops, branch, filename, content)
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id=branch,
+            branch=branch,
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            lane='normal',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success and merge_result.merge_commit
+        base_sha = await git_ops.get_main_sha()
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+        return req, item
+
+    async def test_runner_unavailable_returns_sentinel(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """REMOTE run_merge_verify raises RunnerUnavailable → status=RUNNER_UNAVAILABLE,
+        no exception escapes.
+
+        RED (step-9): caught by generic except Exception → status=None, merge_wt=None.
+        GREEN (step-10): caught by specific except RunnerUnavailable → status set.
+        """
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        dead_remote = _make_fake_remote('dead-laptop')
+        dead_remote.run_merge_verify = AsyncMock(
+            side_effect=RunnerUnavailable('connection refused')
+        )
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'runner-unavail-a', 'ra.py', 'a=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='dead-laptop', runner=dead_remote, is_local=False)
+
+        # Should not raise — RunnerUnavailable is caught internally
+        result = await worker._run_inflight_verify(item, lease)
+
+        # GREEN: status sentinel set, merge_wt preserved for re-dispatch
+        # RED: status=None (generic except catches RunnerUnavailable)
+        assert result.status == 'RUNNER_UNAVAILABLE'  # RED: fails (None != ...)
+
+    async def test_runner_unavailable_merge_wt_not_cleaned(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """REMOTE RunnerUnavailable → merge_wt NOT cleaned (preserved for re-dispatch)."""
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        dead_remote = _make_fake_remote('dead-laptop2')
+        dead_remote.run_merge_verify = AsyncMock(
+            side_effect=RunnerUnavailable('timeout')
+        )
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'runner-unavail-b', 'rb.py', 'b=2\n',
+        )
+        merge_wt_path = item.merge_wt
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='dead-laptop2', runner=dead_remote, is_local=False)
+
+        result = await worker._run_inflight_verify(item, lease)
+
+        # GREEN: merge_wt intact — item re-dispatched on another host with wt intact
+        # RED: merge_wt=None (generic exception handler cleans it)
+        assert result.merge_wt is not None  # RED: fails (merge_wt is None)
+        assert result.merge_wt == merge_wt_path
