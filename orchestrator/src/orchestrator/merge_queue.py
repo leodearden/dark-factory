@@ -4837,6 +4837,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # avoid the lost-item hazard of cancelling an in-flight get().
         # The merger always has at most one of these outstanding.
         self._pending_get: asyncio.Task | None = None
+        # γ persistent getter on _verifier_queue, mirroring _pending_get for the
+        # merger queue.  Kept alive across DISPATCH-FILL iterations so the verifier
+        # loop can race the next queue item against running verify tasks
+        # (asyncio.wait FIRST_COMPLETED) without the lost-item hazard of cancelling
+        # a pending get().  At most one outstanding.  Cancelled in stop().
+        self._pending_verifier_get: asyncio.Task | None = None
         # Set True when the shutdown sentinel (None) has been dequeued so
         # _acquire_next_request can drain remaining lane-buffer items before
         # returning None.  Cleared by stop() on full reset.
@@ -5355,6 +5361,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if self._pending_get is not None and not self._pending_get.done():
             self._pending_get.cancel()
             self._pending_get = None
+
+        # γ: resolve/cancel the persistent verifier getter.  If it already
+        # harvested an item it is invisible to the queue-drain below, so resolve
+        # that item's Future (and clean its worktree) here to avoid a hung
+        # merge() caller; otherwise cancel the still-pending get().
+        if self._pending_verifier_get is not None:
+            _pvg = self._pending_verifier_get
+            self._pending_verifier_get = None
+            if _pvg.done() and not _pvg.cancelled():
+                try:
+                    _harvested = _pvg.result()
+                except BaseException:
+                    _harvested = None
+                if _harvested is not None:
+                    if _harvested.merge_wt is not None:
+                        with contextlib.suppress(BaseException):
+                            await self._cleanup_owned_merge_worktree(
+                                _harvested.merge_wt
+                            )
+                    if not _harvested.request.result.done():
+                        _harvested.request.result.set_result(shutdown)
+            elif not _pvg.done():
+                _pvg.cancel()
 
         # Drain verifier queue — also clean up orphaned merge worktrees.
         # cleanup_merge_worktree is wrapped in suppress(BaseException) so that
@@ -6411,21 +6440,41 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if self._redispatch:
                     item = self._redispatch.popleft()
                     is_from_verifier_queue = False
+                elif (
+                    self._pending_verifier_get is not None
+                    and self._pending_verifier_get.done()
+                ):
+                    # A persistent getter launched by a prior race already harvested
+                    # the next queue item — consume it before anything else so it is
+                    # not lost (None is handled by the shutdown check below).
+                    item = self._pending_verifier_get.result()
+                    self._pending_verifier_get = None
+                    is_from_verifier_queue = True
                 else:
                     try:
+                        if self._pending_verifier_get is not None:
+                            # A getter is still pending → the queue is empty from our
+                            # view (a pending getter consumes arrivals before
+                            # get_nowait would see them).
+                            raise asyncio.QueueEmpty
                         item = self._verifier_queue.get_nowait()
                         is_from_verifier_queue = True
                     except asyncio.QueueEmpty:
                         # Multi-host fill-ahead: when real verify tasks are
-                        # STILL RUNNING (not done) AND a host slot is free,
-                        # block for the next queue item so dispatch-fill
-                        # launches N+1 to the free slot while N verifies.
-                        # Single-host: free_host_count()==0 when the local
-                        # slot is held → else branch, break immediately →
-                        # byte-identical to prior serial behaviour.
-                        # Guard: only block while in-flight tasks are running;
-                        # once they are done the head needs to be finalized,
-                        # not more items fetched.
+                        # STILL RUNNING (not done) AND a host slot is free, race the
+                        # next queue item against the running verifies so dispatch-
+                        # fill launches N+1 to the free slot while N verifies — but a
+                        # verify *completing* must ALSO wake us so FINALIZE-HEAD runs.
+                        # Otherwise the last item of a merge burst would hang: its
+                        # verify finishes in the background but FINALIZE-HEAD is never
+                        # reached, so _finalize_inflight() never runs and the merge()
+                        # caller's result Future is never resolved.
+                        # Single-host: free_host_count()==0 when the local slot is
+                        # held → else branch, break immediately → byte-identical to
+                        # prior serial behaviour.
+                        # Guard: only block while in-flight tasks are running; once
+                        # they are done the head needs to be finalized, not more
+                        # items fetched.
                         _has_running_inflight = any(
                             e.verify_task is not None and not e.verify_task.done()
                             for e in self._inflight
@@ -6435,16 +6484,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             and self._host_allocator is not None
                             and self._host_allocator.free_host_count() > 0
                         ):
-                            # Block while current verify(s) run in background.
-                            item = await self._verifier_queue.get()
-                            is_from_verifier_queue = True
-                            if item is None:
-                                # Shutdown during fill: drain and exit.
-                                while self._inflight:
-                                    _hd = self._inflight.popleft()
-                                    await self._finalize_inflight(_hd)
-                                return
-                            # Fall through with item to dispatch below.
+                            # Persistent getter (never cancelled mid-race → no lost
+                            # item) raced against the running verify tasks.
+                            if self._pending_verifier_get is None:
+                                self._pending_verifier_get = asyncio.ensure_future(
+                                    self._verifier_queue.get()
+                                )
+                            _running = {
+                                e.verify_task for e in self._inflight
+                                if e.verify_task is not None
+                                and not e.verify_task.done()
+                            }
+                            await asyncio.wait(
+                                {self._pending_verifier_get, *_running},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if self._pending_verifier_get.done():
+                                # A new item arrived first → dispatch it.
+                                item = self._pending_verifier_get.result()
+                                self._pending_verifier_get = None
+                                is_from_verifier_queue = True
+                                # Fall through with item (None handled below).
+                            else:
+                                # A verify finished first → stop filling and proceed
+                                # to FINALIZE-HEAD.  The getter persists to the next
+                                # DISPATCH-FILL iteration so no queue item is lost.
+                                fill_done = True
+                                break
                         else:
                             fill_done = True
                             break
@@ -6645,7 +6711,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             else:
                 # Nothing dispatched (no items in queue or no host yet free after
                 # putting item back).  Block on the next item from the queue.
-                item = await self._verifier_queue.get()
+                # Reuse the persistent getter if a prior race left one outstanding,
+                # so there is never a second concurrent getter on _verifier_queue
+                # (two getters would race for one item → the loser blocks forever).
+                if self._pending_verifier_get is not None:
+                    _pvg = self._pending_verifier_get
+                    self._pending_verifier_get = None
+                    item = await _pvg
+                else:
+                    item = await self._verifier_queue.get()
                 if item is None:
                     # Shutdown sentinel with an already-empty queue.
                     return

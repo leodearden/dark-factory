@@ -1907,6 +1907,107 @@ class TestOverlapSignal:
 
 
 # ---------------------------------------------------------------------------
+# esc-1735-5 REGRESSION: last-item-of-burst must not hang on the fill-loop's
+# blocking queue.get() when a verify completes with no follow-on item.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLastItemOfBurstFinalizes:
+    """A single (last-of-burst) item must finalize even with a free remote slot.
+
+    Repro for the DISPATCH-FILL liveness bug (esc-1735-5): on multi-host, after
+    dispatching N to the LOCAL slot the fill loop continues (a remote slot is
+    free), finds the queue empty while N is still verifying, and — in the buggy
+    version — blocks on a bare ``await self._verifier_queue.get()``.  Nothing
+    wakes that get() when N's verify completes, so FINALIZE-HEAD never runs and
+    N's result Future is never resolved: ``merge()`` hangs until an unrelated
+    request happens to flow through.
+
+    RED (buggy): ``req.result`` times out after the gate is released.
+    GREEN (fixed): the fill loop races the persistent getter against the running
+    verify task (asyncio.wait FIRST_COMPLETED); the completing verify wakes it,
+    fill stops, FINALIZE-HEAD resolves N → 'done'.
+    """
+
+    async def test_single_item_resolves_with_free_remote_slot(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        import contextlib
+
+        # Gated LOCAL verify: enters, then blocks until released — guarantees the
+        # fill loop reaches the empty-queue branch while N is still running.
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        async def _gated_local_verify(*args: Any, **kwargs: Any) -> MagicMock:
+            gate_entered.set()
+            await gate_release.wait()
+            return MagicMock(passed=True, summary='', test_output='',
+                             lint_output='', type_output='', category='')
+
+        # Remote runner exists (→ free_host_count()>1 so the fill loop continues
+        # past the local dispatch) but is never used by this single-item burst.
+        remote = _gated_runner(asyncio.Event(), name='laptop')
+
+        wt = await _make_branch_with_file(git_ops, 'task/burst-n', 'burst_n.py', 'n = 1\n')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, remote)
+
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id='burst-n', branch='task/burst-n', worktree=wt,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local_verify):
+            worker_task = asyncio.create_task(worker.run())
+            # Submit ONLY this one item — the last (and only) item of the burst.
+            await q.put(req)
+
+            # N enters its gated verify; the dispatch-fill loop is now parked
+            # waiting for either a new queue item or N's verify to complete.
+            await asyncio.wait_for(gate_entered.wait(), timeout=15.0)
+
+            # Release N's verify.  With the bug, FINALIZE-HEAD is unreachable
+            # (loop blocked on get()) and this Future never resolves.
+            gate_release.set()
+            try:
+                outcome = await asyncio.wait_for(req.result, timeout=10.0)
+            except TimeoutError:
+                with contextlib.suppress(Exception):
+                    await worker.stop()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker_task, timeout=5.0)
+                pytest.fail(
+                    'LAST-ITEM HANG: single-item burst never finalized. '
+                    'RED: fill loop blocked on bare _verifier_queue.get() — the '
+                    'completing verify did not wake it, so FINALIZE-HEAD never ran. '
+                    'GREEN: race persistent getter vs running verify tasks.'
+                )
+
+        await worker.stop()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        assert outcome.status == 'done', f'expected done, got {outcome}'
+
+        from orchestrator.git_ops import _run as _git_run
+        _, main_files, _ = await _git_run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'burst_n.py' in main_files, 'N (burst_n.py) not on main'
+
+
+# ---------------------------------------------------------------------------
 # step-19 RED: CHAIN-INVALIDATION UNDER OVERLAP
 # ---------------------------------------------------------------------------
 
