@@ -18815,6 +18815,7 @@ class TestHeartbeatOccupancy:
         RED: snapshot has no 'occupancy' key; heartbeat line/event have no occupancy.
         """
         import json as _json
+
         from orchestrator.merge_queue import InflightEntry, SpeculativeItem
         from orchestrator.verify_runner import HostAllocator, HostLease
 
