@@ -7398,6 +7398,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             # ── Step 5: CAS advance_main ──────────────────────────────────
             self._verify_phase = 'finalizing'
+            entry.phase = 'finalizing'   # per-entry source of truth for snapshot()
             current_sha = merge_commit
             while True:
                 result = await self._git_ops.advance_main(
@@ -7469,6 +7470,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
 
                     self._verify_phase = 'gate_reverify'
+                    entry.phase = 'gate_reverify'
                     gate = await _reverify_rebased_tree(
                         self._git_ops, req, merge_wt,
                         rebased_from=rebased_from,
@@ -7533,6 +7535,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         duration_ms=_elapsed_ms(item.started_monotonic),
                     )
                     self._verify_phase = 'finalizing'
+                    entry.phase = 'finalizing'
                     continue
 
                 if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
