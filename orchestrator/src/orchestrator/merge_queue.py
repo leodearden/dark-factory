@@ -6267,16 +6267,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # operators can distinguish it from normal verification.
                     self._verify_item = item
                     self._verify_phase = 'remerging'
-                    # Capture the original skip_verify and resolved merge tree
-                    # BEFORE cleaning the stale worktree.  _remerge uses them to
-                    # key the new skip_verify decision on the actual TREE SHA
-                    # rather than the pre_rebased proxy flag (task #1687 fix).
-                    prev_skip_verify = item.skip_verify
-                    prev_merge_tree: str | None = None
-                    if item.merge_result and item.merge_result.merge_commit:
-                        prev_merge_tree = await _resolve_commit_tree(
-                            self._git_ops, item.merge_result.merge_commit,
-                        )
                     # Clean up the stale merge worktree (deregister-before-cleanup).
                     if item.merge_wt:
                         await self._cleanup_owned_merge_worktree(item.merge_wt)
@@ -6288,18 +6278,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         f'Task {req.task_id}: discarding stale merge '
                         f'({remerge_reason}), re-merging against actual main'
                     )
-                    # force_verify=True for 'main_advanced' (same as the
-                    # speculation-race retry: main advanced → invariant broken →
-                    # always verify).
-                    # force_verify=False for 'chain_invalidated'/'previous_failed':
-                    # skip is keyed on tree-SHA equality instead of the
-                    # pre_rebased proxy (prev_skip_verify + prev_merge_tree).
-                    item = await self._remerge(
-                        req, item.started_monotonic,
-                        force_verify=(remerge_reason == 'main_advanced'),
-                        prev_skip_verify=prev_skip_verify,
-                        prev_merge_tree=prev_merge_tree,
-                    )
+                    # task-1724: all re-merges always verify (skip_verify removed).
+                    item = await self._remerge(req, item.started_monotonic)
                     # Update _verify_item to the freshly re-merged item; phase stays
                     # 'remerging' until _verify_and_advance transitions it.
                     self._verify_item = item
@@ -6411,30 +6391,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self,
         req: MergeRequest,
         started_monotonic: float | None,
-        *,
-        force_verify: bool = False,
-        prev_skip_verify: bool = False,
-        prev_merge_tree: str | None = None,
     ) -> SpeculativeItem:
         """Re-merge a request against actual main after speculation invalidation.
 
-        ``force_verify`` overrides the skip_verify computation in the normal-success
-        return.  Set True for 'main_advanced': main advanced since the branch was
-        pre-rebased, so the skip invariant does not hold.  Always verify.
-
-        For chain-invalidation re-merges ('previous_failed' / 'chain_invalidated')
-        ``force_verify=False`` is passed and the skip decision is pinned to the
-        actual merged TREE SHA:
-
-        * ``prev_skip_verify=False`` → always verify (default / fail-closed).
-        * ``prev_skip_verify=True`` and ``prev_merge_tree`` is the tree SHA of the
-          item's original merge commit: skip re-verification only when the re-merged
-          tree SHA equals ``prev_merge_tree`` (a genuine no-op re-merge that
-          produces the same tree).  Any tree change → ``skip_verify=False``.
-
-        Fail-closed: if either tree SHA cannot be resolved (git error), verify.
-        The dispatch site captures ``prev_skip_verify``/``prev_merge_tree`` from the
-        item before cleaning its stale merge worktree and passes them here.
+        task-1724: skip_verify is unconditionally False on every success path —
+        the merge gate always runs before advance_main regardless of pre_rebased
+        or tree-SHA equality.  The force_verify/prev_skip_verify/prev_merge_tree
+        parameters and tree-equality cascade are removed.
         """
         actual_main = await self._git_ops.get_main_sha()
         merge_result = await self._git_ops.merge_to_main(
@@ -6596,34 +6559,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 failure_diagnostic=diag,
                 started_monotonic=started_monotonic,
             )
-        # When force_verify is set (main_advanced re-merge), skip_verify is
-        # unconditionally False — same 'Always verify' rule as the race-retry
-        # success return above:  main advanced since the branch was pre-rebased,
-        # so the invariant ('pre_rebased AND main unchanged') does not hold and
-        # verification must run.
-        if force_verify:
-            skip_verify = False
-        elif not prev_skip_verify:
-            # Fail-closed default: no verified-tree anchor → always verify.
-            skip_verify = False
-        else:
-            # prev_skip_verify=True: skip ONLY if the re-merged tree is identical
-            # to the previously verified tree (a genuine no-op re-merge).  Any
-            # tree-changing re-merge (e.g. chain_invalidated after a sibling
-            # landed) yields a new unverified tree → skip_verify=False.
-            new_tree = await _resolve_commit_tree(
-                self._git_ops, merge_result.merge_commit,  # type: ignore[arg-type]
-            )
-            skip_verify = (
-                prev_merge_tree is not None
-                and new_tree is not None
-                and new_tree == prev_merge_tree
-            )
+        # task-1724: merge gate always runs — skip_verify is unconditionally False.
         self._register_owned_merge_worktree(merge_result.merge_worktree)
         return SpeculativeItem(
             request=req, merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
-            base_sha=actual_main, speculative=False, skip_verify=skip_verify,
+            base_sha=actual_main, speculative=False, skip_verify=False,
             started_monotonic=started_monotonic,
         )
 
