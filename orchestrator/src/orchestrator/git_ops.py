@@ -28,6 +28,7 @@ import asyncio
 import logging
 import re
 import shutil
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -2077,7 +2078,7 @@ class GitOps:
             yield wt_path, wt_resolved
 
     async def prune_stale_merge_worktrees(
-        self, keep: Path | None = None,
+        self, keep: Path | Collection[Path] | None = None,
     ) -> list[str]:
         """Force-remove leftover ``_merge-*`` worktrees; return paths removed.
 
@@ -2087,6 +2088,11 @@ class GitOps:
         force-removes every such *registered* worktree EXCEPT *keep* (the merge
         worktree currently in use), then runs ``git worktree prune`` to clear
         stale admin entries.
+
+        *keep* may be a single :class:`~pathlib.Path`, a collection (set, list,
+        …) of paths, or ``None`` (remove all).  Every path in the keep-set is
+        resolved before comparison so symlinks and relative paths are handled
+        correctly.
 
         NEVER touches task worktrees (``worktree_base/<task_id>``) — those hold
         live builds.  Only paths that are direct children of ``worktree_base``
@@ -2102,10 +2108,15 @@ class GitOps:
         (PRD §10 invariant 4).
         """
         removed: list[str] = []
-        keep_resolved = keep.resolve() if keep else None
+        if keep is None:
+            keep_resolved: set[Path] = set()
+        elif isinstance(keep, Path):
+            keep_resolved = {keep.resolve()}
+        else:
+            keep_resolved = {p.resolve() for p in keep}
 
         async for wt_path, wt_resolved in self._iter_merge_worktrees():
-            if keep_resolved is not None and wt_resolved == keep_resolved:
+            if wt_resolved in keep_resolved:
                 continue
             rc_rm, _, err = await _run(
                 ['git', 'worktree', 'remove', '--force', str(wt_path)],
