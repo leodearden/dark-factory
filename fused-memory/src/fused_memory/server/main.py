@@ -156,6 +156,23 @@ def _cancel_force_exit() -> None:
         _shutdown_watchdog = None
 
 
+def _watchdog_thread_loop(stop_event: threading.Event, interval: float) -> None:
+    """Drive the systemd WATCHDOG=1 heartbeat from a dedicated OS thread.
+
+    Runs on its own thread so a busy/blocked asyncio loop cannot delay the
+    heartbeat past WatchdogSec (task 1731 root-cause fix).
+
+    Pings _sd_notify('WATCHDOG=1') immediately on entry, then uses
+    Event.wait(interval) as a stoppable sleep — stop_event.set() ends the
+    loop promptly during shutdown with no busy-wait and no up-to-interval
+    shutdown delay.
+    """
+    while True:
+        _sd_notify('WATCHDOG=1')
+        if stop_event.wait(interval):
+            return
+
+
 async def _run_shielded(
     name: str,
     coro_factory: Callable[[], Awaitable[Any]],
