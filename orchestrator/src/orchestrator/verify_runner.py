@@ -1842,7 +1842,7 @@ class HostAllocator:
         """True when the slot for *name* is BUSY or PARKED (not FREE)."""
         return self._slots.get(name, _SLOT_FREE) != _SLOT_FREE
 
-    def _acquire_local(self, factory: Any) -> 'HostLease | None':
+    def acquire_local(self, factory: Any) -> HostLease | None:
         """Try to acquire the local slot.  Returns None if the slot is not FREE."""
         if self._slots[self._local_name] == _SLOT_FREE:
             runner = factory()
@@ -1850,7 +1850,7 @@ class HostAllocator:
             return HostLease(name=self._local_name, runner=runner, is_local=True)
         return None
 
-    def _acquire_remote(self) -> 'HostLease | None':
+    def acquire_remote(self) -> HostLease | None:
         """Acquire the first FREE, non-quarantined, non-PARKED remote slot."""
         for name, runner in self._remote_runners.items():
             if self._slots[name] == _SLOT_FREE and name not in self._quarantine:
@@ -1858,29 +1858,33 @@ class HostAllocator:
                 return HostLease(name=name, runner=runner, is_local=False)
         return None
 
-    async def acquire(self, local_factory: Any) -> 'HostLease | None':
+    async def acquire(self, local_factory: Any) -> HostLease | None:
         """Acquire a host slot, preferring local.
 
         Policy (β decision 1): prefer local when free; overflow to first
         available remote (not quarantined, not PARKED); return None when all
         slots are BUSY/PARKED.
         """
-        local = self._acquire_local(local_factory)
+        local = self.acquire_local(local_factory)
         if local is not None:
             return local
-        return self._acquire_remote()
+        return self.acquire_remote()
 
-    async def release(self, lease: 'HostLease') -> None:
+    async def release(self, lease: HostLease) -> None:
         """Release a held slot back to FREE.  Idempotent."""
         current = self._slots.get(lease.name)
         if current in (_SLOT_BUSY, _SLOT_PARKED):
             self._slots[lease.name] = _SLOT_FREE
 
-    async def quarantine_and_release(self, lease: 'HostLease') -> None:
+    async def quarantine_and_release(self, lease: HostLease) -> None:
         """Add a remote host to the shared quarantine set and free its slot.
 
         For a local lease only the slot is freed — local is the trust anchor
         and is never added to the shared quarantine set.
+
+        Note: intentionally not yet called from production code in β — wiring
+        is staged for γ (task 1735, concurrent dispatch loop).  It is exercised
+        by :class:`TestHostAllocatorQuarantine` unit tests.
         """
         if not lease.is_local:
             self._quarantine.add(lease.name)
@@ -1888,9 +1892,9 @@ class HostAllocator:
 
     async def cancel_and_release(
         self,
-        lease: 'HostLease',
+        lease: HostLease,
         *,
-        sleep: 'Any | None' = None,
+        sleep: Any | None = None,
         max_attempts: int = 10,
     ) -> bool:
         """Cancel an in-flight verify and release the slot.
@@ -1913,6 +1917,11 @@ class HostAllocator:
                       Tests pass a no-op to drive the probe loop synchronously.
         max_attempts: maximum number of probe polls before giving up (slot stays
                       PARKED on exhaustion).
+
+        Note: intentionally not yet called from production code in β — wiring
+        is staged for γ (task 1735, concurrent dispatch loop).  It is exercised
+        by :class:`TestHostAllocatorCancelRelease` and
+        :class:`TestHostAllocatorCancelFail` unit tests.
         """
         if sleep is None:
             import asyncio as _asyncio
@@ -1929,12 +1938,13 @@ class HostAllocator:
 
         # Cancel failed: PARK the slot and poll until the host is clean
         self._slots[lease.name] = _SLOT_PARKED
-        for _ in range(max_attempts):
+        for attempt in range(max_attempts):
             clean = await lease.runner.probe_clean()
             if clean:
                 self._slots[lease.name] = _SLOT_FREE
                 return False
-            await sleep(1.0)
+            if attempt < max_attempts - 1:
+                await sleep(1.0)
 
         # max_attempts exhausted — slot remains PARKED (non-acquirable)
         return False

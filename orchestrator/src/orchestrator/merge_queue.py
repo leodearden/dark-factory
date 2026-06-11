@@ -768,6 +768,7 @@ async def _run_post_merge_verify(
     # path via HostAllocator.  The `quarantine` parameter is reserved/unused here;
     # it remains in the signature so existing call sites stay byte-identical.
     # _run_cold_shadow_verify was already LOCAL-ONLY (cold trust-anchor design decision).
+    _ = quarantine  # reserved/unused — LOCAL-ONLY pool below
     pool = VerifyRunnerPool(
         [LocalRunner(
             merge_wt, req.config, req.module_configs, task_files_tuple,
@@ -4776,7 +4777,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
     # ── β host allocator ──────────────────────────────────────────────────
 
-    def _ensure_host_allocator(self, config: 'OrchestratorConfig') -> HostAllocator:
+    def _ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator:
         """Lazily build and cache the worker-lifetime HostAllocator.
 
         Called on first use (config arrives per-MergeRequest; not available at
@@ -4786,9 +4787,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Stable cwd: objects are shared across worktrees so the merge-sha push
         is valid from ``git_ops.project_root`` regardless of which worktree
-        built the merge commit.  None-safe: when ``git_ops`` has no
-        ``project_root`` (bare-worker/bare-harness tests) the allocator is
-        built with an empty remote list.
+        built the merge commit.
+
+        Caching assumption: ``config.enabled_verify_runners`` (and therefore
+        the resolved remote set) is assumed stable for the worker's lifetime.
+        If a later MergeRequest carries a different runner list the cached
+        allocator silently uses the first-seen set — this is acceptable because
+        worker lifetime maps to a single scheduler dispatch session, within
+        which runner configuration does not change.
+
+        None-safe: when ``git_ops`` has no ``project_root`` the allocator is
+        built transiently (no cache) with an empty remote list so that a later
+        call, once ``project_root`` is available, produces the fully-populated
+        cached allocator rather than re-using an empty one.
 
         The allocator shares ``self._runner_quarantine`` by reference so
         HostAllocator-driven (RunnerUnavailable) and DriftDetector-driven
@@ -4801,12 +4812,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             remotes = _build_remote_runners(
                 config, project_root, quarantine=self._runner_quarantine
             )
-        else:
-            remotes = []
-        self._host_allocator = HostAllocator(
-            remotes, quarantine=self._runner_quarantine
-        )
-        return self._host_allocator
+            self._host_allocator = HostAllocator(
+                remotes, quarantine=self._runner_quarantine
+            )
+            return self._host_allocator
+        # project_root unavailable: return a transient empty-remote allocator
+        # without caching so a subsequent call with project_root set builds the
+        # fully-populated instance.
+        return HostAllocator([], quarantine=self._runner_quarantine)
 
     # ── owned-worktree liveness ledger ───────────────────────────────────
 
@@ -8209,8 +8222,9 @@ async def _run_drift_check(
         if allocator is not None:
             # β decision 5: acquire both hosts through the allocator so slot
             # accounting is respected (≤1 verify-merge per host at any time).
-            # The local runner is built lazily inside the factory so the
-            # throwaway worktree path is constructed only when the slot is free.
+            # The throwaway worktree (wt) was created unconditionally above; only
+            # the LocalRunner *object* is deferred to the factory so it is not
+            # constructed if the local slot is unavailable.
             _ttf = task_files_tuple  # capture for closure
 
             def _local_factory() -> LocalRunner:
@@ -8221,8 +8235,8 @@ async def _run_drift_check(
                     task_id=req.task_id,
                 )
 
-            local_lease = allocator._acquire_local(_local_factory)
-            remote_lease = allocator._acquire_remote()
+            local_lease = allocator.acquire_local(_local_factory)
+            remote_lease = allocator.acquire_remote()
             if local_lease is None or remote_lease is None:
                 logger.debug(
                     'Drift check skipped for task %s: host slots unavailable '
