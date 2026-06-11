@@ -358,3 +358,22 @@ watcher_backend: claude
 # Disable a ceiling by setting it to a very high value.
 watcher_daily_cost_ceiling_usd: 50.0
 orch_daily_cost_ceiling_usd: 200.0
+
+# Retroactive merge-queue train coalescing (γ/1719, task 1722)
+#
+# When true, the merger loop runs _maybe_coalesce_waiting_singles before
+# dispatching the next item.  The pass groups ≥2 stackable waiting singles
+# (disjoint changed-line-ranges, all merge-ready by the confidence gate) into
+# a GroupMergeRequest that lands as a single atomic merge commit, then
+# resolves each absorbed member's future as 'superseded' with the train_id.
+# The train bypasses the speculative look-ahead (speculative=False) and is
+# exempt from the merge-ahead cap.  Absorbed members are flipped done via the
+# scheduler's mark_done callback with kind='merged' provenance (β/1718).
+#
+# merge_train_coalesce_enabled: set to true to activate (default false).
+#   Requires merge_train_max_members >= 2 (already the default).
+#   Off by default — human-flip after an observation soak confirms the
+#   coalescing pass behaves safely under the project's actual queue load
+#   (fold-the-decision norm).  When false, the merger loop is byte-identical
+#   to pre-γ behaviour.
+merge_train_coalesce_enabled: false
