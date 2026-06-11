@@ -525,7 +525,7 @@ class TestScenario2:
 
 @pytest.mark.asyncio
 class TestScenario3:
-    """step-5 (RED) / step-6 (GREEN): confidence-gate exclusion through the worker.
+    """step-6 (GREEN): confidence-gate exclusion through the worker.
 
     Three disjoint-file branches are pre-enqueued.  One member (s31) has a
     prior blocked merge outcome recorded in the EventStore (δ's
@@ -541,12 +541,13 @@ class TestScenario3:
       (d) after gate_release the 2-member train lands; s32/s33 files on main
       (e) s31 resolves independently after worker.stop() (never 'superseded')
 
-    RED (step-5): no blocked-history seed → default predicate returns None for
-    all 3 → all 3 coalesce into a 3-member train → assertion (a) fails because
-    member_task_ids == {s31, s32, s33} and assertion (b) fails because
-    exclusions == [].
-    step-6 adds the es.emit(blocked merge_finalized for s31) before the worker
-    starts and wires the full gated-verify driver to make it GREEN.
+    GREEN (step-6): es.emit(merge_finalized, state='blocked') for s31 is
+    seeded before the worker starts.  The branch 'ig_s31' in the event data
+    matches req1.branch so _default_coalesce_exclusion_reason returns
+    'recent_terminal_blocked' for s31 → it is excluded from the train.
+    Timing mirrors scenario 2: the gate blocks s31's run_scoped_verification
+    (the FIRST call); the train's verify is the SECOND call and passes
+    immediately → train lands while the gate is still held.
     """
 
     async def test_confidence_gate_excludes_blocked_member(
@@ -570,11 +571,24 @@ class TestScenario3:
         db_path = tmp_path / 'es_s3.db'
         es = EventStore(db_path=db_path, run_id='s3-run')
 
-        # RED: no blocked-history seed for s31.
-        # step-6 adds: es.emit(EventType.merge_finalized, task_id='ig_s31', ...)
-        # with data={'branch': 'ig_s31', 'state': 'blocked', ...} so that
-        # _default_coalesce_exclusion_reason sees a recent blocked terminal and
-        # excludes s31 from the coalescing pass.
+        from orchestrator.event_store import EventType
+        # GREEN (step-6): seed a prior blocked merge outcome for s31.
+        # The branch field must match req1.branch (bare name 'ig_s31') so that
+        # _default_coalesce_exclusion_reason's lookup
+        #     self._event_store.latest_merge_finalized(branch=req.branch)
+        # finds this record and returns 'recent_terminal_blocked' for s31.
+        es.emit(
+            EventType.merge_finalized,
+            task_id='ig_s31',
+            phase='merge',
+            role='merger',
+            data={
+                'request_id': 'mr-old-s31',
+                'branch': 'ig_s31',
+                'state': 'blocked',
+                'merge_sha': None,
+            },
+        )
 
         scheduler = FakeScheduler()
         for mid in ('ig_s31', 'ig_s32', 'ig_s33'):
