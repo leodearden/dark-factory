@@ -29,6 +29,7 @@ from shared.cli_invoke import (
     classify_agent_failure,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    is_zero_output_timeout,
 )
 from shared.testing import make_gate_mock
 
@@ -2174,4 +2175,60 @@ class TestSchemaToolDenied:
         ])
         parsed = _parse_claude_output(result)
         assert parsed.success is False
+
+
+class TestIsZeroOutputTimeout:
+    """Unit tests for the is_zero_output_timeout() predicate.
+
+    This predicate captures the fresh-invocation wedge condition first observed
+    in reify-4429 (2026-06-11): the CLI subprocess hangs for the full
+    invocation_timeout producing zero output.  The same three-field condition
+    is used by the task-1532 resume-variant wedge guard
+    (invoke_with_cap_retry:644-648).
+    """
+
+    def _zero_output_result(self) -> AgentResult:
+        """Build a canonical zero-output timed-out AgentResult."""
+        return AgentResult(
+            success=False,
+            output='Agent produced no output',
+            timed_out=True,
+            turns=0,
+            cost_usd=0.0,
+            duration_ms=1_200_000,
+        )
+
+    def test_true_for_canonical_zero_output_timeout(self):
+        """timed_out=True, turns=0, cost_usd=0.0 → True."""
+        result = self._zero_output_result()
+        assert is_zero_output_timeout(result) is True
+
+    def test_false_when_not_timed_out(self):
+        """timed_out=False makes it a normal (non-wedged) result."""
+        result = self._zero_output_result()
+        result.timed_out = False
+        assert is_zero_output_timeout(result) is False
+
+    def test_false_when_turns_nonzero(self):
+        """turns>0 means the CLI did real agentic work — not a zero-output wedge."""
+        result = self._zero_output_result()
+        result.turns = 1
+        assert is_zero_output_timeout(result) is False
+
+    def test_false_when_cost_nonzero(self):
+        """cost_usd>0.0 means tokens were consumed — not a zero-output wedge."""
+        result = self._zero_output_result()
+        result.cost_usd = 0.01
+        assert is_zero_output_timeout(result) is False
+
+    def test_false_for_successful_result(self):
+        """A successful result is definitionally not a zero-output wedge."""
+        result = AgentResult(
+            success=True,
+            output='Done!',
+            timed_out=False,
+            turns=5,
+            cost_usd=0.25,
+        )
+        assert is_zero_output_timeout(result) is False
         assert parsed.schema_tool_denied is False
