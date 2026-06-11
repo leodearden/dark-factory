@@ -236,3 +236,104 @@ def _inject_two_host_allocator(
     allocator = HostAllocator([fake_remote], quarantine=worker._runner_quarantine)
     worker._host_allocator = allocator
     return allocator
+
+
+# ---------------------------------------------------------------------------
+# step-1 RED: _run_post_merge_verify(runner=<fake>) wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerifyRunnerParam:
+    """_run_post_merge_verify(runner=<fake>) dispatches on the injected runner;
+    runner=None (default) stays LOCAL-ONLY byte-identical.
+
+    RED until step-2 GREEN adds the runner= keyword arg.
+    """
+
+    def _make_git_ops_mock(self) -> MagicMock:
+        from unittest.mock import patch as _patch
+        mock = MagicMock()
+        mock.get_main_sha = AsyncMock(return_value='main-sha')
+        mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
+        mock.cleanup_merge_worktree = AsyncMock()
+        mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+        return mock
+
+    async def test_remote_runner_dispatched_when_runner_provided(self, tmp_path: Path) -> None:
+        """runner=<fake remote> → pool is [runner], fake.run_merge_verify called."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        fake_remote = _make_fake_remote('laptop')
+        config = OrchestratorConfig(git=GitConfig(main_branch='main'))
+        req = _make_request('t1', 'task/t1', tmp_path, config)
+        git_ops = self._make_git_ops_mock()
+
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            runner=fake_remote,  # RED: this param doesn't exist yet
+        )
+
+        assert outcome is None  # verify passed
+        fake_remote.run_merge_verify.assert_called_once()
+
+    async def test_runner_none_uses_local_runner_byte_identical(self, tmp_path: Path) -> None:
+        """runner=None (default) → LocalRunner pool, byte-identical to today."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+        from unittest.mock import patch
+
+        config = OrchestratorConfig(git=GitConfig(main_branch='main'))
+        req = _make_request('t2', 'task/t2', tmp_path, config)
+        git_ops = self._make_git_ops_mock()
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            new=AsyncMock(return_value=_mock_verify_result(True)),
+        ):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                merge_sha='abc123',
+                runner=None,  # RED: this param doesn't exist yet
+            )
+
+        assert outcome is None
+
+    async def test_merge_verify_event_carries_runner_name_when_remote(self, tmp_path: Path) -> None:
+        """merge_verify event runner field == injected runner's name, not 'local'."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.event_store import EventStore
+
+        fake_remote = _make_fake_remote('laptop')
+        config = OrchestratorConfig(git=GitConfig(main_branch='main'))
+        req = _make_request('t3', 'task/t3', tmp_path, config)
+        git_ops = self._make_git_ops_mock()
+
+        emitted: list[dict] = []
+
+        class _FakeEventStore(EventStore):
+            def __init__(self) -> None:
+                object.__init__(self)
+
+            def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):  # type: ignore[override]
+                emitted.append({'event_type': event_type, 'data': data or {}})
+
+        await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            runner=fake_remote,   # RED: this param doesn't exist yet
+            event_store=_FakeEventStore(),
+        )
+
+        merge_verify_events = [
+            e for e in emitted
+            if hasattr(e['event_type'], 'value') and e['event_type'].value == 'merge_verify'
+        ]
+        assert len(merge_verify_events) >= 1
+        assert merge_verify_events[0]['data']['runner'] == 'laptop'
