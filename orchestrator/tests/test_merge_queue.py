@@ -18797,6 +18797,79 @@ class TestSnapshotInflightCollection:
                     'position', 'waiter_alive', 'worktree', 'pre_rebased', 'request_id', 'lane'):
             assert key in head_entry, f'Entry key {key!r} missing from in-flight entry'
 
+    async def test_snapshot_remerge_window_visible(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ) -> None:
+        """Item being remerged appears in snapshot() as a 'remerging' entry.
+
+        During the remerge window the item is popped from the queue but has not
+        yet been appended to _inflight.  Without _remerging_item it would be
+        invisible to all observability (suggestion 2 from amendment review).
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        req = _make_request('remerge-task', 'remerge-task', wt, config)
+        # Simulate the start of the remerge window: _inflight is empty, but
+        # _remerging_item is set (as _dispatch_item does before await _remerge).
+        worker._remerging_item = req
+
+        snap = worker.snapshot()
+
+        remerging = [e for e in snap['entries'] if e['state'] == 'remerging']
+        assert len(remerging) == 1, (
+            f'Expected 1 remerging entry; got: {remerging}'
+        )
+        assert remerging[0]['task_id'] == 'remerge-task'
+
+        # Clearing _remerging_item (as _dispatch_item does after _remerge returns)
+        # must remove the synthetic entry.
+        worker._remerging_item = None
+        snap2 = worker.snapshot()
+        remerging2 = [e for e in snap2['entries'] if e['state'] == 'remerging']
+        assert len(remerging2) == 0, (
+            f'remerging entry must vanish after _remerging_item cleared; got: {remerging2}'
+        )
+
+    async def test_snapshot_uniform_entry_schema(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ) -> None:
+        """All entry types carry host/verify_started_at/verify_age_secs (None for non-inflight).
+
+        Suggestion 5 (amendment): consumers iterating snap['entries'] uniformly
+        must not KeyError on non-verifying entries.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        # Put a queued item in the queue.
+        req = _make_request('queued-task', 'queued-task', wt, config)
+        await queue.put(req)
+
+        snap = worker.snapshot()
+
+        # snapshot() includes all entries regardless of state; at minimum the
+        # queued entry must be present (other pipeline stages may add more).
+        assert snap['depth'] >= 1, 'Expected at least 1 entry (queued-task)'
+        uniform_keys = ('host', 'verify_started_at', 'verify_age_secs')
+        for entry in snap['entries']:
+            for key in uniform_keys:
+                assert key in entry, (
+                    f"Entry (state={entry['state']!r}) missing uniform key {key!r}"
+                )
+                # Non-inflight entries must have None for these keys
+                if entry['state'] not in ('verifying', 'gate_reverify', 'finalizing', 'passthrough'):
+                    assert entry[key] is None, (
+                        f"Entry (state={entry['state']!r}) key {key!r} must be None; "
+                        f"got: {entry[key]}"
+                    )
+
 
 # ---------------------------------------------------------------------------
 # TestHeartbeatOccupancy -- task-1736 (epsilon) step-5

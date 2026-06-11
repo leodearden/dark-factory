@@ -4758,15 +4758,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # queue. Used by stop() to resolve Futures for requests that were
         # mid-processing when shutdown was initiated.
         self._inflight_req: MergeRequest | None = None
-        # Verifier sub-state: current item and its phase within _verify_and_advance.
-        # Set by _verifier_loop (early, before _remerge, to cover the remerge blind
-        # spot); cleared in the loop's finally.
+        # Vestigial single-host observability fields — write-only after ε.
+        # snapshot() no longer reads these; all observability derives from
+        # self._inflight (InflightEntry.phase) and self._remerging_item.
+        # Retained to avoid a large diff; may be removed in a later cleanup.
         self._verify_item: SpeculativeItem | None = None
         self._verify_phase: str | None = None
-        # Timestamp (wall clock) when _verify_phase first entered 'verifying'.
-        # Separate from enqueued_at so verify_in_progress can report pure verify
-        # time rather than total queue-wait time (useful for triage of stuck verifies).
         self._verify_started_at: float | None = None
+        # Remerge-window observability: set to the MergeRequest being remerged
+        # so snapshot() can surface it between queue-pop and _inflight append.
+        # Cleared to None immediately after _remerge() returns.
+        self._remerging_item: MergeRequest | None = None
         # Persistent warm merge-verify worktree: counts verifying attempts so
         # _safety_valve_due can fire the periodic cold-verify (PRD §10 invariant 6).
         # Only incremented when not item.skip_verify; never reset so the counter
@@ -5098,15 +5100,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           entries: list of entry dicts, head-of-line first.
           depth: total number of entries.
           head_of_line: task_id of the first entry, or None.
-          verify_in_progress: {task_id, age_secs} when verifier is active, else None.
+          verify_in_progress: {task_id, phase, age_secs, verify_age_secs} when the
+            deque head is actively verifying (phase in verifying/gate_reverify/finalizing),
+            else None.  Passthrough entries (no verify task) produce None.
+            verify_age_secs measures time since dispatch, which includes host-acquisition
+            latency — it is NOT pure verify time.
+          occupancy: {hosts_total, hosts_busy, by_host} — per-host in-flight count.
           is_wip_halted: bool.
           halt_owner_esc_id: str or None.
 
         Each entry dict contains:
           task_id, branch, state, enqueued_at, age_secs, position,
-          waiter_alive, worktree, pre_rebased, request_id.
-        State values: queued, merging, awaiting_verify, verifying,
-          gate_reverify, finalizing.
+          waiter_alive, worktree, pre_rebased, request_id, lane.
+          host, verify_started_at, verify_age_secs — non-None only on _inflight entries.
+        State values: queued, merging, remerging, awaiting_verify, verifying,
+          passthrough, gate_reverify, finalizing.
         """
         entries: list[dict] = []
         now = time.time()
@@ -5130,6 +5138,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'pre_rebased': req.pre_rebased,
                 'request_id': req.request_id,
                 'lane': lane if lane is not None else req.lane,
+                # Uniform schema: present on all entries; non-None only on _inflight entries.
+                'host': None,
+                'verify_started_at': None,
+                'verify_age_secs': None,
             }
 
         # 1. In-flight verify entries: iterate self._inflight head-first.
@@ -5154,6 +5166,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if _infl.started_at is not None else None
             )
             entries.append(_e)
+
+        # 1b. Remerge-window entry: item popped from queue and being remerged
+        # but not yet appended to _inflight.  Without this, the item is invisible
+        # to all observability during the await self._remerge(...) call.
+        if self._remerging_item is not None:
+            entries.append(_entry(
+                self._remerging_item, 'remerging',
+                worktree_path=None,
+                position=len(entries),
+            ))
 
         # 2. Awaiting-verify items from the verifier queue (skip None sentinel)
         # Accessing asyncio.Queue._queue (the internal deque) directly — a CPython
@@ -5194,22 +5216,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 continue
             entries.append(_entry(req, 'queued', worktree_path=None, position=len(entries)))
 
-        # verify_in_progress: derived from the deque head so it is always current
-        # and correctly returns None when the deque is empty (fixing the latent γ
-        # phantom where _verify_item was set but never cleared after first verify).
+        # verify_in_progress: non-None only when the deque head is actively
+        # verifying or in a post-verify gate phase.  Passthrough entries
+        # (phase='passthrough') produce None here — no verify task is running.
+        # Includes 'phase' so consumers can distinguish verifying vs. gate_reverify
+        # vs. finalizing without misreading the presence of this field.
         verify_in_progress = None
         if self._inflight:
             _head = self._inflight[0]
-            verify_in_progress = {
-                'task_id': _head.item.request.task_id,
-                # age_secs: total time since enqueued (queue wait + verify time).
-                'age_secs': max(0.0, now - _head.item.request.enqueued_at),
-                # verify_age_secs: time elapsed since dispatch (≈ verify start).
-                'verify_age_secs': (
-                    max(0.0, now - _head.started_at)
-                    if _head.started_at is not None else None
-                ),
-            }
+            if _head.phase in {'verifying', 'gate_reverify', 'finalizing'}:
+                verify_in_progress = {
+                    'task_id': _head.item.request.task_id,
+                    'phase': _head.phase,
+                    # age_secs: total time since enqueued (queue wait + verify time).
+                    'age_secs': max(0.0, now - _head.item.request.enqueued_at),
+                    # verify_age_secs: time since dispatch (includes host acquisition).
+                    # This is NOT pure verify time — see started_at on InflightEntry.
+                    'verify_age_secs': (
+                        max(0.0, now - _head.started_at)
+                        if _head.started_at is not None else None
+                    ),
+                }
 
         # occupancy: per-host in-flight breakdown for heartbeat and dashboard consumers.
         _by_host = {
@@ -7137,13 +7164,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     and not _due
                 )
 
-            # NOTE: _verify_item/_verify_phase/_verify_started_at are
-            # SINGLE-HOST observability fields.  Under multi-host overlap,
-            # concurrent _run_inflight_verify coroutines overwrite them
-            # (last-writer wins).  They are single-host-authoritative for
-            # snapshot() verify_in_progress reporting; for multi-host the
-            # per-entry InflightEntry.phase field is the authoritative source
-            # of truth (snapshot() section 1b reads it for non-head entries).
+            # NOTE: _verify_item/_verify_phase/_verify_started_at are vestigial
+            # fields retained for future single-host shim compatibility only.
+            # snapshot() no longer reads them — all verify observability derives
+            # from self._inflight (InflightEntry.phase) and self._remerging_item.
+            # These assignments are write-only; nothing currently reads them.
             self._verify_item = item
             self._verify_phase = 'verifying'
             self._verify_started_at = time.time()
@@ -7747,8 +7772,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             if remerge_reason is not None:
                 iteration_did_remerge = True
-                # Snapshot item in _verify_item so snapshot() covers the
-                # remerge window (item popped from queue but not yet verifying).
+                # Set _remerging_item so snapshot() surfaces this request during
+                # the remerge window (item is popped from queue but not yet in
+                # _inflight, so without this it is invisible to all observability).
+                # Cleared to None immediately after _remerge() returns.
+                self._remerging_item = req
                 self._verify_item = item
                 self._verify_phase = 'remerging'
                 if item.merge_wt:
@@ -7762,6 +7790,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     req.task_id, remerge_reason,
                 )
                 item = await self._remerge(req, item.started_monotonic)
+                self._remerging_item = None
                 self._verify_item = item
 
                 # After remerge the new item may itself carry an immediate_outcome
