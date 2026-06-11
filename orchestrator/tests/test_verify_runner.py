@@ -3400,25 +3400,37 @@ class TestRemoteRunnerMainBranchPush:
         )
         return runner, calls
 
-    async def test_with_main_branch_main_push_is_first(self):
-        """With main_branch='main', calls[0] argv is the main-branch push."""
+    async def test_with_main_branch_main_push_is_second(self):
+        """With main_branch='main', calls[0] is git rev-parse and calls[1] is the main push.
+
+        β dedup: a rev-parse is now issued BEFORE the best-effort main push so the runner
+        can skip the push when the sha is unchanged.  On the first call _last_pushed_main_sha
+        is None, so the push always fires; the ordering shifts by one slot.
+        """
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
         runner, calls = self._make_runner_and_calls(expected, main_branch='main')
         await runner.run_merge_verify('abc123', _make_spec())
-        # calls[0] must be the main-branch push
-        push_argv, push_cwd = calls[0]
+        # calls[0] must be the rev-parse (leading dedup probe)
+        rev_argv, rev_cwd = calls[0]
+        assert rev_argv == ['git', 'rev-parse', 'main']
+        assert rev_cwd == '/repo'
+        # calls[1] must be the main-branch push
+        push_argv, push_cwd = calls[1]
         assert push_argv == ['git', 'push', 'origin', 'main:refs/heads/main']
         assert push_cwd == '/repo'
-        # calls[1] must be the merge-sha push
-        merge_push_argv, _ = calls[1]
+        # calls[2] must be the merge-sha push
+        merge_push_argv, _ = calls[2]
         assert merge_push_argv == ['git', 'push', 'origin', 'abc123:refs/merge-verify/fixed-id']
 
-    async def test_with_main_branch_ssh_is_third(self):
-        """With main_branch set, ssh invocation is calls[2] (after two git pushes)."""
+    async def test_with_main_branch_ssh_is_fourth(self):
+        """With main_branch set, ssh invocation is calls[3] (after rev-parse + two git pushes).
+
+        β dedup: rev-parse is now calls[0], shifting ssh from calls[2] to calls[3].
+        """
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
         runner, calls = self._make_runner_and_calls(expected, main_branch='main')
         await runner.run_merge_verify('abc123', _make_spec())
-        ssh_argv, _ = calls[2]
+        ssh_argv, _ = calls[3]
         assert ssh_argv[0] == 'ssh'
 
     async def test_without_main_branch_calls0_is_merge_sha_push(self):

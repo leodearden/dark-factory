@@ -646,6 +646,9 @@ class RemoteRunner:
         # the per-call round-trip is acceptable at current merge cadences.
         # Filed as a follow-up: cache runners and wire deduplication.
         self._last_pushed_main_sha: str | None = None
+        # β: track the in-flight request-id so cancel_verify() can issue a targeted cancel.
+        # Set to request_id just before the load-bearing push; cleared in the finally.
+        self._inflight_request_id: str | None = None
 
     async def health(self) -> bool:
         """Best-effort health probe: ``ssh <host> true``.
@@ -680,89 +683,170 @@ class RemoteRunner:
         request_id = self._id_factory()
         ref = f'refs/merge-verify/{request_id}'
 
-        # Step 0 (best-effort): if main_branch is set, push it FIRST so the remote
-        # has a fresh view of main.  This also makes the subsequent merge-sha push
-        # thin (objects already present on the remote).  A non-zero rc or OSError
-        # is logged at WARNING and swallowed — a non-fast-forward must not abort
-        # the verify.  The merge-sha push that follows is the load-bearing transport.
-        if self._main_branch:
+        # β: Track the in-flight request-id for cancel_verify().  Cleared in the
+        # outer finally so it is always reset even when RunnerUnavailable is raised
+        # before the inner try/finally (e.g. on merge-sha push failure).
+        self._inflight_request_id = request_id
+        try:
+            # Step 0 (best-effort): if main_branch is set, push it FIRST so the remote
+            # has a fresh view of main.  A non-zero rc or OSError is logged at WARNING
+            # and swallowed — a non-fast-forward must not abort the verify.
+            #
+            # β dedup: resolve the local main tip via `git rev-parse` (network-free).
+            # When the resolved sha matches _last_pushed_main_sha the push is skipped —
+            # the remote already has this main sha, so the push is redundant.
+            if self._main_branch:
+                # Resolve local main tip (network-free)
+                resolved_main_sha: str | None = None
+                try:
+                    rev_rc, rev_stdout, _ = await self._run(
+                        ['git', 'rev-parse', self._main_branch],
+                        cwd=self._cwd,
+                    )
+                    if rev_rc == 0:
+                        resolved_main_sha = rev_stdout.strip() or None
+                except OSError:
+                    pass  # rev-parse failed; push unconditionally below
+
+                # Skip push when sha is unchanged (dedup)
+                if resolved_main_sha is None or resolved_main_sha != self._last_pushed_main_sha:
+                    try:
+                        main_rc, _, main_stderr = await self._run(
+                            ['git', 'push', self._git_remote,
+                             f'{self._main_branch}:refs/heads/{self._main_branch}'],
+                            cwd=self._cwd,
+                        )
+                        if main_rc == 0:
+                            if resolved_main_sha is not None:
+                                self._last_pushed_main_sha = resolved_main_sha
+                        else:
+                            import logging as _logging
+                            _logging.getLogger(__name__).warning(
+                                'RemoteRunner %r: best-effort main push of %r to %r failed '
+                                '(rc=%d): %s — continuing with merge-sha push',
+                                self.name, self._main_branch, self._git_remote, main_rc, main_stderr,
+                            )
+                    except OSError as exc:
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(
+                            'RemoteRunner %r: best-effort main push failed with OSError: %s'
+                            ' — continuing',
+                            self.name, exc,
+                        )
+
+            # Step 1: push the merge sha to the remote (load-bearing transport)
             try:
-                main_rc, _, main_stderr = await self._run(
-                    ['git', 'push', self._git_remote,
-                     f'{self._main_branch}:refs/heads/{self._main_branch}'],
+                push_rc, _push_out, push_stderr = await self._run(
+                    ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],
                     cwd=self._cwd,
                 )
-                if main_rc != 0:
-                    import logging as _logging
-                    _logging.getLogger(__name__).warning(
-                        'RemoteRunner %r: best-effort main push of %r to %r failed '
-                        '(rc=%d): %s — continuing with merge-sha push',
-                        self.name, self._main_branch, self._git_remote, main_rc, main_stderr,
+            except OSError as exc:
+                raise RunnerUnavailable(f'git push spawn failed: {exc}') from exc
+
+            if push_rc != 0:
+                raise RunnerUnavailable(
+                    f'git push {self._git_remote} {merge_sha}:{ref} failed'
+                    f' (rc={push_rc}): {push_stderr}'
+                )
+
+            # Push succeeded — clean up the ref on return (best-effort, in finally)
+            try:
+                # Step 2: build and issue the ssh command.
+                # --request-id is APPENDED so parsed[:4] stays back-compat.
+                argv = [
+                    'orchestrator', 'verify-merge',
+                    '--sha', merge_sha,
+                    '--spec', spec_to_json(spec),
+                ]
+                if self._config_path:
+                    argv += ['--config', self._config_path]
+                argv += ['--request-id', request_id]
+                remote_cmd = ' '.join(shlex.quote(a) for a in argv)
+
+                try:
+                    ssh_rc, ssh_stdout, ssh_stderr = await self._run(
+                        ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                         self._ssh_host, remote_cmd],
                     )
-            except OSError as exc:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    'RemoteRunner %r: best-effort main push failed with OSError: %s — continuing',
-                    self.name, exc,
-                )
+                except OSError as exc:
+                    raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
 
-        # Step 1: push the merge sha to the remote (load-bearing transport)
-        try:
-            push_rc, _push_out, push_stderr = await self._run(
-                ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],
-                cwd=self._cwd,
-            )
-        except OSError as exc:
-            raise RunnerUnavailable(f'git push spawn failed: {exc}') from exc
+                if ssh_rc != 0:
+                    raise RunnerUnavailable(
+                        f'ssh {self._ssh_host} exited {ssh_rc}: {ssh_stderr}'
+                    )
 
-        if push_rc != 0:
-            raise RunnerUnavailable(
-                f'git push {self._git_remote} {merge_sha}:{ref} failed'
-                f' (rc={push_rc}): {push_stderr}'
-            )
+                # Step 3: parse the host's stdout
+                # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
+                # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
+                try:
+                    return result_from_json(ssh_stdout)
+                except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+                    raise RunnerUnavailable(
+                        f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
+                    ) from exc
 
-        # Push succeeded — clean up the ref on return (best-effort, in finally)
-        try:
-            # Step 2: build and issue the ssh command
-            argv = [
-                'orchestrator', 'verify-merge',
-                '--sha', merge_sha,
-                '--spec', spec_to_json(spec),
-            ]
-            if self._config_path:
-                argv += ['--config', self._config_path]
-            remote_cmd = ' '.join(shlex.quote(a) for a in argv)
-
-            try:
-                ssh_rc, ssh_stdout, ssh_stderr = await self._run(
-                    ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                     self._ssh_host, remote_cmd],
-                )
-            except OSError as exc:
-                raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
-
-            if ssh_rc != 0:
-                raise RunnerUnavailable(
-                    f'ssh {self._ssh_host} exited {ssh_rc}: {ssh_stderr}'
-                )
-
-            # Step 3: parse the host's stdout
-            # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
-            # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
-            try:
-                return result_from_json(ssh_stdout)
-            except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
-                raise RunnerUnavailable(
-                    f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
-                ) from exc
+            finally:
+                # Best-effort ref cleanup — never alters returned result nor masks exceptions
+                with contextlib.suppress(Exception):
+                    await self._run(
+                        ['git', 'push', self._git_remote, '--delete', ref],
+                        cwd=self._cwd,
+                    )
 
         finally:
-            # Best-effort ref cleanup — never alters the returned result nor masks exceptions
-            with contextlib.suppress(Exception):
-                await self._run(
-                    ['git', 'push', self._git_remote, '--delete', ref],
-                    cwd=self._cwd,
-                )
+            # Always clear the in-flight tracker so cancel_verify is idempotent after return
+            self._inflight_request_id = None
+
+    async def cancel_verify(self) -> int:
+        """Cancel the in-flight verify-merge on the remote host.
+
+        Returns 0 immediately (idempotent) when _inflight_request_id is None —
+        matches α's contract: cancel an unknown/finished id exits 0.
+
+        Otherwise issues:
+            ssh -o BatchMode=yes -o ConnectTimeout=10 <host>
+                orchestrator cancel-verify --request-id <id> [--config <path>]
+
+        Returns the ssh return code.  An OSError (host unreachable) returns a
+        non-zero sentinel so the caller treats it as a cancel failure.
+        """
+        if self._inflight_request_id is None:
+            return 0
+        cmd_parts = [
+            'orchestrator', 'cancel-verify',
+            '--request-id', self._inflight_request_id,
+        ]
+        if self._config_path:
+            cmd_parts += ['--config', self._config_path]
+        remote_cmd = ' '.join(shlex.quote(a) for a in cmd_parts)
+        try:
+            rc, _, _ = await self._run(
+                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                 self._ssh_host, remote_cmd]
+            )
+            return rc
+        except OSError:
+            return 1  # non-zero → caller treats as cancel failure
+
+    async def probe_clean(self) -> bool:
+        """Probe whether any verify-merge is still running on the remote host.
+
+        Issues: ssh -o BatchMode=yes -o ConnectTimeout=10 <host> pgrep -f verify-merge
+
+        Returns:
+            True  — rc == 1 (pgrep found no match; host is clean)
+            False — rc == 0 (process still running) or rc >= 2 (error / ssh failure)
+                    Conservative: any non-1 rc keeps the slot PARKED.
+        """
+        try:
+            rc, _, _ = await self._run(
+                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                 self._ssh_host, 'pgrep -f verify-merge']
+            )
+            return rc == 1
+        except Exception:
+            return False  # fail-safe: stay PARKED on any transport error
 
 
 # ---------------------------------------------------------------------------
