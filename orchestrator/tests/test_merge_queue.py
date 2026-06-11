@@ -8221,7 +8221,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         git_ops: GitOps,
         branch_name: str,
         config: OrchestratorConfig,
-    ) -> tuple[Path, 'MergeRequest']:
+    ) -> tuple[Path, MergeRequest]:
         """Commit shared.py on main, then create a branch editing line1."""
         (git_ops.project_root / 'shared.py').write_text(self._SHARED_BASE)
         await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
