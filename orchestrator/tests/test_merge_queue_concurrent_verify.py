@@ -2344,3 +2344,390 @@ class TestHaltAndUnavailable:
             'GREEN (step-22): RUNNER_UNAVAILABLE handled explicitly; '
             'quarantine_and_release called, runner quarantined.'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-23 RED: stop() drains _inflight + snapshot() surfaces _inflight entries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStopDrainsInflight:
+    """stop() with items in-flight: verify tasks cancelled, futures resolved.
+
+    RED until step-24 GREEN extends stop() to drain self._inflight.
+
+    RED markers:
+    1. req_a.result / req_b.result still pending after stop() — the current
+       stop() drains _queue and _verifier_queue but ignores _inflight.
+    2. In-flight verify tasks are not cancelled (still blocked on their gates).
+    """
+
+    async def test_stop_resolves_inflight_futures_without_running_worker(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """stop() called with two manual InflightEntries → both futures resolved.
+
+        This test injects entries directly into _inflight without running
+        worker.run(), so stop() is exercised in isolation.
+
+        RED: stop() doesn't drain _inflight → futures stay pending.
+        GREEN (step-24): stop() cancels each verify_task, resolves each
+        pending req.result with the shutdown outcome.
+        """
+        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult, SpeculativeItem
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._shutdown_timeout = 0.5  # fast for test
+
+        # Two gated verify coroutines that block until the gate is set.
+        gate_a = asyncio.Event()
+        gate_b = asyncio.Event()
+
+        async def _gated_verify_a() -> InflightVerifyResult:
+            await gate_a.wait()
+            return InflightVerifyResult(outcome=None, merge_wt=None, status=None)
+
+        async def _gated_verify_b() -> InflightVerifyResult:
+            await gate_b.wait()
+            return InflightVerifyResult(outcome=None, merge_wt=None, status=None)
+
+        verify_task_a = asyncio.ensure_future(_gated_verify_a())
+        verify_task_b = asyncio.ensure_future(_gated_verify_b())
+
+        # Build two fake SpeculativeItems with fresh futures.
+        loop = asyncio.get_event_loop()
+        req_a = _make_request('stop-a', 'task/stop-a', git_ops.project_root, config)
+        req_b = _make_request('stop-b', 'task/stop-b', git_ops.project_root, config)
+
+        item_a = SpeculativeItem(
+            request=req_a,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='aaa',
+            speculative=False,
+            skip_verify=False,
+        )
+        item_b = SpeculativeItem(
+            request=req_b,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='bbb',
+            speculative=False,
+            skip_verify=False,
+        )
+
+        entry_a = InflightEntry(
+            item=item_a,
+            lease=None,
+            verify_task=verify_task_a,
+            merge_wt=None,
+            was_speculative=False,
+            phase='verifying',
+        )
+        entry_b = InflightEntry(
+            item=item_b,
+            lease=None,
+            verify_task=verify_task_b,
+            merge_wt=None,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+        # Inject directly into _inflight
+        worker._inflight.append(entry_a)
+        worker._inflight.append(entry_b)
+
+        # stop() must resolve both futures (gates still blocked).
+        await worker.stop()
+
+        # RED: futures still pending (stop() ignored _inflight).
+        # GREEN (step-24): stop() cancels tasks + resolves futures with shutdown.
+        assert req_a.result.done(), (
+            'req_a.result not resolved by stop(). '
+            'RED: stop() does not drain _inflight. '
+            'GREEN (step-24): stop() cancels each verify_task and resolves the future.'
+        )
+        assert req_b.result.done(), (
+            'req_b.result not resolved by stop(). '
+            'RED: stop() does not drain _inflight. '
+            'GREEN (step-24): stop() cancels each verify_task and resolves the future.'
+        )
+
+    async def test_stop_cancels_inflight_verify_tasks(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """stop() cancels all in-flight verify tasks (no leaked tasks).
+
+        RED: tasks remain running after stop() (not cancelled).
+        GREEN (step-24): tasks are cancelled by stop().
+        """
+        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult, SpeculativeItem
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._shutdown_timeout = 0.5
+
+        gate = asyncio.Event()
+
+        async def _blocking_verify() -> InflightVerifyResult:
+            await gate.wait()
+            return InflightVerifyResult(outcome=None, merge_wt=None, status=None)
+
+        verify_task = asyncio.ensure_future(_blocking_verify())
+        req = _make_request('stop-ct', 'task/stop-ct', git_ops.project_root, config)
+        item = SpeculativeItem(
+            request=req,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='ccc',
+            speculative=False,
+            skip_verify=False,
+        )
+        entry = InflightEntry(
+            item=item,
+            lease=None,
+            verify_task=verify_task,
+            merge_wt=None,
+            was_speculative=False,
+            phase='verifying',
+        )
+        worker._inflight.append(entry)
+
+        await worker.stop()
+
+        # RED: verify_task.cancelled() → False (stop() didn't cancel it).
+        # GREEN (step-24): stop() cancels each task → done() and cancelled() True.
+        assert verify_task.done(), (
+            'verify_task not done after stop(). '
+            'RED: stop() ignores _inflight. '
+            'GREEN (step-24): stop() cancels each verify_task.'
+        )
+
+    async def test_stop_drains_redispatch(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """stop() also drains _redispatch (pending re-dispatch items).
+
+        RED: _redispatch items are not drained; their futures stay pending.
+        GREEN (step-24): _redispatch drained + futures resolved.
+        """
+        from orchestrator.merge_queue import SpeculativeItem
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._shutdown_timeout = 0.5
+
+        req = _make_request('stop-rd', 'task/stop-rd', git_ops.project_root, config)
+        item = SpeculativeItem(
+            request=req,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='ddd',
+            speculative=False,
+            skip_verify=False,
+        )
+        worker._redispatch.append(item)
+
+        await worker.stop()
+
+        assert req.result.done(), (
+            'req.result not resolved after stop() with item in _redispatch. '
+            'RED: stop() does not drain _redispatch. '
+            'GREEN (step-24): _redispatch drained; future resolved with shutdown.'
+        )
+
+
+@pytest.mark.asyncio
+class TestSnapshotInflight:
+    """snapshot() surfaces all _inflight entries (not just the back-compat head).
+
+    RED until step-24 GREEN extends snapshot() to enumerate self._inflight.
+
+    RED markers:
+    1. Only the head (via _verify_item) appears; second _inflight entry invisible.
+    2. verify_in_progress matches the head (back-compat unchanged).
+    Single-host (≤1 in-flight) is byte-identical to today.
+    """
+
+    async def test_snapshot_second_inflight_item_missing_in_red(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """With two in-flight entries, snapshot() currently only shows the head.
+
+        After step-24 GREEN, both items appear in snapshot()['entries'].
+
+        RED: second item's task_id ('snap-b') NOT in entries.
+        GREEN: both 'snap-a' and 'snap-b' in entries (with state 'verifying').
+        """
+        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        req_a = _make_request('snap-a', 'task/snap-a', git_ops.project_root, config)
+        req_b = _make_request('snap-b', 'task/snap-b', git_ops.project_root, config)
+
+        item_a = SpeculativeItem(
+            request=req_a,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='aaa',
+            speculative=False,
+            skip_verify=False,
+        )
+        item_b = SpeculativeItem(
+            request=req_b,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='bbb',
+            speculative=False,
+            skip_verify=False,
+        )
+
+        entry_a = InflightEntry(
+            item=item_a,
+            lease=None,
+            verify_task=None,
+            merge_wt=None,
+            was_speculative=False,
+            phase='verifying',
+        )
+        entry_b = InflightEntry(
+            item=item_b,
+            lease=None,
+            verify_task=None,
+            merge_wt=None,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+        # Set head back-compat mirror
+        worker._verify_item = item_a
+        worker._verify_phase = 'verifying'
+
+        # Both entries in _inflight
+        worker._inflight.append(entry_a)
+        worker._inflight.append(entry_b)
+
+        snap = worker.snapshot()
+        entry_task_ids = [e['task_id'] for e in snap['entries']]
+
+        # GREEN: both appear
+        assert 'snap-a' in entry_task_ids, (
+            f'HEAD (snap-a) missing from snapshot entries: {entry_task_ids}.'
+        )
+        assert 'snap-b' in entry_task_ids, (
+            f'snap-b (second in-flight) not in snapshot entries: {entry_task_ids}. '
+            'RED: snapshot() uses only _verify_item (head); _inflight[1:] invisible. '
+            'GREEN (step-24): enumerate _inflight for additional verifying entries.'
+        )
+
+    async def test_snapshot_single_host_byte_identical(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Single-host (≤1 in-flight): snapshot unchanged from today.
+
+        With only _verify_item set and _inflight having exactly that one entry,
+        the snapshot must produce the SAME output as the pre-γ code.
+
+        GREEN both before and after step-24 (byte-identical oracle).
+        """
+        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        req = _make_request('snap-sh', 'task/snap-sh', git_ops.project_root, config)
+        item = SpeculativeItem(
+            request=req,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='aaa',
+            speculative=False,
+            skip_verify=False,
+        )
+        entry = InflightEntry(
+            item=item,
+            lease=None,
+            verify_task=None,
+            merge_wt=None,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+        # Single-host scenario: _verify_item set + one _inflight entry
+        worker._verify_item = item
+        worker._verify_phase = 'verifying'
+        worker._inflight.append(entry)
+
+        snap = worker.snapshot()
+        verifying_entries = [e for e in snap['entries'] if e['state'] == 'verifying']
+
+        # Must have EXACTLY 1 verifying entry (no double-count)
+        assert len(verifying_entries) == 1, (
+            f'Expected exactly 1 verifying entry for single-host, '
+            f'got {len(verifying_entries)}: {verifying_entries}. '
+            'Single-host must be byte-identical before and after step-24.'
+        )
+        assert verifying_entries[0]['task_id'] == 'snap-sh'
+
+    async def test_snapshot_verify_in_progress_reflects_head(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """verify_in_progress still mirrors the head (back-compat unchanged).
+
+        After step-24, verify_in_progress must still come from _verify_item
+        (back-compat); additional _inflight entries appear only in 'entries'.
+        """
+        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        req_a = _make_request('snap-vip-a', 'task/snap-vip-a', git_ops.project_root, config)
+        req_b = _make_request('snap-vip-b', 'task/snap-vip-b', git_ops.project_root, config)
+
+        item_a = SpeculativeItem(
+            request=req_a, merge_result=None, merge_wt=None,
+            base_sha='aaa', speculative=False, skip_verify=False,
+        )
+        item_b = SpeculativeItem(
+            request=req_b, merge_result=None, merge_wt=None,
+            base_sha='bbb', speculative=False, skip_verify=False,
+        )
+        entry_a = InflightEntry(
+            item=item_a, lease=None, verify_task=None, merge_wt=None,
+            was_speculative=False, phase='verifying',
+        )
+        entry_b = InflightEntry(
+            item=item_b, lease=None, verify_task=None, merge_wt=None,
+            was_speculative=False, phase='verifying',
+        )
+
+        worker._verify_item = item_a
+        worker._verify_phase = 'verifying'
+        worker._inflight.append(entry_a)
+        worker._inflight.append(entry_b)
+
+        snap = worker.snapshot()
+
+        # verify_in_progress must still point to head (back-compat)
+        assert snap['verify_in_progress'] is not None
+        assert snap['verify_in_progress']['task_id'] == 'snap-vip-a', (
+            f"verify_in_progress['task_id'] should be 'snap-vip-a' (head), "
+            f"got {snap['verify_in_progress'].get('task_id')!r}."
+        )
