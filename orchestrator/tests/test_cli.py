@@ -1302,3 +1302,151 @@ def test_cancel_verify_real_impl_dead_pgid(tmp_path, monkeypatch):
         f'expected exit_code 0 for dead pgid, got {r.exit_code}; output={r.output!r}'
     )
     assert not pgf.exists(), f'pgid file must be removed after successful cancel; still at {pgf}'
+
+
+# ---------------------------------------------------------------------------
+# Task 1732 step-13 (part 2) — end-to-end: real subprocess cancel capstone
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_file_cli(path: 'Path', timeout: float = 10.0, interval: float = 0.1) -> bool:
+    """Poll until *path* exists or *timeout* expires. Return True if found."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(interval)
+    return False
+
+
+@pytest.mark.timeout(30)
+def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
+    """End-to-end: real subprocess 'verify-merge --request-id X' is killed by cancel-verify.
+
+    Spawns a real 'orchestrator verify-merge --request-id X' subprocess with a
+    long-running sleep spec.  Polls for the pgid file that verify-merge writes
+    after os.setsid().  Calls 'cancel-verify --request-id X' via CliRunner
+    (in-process, monkeypatched load_config).  Asserts:
+
+    * cancel-verify exits 0
+    * pgid file is removed by cancel_request
+    * verify-merge subprocess exits within seconds (SIGKILL delivered)
+    * the recorded pgid group is gone (os.killpg raises ESRCH) after wait()
+    """
+    import errno
+    import os
+    import subprocess as subprocess_mod
+    import sys
+
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.git_ops import GitOps
+    from orchestrator.verify_cancel import pgid_file
+    from orchestrator.verify_runner import (
+        MergeVerifySpec,
+        UnscopedTypecheckSpec,
+        VerifyCommand,
+        spec_to_json,
+    )
+
+    # --- Set up a real git repo ---
+    repo, head_sha = _setup_verify_repo(tmp_path)
+
+    # --- Write minimal config YAML (project_root -> repo) ---
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text(f'project_root: {repo}\n')
+
+    # --- Spec with a long-running sleep test command ---
+    spec = MergeVerifySpec(
+        verify_commands=(VerifyCommand('mod', test_command='sleep 300'),),
+        unscoped_typecheck=UnscopedTypecheckSpec(
+            commands=(VerifyCommand('mod', type_check_command='true'),),
+            block_on_timeout=True,
+        ),
+        task_files=('mod/test_x.py',),
+        verify_env={},
+        cold_timeout_secs=300.0,
+    )
+
+    REQUEST_ID = 'e2e-cancel-test'
+
+    # --- Derive the expected pgid file path (same derivation as verify-merge uses) ---
+    config_obj = OrchestratorConfig(project_root=repo)
+    _git_ops = GitOps(config_obj.git, repo)
+    pgf = pgid_file(_git_ops.worktree_base, REQUEST_ID)
+
+    # --- Spawn verify-merge as a real subprocess ---
+    # Set PYTHONPATH so the subprocess imports from the worktree's src (not the
+    # editable-install main-checkout), ensuring it uses the task-branch code.
+    worktree_src = str(Path(__file__).parent.parent / 'src')
+    env = dict(os.environ)
+    existing_pp = env.get('PYTHONPATH', '')
+    env['PYTHONPATH'] = f'{worktree_src}:{existing_pp}' if existing_pp else worktree_src
+
+    child = subprocess_mod.Popen(
+        [sys.executable, '-c', 'from orchestrator.cli import main; main()',
+         'verify-merge',
+         '--sha', head_sha,
+         '--spec', spec_to_json(spec),
+         '--config', str(cfg_file),
+         '--request-id', REQUEST_ID],
+        env=env,
+        stdout=subprocess_mod.PIPE,
+        stderr=subprocess_mod.PIPE,
+    )
+
+    pgid_val = None
+    try:
+        # --- Poll for the pgid file (written before asyncio.run) ---
+        if not _wait_for_file_cli(pgf, timeout=15):
+            _debug_stdout, _debug_stderr = child.communicate(timeout=5) if child.poll() is not None else (b'', b'')
+            pytest.fail(
+                f'verify-merge did not write pgid file within 15s '
+                f'(subprocess poll={child.poll()!r})\n'
+                f'STDOUT: {_debug_stdout.decode()[:2000]!r}\n'
+                f'STDERR: {_debug_stderr.decode()[:2000]!r}'
+            )
+
+        # Save pgid BEFORE cancel-verify removes the file
+        pgid_val = int(pgf.read_text().strip())
+
+        # --- Cancel via CliRunner (in-process, monkeypatched load_config) ---
+        monkeypatch.setattr(cli_module, 'load_config', lambda _: config_obj)
+        r = CliRunner().invoke(main, [
+            'cancel-verify',
+            '--request-id', REQUEST_ID,
+            '--config', str(cfg_file),
+        ])
+
+        assert r.exit_code == 0, (
+            f'cancel-verify expected exit 0, got {r.exit_code}; '
+            f'output={r.output!r}'
+        )
+        assert not pgf.exists(), (
+            'pgid file must be removed by cancel-verify on success'
+        )
+
+        # --- verify-merge subprocess must exit within seconds ---
+        try:
+            child.wait(timeout=10)
+        except subprocess_mod.TimeoutExpired:
+            pytest.fail(
+                'verify-merge subprocess did not exit within 10s after cancel-verify'
+            )
+
+        # --- Process group must be gone after the subprocess is reaped ---
+        # child.wait() above reaped the zombie; pgid == pid after setsid, so
+        # there should be no processes left in the group.
+        try:
+            os.killpg(pgid_val, 0)
+            pytest.fail(
+                f'verify-merge pgid group {pgid_val} still alive after cancel-verify'
+            )
+        except (ProcessLookupError, OSError) as exc:
+            if hasattr(exc, 'errno') and exc.errno == errno.EPERM:
+                pytest.fail(f'pgid group {pgid_val}: got EPERM (unexpected)')
+            # ESRCH → group is gone — expected
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
