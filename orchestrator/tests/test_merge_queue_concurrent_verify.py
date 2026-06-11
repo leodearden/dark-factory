@@ -538,3 +538,205 @@ class TestRunInflightVerifyHappyPath:
         result = await worker._run_inflight_verify(item, lease)
 
         assert result.merge_wt is not None
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: _run_inflight_verify abort-poll (abandon + operator halt)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyAbortPoll:
+    """_run_inflight_verify abort-poll: abandon → DROPPED, halt → REQUEUED.
+
+    RED until step-8 GREEN ports the abort-poll loop into _run_inflight_verify.
+    """
+
+    async def _make_merged_item(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+        content: str,
+    ):
+        """Create a merged SpeculativeItem on the given branch."""
+        from orchestrator.merge_queue import SpeculativeItem
+
+        wt = await _make_branch_with_file(git_ops, branch, filename, content)
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id=branch,
+            branch=branch,
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=loop.create_future(),
+            lane='normal',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success and merge_result.merge_commit
+        base_sha = await git_ops.get_main_sha()
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+        return req, item
+
+    async def test_abandon_mid_verify_returns_dropped(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Sole-waiter abandon mid-verify → inner task cancelled, merge_wt cleaned,
+        returns status=DROPPED.
+
+        RED (step-6): current code has no poll loop — verify runs to completion
+        when gate is released, result.status is None.
+        GREEN (step-8): poll loop detects abandon before gate released → DROPPED.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+        gated = _gated_runner(gate_release, gate_entered, passed=True, name='slow-abandon')
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'abort-poll-a', 'pa.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02  # fast polling for tests
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='slow-abandon', runner=gated, is_local=False)
+
+        # Start verify in background (gated runner blocks until gate_release)
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+
+        # Wait for the gated runner to enter
+        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+
+        # Trigger sole-waiter abandon
+        req.result.cancel()
+
+        # Give poll loop a chance to fire (step-6: will not detect — no loop)
+        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+
+        # Release gate so RED case doesn't hang
+        gate_release.set()
+
+        result = await verify_future
+
+        # GREEN: poll loop detected abandon before gate → DROPPED
+        # RED: verify ran to completion (gate released) → status=None
+        assert result.status == 'DROPPED'  # RED: fails (None != 'DROPPED')
+
+    async def test_abandon_mid_verify_cleans_merge_wt(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Abandon → merge_wt cleaned: result.merge_wt is None on DROPPED."""
+        from orchestrator.verify_runner import HostLease
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+        gated = _gated_runner(gate_release, gate_entered, passed=True, name='slow-wt')
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'abort-poll-b', 'pb.py', 'y=2\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='slow-wt', runner=gated, is_local=False)
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+        req.result.cancel()
+        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        gate_release.set()
+
+        result = await verify_future
+
+        # GREEN: wt cleaned by abort handler → result.merge_wt is None
+        # RED: verify ran normally → result.merge_wt is not None
+        assert result.merge_wt is None  # RED: fails (merge_wt is not None)
+
+    async def test_operator_halt_mid_verify_returns_requeued(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Operator halt mid-verify → inner task cancelled, req re-queued, status=REQUEUED.
+
+        RED (step-6): current code has no poll loop — verify completes normally.
+        GREEN (step-8): poll loop detects halt, requeues req, returns REQUEUED.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+        gated = _gated_runner(gate_release, gate_entered, passed=True, name='slow-halt')
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'abort-poll-c', 'pc.py', 'z=3\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='slow-halt', runner=gated, is_local=False)
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+
+        # Trigger operator halt
+        worker._operator_halt.set()
+
+        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        # Release gate so RED case doesn't hang
+        gate_release.set()
+
+        result = await verify_future
+
+        # GREEN: poll loop detected halt → REQUEUED
+        # RED: verify ran to completion → status=None
+        assert result.status == 'REQUEUED'  # RED: fails (None != 'REQUEUED')
+
+    async def test_operator_halt_requeues_request_on_queue(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Operator halt → req is put back on worker._queue."""
+        from orchestrator.verify_runner import HostLease
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+        gated = _gated_runner(gate_release, gate_entered, passed=True, name='slow-halt2')
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'abort-poll-d', 'pd.py', 'w=4\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='slow-halt2', runner=gated, is_local=False)
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+
+        worker._operator_halt.set()
+        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        gate_release.set()
+
+        await verify_future
+
+        # GREEN: req put_nowait onto _queue (which is worker._queue == q)
+        # RED: _queue is empty
+        assert not q.empty(), 'req should be back on _queue after halt'  # RED: fails
