@@ -138,9 +138,12 @@ path (:6324-6339); `enabled_verify_runners` (config.py:1411). New mechanisms: th
 
 ## 6. Out of scope
 
-- Flipping reify's `verify_runners` on (operator action; enable checklist in
-  `plans/lever-c-enable-path-gap-2026-06-10.md` — after this PRD lands, its step 5
-  measurement becomes honest: overlapping spans are real).
+- ~~Flipping reify's `verify_runners` on (operator action)~~ **Superseded 2026-06-11:**
+  activation is automated as task **η** (user directive; orchestrator restarts
+  explicitly authorized for this case). What remains out of scope: live
+  fault-injection (powering the laptop off — ζ's B3 covers the logic with fakes) and
+  the multi-hour λ throughput-delta measurement (observational follow-up once a real
+  backlog window has run; η reports the first overlap signals).
 - Dashboard rendering of multi-verify state (dashboard package; ε ships the snapshot
   shape; a dashboard task can consume it later — split-multi-package rule).
 - Merge-ahead buffer deepening (K+1) and any host-weighted scheduling.
@@ -155,7 +158,8 @@ path (:6324-6339); `enabled_verify_runners` (config.py:1411). New mechanisms: th
 | Warm-builds per-host worktree (1692/η) | allocator slots enforce ≤1/host; `enforce_persistent_worktree_serial_lane` call unchanged | this PRD enforces, 1692 invariants hold |
 | Trains γ2 (1717-1722) | `immediate_outcome` items bypass hosts, flow through ordered finalize | this PRD (no-host pass-through) |
 | Drift detector ι | acquires host slots through the allocator | this PRD (β) |
-| γ CLI contract (`verify-merge`) | extended with `--request-id`/`cancel-verify`; both hosts must update together (df checkout on laptop) | this PRD (α); rollout note in ops checklist |
+| γ CLI contract (`verify-merge`) | extended with `--request-id`/`cancel-verify`; both hosts must update together | this PRD — η syncs the laptop df checkout before the flip |
+| Lever C enable checklist (`plans/lever-c-enable-path-gap-2026-06-10.md` steps 2-3) | executed by η (automated); η also updates the checklist + deletes the obsolete per-host comment in reify yaml | this PRD (η) |
 
 ## 8. Decomposition (G5: B+H — contract = decisions 1-6; boundary tests = ζ)
 
@@ -213,7 +217,34 @@ path (:6324-6339); `enabled_verify_runners` (config.py:1411). New mechanisms: th
   **Consumer:** the operator enable checklist — the go-signal that flipping C now
   buys real overlap.
 
-**DAG:** α → β; δ → β (linearizes `merge_queue.py` edits); β → γ; γ → ε; ε → ζ.
+- **η — Automated Lever C activation** (ops; reify repo config + service restart —
+  **user-authorized 2026-06-11, restarts explicitly permitted**). Steps: (0) preflight
+  `ssh leo-laptop true`; unreachable → abort + escalate (don't flip toward a dead
+  remote). (1) Sync the laptop df checkout (path via the `/usr/local/bin/orchestrator`
+  wrapper; `git pull --ff-only` — ships the α cancel contract; venv is editable).
+  (2) Edit reify `orchestrator.yaml`: enable the staged `verify_runners` block
+  (values at :119-133: laptop / leo-laptop / leo-laptop /
+  `~/.config/orchestrator/reify-laptop.yaml`), `verify_drift_check_every_n_lands: 20`,
+  the staged `sccache:` block; **delete the obsolete incident-revert paragraph** (the
+  disproven per-host hypothesis). Update the gap-report enable checklist (steps 2-3
+  done). (3) Dirty-tree safety: if reify has OTHER tracked modifications, abort +
+  escalate (never commit over live WIP); else commit. (4) Quiet-window restart: poll
+  the reify merge state (escalation port 8100 — python-urllib JSON-RPC shim, curl is
+  broken on this host) for no in-flight merge verify, bounded ≤90 min, then
+  `systemctl --user restart orchestrator-reify.service` (timeout → restart anyway,
+  authorized). (5) Hard validation: journal shows "Speculative merge worker started",
+  no `MergeLivenessConfigError`, NRestarts stable ≥10 min, and a df-venv assertion
+  `len(load_config(<reify yaml>).enabled_verify_runners) == 1` (K=2). (6) sccache
+  best-effort: `sccache --stop-server` on each host only when no build is running
+  (next compile auto-starts the server with `SCCACHE_REDIS` from the verify env);
+  busy → skip with a loud note (local-cache degradation is safe; drift detector is
+  the standing guarantee). (7) Bounded observation ≤60 min: first `runner=laptop`
+  merge-verify event in the journal — **reported, not gating** (depends on natural
+  traffic; G6). **Signal (hard):** flipped config committed in reify; reify
+  orchestrator restarted and stable on K=2; obsolete comment gone; checklist updated.
+  **Consumer:** the merge-throughput goal — completes Lever C end-to-end.
+
+**DAG:** α → β; δ → β (linearizes `merge_queue.py` edits); β → γ; γ → ε; ε → ζ; ζ → η.
 (α ∥ δ run first in parallel — disjoint files.)
 
 ## 9. Open questions (tactical)
