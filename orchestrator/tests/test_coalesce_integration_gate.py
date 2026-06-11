@@ -361,11 +361,12 @@ class TestScenario1:
 
 @pytest.mark.asyncio
 class TestScenario2:
-    """step-3 (RED): partial stackability — overlap keeps 3rd as solo.
+    """step-4 (GREEN): partial stackability — overlap keeps 3rd as solo.
 
     Three branches: s21 and s22 are disjoint (unique files → stackable);
-    s23 edits the SAME file as s21 → get_changed_line_ranges returns
-    overlapping ranges → _select_train_members rejects co-selection.
+    s23 adds the SAME file as s21 (file_overlap.py) → get_changed_line_ranges
+    returns old-side point range (0,0) on file_overlap.py for BOTH s21 and s23
+    → _line_ranges_stackable returns False → _select_train_members rejects s23.
 
     Assertions:
       (a) the formed train has exactly 2 members (s21 + s22), NOT s23
@@ -375,10 +376,10 @@ class TestScenario2:
       (d) after gate_release the 2-member train lands; s21/s22 files on main
       (e) s23 stays in the worker queue as a solo MergeRequest (not a GroupMergeRequest)
 
-    RED: s23 currently uses a UNIQUE file (file_s23.py) — disjoint from s21 →
-    all 3 get coalesced into a 3-member train → assertion (b) fails because
-    s23.result.done() is True (absorbed).  step-4 fixes this by giving s23
-    the SAME filename as s21 (file_overlap.py) so ranges overlap.
+    GREEN (step-4): s23 now adds file_overlap.py (same filename as s21) so
+    parse_diff_line_ranges maps it to (0,0) on file_overlap.py — same as s21's
+    range — and _line_ranges_stackable returns False.  The coalescing pass forms
+    a 2-member train from s21+s22 and leaves s23 solo in the buffer.
     """
 
     async def test_partial_stackability_overlap_keeps_solo(
@@ -395,14 +396,17 @@ class TestScenario2:
         from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
 
         # Three branches:
-        #   s21: adds file_overlap.py → old-side range (0,0) on file_overlap.py
-        #   s22: adds file_s22.py (unique) → no shared file with s21 → stackable
-        #   s23: RED — adds file_s23.py (unique) instead of file_overlap.py →
-        #        disjoint from everyone → all 3 get coalesced → assertion (b) fails.
-        #        step-4 fixes s23 to add file_overlap.py → overlaps with s21 → stays solo.
+        #   s21: adds file_overlap.py → old-side point range (0,0) on file_overlap.py
+        #   s22: adds file_s22.py (unique file) → no shared file with s21 → stackable
+        #   s23: adds file_overlap.py (SAME filename as s21) → old-side point range
+        #        (0,0) on file_overlap.py → intersects s21's range → NOT stackable.
+        #        git diff main...task/ig_s23 shows file_overlap.py as a pure insertion
+        #        (@@ -0,0 +1,1 @@) → parse_diff_line_ranges maps it to (0,0).
+        #        _line_ranges_stackable({'file_overlap.py': [(0,0)]}, {'file_overlap.py': [(0,0)]})
+        #        → shared_files={'file_overlap.py'}, 0<=0 and 0<=0 → NOT stackable.
         wt1 = await _make_branch_with_file(git_ops, 'ig_s21', 'file_overlap.py', 'x = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'ig_s22', 'file_s22.py',      'y = 2\n')
-        wt3 = await _make_branch_with_file(git_ops, 'ig_s23', 'file_s23.py',      'z = 3\n')
+        wt3 = await _make_branch_with_file(git_ops, 'ig_s23', 'file_overlap.py',  'z = 3\n')
 
         db_path = tmp_path / 'es_s2.db'
         es = EventStore(db_path=db_path, run_id='s2-run')
@@ -450,8 +454,12 @@ class TestScenario2:
             await asyncio.wait_for(gate_entered.wait(), timeout=60)
 
             # (b) s23's future must be UNRESOLVED — it is not absorbed.
-            # RED: s23 uses file_s23.py (disjoint) → all 3 coalesced → s23.result.done()
-            # is True → this assertion FAILS.
+            # GREEN timing: when gate_entered fires, the verifier is blocked at
+            # ig_s23's run_scoped_verification (the FIRST call to the patched fn).
+            # ig_s23 was dequeued by the merger (as a solo) before the
+            # GroupMergeRequest, but its result has NOT been delivered yet because
+            # the verifier is suspended.  s23 is therefore neither superseded
+            # (coalescing excluded it) nor done (verifier hasn't resolved it yet).
             assert not req3.result.done(), (
                 's23 must remain solo (future unresolved); '
                 'expected s23 NOT absorbed by the train'
@@ -474,8 +482,15 @@ class TestScenario2:
                 f'train_coalesced member_task_ids must be {{s21, s22}}; got {event_data}'
             )
 
-            gate_release.set()
+            # GREEN fix: wait for the 2-member train to land WHILE the gate is
+            # still held.  The gate blocks ig_s23's advance_main (verifier is
+            # suspended at run_scoped_verification for ig_s23), preventing it from
+            # racing with the train's rebase_onto_main.  The train's
+            # run_scoped_verification is the 2ND call to the patched fn → passes
+            # immediately (gate only blocks the first call), so the train CAN land
+            # while the gate is held.  Only release the gate AFTER train_done fires.
             await asyncio.wait_for(train_done.wait(), timeout=30)
+            gate_release.set()
 
         # (d) s21 and s22 files on main after the train lands.
         from orchestrator.git_ops import _run
@@ -486,14 +501,21 @@ class TestScenario2:
         assert 'file_overlap.py' in main_files, 'file_overlap.py (s21) must be on main'
         assert 'file_s22.py' in main_files,     'file_s22.py (s22) must be on main'
 
-        # (e) s23 remains in worker queue as solo (not GroupMergeRequest).
-        # The worker stopped processing after the train landed; s23 is still pending.
-        buf = list(worker._lane_buffers['normal'])
-        solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
-        assert any(r.task_id == 'ig_s23' for r in solos), (
-            f's23 must remain as a solo in lane_buffers; buf={[r.task_id for r in buf]}'
-        )
-
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+        # (e) s23 was NOT absorbed as 'superseded' by the coalescing pass.
+        # ig_s23 was dequeued by the merger as a solo (NOT part of the train) and
+        # processed independently.  After worker.stop(), its result is resolved
+        # (either 'blocked' because advance_main's CAS failed after the train
+        # advanced main, or 'shutdown' if the stop drain got it first).
+        # The key invariant: its outcome is never 'superseded'.
+        assert req3.result.done(), (
+            's23 result must be resolved after worker.stop()'
+        )
+        outcome_s23 = req3.result.result()
+        assert outcome_s23.status != 'superseded', (
+            f's23 must not be superseded by the coalescing pass; '
+            f'got {outcome_s23!r}'
+        )
