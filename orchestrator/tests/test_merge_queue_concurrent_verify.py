@@ -1919,3 +1919,182 @@ class TestOverlapSignal:
         )
         assert 'ov_a.py' in main_files, 'N (ov_a.py) not on main'
         assert 'ov_b.py' in main_files, 'N+1 (ov_b.py) not on main'
+
+
+# ---------------------------------------------------------------------------
+# step-19 RED: CHAIN-INVALIDATION UNDER OVERLAP
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestChainInvalidationUnderOverlap:
+    """N's verify fails while N+1 is in-flight: N+1 aborted, re-merged, re-verifies done.
+
+    RED (step-19) until step-20 GREEN implements the head-failure cascade.
+
+    RED markers:
+    1. req_b times out — the fill-ahead blocking-get deadlocks: after N fails,
+       the loop re-enters DISPATCH-FILL with _has_running_inflight=True and
+       free_host_count=1, so it blocks on queue.get() waiting for new items.
+       N+1's verify task finishes (gate_b released) but its result is never
+       consumed because the loop is waiting for QUEUE items, not verify tasks.
+    2. remote cancel_verify NOT called — N+1's verify runs to completion
+       (or is left dangling) without the cancel signal.
+
+    GREEN after step-20: head-failure cascade in _verifier_loop:
+      · cancels N+1's in-flight verify task
+      · cancel_and_release(N+1's lease) → remote cancel_verify called
+      · cleans N+1's stale merge worktree
+      · _remerge(N+1's req) → fresh SpeculativeItem on actual main
+      · appends to _redispatch → re-dispatched on next fill iteration
+    N+1 resolves 'done' and main has ci_b.py; N (ci_a.py) never landed.
+    """
+
+    async def test_n_fail_aborts_downstream_verify_reruns_remerge(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """N's local verify fails; N+1's remote verify is aborted and re-verified.
+
+        RED: loop deadlocks on fill-ahead queue.get() → req_b times out.
+        GREEN (step-20): head-failure cascade aborts N+1, re-merges onto
+        actual main, re-dispatches → N+1 resolves 'done'.
+        """
+        # ── N's local verify: gated (fails when gate_a_release is set) ──────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+
+        # Track local-verify call count: first call = N (gate + fail),
+        # subsequent calls = N+1's re-dispatch (pass immediately).
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # N's verify: gate and fail
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False,
+                    summary='test_failure',
+                    test_output='FAILED',
+                    lint_output='',
+                    type_output='',
+                    category='test_failure',
+                    timed_out=False,
+                    verify_skipped=False,
+                )
+            # N+1's re-dispatched local verify (GREEN step-20 cascade path)
+            return MagicMock(
+                passed=True,
+                summary='ok',
+                test_output='ok',
+                lint_output='',
+                type_output='',
+                category='',
+                timed_out=False,
+                verify_skipped=False,
+            )
+
+        # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='laptop',
+        )
+
+        # ── Branches ─────────────────────────────────────────────────────────
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/ci-a', 'ci_a.py', 'a = 1\n'
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/ci-b', 'ci_b.py', 'b = 2\n'
+        )
+
+        # ── Worker setup ──────────────────────────────────────────────────────
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        loop = asyncio.get_event_loop()
+        req_a = MergeRequest(
+            task_id='ci-a', branch='task/ci-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='ci-b', branch='task/ci-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        outcome_b: MergeOutcome | None = None
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for both verifies to enter (true concurrent overlap)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # N's verify fails
+            gate_a_release.set()
+
+            # N must resolve with a fail status
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status not in ('done', 'already_merged'), (
+                f'Expected N to fail, got status={outcome_a.status!r}.'
+            )
+
+            # Release N+1's gate so the test can complete in both paths:
+            # RED: N+1's inner verify task unblocks, but the loop is still
+            #      stuck on fill-ahead queue.get() → req_b never resolves.
+            # GREEN: cascade already cancelled N+1's task; gate_b unblocks
+            #        only the leaked inner task (result ignored).
+            gate_b_release.set()
+
+            # Wait for N+1 to resolve:
+            # GREEN: cascade → re-merge → re-verify → 'done' (fast)
+            # RED: deadlock → TimeoutError → outcome_b stays None
+            try:
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+            except asyncio.TimeoutError:
+                pass  # RED: expected deadlock
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── RED: fails here (outcome_b is None due to timeout) ──────────────
+        assert outcome_b is not None and outcome_b.status == 'done', (
+            f'Expected N+1 to resolve "done" after re-merge/re-verify, '
+            f'got {outcome_b!r}. '
+            'RED: fill-ahead blocking-get deadlocks after N fails — '
+            '_inflight still has N+1 but loop waits for queue items. '
+            'GREEN (step-20): head-failure cascade clears _inflight, '
+            're-dispatches N+1 via _redispatch → "done".'
+        )
+
+        # ── RED: fails here (cancel_verify not called) ───────────────────────
+        gated_remote.cancel_verify.assert_called_once()
+
+        # ── Main state: N+1 landed, N never did ─────────────────────────────
+        from orchestrator.git_ops import _run as _git_run
+        _, main_files, _ = await _git_run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'ci_b.py' in main_files, (
+            'N+1 (ci_b.py) not on main after re-merge/re-verify'
+        )
+        assert 'ci_a.py' not in main_files, (
+            'N (ci_a.py) must NOT be on main (verify failed)'
+        )
