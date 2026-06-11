@@ -9829,6 +9829,145 @@ class TestCoalesceOrEnqueueStaleWorktreeReap:
 
 
 # ---------------------------------------------------------------------------
+# TestReaperHeartbeatLivenessBoundary — α+β end-to-end contract (γ gate, task 1730)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReaperHeartbeatLivenessBoundary:
+    """Two-way reaper contract framed in α (task 1728) heartbeat semantics.
+
+    α's _heartbeat_loop calls os.utime on each owned _merge-* worktree root
+    every _HEARTBEAT_POLL_S seconds.  The reaper reads the same root mtime at
+    merge_queue.py (wt.stat().st_mtime).
+
+    LIVE path  — fresh root mtime (α is alive)  → coalesce, worktree preserved.
+    DEAD path  — ancient root mtime (α died)     → reap + re-dispatch.
+
+    These two directions consolidate the α+β end-to-end contract at the
+    worktree boundary.  Granular unit regressions live in:
+      - TestCoalesceOrEnqueueWorktreePath (alive → coalesce)
+      - TestCoalesceOrEnqueueStaleWorktreeReap (stale → reap)
+    This class ties the same two directions to the specific heartbeat mechanism
+    that makes liveness possible: os.utime on the root == α still running.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'hb_boundary_events.db'
+        return EventStore(db_path=db, run_id='hb-boundary-test')
+
+    async def test_live_owner_coalesces_no_reap(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Fresh root mtime (α-heartbeat-alive) → coalesce, worktree preserved.
+
+        os.utime(root, (now, now)) reproduces the state α's per-tick
+        _heartbeat_loop guarantees for a live owner.
+        """
+        import os
+        from orchestrator.merge_queue import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+
+        branch = 'hb-live-owner-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'hb_live.py', 'x = 1\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            # Simulate α heartbeat: touch root mtime to now (the exact state
+            # _heartbeat_loop produces for a live owner every _HEARTBEAT_POLL_S secs).
+            now = time.time()
+            os.utime(str(merge_wt), (now, now))
+
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()  # empty — cross-restart scenario
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('hb-live', branch, tmp_path, config)
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=git_ops,
+                liveness_secs=INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+            )
+
+            # LIVE → coalesce: in_flight=True, no new enqueue, worktree intact
+            assert result.in_flight is True, f'Expected in_flight=True; got {result}'
+            assert result.dispatched is False
+            assert result.source == 'worktree'
+            assert queue.qsize() == 0, (
+                f'Queue must be empty — no duplicate enqueue; got {queue.qsize()}'
+            )
+            assert merge_wt.exists(), 'Live worktree must NOT be reaped by the α-fresh path'
+
+            # Behavioral event counts (not string-absence assertions)
+            assert _count_events(event_store.db_path, 'worktree_reaped') == 0, (
+                'worktree_reaped must not fire when α heartbeat keeps the root fresh'
+            )
+            assert _count_events(event_store.db_path, 'merge_coalesced') == 1, (
+                'merge_coalesced must fire once for the alive coalesce path'
+            )
+        finally:
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_dead_owner_reaps_and_redispatches(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Ancient root mtime (α heartbeat stopped) → reap + re-dispatch.
+
+        os.utime(root, (0, 0)) reproduces the worktree left by a dead owner
+        whose heartbeat loop has stopped.  liveness_secs=1 ensures the stale
+        verdict regardless of wall-clock skew.
+        """
+        import os
+
+        branch = 'hb-dead-owner-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'hb_dead.py', 'x = 2\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        # Simulate dead α: set root mtime to epoch 0 (heartbeat stopped)
+        os.utime(str(merge_wt), (0, 0))
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        req = _make_request('hb-dead', branch, tmp_path, config)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=git_ops,
+            liveness_secs=1,  # tight window so epoch-0 mtime is always stale
+        )
+
+        # DEAD → reap + re-dispatch
+        assert not merge_wt.exists(), (
+            f'Dead worktree {merge_wt} must be removed by the reaper'
+        )
+        found = await git_ops.find_inflight_merge_worktree(branch)
+        assert found is None, f'Worktree still on disk after reap: {found}'
+
+        assert _count_events(event_store.db_path, 'worktree_reaped') == 1, (
+            'worktree_reaped must fire exactly once for the dead-owner path'
+        )
+        assert result.dispatched is True, f'Expected dispatched=True; got {result}'
+        assert result.in_flight is False
+        assert queue.qsize() == 1, (
+            f'Expected queue size 1 (fresh request enqueued); got {queue.qsize()}'
+        )
+        assert registry.is_inflight(branch) is True, (
+            'Registry must record the re-dispatched branch as in-flight'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculationRaceRetry
 # ---------------------------------------------------------------------------
 
