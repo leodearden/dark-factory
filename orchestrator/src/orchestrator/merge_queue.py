@@ -3381,6 +3381,7 @@ class InflightEntry:
     passthrough_outcome: MergeOutcome | None = None
     verify_result: VerifyResult | None = None  # None = pass; VerifyResult = fail/skip
     status: str | None = None               # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
+    started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
 
 
 @dataclass
@@ -5131,32 +5132,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'lane': lane if lane is not None else req.lane,
             }
 
-        # 1. Verifier-current item (head-of-line)
-        if self._verify_item is not None:
-            item = self._verify_item
-            state = self._verify_phase or 'verifying'
-            entries.append(_entry(
-                item.request, state,
-                worktree_path=item.merge_wt,
-                position=len(entries),
-            ))
-
-        # 1b. Additional in-flight entries (multi-host only).
-        # With single-host _inflight has ≤1 entry (already covered by _verify_item).
-        # With multi-host there may be more — surface them as 'verifying' entries.
-        # De-duplicate by task_id so the head is never double-counted regardless
-        # of which item _verify_item currently points to.
-        _snapshot_seen_task_ids = {e['task_id'] for e in entries}
+        # 1. In-flight verify entries: iterate self._inflight head-first.
+        # self._inflight is the sole source of truth for concurrent-verify state.
+        # The singular self._verify_item/_verify_phase are no longer read here
+        # (they are set but never cleared after γ, causing a stale phantom entry).
+        # Each entry carries host (from lease.name), started_at (dispatch time ≈
+        # verify start), and phase (per-entry authoritative source under multi-host).
         for _infl in self._inflight:
             _infl_req = _infl.item.request
-            if _infl_req.task_id not in _snapshot_seen_task_ids:
-                entries.append(_entry(
-                    _infl_req,
-                    _infl.phase or 'verifying',
-                    worktree_path=_infl.merge_wt,
-                    position=len(entries),
-                ))
-                _snapshot_seen_task_ids.add(_infl_req.task_id)
+            _host = _infl.lease.name if _infl.lease is not None else None
+            _e = _entry(
+                _infl_req,
+                _infl.phase or 'verifying',
+                worktree_path=_infl.merge_wt,
+                position=len(entries),
+            )
+            _e['host'] = _host
+            _e['verify_started_at'] = _infl.started_at
+            _e['verify_age_secs'] = (
+                max(0.0, now - _infl.started_at)
+                if _infl.started_at is not None else None
+            )
+            entries.append(_e)
 
         # 2. Awaiting-verify items from the verifier queue (skip None sentinel)
         # Accessing asyncio.Queue._queue (the internal deque) directly — a CPython
@@ -7748,6 +7745,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         was_speculative=item_was_speculative,
                         phase='passthrough',
                         passthrough_outcome=item.immediate_outcome,
+                        started_at=time.time(),
                     )
 
         # Propagate chain-invalidation flag for the next dispatch call.
@@ -7797,6 +7795,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             merge_wt=item.merge_wt,
             was_speculative=item_was_speculative,
             phase='verifying',
+            started_at=time.time(),
         )
 
     async def _verify_and_advance(self, item: SpeculativeItem) -> bool:
@@ -7857,6 +7856,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             merge_wt=item.merge_wt,
             was_speculative=False,  # shim does not manage the speculation slot
             phase='verifying',
+            started_at=time.time(),
         )
 
         return await self._finalize_inflight(entry)

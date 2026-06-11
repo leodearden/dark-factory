@@ -18927,11 +18927,10 @@ class TestEntryPhaseDuringFinalize:
 
         branch = 'ep-finalize-a'
         wt = await _make_branch_with_file(git_ops, branch, 'ep_a.py', 'x=1\n')
-        loop = asyncio.get_event_loop()
         req = MergeRequest(
             task_id=branch, branch=branch, worktree=wt, pre_rebased=False,
             task_files=None, module_configs=[], config=config,
-            result=loop.create_future(), lane='normal',
+            result=asyncio.get_running_loop().create_future(), lane='normal',
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
