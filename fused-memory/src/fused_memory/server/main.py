@@ -72,9 +72,12 @@ _CLEANUP_STEP_TIMEOUT = 5.0
 # +harness_cancel(25)+memory_close(5)+journal_close(5) = 55s; +20s headroom = 75.
 _FORCE_EXIT_BUDGET = 75.0
 
-# systemd watchdog heartbeat interval. Must be comfortably less than
-# WatchdogSec in the unit file (we use 30s there) so a single missed tick
-# doesn't trigger a restart.
+# systemd watchdog heartbeat interval. The dedicated OS thread
+# (_watchdog_thread_loop, task 1731 root-cause fix) pings every
+# _WATCHDOG_INTERVAL independent of asyncio loop scheduling, so a
+# busy/blocked loop cannot delay the ping past WatchdogSec.
+# WatchdogSec=120 in the committed unit template; this interval is
+# intentionally 12× smaller to give plenty of margin.
 _WATCHDOG_INTERVAL = 10.0
 
 # Periodic WAL TRUNCATE checkpoint interval. The 2026-05-13 incident
@@ -862,7 +865,6 @@ async def run_server():
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
 
-    watchdog_task: asyncio.Task[None] | None = None
     # recon_report_state already initialized above (PRD γ, task 1546 step-12)
     server: Any | None = None  # primary uvicorn.Server
     recon_server: Any | None = None  # uvicorn.Server for the 2nd port
@@ -926,15 +928,12 @@ async def run_server():
                 _make_operator_stop_callback(server, recon_server),
             )
 
-            # Systemd watchdog heartbeat: ping every _WATCHDOG_INTERVAL so a
-            # wedged asyncio loop (no ticks) triggers a restart via
-            # WatchdogSec in the unit file. No-op when NOTIFY_SOCKET unset.
-            async def _watchdog_heartbeat() -> None:
-                while True:
-                    _sd_notify('WATCHDOG=1')
-                    await asyncio.sleep(_WATCHDOG_INTERVAL)
-
-            watchdog_task = asyncio.create_task(_watchdog_heartbeat())
+            # Systemd watchdog heartbeat: dedicated OS thread pings every
+            # _WATCHDOG_INTERVAL independent of asyncio loop scheduling
+            # (task 1731 root-cause fix — on-loop coroutine was silenced by
+            # a busy loop, causing systemd SIGABRT ~6-8x/day). No-op when
+            # NOTIFY_SOCKET unset.
+            _start_watchdog_thread()
 
             await recon_report_state.start_reaper()
             logger.info(
@@ -995,10 +994,7 @@ async def run_server():
             recon_server.should_exit = True
             with contextlib.suppress(BaseException):
                 await recon_server.shutdown()
-        if watchdog_task is not None:
-            watchdog_task.cancel()
-            with contextlib.suppress(BaseException):
-                await watchdog_task
+        _stop_watchdog_thread()
         if janitor_task is not None:
             janitor_task.cancel()
             with contextlib.suppress(BaseException):
