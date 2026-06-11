@@ -4,13 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
-# PyPI name `jcodemunch-mcp` was quarantined (admin review #308, ~2026-05-30) →
-# bare `uvx jcodemunch-mcp` 404s. Pinned to the git source until PyPI is restored.
-# v1.108.27 is the latest-stable line (index-schema matches existing on-disk indexes);
-# the v2.x git tags are an OLDER/divergent line (older index schema) despite the
-# higher semver — do NOT pin 2.x. Revert to `--with "jcodemunch-mcp[watch]"` once
-# `uvx jcodemunch-mcp` resolves from PyPI again.
-ExecStart=__UV_PATH__x --python 3.12 --from "jcodemunch-mcp[watch] @ git+https://github.com/jgravelle/jcodemunch-mcp.git@v1.108.27" \
+# PyPI was quarantined 2026-05-30 (admin review #308) and restored 2026-06-11.
+# Back on PyPI with an EXACT pin — supply-chain history means no floating
+# versions: bump deliberately after verifying the sdist matches the upstream git
+# tag (1.108.54 verified identical modulo CRLF, 2026-06-11) and INDEX_VERSION is
+# unchanged (v16 — no forced re-index). The v2.x git tags are an OLDER/divergent
+# line (index-schema v8) despite the higher semver — do NOT pin 2.x.
+ExecStart=__UV_PATH__x --python 3.12 --from "jcodemunch-mcp[watch]==1.108.54" \
   jcodemunch-mcp watch-claude \
   --repos __REPO_ROOT__
 
