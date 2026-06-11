@@ -14,9 +14,17 @@ ExecStart=__UV_PATH__x --python 3.12 --from "jcodemunch-mcp[watch] @ git+https:/
   jcodemunch-mcp watch-claude \
   --repos __REPO_ROOT__
 
-# Restart policy: always restart on failure, back off up to 60s
-Restart=on-failure
+# Restart policy: Restart=always, NOT on-failure. watch-claude is a daemon that
+# should never stay down, but it exits 0 on more than just signals: its main loop
+# is asyncio.wait(FIRST_COMPLETED) over the repos-poller/manifest-watcher tasks,
+# so an exception that kills a management task is swallowed and the process
+# shuts down "cleanly" (observed 2026-05-30: exit 0/SUCCESS after 1h42m, then
+# 12 days down because on-failure never re-fired).
+# RestartSteps makes RestartMaxDelaySec effective (without it systemd warns and
+# ignores the cap): backoff 5s -> 60s over 4 steps.
+Restart=always
 RestartSec=5
+RestartSteps=4
 RestartMaxDelaySec=60
 
 # Logging goes to journalctl --user -u jcodemunch-watcher
