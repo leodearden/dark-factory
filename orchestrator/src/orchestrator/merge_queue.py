@@ -5422,6 +5422,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             except asyncio.QueueEmpty:
                 break
 
+        # Re-drain main queue: under operator halt, _dispatch_item returns
+        # REQUEUED_PREDISPATCH and calls _queue.put_nowait(req) without resolving
+        # the future.  If the verifier processed a SpeculativeItem during the
+        # asyncio.wait() above (step G), the req landed back on _queue after the
+        # initial drain (step A) was already done.  A second drain catches those.
+        while not self._queue.empty():
+            try:
+                req_post = self._queue.get_nowait()
+                if req_post is not None and not req_post.result.done():
+                    req_post.result.set_result(shutdown)
+            except asyncio.QueueEmpty:
+                break
+
         # Check _inflight_req: if the merger was still blocked inside merge_to_main
         # when asyncio.wait() timed out, it still holds _inflight_req.  Resolve the
         # Future now so the caller doesn't hang forever.
