@@ -27,6 +27,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
     invoke_with_cap_retry,
+    is_zero_output_timeout,
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
@@ -227,6 +228,11 @@ class _BriefingLike(Protocol):
     ) -> str: ...
 
 logger = logging.getLogger(__name__)
+
+# Reason string used when the fresh-invocation zero-output circuit breaker trips.
+# Mirrors the _inherited_break_info pattern: set by _execute_iterations, consumed
+# at the BLOCKED route in _execute_verify_review_loop (task 1739).
+ZERO_OUTPUT_HANG_REASON = 'infra: zero-output CLI hang (consecutive fresh-invocation timeouts)'
 
 
 class WorkflowState(enum.Enum):
@@ -547,6 +553,16 @@ class TaskWorkflow:
         # from main (preexisting break).  Read at the call site (run()) to route
         # _mark_blocked with dedupe_fingerprint instead of the generic reason.
         self._inherited_break_info: dict | None = None
+        # Set by the zero-output circuit breaker in _execute_iterations when
+        # max_consecutive_zero_output_timeouts consecutive fresh-invocation
+        # timeouts are detected.  Read by _execute_verify_review_loop to route
+        # _mark_blocked with the distinct infra_issue reason instead of the
+        # generic 'Execution iterations exhausted' (task 1739).
+        self._zero_output_hang_info: dict | None = None
+        # When True, the finally-block config-dir cleanup is skipped so the
+        # preserved dir can be used for forensic analysis.  Set alongside
+        # _zero_output_hang_info when the circuit breaker trips (task 1739).
+        self._preserve_config_dir: bool = False
         # Per-run history of (category, normalised cause_hint) tuples for the
         # signature-repetition guard.  Ephemeral — intentionally not persisted
         # in task metadata because the verify loop is wholly within one
@@ -3454,6 +3470,17 @@ class TaskWorkflow:
             if exec_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
             if exec_outcome == WorkflowOutcome.BLOCKED:
+                # Zero-output hang: use the distinct infra_issue reason instead
+                # of the generic 'Execution iterations exhausted' so the escalation
+                # is classified correctly and ops can distinguish deterministic
+                # CLI wedges from real task failures (task 1739).
+                if self._zero_output_hang_info is not None:
+                    info = self._zero_output_hang_info
+                    return await self._mark_blocked(
+                        info['reason'],
+                        detail=info['detail'],
+                        category='infra_issue',
+                    )
                 return await self._mark_blocked('Execution iterations exhausted')
 
             # VERIFY + DEBUGFIX loop
@@ -3573,6 +3600,10 @@ class TaskWorkflow:
     async def _execute_iterations(self) -> WorkflowOutcome:
         """Run implementer iterations until plan is complete."""
         assert self.worktree is not None and self.artifacts is not None
+        # Zero-output hang circuit breaker: reset each time _execute_iterations
+        # is entered.  Counts CONSECUTIVE zero-output CLI timeouts; any non-zero-
+        # output result resets it.  Threshold: config.max_consecutive_zero_output_timeouts.
+        consecutive_zero_output = 0
         while self.artifacts.get_pending_steps():
             if self.metrics.execute_iterations >= self.config.max_execute_iterations:
                 return WorkflowOutcome.BLOCKED
@@ -3679,6 +3710,43 @@ class TaskWorkflow:
                     f'Task {self.task_id}: implementer iteration '
                     f'{self.metrics.execute_iterations} failed'
                 )
+
+            # --- Zero-output hang circuit breaker ---
+            # Detect consecutive fresh-invocation CLI hangs (reify-4429 pattern):
+            # the subprocess produced ZERO output for the full timeout, meaning
+            # the CLI never started real work.  Retrying identically burns time
+            # (~20 min/iteration × threshold) with no chance of progress.
+            if is_zero_output_timeout(result):
+                consecutive_zero_output += 1
+                # Evidence capture (step-10 wires _capture_zero_output_evidence here).
+                if consecutive_zero_output >= self.config.max_consecutive_zero_output_timeouts:
+                    self._zero_output_hang_info = {
+                        'reason': ZERO_OUTPUT_HANG_REASON,
+                        'detail': (
+                            f'consecutive_zero_output={consecutive_zero_output} '
+                            f'iteration={self.metrics.execute_iterations} '
+                            f'duration_ms={result.duration_ms} '
+                            f'subtype={result.subtype!r} '
+                            f'evidence: .task/zero_output_evidence-iter*.json'
+                        ),
+                    }
+                    self._preserve_config_dir = True
+                    logger.error(
+                        'Task %s: zero-output hang circuit breaker tripped after %d '
+                        'consecutive fresh-invocation timeouts — blocking as infra_issue',
+                        self.task_id, consecutive_zero_output,
+                    )
+                    return WorkflowOutcome.BLOCKED
+                logger.warning(
+                    'Task %s: zero-output CLI timeout (%d/%d consecutive) — '
+                    'will retry; recycling config dir if enabled',
+                    self.task_id, consecutive_zero_output,
+                    self.config.max_consecutive_zero_output_timeouts,
+                )
+                continue  # skip judge on zero-output; increment next iteration
+            else:
+                # Non-zero-output result: reset the consecutive counter.
+                consecutive_zero_output = 0
 
             # --- Judge: decide whether to exit early (ζ) ---
             # Opt-in via config.judge_after_each_iteration (default False).
