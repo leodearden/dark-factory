@@ -28,25 +28,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
-from orchestrator.verify_runner import HostAllocator, RunnerUnavailable
-
 # Reuse the γ harness fakes/fixtures (established cross-test-module import pattern).
 from test_merge_queue_concurrent_verify import (
     _gated_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
     _make_config_no_runners,
-    _make_config_with_runner,
     _make_fake_remote,
-    _make_request,
     _mock_verify_result,
-    config,
-    git_config,
-    git_ops,
-    git_repo,
+    config,  # noqa: F401 — pytest fixture re-exported from γ harness
+    git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
+    git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
+    git_repo,  # noqa: F401 — pytest fixture re-exported from γ harness
 )
 
+from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
+from orchestrator.verify_runner import RunnerUnavailable
 
 # ---------------------------------------------------------------------------
 # Local helpers
@@ -695,7 +692,7 @@ class TestB4CancelBehavior:
             await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
 
             gate_a_release.set()   # N fails → cascade
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            await asyncio.wait_for(req_a.result, timeout=15.0)
 
             gate_b_release.set()   # release leaked inner task
             outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
