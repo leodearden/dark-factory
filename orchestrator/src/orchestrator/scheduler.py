@@ -256,8 +256,11 @@ def is_transient_rejection(rejection: str | None) -> bool:
 
 
 # Marker produced solely by shared.cli_invoke.classify_agent_failure for
-# AgentFailureKind.API_ERROR (cli_invoke.py:362-366).  All phases wrap it
-# verbatim into block_reason (workflow.py:2222/2298/2599).
+# AgentFailureKind.API_ERROR (cli_invoke.py:362-366).  The planning and
+# execution phases write it into block_reason (workflow.py:2222/2298);
+# _run_simple_task (workflow.py:2599) uses it only as an internal REQUEUED
+# fall-through sentinel and does NOT write block_reason directly — that is
+# done later by the architect phase (workflow.py:2222/2298).
 _API_ERROR_REASON_RE = re.compile(r'agent API error: HTTP (\d{3})')
 
 
@@ -269,6 +272,13 @@ def is_transient_api_requeue(reason: str | None) -> bool:
     (500-599, including 529 Overloaded) as transient.  HTTP 4xx (client/auth
     errors) and non-API reasons return False and still count against
     ``requeue_cap``.
+
+    Note: HTTP 429 (rate-limit / too-many-requests) is intentionally
+    classified as non-transient.  Unlike a server-side 5xx overload that
+    resolves on its own, a 429 signals a quota or rate-limiting configuration
+    problem that benefits from human review.  To change this policy, also
+    update the ``test_false_for_non_transient`` parametrize list and the
+    design decision in plan.json.
     """
     if not reason:
         return False
