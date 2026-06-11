@@ -8196,6 +8196,43 @@ class TestEnsureVerifyDiskSpace:
         assert reason is None
         gops.prune_stale_merge_worktrees.assert_awaited_once()
 
+    async def test_keep_worktrees_unioned_with_merge_wt_forwarded_to_prune(
+        self, tmp_path: Path,
+    ):
+        """keep_worktrees is unioned with merge_wt and the combined set is
+        forwarded to prune_stale_merge_worktrees as the keep= argument."""
+        gops = self._git_ops(pruned=[])
+        merge_wt = tmp_path / '_merge-active'
+        l1 = tmp_path / '_merge-l1'
+        l2 = tmp_path / '_merge-l2'
+        with patch(
+            'orchestrator.merge_queue.shutil.disk_usage',
+            side_effect=[_usage(2 * _GIB), _usage(15 * _GIB)],
+        ):
+            reason = await _ensure_verify_disk_space(
+                gops, merge_wt, 10 * _GIB, 't1', keep_worktrees={l1, l2},
+            )
+        assert reason is None
+        call_kwargs = gops.prune_stale_merge_worktrees.await_args.kwargs
+        assert call_kwargs['keep'] == {merge_wt, l1, l2}
+
+    async def test_default_keep_worktrees_prunes_only_merge_wt(
+        self, tmp_path: Path,
+    ):
+        """Default keep_worktrees=None → keep-set == {merge_wt} (regression)."""
+        gops = self._git_ops(pruned=[])
+        merge_wt = tmp_path / '_merge-active'
+        with patch(
+            'orchestrator.merge_queue.shutil.disk_usage',
+            side_effect=[_usage(2 * _GIB), _usage(15 * _GIB)],
+        ):
+            reason = await _ensure_verify_disk_space(
+                gops, merge_wt, 10 * _GIB, 't1',
+            )
+        assert reason is None
+        call_kwargs = gops.prune_stale_merge_worktrees.await_args.kwargs
+        assert call_kwargs['keep'] == {merge_wt}
+
 
 @pytest.mark.asyncio
 class TestPreVerifyDiskGuardWiring:
