@@ -8002,6 +8002,25 @@ class TestPruneStaleMergeWorktrees:
         assert not b.exists()
         assert task_wt.exists()
 
+    async def test_keep_set_protects_all_members_removes_only_orphan(
+        self, git_ops: GitOps,
+    ):
+        """Passing a SET of paths to keep= protects all members; only the
+        orphan (outside the set) is removed.  Task worktrees are never touched
+        regardless of the keep-set."""
+        keep_a, _ = await git_ops._create_merge_worktree()
+        keep_b, _ = await git_ops._create_merge_worktree()
+        orphan, _ = await git_ops._create_merge_worktree()
+        task_wt = (await git_ops.create_worktree('task-live')).path
+
+        removed = await git_ops.prune_stale_merge_worktrees(keep={keep_a, keep_b})
+
+        assert len(removed) == 1
+        assert not orphan.exists()
+        assert keep_a.exists()
+        assert keep_b.exists()
+        assert task_wt.exists()
+
 
 @pytest.mark.asyncio
 class TestEnospcTransientInfraRetry:
