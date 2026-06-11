@@ -10566,12 +10566,20 @@ class TestRemergeTreePinnedSkip:
     async def test_noop_remerge_preserves_skip(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """(a) No-op re-merge: main unchanged → tree identical → skip_verify=True.
+        """(a) No-op re-merge: even when tree is unchanged, skip_verify must be False.
 
-        A chain_invalidated/previous_failed re-merge where no sibling landed
-        since the last verify produces the same tree (the --no-ff commit has
-        different timestamps but identical content).  skip_verify must be True
-        to avoid a throughput regression on the no-op path.
+        task-1724: the tree-SHA-pinned skip is removed entirely.  A re-merge whose
+        tree equals the previously-verified tree must STILL run the merge gate —
+        the skip was unsound (it treated a narrower task-level verify as equivalent
+        to the full merge gate).
+
+        The call keeps the OLD kwargs shape (force_verify=False, prev_skip_verify=True,
+        prev_merge_tree=T1) so the test is RED on current code: current _remerge
+        returns skip_verify=True for a no-op re-merge with those kwargs.
+        In step-6 the kwargs are removed and the call is simplified to _remerge(req, None).
+
+        RED on current code: returns skip_verify=True → assertion fails.
+        GREEN after step-6: skip_verify always False.
         """
         wt = await _make_branch_with_file(git_ops, 'tp-a', 'file_tp_a.py', 'a = 1\n')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -10590,22 +10598,35 @@ class TestRemergeTreePinnedSkip:
         assert probe.merge_worktree is not None
         await git_ops.cleanup_merge_worktree(probe.merge_worktree)
 
-        # Re-merge (no-op): main unchanged → new merge commit has tree T1 again.
+        # Re-merge (no-op): main unchanged → same tree, but skip must NOT be honored.
         item = await worker._remerge(
             req, None,
             force_verify=False, prev_skip_verify=True, prev_merge_tree=T1,
         )
-        if item.merge_wt:
-            await git_ops.cleanup_merge_worktree(item.merge_wt)
 
         assert item.immediate_outcome is None, (
             f'Expected flowing item; got {item.immediate_outcome}'
         )
-        assert item.skip_verify is True, (
-            f'No-op re-merge (tree unchanged): expected skip_verify=True to '
-            f'preserve the no-op skip; got skip_verify={item.skip_verify}.  '
-            f'Over-correcting to a blanket verify would regress throughput.'
+        # task-1724: no-op re-merge must NOT skip the merge gate.
+        assert item.skip_verify is False, (
+            f'No-op re-merge (tree unchanged): expected skip_verify=False — '
+            f'the tree-SHA-pinned skip is removed (task-1724); got '
+            f'skip_verify={item.skip_verify}.  '
+            f'A no-op re-merge must still run the merge gate.'
         )
+
+        # Behavioural check: _verify_and_advance must invoke run_scoped_verification.
+        mock_verify = AsyncMock(return_value=MagicMock(passed=True, summary=''))
+        with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced is True
+        assert mock_verify.called, (
+            'run_scoped_verification must be invoked for a no-op re-merge '
+            '(skip_verify=False); verification was skipped.'
+        )
+        if item.merge_wt:
+            await git_ops.cleanup_merge_worktree(item.merge_wt)
 
     async def test_tree_change_forces_verify(
         self, git_ops: GitOps, config: OrchestratorConfig,
