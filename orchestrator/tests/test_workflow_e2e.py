@@ -7151,6 +7151,38 @@ class TestBuildAgentEnvJobserver:
 
         assert workflow._build_agent_env(ARCHITECT) is None
 
+    async def test_implementer_env_overrides_and_jobserver_coexist(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """IMPLEMENTER merges env_overrides, REIFY_DEBUG_PORT, and CARGO_MAKEFLAGS.
+
+        All three sources must coexist in the returned dict.  When env_overrides
+        contains the same key as the jobserver env (CARGO_MAKEFLAGS), the
+        jobserver value wins because it is merged last.
+        """
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        # env_overrides with a custom key AND a deliberate collision on CARGO_MAKEFLAGS
+        workflow.config.env_overrides = {
+            'MY_CUSTOM_VAR': 'custom_value',
+            'CARGO_MAKEFLAGS': 'stale-value',  # jobserver should win over this
+        }
+        workflow._reify_debug_port = 39411
+
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+
+        # Custom env_overrides key survives
+        assert env.get('MY_CUSTOM_VAR') == 'custom_value'
+
+        # REIFY_DEBUG_PORT from _reify_debug_port survives
+        assert env.get('REIFY_DEBUG_PORT') == '39411'
+
+        # Jobserver env wins over the stale env_overrides value (merged last)
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
 
 if TYPE_CHECKING:
     from orchestrator.scheduler import Scheduler

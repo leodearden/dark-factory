@@ -457,6 +457,14 @@ class JobserverConfig(BaseModel):
         Mirrors shell ``[ -p "$FIFO" ]``: a stale regular file or missing path
         returns {} rather than injecting a broken --jobserver-auth value that
         would wedge cargo.
+
+        TOCTOU note: the FIFO is stat-checked here but consumed by cargo later.
+        If the FIFO disappears between the check and the subprocess spawn,
+        cargo receives a stale ``--jobserver-auth`` value.  Per cargo's
+        documented behaviour this causes it to fall back to unbounded
+        parallelism (equivalent to ``-j$(nproc)``) rather than hanging, so
+        the failure mode is over-subscription — the same state as having no
+        jobserver at all — not a deadlock.
         """
         if not self.enabled:
             return {}
