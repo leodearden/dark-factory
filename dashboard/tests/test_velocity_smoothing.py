@@ -189,7 +189,7 @@ class TestDeriveVelocitySeries:
     def test_regular_10min_spacing_non_uniform_is_non_constant(self):
         # 145 samples at 10-min spacing; done rises in bursts → output must vary.
         import datetime
-        base = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+        base = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
         labels = [
             (base + datetime.timedelta(minutes=10 * i)).strftime('%Y-%m-%dT%H:%M:%SZ')
             for i in range(145)
