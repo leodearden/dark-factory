@@ -7057,6 +7057,126 @@ class TestDryRunUnblockE2EGuardOptIn:
         assert result is None
 
 
+# ---------------------------------------------------------------------------
+# Tests: _build_agent_env jobserver wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBuildAgentEnvJobserver:
+    """Unit tests for TaskWorkflow._build_agent_env with jobserver config."""
+
+    def _make_workflow(self, config, git_ops, task_assignment):
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        return workflow
+
+    async def test_architect_receives_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
+        """ARCHITECT gets CARGO_MAKEFLAGS when jobserver enabled and FIFO present."""
+        import os
+        from orchestrator.agents.roles import ARCHITECT
+        from orchestrator.config import JobserverConfig
+
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        env = workflow._build_agent_env(ARCHITECT)
+        assert env is not None
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+    async def test_implementer_receives_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
+        """IMPLEMENTER gets CARGO_MAKEFLAGS when jobserver enabled and FIFO present."""
+        import os
+        from orchestrator.agents.roles import IMPLEMENTER
+        from orchestrator.config import JobserverConfig
+
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+    async def test_debugger_receives_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
+        """DEBUGGER gets CARGO_MAKEFLAGS when jobserver enabled and FIFO present."""
+        import os
+        from orchestrator.agents.roles import DEBUGGER
+        from orchestrator.config import JobserverConfig
+
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        env = workflow._build_agent_env(DEBUGGER)
+        assert env is not None
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+    async def test_merger_returns_none(self, config, git_ops, task_assignment, tmp_path):
+        """MERGER returns None even when jobserver is enabled."""
+        import os
+        from orchestrator.agents.roles import MERGER
+        from orchestrator.config import JobserverConfig
+
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        assert workflow._build_agent_env(MERGER) is None
+
+    async def test_judge_returns_none(self, config, git_ops, task_assignment, tmp_path):
+        """JUDGE returns None even when jobserver is enabled."""
+        import os
+        from orchestrator.agents.roles import JUDGE
+        from orchestrator.config import JobserverConfig
+
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        assert workflow._build_agent_env(JUDGE) is None
+
+    async def test_architect_no_reify_debug_port(self, config, git_ops, task_assignment, tmp_path):
+        """ARCHITECT carries CARGO_MAKEFLAGS but NOT REIFY_DEBUG_PORT."""
+        import os
+        from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER
+        from orchestrator.config import JobserverConfig
+
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        workflow._reify_debug_port = 39411
+
+        arch_env = workflow._build_agent_env(ARCHITECT)
+        assert arch_env is not None
+        assert 'CARGO_MAKEFLAGS' in arch_env
+        assert 'REIFY_DEBUG_PORT' not in arch_env
+
+        impl_env = workflow._build_agent_env(IMPLEMENTER)
+        assert impl_env is not None
+        assert 'CARGO_MAKEFLAGS' in impl_env
+        assert impl_env.get('REIFY_DEBUG_PORT') == '39411'
+
+    async def test_fifo_absent_architect_returns_none(self, config, git_ops, task_assignment, tmp_path):
+        """FIFO-absent → ARCHITECT returns None (no jobserver env injected)."""
+        from orchestrator.agents.roles import ARCHITECT
+        from orchestrator.config import JobserverConfig
+
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(
+            enabled=True, task_fifo=str(tmp_path / 'nonexistent.fifo'),
+        )
+
+        assert workflow._build_agent_env(ARCHITECT) is None
+
+
 if TYPE_CHECKING:
     from orchestrator.scheduler import Scheduler
     from orchestrator.workflow import _SchedulerLike
