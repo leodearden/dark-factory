@@ -565,6 +565,19 @@ class CuratorConfig(BaseModel):
     # Background janitor that surfaces failed tickets to the orchestrator.
     janitor: TicketJanitorConfig = Field(default_factory=TicketJanitorConfig)
 
+    # Zero-output-timeout (ZOT) circuit-breaker watchdog.
+    # Root cause: transient Anthropic-backend degradation on the curator's
+    # sonnet+json-schema call shape (task 1550). Each hang burns the full
+    # timeout_seconds (180s); the breaker stops every call burning that cost
+    # during a sustained outage while preserving the best-effort
+    # degrade-to-create contract.
+    # Open after this many CONSECUTIVE ZOT curator LLM failures (reset on
+    # any success or on a non-ZOT failure).
+    zero_output_breaker_threshold: int = Field(default=2, ge=1)
+    # How long the breaker stays open / short-circuits to action='create'
+    # before allowing a half-open probe.
+    zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
+
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching
     # candidates are dropped before any LLM call. None disables the guard.
