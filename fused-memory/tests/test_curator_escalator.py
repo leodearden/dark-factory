@@ -336,3 +336,68 @@ class TestSchemaToolDeniedEscalation:
             assert 'shared/cli_invoke.py' in body
         finally:
             handle.close()
+
+
+class TestZeroOutputTimeoutEscalation:
+    """Step-3 RED: a zero-output/full-timeout hang is a distinct INFRA event,
+    not a flaky candidate.  It must ALWAYS surface (bypassing the 1-hour burst
+    window) with a self-describing summary + forensic evidence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bypasses_burst_suppression(self, tmp_path):
+        """Even as the 4th failure in the window, a ZOT failure still enqueues."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            # Exhaust the window with three ordinary failures.
+            for _ in range(3):
+                await escalator.report_failure(
+                    project_root=str(tmp_path), project_id='proj-z',
+                    justification='ordinary', candidate_title='T',
+                )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 3
+            # A normal 4th would be suppressed; ZOT must NOT be.
+            await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-z',
+                justification='ZOT x4', candidate_title='T',
+                zero_output_timeout=True,
+                account_name='max-g',
+                proc_tree='TREE-XYZ',
+                timed_out=True,
+                duration_ms=181_600,
+            )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 4
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_distinct_summary_and_evidence(self, tmp_path):
+        """ZOT escalation body: distinct summary + category + forensic evidence."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-z',
+                justification='ZOT', candidate_title='T',
+                zero_output_timeout=True,
+                account_name='max-g',
+                proc_tree='TREE-XYZ',
+                timed_out=True,
+                duration_ms=181_600,
+            )
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 1
+            body = files[0].read_text()
+            # Distinct summary — must be unmistakable vs generic 'curator LLM failing'.
+            assert 'zero-output' in body or 'full-timeout' in body or 'infra hang' in body.lower()
+            # Distinct category.
+            assert 'curator_zero_output_hang' in body
+            # Forensic evidence.
+            assert 'max-g' in body
+            assert 'TREE-XYZ' in body
+            assert '181600' in body
+        finally:
+            handle.close()
