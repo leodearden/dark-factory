@@ -1237,6 +1237,42 @@ class TestProactiveSampling:
             "str(task_id)} so the deterministic suppression count has a writer."
         )
 
+    def test_stage2_prompt_reverifies_reconstruction_before_carry_forward(self):
+        """Stage 2 prompt must instruct agents to re-check Path-2 count AFTER a reconstruction write.
+
+        Regression for stage2_report_before_write_ordering_bug (run 401766c4, know_live,
+        2026-06-12): Stage 2 was drafting the carry-forward finding from the PRE-write
+        Path-2 count (0 by definition, since that is why it reconstructs). That caused
+        an already-resolved finding to be re-emitted as UNRESOLVED every following cycle.
+
+        The fix adds a section to STAGE2_SYSTEM_PROMPT instructing: after the
+        reconstruction add_memory write, RE-RUN the Path-2 count_memories_by_metadata;
+        only carry forward the finding if the count is STILL 0 after the write.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'report-before-write ordering' in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must contain the section anchor '
+            '"report-before-write ordering" to document the bug being fixed.'
+        )
+        assert 'stage2_report_before_write_ordering_bug' in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must name the flag_type '
+            '"stage2_report_before_write_ordering_bug" to tie the instruction '
+            'to the documented finding.'
+        )
+        assert 'AFTER your reconstruction' in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must instruct that the Path-2 re-check happens '
+            'AFTER the reconstruction add_memory write, not before.'
+        )
+        assert 'STILL 0 after the write' in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must state that carry-forward is only valid '
+            'when the count is STILL 0 after the write.'
+        )
+        assert 'emit the finding as RESOLVED' in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must instruct agents to emit the finding as '
+            'RESOLVED (or omit it) when the post-write count is > 0.'
+        )
+
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
