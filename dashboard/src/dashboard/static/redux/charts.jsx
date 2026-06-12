@@ -369,4 +369,16 @@ function HistBar({ values, maxOverride, height = 50, color = PALETTE.accent }) {
   );
 }
 
-window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar };
+const SMOOTHING_OPTIONS = ['1h', '2h', '4h', '8h', '1d', '3d'];
+
+function smoothingLabelToSeconds(label) {
+  const map = { '1h': 3600, '2h': 7200, '4h': 14400, '8h': 28800, '1d': 86400, '3d': 259200 };
+  return map[label] ?? null;
+}
+
+function defaultSmoothingForWindow(windowKey) {
+  const map = { '24h': '2h', '7d': '8h', '30d': '1d', '90d': '3d' };
+  return map[windowKey] ?? '8h';
+}
+
+window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow };

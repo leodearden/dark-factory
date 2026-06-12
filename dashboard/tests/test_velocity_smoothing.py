@@ -20,25 +20,37 @@ CHARTS_PATH = str(
     pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux/charts.jsx'
 )
 
-# Node driver: loads charts.jsx in a vm sandbox, calls a named export as a
-# function (when argsJson is provided) or reads it as a property (when absent).
+# Node driver: extracts the pure-JS helper section from charts.jsx (no JSX) and
+# runs it in a vm sandbox.  The helpers live between the `const SMOOTHING_OPTIONS`
+# line and the `window.DF_CHARTS` export line — no JSX appears in that section.
+#
+# With `node -e CODE arg1 arg2`, process.argv is [node, arg1, arg2] (no [eval] slot).
 _DRIVER = r"""
 const vm = require('vm');
 const fs = require('fs');
-const src = fs.readFileSync(process.argv[2], 'utf8');
-const sandbox = {
-  React: { useRef: ()=>{}, useEffect: ()=>{}, useState: ()=>[], useMemo: ()=>{} },
-  window: {},
-  Math, console, Date,
-};
-vm.runInNewContext(src, sandbox);
-const charts = sandbox.window.DF_CHARTS;
-const name = process.argv[3];
-const argsJson = process.argv[4];
-const result = argsJson !== undefined
-  ? charts[name](...JSON.parse(argsJson))
-  : charts[name];
-process.stdout.write(JSON.stringify(result) + '\n');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+
+// Extract the pure-JS helpers between our start marker and the DF_CHARTS export.
+const startIdx = src.indexOf('\nconst SMOOTHING_OPTIONS');
+const endIdx   = src.lastIndexOf('\nwindow.DF_CHARTS');
+if (startIdx < 0) throw new Error('SMOOTHING_OPTIONS not found — has step-2 run?');
+const helpersSrc = src.slice(startIdx + 1, endIdx > startIdx ? endIdx : undefined);
+
+const name    = process.argv[2];
+const argsJson = process.argv[3];
+
+// Pass parsed args as a sandbox global so the vm script can spread them.
+const sandbox = { Math, console, Date };
+if (argsJson !== undefined) sandbox.__args = JSON.parse(argsJson);
+
+// `function` declarations become sandbox properties; `const` stays lexical but
+// is reachable within the same top-level vm script scope.
+const scriptBody = argsJson !== undefined
+  ? `var __result = ${name}(...__args);`
+  : `var __result = ${name};`;
+
+vm.runInNewContext(helpersSrc + '\n' + scriptBody, sandbox);
+process.stdout.write(JSON.stringify(sandbox.__result) + '\n');
 """
 
 
