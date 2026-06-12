@@ -3687,3 +3687,77 @@ class TestCancelledPremiseBlocklistPinsFixCRegression:
         assert hit is None, (
             f"Control fixture should NOT match blocklist, but hit: {hit}"
         )
+
+
+# step-9 RED: TestZeroOutputBreakerBatchPath
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestZeroOutputBreakerBatchPath:
+    """Step-9 RED: consecutive-ZOT circuit breaker also gates curate_batch_prepared.
+
+    The production path uses curate_batch_prepared; the breaker in curate() alone
+    would not stop every call from burning the full batch LLM round-trip during a
+    sustained hang window.  These tests confirm that curate_batch_prepared checks
+    the breaker BEFORE dispatching the LLM.
+    """
+
+    def _zot_result(self) -> AgentResult:
+        return AgentResult(
+            success=False, output='', subtype='error_empty_output',
+            timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+            proc_tree='<pgid tree>', account_name='max-g',
+        )
+
+    async def test_breaker_open_gates_batch_llm_calls(self):
+        """With breaker OPEN, curate_batch_prepared short-circuits all LLM-bound
+        candidates to action='create' without invoking invoke_with_cap_retry."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 1  # opens after 1 ZOT
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        # Feed one ZOT through curate() to open the breaker (threshold=1).
+        zot = self._zot_result()
+        mock_llm = AsyncMock(return_value=zot)
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            await curator.curate(
+                CandidateTask(title='Opener'), project_id='p', project_root='/x',
+            )
+        # Breaker is now open (threshold=1 consecutive ZOT reached).
+        call_count_before_batch = mock_llm.await_count  # == 1
+
+        # Build 2+ distinct PreparedCandidates (distinct payloads avoid cache hits).
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        c1 = CandidateTask(title='Batch candidate Alpha', description='alpha task details')
+        c2 = CandidateTask(title='Batch candidate Beta', description='beta task details')
+        prepared = [
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+            PreparedCandidate(candidate=c2, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+        ]
+
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id='p', project_root='/x',
+            )
+
+        # (a) Every returned decision must be action='create' (short-circuit).
+        assert len(decisions) == 2
+        for decision in decisions:
+            assert decision.action == 'create'
+            assert 'zero-output-breaker' in decision.justification
+
+        # (b) LLM must NOT have been invoked for the batch dispatch.
+        assert mock_llm.await_count == call_count_before_batch
