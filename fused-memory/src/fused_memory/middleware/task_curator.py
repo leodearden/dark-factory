@@ -837,6 +837,9 @@ class TaskCurator:
                     timed_out=exc.timed_out,
                     duration_ms=exc.duration_ms,
                     schema_tool_denied=exc.schema_tool_denied,
+                    zero_output_timeout=exc.zero_output_timeout,
+                    account_name=exc.account_name or None,
+                    proc_tree=exc.proc_tree or None,
                 )
             else:
                 logger.warning(

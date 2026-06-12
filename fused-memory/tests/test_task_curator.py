@@ -861,6 +861,97 @@ class TestCuratorCapHandling:
         assert kwargs['candidate_title'] == 'T'
 
 
+class TestZeroOutputTimeoutAcceptance:
+    """Step-5 RED/ACCEPTANCE: simulated hung subprocess does not wedge curator;
+    ZOT evidence is threaded into report_failure."""
+
+    @pytest.mark.asyncio
+    async def test_zot_degrades_to_create_and_threads_evidence_to_escalator(self):
+        """ZOT: curate() returns action='create' (best-effort preserved) AND
+        report_failure is called with zero_output_timeout=True + evidence."""
+        config = _make_config()
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        zot_result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_empty_output',
+            timed_out=True,
+            turns=0,
+            cost_usd=0.0,
+            duration_ms=181_000,
+            proc_tree='<pgid tree>',
+            account_name='max-g',
+        )
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=zot_result)):
+            result = await curator.curate(
+                CandidateTask(title='Candidate A'), project_id='p', project_root='/x',
+            )
+
+        # (a) Best-effort: curate() returns create, no exception.
+        assert result.action == 'create'
+        # (b) report_failure was called with ZOT evidence.
+        escalator.report_failure.assert_awaited_once()
+        kw = escalator.report_failure.await_args.kwargs
+        assert kw['zero_output_timeout'] is True
+        assert kw['account_name'] == 'max-g'
+        assert kw['proc_tree'] == '<pgid tree>'
+        assert kw['timed_out'] is True
+
+    @pytest.mark.asyncio
+    async def test_subsequent_curator_call_succeeds_after_zot(self):
+        """A ZOT does not wedge subsequent calls: call 1 = ZOT (create), call 2 = real decision."""
+        config = _make_config()
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        zot_result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_empty_output',
+            timed_out=True,
+            turns=0,
+            cost_usd=0.0,
+            duration_ms=181_000,
+            proc_tree='<pgid tree>',
+            account_name='max-g',
+        )
+        healthy_result = AgentResult(
+            success=True,
+            output='',
+            structured_output={'action': 'create', 'justification': 'ok'},
+        )
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        mock_llm = AsyncMock(side_effect=[zot_result, healthy_result])
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            result_a = await curator.curate(
+                CandidateTask(title='Candidate A'), project_id='p', project_root='/x',
+            )
+            # Use a distinct payload to avoid idempotency-cache interference.
+            result_b = await curator.curate(
+                CandidateTask(title='Candidate B'), project_id='p', project_root='/x',
+            )
+
+        # (c) No in-process wedge: second call goes through and returns the real decision.
+        assert result_a.action == 'create'
+        assert result_b.action == 'create'
+        assert mock_llm.await_count == 2
+
+
 class TestCurateHappyPath:
     @pytest.mark.asyncio
     async def test_create_flows_through_llm(self):
