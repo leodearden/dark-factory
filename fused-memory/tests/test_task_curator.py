@@ -699,6 +699,109 @@ class TestCurateFallbacks:
         assert kwargs['max_turns'] >= 3
 
 
+class TestZeroOutputTimeoutSignal:
+    """Step-1 RED: CuratorFailureError carries zero_output_timeout + forensic evidence."""
+
+    @pytest.mark.asyncio
+    async def test_call_llm_zot_sets_zero_output_timeout_flag(self):
+        """A ZOT AgentResult raises CuratorFailureError with zero_output_timeout=True
+        and carries proc_tree + account_name evidence."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        zot_result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_empty_output',
+            timed_out=True,
+            turns=0,
+            cost_usd=0.0,
+            duration_ms=181_000,
+            proc_tree='<pgid tree>',
+            account_name='max-g',
+        )
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=zot_result)), \
+             pytest.raises(CuratorFailureError) as exc_info:
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=[],
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+        exc = exc_info.value
+        assert exc.zero_output_timeout is True
+        assert exc.proc_tree == '<pgid tree>'
+        assert exc.account_name == 'max-g'
+        assert exc.timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_call_llm_batch_zot_sets_zero_output_timeout_flag(self):
+        """Parallel case: _call_llm_batch ZOT result also sets zero_output_timeout."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        zot_result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_empty_output',
+            timed_out=True,
+            turns=0,
+            cost_usd=0.0,
+            duration_ms=361_000,
+            proc_tree='<pgid tree>',
+            account_name='max-g',
+        )
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=zot_result)), \
+             pytest.raises(CuratorFailureError) as exc_info:
+            await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[
+                    {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                    {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                ],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+        exc = exc_info.value
+        assert exc.zero_output_timeout is True
+        assert exc.proc_tree == '<pgid tree>'
+        assert exc.account_name == 'max-g'
+
+    @pytest.mark.asyncio
+    async def test_call_llm_ordinary_failure_zero_output_timeout_false(self):
+        """Contrast: an ordinary failure (error_max_turns) has zero_output_timeout=False."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        ordinary_result = AgentResult(
+            success=False,
+            output='max turns hit',
+            subtype='error_max_turns',
+            timed_out=False,
+            turns=8,
+            cost_usd=0.10,
+            duration_ms=45_000,
+        )
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=ordinary_result)), \
+             pytest.raises(CuratorFailureError) as exc_info:
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=[],
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+        assert exc_info.value.zero_output_timeout is False
+
+
 class TestCuratorCapHandling:
     """Verify TaskCurator.curate() handles AllAccountsCappedException gracefully."""
 

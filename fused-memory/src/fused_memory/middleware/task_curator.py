@@ -38,7 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry, is_zero_output_timeout
 from shared.locking import files_to_modules
 
 from fused_memory.reconciliation.context_assembler import estimate_tokens
@@ -84,12 +84,18 @@ class CuratorFailureError(RuntimeError):
         duration_ms: int | None = None,
         subtype: str | None = None,
         schema_tool_denied: bool = False,
+        zero_output_timeout: bool = False,
+        proc_tree: str = '',
+        account_name: str = '',
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
         self.duration_ms = duration_ms
         self.subtype = subtype
         self.schema_tool_denied = schema_tool_denied
+        self.zero_output_timeout = zero_output_timeout
+        self.proc_tree = proc_tree
+        self.account_name = account_name
 
 
 Action = Literal['drop', 'combine', 'create']
@@ -1593,6 +1599,9 @@ class TaskCurator:
                 duration_ms=agent_result.duration_ms,
                 subtype=agent_result.subtype or None,
                 schema_tool_denied=agent_result.schema_tool_denied,
+                zero_output_timeout=is_zero_output_timeout(agent_result),
+                proc_tree=agent_result.proc_tree,
+                account_name=agent_result.account_name,
             )
 
         return _parse_decision(
@@ -1675,6 +1684,9 @@ class TaskCurator:
                 duration_ms=agent_result.duration_ms,
                 subtype=agent_result.subtype or None,
                 schema_tool_denied=agent_result.schema_tool_denied,
+                zero_output_timeout=is_zero_output_timeout(agent_result),
+                proc_tree=agent_result.proc_tree,
+                account_name=agent_result.account_name,
             )
 
         return _parse_batch_decisions(
