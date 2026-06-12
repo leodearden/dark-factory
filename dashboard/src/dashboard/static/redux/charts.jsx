@@ -381,4 +381,27 @@ function defaultSmoothingForWindow(windowKey) {
   return map[windowKey] ?? '8h';
 }
 
-window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow };
+// Returns a per-sample rate array (tasks/day) for the given cumulative series
+// using a trailing time window.  Irregular sample spacing is handled by
+// parsing ISO timestamps from labels.  Returns [] for <2 points or
+// length mismatch.  A flat series yields exact zeros (no synthesis).
+function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
+  if (!series || !labels || series.length !== labels.length || series.length < 2) return [];
+  const t = labels.map(l => {
+    const ms = new Date(l).getTime();
+    return isNaN(ms) ? NaN : ms / 1000;
+  });
+  const result = [];
+  for (let i = 0; i < series.length; i++) {
+    if (isNaN(t[i])) { result.push(0); continue; }
+    let j = i;
+    for (let k = 0; k < i; k++) {
+      if (!isNaN(t[k]) && t[i] - t[k] <= smoothingWindowSeconds) { j = k; break; }
+    }
+    const dtDays = (t[i] - t[j]) / 86400;
+    result.push(dtDays > 0 ? (series[i] - series[j]) / dtDays : 0);
+  }
+  return result;
+}
+
+window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries };
