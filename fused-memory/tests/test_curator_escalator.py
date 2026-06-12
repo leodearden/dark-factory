@@ -15,7 +15,7 @@ that suppresses spam from a stuck curator.
 from __future__ import annotations
 
 import fcntl
-from typing import IO, Literal, overload
+from typing import IO, Any, Literal, overload
 
 import pytest
 
@@ -414,7 +414,7 @@ class TestZeroOutputTimeoutEscalation:
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
             escalator = CuratorEscalator(cooldown_secs=3600.0)
-            common = dict(
+            common: dict[str, Any] = dict(
                 project_root=str(tmp_path), project_id='proj-dedup',
                 zero_output_timeout=True, timed_out=True, duration_ms=181_000,
                 account_name='max-g', proc_tree='TREE-DEDUP',
