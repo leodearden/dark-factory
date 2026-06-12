@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -950,6 +951,156 @@ class TestZeroOutputTimeoutAcceptance:
         assert result_a.action == 'create'
         assert result_b.action == 'create'
         assert mock_llm.await_count == 2
+
+
+class TestZeroOutputBreakerCurate:
+    """Step-7 RED: consecutive-ZOT circuit breaker in curate()."""
+
+    def _zot_result(self) -> AgentResult:
+        return AgentResult(
+            success=False, output='', subtype='error_empty_output',
+            timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+            proc_tree='<pgid tree>', account_name='max-g',
+        )
+
+    def _healthy_result(self) -> AgentResult:
+        return AgentResult(
+            success=True, output='',
+            structured_output={'action': 'create', 'justification': 'ok'},
+        )
+
+    async def _curate(self, curator, title: str) -> 'CuratorDecision':
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
+            return await curator.curate(
+                CandidateTask(title=title), project_id='p', project_root='/x',
+            )
+
+    @pytest.mark.asyncio
+    async def test_open_short_circuits_after_threshold(self):
+        """(a) After threshold ZOTs, 3rd call skips the LLM entirely."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        zot = self._zot_result()
+        mock_llm = AsyncMock(return_value=zot)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            # ZOT #1 (counter → 1).
+            r1 = await self._curate(curator, 'A')
+            # ZOT #2 (counter → 2, breaker opens).
+            r2 = await self._curate(curator, 'B')
+        call_count_after_two = mock_llm.await_count
+
+        # 3rd call with breaker open — LLM must NOT be invoked.
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            r3 = await curator.curate(
+                CandidateTask(title='C'), project_id='p', project_root='/x',
+            )
+        assert r1.action == 'create'
+        assert r2.action == 'create'
+        assert r3.action == 'create'
+        # LLM call count must NOT have increased on the 3rd call.
+        assert mock_llm.await_count == call_count_after_two
+        # Justification signals the breaker.
+        assert 'zero-output-breaker' in r3.justification
+
+    @pytest.mark.asyncio
+    async def test_success_resets_counter(self):
+        """(b) A success between ZOTs resets the counter — breaker doesn't open at 1+success+1."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        zot = self._zot_result()
+        healthy = self._healthy_result()
+        mock_llm = AsyncMock(side_effect=[zot, healthy, zot])
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            # ZOT (counter=1) → success (counter resets to 0) → ZOT (counter=1).
+            await self._curate(curator, 'A')  # ZOT
+            await self._curate(curator, 'B')  # healthy
+            r3 = await self._curate(curator, 'C')  # ZOT again
+
+        # Breaker should NOT be open (counter=1 < threshold=2).
+        # The 3rd call must have actually invoked the LLM (call count = 3).
+        assert mock_llm.await_count == 3
+        assert r3.action == 'create'
+
+    @pytest.mark.asyncio
+    async def test_half_open_recovery(self):
+        """(c) After cooldown expires, probe is allowed; success closes the breaker."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 0.05  # 50ms for test
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        zot = self._zot_result()
+        healthy = self._healthy_result()
+        mock_llm = AsyncMock(return_value=zot)
+
+        # Open the breaker (2 ZOTs).
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            await self._curate(curator, 'A')
+            await self._curate(curator, 'B')
+        count_after_open = mock_llm.await_count  # =2
+
+        # Wait for cooldown.
+        await asyncio.sleep(0.1)
+
+        # Switch mock to healthy.
+        mock_llm.return_value = healthy
+        mock_llm.side_effect = None
+
+        # Probe (half-open): should be allowed through and succeed.
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            probe = await curator.curate(
+                CandidateTask(title='D'), project_id='p', project_root='/x',
+            )
+        assert probe.action == 'create'
+        assert mock_llm.await_count == count_after_open + 1  # probe hit the LLM
+
+        # After probe success breaker is closed — a single subsequent ZOT
+        # alone should NOT re-open (counter=1 < threshold=2).
+        mock_llm.return_value = zot
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            await curator.curate(CandidateTask(title='E'), project_id='p', project_root='/x')
+
+        async def empty_corpus2(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus2), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            r_next = await curator.curate(
+                CandidateTask(title='F'), project_id='p', project_root='/x',
+            )
+        # Breaker should NOT be open after 1 ZOT since reset.
+        assert 'zero-output-breaker' not in r_next.justification
 
 
 class TestCurateHappyPath:

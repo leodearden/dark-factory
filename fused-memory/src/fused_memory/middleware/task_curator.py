@@ -481,6 +481,45 @@ class TaskCurator:
         # None means "not yet attempted"; [] means "loaded but empty or failed".
         self._blocklist: list | None = None
         self._blocklist_load_attempted: bool = False
+        # Consecutive-ZOT circuit breaker (task 1743).
+        # Counts CONSECUTIVE zero-output/full-timeout curator LLM failures;
+        # reset to 0 on any real LLM success or non-ZOT failure.
+        self._consecutive_zero_output_timeouts: int = 0
+        # monotonic() time until which the breaker is open (None = closed).
+        self._zero_output_breaker_open_until: float | None = None
+
+    # ------------------------------------------------------------------
+    # Zero-output-timeout circuit breaker (task 1743)
+    # ------------------------------------------------------------------
+
+    def _zero_output_breaker_open(self, now: float) -> bool:
+        """Return True while the breaker is tripped and the cooldown has not elapsed."""
+        return (
+            self._zero_output_breaker_open_until is not None
+            and now < self._zero_output_breaker_open_until
+        )
+
+    def _record_zero_output_timeout(self, now: float) -> None:
+        """Increment the consecutive-ZOT counter; open the breaker when threshold is reached."""
+        self._consecutive_zero_output_timeouts += 1
+        if (
+            self._consecutive_zero_output_timeouts
+            >= self._config.curator.zero_output_breaker_threshold
+        ):
+            self._zero_output_breaker_open_until = (
+                now + self._config.curator.zero_output_breaker_cooldown_seconds
+            )
+            logger.warning(
+                'task_curator: zero-output-breaker OPEN after %d consecutive ZOTs; '
+                'short-circuiting curator LLM calls for %.0fs',
+                self._consecutive_zero_output_timeouts,
+                self._config.curator.zero_output_breaker_cooldown_seconds,
+            )
+
+    def _reset_zero_output_breaker(self) -> None:
+        """Reset the breaker on any real LLM success."""
+        self._consecutive_zero_output_timeouts = 0
+        self._zero_output_breaker_open_until = None
 
     # ------------------------------------------------------------------
     # Lazy init (mirrors task_dedup.py pattern)
@@ -778,6 +817,24 @@ class TaskCurator:
         if cached is not None:
             return cached
 
+        # Zero-output-timeout circuit breaker — gate BEFORE corpus build + LLM.
+        # Only the 180s LLM call (and the corpus build that precedes it) is the
+        # cost the breaker exists to avoid; cheap cache checks above run always.
+        now = time.monotonic()
+        if self._zero_output_breaker_open(now):
+            logger.warning(
+                'task_curator: zero-output-breaker open — short-circuiting '
+                'curator LLM call for candidate %r (consecutive ZOTs=%d)',
+                candidate.title,
+                self._consecutive_zero_output_timeouts,
+            )
+            return CuratorDecision(
+                action='create',
+                justification='zero-output-breaker-open',
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+
         try:
             pool, pool_sizes = await self._build_corpus(
                 candidate, project_id, project_root,
@@ -806,6 +863,9 @@ class TaskCurator:
             decision = await self._call_llm(
                 candidate, pool, pool_sizes, start, project_id, project_root,
             )
+            # Success: reset the consecutive-ZOT counter so a single hung call
+            # that was followed by a healthy one doesn't accumulate toward open.
+            self._reset_zero_output_breaker()
         except AllAccountsCappedException as exc:
             logger.warning(
                 'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
@@ -847,6 +907,8 @@ class TaskCurator:
                     'falling through to create: %s',
                     exc,
                 )
+            if exc.zero_output_timeout:
+                self._record_zero_output_timeout(now)
             decision = CuratorDecision(
                 action='create',
                 justification='llm-error-escalated',
