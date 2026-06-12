@@ -1145,7 +1145,7 @@ function BurnTab({ projectFilter, displayWindow }) {
           <div className="col-span-12 grid cols-4">
             <ST label="Net velocity" value={velocity.toFixed(1)} unit="/day"
                 hint={b.window_days ? `window avg · ${b.window_days}d` : 'window avg'}
-                spark={b.done} sparkColor={CP.ok} />
+                spark={deriveVelocitySeries(b.done, b.labels, smoothSecs)} sparkColor={CP.ok} />
             <ST label="Completed (window)" value={completed}
                 spark={b.done} sparkColor={CP.ok} />
             <ST label="Backlog" value={lastPending}
@@ -1229,7 +1229,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                       <td className="num" style={{ color: CP.accent }}>{active}</td>
                       <td className="num" style={{ color: CP.bad }}>{blocked}</td>
                       <td className="num" style={{ color: CP.warn }}>{pending}</td>
-                      <td style={{ width: 200 }}><div style={{ height: 22 }}><SP values={pb.done} color={CP.accent} /></div></td>
+                      <td style={{ width: 200 }}><div style={{ height: 22 }}><SP values={deriveVelocitySeries(pb.done, pb.labels, smoothSecs)} color={CP.accent} /></div></td>
                     </tr>
                   );
                 })}
@@ -1286,11 +1286,11 @@ function BurnTab({ projectFilter, displayWindow }) {
                     </div>
                     <div>
                       <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Completion trend</div>
-                      <div style={{ height: 36 }}><SP values={pb.done} color={CP.ok} /></div>
+                      <div style={{ height: 36 }}><SP values={deriveVelocitySeries(pb.done, pb.labels, smoothSecs)} color={CP.ok} /></div>
                     </div>
                     <div>
                       <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Backlog trend</div>
-                      <div style={{ height: 36 }}><SP values={pb.pending} color={CP.warn} /></div>
+                      <div style={{ height: 36 }}><SP values={deriveVelocitySeries(pb.pending, pb.labels, smoothSecs)} color={CP.warn} /></div>
                     </div>
                   </div>
                 </div>
