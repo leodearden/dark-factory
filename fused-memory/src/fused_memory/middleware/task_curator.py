@@ -1085,6 +1085,39 @@ class TaskCurator:
             else:
                 llm_k_list.append(k)
 
+        # ── Zero-output-timeout circuit breaker gate (task 1743) ──────────────
+        # Check the breaker BEFORE the expensive batch LLM round-trip (up to
+        # batch_timeout_cap_seconds = 360s).  If open, resolve every LLM-bound
+        # unique candidate to action='create' immediately — the bisect fallback
+        # path would eventually reach size-1 curate() calls which check the
+        # breaker individually, but this gate avoids the first batch LLM call
+        # (and the bisect overhead) entirely.
+        #
+        # Breaker-open decisions are NOT written to the idempotency cache (so
+        # once the breaker closes, an identical candidate is re-evaluated by
+        # the real LLM rather than being pinned to a stale 'create' for the TTL).
+        #
+        # Double-count guard: a batch ZOT that bisects all the way to size-1
+        # curate() calls records the ZOT via curate()'s own except block;
+        # curate_batch_prepared need not record it again.
+        if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
+            batch_breaker_now = time.monotonic()
+            logger.warning(
+                'curate_batch: zero-output-breaker open — short-circuiting %d '
+                'LLM-bound candidate(s) to create (consecutive ZOTs=%d)',
+                len(llm_k_list),
+                self._consecutive_zero_output_timeouts,
+            )
+            _empty_pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            for _k in llm_k_list:
+                cache_hit_map[_k] = CuratorDecision(
+                    action='create',
+                    justification='zero-output-breaker-open',
+                    pool_sizes=_empty_pool_sizes,
+                    latency_ms=int((batch_breaker_now - start) * 1000),
+                )
+            llm_k_list = []
+
         # ── LLM dispatch for non-cached unique candidates ────────────────────
         # Re-use the pre-built pools/pool_sizes from the prepared bundles
         # (skipping cache hits).  No second corpus build.
