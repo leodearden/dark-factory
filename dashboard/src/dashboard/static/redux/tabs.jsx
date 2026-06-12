@@ -1289,7 +1289,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                       <div style={{ height: 36 }}><SP values={deriveVelocitySeries(pb.done, pb.labels, smoothSecs)} color={CP.ok} /></div>
                     </div>
                     <div>
-                      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Backlog trend</div>
+                      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Backlog change rate</div>
                       <div style={{ height: 36 }}><SP values={deriveVelocitySeries(pb.pending, pb.labels, smoothSecs)} color={CP.warn} /></div>
                     </div>
                   </div>

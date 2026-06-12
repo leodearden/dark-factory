@@ -87,13 +87,15 @@ class TestBurnTabSmoothingChip:
 
 class TestVelocitySparkWiring:
     def test_net_velocity_tile_uses_derive(self, tabs_jsx_body):
-        """Net velocity StatTile spark must use deriveVelocitySeries, not raw b.done."""
+        """Net velocity StatTile spark must use deriveVelocitySeries, not raw b.done.
+
+        The regex ties the tile's label attribute to its spark attribute within the
+        same element, so the test fails if the Net velocity tile reverts to spark={b.done}.
+        """
         assert re.search(
-            r'label=["\']Net velocity["\'][^/]*/?>',
+            r'label=["\']Net velocity["\'].*?spark=\{deriveVelocitySeries\(',
             tabs_jsx_body,
-        ) or re.search(
-            r'spark=\{deriveVelocitySeries\(',
-            tabs_jsx_body,
+            re.DOTALL,
         )
 
     def test_completion_trend_spark_uses_derive(self, tabs_jsx_body):
@@ -102,8 +104,13 @@ class TestVelocitySparkWiring:
         assert re.search(r'deriveVelocitySeries\(pb\.done', tabs_jsx_body)
 
     def test_backlog_trend_spark_uses_derive(self, tabs_jsx_body):
-        """Per-project Velocity panel 'Backlog trend' must use deriveVelocitySeries."""
-        assert re.search(r'Backlog trend', tabs_jsx_body)
+        """Per-project Velocity panel 'Backlog change rate' must use deriveVelocitySeries.
+
+        The label was changed from 'Backlog trend' to 'Backlog change rate' to
+        clarify that this spark shows the rate of change of backlog (derivative),
+        not the backlog level over time.
+        """
+        assert re.search(r'Backlog change rate', tabs_jsx_body)
         assert re.search(r'deriveVelocitySeries\(pb\.pending', tabs_jsx_body)
 
     def test_status_mix_area_stays_cumulative(self, tabs_jsx_body):
@@ -112,8 +119,13 @@ class TestVelocitySparkWiring:
         assert re.search(r"values:\s*b\.done", tabs_jsx_body)
 
     def test_completed_window_tile_stays_cumulative(self, tabs_jsx_body):
-        """'Completed (window)' tile spark must remain on raw b.done."""
+        """'Completed (window)' tile spark must remain on raw b.done.
+
+        Ties the label and spark attributes within the same element so that
+        a regression swapping this tile to deriveVelocitySeries is caught.
+        """
         assert re.search(
-            r'label=["\']Completed \(window\)["\']',
+            r'label=["\']Completed \(window\)["\'].*?spark=\{b\.done\}',
             tabs_jsx_body,
+            re.DOTALL,
         )
