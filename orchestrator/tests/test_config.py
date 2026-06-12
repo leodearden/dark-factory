@@ -1,6 +1,7 @@
 """Tests for configuration loading."""
 
 import logging
+import os
 from importlib import resources as pkg_resources
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from pydantic import ValidationError
 
 from orchestrator.config import (
     ConfigRequiredError,
+    JobserverConfig,
     ModuleConfig,
     OrchestratorConfig,
     SccacheConfig,
@@ -1256,3 +1258,57 @@ class TestVerifyRunnerConfig:
             {'name': 'r2', 'ssh_host': 'h2', 'git_remote': 'g2'},
         ])
         assert len(config.enabled_verify_runners) == 2
+
+
+class TestJobserverConfig:
+    """Unit tests for JobserverConfig.agent_env()."""
+
+    def test_enabled_with_fifo_present(self, tmp_path):
+        """enabled=True and task_fifo is a real FIFO → returns CARGO_MAKEFLAGS."""
+        fifo = tmp_path / 'test.fifo'
+        os.mkfifo(fifo)
+        cfg = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        env = cfg.agent_env()
+        assert 'CARGO_MAKEFLAGS' in env
+        assert env['CARGO_MAKEFLAGS'].startswith('--jobserver-auth=fifo:')
+        assert str(fifo) in env['CARGO_MAKEFLAGS']
+
+    def test_enabled_with_fifo_absent(self, tmp_path):
+        """enabled=True but task_fifo path does not exist → returns {}."""
+        fifo = tmp_path / 'nonexistent.fifo'
+        cfg = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        assert cfg.agent_env() == {}
+
+    def test_enabled_with_regular_file(self, tmp_path):
+        """enabled=True but task_fifo is a regular file (not FIFO) → returns {}."""
+        f = tmp_path / 'not-a-fifo'
+        f.write_text('not a fifo')
+        cfg = JobserverConfig(enabled=True, task_fifo=str(f))
+        assert cfg.agent_env() == {}
+
+    def test_disabled_returns_empty(self, tmp_path):
+        """enabled=False → returns {} regardless of path."""
+        fifo = tmp_path / 'test.fifo'
+        os.mkfifo(fifo)
+        cfg = JobserverConfig(enabled=False, task_fifo=str(fifo))
+        assert cfg.agent_env() == {}
+
+    def test_custom_env_var_and_task_fifo(self, tmp_path):
+        """Custom env_var and task_fifo are honored in the returned dict."""
+        fifo = tmp_path / 'custom.fifo'
+        os.mkfifo(fifo)
+        cfg = JobserverConfig(enabled=True, task_fifo=str(fifo), env_var='MY_MAKEFLAGS')
+        env = cfg.agent_env()
+        assert 'MY_MAKEFLAGS' in env
+        assert env['MY_MAKEFLAGS'] == f'--jobserver-auth=fifo:{fifo}'
+
+    def test_validator_rejects_enabled_with_empty_task_fifo(self):
+        """enabled=True with empty task_fifo raises ValidationError."""
+        with pytest.raises(ValidationError):
+            JobserverConfig(enabled=True, task_fifo='')
+
+    def test_orchestrator_config_has_jobserver_field(self):
+        """OrchestratorConfig exposes a jobserver field that defaults to disabled."""
+        cfg = OrchestratorConfig()
+        assert isinstance(cfg.jobserver, JobserverConfig)
+        assert cfg.jobserver.enabled is False
