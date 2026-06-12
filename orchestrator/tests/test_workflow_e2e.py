@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
@@ -24,8 +25,9 @@ from _workflow_helpers import (
 from escalation.queue import EscalationQueue
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, JobserverConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -7073,10 +7075,6 @@ class TestBuildAgentEnvJobserver:
 
     async def test_architect_receives_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
         """ARCHITECT gets CARGO_MAKEFLAGS when jobserver enabled and FIFO present."""
-        import os
-        from orchestrator.agents.roles import ARCHITECT
-        from orchestrator.config import JobserverConfig
-
         fifo = tmp_path / 'task.fifo'
         os.mkfifo(fifo)
         workflow = self._make_workflow(config, git_ops, task_assignment)
@@ -7088,10 +7086,6 @@ class TestBuildAgentEnvJobserver:
 
     async def test_implementer_receives_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
         """IMPLEMENTER gets CARGO_MAKEFLAGS when jobserver enabled and FIFO present."""
-        import os
-        from orchestrator.agents.roles import IMPLEMENTER
-        from orchestrator.config import JobserverConfig
-
         fifo = tmp_path / 'task.fifo'
         os.mkfifo(fifo)
         workflow = self._make_workflow(config, git_ops, task_assignment)
@@ -7103,10 +7097,6 @@ class TestBuildAgentEnvJobserver:
 
     async def test_debugger_receives_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
         """DEBUGGER gets CARGO_MAKEFLAGS when jobserver enabled and FIFO present."""
-        import os
-        from orchestrator.agents.roles import DEBUGGER
-        from orchestrator.config import JobserverConfig
-
         fifo = tmp_path / 'task.fifo'
         os.mkfifo(fifo)
         workflow = self._make_workflow(config, git_ops, task_assignment)
@@ -7118,10 +7108,6 @@ class TestBuildAgentEnvJobserver:
 
     async def test_merger_returns_none(self, config, git_ops, task_assignment, tmp_path):
         """MERGER returns None even when jobserver is enabled."""
-        import os
-        from orchestrator.agents.roles import MERGER
-        from orchestrator.config import JobserverConfig
-
         fifo = tmp_path / 'task.fifo'
         os.mkfifo(fifo)
         workflow = self._make_workflow(config, git_ops, task_assignment)
@@ -7131,10 +7117,6 @@ class TestBuildAgentEnvJobserver:
 
     async def test_judge_returns_none(self, config, git_ops, task_assignment, tmp_path):
         """JUDGE returns None even when jobserver is enabled."""
-        import os
-        from orchestrator.agents.roles import JUDGE
-        from orchestrator.config import JobserverConfig
-
         fifo = tmp_path / 'task.fifo'
         os.mkfifo(fifo)
         workflow = self._make_workflow(config, git_ops, task_assignment)
@@ -7144,10 +7126,6 @@ class TestBuildAgentEnvJobserver:
 
     async def test_architect_no_reify_debug_port(self, config, git_ops, task_assignment, tmp_path):
         """ARCHITECT carries CARGO_MAKEFLAGS but NOT REIFY_DEBUG_PORT."""
-        import os
-        from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER
-        from orchestrator.config import JobserverConfig
-
         fifo = tmp_path / 'task.fifo'
         os.mkfifo(fifo)
         workflow = self._make_workflow(config, git_ops, task_assignment)
@@ -7166,9 +7144,6 @@ class TestBuildAgentEnvJobserver:
 
     async def test_fifo_absent_architect_returns_none(self, config, git_ops, task_assignment, tmp_path):
         """FIFO-absent → ARCHITECT returns None (no jobserver env injected)."""
-        from orchestrator.agents.roles import ARCHITECT
-        from orchestrator.config import JobserverConfig
-
         workflow = self._make_workflow(config, git_ops, task_assignment)
         workflow.config.jobserver = JobserverConfig(
             enabled=True, task_fifo=str(tmp_path / 'nonexistent.fifo'),

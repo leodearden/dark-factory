@@ -7,7 +7,7 @@ without conflicting with sibling subprojects' conftests under
 """
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -163,6 +163,26 @@ def _clear_probe_cache():
     verify._PROBE_CACHE.clear()
     yield
     verify._PROBE_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _mock_merge_queue_verification(monkeypatch):
+    """Patch merge_queue's run_scoped_verification to return passed=True by default.
+
+    MergeWorker hardcodes orchestrator.merge_queue.run_scoped_verification in its
+    internal calls; tests that create a live MergeWorker need this patched or
+    pytest/ruff/pyright (not in PATH in test environments) cause BLOCKED outcomes.
+    Tests that need specific merge-verification behaviour override this with their
+    own monkeypatch.setattr call in the test body.
+    """
+    from orchestrator.verify import VerifyResult
+    monkeypatch.setattr(
+        'orchestrator.merge_queue.run_scoped_verification',
+        AsyncMock(return_value=VerifyResult(
+            passed=True, test_output='', lint_output='',
+            type_output='', summary='mocked merge verify',
+        )),
+    )
 
 
 @pytest.fixture(autouse=True)
