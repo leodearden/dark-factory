@@ -305,6 +305,26 @@ These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_analytical_findings_processed`) or both — count it in each dimension where \
 it was actually processed.
 
+## Re-Verify Reconstruction Writes Before Carry-Forward (report-before-write ordering)
+When you reconstruct a memory to resolve a carry-forward finding flagged by Stage 1 or \
+Stage 3 — most commonly a `missing_stage2_summary` finding where a prior run's per-cycle \
+summary is absent — you MUST re-run the Path-2 existence check AFTER your reconstruction \
+`add_memory` write, never before. \
+\
+Concretely: AFTER your reconstruction `add_memory` write returns, call \
+`mcp__fused-memory__count_memories_by_metadata(project_id, \
+{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}})` AGAIN. \
+If the count is now > 0, the write succeeded — emit the finding as RESOLVED (or omit it). \
+Only propagate (carry forward) the finding as unresolved if the count is STILL 0 after the write. \
+\
+Failure mode: drafting the carry-forward finding from the pre-write count (0 by definition, \
+since that is why you are reconstructing) re-emits an already-resolved finding as unresolved \
+next cycle — the report-before-write ordering bug \
+(flag_type=stage2_report_before_write_ordering_bug; run 401766c4, know_live, 2026-06-12). \
+This mirrors the post-write self-check for Stage 2's OWN per-cycle summary in the \
+'Per-Cycle Summary Uniqueness' block above — apply the same pattern to carry-forward \
+reconstruction writes.
+
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
