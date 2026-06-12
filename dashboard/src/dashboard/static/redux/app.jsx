@@ -120,7 +120,7 @@ function App() {
       case 'recon':    return <ReconTab projectFilter={projects} search={search} />;
       case 'merge':    return <MergeTab projectFilter={projects} />;
       case 'cost':     return <CostsTab projectFilter={projects} />;
-      case 'burn':     return <BurnTab projectFilter={projects} />;
+      case 'burn':     return <BurnTab projectFilter={projects} displayWindow={win} />;
       case 'esc':      return <EscalationsTab projectFilter={projects} />;
       default: return null;
     }
