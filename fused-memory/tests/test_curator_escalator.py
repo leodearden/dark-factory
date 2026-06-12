@@ -401,3 +401,38 @@ class TestZeroOutputTimeoutEscalation:
             assert '181600' in body
         finally:
             handle.close()
+
+    @pytest.mark.asyncio
+    async def test_zot_dedup_within_short_window(self, tmp_path):
+        """Multiple rapid ZOT reports for the same project enqueue only the first.
+
+        A batch of N candidates all hitting ZOT bisects to N concurrent size-1
+        curate() calls, each of which calls report_failure independently.  The
+        dedup window (60 s) ensures only one escalation is submitted per outage
+        event so the queue is not flooded.
+        """
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            common = dict(
+                project_root=str(tmp_path), project_id='proj-dedup',
+                zero_output_timeout=True, timed_out=True, duration_ms=181_000,
+                account_name='max-g', proc_tree='TREE-DEDUP',
+            )
+            # First report: should be submitted.
+            await escalator.report_failure(
+                justification='ZOT 1', candidate_title='Alpha', **common,
+            )
+            # Rapid follow-ups (simulating concurrent batch bisect): should be deduped.
+            await escalator.report_failure(
+                justification='ZOT 2', candidate_title='Beta', **common,
+            )
+            await escalator.report_failure(
+                justification='ZOT 3', candidate_title='Gamma', **common,
+            )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 1, (
+                f'Expected 1 escalation (dedup), got {len(files)}'
+            )
+        finally:
+            handle.close()

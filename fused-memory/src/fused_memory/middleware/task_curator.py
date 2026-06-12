@@ -913,7 +913,10 @@ class TaskCurator:
                     exc,
                 )
             if exc.zero_output_timeout:
-                self._record_zero_output_timeout(now)
+                # Capture a fresh timestamp so the cooldown window is measured
+                # from when the failure was observed, not from before the
+                # (potentially 180s) hung LLM call started.
+                self._record_zero_output_timeout(time.monotonic())
             decision = CuratorDecision(
                 action='create',
                 justification='llm-error-escalated',
@@ -1102,9 +1105,14 @@ class TaskCurator:
         # once the breaker closes, an identical candidate is re-evaluated by
         # the real LLM rather than being pinned to a stale 'create' for the TTL).
         #
-        # Double-count guard: a batch ZOT that bisects all the way to size-1
-        # curate() calls records the ZOT via curate()'s own except block;
-        # curate_batch_prepared need not record it again.
+        # Batch ZOT counting: each size-1 curate() that bisects out of a batch
+        # ZOT records the failure independently via its own except block.
+        # A single batch outage of M LLM-bound candidates may therefore
+        # increment _consecutive_zero_output_timeouts up to M times, opening
+        # the breaker faster than a single count per event would.  That is
+        # intentional — opening sooner is harmless and simpler than trying to
+        # normalise concurrent increments.  curate_batch_prepared need not
+        # record separately; it relies on the per-size-1 accumulation.
         if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
             batch_breaker_now = time.monotonic()
             logger.warning(

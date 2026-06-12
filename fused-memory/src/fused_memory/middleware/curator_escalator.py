@@ -61,6 +61,13 @@ _DEFAULT_COOLDOWN_SECS = 3600.0
 _LOCK_FILENAME = 'data/orchestrator/orchestrator.lock'
 _QUEUE_DIRNAME = 'data/escalations'
 
+# Short dedup window for zero-output-timeout escalations. A batch of N
+# candidates that all hit ZOT bisects to N concurrent size-1 curate() calls,
+# each of which calls report_failure independently. Without dedup, a single
+# outage event on a batch of N can enqueue up to N un-suppressed escalations.
+# Submissions within this window after the first are logged and dropped.
+_ZOT_DEDUP_WINDOW_SECS = 60.0
+
 
 class CuratorEscalator:
     """Route :class:`CuratorFailureError` to the orchestrator or back to the caller."""
@@ -75,6 +82,10 @@ class CuratorEscalator:
         # the burst, which is desired (operator gets fresh visibility).
         self._failure_log: dict[str, list[float]] = {}
         self._queues: dict[str, EscalationQueue] = {}
+        # project_id → monotonic timestamp of the last submitted ZOT escalation.
+        # Prevents a batch of N concurrent curate() ZOT calls from flooding the
+        # escalation queue with N identical entries for a single outage event.
+        self._zot_last_submitted: dict[str, float] = {}
 
     def _orchestrator_running(self, project_root: str) -> bool:
         """Return True if the project's orchestrator holds its exclusive lock.
@@ -376,7 +387,31 @@ class CuratorEscalator:
         vs the generic "curator LLM failing" escalation, and the detail includes
         forensic evidence (account_name, proc_tree, duration_ms) so the next
         occurrence is diagnosable without re-reading logs.
+
+        A short dedup window (_ZOT_DEDUP_WINDOW_SECS) prevents escalation floods
+        from a single batch outage (bisect produces N concurrent size-1 curate()
+        calls which each call report_failure independently).
         """
+        # Dedup: a batch bisect of N candidates all hitting ZOT can call this
+        # concurrently N times for the same project. Only the first submission
+        # within _ZOT_DEDUP_WINDOW_SECS actually enqueues; the rest are logged
+        # and dropped so the operator sees a pattern across outage events but
+        # not a per-candidate flood within a single event.
+        now_mono = time.monotonic()
+        last = self._zot_last_submitted.get(project_id)
+        if last is not None and (now_mono - last) < _ZOT_DEDUP_WINDOW_SECS:
+            logger.info(
+                'curator_escalator: deduplicating ZOT escalation for project %s '
+                '(last submitted %.1fs ago < dedup window %.0fs); '
+                'candidate_title=%r',
+                project_id,
+                now_mono - last,
+                _ZOT_DEDUP_WINDOW_SECS,
+                candidate_title,
+            )
+            return
+        self._zot_last_submitted[project_id] = now_mono
+
         detail_lines = [
             f'candidate_title={candidate_title!r}',
             f'project_id={project_id!r}',

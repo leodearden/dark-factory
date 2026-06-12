@@ -929,7 +929,14 @@ class TestZeroOutputTimeoutAcceptance:
         healthy_result = AgentResult(
             success=True,
             output='',
-            structured_output={'action': 'create', 'justification': 'ok'},
+            # Use action='drop' with batch_target_index=0 (within-batch drop) so
+            # the returned decision is distinguishable from the breaker-open 'create'
+            # fallback — the call count check alone would otherwise carry all the weight.
+            structured_output={
+                'action': 'drop',
+                'justification': 'duplicate of batch item 0',
+                'batch_target_index': 0,
+            },
         )
 
         async def empty_corpus(*a, **k):
@@ -948,8 +955,10 @@ class TestZeroOutputTimeoutAcceptance:
             )
 
         # (c) No in-process wedge: second call goes through and returns the real decision.
+        # result_b must be 'drop' (the real LLM decision), not 'create' (the breaker
+        # or ZOT degrade path), proving the second call took the actual LLM result.
         assert result_a.action == 'create'
-        assert result_b.action == 'create'
+        assert result_b.action == 'drop'
         assert mock_llm.await_count == 2
 
 
@@ -3761,3 +3770,75 @@ class TestZeroOutputBreakerBatchPath:
 
         # (b) LLM must NOT have been invoked for the batch dispatch.
         assert mock_llm.await_count == call_count_before_batch
+
+    async def test_batch_zot_without_preopen_trips_breaker(self):
+        """A curate_batch_prepared call (no pre-opened breaker) where all candidates
+        hit ZOT must open the breaker and bound escalation submissions.
+
+        Bisect funnels to size-1 curate() calls which each record ZOTs.  After
+        threshold consecutive recordings the breaker opens; subsequent size-1 calls
+        within the same asyncio.gather check the breaker and short-circuit.
+        A follow-on batch with the breaker open produces no LLM calls and no
+        new escalation submissions.
+        """
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 1  # open after 1 ZOT
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        zot = self._zot_result()
+        mock_llm = AsyncMock(return_value=zot)
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        # First batch: 1 candidate, no pre-opened breaker.
+        # Bisects immediately to size-1 → curate() → ZOT → counter=1 → opens (threshold=1).
+        prepared_first = [
+            PreparedCandidate(
+                candidate=CandidateTask(title='ZOT batch candidate', description='desc1'),
+                pool=[], pool_sizes=empty_sizes, prompt_tokens=20,
+            )
+        ]
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            first_decisions = await curator.curate_batch_prepared(
+                prepared_first, project_id='p', project_root='/x',
+            )
+
+        # First batch: degrade-to-create, breaker now open.
+        assert len(first_decisions) == 1
+        assert first_decisions[0].action == 'create'
+        assert curator._zero_output_breaker_open_until is not None, (
+            'Breaker must be open after a batch ZOT trips the threshold'
+        )
+        # Escalation bounded: threshold=1 means at most 1 report_failure call.
+        assert escalator.report_failure.await_count <= 1
+
+        llm_calls_after_first = mock_llm.await_count  # 1 (the ZOT call)
+
+        # Second batch: 3 candidates, breaker is open → all short-circuited.
+        prepared_second = [
+            PreparedCandidate(
+                candidate=CandidateTask(title=f'Post-breaker {i}', description=f'd{i}'),
+                pool=[], pool_sizes=empty_sizes, prompt_tokens=20,
+            )
+            for i in range(3)
+        ]
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            second_decisions = await curator.curate_batch_prepared(
+                prepared_second, project_id='p', project_root='/x',
+            )
+
+        assert len(second_decisions) == 3
+        for d in second_decisions:
+            assert d.action == 'create'
+            assert 'zero-output-breaker' in d.justification
+
+        # No LLM calls during second batch (breaker-open gate).
+        assert mock_llm.await_count == llm_calls_after_first
+        # No new escalations from the short-circuited second batch.
+        assert escalator.report_failure.await_count <= 1
