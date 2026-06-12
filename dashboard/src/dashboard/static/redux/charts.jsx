@@ -385,6 +385,15 @@ function defaultSmoothingForWindow(windowKey) {
 // using a trailing time window.  Irregular sample spacing is handled by
 // parsing ISO timestamps from labels.  Returns [] for <2 points or
 // length mismatch.  A flat series yields exact zeros (no synthesis).
+//
+// Uses a monotonic two-pointer sweep (O(n)): since labels are sorted ascending,
+// the window's left boundary is non-decreasing as i advances, so `left` only
+// ever moves forward.
+//
+// Cf. dailyDeltas() in shell.jsx — related but distinct: dailyDeltas buckets by
+// calendar day, clamps rates to >=0, and returns N-1 entries (day-to-day diff).
+// deriveVelocitySeries uses a configurable trailing time window, allows negative
+// rates (backlog can shrink), and returns N entries aligned to each sample.
 function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   if (!series || !labels || series.length !== labels.length || series.length < 2) return [];
   const t = labels.map(l => {
@@ -392,14 +401,16 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
     return isNaN(ms) ? NaN : ms / 1000;
   });
   const result = [];
+  let left = 0;
   for (let i = 0; i < series.length; i++) {
     if (isNaN(t[i])) { result.push(0); continue; }
-    let j = i;
-    for (let k = 0; k < i; k++) {
-      if (!isNaN(t[k]) && t[i] - t[k] <= smoothingWindowSeconds) { j = k; break; }
+    // Advance left past NaN entries and entries that have fallen outside the
+    // trailing window.  left is strictly non-decreasing, giving O(n) total.
+    while (left < i && (isNaN(t[left]) || t[i] - t[left] > smoothingWindowSeconds)) {
+      left++;
     }
-    const dtDays = (t[i] - t[j]) / 86400;
-    result.push(dtDays > 0 ? (series[i] - series[j]) / dtDays : 0);
+    const dtDays = (t[i] - t[left]) / 86400;
+    result.push(dtDays > 0 ? (series[i] - series[left]) / dtDays : 0);
   }
   return result;
 }
