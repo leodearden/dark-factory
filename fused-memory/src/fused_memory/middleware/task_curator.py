@@ -38,7 +38,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry, is_zero_output_timeout
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+    is_zero_output_timeout,
+)
 from shared.locking import files_to_modules
 
 from fused_memory.reconciliation.context_assembler import estimate_tokens

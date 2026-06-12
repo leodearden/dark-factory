@@ -969,7 +969,7 @@ class TestZeroOutputBreakerCurate:
             structured_output={'action': 'create', 'justification': 'ok'},
         )
 
-    async def _curate(self, curator, title: str) -> 'CuratorDecision':
+    async def _curate(self, curator, title: str) -> CuratorDecision:
         async def empty_corpus(*a, **k):
             return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 
