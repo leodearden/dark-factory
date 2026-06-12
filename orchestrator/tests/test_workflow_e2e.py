@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
@@ -24,8 +25,9 @@ from _workflow_helpers import (
 from escalation.queue import EscalationQueue
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, JobserverConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -7055,6 +7057,131 @@ class TestDryRunUnblockE2EGuardOptIn:
             config=None,
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: _build_agent_env jobserver wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBuildAgentEnvJobserver:
+    """Unit tests for TaskWorkflow._build_agent_env with jobserver config."""
+
+    def _make_workflow(self, config, git_ops, task_assignment):
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        return workflow
+
+    async def test_architect_receives_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
+        """ARCHITECT gets CARGO_MAKEFLAGS when jobserver enabled and FIFO present."""
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        env = workflow._build_agent_env(ARCHITECT)
+        assert env is not None
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+    async def test_implementer_receives_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
+        """IMPLEMENTER gets CARGO_MAKEFLAGS when jobserver enabled and FIFO present."""
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+    async def test_debugger_receives_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
+        """DEBUGGER gets CARGO_MAKEFLAGS when jobserver enabled and FIFO present."""
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        env = workflow._build_agent_env(DEBUGGER)
+        assert env is not None
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+    async def test_merger_returns_none(self, config, git_ops, task_assignment, tmp_path):
+        """MERGER returns None even when jobserver is enabled."""
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        assert workflow._build_agent_env(MERGER) is None
+
+    async def test_judge_returns_none(self, config, git_ops, task_assignment, tmp_path):
+        """JUDGE returns None even when jobserver is enabled."""
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+
+        assert workflow._build_agent_env(JUDGE) is None
+
+    async def test_architect_no_reify_debug_port(self, config, git_ops, task_assignment, tmp_path):
+        """ARCHITECT carries CARGO_MAKEFLAGS but NOT REIFY_DEBUG_PORT."""
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        workflow._reify_debug_port = 39411
+
+        arch_env = workflow._build_agent_env(ARCHITECT)
+        assert arch_env is not None
+        assert 'CARGO_MAKEFLAGS' in arch_env
+        assert 'REIFY_DEBUG_PORT' not in arch_env
+
+        impl_env = workflow._build_agent_env(IMPLEMENTER)
+        assert impl_env is not None
+        assert 'CARGO_MAKEFLAGS' in impl_env
+        assert impl_env.get('REIFY_DEBUG_PORT') == '39411'
+
+    async def test_fifo_absent_architect_returns_none(self, config, git_ops, task_assignment, tmp_path):
+        """FIFO-absent → ARCHITECT returns None (no jobserver env injected)."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(
+            enabled=True, task_fifo=str(tmp_path / 'nonexistent.fifo'),
+        )
+
+        assert workflow._build_agent_env(ARCHITECT) is None
+
+    async def test_implementer_env_overrides_and_jobserver_coexist(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """IMPLEMENTER merges env_overrides, REIFY_DEBUG_PORT, and CARGO_MAKEFLAGS.
+
+        All three sources must coexist in the returned dict.  When env_overrides
+        contains the same key as the jobserver env (CARGO_MAKEFLAGS), the
+        jobserver value wins because it is merged last.
+        """
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        # env_overrides with a custom key AND a deliberate collision on CARGO_MAKEFLAGS
+        workflow.config.env_overrides = {
+            'MY_CUSTOM_VAR': 'custom_value',
+            'CARGO_MAKEFLAGS': 'stale-value',  # jobserver should win over this
+        }
+        workflow._reify_debug_port = 39411
+
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+
+        # Custom env_overrides key survives
+        assert env.get('MY_CUSTOM_VAR') == 'custom_value'
+
+        # REIFY_DEBUG_PORT from _reify_debug_port survives
+        assert env.get('REIFY_DEBUG_PORT') == '39411'
+
+        # Jobserver env wins over the stale env_overrides value (merged last)
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
 
 
 if TYPE_CHECKING:

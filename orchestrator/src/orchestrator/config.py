@@ -4,6 +4,7 @@ import importlib.resources
 import logging
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -412,6 +413,68 @@ class SccacheConfig(BaseModel):
         this model instance.
         """
         return dict(self.backend_env) if self.enabled else {}
+
+
+class JobserverConfig(BaseModel):
+    """Task-pool jobserver wiring for agent inner-loop cargo builds.
+
+    When enabled, injects CARGO_MAKEFLAGS into implementer/debugger/architect
+    subprocesses so their cargo build/test/metadata calls participate in the
+    task-pool FIFO jobserver instead of running uncoordinated.
+
+    The reify project enables this in /home/leo/src/reify/orchestrator.yaml.
+    All other projects leave enabled=False (the default) and receive no change.
+
+    ``enabled=True`` with an empty ``task_fifo`` is rejected by the
+    model_validator so a half-configured knob fails fast at load time.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description='Enable jobserver wiring for agent cargo builds.',
+    )
+    task_fifo: str = Field(
+        default='/tmp/reify-jobserver-task',
+        description='Absolute path to the task-pool FIFO created by the jobserver.',
+    )
+    env_var: str = Field(
+        default='CARGO_MAKEFLAGS',
+        description='Environment variable name that cargo reads for jobserver auth.',
+    )
+
+    @model_validator(mode='after')
+    def _reject_enabled_with_empty_task_fifo(self) -> 'JobserverConfig':
+        if self.enabled and not self.task_fifo:
+            raise ValueError(
+                'JobserverConfig.enabled is True but task_fifo is empty; '
+                'set task_fifo to the absolute FIFO path or set enabled: false.'
+            )
+        return self
+
+    def agent_env(self) -> dict[str, str]:
+        """Return jobserver env dict when enabled and FIFO exists, else {}.
+
+        Mirrors shell ``[ -p "$FIFO" ]``: a stale regular file or missing path
+        returns {} rather than injecting a broken --jobserver-auth value that
+        would wedge cargo.
+
+        TOCTOU note: the FIFO is stat-checked here but consumed by cargo later.
+        If the FIFO disappears between the check and the subprocess spawn,
+        cargo receives a stale ``--jobserver-auth`` value.  Per cargo's
+        documented behaviour this causes it to fall back to unbounded
+        parallelism (equivalent to ``-j$(nproc)``) rather than hanging, so
+        the failure mode is over-subscription — the same state as having no
+        jobserver at all — not a deadlock.
+        """
+        if not self.enabled:
+            return {}
+        try:
+            mode = os.stat(self.task_fifo).st_mode
+        except OSError:
+            return {}
+        if not stat.S_ISFIFO(mode):
+            return {}
+        return {self.env_var: f'--jobserver-auth=fifo:{self.task_fifo}'}
 
 
 class GitConfig(BaseModel):
@@ -1351,6 +1414,11 @@ class OrchestratorConfig(BaseSettings):
     # An absent stanza in orchestrator.yaml yields the disabled default;
     # no defaults.yaml edit is required.
     sccache: SccacheConfig = Field(default_factory=SccacheConfig)
+
+    # Jobserver wiring for agent inner-loop cargo builds (implementer/debugger/architect).
+    # An absent stanza in orchestrator.yaml yields the disabled default.
+    # Reify enables this in /home/leo/src/reify/orchestrator.yaml.
+    jobserver: JobserverConfig = Field(default_factory=JobserverConfig)
 
     # Lever C: remote verify runner pool configuration.
     # Adding this field makes a verify_runners: block in orchestrator.yaml live;

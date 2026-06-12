@@ -5957,15 +5957,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     def _build_agent_env(self, role: AgentRole) -> dict[str, str] | None:
         """Build the env_overrides dict for this agent invocation.
 
-        Only implementer and debugger inherit env_overrides; other roles get None.
-        REIFY_DEBUG_PORT is merged in per-invocation (never mutating shared config)
-        so concurrent tasks each carry their own worktree-specific port.
+        Implementer and debugger inherit env_overrides and REIFY_DEBUG_PORT.
+        Architect, implementer, and debugger also get the jobserver task-pool env
+        (CARGO_MAKEFLAGS) so their cargo build/test/metadata calls participate in
+        the FIFO jobserver instead of running uncoordinated.
+        Other roles (merger, judge, reviewer) receive None.
         """
-        if role.name not in ('implementer', 'debugger'):
+        if role.name not in ('architect', 'implementer', 'debugger'):
             return None
-        merged: dict[str, str] = dict(self.config.env_overrides or {})
-        if self._reify_debug_port is not None:
-            merged['REIFY_DEBUG_PORT'] = str(self._reify_debug_port)
+        merged: dict[str, str] = {}
+        if role.name in ('implementer', 'debugger'):
+            merged.update(self.config.env_overrides or {})
+            if self._reify_debug_port is not None:
+                merged['REIFY_DEBUG_PORT'] = str(self._reify_debug_port)
+        merged.update(self.config.jobserver.agent_env())
         return merged or None
 
     async def _invoke(
