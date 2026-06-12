@@ -38,7 +38,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+    is_zero_output_timeout,
+)
 from shared.locking import files_to_modules
 
 from fused_memory.reconciliation.context_assembler import estimate_tokens
@@ -84,12 +89,18 @@ class CuratorFailureError(RuntimeError):
         duration_ms: int | None = None,
         subtype: str | None = None,
         schema_tool_denied: bool = False,
+        zero_output_timeout: bool = False,
+        proc_tree: str = '',
+        account_name: str = '',
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
         self.duration_ms = duration_ms
         self.subtype = subtype
         self.schema_tool_denied = schema_tool_denied
+        self.zero_output_timeout = zero_output_timeout
+        self.proc_tree = proc_tree
+        self.account_name = account_name
 
 
 Action = Literal['drop', 'combine', 'create']
@@ -475,6 +486,45 @@ class TaskCurator:
         # None means "not yet attempted"; [] means "loaded but empty or failed".
         self._blocklist: list | None = None
         self._blocklist_load_attempted: bool = False
+        # Consecutive-ZOT circuit breaker (task 1743).
+        # Counts CONSECUTIVE zero-output/full-timeout curator LLM failures;
+        # reset to 0 on any real LLM success or non-ZOT failure.
+        self._consecutive_zero_output_timeouts: int = 0
+        # monotonic() time until which the breaker is open (None = closed).
+        self._zero_output_breaker_open_until: float | None = None
+
+    # ------------------------------------------------------------------
+    # Zero-output-timeout circuit breaker (task 1743)
+    # ------------------------------------------------------------------
+
+    def _zero_output_breaker_open(self, now: float) -> bool:
+        """Return True while the breaker is tripped and the cooldown has not elapsed."""
+        return (
+            self._zero_output_breaker_open_until is not None
+            and now < self._zero_output_breaker_open_until
+        )
+
+    def _record_zero_output_timeout(self, now: float) -> None:
+        """Increment the consecutive-ZOT counter; open the breaker when threshold is reached."""
+        self._consecutive_zero_output_timeouts += 1
+        if (
+            self._consecutive_zero_output_timeouts
+            >= self._config.curator.zero_output_breaker_threshold
+        ):
+            self._zero_output_breaker_open_until = (
+                now + self._config.curator.zero_output_breaker_cooldown_seconds
+            )
+            logger.warning(
+                'task_curator: zero-output-breaker OPEN after %d consecutive ZOTs; '
+                'short-circuiting curator LLM calls for %.0fs',
+                self._consecutive_zero_output_timeouts,
+                self._config.curator.zero_output_breaker_cooldown_seconds,
+            )
+
+    def _reset_zero_output_breaker(self) -> None:
+        """Reset the breaker on any real LLM success."""
+        self._consecutive_zero_output_timeouts = 0
+        self._zero_output_breaker_open_until = None
 
     # ------------------------------------------------------------------
     # Lazy init (mirrors task_dedup.py pattern)
@@ -772,6 +822,24 @@ class TaskCurator:
         if cached is not None:
             return cached
 
+        # Zero-output-timeout circuit breaker — gate BEFORE corpus build + LLM.
+        # Only the 180s LLM call (and the corpus build that precedes it) is the
+        # cost the breaker exists to avoid; cheap cache checks above run always.
+        now = time.monotonic()
+        if self._zero_output_breaker_open(now):
+            logger.warning(
+                'task_curator: zero-output-breaker open — short-circuiting '
+                'curator LLM call for candidate %r (consecutive ZOTs=%d)',
+                candidate.title,
+                self._consecutive_zero_output_timeouts,
+            )
+            return CuratorDecision(
+                action='create',
+                justification='zero-output-breaker-open',
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+
         try:
             pool, pool_sizes = await self._build_corpus(
                 candidate, project_id, project_root,
@@ -800,6 +868,9 @@ class TaskCurator:
             decision = await self._call_llm(
                 candidate, pool, pool_sizes, start, project_id, project_root,
             )
+            # Success: reset the consecutive-ZOT counter so a single hung call
+            # that was followed by a healthy one doesn't accumulate toward open.
+            self._reset_zero_output_breaker()
         except AllAccountsCappedException as exc:
             logger.warning(
                 'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
@@ -831,6 +902,9 @@ class TaskCurator:
                     timed_out=exc.timed_out,
                     duration_ms=exc.duration_ms,
                     schema_tool_denied=exc.schema_tool_denied,
+                    zero_output_timeout=exc.zero_output_timeout,
+                    account_name=exc.account_name or None,
+                    proc_tree=exc.proc_tree or None,
                 )
             else:
                 logger.warning(
@@ -838,6 +912,11 @@ class TaskCurator:
                     'falling through to create: %s',
                     exc,
                 )
+            if exc.zero_output_timeout:
+                # Capture a fresh timestamp so the cooldown window is measured
+                # from when the failure was observed, not from before the
+                # (potentially 180s) hung LLM call started.
+                self._record_zero_output_timeout(time.monotonic())
             decision = CuratorDecision(
                 action='create',
                 justification='llm-error-escalated',
@@ -1013,6 +1092,44 @@ class TaskCurator:
                 cache_hit_map[k] = cached
             else:
                 llm_k_list.append(k)
+
+        # ── Zero-output-timeout circuit breaker gate (task 1743) ──────────────
+        # Check the breaker BEFORE the expensive batch LLM round-trip (up to
+        # batch_timeout_cap_seconds = 360s).  If open, resolve every LLM-bound
+        # unique candidate to action='create' immediately — the bisect fallback
+        # path would eventually reach size-1 curate() calls which check the
+        # breaker individually, but this gate avoids the first batch LLM call
+        # (and the bisect overhead) entirely.
+        #
+        # Breaker-open decisions are NOT written to the idempotency cache (so
+        # once the breaker closes, an identical candidate is re-evaluated by
+        # the real LLM rather than being pinned to a stale 'create' for the TTL).
+        #
+        # Batch ZOT counting: each size-1 curate() that bisects out of a batch
+        # ZOT records the failure independently via its own except block.
+        # A single batch outage of M LLM-bound candidates may therefore
+        # increment _consecutive_zero_output_timeouts up to M times, opening
+        # the breaker faster than a single count per event would.  That is
+        # intentional — opening sooner is harmless and simpler than trying to
+        # normalise concurrent increments.  curate_batch_prepared need not
+        # record separately; it relies on the per-size-1 accumulation.
+        if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
+            batch_breaker_now = time.monotonic()
+            logger.warning(
+                'curate_batch: zero-output-breaker open — short-circuiting %d '
+                'LLM-bound candidate(s) to create (consecutive ZOTs=%d)',
+                len(llm_k_list),
+                self._consecutive_zero_output_timeouts,
+            )
+            _empty_pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            for _k in llm_k_list:
+                cache_hit_map[_k] = CuratorDecision(
+                    action='create',
+                    justification='zero-output-breaker-open',
+                    pool_sizes=_empty_pool_sizes,
+                    latency_ms=int((batch_breaker_now - start) * 1000),
+                )
+            llm_k_list = []
 
         # ── LLM dispatch for non-cached unique candidates ────────────────────
         # Re-use the pre-built pools/pool_sizes from the prepared bundles
@@ -1593,6 +1710,9 @@ class TaskCurator:
                 duration_ms=agent_result.duration_ms,
                 subtype=agent_result.subtype or None,
                 schema_tool_denied=agent_result.schema_tool_denied,
+                zero_output_timeout=is_zero_output_timeout(agent_result),
+                proc_tree=agent_result.proc_tree,
+                account_name=agent_result.account_name,
             )
 
         return _parse_decision(
@@ -1675,6 +1795,9 @@ class TaskCurator:
                 duration_ms=agent_result.duration_ms,
                 subtype=agent_result.subtype or None,
                 schema_tool_denied=agent_result.schema_tool_denied,
+                zero_output_timeout=is_zero_output_timeout(agent_result),
+                proc_tree=agent_result.proc_tree,
+                account_name=agent_result.account_name,
             )
 
         return _parse_batch_decisions(

@@ -61,6 +61,13 @@ _DEFAULT_COOLDOWN_SECS = 3600.0
 _LOCK_FILENAME = 'data/orchestrator/orchestrator.lock'
 _QUEUE_DIRNAME = 'data/escalations'
 
+# Short dedup window for zero-output-timeout escalations. A batch of N
+# candidates that all hit ZOT bisects to N concurrent size-1 curate() calls,
+# each of which calls report_failure independently. Without dedup, a single
+# outage event on a batch of N can enqueue up to N un-suppressed escalations.
+# Submissions within this window after the first are logged and dropped.
+_ZOT_DEDUP_WINDOW_SECS = 60.0
+
 
 class CuratorEscalator:
     """Route :class:`CuratorFailureError` to the orchestrator or back to the caller."""
@@ -75,6 +82,10 @@ class CuratorEscalator:
         # the burst, which is desired (operator gets fresh visibility).
         self._failure_log: dict[str, list[float]] = {}
         self._queues: dict[str, EscalationQueue] = {}
+        # project_id → monotonic timestamp of the last submitted ZOT escalation.
+        # Prevents a batch of N concurrent curate() ZOT calls from flooding the
+        # escalation queue with N identical entries for a single outage event.
+        self._zot_last_submitted: dict[str, float] = {}
 
     def _orchestrator_running(self, project_root: str) -> bool:
         """Return True if the project's orchestrator holds its exclusive lock.
@@ -125,6 +136,9 @@ class CuratorEscalator:
         timed_out: bool | None = None,
         duration_ms: int | None = None,
         schema_tool_denied: bool = False,
+        zero_output_timeout: bool = False,
+        account_name: str | None = None,
+        proc_tree: str | None = None,
     ) -> None:
         """Route a curator failure. Raises :class:`CuratorFailureError` when no
         orchestrator is running so the MCP caller sees a loud error.
@@ -174,6 +188,24 @@ class CuratorEscalator:
                 candidate_title=candidate_title,
                 timed_out=timed_out,
                 duration_ms=duration_ms,
+            )
+            return
+
+        if zero_output_timeout:
+            # Transient Anthropic-backend INFRA hang on the curator's
+            # sonnet+json-schema call shape (task 1550). Two hangs hours apart
+            # each read as "failure 1 of 3" under the normal burst window —
+            # the outage was invisible. Always surface, bypassing burst
+            # suppression (don't touch _failure_log).
+            await self._submit_zero_output_timeout(
+                project_root=project_root,
+                project_id=project_id,
+                justification=justification,
+                candidate_title=candidate_title,
+                timed_out=timed_out,
+                duration_ms=duration_ms,
+                account_name=account_name,
+                proc_tree=proc_tree,
             )
             return
 
@@ -331,4 +363,111 @@ class CuratorEscalator:
             'project %s — StructuredOutput tool blocked by cli_invoke deny-list; '
             'dedupe disabled until fixed',
             escalation.id, project_id,
+        )
+
+    async def _submit_zero_output_timeout(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        justification: str,
+        candidate_title: str,
+        timed_out: bool | None,
+        duration_ms: int | None,
+        account_name: str | None,
+        proc_tree: str | None,
+    ) -> None:
+        """Submit a distinct, un-suppressed escalation for a zero-output/full-timeout
+        curator INFRA hang.
+
+        Deliberately bypasses the rolling-window burst suppression (and does not
+        touch ``_failure_log``): two hangs hours apart each read as "failure 1 of 3"
+        under the normal window — the outage is invisible. Each ZOT must surface
+        so operators can see a pattern across occurrences. The summary is unmistakable
+        vs the generic "curator LLM failing" escalation, and the detail includes
+        forensic evidence (account_name, proc_tree, duration_ms) so the next
+        occurrence is diagnosable without re-reading logs.
+
+        A short dedup window (_ZOT_DEDUP_WINDOW_SECS) prevents escalation floods
+        from a single batch outage (bisect produces N concurrent size-1 curate()
+        calls which each call report_failure independently).
+        """
+        # Dedup: a batch bisect of N candidates all hitting ZOT can call this
+        # concurrently N times for the same project. Only the first submission
+        # within _ZOT_DEDUP_WINDOW_SECS actually enqueues; the rest are logged
+        # and dropped so the operator sees a pattern across outage events but
+        # not a per-candidate flood within a single event.
+        now_mono = time.monotonic()
+        last = self._zot_last_submitted.get(project_id)
+        if last is not None and (now_mono - last) < _ZOT_DEDUP_WINDOW_SECS:
+            logger.info(
+                'curator_escalator: deduplicating ZOT escalation for project %s '
+                '(last submitted %.1fs ago < dedup window %.0fs); '
+                'candidate_title=%r',
+                project_id,
+                now_mono - last,
+                _ZOT_DEDUP_WINDOW_SECS,
+                candidate_title,
+            )
+            return
+        self._zot_last_submitted[project_id] = now_mono
+
+        detail_lines = [
+            f'candidate_title={candidate_title!r}',
+            f'project_id={project_id!r}',
+        ]
+        if timed_out is not None:
+            detail_lines.append(f'timed_out={timed_out}')
+        if duration_ms is not None:
+            detail_lines.append(f'duration_ms={duration_ms}')
+        if account_name is not None:
+            detail_lines.append(f'account_name={account_name!r}')
+        if proc_tree:
+            # Truncate to avoid overwhelming the escalation body.
+            snippet = proc_tree[:1500]
+            detail_lines.append(f'proc_tree=\n{snippet}')
+        detail_lines.append(f'justification={justification}')
+        detail_lines.append('')
+        detail_lines.append(
+            'NOTE: this bypasses the 1-hour burst-suppression window because '
+            'zero-output/full-timeout hangs hours apart otherwise each read as '
+            '"failure 1 of 3" and never cross the escalate threshold — the outage '
+            'is invisible. Root cause: transient Anthropic-backend degradation on '
+            'the curator\'s sonnet+json-schema call shape (task 1550). Dedupe '
+            'degraded to create for this candidate. The circuit-breaker watchdog '
+            'will short-circuit further curator LLM calls if this recurs.',
+        )
+        detail = '\n'.join(detail_lines)
+
+        queue = self._queue_for(project_root)
+        escalation = Escalation(
+            id=queue.make_id('curator'),
+            task_id='task-curator',
+            agent_role='fused-memory/task-curator',
+            severity='blocking',
+            category='curator_zero_output_hang',
+            summary=(
+                'curator zero-output/full-timeout INFRA hang — dedupe degraded to '
+                'create; NOT a flaky candidate. Transient Anthropic-backend hang on '
+                'sonnet+json-schema call shape.'
+            ),
+            detail=detail,
+            level=1,
+        )
+        try:
+            queue.submit(escalation)
+        except Exception:
+            logger.exception(
+                'curator_escalator: failed to submit zero-output-timeout '
+                'escalation for project %s',
+                project_id,
+            )
+            # Do not re-raise — falling through to action='create' is safer than
+            # failing add_task just because queue I/O broke.
+            return
+
+        logger.error(
+            'curator_escalator: queued zero-output-timeout L1 escalation %s for '
+            'project %s — account=%s duration_ms=%s; dedupe degraded to create',
+            escalation.id, project_id, account_name, duration_ms,
         )
