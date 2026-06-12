@@ -1,6 +1,6 @@
 /* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
-const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, HistBar: HB, PALETTE: CP } = window.DF_CHARTS;
-const { Glyph: GL, ProjectGroup, Segmented } = window.DF_SHELL;
+const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, HistBar: HB, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS } = window.DF_CHARTS;
+const { Glyph: GL, ProjectGroup, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { useState: uS, useEffect: uE } = React;
 
@@ -1122,9 +1122,12 @@ function CostsTab({ projectFilter }) {
 }
 
 // ── Burndown ──
-function BurnTab({ projectFilter }) {
+function BurnTab({ projectFilter, displayWindow }) {
   const b = DF.BURNDOWN;
   const [view, setView] = uS('aggregate'); // 'aggregate' | 'per-project'
+  const [smoothOverride, setSmoothOverride] = uS(null);
+  const smooth = smoothOverride ?? defaultSmoothingForWindow(displayWindow);
+  const smoothSecs = smoothingLabelToSeconds(smooth);
   const projects = DF.PROJECTS.filter(p => projectFilter.length === 0 || projectFilter.includes(p.id));
   const projIds = projects.map(p => p.id);
   const [openMap, toggle, setAll] = useOpenSet(projIds, true, 'df.open.burn');
@@ -1142,7 +1145,7 @@ function BurnTab({ projectFilter }) {
           <div className="col-span-12 grid cols-4">
             <ST label="Net velocity" value={velocity.toFixed(1)} unit="/day"
                 hint={b.window_days ? `window avg · ${b.window_days}d` : 'window avg'}
-                spark={b.done} sparkColor={CP.ok} />
+                spark={deriveVelocitySeries(b.done, b.labels, smoothSecs)} sparkColor={CP.ok} />
             <ST label="Completed (window)" value={completed}
                 spark={b.done} sparkColor={CP.ok} />
             <ST label="Backlog" value={lastPending}
@@ -1176,6 +1179,10 @@ function BurnTab({ projectFilter }) {
 
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <Segmented options={[{ value: 'aggregate', label: 'Aggregate' }, { value: 'per-project', label: 'Per project' }]} value={view} onChange={setView} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, color: 'var(--fg-3)' }}>Smoothing</span>
+          <ChipGroup options={SMOOTHING_OPTIONS} value={smooth} onChange={setSmoothOverride} />
+        </div>
         {view === 'per-project' && <GroupAllToggle allOpen={allOpen} onSetAll={setAll} />}
       </div>
 
@@ -1222,7 +1229,7 @@ function BurnTab({ projectFilter }) {
                       <td className="num" style={{ color: CP.accent }}>{active}</td>
                       <td className="num" style={{ color: CP.bad }}>{blocked}</td>
                       <td className="num" style={{ color: CP.warn }}>{pending}</td>
-                      <td style={{ width: 200 }}><div style={{ height: 22 }}><SP values={pb.done} color={CP.accent} /></div></td>
+                      <td style={{ width: 200 }}><div style={{ height: 22 }}><SP values={deriveVelocitySeries(pb.done, pb.labels, smoothSecs)} color={CP.accent} /></div></td>
                     </tr>
                   );
                 })}
@@ -1279,11 +1286,11 @@ function BurnTab({ projectFilter }) {
                     </div>
                     <div>
                       <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Completion trend</div>
-                      <div style={{ height: 36 }}><SP values={pb.done} color={CP.ok} /></div>
+                      <div style={{ height: 36 }}><SP values={deriveVelocitySeries(pb.done, pb.labels, smoothSecs)} color={CP.ok} /></div>
                     </div>
                     <div>
-                      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Backlog trend</div>
-                      <div style={{ height: 36 }}><SP values={pb.pending} color={CP.warn} /></div>
+                      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Backlog change rate</div>
+                      <div style={{ height: 36 }}><SP values={deriveVelocitySeries(pb.pending, pb.labels, smoothSecs)} color={CP.warn} /></div>
                     </div>
                   </div>
                 </div>

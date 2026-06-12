@@ -369,4 +369,50 @@ function HistBar({ values, maxOverride, height = 50, color = PALETTE.accent }) {
   );
 }
 
-window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar };
+const SMOOTHING_OPTIONS = ['1h', '2h', '4h', '8h', '1d', '3d'];
+
+function smoothingLabelToSeconds(label) {
+  const map = { '1h': 3600, '2h': 7200, '4h': 14400, '8h': 28800, '1d': 86400, '3d': 259200 };
+  return map[label] ?? null;
+}
+
+function defaultSmoothingForWindow(windowKey) {
+  const map = { '24h': '2h', '7d': '8h', '30d': '1d', '90d': '3d' };
+  return map[windowKey] ?? '8h';
+}
+
+// Returns a per-sample rate array (tasks/day) for the given cumulative series
+// using a trailing time window.  Irregular sample spacing is handled by
+// parsing ISO timestamps from labels.  Returns [] for <2 points or
+// length mismatch.  A flat series yields exact zeros (no synthesis).
+//
+// Uses a monotonic two-pointer sweep (O(n)): since labels are sorted ascending,
+// the window's left boundary is non-decreasing as i advances, so `left` only
+// ever moves forward.
+//
+// Cf. dailyDeltas() in shell.jsx — related but distinct: dailyDeltas buckets by
+// calendar day, clamps rates to >=0, and returns N-1 entries (day-to-day diff).
+// deriveVelocitySeries uses a configurable trailing time window, allows negative
+// rates (backlog can shrink), and returns N entries aligned to each sample.
+function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
+  if (!series || !labels || series.length !== labels.length || series.length < 2) return [];
+  const t = labels.map(l => {
+    const ms = new Date(l).getTime();
+    return isNaN(ms) ? NaN : ms / 1000;
+  });
+  const result = [];
+  let left = 0;
+  for (let i = 0; i < series.length; i++) {
+    if (isNaN(t[i])) { result.push(0); continue; }
+    // Advance left past NaN entries and entries that have fallen outside the
+    // trailing window.  left is strictly non-decreasing, giving O(n) total.
+    while (left < i && (isNaN(t[left]) || t[i] - t[left] > smoothingWindowSeconds)) {
+      left++;
+    }
+    const dtDays = (t[i] - t[left]) / 86400;
+    result.push(dtDays > 0 ? (series[i] - series[left]) / dtDays : 0);
+  }
+  return result;
+}
+
+window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries };
