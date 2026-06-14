@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1172,8 +1173,9 @@ class TestRemoteRunnerConstruction:
             calls.append(argv)
             return responses.pop(0)
 
-        fake_run.calls = calls
-        return fake_run
+        run: Any = fake_run
+        run.calls = calls
+        return run
 
     async def test_name_attribute(self):
         from orchestrator.verify_runner import RemoteRunner
@@ -1898,8 +1900,9 @@ class TestCaptureEnvFingerprint:
             issued.append(argv)
             return responses_queue.pop(0)
 
-        fake_run.issued = issued
-        return fake_run
+        run: Any = fake_run
+        run.issued = issued
+        return run
 
     async def test_toolchain_from_rustc_cargo_stdout(self):
         """toolchain == trimmed rustc + cargo --version stdout joined by newline."""
@@ -3260,8 +3263,9 @@ class TestCaptureSccacheStats:
             issued.append(argv)
             return responses_queue.pop(0)
 
-        fake_run.issued = issued
-        return fake_run
+        run: Any = fake_run
+        run.issued = issued
+        return run
 
     async def test_parses_redis_stats_blob(self):
         from orchestrator.verify_runner import SccacheStats, capture_sccache_stats
