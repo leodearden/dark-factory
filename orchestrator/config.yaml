@@ -17,7 +17,10 @@ test_command: "cd shared && uv run pytest tests/ && cd ../escalation && uv run p
 # this to a single touched file for root-level changes) emits a bare ``ruff
 # check <file>`` that exits 127 (command not found). ``uv run ruff`` resolves
 # the workspace venv from root in both the full and scoped forms.
-lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard"
+# bare-MagicMock config gate — whole-repo scope on this rare module_config-less
+# fallback path (per-module orchestrator.yaml lint_commands carry the per-package
+# scope; also runs in merge-queue verify; see hooks/project-checks).
+lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
 
 # Verification timeouts — dark-factory is Python-only (no cargo builds), so the

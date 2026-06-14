@@ -5,7 +5,9 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     LocalRunner,
@@ -440,7 +442,7 @@ class TestErrorPaths:
 def _make_local_runner(*, run_scoped=None, run_unscoped=None):
     """Build a LocalRunner with injected fake callables."""
     merge_wt = MagicMock()
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.merge_verify_workspace = False
     module_configs = []
     task_files = None
@@ -582,7 +584,7 @@ class TestLocalRunnerBundle:
     async def test_scoped_called_with_correct_kwargs(self):
         run_scoped = AsyncMock(return_value=_make_pass_result())
         run_unscoped = AsyncMock(return_value=MagicMock(broken=False))
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.merge_verify_workspace = True
         merge_wt = MagicMock()
         module_configs = [MagicMock()]
@@ -683,7 +685,7 @@ class TestBuildMergeVerifySpec:
         return mc
 
     def _make_config(self, *, verify_env=None, cold_timeout=None):
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.verify_env = verify_env or {}
         config.effective_verify_env = verify_env or {}
         config.merge_verify_cold_command_timeout_secs = cold_timeout
@@ -741,7 +743,7 @@ class TestBuildMergeVerifySpec:
 
     def test_cold_timeout_falls_back_to_verify_cold(self):
         from orchestrator.verify_runner import build_merge_verify_spec
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.verify_env = {}
         config.effective_verify_env = {}
         config.merge_verify_cold_command_timeout_secs = None
@@ -751,7 +753,7 @@ class TestBuildMergeVerifySpec:
 
     def test_cold_timeout_falls_back_to_zero_when_both_none(self):
         from orchestrator.verify_runner import build_merge_verify_spec
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.verify_env = {}
         config.effective_verify_env = {}
         config.merge_verify_cold_command_timeout_secs = None
@@ -916,7 +918,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.merge_verify_workspace = False
         merge_wt = MagicMock()
         spec = self._make_two_command_spec()
@@ -941,7 +943,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.merge_verify_workspace = False
         merge_wt = MagicMock()
         spec = self._make_two_command_spec()
@@ -976,7 +978,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.merge_verify_workspace = False
         spec = self._make_two_command_spec()
 
@@ -1009,7 +1011,7 @@ class TestRunMergeVerifyOnWorktree:
                 detail='type err',
             )
         )
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.merge_verify_workspace = False
         spec = self._make_two_command_spec()
 
@@ -1042,7 +1044,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.merge_verify_workspace = False
 
         # Spec with type_check_command mirroring what build_merge_verify_spec produces
@@ -1107,7 +1109,7 @@ class TestRunMergeVerifyOnWorktreeDefaults:
         monkeypatch.setattr(verify_mod, 'run_scoped_verification', fake_scoped)
         monkeypatch.setattr(mq_mod, '_run_unscoped_typechecks', fake_unscoped)
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.merge_verify_workspace = False
         spec = MergeVerifySpec(
             verify_commands=(VerifyCommand('mod', test_command='true'),),
