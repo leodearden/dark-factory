@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import make_placeholder_future
+from _orch_helpers import make_placeholder_future, pydantic_spec
 from escalation.models import BORN_AT_L2_SEVERITIES
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -1519,7 +1519,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         """SMW must be constructed with the harness's live escalation_queue."""
         from orchestrator.harness import Harness  # noqa: PLC0415
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2
         config.project_root = tmp_path
         config.git = GitConfig(
@@ -1574,7 +1574,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         """When _escalation_queue is None (bare harness), SMW receives None — no crash."""
         from orchestrator.harness import Harness  # noqa: PLC0415
 
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2
         config.project_root = tmp_path
         config.git = GitConfig(

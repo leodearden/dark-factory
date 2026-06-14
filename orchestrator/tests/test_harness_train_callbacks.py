@@ -22,7 +22,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeScheduler
+
+from orchestrator.config import OrchestratorConfig
 
 # ---------------------------------------------------------------------------
 # Step 1 / Step 2 — worker-side surface
@@ -99,8 +102,7 @@ class TestRealTaskFlip:
 
         # Build a GroupMergeRequest wired with factory callbacks, as γ would.
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-        config = MagicMock()
-        config.merge_timeout_seconds = 30
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         req = GroupMergeRequest(
             task_id='4442',
             branch='4442',

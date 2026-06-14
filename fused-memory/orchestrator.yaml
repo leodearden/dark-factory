@@ -7,5 +7,6 @@
 # a direct subdirectory (repo root or full-checkout worktree), so that
 # --project fused-memory and --directory fused-memory resolve correctly.
 test_command: "uv run --project fused-memory --directory fused-memory pytest tests/ --tb=short -q"
-lint_command: "uv run --project fused-memory --directory fused-memory ruff check src/ tests/"
+# bare-MagicMock + asyncmock-assertion gates (also run in merge-queue verify; see hooks/project-checks)
+lint_command: "uv run --project fused-memory --directory fused-memory ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests"
 type_check_command: "uv run --project fused-memory --directory fused-memory pyright src/ tests/"

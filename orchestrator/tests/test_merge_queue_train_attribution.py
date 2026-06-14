@@ -15,8 +15,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import make_placeholder_future
+from _orch_helpers import make_placeholder_future, pydantic_spec
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
@@ -82,7 +83,7 @@ def _make_group_req(
     except RuntimeError:
         future = make_placeholder_future()
 
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.merge_verify_workspace = False
     config.max_advance_attempts = 3
 
@@ -238,9 +239,7 @@ class TestReverifyMemberSoloContract:
         solo_wt = Path('/tmp/fake-solo-wt')
         solo_branch = '_solo-b2'
         tip_sha = 'cafe1234solo'
-        config = MagicMock()
-        config.max_post_merge_verify_timeouts = 3
-        config.max_post_merge_verify_enospc_retries = 3
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
 
         with patch(
             'orchestrator.merge_queue._run_post_merge_verify',
@@ -274,7 +273,7 @@ class TestReverifyMemberSoloContract:
         solo_wt = Path('/tmp/fake-solo-wt')
         solo_branch = '_solo-b1'
         tip_sha = 'dead1234solo'
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
 
         fail_outcome = MergeOutcome(
             'blocked',
@@ -319,7 +318,7 @@ class TestReverifyMemberSoloContract:
         git_ops.delete_solo_branch = AsyncMock()
         solo_wt = Path('/tmp/fake-solo-wt-pass')
         solo_branch = '_solo-b2'
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
 
         with patch(
             'orchestrator.merge_queue._run_post_merge_verify',
@@ -356,7 +355,7 @@ class TestReverifyMemberSoloContract:
         git_ops.delete_solo_branch = AsyncMock()
         solo_wt = Path('/tmp/fake-solo-wt-fail')
         solo_branch = '_solo-b1'
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
 
         fail_outcome = MergeOutcome('blocked', reason='tests failed', failure_category='x')
 

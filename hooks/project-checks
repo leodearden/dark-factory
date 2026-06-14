@@ -21,23 +21,39 @@ if ! uv run ruff check --quiet "${DIRS[@]}"; then
     exit 1
 fi
 
-# asyncmock assertion-style check (fused-memory/tests only)
+# asyncmock assertion-style check — STAGED test files only (no repo-wide ambush).
+# The repo-wide enforcement now lives in the per-module verify lint_commands (which
+# also run in merge-queue verify); this pre-commit gate is the last line for a direct
+# human commit to main and is scoped to what the commit actually stages.
 # Script is stdlib-only (ast/argparse/pathlib/sys) — invoked via plain python3 to skip uv env-resolution overhead.
-echo "pre-commit: asyncmock assertion-style check..."
-if ! (cd "$ROOT" && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests); then
-    echo "pre-commit: asyncmock style check failed. Use assert_not_awaited() instead of assert_not_called() on AsyncMocks."
-    exit 1
+echo "pre-commit: asyncmock assertion-style check (staged)..."
+staged_am="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMR -- \
+    fused-memory/tests \
+    | grep -E '\.py$' || true)"
+if [ -n "$staged_am" ]; then
+    if ! (cd "$ROOT" && printf '%s\n' "$staged_am" | xargs python3 fused-memory/scripts/check_asyncmock_assertion_style.py); then
+        echo "pre-commit: asyncmock style check failed. Use assert_not_awaited() instead of assert_not_called() on AsyncMocks."
+        exit 1
+    fi
 fi
 
-# bare-magicmock-config check (all five package test dirs)
+# bare-magicmock-config check — STAGED test files only (no repo-wide ambush).
+# See the asyncmock note above: repo-wide enforcement is in the verify lint_commands;
+# this gate only inspects the .py test files this commit stages, so it never blocks an
+# unrelated commit with debt that commit did not introduce.
 # Script is stdlib-only (ast/argparse/pathlib/re/sys) — invoked via plain python3 to skip uv env-resolution overhead.
-echo "pre-commit: bare-magicmock-config check..."
-if ! (cd "$ROOT" && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests); then
-    echo "pre-commit: bare-magicmock-config check failed."
-    echo "  Use the mock_orch_config fixture or MagicMock(spec_set=pydantic_spec(...)) instead of bare MagicMock()."
-    echo "  See task 1339 (migration) for the canonical fix pattern."
-    echo "  To suppress a specific site: add '# noqa: bare-magicmock — <reason>' on the preceding non-blank line."
-    exit 1
+echo "pre-commit: bare-magicmock-config check (staged)..."
+staged_mm="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMR -- \
+    shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests \
+    | grep -E '\.py$' || true)"
+if [ -n "$staged_mm" ]; then
+    if ! (cd "$ROOT" && printf '%s\n' "$staged_mm" | xargs python3 fused-memory/scripts/check_bare_magicmock_config.py); then
+        echo "pre-commit: bare-magicmock-config check failed."
+        echo "  Use the mock_orch_config fixture or MagicMock(spec_set=pydantic_spec(...)) instead of bare MagicMock()."
+        echo "  See task 1339 (migration) for the canonical fix pattern."
+        echo "  To suppress a specific site: add '# noqa: bare-magicmock — <reason>' on the preceding non-blank line."
+        exit 1
+    fi
 fi
 
 # pyright (must run from each package directory to pick up [tool.pyright] config)
