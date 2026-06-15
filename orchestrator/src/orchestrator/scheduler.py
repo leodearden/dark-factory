@@ -2478,27 +2478,39 @@ class Scheduler:
                 )
 
         # Drop _last_dispatch_at, _skip_count, _module_cache, and sub-threshold
-        # _external_unresolved_counts entries for tasks now in a terminal status
+        # _external_unresolved_counts entries for tasks that are:
+        #   (a) in a terminal status in status_map, OR
+        #   (b) absent from tasks_by_id (active-only filter dropped them because
+        #       they completed between ticks — γ2: previously the full get_tasks
+        #       result kept completed tasks visible so the terminal sweep could
+        #       clean them up; active-only filtering removes them from the result).
         # so a future legitimate re-dispatch (e.g. cancelled -> pending
         # re-architect, or a freshly-created task reusing the id) starts from a
         # clean slate.  Resurrection-safe: a re-queued task re-derives modules
         # and re-accumulates its skip count fresh.
         # Mirrors the _pending_anchor clearing in _update_age_anchors.
-        _terminal_ids: set[str] = set()
-        for tid_str, status in status_map.items():
-            if status in TERMINAL_STATUSES:
+        _stale_ids: set[str] = set()
+        # Iterate the union of all tracked bookkeeping keys so we catch ids that
+        # are absent from status_map entirely (completed, dropped by active filter).
+        _all_tracked: set[str] = (
+            set(self._last_dispatch_at)
+            | set(self._skip_count)
+            | set(self._module_cache)
+        )
+        for tid_str in _all_tracked:
+            if status_map.get(tid_str) in TERMINAL_STATUSES or tid_str not in tasks_by_id:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
-                _terminal_ids.add(tid_str)
+                _stale_ids.add(tid_str)
         # _external_unresolved_counts is keyed by (task_id, dep); sweep
         # separately to avoid mutating while iterating.  A sub-threshold counter
         # entry would otherwise leak permanently if the task terminates before
         # crossing the escalation threshold (e.g. manually cancelled while count=1).
-        if _terminal_ids and self._external_unresolved_counts:
+        if _stale_ids and self._external_unresolved_counts:
             _stale_ext_keys = [
                 k for k in self._external_unresolved_counts
-                if k[0] in _terminal_ids
+                if k[0] in _stale_ids
             ]
             for k in _stale_ext_keys:
                 del self._external_unresolved_counts[k]
