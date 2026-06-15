@@ -6987,6 +6987,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         except BaseException:
                             pass
 
+                    # Cancellation safety note: _downstream entries have been
+                    # moved out of self._inflight, so stop()'s inflight drain
+                    # will not reach any entry that hasn't been processed yet.
+                    # CancelledError from the bare awaits below (_abort_remote_verify
+                    # or cancel_and_release) would leave remaining entries with
+                    # unreleased leases and unresolved futures — the same pre-existing
+                    # risk as the cancel_and_release at line 7022.  In practice,
+                    # stop() terminates the loop via a None sentinel rather than
+                    # direct task cancellation, so the cascade always completes
+                    # before the sentinel is processed.  External task cancellation
+                    # (e.g. test harness timeout) can still hit this window; it is
+                    # accepted as an edge case given the sentinel-based shutdown design.
                     for _entry in _downstream:
                         _entry_status: str | None = None
                         if _entry.verify_task is not None:

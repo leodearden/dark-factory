@@ -390,11 +390,18 @@ class TestB2ChainInvalidationUnderOverlap:
             f'Expected N to fail, got status={outcome_a.status!r}'
         )
 
-        # (2) N+1's in-flight verify was aborted (cancel_verify called).
-        # Relaxed from assert_called_once() to assert_called(): task-1762 step-4
-        # legitimately adds a second cancel_verify per aborted downstream entry
-        # (_abort_remote_verify pre-cancel + cancel_and_release post-cancel).
-        gated_remote.cancel_verify.assert_called()
+        # (2) N+1's in-flight verify was aborted via exactly two cancel_verify calls:
+        # first from _abort_remote_verify (pre-cancel, id live → reaches remote),
+        # then from cancel_and_release (post-cancel, id dead → harmless no-op).
+        # assert_called_once() was relaxed in task-1762 step-4 because the fix
+        # legitimately adds a second call; strengthened here to call_count == 2
+        # (task-1762 amend) because the count is deterministic on the clean-cancel
+        # (rc=0) path — catching both a missing and a spurious extra call.
+        assert gated_remote.cancel_verify.call_count == 2, (
+            f'Expected exactly 2 cancel_verify calls '
+            f'(pre-cancel _abort_remote_verify + post-cancel cancel_and_release), '
+            f'got {gated_remote.cancel_verify.call_count}'
+        )
 
         # (3) N+1 was re-merged onto actual main
         assert 'b2-b' in remerge_task_ids, (
@@ -602,11 +609,17 @@ class TestB4CancelBehavior:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        # (1) cancel_verify called for the clean cancel (rc=0).
-        # Relaxed from assert_called_once() to assert_called(): task-1762 step-4
-        # legitimately adds a second cancel_verify per aborted downstream entry
-        # (_abort_remote_verify pre-cancel + cancel_and_release post-cancel).
-        gated_remote.cancel_verify.assert_called()
+        # (1) Exactly 2 cancel_verify calls on the clean-cancel (rc=0) path:
+        # _abort_remote_verify (pre-cancel, id live) + cancel_and_release
+        # (post-cancel, id dead → harmless no-op, slot freed).
+        # assert_called_once() was relaxed in task-1762 step-4; strengthened
+        # to call_count == 2 (task-1762 amend) since the count is deterministic
+        # on this path — catches both a missing and a spurious extra call.
+        assert gated_remote.cancel_verify.call_count == 2, (
+            f'Expected exactly 2 cancel_verify calls '
+            f'(pre-cancel _abort_remote_verify + post-cancel cancel_and_release), '
+            f'got {gated_remote.cancel_verify.call_count}'
+        )
 
         # (2) Remote slot freed after cancel confirm
         assert not allocator.is_busy(remote_name), (
@@ -708,9 +721,12 @@ class TestB4CancelBehavior:
             await asyncio.wait_for(worker_task, timeout=5.0)
 
         # (1) cancel_verify called → cancel-fail path taken.
-        # Relaxed from assert_called_once() to assert_called(): task-1762 step-4
-        # legitimately adds a second cancel_verify per aborted downstream entry
-        # (_abort_remote_verify pre-cancel + cancel_and_release post-cancel).
+        # assert_called_once() was relaxed to assert_called() in task-1762 step-4:
+        # the fix adds a second cancel_verify call (_abort_remote_verify pre-cancel
+        # + cancel_and_release post-cancel).  assert_called() is intentionally kept
+        # (not strengthened to call_count == 2) on this cancel-fail/probe path
+        # because the count may legitimately vary if retry or re-probe logic is
+        # added; the PARK + probe behavior below is the load-bearing assertion here.
         gated_remote.cancel_verify.assert_called()
 
         # (2) probe_clean called → slot was PARKED during probe

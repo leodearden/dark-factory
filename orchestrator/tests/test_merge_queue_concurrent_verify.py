@@ -2195,12 +2195,17 @@ class TestChainInvalidationUnderOverlap:
         )
 
         # ── RED: fails here (cancel_verify not called) ───────────────────────
-        # Relaxed from assert_called_once() to assert_called(): the fix
-        # (task-1762 step-4) legitimately adds a second cancel_verify per
-        # aborted downstream entry (_abort_remote_verify pre-cancel + the
-        # existing cancel_and_release post-cancel, which is a harmless no-op
-        # in production).  Intent preserved: "cancel_verify was issued."
-        gated_remote.cancel_verify.assert_called()
+        # Exactly 2 cancel_verify calls on the clean-cancel (rc=0) path:
+        # (a) _abort_remote_verify (pre-cancel, id live → reaches remote process)
+        # (b) cancel_and_release (post-cancel, id dead → harmless no-op in prod)
+        # assert_called_once() was relaxed in task-1762 step-4; strengthened
+        # to call_count == 2 (task-1762 amend) because the count is deterministic
+        # on this path — catches both a missing and a spurious extra call.
+        assert gated_remote.cancel_verify.call_count == 2, (
+            f'Expected exactly 2 cancel_verify calls '
+            f'(pre-cancel _abort_remote_verify + post-cancel cancel_and_release), '
+            f'got {gated_remote.cancel_verify.call_count}'
+        )
 
         # ── Main state: N+1 landed, N never did ─────────────────────────────
         from orchestrator.git_ops import _run as _git_run
