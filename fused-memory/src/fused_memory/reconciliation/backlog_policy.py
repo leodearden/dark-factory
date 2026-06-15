@@ -257,12 +257,14 @@ class BacklogPolicy:
         suggested_action: str,
     ) -> BacklogVerdict:
         """Either write an escalation (if orchestrator live) or return a rejection."""
+        limit = self.hard_limit_for(project_id)
         project_root = self.project_root_for(project_id)
         if project_root is not None and self._detector(project_root):
             path = await self._maybe_write_escalation(
                 project_id=project_id,
                 project_root=project_root,
                 backlog=backlog,
+                threshold=limit,
                 error_type=error_type,
                 summary=summary,
                 detail=detail,
@@ -271,7 +273,7 @@ class BacklogPolicy:
             return BacklogVerdict(
                 outcome='escalated',
                 backlog=backlog,
-                threshold=self._hard_limit,
+                threshold=limit,
                 project_id=project_id,
                 error_type=error_type,
                 escalation_path=str(path) if path else None,
@@ -280,7 +282,7 @@ class BacklogPolicy:
         return BacklogVerdict(
             outcome='rejection',
             backlog=backlog,
-            threshold=self._hard_limit,
+            threshold=limit,
             project_id=project_id,
             error_type=error_type,
         )
@@ -291,6 +293,7 @@ class BacklogPolicy:
         project_id: str,
         project_root: str,
         backlog: int,
+        threshold: int,
         error_type: str,
         summary: str,
         detail: str,
@@ -329,7 +332,7 @@ class BacklogPolicy:
             'level': 1,
             'workflow_state': 'infra',
             'backlog': backlog,
-            'threshold': self._hard_limit,
+            'threshold': threshold,
             'project_id': project_id,
             'error_type': error_type,
         }
@@ -337,7 +340,7 @@ class BacklogPolicy:
             path.write_text(json.dumps(record, indent=2), encoding='utf-8')
             logger.warning(
                 'backlog_policy: wrote L1 escalation %s (backlog=%d, threshold=%d)',
-                path, backlog, self._hard_limit,
+                path, backlog, threshold,
             )
             return path
         except OSError as exc:
