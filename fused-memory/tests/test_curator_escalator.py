@@ -439,6 +439,55 @@ class TestZeroOutputTimeoutEscalation:
 
 
 # ----------------------------------------------------------------------
+# Burst log keyed by (project_id, subtype) — independent counters
+# ----------------------------------------------------------------------
+
+
+class TestBurstLogCompositeKey:
+    """Lever 2b — different subtypes for the same project are counted
+    independently, so an error_max_budget_usd trip doesn't absorb burst
+    quota meant for error_max_turns or vice-versa.
+    """
+
+    @pytest.mark.asyncio
+    async def test_different_subtypes_have_independent_burst_counters(self, tmp_path):
+        """Two report_failure calls for the same project with DIFFERENT subtypes
+        should each produce 'failures_in_window=1 of 3' — independent counters.
+        Under the old project_id-only keying the second call would read '2 of 3'.
+        """
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            # First failure: subtype='error_max_budget_usd'.
+            await escalator.report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='budget exceeded',
+                candidate_title='T',
+                subtype='error_max_budget_usd',
+            )
+            # Second failure: different subtype for the same project.
+            await escalator.report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='turns exceeded',
+                candidate_title='T',
+                subtype='error_max_turns',
+            )
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            # Both subtypes should produce escalations.
+            assert len(files) == 2
+            bodies = [f.read_text() for f in files]
+            # Each should be '1 of 3' — independent per-subtype counters.
+            for body in bodies:
+                assert 'failures_in_window=1 of 3' in body, (
+                    f'Expected independent counter (1 of 3); got:\n{body}'
+                )
+        finally:
+            handle.close()
+
+
+# ----------------------------------------------------------------------
 # Generic detail renders cost_usd= and pool_sizes= (Fix R-detail)
 # ----------------------------------------------------------------------
 
