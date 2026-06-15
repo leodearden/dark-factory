@@ -560,11 +560,12 @@ class SqliteTaskBackend:
         Args:
             project_root: Absolute path to the project root.
             tag: Tag context; defaults to ``DEFAULT_TAG`` when ``None``.
-            ids: Reserved for the ids-filter path (step-4).  Currently ignored;
-                 all tasks are always returned.
+            ids: When given, only return entries for these task ids (as strings;
+                 cast to int for the SQL IN clause; non-numeric ids silently
+                 omitted).  ``None`` returns all tasks.  ``[]`` returns ``{}``.
 
         Returns:
-            ``{str(id): status}`` mapping.
+            ``{str(id): status}`` mapping.  Unknown ids are silently omitted.
             A ``NULL`` status (defensive; unreachable via normal writes) maps to
             ``'unknown'``.
         """
@@ -572,10 +573,28 @@ class SqliteTaskBackend:
         tag = tag or DEFAULT_TAG
         conn = await self._get_connection(project_root)
 
-        cursor = await conn.execute(
-            'SELECT id, status FROM tasks WHERE tag = ?',
-            (tag,),
-        )
+        if ids is not None:
+            if not ids:
+                return {}
+            int_ids: list[int] = []
+            for raw_id in ids:
+                try:
+                    int_ids.append(int(raw_id))
+                except (ValueError, TypeError):
+                    pass  # silently omit non-numeric ids
+            if not int_ids:
+                return {}
+            placeholders = ','.join('?' * len(int_ids))
+            cursor = await conn.execute(
+                f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})',
+                (tag, *int_ids),
+            )
+        else:
+            cursor = await conn.execute(
+                'SELECT id, status FROM tasks WHERE tag = ?',
+                (tag,),
+            )
+
         rows = await cursor.fetchall()
         return {
             str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
