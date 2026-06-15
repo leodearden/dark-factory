@@ -31,7 +31,10 @@ from escalation.server import create_server
 # Mirrors test_server.py lines 30-54 exactly.
 # ---------------------------------------------------------------------------
 try:
-    from orchestrator.config import GitConfig, OrchestratorConfig  # type: ignore[reportMissingImports]
+    from orchestrator.config import (  # type: ignore[reportMissingImports]
+        GitConfig,
+        OrchestratorConfig,
+    )
     from orchestrator.git_ops import GitOps, _run  # type: ignore[reportMissingImports]
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
@@ -102,7 +105,7 @@ async def _init_repo(repo: Path) -> None:
 
 
 @pytest.fixture
-def orch_config(git_repo: Path) -> OrchestratorConfig:
+def orch_config(git_repo: Path) -> OrchestratorConfig:  # type: ignore[reportInvalidTypeForm]
     return OrchestratorConfig(
         project_root=git_repo,
         max_concurrent_tasks=1,
@@ -116,7 +119,7 @@ def orch_config(git_repo: Path) -> OrchestratorConfig:
 
 
 @pytest.fixture
-def git_ops(orch_config: OrchestratorConfig) -> GitOps:
+def git_ops(orch_config: OrchestratorConfig) -> GitOps:  # type: ignore[reportInvalidTypeForm]
     return GitOps(orch_config.git, orch_config.project_root)
 
 
@@ -367,7 +370,7 @@ class TestMergeStatusGitAuthorityIntegration:
     """
 
     async def test_4352_lost_record_returns_done_found_on_main(
-        self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig
+        self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig  # type: ignore[reportInvalidTypeForm]
     ) -> None:
         """After merge+delete with no ring/event-store record, merge_status returns done.
 
