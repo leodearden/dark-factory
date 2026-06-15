@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -519,6 +520,55 @@ class TestRunSubstrateGate:
         remove_seen = any('remove' in str(call) for call in all_calls)
         assert remove_seen, (
             f'Expected git worktree remove to be called in finally; calls={all_calls!r}'
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_checker_runs_off_event_loop_thread(self, tmp_path: Path, monkeypatch):
+        """run_substrate_recheck must execute on a worker thread, not the event-loop thread.
+
+        step-11 RED: with the current inline call the checker runs on the same
+        event-loop thread (idents equal) → this assertion fails.
+        step-12 GREEN: after wrapping with asyncio.to_thread the checker executes
+        on a worker thread (idents differ) → passes.
+
+        The test is implementation-agnostic: any offload mechanism (to_thread,
+        run_in_executor, etc.) that moves execution off the event-loop thread
+        satisfies it.
+        """
+        h = _make_harness(tmp_path)
+        assignment = _make_assignment()
+
+        # Capture the event-loop thread identity at call time.
+        event_loop_thread_ident = threading.get_ident()
+
+        # Replace run_substrate_recheck with a recorder that captures its own
+        # thread ident when invoked, then returns PASS so the gate returns True.
+        checker_thread_idents: list[int] = []
+
+        def _recording_recheck(**kw):
+            checker_thread_idents.append(threading.get_ident())
+            return _pass_verdict()
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            _recording_recheck,
+        )
+
+        with patch('asyncio.create_subprocess_exec', new=AsyncMock(
+            return_value=_fake_proc(0)
+        )):
+            result = await h._run_substrate_gate(assignment)
+
+        assert result is True, 'gate should return True (PASS verdict)'
+        assert len(checker_thread_idents) == 1, (
+            'run_substrate_recheck should have been called exactly once'
+        )
+        # KEY assertion: the checker must NOT run on the event-loop thread.
+        assert checker_thread_idents[0] != event_loop_thread_ident, (
+            'run_substrate_recheck ran on the event-loop thread — it must be '
+            'offloaded to a worker thread (asyncio.to_thread) to avoid blocking '
+            'the entire asyncio event loop during a 120s subprocess.run call'
         )
 
 
