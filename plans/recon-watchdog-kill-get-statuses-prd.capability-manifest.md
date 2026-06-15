@@ -50,4 +50,22 @@ branches 1–2 reduce to the dependency-direction check (branch-3), checked belo
 | producer: the `statuses` param γ2 calls | shipped by γ1 (dep wired γ2→γ1) | PASS (producer:γ1 upstream) |
 | DAG-direction (G6 branch-3) | γ2 depends_on γ1; γ1 ships the param γ2 needs | PASS |
 
+## γ3a — dashboard TTL-cache of fetch_tasks (follow-up 2026-06-15)
+
+| Capability asserted | Evidence | Verdict |
+|---|---|---|
+| dashboard full-tree caller to cache | `dashboard/src/dashboard/data/tasks.py:85` (`get_tasks` with only `{project_root}`) | PASS |
+| dashboard needs ALL statuses (so γ1 active-filter is N/A — cache, don't filter) | `_shape_task` `tasks.py:29-35` keeps `updated_at` as recency key for ordering/displaying done tasks | PASS |
+| a cacheable seam exists (per-project async fetch) | `fetch_tasks(client, config, project_root)` `tasks.py:70` returns a list per project_root | PASS |
+| DAG-direction | self-contained dashboard change; no upstream dep | PASS |
+
+## γ3b — orchestrator: filter remaining unfiltered get_tasks callers (uses γ1, task 1758 done)
+
+| Capability asserted | Evidence | Verdict |
+|---|---|---|
+| `statuses=` filter param exists on get_tasks (producer) | task 1758 (γ1) merged `2541d9c7b8`-line; `get_statuses_raw`/filter on main | PASS (producer:1758 done) |
+| unfiltered callers to convert | `scheduler.py:1147` (_get_train_members), `harness.py:1173/1201/1544`; skip `cli.py:271` (manual) | PASS |
+| lean dep-status path for any done-status need | `scheduler.get_statuses` `scheduler.py:1429` | PASS |
+| DAG-direction | γ1 already on main; no new upstream dep | PASS |
+
 **Result:** 0 FAIL bindings — batch clears the manifest gate.

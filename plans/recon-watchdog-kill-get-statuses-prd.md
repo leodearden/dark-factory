@@ -214,3 +214,34 @@ Split per the multi-package rule (fused-memory + orchestrator exceed one archite
     `statuses` argument / stubbed tool call), AND a task whose dependency is a *terminal*
     (done) task still dispatches correctly because dep-satisfaction reads `get_statuses`
     — proving the filter didn't blind the scheduler to done deps.
+
+## Follow-up γ3 (post-deploy 2026-06-15): residual unfiltered `get_tasks` callers
+
+After γ1+γ2 deployed (all 5 orchestrators restarted) the watchdog kills **stopped**, but
+the fused-memory event loop still ran ~83% CPU (warm, no longer pegged/killing) — there are
+residual **unfiltered** `get_tasks` callers γ2 didn't touch. Non-urgent (no kills); the goal
+is a truly-idle loop. Two packages → split.
+
+- **γ3a — dashboard: stop re-pulling every project's full tree on each refresh** (leaf;
+  dashboard package). `dashboard/src/dashboard/data/fetch_tasks` (`data/tasks.py:85`) calls
+  `get_tasks` with only `{project_root}` (full tree) on every render. **The γ1 active-only
+  filter does NOT apply here** — `_shape_task` (`tasks.py:29`) keeps `updated_at` as the
+  recency key for ordering/displaying **done** tasks, so the dashboard genuinely needs all
+  statuses. Lever instead: **cache `fetch_tasks` per project with a short TTL** (decouples
+  the frontend poll cadence from full-tree MCP serialization — a monitoring view tolerates
+  ~15–30 s staleness). Alternative (architect's call, heavier — cross-package): a server-side
+  field projection on `get_tasks` so the dashboard list fetches only the columns it renders
+  (drop `details`/heavy `metadata`, lazy-load on expand) while keeping all statuses.
+  - **Signal:** dashboard tests — repeated `fetch_tasks`/render calls within the TTL issue at
+    most one `get_tasks` MCP call per project (asserted via a spy/mock counting calls); the
+    rendered task set (incl. done tasks and their completed timestamps) is unchanged.
+
+- **γ3b — orchestrator: filter the remaining unfiltered `get_tasks()` callers** (leaf;
+  orchestrator package; uses γ1's filter, task 1758 done). Audit and apply `statuses=` where
+  terminal tasks aren't needed: `scheduler.py:1147` (`_get_train_members` — train members are
+  active work), `harness.py:1173/1201/1544`. Skip `cli.py:271` (manual one-shot, not a hot
+  loop). Same correctness crux as γ2 — don't filter a caller that needs terminal tasks; route
+  any done-status need to `get_statuses`.
+  - **Signal:** orchestrator tests — each converted caller issues `get_tasks` with the
+    non-terminal `statuses` set (captured via stub) and its behavior (train-member ordering,
+    harness logic) is unchanged for an active-only tree.
