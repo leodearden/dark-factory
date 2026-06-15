@@ -102,6 +102,7 @@ class BacklogPolicy:
         orchestrator_detector: OrchestratorDetector,
         *,
         hard_limit: int = 500,
+        hard_limit_overrides: dict[str, int] | None = None,
         rate_limit_seconds: float = 900.0,
         time_provider: TimeProvider = time.time,
     ) -> None:
@@ -109,6 +110,7 @@ class BacklogPolicy:
         self._event_queue = event_queue
         self._detector = orchestrator_detector
         self._hard_limit = hard_limit
+        self._hard_limit_overrides: dict[str, int] = dict(hard_limit_overrides or {})
         self._rate_limit_seconds = rate_limit_seconds
         self._now = time_provider
         self._state: dict[str, _PolicyState] = {}
@@ -117,6 +119,14 @@ class BacklogPolicy:
     @property
     def hard_limit(self) -> int:
         return self._hard_limit
+
+    def hard_limit_for(self, project_id: str) -> int:
+        """Return the effective hard limit for ``project_id``.
+
+        Returns the per-project override if one is configured, otherwise
+        falls back to the global default ``hard_limit``.
+        """
+        return self._hard_limit_overrides.get(project_id, self._hard_limit)
 
     def register_project_root(self, project_id: str, project_root: str) -> None:
         """Cache the project_root for a project_id.
@@ -162,7 +172,8 @@ class BacklogPolicy:
             self.register_project_root(project_id, project_root)
 
         backlog = await self.current_backlog(project_id)
-        if backlog <= self._hard_limit:
+        limit = self.hard_limit_for(project_id)
+        if backlog <= limit:
             return BacklogVerdict(outcome='ok', project_id=project_id)
 
         return await self._route_over_limit(
@@ -171,11 +182,11 @@ class BacklogPolicy:
             error_type='ReconciliationBacklogExceeded',
             summary=(
                 f'Reconciliation backlog exceeded for {project_id}: '
-                f'{backlog}/{self._hard_limit}'
+                f'{backlog}/{limit}'
             ),
             detail=(
                 f'Buffered events + queue depth = {backlog}, threshold = '
-                f'{self._hard_limit}. Drain the backlog (run reconciliation '
+                f'{limit}. Drain the backlog (run reconciliation '
                 f'or trigger_reconciliation) before retrying.'
             ),
             suggested_action='drain_reconciliation',
