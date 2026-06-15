@@ -9810,6 +9810,74 @@ class TestInFlightMergeRegistry:
 
 
 # ---------------------------------------------------------------------------
+# TestInFlightMergeRegistryReleaseDetach — 1756 step-1 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInFlightMergeRegistryReleaseDetach:
+    """1756 step-1 RED: release(detach_waiters=True) cancels stranded waiters.
+
+    RED until step-2 impl: release() has no detach_waiters keyword →
+    TypeError on (a)/(b); (c) characterises the unchanged default path.
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_release_detach_waiters_cancels_primary_and_waiters(self):
+        """(a) release(detach_waiters=True) cancels all pending waiters and pops slot."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        f2 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        registry.release('B', detach_waiters=True)
+
+        assert registry.is_inflight('B') is False
+        # Both the primary (waiter #1) and the attached waiter (#2) must be cancelled.
+        assert f1.cancelled() is True
+        assert f2.cancelled() is True
+
+    async def test_release_detach_waiters_skips_done_futures(self):
+        """(b) release(detach_waiters=True) does not raise on already-done futures.
+
+        Simulates a finalized request whose done_callback has not fired yet —
+        the slot still exists, but the primary future is already resolved.
+        The guard (if not w.future.done(): w.future.cancel()) must prevent
+        calling cancel() on the already-resolved future so no InvalidStateError
+        or unexpected exception is raised.
+        """
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        # Resolve the primary (simulating an abnormal finalize path where the
+        # future is done but the registry slot hasn't been auto-released yet).
+        f1.set_result(MergeOutcome('done'))
+
+        # Must not raise even though the waiter future is already done.
+        registry.release('B', detach_waiters=True)
+
+        assert registry.is_inflight('B') is False
+
+    async def test_release_default_still_pops_slot(self):
+        """(c) release() with no kwargs pops the slot (default path unchanged)."""
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1)
+
+        registry.release('B')
+
+        assert registry.is_inflight('B') is False
+        # The default release path must NOT cancel the primary future —
+        # normal terminal resolution fans the outcome to attached waiters
+        # via the _mirror callbacks that run after _release.
+        assert f1.cancelled() is False
+
+
+# ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueue — registry-only path (git_ops=None)
 # ---------------------------------------------------------------------------
 
