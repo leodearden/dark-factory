@@ -783,13 +783,20 @@ async def _run_post_merge_verify(
             task_id=req.task_id,
         )
     else:
-        # Local path: LOCAL-ONLY pool — byte-identical to β.
+        # Local path: sole production site for human-facing local merge verify.
+        # archive_root mirrors the task-verify convention (workflow.py:4105):
+        # durable logs land under data/verify-logs/<task_id>/ so merge-verify
+        # and task-verify archives are co-located for operator triage.
+        # Cold-shadow (merge_queue.py:9112) and drift (9375/9402) are detective
+        # controls that intentionally leave archive_root=None — they are never
+        # constructed here and are auto-excluded by LocalRunner's default.
         pool = VerifyRunnerPool(
             [LocalRunner(
                 merge_wt, req.config, req.module_configs, task_files_tuple,
                 run_scoped=run_scoped_verification,
                 run_unscoped=_run_unscoped_typechecks,
                 task_id=req.task_id,
+                archive_root=req.config.project_root / 'data' / 'verify-logs',
             )],
             event_store=event_store,
             task_id=req.task_id,
@@ -888,6 +895,13 @@ async def _run_post_merge_verify(
             return main_health_outcome
         detail = verify.failure_report()
         reason = f'Post-merge verification failed: {verify.summary}'
+        # Append the failure category so the timeout-vs-real-failure
+        # distinction is visible in the surviving human-facing signal
+        # without requiring log spelunking.  Append-only (after the
+        # summary, before the detail block) keeps all existing
+        # prefix/substring reason assertions green.
+        if verify.category:
+            reason = f'{reason} [category: {verify.category}]'
         if detail:
             reason = f'{reason}\n\n{detail}'
         # Loop-breaker bookkeeping: bump only when the failure was a

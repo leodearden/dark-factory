@@ -12035,6 +12035,145 @@ class TestRunPostMergeVerify:
         call_kwargs = git_ops.prune_stale_merge_worktrees.await_args.kwargs
         assert call_kwargs['keep'] == {merge_wt}
 
+    async def test_local_path_archive_root_wired(self, tmp_path: Path) -> None:
+        """(task 1768 step-7 RED) On the local path, the inline LocalRunner is built with
+        archive_root == req.config.project_root / 'data' / 'verify-logs'.
+
+        Fails today because the inline LocalRunner construction at merge_queue.py:788
+        passes no archive_root (→ default None), so run_scoped_verification receives
+        archive_root=None.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        # Use a real Path so we can check the derived archive_root value.
+        req.config.project_root = tmp_path
+        merge_wt = MagicMock()
+
+        captured_kwargs: list[dict] = []
+
+        async def spy_run_scoped(*args, **kwargs):
+            captured_kwargs.append(kwargs)
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='', summary='ok',
+            )
+
+        expected_archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', spy_run_scoped),
+            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(
+                return_value=MagicMock(broken=False, timed_out=False, failing_subprojects=[],
+                                       timed_out_subprojects=[]),
+            )),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is None, f'Expected None (pass), got {result!r}'
+        assert captured_kwargs, 'run_scoped_verification must have been called'
+        actual_archive_root = captured_kwargs[0].get('archive_root')
+        assert actual_archive_root == expected_archive_root, (
+            f'Expected archive_root={expected_archive_root!r}, '
+            f'got {actual_archive_root!r}'
+        )
+
+    async def test_failure_reason_contains_infra_timeout_category(self) -> None:
+        """(task 1768 step-9 RED) Timed-out verify → reason contains '[category: infra_timeout]'.
+
+        Fails today because the generic failure block (merge_queue.py:890) does not
+        append the category to the reason string.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        timed_out_result = MagicMock(
+            passed=False,
+            summary='timed out after 7200s',
+            timed_out=True,
+            category='infra_timeout',
+            cause_hint='',
+        )
+        timed_out_result.failure_report.return_value = ''
+        timed_out_result.test_output = ''
+        timed_out_result.lint_output = ''
+        timed_out_result.type_output = ''
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=timed_out_result)),
+            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=99, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith('Post-merge verification failed:'), (
+            f'Reason prefix must be preserved: {result.reason!r}'
+        )
+        assert '[category: infra_timeout]' in result.reason, (
+            f'Expected "[category: infra_timeout]" in reason; got: {result.reason!r}'
+        )
+
+    async def test_failure_reason_contains_test_failure_category(self) -> None:
+        """(task 1768 step-9 RED) Real test failure → reason contains '[category: test_failure]'.
+
+        Fails today because the generic failure block does not append the category.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        test_fail_result = MagicMock(
+            passed=False,
+            summary='test-fail',
+            timed_out=False,
+            category='test_failure',
+            cause_hint='assert x == y',
+        )
+        test_fail_result.failure_report.return_value = ''
+        test_fail_result.test_output = ''
+        test_fail_result.lint_output = ''
+        test_fail_result.type_output = ''
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=test_fail_result)),
+            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        # Existing assertions must still pass (prefix + known substring)
+        assert result.reason.startswith('Post-merge verification failed:'), (
+            f'Reason prefix must be preserved: {result.reason!r}'
+        )
+        assert 'Post-merge verification failed: test-fail' in result.reason, (
+            f'Summary substring must survive: {result.reason!r}'
+        )
+        assert '[category: test_failure]' in result.reason, (
+            f'Expected "[category: test_failure]" in reason; got: {result.reason!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests

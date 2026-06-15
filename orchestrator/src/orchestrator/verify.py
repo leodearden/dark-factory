@@ -427,6 +427,116 @@ def _should_archive_category(category: str) -> bool:
     return category.endswith('_error')
 
 
+def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> dict:
+    """Build the summary.json payload dict from a list of run dicts.
+
+    Extracted from ``_persist_attempt_logs`` so both the task-path summary
+    (written into ``<worktree>/.task/verify/``) and the merge-path summary
+    (written directly to the durable archive) share an identical shape.
+
+    Top-level rc/cmd/timed_out/started_at/duration_secs fields come from the
+    run with the highest numeric rc (timed_out used as a tiebreaker).  This
+    intentionally differs from the 'category' field, which uses _worst_category
+    priority semantics.  The rationale: rc is the most unambiguous exit-code
+    signal for the outermost process, while category conveys semantic severity
+    across tools that may use different rc scales.  Downstream readers should
+    treat top-level metadata as "the loudest raw exit code" and 'category' as
+    "the highest-severity classification".
+    """
+    active_runs = [r for r in runs if r.get('cmd') is not None]
+    if active_runs:
+        worst = max(active_runs, key=lambda r: (r['rc'], r['timed_out']))
+    else:
+        worst = {'rc': 0, 'timed_out': False, 'cmd': None,
+                 'started_at': '', 'duration_secs': 0.0}
+
+    return {
+        'category': category,
+        'cause_hint': cause_hint,
+        'rc': worst['rc'],
+        'timed_out': worst['timed_out'],
+        'cmd': worst['cmd'],
+        'started_at': worst['started_at'],
+        'duration_secs': worst['duration_secs'],
+        'commands': [
+            {
+                'label': r['label'],
+                'cmd': r['cmd'],
+                'rc': r['rc'],
+                'timed_out': r['timed_out'],
+                'started_at': r['started_at'],
+                'duration_secs': r['duration_secs'],
+            }
+            for r in active_runs
+        ],
+    }
+
+
+def _make_infix(module_prefix: 'str | None') -> str:
+    """Return the dot-prefixed filename infix for *module_prefix*, or '' if None.
+
+    Sanitizes by replacing ``/`` and spaces with ``_``, mirroring
+    :func:`_warm_marker_name`.
+
+    Examples::
+
+        _make_infix('src/my module') -> '.src_my_module'
+        _make_infix(None)            -> ''
+    """
+    if module_prefix is None:
+        return ''
+    safe = module_prefix.replace('/', '_').replace(' ', '_')
+    return f'.{safe}'
+
+
+def _write_run_log(
+    target_dir: Path,
+    attempt_id: int,
+    infix: str,
+    run: dict,
+    *,
+    ts_suffix: str = '',
+    skip_if_exists: bool = False,
+    caller: str = '_write_run_log',
+) -> 'Path | None':
+    """Write a single run's output to a log file; return the path or None on error.
+
+    Filename: ``attempt-{attempt_id}{infix}.{run['label']}{ts_suffix}.log``
+
+    Parameters
+    ----------
+    target_dir:
+        Directory to write into (must already exist).
+    attempt_id:
+        Attempt counter embedded in the filename stem.
+    infix:
+        Module-prefix infix (including leading ``.``), or ``''``.  Build via
+        :func:`_make_infix`.
+    run:
+        Run dict with at least ``label`` (str) and optionally ``output`` (str).
+    ts_suffix:
+        Timestamp suffix to append before ``.log`` (e.g. ``'-20260615T120000_000000Z'``).
+        Empty string on the task path (no timestamp); non-empty on the merge path.
+    skip_if_exists:
+        When True and the target path already exists, return the path without
+        rewriting.  Used on the task path where ``_run_cmd`` may have already
+        streamed output there.
+    caller:
+        Name embedded in warning log messages for attribution.
+
+    Returns ``None`` on OSError (logged at warning level).
+    """
+    log_path = target_dir / f'attempt-{attempt_id}{infix}.{run["label"]}{ts_suffix}.log'
+    if skip_if_exists and log_path.exists():
+        return log_path
+    try:
+        log_path.write_text(run.get('output', ''), encoding='utf-8')
+        return log_path
+    except OSError as exc:
+        logger.warning('%s: could not write %s: %s', caller, log_path, exc)
+        return None
+
+
 def _persist_attempt_logs(
     worktree: Path,
     attempt_id: int,
@@ -482,13 +592,7 @@ def _persist_attempt_logs(
         logger.warning('_persist_attempt_logs: could not create %s: %s', verify_dir, exc)
         return []
 
-    # Sanitize the module prefix for use in filenames (mirrors _warm_marker_name).
-    if module_prefix is not None:
-        safe_prefix = module_prefix.replace('/', '_').replace(' ', '_')
-        infix = f'.{safe_prefix}'
-    else:
-        infix = ''
-
+    infix = _make_infix(module_prefix)
     written: list[Path] = []
 
     # Write per-command log files.  When the file already exists on disk it
@@ -498,52 +602,16 @@ def _persist_attempt_logs(
     for run in runs:
         if run.get('cmd') is None:
             continue
-        log_path = verify_dir / f'attempt-{attempt_id}{infix}.{run["label"]}.log'
-        if log_path.exists():
-            written.append(log_path)
-            continue
-        try:
-            log_path.write_text(run['output'], encoding='utf-8')
-            written.append(log_path)
-        except OSError as exc:
-            logger.warning('_persist_attempt_logs: could not write %s: %s', log_path, exc)
+        # No ts_suffix on the task path; skip_if_exists handles streamed files.
+        path = _write_run_log(
+            verify_dir, attempt_id, infix, run,
+            skip_if_exists=True, caller='_persist_attempt_logs',
+        )
+        if path is not None:
+            written.append(path)
 
-    # Build summary.json.
-    # Top-level rc/cmd/timed_out/started_at/duration_secs fields come from the
-    # run with the highest numeric rc (timed_out used as a tiebreaker).  This
-    # intentionally differs from the 'category' field, which uses _worst_category
-    # priority semantics.  The rationale: rc is the most unambiguous exit-code
-    # signal for the outermost process, while category conveys semantic severity
-    # across tools that may use different rc scales.  Downstream readers should
-    # treat top-level metadata as "the loudest raw exit code" and 'category' as
-    # "the highest-severity classification".
-    active_runs = [r for r in runs if r.get('cmd') is not None]
-    if active_runs:
-        worst = max(active_runs, key=lambda r: (r['rc'], r['timed_out']))
-    else:
-        worst = {'rc': 0, 'timed_out': False, 'cmd': None,
-                 'started_at': '', 'duration_secs': 0.0}
-
-    summary_payload: dict = {
-        'category': category,
-        'cause_hint': cause_hint,
-        'rc': worst['rc'],
-        'timed_out': worst['timed_out'],
-        'cmd': worst['cmd'],
-        'started_at': worst['started_at'],
-        'duration_secs': worst['duration_secs'],
-        'commands': [
-            {
-                'label': r['label'],
-                'cmd': r['cmd'],
-                'rc': r['rc'],
-                'timed_out': r['timed_out'],
-                'started_at': r['started_at'],
-                'duration_secs': r['duration_secs'],
-            }
-            for r in active_runs
-        ],
-    }
+    # Build summary.json via the shared helper (same shape as merge-path summary).
+    summary_payload = _build_summary_payload(runs, category, cause_hint)
 
     summary_path = verify_dir / f'attempt-{attempt_id}{infix}.summary.json'
     try:
@@ -609,6 +677,86 @@ def _archive_attempt_log(
     return archived
 
 
+def _archive_merge_verify_logs(
+    runs: list[dict],
+    archive_root: 'Path | None',
+    task_id: str,
+    attempt_id: int,
+    category: str,
+    cause_hint: str,
+    *,
+    module_prefix: 'str | None' = None,
+) -> list[Path]:
+    """Write merge-verify run outputs + summary DIRECTLY to the durable archive.
+
+    Unlike ``_archive_attempt_log`` (which copies files from the worktree's
+    ``.task/verify/``), this function writes directly to
+    ``<archive_root>/<task_id>/`` because merge worktrees have ``.task/``
+    scrubbed by design (git_ops.py) and there are no intermediate worktree
+    log files to copy from.
+
+    Differences from the task-path helpers:
+    - **No deny-list check**: on the merge path there is no debugger loop;
+      every failure reaches a human.  ``infra_timeout`` and ``test_failure``
+      (the exact categories that distinguish timeout-vs-real-failure) are
+      archived unconditionally.
+    - **Direct-to-archive**: bypasses ``.task/verify/``; the archive is the
+      only persistence target that survives merge_wt cleanup.
+
+    Filename convention mirrors ``_archive_attempt_log``:
+        ``attempt-{N}[.{safe_prefix}].{label}-{utc_ts}.log``
+        ``attempt-{N}[.{safe_prefix}].summary-{utc_ts}.json``
+
+    Returns the list of paths actually written (both .log and .json).
+    Returns ``[]`` when ``archive_root`` is ``None``.
+    All filesystem errors are caught, logged, and swallowed (best-effort).
+    """
+    if archive_root is None:
+        return []
+
+    target_dir = archive_root / task_id
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning('_archive_merge_verify_logs: could not create %s: %s', target_dir, exc)
+        return []
+
+    infix = _make_infix(module_prefix)
+    # Use microsecond precision so rapid back-to-back merge-verify retries for
+    # the same task (same attempt_id=1 default, same second) never overwrite each
+    # other.  The format is still lexicographically sortable.
+    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+    ts_suffix = f'-{utc_ts}'
+    archived: list[Path] = []
+
+    # Write per-command log files directly to the archive.
+    for run in runs:
+        if run.get('cmd') is None:
+            continue
+        path = _write_run_log(
+            target_dir, attempt_id, infix, run,
+            ts_suffix=ts_suffix, caller='_archive_merge_verify_logs',
+        )
+        if path is not None:
+            archived.append(path)
+
+    # Write summary.json using the shared payload builder.
+    summary_path = target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json'
+    try:
+        summary_payload = _build_summary_payload(runs, category, cause_hint)
+        summary_path.write_text(
+            json.dumps(summary_payload, indent=2, ensure_ascii=False),
+            encoding='utf-8',
+        )
+        archived.append(summary_path)
+    except OSError as exc:
+        logger.warning(
+            '_archive_merge_verify_logs: could not write %s: %s', summary_path, exc,
+        )
+
+    return archived
+
+
 _DEFAULT_ARCHIVE_MAX_AGE_DAYS = 30
 _DEFAULT_ARCHIVE_MAX_BYTES = 500 * 1024 * 1024
 # Process-local throttle: at most one rglob walk per process per 30 min.
@@ -646,10 +794,16 @@ def _prune_archive(
     now = time.time()
     cutoff = now - max_age_days * 86_400
 
-    # Single rglob walk — collect all log files once, avoiding a second
-    # directory scan for the size-cap pass.
+    # Single rglob walk — collect all archivable files once, avoiding a second
+    # directory scan for the size-cap pass.  Both *.log and *.json are counted
+    # because _archive_merge_verify_logs emits summary.json files into the same
+    # tree and they would otherwise accumulate unbounded (never counted toward the
+    # size budget, never pruned).
+    _PRUNE_SUFFIXES = frozenset(('.log', '.json'))
     all_entries: list[tuple[Path, float, int]] = []
-    for path in archive_root.rglob('*.log'):
+    for path in archive_root.rglob('*'):
+        if path.suffix not in _PRUNE_SUFFIXES:
+            continue
         try:
             st = path.stat()
             if not path.is_file():
@@ -1809,40 +1963,62 @@ async def run_verification(
         cause_hint = ' | '.join(hint_parts)
         category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
-    # Persist attempt logs when requested (opt-in via attempt_id kwarg).
-    # No-op when attempt_id is None (existing callers: merge_queue, review_checkpoint).
+    # Hoist runs list so both the merge-path and task-path branches can use it.
+    runs = [
+        {
+            'label': 'test',
+            'cmd': test_cmd,
+            'rc': test_rc,
+            'output': test_out,
+            'timed_out': test_timed_out,
+            'started_at': test_started_at or '',
+            'duration_secs': test_duration,
+        },
+        {
+            'label': 'lint',
+            'cmd': lint_cmd,
+            'rc': lint_rc,
+            'output': lint_out,
+            'timed_out': lint_timed_out,
+            'started_at': lint_started_at or '',
+            'duration_secs': lint_duration,
+        },
+        {
+            'label': 'type',
+            'cmd': type_cmd,
+            'rc': type_rc,
+            'output': type_out,
+            'timed_out': type_timed_out,
+            'started_at': type_started_at or '',
+            'duration_secs': type_duration,
+        },
+    ]
+
     worktree_log_paths: list[str] = []
     archive_log_paths: list[str] = []
-    if attempt_id is not None and task_id is not None:
-        runs = [
-            {
-                'label': 'test',
-                'cmd': test_cmd,
-                'rc': test_rc,
-                'output': test_out,
-                'timed_out': test_timed_out,
-                'started_at': test_started_at or '',
-                'duration_secs': test_duration,
-            },
-            {
-                'label': 'lint',
-                'cmd': lint_cmd,
-                'rc': lint_rc,
-                'output': lint_out,
-                'timed_out': lint_timed_out,
-                'started_at': lint_started_at or '',
-                'duration_secs': lint_duration,
-            },
-            {
-                'label': 'type',
-                'cmd': type_cmd,
-                'rc': type_rc,
-                'output': type_out,
-                'timed_out': type_timed_out,
-                'started_at': type_started_at or '',
-                'duration_secs': type_duration,
-            },
-        ]
+    if role == 'merge':
+        # Merge worktrees have .task/ scrubbed by design (git_ops.py); there
+        # are no worktree log files to copy.  Write directly to the durable
+        # archive instead.  No deny-list check: on the merge path there is no
+        # debugger loop — every failure goes straight to a human/steward —
+        # so infra_timeout and test_failure (the exact categories that
+        # distinguish timeout-vs-real-failure) must be archived
+        # unconditionally.  archive_root is not None is the discriminator
+        # that auto-excludes cold-shadow / drift paths (left at None).
+        if archive_root is not None and task_id is not None and not passed:
+            try:
+                arch_paths = _archive_merge_verify_logs(
+                    runs, archive_root, task_id, attempt_id or 1,
+                    category, cause_hint, module_prefix=module_prefix,
+                )
+                archive_log_paths = [str(p) for p in arch_paths]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'run_verification: merge archival error (non-fatal): %s', exc,
+                )
+    elif attempt_id is not None and task_id is not None:
+        # Task path: persist to worktree/.task/verify/ then optionally copy
+        # to the durable archive when category warrants it.
         try:
             wt_paths = _persist_attempt_logs(
                 worktree, attempt_id, runs, category, cause_hint,

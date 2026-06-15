@@ -607,6 +607,8 @@ class TestLocalRunnerBundle:
             is_merge_verify=True,
             force_workspace=True,
             role='merge',
+            task_id=None,
+            archive_root=None,
         )
 
 
@@ -3861,3 +3863,119 @@ class TestRemoteRunnerMainBranchDedup:
         )
         await runner.run_merge_verify('abc123', _make_spec())
         assert rev_parse_called[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Step-5 (task 1768): LocalRunner archive_root forwarding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLocalRunnerArchiveRoot:
+    """LocalRunner forwards archive_root + task_id through run_merge_verify.
+
+    Tests are RED until step-6 adds archive_root to LocalRunner.__init__ and
+    wires it through the self._run_scoped(...) call in run_merge_verify.
+    """
+
+    def _make_runner_with_spy(
+        self,
+        *,
+        archive_root=None,
+        task_id=None,
+    ):
+        """Build a LocalRunner with a spy run_scoped that records its kwargs."""
+        captured: list[dict] = []
+
+        async def spy_run_scoped(*args, **kwargs):
+            captured.append(kwargs)
+            return _make_pass_result()
+
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.merge_verify_workspace = False
+        run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
+
+        runner = LocalRunner(
+            merge_wt=MagicMock(),
+            config=config,
+            module_configs=[],
+            task_files=None,
+            run_scoped=spy_run_scoped,
+            run_unscoped=run_unscoped,
+            task_id=task_id,
+            archive_root=archive_root,
+        )
+        return runner, captured
+
+    async def test_archive_root_forwarded_to_run_scoped(self, tmp_path):
+        """archive_root=tmp_path is forwarded to run_scoped as a kwarg."""
+        runner, captured = self._make_runner_with_spy(
+            archive_root=tmp_path,
+            task_id='1768',
+        )
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert captured, 'run_scoped must have been called'
+        kwargs = captured[0]
+        assert kwargs.get('archive_root') == tmp_path, (
+            f'Expected archive_root={tmp_path!r}, got {kwargs.get("archive_root")!r}'
+        )
+
+    async def test_task_id_forwarded_to_run_scoped(self, tmp_path):
+        """task_id='1768' is forwarded to run_scoped as a kwarg."""
+        runner, captured = self._make_runner_with_spy(
+            archive_root=tmp_path,
+            task_id='1768',
+        )
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert captured, 'run_scoped must have been called'
+        kwargs = captured[0]
+        assert kwargs.get('task_id') == '1768', (
+            f'Expected task_id="1768", got {kwargs.get("task_id")!r}'
+        )
+
+    async def test_role_merge_forwarded_to_run_scoped(self, tmp_path):
+        """role='merge' is always forwarded to run_scoped."""
+        runner, captured = self._make_runner_with_spy(
+            archive_root=tmp_path,
+            task_id='1768',
+        )
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert captured, 'run_scoped must have been called'
+        kwargs = captured[0]
+        assert kwargs.get('role') == 'merge', (
+            f'Expected role="merge", got {kwargs.get("role")!r}'
+        )
+
+    async def test_default_archive_root_none_forwarded(self):
+        """LocalRunner without archive_root (default) forwards archive_root=None."""
+        captured: list[dict] = []
+
+        async def spy_run_scoped(*args, **kwargs):
+            captured.append(kwargs)
+            return _make_pass_result()
+
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.merge_verify_workspace = False
+        run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
+
+        # Construct without archive_root (uses default)
+        runner = LocalRunner(
+            merge_wt=MagicMock(),
+            config=config,
+            module_configs=[],
+            task_files=None,
+            run_scoped=spy_run_scoped,
+            run_unscoped=run_unscoped,
+            task_id='1768',
+            # archive_root omitted → default None
+        )
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert captured, 'run_scoped must have been called'
+        kwargs = captured[0]
+        assert kwargs.get('archive_root') is None, (
+            f'Expected archive_root=None when not set, got {kwargs.get("archive_root")!r}'
+        )
