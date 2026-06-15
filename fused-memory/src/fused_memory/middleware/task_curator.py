@@ -65,8 +65,8 @@ class CuratorFailureError(RuntimeError):
     errors; instead the interceptor translates this into an L1 escalation or
     a hard failure at the MCP boundary so operators notice breakage.
 
-    Attaches ``timed_out``, ``duration_ms``, ``subtype``, and
-    ``schema_tool_denied`` from the underlying ``AgentResult`` so
+    Attaches ``timed_out``, ``duration_ms``, ``subtype``, ``schema_tool_denied``,
+    and ``cost_usd`` from the underlying ``AgentResult`` so
     :class:`CuratorEscalator` can surface them in the L1 escalation detail and
     so the bisecting fallback in
     :meth:`TaskCurator._call_llm_batch_with_fallback` can branch on the
@@ -92,6 +92,7 @@ class CuratorFailureError(RuntimeError):
         zero_output_timeout: bool = False,
         proc_tree: str = '',
         account_name: str = '',
+        cost_usd: float | None = None,
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
@@ -101,6 +102,7 @@ class CuratorFailureError(RuntimeError):
         self.zero_output_timeout = zero_output_timeout
         self.proc_tree = proc_tree
         self.account_name = account_name
+        self.cost_usd = cost_usd
 
 
 Action = Literal['drop', 'combine', 'create']
@@ -1727,6 +1729,7 @@ class TaskCurator:
                 zero_output_timeout=is_zero_output_timeout(agent_result),
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
+                cost_usd=agent_result.cost_usd,
             )
 
         return _parse_decision(
@@ -1812,6 +1815,7 @@ class TaskCurator:
                 zero_output_timeout=is_zero_output_timeout(agent_result),
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
+                cost_usd=agent_result.cost_usd,
             )
 
         return _parse_batch_decisions(
