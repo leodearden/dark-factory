@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -164,7 +165,7 @@ class _SchedulerLike(Protocol):
     async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = ...,
     ) -> dict: ...
-    async def get_tasks(self) -> list[dict]: ...
+    async def get_tasks(self, *, statuses: Iterable[str] | None = ...) -> list[dict]: ...
     async def get_statuses(
         self, ids: list[str] | None = ...,
     ) -> tuple[dict[str, str], Exception | None]: ...
