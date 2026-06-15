@@ -436,3 +436,51 @@ class TestZeroOutputTimeoutEscalation:
             )
         finally:
             handle.close()
+
+
+# ----------------------------------------------------------------------
+# Generic detail renders cost_usd= and pool_sizes= (Fix R-detail)
+# ----------------------------------------------------------------------
+
+
+class TestOverBudgetDetail:
+    """Lever 2a — generic curator_failure detail includes cost_usd and pool_sizes.
+
+    When report_failure is called with subtype='error_max_budget_usd',
+    cost_usd, and pool_sizes, the queued escalation body (generic
+    curator_failure path, NOT ZOT/schema-denied) must contain
+    `cost_usd=` and `pool_sizes=` for operator triage.
+    """
+
+    @pytest.mark.asyncio
+    async def test_generic_detail_includes_cost_usd_and_pool_sizes(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            await escalator.report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='budget',
+                candidate_title='T',
+                subtype='error_max_budget_usd',
+                cost_usd=0.30574,
+                pool_sizes={
+                    'anchor': 1,
+                    'module': 15,
+                    'embedding': 10,
+                    'dependency': 3,
+                },
+            )
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 1
+            body = files[0].read_text()
+            # Must be on the generic curator_failure path.
+            assert 'curator_failure' in body
+            # ZOT/schema-denied branches must NOT be triggered.
+            assert 'curator_zero_output_hang' not in body
+            assert 'curator_schema_tool_denied' not in body
+            # cost_usd and pool_sizes must appear in the detail.
+            assert 'cost_usd=' in body
+            assert 'pool_sizes=' in body
+        finally:
+            handle.close()
