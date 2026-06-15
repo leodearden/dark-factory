@@ -56,3 +56,15 @@ class TestOrchTabCurrentFocusRemoved:
         consumer in tabs.jsx.
         """
         assert not re.search(r'\{\s*o\.current_task\s*\}', tabs_jsx_body)
+
+
+class TestOrchTabLastUpdate:
+    """OrchTab must render the per-orchestrator last-update timestamp."""
+
+    def test_orch_tab_renders_last_update_via_timeago(self, tabs_jsx_body):
+        """tabs.jsx must contain the render reference timeago(o.last_update)."""
+        assert 'timeago(o.last_update)' in tabs_jsx_body
+
+    def test_orch_tab_has_updated_label(self, tabs_jsx_body):
+        """tabs.jsx must contain an 'Updated' label token in OrchTab."""
+        assert 'Updated' in tabs_jsx_body
