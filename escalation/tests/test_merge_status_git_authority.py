@@ -227,3 +227,122 @@ class TestMergeStatusGitAuthority:
         fmm.assert_called_once_with('task/456')
         # is_ancestor must NOT be called when tip is None
         ia.assert_not_called()
+
+    # ── step-5: fire-safety + negatives + guards ──────────────────────────────
+
+    async def _make_server_with_git_ops(
+        self, tmp_path: Path, stub_git
+    ) -> Any:
+        """Helper: create a server with git_ops wired, no event_store."""
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=None,
+            _terminal_retention=None,
+            git_ops=stub_git,
+        )
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            max_concurrent_tasks=1,
+            git=GitConfig(main_branch='main', branch_prefix='task/', remote='origin',
+                          worktree_dir='.worktrees'),
+        )
+        return create_server(esc_queue, harness=stub_harness, orch_config=config)
+
+    async def test_fire_safe_resolve_branch_sha_raises_returns_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) fire-safe: resolve_branch_sha raising → state='unknown', no raise."""
+        rsb = AsyncMock(side_effect=RuntimeError('git exploded'))
+        stub_git = _stub_git_ops(resolve_branch_sha=rsb)
+        server = await self._make_server_with_git_ops(tmp_path, stub_git)
+
+        result = await _call_merge_status(server, task_id='T')
+
+        assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
+        assert 'hint' in result, f'Expected hint key in unknown response: {result}'
+
+    async def test_fire_safe_is_ancestor_raises_returns_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) fire-safe: is_ancestor raising → state='unknown', no raise."""
+        tip = 'c' * 40
+        rsb = AsyncMock(return_value=tip)
+        ia = AsyncMock(side_effect=RuntimeError('git subprocess died'))
+        stub_git = _stub_git_ops(resolve_branch_sha=rsb, is_ancestor=ia)
+        server = await self._make_server_with_git_ops(tmp_path, stub_git)
+
+        result = await _call_merge_status(server, task_id='T')
+
+        assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
+        assert 'hint' in result, f'Expected hint key in unknown response: {result}'
+
+    async def test_genuine_miss_branch_present_not_on_main_returns_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """(b) genuine miss: tip present, is_ancestor=False, no marker → unknown.
+
+        A branch that exists but hasn't landed on main yet must NOT
+        false-positive as 'done'.
+        """
+        tip = 'd' * 40
+        rsb = AsyncMock(return_value=tip)
+        ia = AsyncMock(return_value=False)
+        fmm = AsyncMock(return_value=None)
+        stub_git = _stub_git_ops(resolve_branch_sha=rsb, is_ancestor=ia,
+                                  find_merge_marker=fmm)
+        server = await self._make_server_with_git_ops(tmp_path, stub_git)
+
+        result = await _call_merge_status(server, task_id='T-pending')
+
+        assert result.get('state') == 'unknown', (
+            f'Branch not on main must stay unknown, got: {result}'
+        )
+        # find_merge_marker must NOT be called when tip is present (cheaper path)
+        fmm.assert_not_called()
+
+    async def test_guard_orch_config_absent_returns_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) guard: git_ops present but no orch_config → straight to honest unknown."""
+        stub_git = _stub_git_ops(
+            resolve_branch_sha=AsyncMock(return_value='e' * 40),
+            is_ancestor=AsyncMock(return_value=True),
+        )
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=None,
+            _terminal_retention=None,
+            git_ops=stub_git,
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        # No orch_config passed — Tier-3.5 must be skipped
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, task_id='T-noconfig')
+
+        assert result.get('state') == 'unknown', (
+            f'No orch_config must yield unknown, got: {result}'
+        )
+
+    async def test_guard_git_ops_absent_returns_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """(d) guard: harness without git_ops attr → straight to honest unknown."""
+        # Harness with NO git_ops attribute at all
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=None,
+            _terminal_retention=None,
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            max_concurrent_tasks=1,
+            git=GitConfig(main_branch='main', branch_prefix='task/', remote='origin',
+                          worktree_dir='.worktrees'),
+        )
+        server = create_server(esc_queue, harness=stub_harness, orch_config=config)
+
+        result = await _call_merge_status(server, task_id='T-nogit')
+
+        assert result.get('state') == 'unknown', (
+            f'No git_ops must yield unknown, got: {result}'
+        )
