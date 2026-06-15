@@ -167,3 +167,50 @@ visibility guard so a recurrence can't hide again.
 - β: exact escalation `category` string — reuse `recon_stale_run` with a distinct
   storm `finding` identity, or a new `recon_watchdog_kill_storm` category — pick the
   one the 8103 watcher surfaces most legibly.
+
+## Follow-up γ (post-deploy finding 2026-06-15): `get_tasks` encode hot path
+
+After α+β merged and deployed, the watchdog kills **continued** — ~22-min intervals
+against `WatchdogSec=600` (raised as an interim mitigation), event-loop thread still
+~78–88% CPU. A second `py-spy` dump caught the residual GIL-hog on the **encode**
+side: pydantic `model_dump_json` (`mcp/server/streamable_http.py:_create_json_response`)
+serializing a large MCP tool **response** on the event loop — a full `get_tasks`
+payload. α fixed the status-only **read/decode** path; this is the same full-tree cost
+on the **serialize-out** path for callers that fetch whole task dicts.
+`scheduler.get_tasks()` (`orchestrator/scheduler.py:1148`) dispatches MCP `get_tasks`
+with only `{project_root}` — no filter — pulling reify's entire tree (**4,577 tasks ≈
+9.84 MB** column text) every fetch, across 6 orchestrators. Of those **4,333 are
+terminal** (done/cancelled); only ~244 are dispatchable.
+
+**Decision (user, 2026-06-15):** server-side filtered `get_tasks` (option 1) — opt-in
+status filter pushed into SQL (default contract unchanged), adopted by the scheduler's
+hot paths. Mirrors α (lean query at the source), fixes all callers.
+
+**Correctness crux (G6/G2):** active-only filtering must NOT hide terminal tasks from
+the scheduler's **dependency-satisfaction** checks — those read the lean `get_statuses`
+(status-only, made cheap by α), not the filtered `get_tasks`. The γ2 audit must confirm
+every `scheduler.get_tasks()` consumer either tolerates active-only or is rerouted to
+`get_statuses`.
+
+Split per the multi-package rule (fused-memory + orchestrator exceed one architect budget):
+
+- **γ1 — fused-memory: opt-in status filter on `get_tasks`** (leaf; no deps). Thread a
+  `statuses: list[str] | None` (or `exclude_terminal: bool`) param through the server
+  tool (`server/tools.py:2020`) → interceptor (`task_interceptor.py:3187`) → backend
+  (`sqlite_task_backend.py:514` / `_get_tasks_internal:497`), pushed into SQL as
+  `... WHERE tag=? AND status IN (…)` (uses `ix_tasks_status`). Param omitted = today's
+  full unfiltered tree, byte-identical — contract unchanged. Shrinks both the per-row
+  decode and the `model_dump_json` encode proportionally.
+  - **Signal:** backend/tool unit tests — `get_tasks(statuses=[…])` returns only matching
+    rows and the issued SQL carries a `status IN` predicate; omitting the param returns
+    the full tree identical to today; an empty list returns no tasks.
+
+- **γ2 — orchestrator: scheduler adopts active-only on hot paths** (leaf; depends on γ1).
+  Audit the four `scheduler.get_tasks()` consumers (`scheduler.py:1129, 2392`;
+  `workflow.py:918, 7208`); per-tick/dispatch hot callers request non-terminal statuses;
+  confirm dependency-satisfaction reads `get_statuses` (`scheduler.py:1429`) not the
+  filtered fetch; leave any consumer that genuinely needs terminal tasks on the full fetch.
+  - **Signal:** scheduler tests — the dispatch path fetches active-only (asserted via the
+    `statuses` argument / stubbed tool call), AND a task whose dependency is a *terminal*
+    (done) task still dispatches correctly because dep-satisfaction reads `get_statuses`
+    — proving the filter didn't blind the scheduler to done deps.

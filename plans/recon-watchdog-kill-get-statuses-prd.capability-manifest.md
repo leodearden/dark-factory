@@ -32,4 +32,22 @@ branches 1–2 reduce to the dependency-direction check (branch-3), checked belo
 | threshold is a defined default, not a matched external number (G6 branch 1–2 N/A) | β owns the knob; test feeds N events and asserts the boundary it defines | PASS |
 | DAG-direction (G6 branch-3) | independent of α; all substrate on main | PASS |
 
+## γ1 — fused-memory opt-in status filter on get_tasks (follow-up 2026-06-15)
+
+| Capability asserted | Evidence | Verdict |
+|---|---|---|
+| get_tasks layers to thread a filter through | server tool `server/tools.py:2020`; interceptor `task_interceptor.py:3187`; backend `sqlite_task_backend.py:514` → `_get_tasks_internal:497` (`SELECT * … WHERE tag=?`) | PASS |
+| `status` column + index for `status IN` predicate | `sqlite_task_backend.py:62` (`status TEXT NOT NULL`), `:69` `ix_tasks_status(tag,status)` | PASS |
+| default-unchanged contract is observable | `get_tasks` returns `{tasks:[…]}` full tree today; param-omitted path must match byte-for-byte | PASS |
+| DAG-direction | no deps; all substrate on main | PASS |
+
+## γ2 — scheduler adopts active-only on hot paths (depends γ1)
+
+| Capability asserted | Evidence | Verdict |
+|---|---|---|
+| scheduler get_tasks consumers to audit | `scheduler.py:1129` (_get_train_members), `:2392` (dispatch); `workflow.py:918, 7208` | PASS |
+| lean dep-satisfaction path exists (so filtering can't blind done-deps) | `scheduler.get_statuses` `scheduler.py:1429` ("~95% less data"), already used at `workflow.py:795` | PASS |
+| producer: the `statuses` param γ2 calls | shipped by γ1 (dep wired γ2→γ1) | PASS (producer:γ1 upstream) |
+| DAG-direction (G6 branch-3) | γ2 depends_on γ1; γ1 ships the param γ2 needs | PASS |
+
 **Result:** 0 FAIL bindings — batch clears the manifest gate.
