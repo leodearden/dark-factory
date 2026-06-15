@@ -2368,6 +2368,184 @@ Output JSON matching the schema. Every task must appear in the output.
             task_id,
         )
 
+    async def _block_and_escalate_substrate_flip(
+        self,
+        task_id: str,
+        *,
+        verdict,
+    ) -> None:
+        """Block a task and file an L1 escalation for a PASS→FAIL substrate flip.
+
+        Mirrors ``_block_and_escalate_external_dep``:
+        - Sets the task to ``blocked`` via ``scheduler.set_task_status`` (unconditional;
+          wrapped in try/except so a transient write failure does not prevent the L1
+          from being filed).
+        - Submits a level-1 ``Escalation`` with category='design_concern' to the queue.
+        - Deduped by ``has_open_l1`` so repeated dispatch attempts (after the requeue
+          cooldown expires) do not stack duplicate escalations.
+        - No-ops gracefully when ``_escalation_queue`` is None (bare-Harness unit tests).
+
+        A PASS→FAIL flip means the task's probe-set premise no longer holds on
+        current main; the design_concern class routes it to human/curator judgment
+        (same class as report_false_premise).
+        """
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'Substrate flip block for task %s — set_task_status raised; '
+                'will still attempt to file escalation',
+                task_id,
+                exc_info=True,
+            )
+
+        if not self._escalation_queue:
+            logger.warning(
+                'Substrate flip block for task %s — no escalation queue, skipping L1 file',
+                task_id,
+            )
+            return
+
+        if self._escalation_queue.has_open_l1(task_id):
+            logger.warning(
+                'Substrate flip block for task %s — open L1 already exists, suppressing '
+                'duplicate; pre-existing L1 may be for an unrelated cause',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        summary = f'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task {task_id})'
+        detail = (
+            f'Dispatch-time substrate re-check detected a PASS→FAIL flip.\n'
+            f'Verdict: {verdict.verdict!r} | exit_code={verdict.exit_code} | '
+            f'probe_set={verdict.probe_set!r}\n'
+            f'Reason: {verdict.reason}\n'
+            f'The task premise (probe set authored at investigation time) no longer holds '
+            f'on current main — re-spec required before dispatch.'
+        )
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category='design_concern',
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning(
+            'Filed L1 substrate-flip escalation %s for task %s',
+            esc.id,
+            task_id,
+        )
+
+    async def _run_substrate_gate(self, assignment) -> bool:
+        """Run the dispatch-time substrate re-check gate (D4).
+
+        Builds an ephemeral detached worktree at the current-main SHA (mirroring
+        evals/snapshots.py), runs ``substrate_gate.run_substrate_recheck``, and
+        either allows dispatch (True) or blocks + escalates (False).
+
+        Called from ``_run_slot`` BEFORE ``TaskWorkflow`` construction so the
+        agent is never spun up for a task whose probe-set premise has flipped.
+
+        Returns:
+            True   — PASS or SKIP (dispatch may proceed).
+            False  — FLIP (task blocked + L1 filed; caller must arm requeue cooldown
+                     and skip workflow construction).
+        """
+        import asyncio  # noqa: PLC0415
+        from orchestrator import substrate_gate  # noqa: PLC0415
+
+        task_id = assignment.task_id
+        gate_path = self.git_ops.worktree_base / f'_substrate-gate-{task_id}'
+
+        # Resolve current-main SHA for a deterministic, drift-isolated gate run.
+        main_sha = await self.git_ops.resolve_branch_sha('main')
+        if main_sha is None:
+            # Fallback: use 'main' symbolic ref; if that also fails the worktree
+            # add will error and we map to FLIP in the exception handler below.
+            main_sha = 'main'
+            logger.warning(
+                'substrate_gate: resolve_branch_sha returned None for task %s; '
+                'falling back to "main" symbolic ref',
+                task_id,
+            )
+
+        # Build ephemeral detached worktree — mirrors evals/snapshots.py pattern.
+        proc = await asyncio.create_subprocess_exec(
+            'git', 'worktree', 'add', '--detach', str(gate_path), main_sha,
+            cwd=str(self.git_ops.project_root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                'substrate_gate: git worktree add failed for task %s (rc=%s); '
+                'treating as FLIP (substrate unverifiable)',
+                task_id, proc.returncode,
+            )
+            await self._block_and_escalate_substrate_flip(
+                task_id,
+                verdict=substrate_gate.SubstrateVerdict(
+                    verdict=substrate_gate.FLIP,
+                    exit_code=proc.returncode,
+                    checker_argv=None,
+                    probe_set=None,
+                    reason=f'substrate unverifiable / git worktree add failed (rc={proc.returncode})',
+                ),
+            )
+            return False
+
+        try:
+            verdict = substrate_gate.run_substrate_recheck(
+                task=assignment.task,
+                worktree=gate_path,
+            )
+            logger.info(
+                'substrate_gate: task %s verdict=%s reason=%r',
+                task_id, verdict.verdict, verdict.reason,
+            )
+        except Exception as exc:
+            logger.warning(
+                'substrate_gate: run_substrate_recheck raised for task %s: %s',
+                task_id, exc, exc_info=True,
+            )
+            verdict = substrate_gate.SubstrateVerdict(
+                verdict=substrate_gate.FLIP,
+                exit_code=None,
+                checker_argv=None,
+                probe_set=None,
+                reason=f'substrate unverifiable / run_substrate_recheck raised: {exc}',
+            )
+        finally:
+            # Always remove the gate worktree — leak is rare and reclaimable, but
+            # we make a best effort to clean up immediately (mirrors snapshots.py).
+            try:
+                rm_proc = await asyncio.create_subprocess_exec(
+                    'git', 'worktree', 'remove', '--force', str(gate_path),
+                    cwd=str(self.git_ops.project_root),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await rm_proc.communicate()
+            except Exception as rm_exc:
+                logger.warning(
+                    'substrate_gate: failed to remove gate worktree %s for task %s: %s',
+                    gate_path, task_id, rm_exc,
+                )
+
+        if verdict.flipped:
+            await self._block_and_escalate_substrate_flip(task_id, verdict=verdict)
+            return False
+
+        return True
+
     # Synthetic task_id sentinel and root_cause key for watcher-outage L2
     # escalations.  One canonical root_cause keys all watcher-outage L2s
     # regardless of trip reason (crashloop / misconfigured / cost-ceiling /
