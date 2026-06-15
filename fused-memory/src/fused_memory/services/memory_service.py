@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import time
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -106,6 +107,9 @@ class MemoryService:
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
+        # Process-start baselines for uptime reporting
+        self._started_at: datetime = datetime.now(UTC)
+        self._start_monotonic: float = time.monotonic()
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
@@ -1965,6 +1969,10 @@ class MemoryService:
                 status['queue'] = await self.durable_queue.get_stats(group_id=project_id)
             except Exception as e:
                 status['queue'] = {'error': str(e)}
+
+        # Server uptime fields (informational; dashboard reads uptime_seconds as primary)
+        status['started_at'] = self._started_at.isoformat()
+        status['uptime_seconds'] = int(time.monotonic() - self._start_monotonic)
 
         return status
 

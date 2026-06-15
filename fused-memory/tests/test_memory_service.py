@@ -3279,3 +3279,62 @@ class TestGetMemoriesByMetadata:
         )
 
         svc.mem0.search.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 1752: get_status uptime fields
+# ---------------------------------------------------------------------------
+
+class TestGetStatusUptime:
+    """get_status() reports server started_at and uptime_seconds."""
+
+    @pytest.mark.asyncio
+    async def test_started_at_present_and_utc(self, service):
+        """get_status() returns a top-level 'started_at' UTC ISO-format string."""
+        from datetime import timedelta
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        result = await service.get_status()
+
+        assert 'started_at' in result, (
+            f'Expected "started_at" in result; got keys={list(result)}'
+        )
+        dt = datetime.fromisoformat(result['started_at'])
+        assert dt.utcoffset() == timedelta(0), (
+            f'started_at must be UTC; utcoffset={dt.utcoffset()}'
+        )
+        assert result['started_at'] == service._started_at.isoformat(), (
+            f'started_at should match construction-time stamp; '
+            f'got {result["started_at"]!r}, expected {service._started_at.isoformat()!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_uptime_seconds_monotonic_int(self, service):
+        """get_status() returns 'uptime_seconds' as a non-decreasing int."""
+        # Override the monotonic baseline so we control the delta precisely
+        service._start_monotonic = 1000.0
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        with patch('fused_memory.services.memory_service.time.monotonic',
+                   side_effect=[1005.4, 1010.9]):
+            result1 = await service.get_status()
+            result2 = await service.get_status()
+
+        assert 'uptime_seconds' in result1, (
+            f'Expected "uptime_seconds" in result; got keys={list(result1)}'
+        )
+        assert isinstance(result1['uptime_seconds'], int), (
+            f'uptime_seconds must be int; got {type(result1["uptime_seconds"])}'
+        )
+        assert result1['uptime_seconds'] == 5, (
+            f'Expected uptime_seconds=5 (int(1005.4-1000.0)); got {result1["uptime_seconds"]}'
+        )
+        assert result2['uptime_seconds'] == 10, (
+            f'Expected uptime_seconds=10 (int(1010.9-1000.0)); got {result2["uptime_seconds"]}'
+        )
+        assert result2['uptime_seconds'] >= result1['uptime_seconds'], (
+            f'uptime_seconds must be non-decreasing; '
+            f'first={result1["uptime_seconds"]}, second={result2["uptime_seconds"]}'
+        )
