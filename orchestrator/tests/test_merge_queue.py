@@ -6895,6 +6895,84 @@ class TestTerminalOutcomeRetention:
         assert stored is not None
         assert stored.generation == 2
 
+    # ── step-1/2: secondary indexes (get_by_branch / get_by_task) ────────────
+
+    def test_get_by_branch_returns_recorded_record(self) -> None:
+        """get_by_branch(branch) returns the recorded TerminalOutcomeRecord."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-b1',
+            task_id='task-b1',
+            branch='task/branch-one',
+            state='done',
+        )
+        ring.record(rec)
+        result = ring.get_by_branch('task/branch-one')
+        assert result is rec
+
+    def test_get_by_task_returns_recorded_record(self) -> None:
+        """get_by_task(task_id) returns the recorded TerminalOutcomeRecord."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-t1',
+            task_id='task-T42',
+            branch='task/42',
+            state='blocked',
+        )
+        ring.record(rec)
+        result = ring.get_by_task('task-T42')
+        assert result is rec
+
+    def test_get_by_branch_miss_returns_none(self) -> None:
+        """get_by_branch on an unknown branch returns None."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        assert ring.get_by_branch('task/nonexistent') is None
+
+    def test_get_by_task_miss_returns_none(self) -> None:
+        """get_by_task on an unknown task_id returns None."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        assert ring.get_by_task('task-nonexistent') is None
+
+    def test_get_by_branch_newest_wins(self) -> None:
+        """When two records share the same branch, get_by_branch returns the newer one."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec_a = TerminalOutcomeRecord(
+            request_id='mr-ba1',
+            task_id='task-ba1',
+            branch='task/shared-branch',
+            state='blocked',
+        )
+        rec_b = TerminalOutcomeRecord(
+            request_id='mr-ba2',
+            task_id='task-ba2',
+            branch='task/shared-branch',
+            state='done',
+        )
+        ring.record(rec_a)
+        ring.record(rec_b)
+        result = ring.get_by_branch('task/shared-branch')
+        assert result is rec_b, f'Expected newest record rec_b, got {result!r}'
+
+    def test_get_by_task_newest_wins(self) -> None:
+        """When two records share the same task_id, get_by_task returns the newer one."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec_a = TerminalOutcomeRecord(
+            request_id='mr-ta1',
+            task_id='task-shared',
+            branch='task/ta1',
+            state='blocked',
+        )
+        rec_b = TerminalOutcomeRecord(
+            request_id='mr-ta2',
+            task_id='task-shared',
+            branch='task/ta2',
+            state='done',
+        )
+        ring.record(rec_a)
+        ring.record(rec_b)
+        result = ring.get_by_task('task-shared')
+        assert result is rec_b, f'Expected newest record rec_b, got {result!r}'
+
 
 # ---------------------------------------------------------------------------
 # TestMergeWorkerDequeueEvent — step-5
