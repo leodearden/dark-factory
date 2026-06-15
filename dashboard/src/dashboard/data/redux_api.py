@@ -147,6 +147,8 @@ def shape_memory(
             'wal': _shape_wal_status(wal),
             'offline': True,
             'error': status.get('error'),
+            'uptime_seconds': None,
+            'started_at': None,
         }}
 
     graphiti = dict(status.get('graphiti') or {})
@@ -193,6 +195,8 @@ def shape_memory(
         'queue': queue_block,
         'projects': enriched_projects,
         'wal': wal_block,
+        'uptime_seconds': status.get('uptime_seconds'),
+        'started_at': status.get('started_at'),
     }}
 
 
