@@ -3545,6 +3545,76 @@ async def test_recover_stale_runs_suppresses_escalation_for_dead_owner_shielded(
     )
 
 
+# ── _record_dead_owner_suppression unit tests ─────────────────────────────────
+
+
+def test_record_dead_owner_suppression_rolling_window(
+    journal, event_buffer, mock_memory_service,
+):
+    """Unit tests for ReconciliationHarness._record_dead_owner_suppression().
+
+    Phase 1 — threshold crossing + per-project labels:
+        6 calls in the window (3× 'reify', 3× 'autopilot_video') → first 5
+        return None, 6th returns a storm dict with count>=6,
+        window_seconds==3600.0, and projects==['autopilot_video','reify'].
+
+    Phase 2 — no re-fire in the same window:
+        Two more calls at base+6s / base+7s return None (rate-limited).
+
+    Phase 3 — re-fire after a full window during sustained storm:
+        6 calls at now=base+7200s → first 5 None, 6th returns storm dict.
+    """
+    from fused_memory.reconciliation.harness import ReconciliationHarness  # noqa: F401
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
+
+    # ── Phase 1: threshold crossing ──────────────────────────────────────────
+
+    results = []
+    projects = ['reify', 'autopilot_video', 'reify', 'autopilot_video', 'reify', 'autopilot_video']
+    for i, proj in enumerate(projects):
+        result = harness._record_dead_owner_suppression(proj, now=base + timedelta(seconds=i))
+        results.append(result)
+
+    # First 5 must be None
+    for i, r in enumerate(results[:5]):
+        assert r is None, f'Call {i+1} should return None (below threshold), got {r!r}'
+
+    # 6th must be the storm dict
+    storm = results[5]
+    assert storm is not None, 'Call 6 (threshold crossed) should return a storm dict'
+    assert storm['count'] >= 6, f'Expected count>=6, got {storm["count"]}'
+    assert storm['window_seconds'] == 3600.0, f'Expected window_seconds==3600.0, got {storm["window_seconds"]}'
+    assert storm['projects'] == ['autopilot_video', 'reify'], (
+        f'Expected sorted distinct project labels, got {storm["projects"]}'
+    )
+
+    # ── Phase 2: no re-fire in the same window ───────────────────────────────
+
+    r6 = harness._record_dead_owner_suppression('reify', now=base + timedelta(seconds=6))
+    r7 = harness._record_dead_owner_suppression('reify', now=base + timedelta(seconds=7))
+    assert r6 is None, f'Call 7 (same window, already fired) should return None, got {r6!r}'
+    assert r7 is None, f'Call 8 (same window, already fired) should return None, got {r7!r}'
+
+    # ── Phase 3: re-fire after a full window (sustained storm) ───────────────
+
+    future_base = base + timedelta(seconds=7200)
+    results3 = []
+    for i, proj in enumerate(['reify', 'autopilot_video', 'reify', 'autopilot_video', 'reify', 'autopilot_video']):
+        result = harness._record_dead_owner_suppression(proj, now=future_base + timedelta(seconds=i))
+        results3.append(result)
+
+    # First 5 must be None again (count in the new window)
+    for i, r in enumerate(results3[:5]):
+        assert r is None, f'Phase-3 call {i+1} should return None (new window builds up), got {r!r}'
+
+    storm3 = results3[5]
+    assert storm3 is not None, 'Phase-3 call 6 should return a storm dict (new window re-fires)'
+    assert storm3['count'] >= 6
+
+
 # ── build_stale_run_diagnostics unit tests ────────────────────────────────────
 
 
