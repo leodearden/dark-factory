@@ -1198,7 +1198,7 @@ class Harness:
         When *force* is ``True``, retag all non-done/cancelled tasks even if
         they already have file metadata.
         """
-        tasks = await self.scheduler.get_tasks()
+        tasks = await self.scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
 
         skip_statuses = {'done', 'cancelled'}
         untagged = []
