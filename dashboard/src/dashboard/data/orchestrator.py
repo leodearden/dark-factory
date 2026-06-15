@@ -300,6 +300,10 @@ async def discover_orchestrators(
             'blocked': sum(1 for t in tasks if t.get('status') == 'blocked'),
             'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
         }
+        last_update = max(
+            (t['updated_at'] for t in tasks if t.get('updated_at')),
+            default=None,
+        )
 
         # Display label: prefer PRD path, fall back to project root path
         prd = next((p['prd'] for p in group if p.get('prd')), None)
@@ -312,6 +316,7 @@ async def discover_orchestrators(
             'project_root': str(project_root),
             'running': any(p['running'] for p in group),
             'started': group[0]['started'],
+            'last_update': last_update,
             'tasks': tasks,
             'worktrees': worktrees,
             'summary': summary,
