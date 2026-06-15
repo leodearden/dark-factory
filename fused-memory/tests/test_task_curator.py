@@ -3842,3 +3842,121 @@ class TestZeroOutputBreakerBatchPath:
         assert mock_llm.await_count == llm_calls_after_first
         # No new escalations from the short-circuited second batch.
         assert escalator.report_failure.await_count <= 1
+
+
+# ----------------------------------------------------------------------
+# TaskCurator._call_llm — pool-size-scaled max_budget_usd (Fix R-single)
+# ----------------------------------------------------------------------
+
+
+def _make_pool(n: int) -> list[_PoolEntry]:
+    """Build N minimal _PoolEntry objects for budget-scaling tests."""
+    return [
+        _PoolEntry(
+            task_id=str(i),
+            title=f'Task {i}',
+            description='',
+            details='',
+            files_to_modify=[],
+            module_keys=[],
+            status='pending',
+            priority='medium',
+            source='module',
+            combine_eligible=True,
+        )
+        for i in range(n)
+    ]
+
+
+class TestCallLlmSingleBudgetScaling:
+    """Fix R-single — pool-size-scaled max_budget_usd for single-candidate calls.
+
+    A full (~30-entry) corpus pool generates a ~41K-token prompt that costs
+    ~$0.30574 — just over the flat $0.30 cap, triggering error_max_budget_usd.
+    The scaling formula mirrors the R1 batch approach but scales by pool size:
+        budget = min(max_budget_usd + per_pool_entry_budget_usd * len(pool),
+                     single_call_budget_cap_usd)
+    Empty pool stays at $0.30 baseline; full 30-entry pool → $0.675.
+    """
+
+    def _success_ar(self) -> AgentResult:
+        return AgentResult(
+            success=True, output='', cost_usd=0.0,
+            structured_output={'action': 'create', 'justification': 'x'},
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_pool_uses_baseline_budget(self):
+        """N=0 (empty pool) → budget == max_budget_usd (0.30 default)."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._success_ar())
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=_make_pool(0),
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                start=0.0, project_id='p', project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['max_budget_usd'] == pytest.approx(0.30)
+
+    @pytest.mark.asyncio
+    async def test_partial_pool_scales_linearly(self):
+        """N=10 → budget = 0.30 + 0.0125*10 = 0.425."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._success_ar())
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=_make_pool(10),
+                pool_sizes={'anchor': 0, 'module': 10, 'embedding': 0, 'dependency': 0},
+                start=0.0, project_id='p', project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['max_budget_usd'] == pytest.approx(0.425)
+
+    @pytest.mark.asyncio
+    async def test_full_30_entry_pool_gives_sufficient_headroom(self):
+        """N=30 → budget = 0.30 + 0.0125*30 = 0.675, inside $0.60-0.75 PRD target."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._success_ar())
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=_make_pool(30),
+                pool_sizes={'anchor': 1, 'module': 15, 'embedding': 10, 'dependency': 4},
+                start=0.0, project_id='p', project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['max_budget_usd'] == pytest.approx(0.675)
+
+    @pytest.mark.asyncio
+    async def test_oversized_pool_clamped_at_cap(self):
+        """N=50 → unclamped would be 0.30 + 0.0125*50 = 0.925; clamped at $0.75."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._success_ar())
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=_make_pool(50),
+                pool_sizes={'anchor': 1, 'module': 15, 'embedding': 10, 'dependency': 4},
+                start=0.0, project_id='p', project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['max_budget_usd'] == pytest.approx(0.75)
