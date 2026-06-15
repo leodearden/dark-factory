@@ -3067,3 +3067,148 @@ class TestBoundaryTableMcpSurface:
         assert result.get('superseded_by') == 'mr-train3', (
             f"Expected superseded_by='mr-train3', got: {result}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestMergeRequestSnapshotReconcile — 1756 step-5 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestSnapshotReconcile:
+    """1756 step-5 RED: server.merge_request reconciles stale slot with live snapshot.
+
+    RED on (a): server.merge_request does not yet pass live_snapshot to
+    coalesce_or_enqueue_merge_request, so the gate trusts the stale registry
+    slot and returns status='attached' with the dead request_id instead of
+    dispatching fresh.  GREEN after step-6 wires live_snapshot from the
+    worker.
+
+    (b) is a no-regression guard: a genuinely live slot still coalesces after
+    the fix is in place (no over-reap).
+    """
+
+    async def test_failed_finalize_resubmit_dispatches_fresh(self, tmp_path: Path):
+        """(a) REGRESSION: after a dead slot, resubmit gets a fresh request_id.
+
+        Pre-seeds a stale slot (pending future not on the live queue),
+        wires a stub worker whose snapshot returns no entries for the branch,
+        then asserts the server dispatches a fresh merge_request (status='queued'
+        with a new request_id) rather than returning status='attached' on the
+        dead id.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        # Stale slot: pending future whose request_id is not in the snapshot.
+        dead_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        acquired = registry.acquire('B', 'existing-task', dead_fut, request_id='mr-dead')
+        assert acquired, 'Pre-condition: registry must accept first acquire'
+
+        # Stub worker whose snapshot shows no entries for branch 'B'.
+        fake_worker = types.SimpleNamespace(
+            snapshot=lambda: {'entries': [], 'depth': 0, 'head_of_line': None},
+        )
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=fake_worker,
+            git_ops=None,  # skip already_merged fast-path and worktree scan
+        )
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            harness=stub_harness,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='B',
+                branch='B',
+                worktree=str(tmp_path / 'wt'),
+            ),
+            timeout=2.0,
+        )
+
+        # After the fix (step-6), the gate detects the stale slot and dispatches
+        # fresh.  RED now: gate trusts the registry, returns 'attached'/'mr-dead'.
+        assert result.get('status') == 'queued', (
+            f"Expected status='queued' (fresh dispatch), got: {result}"
+        )
+        assert result.get('request_id') != 'mr-dead', (
+            f"Expected a fresh request_id (not 'mr-dead'), got: {result.get('request_id')!r}"
+        )
+        # The dead slot must no longer own branch 'B' in the registry.
+        entry = registry.entry('B')
+        assert entry is None or entry.request_id != 'mr-dead', (
+            f"Expected registry slot for 'B' to be freed or re-acquired, got: {entry}"
+        )
+
+        # Cleanup: cancel dead_fut (slot may already be cleared by the fix)
+        dead_fut.cancel()
+        # Drain the freshly-enqueued request to avoid ResourceWarning
+        if not mq.empty():
+            req = mq.get_nowait()
+            req.result.cancel()
+
+    async def test_inflight_live_branch_still_attaches(self, tmp_path: Path):
+        """(b) No-regression: a live slot still coalesces — the fix must not over-reap.
+
+        Seeds a slot with request_id='mr-live' and a snapshot that confirms it
+        is live.  merge_request(B) must return status='attached' with the
+        existing request_id, not dispatch a fresh one.
+        """
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        live_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        acquired = registry.acquire('B', 'live-task', live_fut, request_id='mr-live')
+        assert acquired, 'Pre-condition: registry must accept first acquire'
+
+        # Snapshot confirms 'mr-live' is present.
+        fake_worker = types.SimpleNamespace(
+            snapshot=lambda: {
+                'entries': [{'branch': 'B', 'request_id': 'mr-live'}],
+                'depth': 1,
+                'head_of_line': None,
+            },
+        )
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=fake_worker,
+            git_ops=None,
+        )
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+            harness=stub_harness,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='B',
+                branch='B',
+                worktree=str(tmp_path / 'wt'),
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'attached', (
+            f"Expected status='attached' (live slot coalesces), got: {result}"
+        )
+        assert result.get('request_id') == 'mr-live', (
+            f"Expected request_id='mr-live', got: {result.get('request_id')!r}"
+        )
+        # Live slot must remain intact.
+        assert mq.empty(), f'Expected empty queue (no fresh dispatch), got qsize={mq.qsize()}'
+
+        live_fut.cancel()  # clean up

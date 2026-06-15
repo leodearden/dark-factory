@@ -2424,8 +2424,11 @@ class InFlightMergeRegistry:
         *branch* was already in-flight (caller should coalesce).
 
         On success, registers a ``done_callback`` on *future* so that
-        ``_release(branch)`` fires automatically on every terminal path
-        (result set, exception set, or cancellation).
+        ``_release_if_current(branch, entry)`` fires automatically on every
+        terminal path (result set, exception set, or cancellation).  The
+        identity guard ensures that a late callback from a cancelled stale
+        future does NOT clobber a subsequently re-acquired slot for the same
+        branch (see ``_release_if_current`` for details).
 
         *request_id* is the stable per-instance identity of the dispatched
         :class:`MergeRequest` (e.g. ``'mr-a1b2c3d4'``).  Stored on the
@@ -2462,7 +2465,7 @@ class InFlightMergeRegistry:
             submitted_tip=submitted_tip,
         )]
         self._slots[branch] = entry
-        future.add_done_callback(lambda _: self._release(branch))
+        future.add_done_callback(lambda _: self._release_if_current(branch, entry))
         return True
 
     def is_inflight(self, branch: str) -> bool:
@@ -2595,7 +2598,7 @@ class InFlightMergeRegistry:
         if entry is not None:
             entry.verifying = verifying
 
-    def release(self, branch: str) -> None:
+    def release(self, branch: str, *, detach_waiters: bool = False) -> None:
         """Remove *branch* from the in-flight registry.
 
         Public surface for callers that need to release a slot on an
@@ -2605,11 +2608,59 @@ class InFlightMergeRegistry:
         explicit fallback used by the slot-leak guards in
         :func:`register_and_enqueue_merge_request` and
         :func:`coalesce_or_enqueue_merge_request`.
+
+        *detach_waiters* (keyword-only, default False):
+        When True, every still-pending waiter future (including the primary,
+        which is waiter #1) is cancelled atomically before the slot is
+        popped.  Use this on the **abnormal / stale-reap path** where the
+        primary is dead and any attached waiters would otherwise hang
+        forever.
+
+        Keep *detach_waiters=False* (the default) for the **normal
+        terminal resolution path**: the acquire-time done-callback
+        (``_release`` alias) fires BEFORE the attach() ``_mirror``
+        callbacks; cancelling waiters here would make ``_mirror`` see them
+        as already-done and skip delivery — regressing coalesced waiters
+        from receiving the real outcome to being cancelled instead.
         """
+        if detach_waiters:
+            entry = self._slots.get(branch)
+            if entry is not None:
+                for w in entry.waiters:
+                    if not w.future.done():
+                        w.future.cancel()
+                entry.waiters.clear()
         self._slots.pop(branch, None)
 
-    # Keep the private alias so existing done_callbacks installed by acquire()
-    # continue to fire correctly without any change to those lambda closures.
+    def _release_if_current(self, branch: str, entry: _InFlightEntry) -> None:
+        """Identity-aware acquire-time done-callback.
+
+        Pops *branch* from ``_slots`` only when the stored entry is still
+        *entry* (object-identity check via ``is``).
+
+        **Why identity matters.**  ``Future.cancel()`` / ``Future.set_result()``
+        schedule done-callbacks via ``loop.call_soon``, so they run on a LATER
+        event-loop turn — not synchronously.  The stale-reap path in
+        :func:`coalesce_or_enqueue_merge_request` calls
+        ``release(branch, detach_waiters=True)``, which cancels the stale
+        primary future and immediately re-acquires the slot for the same branch
+        with a fresh request.  A branch-keyed ``_release(branch)`` would then
+        pop the FRESH entry on the next loop turn, leaving the branch with no
+        registry slot for the rest of the freshly-dispatched merge — so a
+        concurrent :func:`merge_request` would not coalesce and would
+        double-dispatch, the exact failure the registry exists to prevent.
+
+        The identity guard makes the late callback a no-op once the slot has
+        moved on (``self._slots.get(branch)`` returns the FRESH entry, not
+        *entry*).  On the NORMAL terminal-resolution path the slot still IS the
+        entry, so it pops exactly as before.
+        """
+        if self._slots.get(branch) is entry:
+            self._slots.pop(branch, None)
+
+    # Keep the private alias so callers that hold a reference to ``_release``
+    # continue to work, and for the legacy path.  The acquire-time done-callback
+    # now uses ``_release_if_current(branch, entry)`` instead (identity-aware).
     _release = release
 
 
@@ -2686,6 +2737,21 @@ async def _maybe_auto_chain_generation(
     InFlightMergeRegistry and TerminalOutcomeRetention from the harness into the
     workers — harness.py:3238 omits both) belongs to γ3's ATTACH_AND_CHAIN scope
     and is the second precondition guarded by the kill-switch.
+
+    KNOWN RACE (accepted until γ3 slot-handoff lands):
+    :func:`_inflight_entry_is_stale` has a sub-tick window in this code path.
+    After gen-1's future resolves as ``'superseded'`` and gen_next is enqueued,
+    the registry slot still holds gen-1's request_id until the done-callback
+    ``_release`` fires (scheduled via ``call_soon``).  An inbound
+    ``merge_request`` arriving in that window sees a registry slot pointing at
+    gen-1's id (absent from the live snapshot, which now shows gen_next's id),
+    causing :func:`_inflight_entry_is_stale` to judge the slot stale and reap
+    it — dispatching a third concurrent request alongside *gen_next* (double
+    dispatch).  Resolving this requires γ3's ATTACH_AND_CHAIN to update the
+    registry entry's ``request_id`` to gen_next atomically with the enqueue,
+    so the slot always tracks the live generation.  While the kill-switch is
+    OFF (the production default) this code path is unreachable, so the race is
+    accepted.
     """
     if not merged_branch_tip:
         return None
@@ -3025,6 +3091,46 @@ class _FindInflightWorktreeP(Protocol):
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None: ...
 
 
+def _inflight_entry_is_stale(
+    entry: _InFlightEntry | None,
+    branch: str,
+    live_snapshot: Callable[[], dict] | None,
+) -> bool:
+    """Return True when *entry* appears stale relative to the live worker snapshot.
+
+    Liveness is determined by matching ``entry.request_id`` against the
+    ``request_id`` fields of snapshot entries.  When ``entry.request_id`` is
+    None (legacy entries predating the request_id field) the match falls back
+    to branch-name comparison.
+
+    Returns **False** (not stale → keep coalescing) in four cases:
+
+    1. *live_snapshot* is None — no provider wired (back-compat default; all
+       existing callers without a worker).
+    2. ``live_snapshot()`` raises — transient error (fail-safe to coalesce;
+       avoids double-dispatch storms on transient worker hiccups).
+    3. The snapshot is not a dict or lacks the ``'entries'`` key — malformed
+       response (fail-safe to coalesce; mirrors case 2's philosophy: when the
+       snapshot cannot be trusted, assume live rather than risk a double-dispatch).
+    4. The entry's ``request_id`` IS present in the snapshot — slot is live.
+    """
+    if live_snapshot is None:
+        return False
+    try:
+        snap = live_snapshot()
+    except Exception:
+        return False  # fail-safe: transient error → not stale → coalesce
+    if not isinstance(snap, dict) or 'entries' not in snap:
+        return False  # malformed snapshot → fail-safe: not stale → coalesce
+    entries = snap['entries']
+    rid = entry.request_id if entry is not None else None
+    if rid is not None:
+        return not any(e.get('request_id') == rid for e in entries)
+    else:
+        # Legacy entry without a request_id: fall back to branch matching.
+        return not any(e.get('branch') == branch for e in entries)
+
+
 async def coalesce_or_enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,
@@ -3034,6 +3140,7 @@ async def coalesce_or_enqueue_merge_request(
     *,
     liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     retention: TerminalOutcomeRetention | None = None,
+    live_snapshot: Callable[[], dict] | None = None,
 ) -> MergeDispatchResult:
     """De-dup gate for the merge_request MCP chokepoint.
 
@@ -3064,23 +3171,47 @@ async def coalesce_or_enqueue_merge_request(
     :func:`register_and_enqueue_merge_request`).  Coalesced requests
     are NOT recorded — their terminal outcome is owned by the in-flight
     entry's callback.
+
+    *live_snapshot* (keyword-only, default None): a zero-argument callable
+    that returns the live worker snapshot dict (same shape as
+    ``SpeculativeMergeWorker.snapshot()``).  When provided, the registry
+    fast-path **reconciles** the in-memory slot against the live snapshot
+    before coalescing: if the slot's ``request_id`` is absent from the
+    snapshot the slot is considered stale (the request finalized but its
+    slot was not auto-released), it is reaped via
+    ``registry.release(branch, detach_waiters=True)``, and the call falls
+    through to the acquire-and-enqueue block dispatching a fresh request.
+    When absent (None) or when ``live_snapshot()`` raises, the gate
+    behaves exactly as today — trust the registry.
     """
     branch = req.branch
 
     # ── 1. Registry fast-path ──────────────────────────────────────────
     if registry.is_inflight(branch):
-        eta = registry.eta_seconds(branch)
         entry = registry.entry(branch)
-        _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
-        return MergeDispatchResult(
-            dispatched=False,
-            in_flight=True,
-            branch=branch,
-            inflight_task_id=entry.task_id if entry else None,
-            eta_seconds=eta,
-            source='registry',
-            inflight_request_id=entry.request_id if entry else None,
-        )
+        if _inflight_entry_is_stale(entry, branch, live_snapshot):
+            # Slot points at a dead request_id (finalize path left the slot
+            # un-released).  Reap it so the caller gets a fresh dispatch.
+            logger.warning(
+                'coalesce_or_enqueue_merge_request: reaping STALE in-flight slot '
+                'for branch %r (request_id=%r not present in live worker snapshot); '
+                'dispatching fresh',
+                branch, entry.request_id if entry else None,
+            )
+            registry.release(branch, detach_waiters=True)
+            # Fall through to the acquire-and-enqueue block below.
+        else:
+            eta = registry.eta_seconds(branch)
+            _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
+            return MergeDispatchResult(
+                dispatched=False,
+                in_flight=True,
+                branch=branch,
+                inflight_task_id=entry.task_id if entry else None,
+                eta_seconds=eta,
+                source='registry',
+                inflight_request_id=entry.request_id if entry else None,
+            )
 
     # ── 2. On-disk worktree scan (crash-safety / cross-actor) ──────────
     if git_ops is not None:
