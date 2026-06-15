@@ -3203,13 +3203,14 @@ class TaskInterceptor:
             ids: When given, only these task ids are returned (unknown ids are
                  silently omitted).  ``None`` returns all tasks.  ``[]`` returns
                  ``{}``.
-            tag: Tag context forwarded to ``get_tasks`` (optional).
+            tag: Tag context forwarded to ``get_statuses_raw`` (optional).
 
         Notes:
-            Tasks whose dict is missing the ``'status'`` key are included with
-            the sentinel value ``'unknown'``.  Callers that need to distinguish
-            a genuine ``'unknown'`` status from a missing field should treat any
-            ``'unknown'`` value as indeterminate.
+            A ``NULL`` or absent status in the database maps to the sentinel
+            value ``'unknown'``, coerced at the backend layer (never via
+            intermediate task dicts).  Callers that need to distinguish a
+            genuine ``'unknown'`` status from a missing record should treat
+            any ``'unknown'`` value as indeterminate.
         """
         tm = await self._ensure_taskmaster()
         return await tm.get_statuses_raw(project_root, tag=tag, ids=ids)

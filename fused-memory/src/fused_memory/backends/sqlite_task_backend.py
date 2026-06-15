@@ -569,6 +569,9 @@ class SqliteTaskBackend:
             A ``NULL`` status (defensive; unreachable via normal writes) maps to
             ``'unknown'``.
         """
+        # ensure_connected is idempotent; the double-call here (interceptor's
+        # _ensure_taskmaster also calls it) is harmless and keeps the backend
+        # safely callable in isolation without relying on the caller to connect first.
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         conn = await self._get_connection(project_root)
