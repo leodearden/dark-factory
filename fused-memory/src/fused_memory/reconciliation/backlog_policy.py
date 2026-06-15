@@ -102,6 +102,7 @@ class BacklogPolicy:
         orchestrator_detector: OrchestratorDetector,
         *,
         hard_limit: int = 500,
+        hard_limit_overrides: dict[str, int] | None = None,
         rate_limit_seconds: float = 900.0,
         time_provider: TimeProvider = time.time,
     ) -> None:
@@ -109,6 +110,7 @@ class BacklogPolicy:
         self._event_queue = event_queue
         self._detector = orchestrator_detector
         self._hard_limit = hard_limit
+        self._hard_limit_overrides: dict[str, int] = dict(hard_limit_overrides or {})
         self._rate_limit_seconds = rate_limit_seconds
         self._now = time_provider
         self._state: dict[str, _PolicyState] = {}
@@ -117,6 +119,14 @@ class BacklogPolicy:
     @property
     def hard_limit(self) -> int:
         return self._hard_limit
+
+    def hard_limit_for(self, project_id: str) -> int:
+        """Return the effective hard limit for ``project_id``.
+
+        Returns the per-project override if one is configured, otherwise
+        falls back to the global default ``hard_limit``.
+        """
+        return self._hard_limit_overrides.get(project_id, self._hard_limit)
 
     def register_project_root(self, project_id: str, project_root: str) -> None:
         """Cache the project_root for a project_id.
@@ -162,7 +172,8 @@ class BacklogPolicy:
             self.register_project_root(project_id, project_root)
 
         backlog = await self.current_backlog(project_id)
-        if backlog <= self._hard_limit:
+        limit = self.hard_limit_for(project_id)
+        if backlog <= limit:
             return BacklogVerdict(outcome='ok', project_id=project_id)
 
         return await self._route_over_limit(
@@ -171,11 +182,11 @@ class BacklogPolicy:
             error_type='ReconciliationBacklogExceeded',
             summary=(
                 f'Reconciliation backlog exceeded for {project_id}: '
-                f'{backlog}/{self._hard_limit}'
+                f'{backlog}/{limit}'
             ),
             detail=(
                 f'Buffered events + queue depth = {backlog}, threshold = '
-                f'{self._hard_limit}. Drain the backlog (run reconciliation '
+                f'{limit}. Drain the backlog (run reconciliation '
                 f'or trigger_reconciliation) before retrying.'
             ),
             suggested_action='drain_reconciliation',
@@ -246,12 +257,14 @@ class BacklogPolicy:
         suggested_action: str,
     ) -> BacklogVerdict:
         """Either write an escalation (if orchestrator live) or return a rejection."""
+        limit = self.hard_limit_for(project_id)
         project_root = self.project_root_for(project_id)
         if project_root is not None and self._detector(project_root):
             path = await self._maybe_write_escalation(
                 project_id=project_id,
                 project_root=project_root,
                 backlog=backlog,
+                threshold=limit,
                 error_type=error_type,
                 summary=summary,
                 detail=detail,
@@ -260,7 +273,7 @@ class BacklogPolicy:
             return BacklogVerdict(
                 outcome='escalated',
                 backlog=backlog,
-                threshold=self._hard_limit,
+                threshold=limit,
                 project_id=project_id,
                 error_type=error_type,
                 escalation_path=str(path) if path else None,
@@ -269,7 +282,7 @@ class BacklogPolicy:
         return BacklogVerdict(
             outcome='rejection',
             backlog=backlog,
-            threshold=self._hard_limit,
+            threshold=limit,
             project_id=project_id,
             error_type=error_type,
         )
@@ -280,6 +293,7 @@ class BacklogPolicy:
         project_id: str,
         project_root: str,
         backlog: int,
+        threshold: int,
         error_type: str,
         summary: str,
         detail: str,
@@ -318,7 +332,7 @@ class BacklogPolicy:
             'level': 1,
             'workflow_state': 'infra',
             'backlog': backlog,
-            'threshold': self._hard_limit,
+            'threshold': threshold,
             'project_id': project_id,
             'error_type': error_type,
         }
@@ -326,7 +340,7 @@ class BacklogPolicy:
             path.write_text(json.dumps(record, indent=2), encoding='utf-8')
             logger.warning(
                 'backlog_policy: wrote L1 escalation %s (backlog=%d, threshold=%d)',
-                path, backlog, self._hard_limit,
+                path, backlog, threshold,
             )
             return path
         except OSError as exc:

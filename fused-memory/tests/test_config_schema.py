@@ -601,3 +601,94 @@ class TestReconciliationConfigStormKnobs:
     def test_storm_window_negative_rejected(self):
         with pytest.raises(ValidationError):
             ReconciliationConfig(dead_owner_suppression_storm_window_seconds=-1.0)
+
+
+class TestConfigYamlBacklogHardLimitOverrides:
+    """Deployment test: config.yaml must carry the reify override (task 1764).
+
+    Mirrors TestConfigYamlReconciliationFlags: loads the real YAML via CONFIG_PATH,
+    constructs FusedMemoryConfig(), and asserts the deployed values.
+    """
+
+    def test_config_yaml_reify_override_in_recommended_band(self, monkeypatch):
+        """config.yaml must set reconciliation.backlog_hard_limit_overrides.reify in [1000, 1500].
+
+        reify's steady-state backlog (~500-520) sits just over the flat 500,
+        causing benign recon_backlog_overflow escalations (esc-fused-memory-237).
+        The recommended band is 1000-1500. Asserting the full band pins the intent
+        while leaving operators room to re-tune within the range — and catches an
+        edit that silently disables the guard (e.g. setting reify to 50000).
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        reify_limit = cfg.reconciliation.backlog_hard_limit_overrides.get('reify', 0)
+        assert 1000 <= reify_limit <= 1500, (
+            f'fused-memory/config/config.yaml must set '
+            f'reconciliation.backlog_hard_limit_overrides.reify in [1000, 1500] '
+            f'(got {reify_limit!r}) — the recommended band that clears benign '
+            f'esc-fused-memory-237 noise without masking a real runaway.'
+        )
+
+    def test_config_yaml_global_default_unchanged(self, monkeypatch):
+        """config.yaml must not override backlog_hard_limit from its default of 500."""
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.reconciliation.backlog_hard_limit == 500, (
+            'reconciliation.backlog_hard_limit in config.yaml must remain 500 '
+            '(the per-project override is separate).'
+        )
+
+
+class TestReconciliationConfigBacklogHardLimitOverrides:
+    """Tests for ReconciliationConfig.backlog_hard_limit_overrides (task 1764).
+
+    New field: backlog_hard_limit_overrides: dict[str, int] = Field(default_factory=dict)
+    Per-project override map keyed by project_id; empty map = flat hard_limit for all.
+    """
+
+    # --- defaults ---
+
+    def test_default_overrides_is_empty_dict(self):
+        assert ReconciliationConfig().backlog_hard_limit_overrides == {}
+
+    def test_default_backlog_hard_limit_unchanged(self):
+        """Global default 500 must remain unchanged for small projects."""
+        assert ReconciliationConfig().backlog_hard_limit == 500
+
+    # --- override accepted / round-trips ---
+
+    def test_override_map_accepted(self):
+        cfg = ReconciliationConfig(backlog_hard_limit_overrides={'reify': 1500})
+        assert cfg.backlog_hard_limit_overrides == {'reify': 1500}
+
+    def test_override_map_multi_project_round_trips(self):
+        overrides = {'reify': 1500, 'autopilot_video': 800}
+        cfg = ReconciliationConfig(backlog_hard_limit_overrides=overrides)
+        assert cfg.backlog_hard_limit_overrides == overrides
+
+    # --- dict[str, int] guard: non-int value rejected ---
+
+    def test_non_int_value_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(backlog_hard_limit_overrides={'reify': 'not-an-int'})  # type: ignore[arg-type]
+
+    # --- positivity guard: non-positive override values rejected ---
+
+    def test_zero_override_rejected(self):
+        """Zero override would make every check exceed limit — reject at config load."""
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(backlog_hard_limit_overrides={'reify': 0})
+
+    def test_negative_override_rejected(self):
+        """Negative override must also be caught by the positivity guard."""
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(backlog_hard_limit_overrides={'reify': -1})
+
+    def test_mixed_valid_and_zero_rejected(self):
+        """A map with one valid and one zero entry must be rejected (not partially accepted)."""
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(backlog_hard_limit_overrides={'reify': 1500, 'bad': 0})

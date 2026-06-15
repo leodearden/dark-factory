@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -297,6 +297,30 @@ class ReconciliationConfig(BaseModel):
     # orchestrator is live for the project, an L1 escalation JSON is written
     # instead. Rate-limited per project to avoid spam.
     backlog_hard_limit: int = Field(default=500)
+    # Per-project override map keyed by project_id. Empty map = flat
+    # backlog_hard_limit for all projects (default behaviour unchanged).
+    # Example: {reify: 1500} raises reify's bound while leaving all others at 500.
+    backlog_hard_limit_overrides: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator('backlog_hard_limit_overrides')
+    @classmethod
+    def _validate_overrides_positive(cls, v: dict[str, int]) -> dict[str, int]:
+        """Reject non-positive override values.
+
+        A zero or negative override makes every backlog check exceed the limit,
+        producing constant escalations or rejections — the opposite of the
+        feature's intent. Fail fast at config load rather than silently spamming
+        escalations. Per-project overrides are hand-edited and therefore more
+        error-prone than the single global default.
+        """
+        bad = {k: val for k, val in v.items() if val < 1}
+        if bad:
+            raise ValueError(
+                f'backlog_hard_limit_overrides: all values must be >= 1 (positive); '
+                f'got non-positive entries: {bad!r}'
+            )
+        return v
+
     backlog_escalation_rate_limit_seconds: float = Field(default=900.0)
 
     # Defence-in-depth bulk-reset circuit-breaker (task 918, refined task 1016).

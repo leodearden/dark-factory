@@ -109,6 +109,13 @@ reconciliation:
   escalation_port: ${RECON_ESCALATION_PORT:8103}
   escalation_host: "127.0.0.1"
   escalation_queue_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}/escalations"
+  # WP-D per-project backlog override map (task 1764 / esc-fused-memory-237).
+  # reify's steady-state backlog hovers at ~500-520 (< 1.2% of its ~45k-item store),
+  # just over the flat 500 default, causing benign L1→L2 alert noise. 1500 is ~3x
+  # the observed peak (still ~3% of the store) — comfortable headroom that clears
+  # benign hovering without masking a real runaway (which would blow well past 1500).
+  backlog_hard_limit_overrides:
+    reify: 1500
   # Aggregate storm alarm — dead_owner_shielded suppression burst (task 1755 / PRD β).
   # When >=threshold suppressions occur in a rolling window, one loud
   # recon_watchdog_kill_storm escalation fires. Per-event suppression (task 1731) is kept.

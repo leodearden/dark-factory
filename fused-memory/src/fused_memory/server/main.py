@@ -634,6 +634,7 @@ async def run_server():
             event_queue,
             is_orchestrator_live_for,
             hard_limit=config.reconciliation.backlog_hard_limit,
+            hard_limit_overrides=config.reconciliation.backlog_hard_limit_overrides,
             rate_limit_seconds=(
                 config.reconciliation.backlog_escalation_rate_limit_seconds
             ),
