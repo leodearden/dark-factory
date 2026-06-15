@@ -2595,7 +2595,7 @@ class InFlightMergeRegistry:
         if entry is not None:
             entry.verifying = verifying
 
-    def release(self, branch: str) -> None:
+    def release(self, branch: str, *, detach_waiters: bool = False) -> None:
         """Remove *branch* from the in-flight registry.
 
         Public surface for callers that need to release a slot on an
@@ -2605,11 +2605,34 @@ class InFlightMergeRegistry:
         explicit fallback used by the slot-leak guards in
         :func:`register_and_enqueue_merge_request` and
         :func:`coalesce_or_enqueue_merge_request`.
+
+        *detach_waiters* (keyword-only, default False):
+        When True, every still-pending waiter future (including the primary,
+        which is waiter #1) is cancelled atomically before the slot is
+        popped.  Use this on the **abnormal / stale-reap path** where the
+        primary is dead and any attached waiters would otherwise hang
+        forever.
+
+        Keep *detach_waiters=False* (the default) for the **normal
+        terminal resolution path**: the acquire-time done-callback
+        (``_release`` alias) fires BEFORE the attach() ``_mirror``
+        callbacks; cancelling waiters here would make ``_mirror`` see them
+        as already-done and skip delivery — regressing coalesced waiters
+        from receiving the real outcome to being cancelled instead.
         """
+        if detach_waiters:
+            entry = self._slots.get(branch)
+            if entry is not None:
+                for w in entry.waiters:
+                    if not w.future.done():
+                        w.future.cancel()
+                entry.waiters.clear()
         self._slots.pop(branch, None)
 
     # Keep the private alias so existing done_callbacks installed by acquire()
     # continue to fire correctly without any change to those lambda closures.
+    # The alias calls with the default detach_waiters=False so NORMAL terminal
+    # resolution still fans the outcome to attached waiters via _mirror.
     _release = release
 
 
