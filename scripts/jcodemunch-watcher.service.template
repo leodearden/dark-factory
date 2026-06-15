@@ -20,6 +20,17 @@ Type=simple
 # fine for indexing — the 2s debounce only batches events after detection.
 Environment=WATCHFILES_FORCE_POLLING=true
 Environment=WATCHFILES_POLL_DELAY_MS=300000
+# Force uniform PER-PATH index identity (2026-06-11). git-root identity collapses
+# every worktree of a repo onto ONE "<owner>/<repo>" index — but linked worktrees
+# can't share one, so a first-writer claims it and the collision guard
+# (index_folder.py:1601) REFUSES all others ("already exists"), leaving them
+# unindexed while the shared index silently reflects whatever BRANCH that first
+# worktree was on (not main). Per-path keys each worktree as local/<name>-<hash>:
+# no collisions, no branch-shadowing. NOTE: this only stops NEW git indexes —
+# resolve_index_identity (git_root.py:177) still returns a pre-existing git index
+# if one is on disk, so delete any legacy "<owner>/<repo>" indexes by hand
+# (jcodemunch-mcp delete-index <owner>/<repo>) when adopting this — else inert.
+Environment=JCODEMUNCH_GIT_ROOT_IDENTITY=0
 # Initial index peaked at 6.2G RSS (2026-06-11). Cap so a runaway can't starve
 # the host: throttle at 8G, hard-kill at 12G (Restart=always recovers).
 MemoryHigh=8G
