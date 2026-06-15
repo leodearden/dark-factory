@@ -31,7 +31,9 @@ note makes the burst visible to operators without flooding the queue.
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
+import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,14 +77,19 @@ class CuratorEscalator:
     # Queue the first N failures in a burst window; suppress the rest.
     _ESCALATE_FIRST_N = 3
 
-    def __init__(self, cooldown_secs: float = _DEFAULT_COOLDOWN_SECS) -> None:
+    def __init__(
+        self,
+        cooldown_secs: float = _DEFAULT_COOLDOWN_SECS,
+        state_path: str | Path | None = None,
+    ) -> None:
         self._cooldown_secs = cooldown_secs
+        self._state_path: Path | None = Path(state_path) if state_path is not None else None
         # (project_id, subtype) → wall-clock timestamps (time.time()) of recent
         # failures in the window.  Keyed by the composite so different subtypes
         # for the same project are counted independently (e.g. error_max_budget_usd
         # and error_max_turns don't share quota).  Wall-clock is used so timestamps
-        # survive a process restart when persisted (step-12); monotonic resets on
-        # restart making reloaded values meaningless.
+        # survive a process restart when persisted; monotonic resets on restart
+        # making reloaded values meaningless.
         # Pruned on every report_failure call.
         self._failure_log: dict[tuple[str, str | None], list[float]] = {}
         self._queues: dict[str, EscalationQueue] = {}
@@ -91,6 +98,74 @@ class CuratorEscalator:
         # escalation queue with N identical entries for a single outage event.
         # Stays monotonic — in-process dedup, intentionally reset on restart.
         self._zot_last_submitted: dict[str, float] = {}
+        # Reload persisted burst log if state_path is set and exists.
+        if self._state_path is not None and self._state_path.exists():
+            self._load_state()
+
+    # ------------------------------------------------------------------
+    # State persistence helpers (burst log, restart-durable)
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        """Load _failure_log from state_path JSON on construction.
+
+        Format: a JSON array of records::
+
+            [{"project_id": str, "subtype": str|null, "timestamps": [float, ...]}, ...]
+
+        Entries older than cooldown_secs are pruned on load.  A missing,
+        empty, or corrupt file is tolerated (logged at WARNING; starts empty)
+        because the curator has a best-effort contract — a broken state file
+        must never prevent ``add_task`` from succeeding.
+        """
+        assert self._state_path is not None
+        now = time.time()
+        cutoff = now - self._cooldown_secs
+        try:
+            text = self._state_path.read_text()
+            if not text.strip():
+                return
+            records = json.loads(text)
+            for rec in records:
+                project_id = rec['project_id']
+                subtype = rec.get('subtype')  # may be None
+                timestamps = [t for t in rec['timestamps'] if t >= cutoff]
+                if timestamps:
+                    self._failure_log[(project_id, subtype)] = timestamps
+        except Exception:
+            logger.warning(
+                'curator_escalator: failed to load state from %s; starting empty',
+                self._state_path,
+                exc_info=True,
+            )
+
+    def _persist_state(self) -> None:
+        """Atomically write _failure_log to state_path as JSON.
+
+        Uses write-to-temp + os.replace so a crash mid-write never corrupts
+        the existing file.  Only called when state_path is set.
+        """
+        if self._state_path is None:
+            return
+        records = [
+            {
+                'project_id': project_id,
+                'subtype': subtype,
+                'timestamps': timestamps,
+            }
+            for (project_id, subtype), timestamps in self._failure_log.items()
+            if timestamps
+        ]
+        tmp_path = self._state_path.with_suffix('.tmp')
+        try:
+            tmp_path.write_text(json.dumps(records))
+            os.replace(tmp_path, self._state_path)
+        except Exception:
+            logger.warning(
+                'curator_escalator: failed to persist state to %s',
+                self._state_path,
+                exc_info=True,
+            )
 
     def _orchestrator_running(self, project_root: str) -> bool:
         """Return True if the project's orchestrator holds its exclusive lock.
@@ -223,6 +298,8 @@ class CuratorEscalator:
         log = [t for t in self._failure_log.get(log_key, []) if t >= cutoff]
         log.append(now)
         self._failure_log[log_key] = log
+        # Persist the updated burst log so the counter survives a watchdog restart.
+        self._persist_state()
         count = len(log)
         burst_started = log[0]
 
