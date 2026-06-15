@@ -10240,6 +10240,53 @@ class TestCoalesceOrEnqueueRegistryOnly:
         # merge_finalized row must exist in the event store
         assert _count_events(event_store.db_path, 'merge_finalized') == 1
 
+    # ── step-7/8: coalesce path records an alias ──────────────────────────────
+
+    async def test_coalesce_registers_alias_for_coalesced_id(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """coalesce_or_enqueue_merge_request registers an alias for the coalesced id.
+
+        After req2 (request_id=C) is coalesced onto in-flight req1 (request_id=P),
+        recording the primary's terminal record (P) into the retention ring must
+        allow resolution of C via get(C).
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        retention = TerminalOutcomeRetention()
+
+        # req1 acquires the slot (primary)
+        req1 = _make_request('alias-primary', 'branch-alias', tmp_path, config)
+        result1 = await coalesce_or_enqueue_merge_request(
+            queue, req1, event_store, registry, git_ops=None, retention=retention,
+        )
+        assert result1.dispatched is True, f'Expected dispatched=True for req1, got {result1}'
+        primary_request_id = req1.request_id
+
+        # req2 is a second request for the same branch — should coalesce
+        req2 = _make_request('alias-coalesced', 'branch-alias', tmp_path, config)
+        result2 = await coalesce_or_enqueue_merge_request(
+            queue, req2, event_store, registry, git_ops=None, retention=retention,
+        )
+        assert result2.in_flight is True, f'Expected in_flight=True (coalesced), got {result2}'
+        coalesced_request_id = req2.request_id
+
+        # Now record the primary's terminal record — alias C→P must resolve it
+        primary_rec = TerminalOutcomeRecord(
+            request_id=primary_request_id,
+            task_id=req1.task_id,
+            branch=req1.branch,
+            state='done',
+        )
+        retention.record(primary_rec)
+
+        resolved = retention.get(coalesced_request_id)
+        assert resolved is primary_rec, (
+            f'Expected coalesced id {coalesced_request_id!r} to alias to primary '
+            f'{primary_request_id!r}, got {resolved!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueueWorktreePath — disk-scan coalesces alive worktrees
