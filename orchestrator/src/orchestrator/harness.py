@@ -36,7 +36,7 @@ from orchestrator.scheduler import (
     files_to_modules,
 )
 from orchestrator.service_restart import StaleServiceRestartCoordinator
-from orchestrator.task_status import TERMINAL_STATUSES
+from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -1170,7 +1170,7 @@ class Harness:
     async def _tag_prd_metadata(self, prd_path: Path, pre_parse_ids: set[str]) -> None:
         """Tag tasks with the PRD they were created from."""
         resolved_prd = str(prd_path.resolve())
-        tasks = await self.scheduler.get_tasks()
+        tasks = await self.scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
         new_ids = {str(t.get('id', '')) for t in tasks} - pre_parse_ids
 
         tagged = 0
@@ -1198,7 +1198,7 @@ class Harness:
         When *force* is ``True``, retag all non-done/cancelled tasks even if
         they already have file metadata.
         """
-        tasks = await self.scheduler.get_tasks()
+        tasks = await self.scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
 
         skip_statuses = {'done', 'cancelled'}
         untagged = []
@@ -1541,14 +1541,15 @@ Output JSON matching the schema. Every task must appear in the output.
         if not worktree_base.exists():
             return
 
-        tasks = await self.scheduler.get_tasks()
-        if not tasks:
+        statuses, err = await self.scheduler.get_statuses()
+        if err is not None or not statuses:
             logger.warning(
-                'Orphan reaper: get_tasks() returned empty — aborting sweep '
-                '(fail-safe against transient DB failure)'
+                'Orphan reaper: get_statuses() returned %s — aborting sweep '
+                '(fail-safe against transient DB failure or empty task tree)',
+                'error' if err is not None else 'empty',
             )
             return
-        live_ids = {str(t['id']) for t in tasks}
+        live_ids = {str(k) for k in statuses}
 
         reaped = 0
         quarantined = 0

@@ -12,6 +12,7 @@ from shared.cli_invoke import AllAccountsCappedException
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
 @pytest.fixture
@@ -212,3 +213,34 @@ async def test_tag_task_modules_handles_all_accounts_capped(harness, caplog):
     assert any(
         'all accounts capped' in t.lower() for t in warning_texts
     ), f'Expected warning containing "all accounts capped", got: {warning_texts}'
+
+
+@pytest.mark.asyncio
+async def test_tag_task_modules_fetches_active_only(harness, config):
+    """_tag_task_modules must pass statuses=ACTIVE_TASK_STATUSES to get_tasks (γ3b).
+
+    Fails until step-6 converts the get_tasks() call — today it passes no
+    statuses kwarg.
+    """
+    harness.scheduler.get_tasks = AsyncMock(return_value=SAMPLE_TASKS)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_result = AgentResult(
+        success=True,
+        output='{}',
+        structured_output={'tasks': []},
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules()
+
+    harness.scheduler.get_tasks.assert_awaited_once()
+    call_kwargs = harness.scheduler.get_tasks.call_args.kwargs
+    assert 'statuses' in call_kwargs, (
+        f'_tag_task_modules must call get_tasks with statuses=ACTIVE_TASK_STATUSES, '
+        f'but call_args.kwargs was: {call_kwargs}'
+    )
+    assert set(call_kwargs['statuses']) == ACTIVE_TASK_STATUSES, (
+        f'Expected statuses {ACTIVE_TASK_STATUSES}, got {set(call_kwargs["statuses"])}'
+    )

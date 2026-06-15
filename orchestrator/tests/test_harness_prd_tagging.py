@@ -11,6 +11,7 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.scheduler import Scheduler
+from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
 @pytest.fixture
@@ -187,3 +188,34 @@ async def test_tag_prd_metadata_robust_to_pre_ids_never_containing_empty_string(
     # Only task 3 is new — it must be tagged.
     assert harness.scheduler.update_task.call_count == 1
     assert harness.scheduler.update_task.call_args.args[0] == '3'
+
+
+@pytest.mark.asyncio
+async def test_tag_prd_metadata_fetches_active_only(harness, tmp_path):
+    """_tag_prd_metadata must pass statuses=ACTIVE_TASK_STATUSES to get_tasks (γ3b).
+
+    Fails until step-4 converts the get_tasks() call — today it passes no
+    statuses kwarg.
+    """
+    prd = tmp_path / 'feature.md'
+    prd.touch()
+    pre_ids = {'1'}
+
+    tasks = [_task('1'), _task('2')]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    await harness._tag_prd_metadata(prd, pre_ids)
+
+    harness.scheduler.get_tasks.assert_awaited_once()
+    call_kwargs = harness.scheduler.get_tasks.call_args.kwargs
+    assert 'statuses' in call_kwargs, (
+        f'_tag_prd_metadata must call get_tasks with statuses=ACTIVE_TASK_STATUSES, '
+        f'but call_args.kwargs was: {call_kwargs}'
+    )
+    assert set(call_kwargs['statuses']) == ACTIVE_TASK_STATUSES, (
+        f'Expected statuses {ACTIVE_TASK_STATUSES}, got {set(call_kwargs["statuses"])}'
+    )
+    # Behaviour unchanged: task 2 is still tagged (new), task 1 pre-existed.
+    harness.scheduler.update_task.assert_called_once()
+    assert harness.scheduler.update_task.call_args.args[0] == '2'
