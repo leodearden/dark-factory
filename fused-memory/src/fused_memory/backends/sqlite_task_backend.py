@@ -496,12 +496,22 @@ class SqliteTaskBackend:
 
     async def _get_tasks_internal(
         self, project_root: str, tag: str,
+        statuses: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        if statuses is not None and not statuses:
+            return []
         conn = await self._get_connection(project_root)
-        cursor = await conn.execute(
-            'SELECT * FROM tasks WHERE tag = ? ORDER BY id',
-            (tag,),
-        )
+        if statuses is None:
+            cursor = await conn.execute(
+                'SELECT * FROM tasks WHERE tag = ? ORDER BY id',
+                (tag,),
+            )
+        else:
+            placeholders = ','.join('?' * len(statuses))
+            cursor = await conn.execute(
+                f'SELECT * FROM tasks WHERE tag = ? AND status IN ({placeholders}) ORDER BY id',
+                (tag, *statuses),
+            )
         rows = await cursor.fetchall()
         deps = await self._fetch_dependencies(conn, tag)
         return [
@@ -513,10 +523,11 @@ class SqliteTaskBackend:
 
     async def get_tasks(
         self, project_root: str, tag: str | None = None,
+        statuses: list[str] | None = None,
     ) -> GetTasksResult:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        tasks = await self._get_tasks_internal(project_root, tag)
+        tasks = await self._get_tasks_internal(project_root, tag, statuses=statuses)
         return {'tasks': tasks}
 
     async def get_task(

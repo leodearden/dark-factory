@@ -6192,3 +6192,31 @@ async def test_interceptor_remove_dependency_forwards_qualified_verbatim(
 
     stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_threads_statuses(interceptor, taskmaster):
+    """interceptor.get_tasks forwards statuses kwarg to taskmaster.get_tasks.
+
+    (a) statuses=['pending','in-progress'] → taskmaster called with that value.
+    (b) statuses omitted (default) → taskmaster called with statuses=None.
+    """
+    # (a) Explicit statuses filter
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+    await interceptor.get_tasks('/project', statuses=['pending', 'in-progress'])
+
+    taskmaster.get_tasks.assert_awaited_once()
+    _, kwargs = taskmaster.get_tasks.call_args
+    assert kwargs.get('statuses') == ['pending', 'in-progress'], (
+        f'Expected statuses forwarded as kwarg, call_args: {taskmaster.get_tasks.call_args}'
+    )
+
+    # (b) Default (omitted) → statuses=None forwarded
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+    await interceptor.get_tasks('/project')
+
+    taskmaster.get_tasks.assert_awaited_once()
+    _, kwargs2 = taskmaster.get_tasks.call_args
+    assert kwargs2.get('statuses') is None, (
+        f'Expected statuses=None when omitted, call_args: {taskmaster.get_tasks.call_args}'
+    )

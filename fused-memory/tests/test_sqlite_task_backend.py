@@ -1661,3 +1661,72 @@ async def test_get_statuses_raw_filters_by_ids(backend, project_root):
     # (c) empty ids -> {} (must NOT return all 3 tasks)
     result_c = await backend.get_statuses_raw(project_root, ids=[])
     assert result_c == {}, f'Expected empty dict, got: {result_c}'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, monkeypatch):
+    """get_tasks(statuses=...) pushes the filter into SQL and returns only matching tasks.
+
+    Four sub-assertions (mirroring test_get_statuses_raw_filters_by_ids):
+    (a) statuses=['pending','in-progress'] → only those two tasks returned as full dicts,
+        ordered by id, and the issued SQL carries a 'status IN (' predicate.
+    (b) statuses omitted (None) → full unfiltered tree returned AND the SQL does NOT
+        contain a 'status IN (' predicate (byte-identical to the current path).
+    (c) statuses=[] → {'tasks': []} (early return, NOT the full tree).
+    """
+    # Seed 4 tasks with distinct statuses
+    await backend.add_task(project_root=project_root, title='T-pending')       # id=1
+    await backend.add_task(project_root=project_root, title='T-done', status='done')  # id=2
+    await backend.add_task(project_root=project_root, title='T-inprog', status='in-progress')  # id=3
+    await backend.add_task(project_root=project_root, title='T-cancelled', status='cancelled')  # id=4
+
+    # --- Set up spy on conn.execute ---
+    conn = await backend._get_connection(project_root)
+    recorded_sql: list[str] = []
+    _orig_execute = conn.execute
+
+    async def _spy_execute(sql: str, *args, **kwargs):
+        recorded_sql.append(sql)
+        return await _orig_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(conn, 'execute', _spy_execute)
+
+    # (a) Filtered: statuses=['pending', 'in-progress']
+    recorded_sql.clear()
+    result_a = await backend.get_tasks(project_root, statuses=['pending', 'in-progress'])
+
+    assert 'tasks' in result_a, f'Expected tasks key in result: {result_a}'
+    returned_statuses = {t['status'] for t in result_a['tasks']}
+    assert returned_statuses == {'pending', 'in-progress'}, (
+        f'Expected only pending+in-progress tasks, got statuses: {returned_statuses}'
+    )
+    returned_ids = [t['id'] for t in result_a['tasks']]
+    assert returned_ids == sorted(returned_ids), (
+        f'Tasks not in id order: {returned_ids}'
+    )
+    assert len(result_a['tasks']) == 2, f'Expected 2 tasks, got: {len(result_a["tasks"])}'
+    def _norm(s):
+        return ' '.join(s.split()).lower()
+
+    assert any('status in (' in _norm(sql) for sql in recorded_sql), (
+        f'Expected "status IN (" in issued SQL, got: {recorded_sql}'
+    )
+
+    # (b) Unfiltered: statuses omitted (None) → full tree, no IN predicate
+    recorded_sql.clear()
+    result_b = await backend.get_tasks(project_root)
+
+    assert len(result_b['tasks']) == 4, (
+        f'Expected all 4 tasks without filter, got: {len(result_b["tasks"])}'
+    )
+    assert not any('status in (' in _norm(sql) for sql in recorded_sql), (
+        f'Full-tree path must NOT emit "status IN (": {recorded_sql}'
+    )
+
+    # (c) Empty statuses list → {'tasks': []} early return
+    recorded_sql.clear()
+    result_c = await backend.get_tasks(project_root, statuses=[])
+
+    assert result_c == {'tasks': []}, (
+        f'Expected empty tasks list for statuses=[], got: {result_c}'
+    )
