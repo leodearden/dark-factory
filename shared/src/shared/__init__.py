@@ -18,6 +18,7 @@ from shared.cli_invoke import (
     classify_agent_failure,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    is_zero_output_timeout,
 )
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
@@ -44,6 +45,7 @@ __all__ = [
     'classify_agent_failure',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    'is_zero_output_timeout',
     'AccountConfig',
     'UsageCapConfig',
     'CostStore',
