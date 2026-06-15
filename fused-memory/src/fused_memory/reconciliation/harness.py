@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import traceback
+from collections import deque
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -85,12 +86,28 @@ _RECON_DEDUP_CONFIG = (
             'recon_failure',
             'recon_stale_run',
             'recon_backlog_overflow',
+            # Task 1755 / PRD β: aggregate storm alarm for dead_owner_shielded
+            # suppression bursts.  Adding it here ensures submit_or_dedupe folds
+            # repeated storm alarms (stable _DEAD_OWNER_STORM_FINDING fingerprint)
+            # into a single pending escalation for the 8103 watcher.
+            'recon_watchdog_kill_storm',
         ),
     )
     if HAS_ESCALATION else None
 )
 
 logger = logging.getLogger(__name__)
+
+# Task 1755 / PRD β: stable finding identity for the dead_owner_shielded storm alarm.
+# The fingerprint is keyed on finding['category'] / affected_ids / description
+# (harness.py:_escalate), so keeping these fields constant — and putting all
+# variable data (count, window, affected projects) only in summary/detail — ensures
+# submit_or_dedupe folds repeated storm alarms into a single pending escalation.
+_DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
+    'category': 'recon_watchdog_kill_storm',
+    'affected_ids': ['dead_owner_shielded_suppression_storm'],
+    'description': 'dead_owner_shielded recon_stale_run suppression storm',
+}
 
 # Task 1512: minimum number of completed runs that must contain a finding
 # before it is escalated from _run_remediation_pass.  Below this count the
@@ -287,6 +304,28 @@ class ReconciliationHarness:
         # WP-D: track which halted projects we've already escalated so we
         # don't re-fire every harness tick.
         self._halt_escalated: set[str] = set()
+
+        # Task 1755 / PRD β: rolling-window counter for dead_owner_shielded
+        # recon_stale_run suppressions.  Each entry is (timestamp, project_id).
+        # Pruned on each call to _record_dead_owner_suppression().
+        #
+        # ⚠ In-process lifetime limitation: these counters are reset on every
+        # harness restart.  dead_owner_shielded orphans are by definition left
+        # by a *prior* killed incarnation, so a rapid single-orphan-per-restart
+        # churn (watchdog SIGABRT → relaunch → 1 orphan reaped → killed again)
+        # keeps count=1 per lifetime and never crosses the threshold of 6.  The
+        # storm alarm is designed for scenarios where >=threshold orphans surface
+        # WITHIN a single harness lifetime — e.g. a systemic failure that leaves
+        # many projects' runs orphaned simultaneously (the 2026-06-15 event that
+        # triggered this task: 38 in 8h across multiple projects, making count≫6
+        # in the first live incarnation that swept them all up).  Single-orphan
+        # churn is instead observable via the per-event INFO log emitted at
+        # harness.py:741.  If single-orphan restart churn must also alarm,
+        # count recent dead_owner_shielded _error records from the journal over
+        # the window instead of the in-memory deque.
+        self._dead_owner_suppressions: deque[tuple[datetime, str]] = deque()
+        # Timestamp of the last storm escalation — None means never fired.
+        self._last_suppression_storm_escalation_at: datetime | None = None
 
         # Usage gate (multi-account cap failover)
         self.usage_gate: UsageGate | None = None
@@ -723,6 +762,36 @@ class ReconciliationHarness:
                         'age_seconds': diag['age_seconds'],
                     },
                 )
+                # Task 1755 / PRD β: aggregate storm alarm.  The per-event
+                # suppression above is kept; the counter fires ONE loud
+                # 'recon_watchdog_kill_storm' escalation when the burst
+                # threshold is crossed within the rolling window.
+                #
+                # Observability note: storm['count'] is the rolling-window count
+                # at the moment the threshold was first crossed in this window —
+                # not the total orphans reaped in this single _recover_stale_runs
+                # pass.  Within one pass, the first storm return sets the rate-
+                # limit timestamp; subsequent orphans in the same pass are
+                # rate-limited to None, so they do not add to the reported count.
+                # Operators who need the per-tick total should check the INFO
+                # log lines ("recon_stale_run suppressed: dead_owner_shielded
+                # orphan recovered") emitted for every suppression regardless.
+                storm = self._record_dead_owner_suppression(run.project_id)
+                if storm is not None:
+                    window_min = storm['window_seconds'] / 60
+                    proj_label = ', '.join(storm['projects']) or run.project_id
+                    summary = (
+                        f"dead_owner_shielded suppression storm: {storm['count']} in "
+                        f"{window_min:.0f} min (projects: {proj_label}) — "
+                        f'watchdog SIGABRT churn — full recon runs not completing'
+                    )
+                    self._escalate(
+                        'recon_watchdog_kill_storm',
+                        run.id,
+                        summary,
+                        detail,
+                        finding=_DEAD_OWNER_STORM_FINDING,
+                    )
             else:
                 self._escalate(
                     'recon_stale_run',
@@ -730,6 +799,55 @@ class ReconciliationHarness:
                     f'Run stale (>{cutoff}s, lock expired), recovered',
                     detail,
                 )
+
+    # ── Dead-owner suppression storm counter ─────────────────────────
+
+    def _record_dead_owner_suppression(
+        self, project_id: str, *, now: datetime | None = None
+    ) -> dict | None:
+        """Record one dead_owner_shielded suppression and check for a storm.
+
+        Appends (effective_now, project_id) to the rolling deque, prunes
+        entries older than the configured window, then:
+        - Returns None if the count is below the threshold.
+        - Returns None if the alarm already fired within this window
+          (rate limit: <=1 per window).
+        - Otherwise sets _last_suppression_storm_escalation_at = effective_now
+          and returns a storm summary dict with 'count', 'window_seconds', and
+          'projects' (sorted distinct project labels seen in the window).
+
+        The now= parameter follows the ``_finding_recently_resolved(..., now=None)``
+        time-injection convention (harness.py:1592) for deterministic unit tests.
+        Task 1755 / PRD β.
+        """
+        effective_now = now if now is not None else datetime.now(UTC)
+
+        # Append and prune the rolling window.
+        self._dead_owner_suppressions.append((effective_now, project_id))
+        window = timedelta(seconds=self.config.dead_owner_suppression_storm_window_seconds)
+        cutoff_ts = effective_now - window
+        while self._dead_owner_suppressions and self._dead_owner_suppressions[0][0] < cutoff_ts:
+            self._dead_owner_suppressions.popleft()
+
+        count = len(self._dead_owner_suppressions)
+        if count < self.config.dead_owner_suppression_storm_threshold:
+            return None
+
+        # Threshold crossed — apply the per-window rate limit.
+        if (
+            self._last_suppression_storm_escalation_at is not None
+            and (effective_now - self._last_suppression_storm_escalation_at) < window
+        ):
+            return None
+
+        # Fire: set rate-limit timestamp and build the storm summary dict.
+        self._last_suppression_storm_escalation_at = effective_now
+        projects = sorted({pid for _, pid in self._dead_owner_suppressions})
+        return {
+            'count': count,
+            'window_seconds': self.config.dead_owner_suppression_storm_window_seconds,
+            'projects': projects,
+        }
 
     # ── Deferred write replay ─────────────────────────────────────────
 

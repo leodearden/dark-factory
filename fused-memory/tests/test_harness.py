@@ -3545,6 +3545,182 @@ async def test_recover_stale_runs_suppresses_escalation_for_dead_owner_shielded(
     )
 
 
+# ── suppression-site storm integration test ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_emits_storm_escalation_for_dead_owner_shielded_burst(
+    journal, event_buffer, mock_memory_service,
+):
+    """_recover_stale_runs() must emit recon_watchdog_kill_storm when the
+    dead_owner_shielded suppression threshold is crossed (task 1755 / PRD β).
+
+    Scenario: threshold=1 (overridden via mutable pydantic config), single
+    dead_owner_shielded orphan.  After _recover_stale_runs():
+      - NO _escalate call with category 'recon_stale_run' (suppression kept)
+      - Exactly ONE _escalate call with category 'recon_watchdog_kill_storm'
+      - Storm call's summary contains: project_id, count, window hint, and
+        'watchdog SIGABRT churn'
+      - Run was still reaped (status=failed, error_type=StaleRunRecovery)
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    # Override threshold=1 via the mutable pydantic config so a single
+    # suppression trips the storm (mirrors the config mutation pattern used
+    # across the existing test suite, e.g. harness.config.stale_run_recovery_seconds).
+    harness.config.dead_owner_suppression_storm_threshold = 1
+
+    project_id = 'project-storm-test'
+    cutoff = harness.config.stale_run_recovery_seconds  # 1800s
+
+    run = ReconciliationRun(
+        id='run-storm-0001',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test-storm',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run)
+
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    # Backdate heartbeat_at past the cutoff → dead_owner_shielded
+    dead_heartbeat = (
+        datetime.now(UTC) - timedelta(seconds=cutoff + 100)
+    ).isoformat()
+    async with event_buffer._txn() as db:
+        await db.execute(
+            'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
+            (dead_heartbeat, project_id),
+        )
+
+    await harness._recover_stale_runs()
+
+    # Run must still have been reaped
+    after = await journal.get_run('run-storm-0001')
+    assert after is not None
+    assert after.status == RunStatus.failed, (
+        'dead_owner_shielded orphan must be reaped even when storm fires'
+    )
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+
+    all_calls = harness._escalate.call_args_list
+
+    # No per-event recon_stale_run escalation
+    stale_run_calls = [
+        c for c in all_calls
+        if (c.args[0] if c.args else c.kwargs.get('category')) == 'recon_stale_run'
+    ]
+    assert len(stale_run_calls) == 0, (
+        f'recon_stale_run must be suppressed for dead_owner_shielded; got {stale_run_calls}'
+    )
+
+    # Exactly one storm escalation
+    storm_calls = [
+        c for c in all_calls
+        if (c.args[0] if c.args else c.kwargs.get('category')) == 'recon_watchdog_kill_storm'
+    ]
+    assert len(storm_calls) == 1, (
+        f'Expected exactly one recon_watchdog_kill_storm call; got {storm_calls}'
+    )
+
+    # Check summary contents
+    storm_call = storm_calls[0]
+    summary = storm_call.args[2] if len(storm_call.args) >= 3 else storm_call.kwargs.get('summary', '')
+    assert project_id in summary, (
+        f'Storm summary must contain project_id {project_id!r}; got {summary!r}'
+    )
+    # threshold is overridden to 1, so the first suppression trips the storm and
+    # count=1 — assert the specific token "storm: 1 in" rather than a loose
+    # digit scan (e.g. "60 min" contains '6' and '0' and would pass vacuously).
+    assert 'storm: 1 in' in summary, (
+        f'Storm summary must contain "storm: 1 in" (count token); got {summary!r}'
+    )
+    # Window hint (seconds or minutes)
+    assert any(hint in summary for hint in ('3600', '60 min', '60min', '1 hour', '1h')), (
+        f'Storm summary must mention the window; got {summary!r}'
+    )
+    assert 'watchdog SIGABRT churn' in summary, (
+        f'Storm summary must contain cause hint; got {summary!r}'
+    )
+
+
+# ── _record_dead_owner_suppression unit tests ─────────────────────────────────
+
+
+def test_record_dead_owner_suppression_rolling_window(
+    journal, event_buffer, mock_memory_service,
+):
+    """Unit tests for ReconciliationHarness._record_dead_owner_suppression().
+
+    Phase 1 — threshold crossing + per-project labels:
+        6 calls in the window (3× 'reify', 3× 'autopilot_video') → first 5
+        return None, 6th returns a storm dict with count>=6,
+        window_seconds==3600.0, and projects==['autopilot_video','reify'].
+
+    Phase 2 — no re-fire in the same window:
+        Two more calls at base+6s / base+7s return None (rate-limited).
+
+    Phase 3 — re-fire after a full window during sustained storm:
+        6 calls at now=base+7200s → first 5 None, 6th returns storm dict.
+    """
+    from fused_memory.reconciliation.harness import ReconciliationHarness  # noqa: F401
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
+
+    # ── Phase 1: threshold crossing ──────────────────────────────────────────
+
+    results = []
+    projects = ['reify', 'autopilot_video', 'reify', 'autopilot_video', 'reify', 'autopilot_video']
+    for i, proj in enumerate(projects):
+        result = harness._record_dead_owner_suppression(proj, now=base + timedelta(seconds=i))
+        results.append(result)
+
+    # First 5 must be None
+    for i, r in enumerate(results[:5]):
+        assert r is None, f'Call {i+1} should return None (below threshold), got {r!r}'
+
+    # 6th must be the storm dict
+    storm = results[5]
+    assert storm is not None, 'Call 6 (threshold crossed) should return a storm dict'
+    assert storm['count'] >= 6, f'Expected count>=6, got {storm["count"]}'
+    assert storm['window_seconds'] == 3600.0, f'Expected window_seconds==3600.0, got {storm["window_seconds"]}'
+    assert storm['projects'] == ['autopilot_video', 'reify'], (
+        f'Expected sorted distinct project labels, got {storm["projects"]}'
+    )
+
+    # ── Phase 2: no re-fire in the same window ───────────────────────────────
+
+    r6 = harness._record_dead_owner_suppression('reify', now=base + timedelta(seconds=6))
+    r7 = harness._record_dead_owner_suppression('reify', now=base + timedelta(seconds=7))
+    assert r6 is None, f'Call 7 (same window, already fired) should return None, got {r6!r}'
+    assert r7 is None, f'Call 8 (same window, already fired) should return None, got {r7!r}'
+
+    # ── Phase 3: re-fire after a full window (sustained storm) ───────────────
+
+    future_base = base + timedelta(seconds=7200)
+    results3 = []
+    for i, proj in enumerate(['reify', 'autopilot_video', 'reify', 'autopilot_video', 'reify', 'autopilot_video']):
+        result = harness._record_dead_owner_suppression(proj, now=future_base + timedelta(seconds=i))
+        results3.append(result)
+
+    # First 5 must be None again (count in the new window)
+    for i, r in enumerate(results3[:5]):
+        assert r is None, f'Phase-3 call {i+1} should return None (new window builds up), got {r!r}'
+
+    storm3 = results3[5]
+    assert storm3 is not None, 'Phase-3 call 6 should return a storm dict (new window re-fires)'
+    assert storm3['count'] >= 6
+
+
 # ── build_stale_run_diagnostics unit tests ────────────────────────────────────
 
 
@@ -6978,4 +7154,81 @@ def test_escalate_suppressed_when_dismissed_within_window(
     ]
     assert len(suppression_records) >= 1, (
         f'Expected a suppression log for dismissed status, got: {[r.getMessage() for r in caplog.records]}'
+    )
+
+
+# ── Storm alarm dedup-fold test (task 1755 step-7) ────────────────────────────
+
+
+def test_dead_owner_storm_alarm_folds_to_single_pending_escalation(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+):
+    """Two storm alarm submissions with the SAME stable finding identity must fold
+    to a SINGLE pending escalation (dedup via _RECON_DEDUP_CONFIG).
+
+    Simulates two consecutive storm windows firing different summaries/run_ids
+    but the same _DEAD_OWNER_STORM_FINDING.  The expected fingerprint is
+    compute_content_fingerprint('recon_watchdog_kill_storm',
+        'recon_watchdog_kill_storm',
+        ['dead_owner_shielded_suppression_storm'],
+        'dead_owner_shielded recon_stale_run suppression storm').
+
+    RED:  'recon_watchdog_kill_storm' not yet in infra_dedupe_categories →
+          submit_or_dedupe treats it like an un-tracked category and creates
+          two separate pending escalations.
+    GREEN (step-8): adding it to infra_dedupe_categories folds them to one.
+
+    Also asserts the storm escalation's severity is 'blocking' (new category
+    not in the info-category list in _escalate, so it maps to 'blocking').
+    """
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _DEAD_OWNER_STORM_FINDING
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # Compute the expected fingerprint from the STABLE finding identity
+    expected_fp = compute_content_fingerprint(
+        'recon_watchdog_kill_storm',
+        _DEAD_OWNER_STORM_FINDING['category'],
+        list(_DEAD_OWNER_STORM_FINDING['affected_ids']),
+        _DEAD_OWNER_STORM_FINDING['description'],
+    )
+
+    # First storm window
+    harness._escalate(
+        'recon_watchdog_kill_storm',
+        'run-aaaa1111',
+        'dead_owner_shielded suppression storm: 6 in 60 min (projects: project-a) — '
+        'watchdog SIGABRT churn — full recon runs not completing',
+        detail='detail-a',
+        finding=_DEAD_OWNER_STORM_FINDING,
+    )
+
+    # Second storm window — different summary/run_id, same finding identity
+    harness._escalate(
+        'recon_watchdog_kill_storm',
+        'run-bbbb2222',
+        'dead_owner_shielded suppression storm: 9 in 60 min (projects: project-a, project-b) — '
+        'watchdog SIGABRT churn — full recon runs not completing',
+        detail='detail-b',
+        finding=_DEAD_OWNER_STORM_FINDING,
+    )
+
+    # Exactly one pending escalation carrying the stable fingerprint
+    pending_with_fp = [e for e in esc_queue.get_pending() if e.dedupe_fingerprint == expected_fp]
+    assert len(pending_with_fp) == 1, (
+        f'Expected exactly one pending storm escalation (dedup fold); '
+        f'got {len(pending_with_fp)}: {pending_with_fp}'
+    )
+
+    # The storm escalation must be blocking (new category not in info list)
+    assert pending_with_fp[0].severity == 'blocking', (
+        f'Storm alarm must be blocking; got {pending_with_fp[0].severity!r}'
     )
