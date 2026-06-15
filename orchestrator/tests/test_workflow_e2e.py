@@ -27,7 +27,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, JobserverConfig, OrchestratorConfig
+from orchestrator.config import CpuPriorityConfig, GitConfig, JobserverConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -856,10 +856,11 @@ class TestCompletionJudge:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.DONE
-        # Implementer and debugger receive env_overrides.
-        assert stub.env_overrides_by_role.get('implementer') == {
-            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999',
-        }
+        # Implementer receives env_overrides (ANTHROPIC_BASE_URL present).
+        # NOTE: env also contains DF_AGENT_CPU_NICE from cpu_priority (default enabled),
+        # so we check for key presence rather than an exact dict match.
+        impl_env = stub.env_overrides_by_role.get('implementer') or {}
+        assert impl_env.get('ANTHROPIC_BASE_URL') == 'http://127.0.0.1:9999'
         # Judge must NOT receive env_overrides — it always uses Claude API.
         assert stub.env_overrides_by_role.get('judge') is None
 
@@ -7142,14 +7143,21 @@ class TestBuildAgentEnvJobserver:
         assert 'CARGO_MAKEFLAGS' in impl_env
         assert impl_env.get('REIFY_DEBUG_PORT') == '39411'
 
-    async def test_fifo_absent_architect_returns_none(self, config, git_ops, task_assignment, tmp_path):
-        """FIFO-absent → ARCHITECT returns None (no jobserver env injected)."""
+    async def test_fifo_absent_architect_no_cargo_makeflags(self, config, git_ops, task_assignment, tmp_path):
+        """FIFO-absent → ARCHITECT env has no CARGO_MAKEFLAGS (jobserver not injected).
+
+        NOTE: The env is no longer None in this case — architect still receives
+        DF_AGENT_CPU_NICE from the cpu_priority config (enabled by default).
+        This test isolates the jobserver-absent path by asserting only that
+        CARGO_MAKEFLAGS is absent, not that the whole env is None.
+        """
         workflow = self._make_workflow(config, git_ops, task_assignment)
         workflow.config.jobserver = JobserverConfig(
             enabled=True, task_fifo=str(tmp_path / 'nonexistent.fifo'),
         )
 
-        assert workflow._build_agent_env(ARCHITECT) is None
+        env = workflow._build_agent_env(ARCHITECT)
+        assert 'CARGO_MAKEFLAGS' not in (env or {})
 
     async def test_implementer_env_overrides_and_jobserver_coexist(
         self, config, git_ops, task_assignment, tmp_path,
@@ -7182,6 +7190,97 @@ class TestBuildAgentEnvJobserver:
 
         # Jobserver env wins over the stale env_overrides value (merged last)
         assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+
+# ---------------------------------------------------------------------------
+# Tests: _build_agent_env cpu_priority wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBuildAgentEnvCpuPriority:
+    """Unit tests for TaskWorkflow._build_agent_env with cpu_priority config."""
+
+    def _make_workflow(self, config, git_ops, task_assignment):
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        return workflow
+
+    async def test_architect_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
+        """ARCHITECT gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        # cpu_priority is enabled by default (nice=10)
+        env = workflow._build_agent_env(ARCHITECT)
+        assert env is not None
+        assert env.get('DF_AGENT_CPU_NICE') == '10'
+
+    async def test_implementer_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
+        """IMPLEMENTER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+        assert env.get('DF_AGENT_CPU_NICE') == '10'
+
+    async def test_debugger_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
+        """DEBUGGER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        env = workflow._build_agent_env(DEBUGGER)
+        assert env is not None
+        assert env.get('DF_AGENT_CPU_NICE') == '10'
+
+    async def test_merger_returns_none_cpu_priority_enabled(self, config, git_ops, task_assignment):
+        """MERGER returns None even when cpu_priority is enabled (role guard fires first)."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        assert workflow._build_agent_env(MERGER) is None
+
+    async def test_judge_returns_none_cpu_priority_enabled(self, config, git_ops, task_assignment):
+        """JUDGE returns None even when cpu_priority is enabled (role guard fires first)."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        assert workflow._build_agent_env(JUDGE) is None
+
+    async def test_disabled_cpu_priority_architect_no_df_agent_cpu_nice(
+        self, config, git_ops, task_assignment,
+    ):
+        """When cpu_priority is disabled, ARCHITECT does not get DF_AGENT_CPU_NICE."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.cpu_priority = CpuPriorityConfig(enabled=False)
+        env = workflow._build_agent_env(ARCHITECT)
+        # No DF_AGENT_CPU_NICE; env may be None or a dict without the key
+        assert 'DF_AGENT_CPU_NICE' not in (env or {})
+
+    async def test_disabled_cpu_priority_implementer_no_df_agent_cpu_nice(
+        self, config, git_ops, task_assignment,
+    ):
+        """When cpu_priority is disabled, IMPLEMENTER does not get DF_AGENT_CPU_NICE."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.cpu_priority = CpuPriorityConfig(enabled=False)
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert 'DF_AGENT_CPU_NICE' not in (env or {})
+
+    async def test_df_agent_cpu_nice_coexists_with_cargo_makeflags(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """DF_AGENT_CPU_NICE and CARGO_MAKEFLAGS coexist in IMPLEMENTER env."""
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        workflow._reify_debug_port = 39411
+
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+        # All three sources coexist
+        assert env.get('DF_AGENT_CPU_NICE') == '10'
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+        assert env.get('REIFY_DEBUG_PORT') == '39411'
+
+    async def test_custom_nice_value_propagated(self, config, git_ops, task_assignment):
+        """A custom nice value (e.g. 15) is propagated to DF_AGENT_CPU_NICE."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.config.cpu_priority = CpuPriorityConfig(enabled=True, nice=15)
+        env = workflow._build_agent_env(ARCHITECT)
+        assert env is not None
+        assert env.get('DF_AGENT_CPU_NICE') == '15'
 
 
 if TYPE_CHECKING:
