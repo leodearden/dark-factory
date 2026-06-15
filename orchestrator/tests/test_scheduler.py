@@ -18,6 +18,7 @@ from orchestrator.config import (
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
+from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
 @pytest.fixture
@@ -6825,4 +6826,47 @@ class TestGetTasksStatusesParam:
         arguments = call_args[0][1] if (call_args[0] and len(call_args[0]) > 1) else {}
         assert 'statuses' not in arguments, (
             f"'statuses' should be absent when None but got: {arguments}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED: acquire_next() calls get_tasks with ACTIVE_TASK_STATUSES
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextFetchesActiveOnly:
+    """acquire_next() must call get_tasks with statuses=ACTIVE_TASK_STATUSES.
+
+    Fails today because acquire_next calls self.get_tasks() with no statuses arg.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_passes_active_statuses_to_get_tasks(
+        self, scheduler: Scheduler
+    ):
+        """acquire_next() must issue get_tasks with statuses==ACTIVE_TASK_STATUSES."""
+        pending_task = {
+            'id': '42',
+            'title': 'A pending task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend/module_a']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[pending_task])
+        scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+        await scheduler.acquire_next()
+
+        scheduler.get_tasks.assert_awaited_once()
+        call_kwargs = scheduler.get_tasks.call_args.kwargs
+        assert 'statuses' in call_kwargs, (
+            f"acquire_next must call get_tasks with statuses=ACTIVE_TASK_STATUSES, "
+            f"but call_args.kwargs was: {call_kwargs}"
+        )
+        assert set(call_kwargs['statuses']) == ACTIVE_TASK_STATUSES, (
+            f"Expected statuses {ACTIVE_TASK_STATUSES}, got {set(call_kwargs['statuses'])}"
         )
