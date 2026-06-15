@@ -5107,7 +5107,23 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         A registered owner with no pending escalation cannot be resolved by
         _on_escalation_resolved, so the halt would be permanent.  If submit
         raises, the exception propagates before set_halt_owner is reached and
-        no orphan halt is registered.
+        no orphan halt (OWNER-WITHOUT-ESCALATION) is registered.
+
+        HALT-WITHOUT-OWNER guard (task 1765): when the merger has already engaged
+        a per-lane WIP halt before we get here (``is_wip_halted=True,
+        halt_owner_esc_id=None``), a submit failure leaves the lane halted with no
+        owner registered.  ``_on_escalation_resolved`` has nothing to match, no
+        escalation exists for a human, and the halt silently blocks ALL merges on
+        that lane until ``force_unhalt_merge_queue``.  If submit raises and the
+        halt is ownerless, we release it before re-raising — same rationale as the
+        sibling guards in ``_submit_halt_escalation_and_wait`` (task 1448) and
+        ``_map_advance_failure`` (task 1671).
+
+        Guard condition: ``merge_worker.is_wip_halted and halt_owner_esc_id is None``
+        — ensures we release ONLY genuine ownerless orphans, never a foreign owner's
+        halt.  ``except BaseException`` (not ``Exception``) mirrors the sibling
+        guards and also covers a CancelledError arriving between halt-engage and
+        owner-registration.
 
         Callers must guard with ``if self.escalation_queue:`` before calling.
         """
@@ -5115,7 +5131,23 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             '_submit_halt_owning_escalation requires escalation_queue; '
             'callers must guard with `if self.escalation_queue:`'
         )
-        self.escalation_queue.submit(esc)  # propagates on failure; set_halt_owner NOT reached
+        try:
+            self.escalation_queue.submit(esc)  # propagates on failure; set_halt_owner NOT reached
+        except BaseException:
+            # HALT-WITHOUT-OWNER guard (task 1765): the merger may have already
+            # engaged a per-lane WIP halt before we got here. If submit raises,
+            # set_halt_owner is unreachable, so an engaged-but-ownerless halt would
+            # silently block the whole lane until force_unhalt_merge_queue. Release
+            # the orphan halt before propagating — only when it is genuinely
+            # ownerless (never steal a foreign owner's halt). Mirrors the sibling
+            # guards in _submit_halt_escalation_and_wait and _map_advance_failure.
+            if (
+                self.merge_worker is not None
+                and self.merge_worker.is_wip_halted
+                and self.merge_worker.halt_owner_esc_id is None
+            ):
+                self.merge_worker.unhalt_wip(reason='halt_escalation_submit_failed')
+            raise
         if self.merge_worker is not None:
             self.merge_worker.set_halt_owner(esc.id)
 
