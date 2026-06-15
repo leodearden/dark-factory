@@ -3338,7 +3338,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
             gate_entered.set()
             await gate_release.wait()
             from orchestrator.verify import VerifyResult
-            return VerifyResult(passed=True, summary='', category='')
+            return VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='', category='')
 
         req, item = await self._make_merged_item(
             git_ops, config, 'rca-local-a', 'rca_local_a.py', 'l=1\n',
