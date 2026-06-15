@@ -699,6 +699,43 @@ class TestCurateFallbacks:
         _, kwargs = mock.call_args
         assert kwargs['max_turns'] >= 3
 
+    @pytest.mark.asyncio
+    async def test_curate_threads_cost_usd_pool_sizes_subtype_to_report_failure(self):
+        """curate() passes subtype, cost_usd, and pool_sizes from CuratorFailureError
+        into report_failure so the escalation detail carries triage metadata."""
+        config = _make_config()
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        known_pool_sizes = {
+            'anchor': 1, 'module': 15, 'embedding': 10, 'dependency': 3,
+        }
+
+        async def corpus_with_known_sizes(*a, **k):
+            return [], known_pool_sizes
+
+        # CuratorFailureError with subtype and cost_usd set.
+        budget_error = CuratorFailureError(
+            'budget exceeded',
+            subtype='error_max_budget_usd',
+            cost_usd=0.30574,
+        )
+        with (
+            patch.object(curator, '_build_corpus', side_effect=corpus_with_known_sizes),
+            patch.object(curator, '_call_llm', side_effect=budget_error),
+        ):
+            result = await curator.curate(
+                CandidateTask(title='T'), project_id='p', project_root='/x',
+            )
+        assert result.action == 'create'
+        assert result.justification == 'llm-error-escalated'
+        escalator.report_failure.assert_awaited_once()
+        kwargs = escalator.report_failure.await_args.kwargs
+        assert kwargs['subtype'] == 'error_max_budget_usd'
+        assert kwargs['cost_usd'] == pytest.approx(0.30574)
+        assert kwargs['pool_sizes'] == known_pool_sizes
+
 
 class TestZeroOutputTimeoutSignal:
     """Step-1 RED: CuratorFailureError carries zero_output_timeout + forensic evidence."""
