@@ -169,11 +169,13 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 | Check | PASS evidence | FAIL (blocks queue) |
 |---|---|---|
-| Capability→producer (anti-orphan, shape 1) | `grep:<file>:<line>` shows it **wired into the consuming entry path** on main, OR `producer:task-<N>` in the **transitive dependency closure** whose deliverable *is* this capability | `declared-only` · `test-only` · `producer-absent` |
+| Capability→producer (anti-orphan, shape 1) | `grep:<file>:<line>` shows it **wired into the consuming entry path** on main, OR `producer:task-<N>` in the **transitive dependency closure** whose deliverable **covers the specific extent** of this capability (task name-matching the area is not sufficient) | `declared-only` · `test-only` · `producer-absent` · `producer-extent-short` |
 | DAG-direction (anti-inversion, shape 2) | the producer task is **upstream** of this leaf | `producer-downstream` (the owner *depends on* this leaf) |
 | Field-population (the result-field twin) | `grep` shows the producer writes a **non-sentinel sampleable** value into the field on the production path | `declared-only` (field present, producer leaves it the empty sentinel) |
 | Grammar reality (anti-mismatch, shape 4) | `grammar-fixture:<path>` parses with **0 ERROR nodes**, OR a named grammar-producer task is upstream | `fixture-ERROR` |
 | Numeric floor (anti-floor, shape 3) | `floor:<bound> > <method-floor>`, floor stated | `bound≤floor` |
+
+*`producer-extent-short` worked cases:* (a) a task that "owns Transform3" delivers the Type/Value/builtins extent but NOT type-name resolution — a bare `Transform3` type-name does not resolve though the owner name-matches; (b) a prerequisite migrated only the `param: Scalar` extent, not the `-> Scalar` codomain extent — the manifest verified DAG-direction but not extent, and the prereq's own completeness grep was structurally blind to the codomain form.
 
 Any capability resolving to a FAIL value **blocks** queueing until resolved by one of the G3/G6 resolutions: rewrite to an existing capability, queue the prerequisite **upstream** + wire the dep, move the signal to the producing leaf, or relax the bound.
 
