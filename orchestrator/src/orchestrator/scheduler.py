@@ -2424,6 +2424,31 @@ class Scheduler:
         # Maintain age anchors (resurrected tasks reset their anchor).
         self._update_age_anchors(tasks, max_id)
 
+        # Correctness crux (γ2): the active-only filter drops terminal tasks
+        # from the result, so dep-ids referencing DONE/CANCELLED tasks will be
+        # absent from status_map. _deps_satisfied reads status_map.get(dep_id,
+        # 'unknown'), so those deps would block dispatching forever. Fix: collect
+        # local dep-ids referenced by the fetched tasks that are NOT already in
+        # status_map, then backfill them via the lean get_statuses(ids=missing).
+        # Backfill fires only when a dep is absent, so existing tests whose
+        # get_tasks AsyncMocks return the full set (incl. done deps) make zero
+        # get_statuses calls and stay network-free/deterministic.
+        _all_dep_ids: set[str] = set()
+        for _t in tasks:
+            for _d in (_t.get('dependencies') or []):
+                _dep_id = str(
+                    _d.get('id', _d) if isinstance(_d, dict) else _d
+                )
+                if _dep_id:
+                    _all_dep_ids.add(_dep_id)
+        _missing_dep_ids = sorted(_all_dep_ids - set(status_map))
+        if _missing_dep_ids:
+            _backfilled, _backfill_err = await self.get_statuses(
+                ids=_missing_dep_ids
+            )
+            if _backfilled:
+                status_map.update(_backfilled)
+
         # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
         # a park whose owner is terminal / missing / deps-unsatisfied has no
         # reason to keep blocking other tasks, so it's evicted now.
