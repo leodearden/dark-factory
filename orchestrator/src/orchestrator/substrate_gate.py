@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,7 @@ def build_checker_argv(descriptor: Any) -> list[str] | None:
 
     # Append probe_set as a trailing positional arg when no {probe_set}
     # placeholder was used anywhere in the template.
-    if all(token == orig for token, orig in zip(expanded, checker)):
+    if all(token == orig for token, orig in zip(expanded, checker, strict=False)):
         return expanded + [probe_set]
     return expanded
 

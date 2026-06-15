@@ -2459,6 +2459,7 @@ Output JSON matching the schema. Every task must appear in the output.
                      and skip workflow construction).
         """
         import asyncio  # noqa: PLC0415
+
         from orchestrator import substrate_gate  # noqa: PLC0415
 
         task_id = assignment.task_id
@@ -2788,20 +2789,19 @@ Output JSON matching the schema. Every task must appear in the output.
             # but BEFORE TaskWorkflow construction (which spins up the agent).
             # Non-probe tasks (no substrate_probe descriptor) skip the gate
             # entirely so existing dispatch performance is unaffected.
-            if self.scheduler.carries_substrate_probe(assignment.task):
-                if not await self._run_substrate_gate(assignment):
-                    # FLIP detected: task is already blocked + escalated inside
-                    # the gate.  Return a BLOCKED report so the caller (and
-                    # reconciliation) can observe the outcome; arm the requeue
-                    # cooldown so the task is not immediately re-dispatched
-                    # before the blocked-status propagation window closes.
-                    arm_requeue_cooldown = True
-                    return TaskReport(
-                        task_id=assignment.task_id,
-                        title=assignment.task.get('title', ''),
-                        outcome=WorkflowOutcome.BLOCKED,
-                        block_reason='substrate_flip',
-                    )
+            if self.scheduler.carries_substrate_probe(assignment.task) and not await self._run_substrate_gate(assignment):
+                # FLIP detected: task is already blocked + escalated inside
+                # the gate.  Return a BLOCKED report so the caller (and
+                # reconciliation) can observe the outcome; arm the requeue
+                # cooldown so the task is not immediately re-dispatched
+                # before the blocked-status propagation window closes.
+                arm_requeue_cooldown = True
+                return TaskReport(
+                    task_id=assignment.task_id,
+                    title=assignment.task.get('title', ''),
+                    outcome=WorkflowOutcome.BLOCKED,
+                    block_reason='substrate_flip',
+                )
             # ────────────────────────────────────────────────────────────────
 
             workflow = TaskWorkflow(

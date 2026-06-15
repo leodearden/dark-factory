@@ -9,7 +9,9 @@ PRD: prd-gate-exec D4 — dispatch-time substrate re-diff.
 
 from __future__ import annotations
 
+import contextlib
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -292,7 +294,7 @@ class TestRunSubstrateRecheck:
         from orchestrator.substrate_gate import run_substrate_recheck
         task = make_probe_task(checker=['run_check'], probe_set='probes/suite.json')
         checker = fake_checker(rc=0)
-        verdict = run_substrate_recheck(task=task, worktree='/wt/gate', run_subprocess=checker)
+        run_substrate_recheck(task=task, worktree='/wt/gate', run_subprocess=checker)
         assert len(checker.calls) == 1
         called_argv, called_cwd = checker.calls[0]
         assert called_argv == ['run_check', 'probes/suite.json']
@@ -341,8 +343,6 @@ class TestRunSubstrateRecheck:
 # Step-7 RED: harness _run_substrate_gate + _block_and_escalate_substrate_flip
 # ---------------------------------------------------------------------------
 
-from pathlib import Path
-
 
 def _make_harness(tmp_path: Path):
     """Build a bare Harness with mocked internals for substrate-gate tests.
@@ -353,9 +353,8 @@ def _make_harness(tmp_path: Path):
     - harness.git_ops.worktree_base → tmp_path / '.worktrees'
     - harness.scheduler.set_task_status → AsyncMock
     """
-    from unittest.mock import MagicMock, AsyncMock, patch
-    from orchestrator.harness import Harness
     from orchestrator.config import OrchestratorConfig
+    from orchestrator.harness import Harness
 
     config = OrchestratorConfig(project_root=tmp_path, max_per_module=1)
     with (
@@ -395,7 +394,7 @@ def _make_assignment(task_id: str = '42', probe: bool = True):
 
 
 def _pass_verdict():
-    from orchestrator.substrate_gate import SubstrateVerdict, PASS
+    from orchestrator.substrate_gate import PASS, SubstrateVerdict
     return SubstrateVerdict(
         verdict=PASS,
         exit_code=0,
@@ -406,7 +405,7 @@ def _pass_verdict():
 
 
 def _flip_verdict():
-    from orchestrator.substrate_gate import SubstrateVerdict, FLIP
+    from orchestrator.substrate_gate import FLIP, SubstrateVerdict
     return SubstrateVerdict(
         verdict=FLIP,
         exit_code=1,
@@ -417,7 +416,7 @@ def _flip_verdict():
 
 
 def _skip_verdict():
-    from orchestrator.substrate_gate import SubstrateVerdict, SKIP
+    from orchestrator.substrate_gate import SKIP, SubstrateVerdict
     return SubstrateVerdict(
         verdict=SKIP,
         exit_code=None,
@@ -510,12 +509,9 @@ class TestRunSubstrateGate:
 
         proc_mock = AsyncMock(return_value=_fake_proc(0))
 
-        with patch('asyncio.create_subprocess_exec', proc_mock):
+        with patch('asyncio.create_subprocess_exec', proc_mock), contextlib.suppress(Exception):
             # Should not propagate the error (gate catches it and returns False or raises)
-            try:
-                result = await h._run_substrate_gate(assignment)
-            except Exception:
-                pass
+            await h._run_substrate_gate(assignment)
 
         # Regardless of how _run_substrate_gate handles the exception,
         # verify that 'git worktree remove' was called (finally ran)
@@ -549,7 +545,7 @@ class TestBlockAndEscalateSubstrateFlip:
         verdict = _flip_verdict()
         await h._block_and_escalate_substrate_flip('99', verdict=verdict)
 
-        h.scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')
+        h.scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_files_l1_escalation_design_concern(self, tmp_path: Path):
@@ -598,7 +594,7 @@ class TestBlockAndEscalateSubstrateFlip:
         await h._block_and_escalate_substrate_flip('33', verdict=verdict)
 
         # set_task_status is still called (blocking the task is unconditional)
-        h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')
+        h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +664,7 @@ class TestRunSlotSubstrateGateWiring:
 
         with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            report = await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, sem)
 
         # (a1) TaskWorkflow must NOT have been constructed.
         assert not MockWorkflow.called, (
@@ -680,8 +676,8 @@ class TestRunSlotSubstrateGateWiring:
         h._run_substrate_gate.assert_awaited_once()
 
         # (a3) Scheduler.release must be called with requeued=True (cooldown armed).
-        h.scheduler.release.assert_called_once()
-        call_kwargs = h.scheduler.release.call_args
+        h.scheduler.release.assert_called_once()  # type: ignore[attr-defined]
+        call_kwargs = h.scheduler.release.call_args  # type: ignore[attr-defined]
         requeued = call_kwargs.kwargs.get('requeued', None)
         assert requeued is True, (
             f'scheduler.release must be called with requeued=True on flip; got {call_kwargs!r}'
