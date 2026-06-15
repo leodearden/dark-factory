@@ -130,3 +130,51 @@ class TestOrphanReaper:
         _mk(harness.git_ops.worktree_base, '500')
         await harness._reap_orphan_worktrees()
         harness.git_ops.prune_worktrees.assert_called_once()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# γ3b step-7 RED: reaper routes to get_statuses; done task's worktree is live
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reaper_uses_get_statuses_and_spares_done_task_worktree(harness: Harness):
+    """_reap_orphan_worktrees must call get_statuses (not get_tasks) to determine
+    live ids, and must NOT reap the worktree of a done task (γ3b correctness crux).
+
+    Setup:
+      - get_statuses returns {500: done, 999: pending} — ALL ids including terminal.
+      - get_tasks (old path) would return only [{id: 999}] — 500 absent as done.
+      - Worktree '500' exists on disk.
+
+    Correct new behaviour:
+      - live_ids derives from get_statuses → {'500', '999'} → worktree '500' is live.
+      - cleanup_worktree / quarantine_worktree NOT called for '500'.
+
+    Current (wrong) behaviour that makes this RED:
+      - Reaper calls get_tasks, gets live_ids={'999'}, treats '500' as orphan, reaps it.
+      - get_statuses is never awaited.
+    """
+    # Override the fixture's get_tasks to the "old active-only" path.
+    harness.scheduler.get_tasks = AsyncMock(return_value=[{'id': 999}])
+    # Add get_statuses stub — returns full id map incl. done task 500.
+    harness.scheduler.get_statuses = AsyncMock(
+        return_value=({'500': 'done', '999': 'pending'}, None)
+    )
+
+    # Create the worktree for the done task (it must NOT be reaped).
+    _mk(harness.git_ops.worktree_base, '500')
+
+    await harness._reap_orphan_worktrees()
+
+    # (a) get_statuses must have been awaited (routing assertion).
+    harness.scheduler.get_statuses.assert_awaited()  # type: ignore[attr-defined]
+    # (b) The done task's worktree must NOT be cleaned up or quarantined.
+    cleanup_paths = [c.args[0] for c in harness.git_ops.cleanup_worktree.call_args_list]  # type: ignore[attr-defined]
+    quarantine_paths = [c.args[0] for c in harness.git_ops.quarantine_worktree.call_args_list]  # type: ignore[attr-defined]
+    orphan_path = harness.git_ops.worktree_base / '500'
+    assert orphan_path not in cleanup_paths, (
+        f'Done task worktree {orphan_path} must NOT be reaped (get_statuses treats it as live)'
+    )
+    assert orphan_path not in quarantine_paths, (
+        f'Done task worktree {orphan_path} must NOT be quarantined (get_statuses treats it as live)'
+    )
