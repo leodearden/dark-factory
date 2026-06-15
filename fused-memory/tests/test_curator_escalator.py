@@ -182,35 +182,39 @@ class TestReportFailure:
     @pytest.mark.asyncio
     async def test_window_reset_after_cooldown_re_escalates(self, tmp_path):
         """A failure past the cooldown cutoff resets the counter."""
+        import time as _time_module
+        from unittest.mock import patch
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
-            # Short cooldown so we don't need to mock monotonic clocks.
-            escalator = CuratorEscalator(cooldown_secs=0.05)
-            for _ in range(3):
+            # Control time.time() so the burst window is deterministic
+            # regardless of I/O latency.  Writing 3 escalation files can
+            # easily exceed a 50 ms real cooldown on loaded CI workers.
+            fake_t = [0.0]
+            with patch.object(_time_module, 'time', lambda: fake_t[0]):
+                escalator = CuratorEscalator(cooldown_secs=3600.0)
+                for _ in range(3):
+                    await escalator.report_failure(
+                        project_root=str(tmp_path),
+                        project_id='proj-x',
+                        justification='burst-1',
+                        candidate_title='T',
+                    )
+                # 4th call at the same frozen time is inside the window → suppressed.
                 await escalator.report_failure(
-                    project_root=str(tmp_path),
-                    project_id='proj-x',
-                    justification='burst-1',
-                    candidate_title='T',
+                    project_root=str(tmp_path), project_id='proj-x',
+                    justification='burst-1', candidate_title='T',
                 )
-            # 4th call inside the short window is suppressed…
-            await escalator.report_failure(
-                project_root=str(tmp_path), project_id='proj-x',
-                justification='burst-1', candidate_title='T',
-            )
-            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
-            assert len(files) == 3
+                files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+                assert len(files) == 3
 
-            # Sleep past the cooldown and confirm the next failure escalates
-            # again (window reset).
-            import asyncio
-            await asyncio.sleep(0.1)
-            await escalator.report_failure(
-                project_root=str(tmp_path), project_id='proj-x',
-                justification='burst-2', candidate_title='T',
-            )
-            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
-            assert len(files) == 4
+                # Advance past the cooldown — next failure opens a fresh window.
+                fake_t[0] = 3601.0
+                await escalator.report_failure(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    justification='burst-2', candidate_title='T',
+                )
+                files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+                assert len(files) == 4
         finally:
             handle.close()
 
