@@ -5859,6 +5859,27 @@ class TestTasksByTrain:
             f'Expected 501 first (order=0), got {result[0].get("id")!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_tasks_by_train_fetches_active_only(self, scheduler: Scheduler):
+        """tasks_by_train must pass statuses=ACTIVE_TASK_STATUSES to get_tasks (γ3b).
+
+        Fails until step-2 patches the call — today tasks_by_train calls
+        self.get_tasks() with no statuses kwarg.
+        """
+        scheduler.get_tasks = AsyncMock(return_value=self._mixed_tasks())
+
+        await scheduler.tasks_by_train('T1')
+
+        scheduler.get_tasks.assert_awaited_once()
+        call_kwargs = scheduler.get_tasks.call_args.kwargs
+        assert 'statuses' in call_kwargs, (
+            f'tasks_by_train must call get_tasks with statuses=ACTIVE_TASK_STATUSES, '
+            f'but call_args.kwargs was: {call_kwargs}'
+        )
+        assert set(call_kwargs['statuses']) == ACTIVE_TASK_STATUSES, (
+            f'Expected statuses {ACTIVE_TASK_STATUSES}, got {set(call_kwargs["statuses"])}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestGetExternalStatuses (task 1580 — step-1 RED / step-2 GREEN)
