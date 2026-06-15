@@ -103,7 +103,7 @@ logger = logging.getLogger(__name__)
 # (harness.py:_escalate), so keeping these fields constant — and putting all
 # variable data (count, window, affected projects) only in summary/detail — ensures
 # submit_or_dedupe folds repeated storm alarms into a single pending escalation.
-_DEAD_OWNER_STORM_FINDING: dict[str, object] = {
+_DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
     'category': 'recon_watchdog_kill_storm',
     'affected_ids': ['dead_owner_shielded_suppression_storm'],
     'description': 'dead_owner_shielded recon_stale_run suppression storm',
