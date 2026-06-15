@@ -1064,6 +1064,36 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     )
 
 
+def _cpu_priority_prefix(env: dict[str, str]) -> list[str]:
+    """Return a ``nice`` prefix list if DF_AGENT_CPU_NICE is set to a valid value.
+
+    Pops ``DF_AGENT_CPU_NICE`` from *env* (mutates the dict in place) so the
+    variable does not leak into the child process environment and a hypothetical
+    nested invocation cannot double-renice.
+
+    Returns ``['nice', '-n', str(n)]`` when the popped value parses as an int in
+    the privilege-free de-prioritizing range 1..19, else ``[]``.
+
+    Fail-safe: absent key, empty string, zero, negative, out-of-range (>19), or
+    malformed value all return ``[]`` so no spawn ever fails due to a bad signal.
+
+    The ``nice`` coreutil execvp's into the target binary in the same PID, so
+    ``start_new_session=True`` / ``pgid=proc.pid`` and the process-group kill
+    logic in _run_subprocess are unaffected.  cargo/rustc inherit the niceness
+    via fork, which is the intended effect.
+    """
+    raw = env.pop('DF_AGENT_CPU_NICE', None)
+    if not raw:
+        return []
+    try:
+        n = int(raw)
+    except ValueError:
+        return []
+    if not (1 <= n <= 19):
+        return []
+    return ['nice', '-n', str(n)]
+
+
 async def _run_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -1082,8 +1112,15 @@ async def _run_subprocess(
 
     start_ms = int(time.monotonic() * 1000)
 
+    # Prepend `nice -n N` when DF_AGENT_CPU_NICE is set.  This de-prioritizes
+    # the Claude CLI and its inherited cargo/rustc subtree so they yield CPU to
+    # reify's negatively-niced merge/task verifies.  _cpu_priority_prefix pops
+    # the signal from env so it does not leak to the child.  nice execvp's in
+    # place, so start_new_session/pgid logic below is unaffected.
+    spawn_cmd = _cpu_priority_prefix(env) + cmd
+
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
+        *spawn_cmd,
         cwd=str(cwd),
         env=env,
         stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,

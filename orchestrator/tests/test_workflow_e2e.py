@@ -856,10 +856,11 @@ class TestCompletionJudge:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.DONE
-        # Implementer and debugger receive env_overrides.
-        assert stub.env_overrides_by_role.get('implementer') == {
-            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999',
-        }
+        # Implementer receives env_overrides (ANTHROPIC_BASE_URL present).
+        # NOTE: env also contains DF_AGENT_CPU_NICE from cpu_priority (default enabled),
+        # so we check for key presence rather than an exact dict match.
+        impl_env = stub.env_overrides_by_role.get('implementer') or {}
+        assert impl_env.get('ANTHROPIC_BASE_URL') == 'http://127.0.0.1:9999'
         # Judge must NOT receive env_overrides — it always uses Claude API.
         assert stub.env_overrides_by_role.get('judge') is None
 
