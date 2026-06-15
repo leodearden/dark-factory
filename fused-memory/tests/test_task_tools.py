@@ -1386,3 +1386,17 @@ async def test_get_tasks_status_filter_forwarded_and_composes(
         f'Error message should mention statuses: {result_e}'
     )
     task_interceptor.get_tasks.assert_not_awaited()
+
+    # (f) statuses=[None] (list with non-string elements) → ValidationError, interceptor NOT awaited
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    result_f = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'statuses': [None]},
+    )
+    assert result_f.get('error_type') == 'ValidationError', (
+        f'Expected ValidationError for statuses=[None], got: {result_f}'
+    )
+    assert 'statuses' in result_f.get('error', '').lower(), (
+        f'Error message should mention statuses: {result_f}'
+    )
+    task_interceptor.get_tasks.assert_not_awaited()

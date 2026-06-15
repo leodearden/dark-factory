@@ -1705,7 +1705,10 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
         f'Tasks not in id order: {returned_ids}'
     )
     assert len(result_a['tasks']) == 2, f'Expected 2 tasks, got: {len(result_a["tasks"])}'
-    assert any('status IN (' in sql for sql in recorded_sql), (
+    def _norm(s):
+        return ' '.join(s.split()).lower()
+
+    assert any('status in (' in _norm(sql) for sql in recorded_sql), (
         f'Expected "status IN (" in issued SQL, got: {recorded_sql}'
     )
 
@@ -1716,7 +1719,7 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
     assert len(result_b['tasks']) == 4, (
         f'Expected all 4 tasks without filter, got: {len(result_b["tasks"])}'
     )
-    assert not any('status IN (' in sql for sql in recorded_sql), (
+    assert not any('status in (' in _norm(sql) for sql in recorded_sql), (
         f'Full-tree path must NOT emit "status IN (": {recorded_sql}'
     )
 

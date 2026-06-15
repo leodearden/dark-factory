@@ -2058,6 +2058,11 @@ def create_mcp_server(
                 'error': 'statuses must be a list of status strings',
                 'error_type': 'ValidationError',
             }
+        if statuses is not None and any(not isinstance(s, str) for s in statuses):
+            return {
+                'error': 'statuses must be a list of status strings',
+                'error_type': 'ValidationError',
+            }
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
