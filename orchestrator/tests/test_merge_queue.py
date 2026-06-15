@@ -6973,6 +6973,86 @@ class TestTerminalOutcomeRetention:
         result = ring.get_by_task('task-shared')
         assert result is rec_b, f'Expected newest record rec_b, got {result!r}'
 
+    # ── step-3/4: eviction-discipline for secondary indexes ───────────────────
+
+    def test_eviction_drops_secondary_indexes_case_a(self) -> None:
+        """Case A: evicting an old record drops it from _by_branch/_by_task.
+
+        With maxlen=2: record rec_a(branch=A, task=ta), rec_b(branch=B, task=tb),
+        rec_c(branch=C, task=tc). After rec_c evicts rec_a, assert
+        get_by_branch(A) and get_by_task(ta) are None, while C/tc still resolve.
+        """
+        ring = TerminalOutcomeRetention(maxlen=2)
+        rec_a = TerminalOutcomeRecord(
+            request_id='mr-evict-a',
+            task_id='task-ta',
+            branch='task/branch-A',
+            state='done',
+        )
+        rec_b = TerminalOutcomeRecord(
+            request_id='mr-evict-b',
+            task_id='task-tb',
+            branch='task/branch-B',
+            state='done',
+        )
+        rec_c = TerminalOutcomeRecord(
+            request_id='mr-evict-c',
+            task_id='task-tc',
+            branch='task/branch-C',
+            state='blocked',
+        )
+        ring.record(rec_a)
+        ring.record(rec_b)
+        ring.record(rec_c)  # evicts rec_a
+
+        # Evicted record's secondary entries must be gone
+        assert ring.get_by_branch('task/branch-A') is None, (
+            'Expected None after eviction of rec_a from branch index'
+        )
+        assert ring.get_by_task('task-ta') is None, (
+            'Expected None after eviction of rec_a from task index'
+        )
+        # Still-live records must resolve correctly
+        assert ring.get_by_branch('task/branch-C') is rec_c
+        assert ring.get_by_task('task-tc') is rec_c
+
+    def test_eviction_identity_guard_preserves_newer_secondary_entry_case_b(self) -> None:
+        """Case B: identity guard must NOT drop a secondary entry owned by a newer record.
+
+        With maxlen=2: record rec_a(branch=A, task=ta), rec_b(branch=A, task=ta)
+        (same branch+task, newer), rec_c(branch=C, task=tc) which evicts rec_a.
+        Assert get_by_branch(A) is rec_b and get_by_task(ta) is rec_b (NOT None).
+        """
+        ring = TerminalOutcomeRetention(maxlen=2)
+        rec_a = TerminalOutcomeRecord(
+            request_id='mr-guard-a',
+            task_id='task-shared-guard',
+            branch='task/shared-guard',
+            state='blocked',
+        )
+        rec_b = TerminalOutcomeRecord(
+            request_id='mr-guard-b',
+            task_id='task-shared-guard',  # same task_id as rec_a
+            branch='task/shared-guard',   # same branch as rec_a
+            state='done',
+        )
+        rec_c = TerminalOutcomeRecord(
+            request_id='mr-guard-c',
+            task_id='task-guard-c',
+            branch='task/branch-guard-c',
+            state='done',
+        )
+        ring.record(rec_a)
+        ring.record(rec_b)   # rec_b now owns branch/task secondary entries
+        ring.record(rec_c)   # evicts rec_a; identity guard must NOT drop rec_b's entries
+
+        assert ring.get_by_branch('task/shared-guard') is rec_b, (
+            'Expected rec_b (newer) to survive eviction of rec_a via identity guard'
+        )
+        assert ring.get_by_task('task-shared-guard') is rec_b, (
+            'Expected rec_b (newer) to survive eviction of rec_a via identity guard'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMergeWorkerDequeueEvent — step-5
