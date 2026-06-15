@@ -10091,6 +10091,153 @@ class TestCoalesceOrEnqueueRegistryOnly:
 
 
 # ---------------------------------------------------------------------------
+# TestCoalesceSnapshotReconcile — 1756 step-3 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceSnapshotReconcile:
+    """1756 step-3 RED: coalesce gate reconciles stale registry slot with live snapshot.
+
+    RED until step-4 impl: coalesce_or_enqueue_merge_request has no
+    live_snapshot keyword → TypeError on (a)-(c),(e).
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'snap_reconcile_events.db'
+        return EventStore(db_path=db, run_id='snap-reconcile-test')
+
+    async def test_stale_slot_dispatches_fresh(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(a) Stale slot (request_id absent from snapshot) → fresh dispatch, not coalesce."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        # Pre-seed a stale slot: future is pending but not in the live snapshot.
+        stale_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', stale_fut, request_id='mr-dead')
+
+        # Snapshot shows an empty queue (branch 'B' absent).
+        snap = lambda: {'entries': [], 'depth': 0}
+
+        req = _make_request('B', 'B', tmp_path, config)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=snap,
+        )
+
+        assert result.dispatched is True
+        assert result.in_flight is False
+        assert queue.qsize() == 1
+        # Fresh slot must carry a different request_id than the dead one.
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.request_id != 'mr-dead'
+
+    async def test_stale_slot_cancels_dead_primary(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(b) After stale-slot reap, the dead primary future is cancelled."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        stale_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', stale_fut, request_id='mr-dead')
+
+        snap = lambda: {'entries': [], 'depth': 0}
+
+        req = _make_request('B', 'B', tmp_path, config)
+        await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=snap,
+        )
+
+        # release(detach_waiters=True) must have cancelled the stale primary.
+        assert stale_fut.cancelled() is True
+
+    async def test_live_slot_still_coalesces(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(c) Live slot (request_id present in snapshot) → coalesces, no over-reap."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        live_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', live_fut, request_id='mr-live')
+
+        # Snapshot confirms 'mr-live' is present.
+        snap = lambda: {'entries': [{'branch': 'B', 'request_id': 'mr-live'}], 'depth': 1}
+
+        req = _make_request('B', 'B', tmp_path, config)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=snap,
+        )
+
+        assert result.in_flight is True
+        assert result.dispatched is False
+        assert result.inflight_request_id == 'mr-live'
+        # Live slot must be untouched — future NOT cancelled.
+        assert live_fut.cancelled() is False
+        assert queue.qsize() == 0
+
+        live_fut.cancel()  # clean up
+
+    async def test_no_live_snapshot_trusts_registry(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(d) live_snapshot=None (default) → trust registry → coalesce (back-compat).
+
+        Matches existing TestCoalesceOrEnqueueRegistryOnly.test_second_call_coalesces
+        — behavior unchanged when no provider is wired.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', fut, request_id='mr-existing')
+
+        req = _make_request('B', 'B', tmp_path, config)
+        # No live_snapshot kwarg → default None → reconcile skipped.
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None,
+        )
+
+        assert result.in_flight is True
+        assert result.dispatched is False
+        assert result.inflight_request_id == 'mr-existing'
+
+        fut.cancel()  # clean up
+
+    async def test_snapshot_provider_raises_trusts_registry(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(e) Snapshot provider raises → fail-safe → treat as live → coalesce."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', fut, request_id='mr-existing')
+
+        def _raising_snap():
+            raise RuntimeError('worker unavailable')
+
+        req = _make_request('B', 'B', tmp_path, config)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=_raising_snap,
+        )
+
+        # Fail-safe: snapshot error → not stale → coalesce.
+        assert result.in_flight is True
+        assert result.dispatched is False
+
+        fut.cancel()  # clean up
+
+
+# ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueueWorktreePath — disk-scan coalesces alive worktrees
 # ---------------------------------------------------------------------------
 
