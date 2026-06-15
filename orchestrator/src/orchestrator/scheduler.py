@@ -10,7 +10,7 @@ import os
 import re
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1145,12 +1145,27 @@ class Scheduler:
             key=_order_key,
         )
 
-    async def get_tasks(self) -> list[dict]:
-        """Fetch all tasks from fused-memory/taskmaster."""
+    async def get_tasks(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+    ) -> list[dict]:
+        """Fetch tasks from fused-memory/taskmaster.
+
+        Args:
+            statuses: Optional iterable of status strings to filter by (server-side
+                SQL ``status IN (...)`` predicate).  When ``None`` (default), the
+                argument is omitted and the server returns the full task tree —
+                byte-identical to the previous behaviour.  Pass
+                ``ACTIVE_TASK_STATUSES`` on hot paths to shrink the payload.
+        """
         try:
+            arguments: dict = {'project_root': self._project_root}
+            if statuses is not None:
+                arguments['statuses'] = list(statuses)
             result = await self.dispatch_tool(
                 'get_tasks',
-                {'project_root': self._project_root},
+                arguments,
                 timeout=15,
             )
             tasks = self._parse_tool_text_result(result, 'tasks')
