@@ -3048,6 +3048,41 @@ class _FindInflightWorktreeP(Protocol):
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None: ...
 
 
+def _inflight_entry_is_stale(
+    entry: '_InFlightEntry | None',
+    branch: str,
+    live_snapshot: 'Callable[[], dict] | None',
+) -> bool:
+    """Return True when *entry* appears stale relative to the live worker snapshot.
+
+    Liveness is determined by matching ``entry.request_id`` against the
+    ``request_id`` fields of snapshot entries.  When ``entry.request_id`` is
+    None (legacy entries predating the request_id field) the match falls back
+    to branch-name comparison.
+
+    Returns **False** (not stale → keep coalescing) in three cases:
+
+    1. *live_snapshot* is None — no provider wired (back-compat default; all
+       existing callers without a worker).
+    2. ``live_snapshot()`` raises — transient error (fail-safe to coalesce;
+       avoids double-dispatch storms on transient worker hiccups).
+    3. The entry's ``request_id`` IS present in the snapshot — slot is live.
+    """
+    if live_snapshot is None:
+        return False
+    try:
+        snap = live_snapshot()
+    except Exception:
+        return False  # fail-safe: transient error → not stale → coalesce
+    entries = snap.get('entries', [])
+    rid = entry.request_id if entry is not None else None
+    if rid is not None:
+        return not any(e.get('request_id') == rid for e in entries)
+    else:
+        # Legacy entry without a request_id: fall back to branch matching.
+        return not any(e.get('branch') == branch for e in entries)
+
+
 async def coalesce_or_enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,
@@ -3057,6 +3092,7 @@ async def coalesce_or_enqueue_merge_request(
     *,
     liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     retention: TerminalOutcomeRetention | None = None,
+    live_snapshot: Callable[[], dict] | None = None,
 ) -> MergeDispatchResult:
     """De-dup gate for the merge_request MCP chokepoint.
 
@@ -3087,23 +3123,47 @@ async def coalesce_or_enqueue_merge_request(
     :func:`register_and_enqueue_merge_request`).  Coalesced requests
     are NOT recorded — their terminal outcome is owned by the in-flight
     entry's callback.
+
+    *live_snapshot* (keyword-only, default None): a zero-argument callable
+    that returns the live worker snapshot dict (same shape as
+    ``SpeculativeMergeWorker.snapshot()``).  When provided, the registry
+    fast-path **reconciles** the in-memory slot against the live snapshot
+    before coalescing: if the slot's ``request_id`` is absent from the
+    snapshot the slot is considered stale (the request finalized but its
+    slot was not auto-released), it is reaped via
+    ``registry.release(branch, detach_waiters=True)``, and the call falls
+    through to the acquire-and-enqueue block dispatching a fresh request.
+    When absent (None) or when ``live_snapshot()`` raises, the gate
+    behaves exactly as today — trust the registry.
     """
     branch = req.branch
 
     # ── 1. Registry fast-path ──────────────────────────────────────────
     if registry.is_inflight(branch):
-        eta = registry.eta_seconds(branch)
         entry = registry.entry(branch)
-        _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
-        return MergeDispatchResult(
-            dispatched=False,
-            in_flight=True,
-            branch=branch,
-            inflight_task_id=entry.task_id if entry else None,
-            eta_seconds=eta,
-            source='registry',
-            inflight_request_id=entry.request_id if entry else None,
-        )
+        if _inflight_entry_is_stale(entry, branch, live_snapshot):
+            # Slot points at a dead request_id (finalize path left the slot
+            # un-released).  Reap it so the caller gets a fresh dispatch.
+            logger.warning(
+                'coalesce_or_enqueue_merge_request: reaping STALE in-flight slot '
+                'for branch %r (request_id=%r not present in live worker snapshot); '
+                'dispatching fresh',
+                branch, entry.request_id if entry else None,
+            )
+            registry.release(branch, detach_waiters=True)
+            # Fall through to the acquire-and-enqueue block below.
+        else:
+            eta = registry.eta_seconds(branch)
+            _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
+            return MergeDispatchResult(
+                dispatched=False,
+                in_flight=True,
+                branch=branch,
+                inflight_task_id=entry.task_id if entry else None,
+                eta_seconds=eta,
+                source='registry',
+                inflight_request_id=entry.request_id if entry else None,
+            )
 
     # ── 2. On-disk worktree scan (crash-safety / cross-actor) ──────────
     if git_ops is not None:
