@@ -3247,3 +3247,127 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         # RED: cancel_verify not called before fix (await_count == 0)
         # GREEN: cancel_verify called once (await_count == 1)
         gated.cancel_verify.assert_awaited_once()
+
+    async def test_operator_halt_mid_verify_fires_remote_cancel_before_requeue(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Operator halt with a REMOTE lease → cancel_verify() fired AND fired
+        BEFORE req is put back on the queue AND status == 'REQUEUED'.
+
+        RED (step-3a): the halt branch calls verify_task.cancel() first
+        (cancel_verify await_count == 0); even after step-2 fix only the abandon
+        branch was patched.
+        GREEN (step-4): cancel_verify inserted before verify_task.cancel() in
+        the halt branch (trigger 2), and before put_nowait so queue is empty at
+        cancel time.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+        gated = _gated_runner(gate_release, gate_entered, passed=True, name='rca-halt')
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'rca-halt-a', 'rca_halt_a.py', 'h=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = HostLease(name='rca-halt', runner=gated, is_local=False)
+
+        # Patch cancel_verify to record whether queue was empty at call time
+        _queue_empty_at_cancel: list[bool] = []
+
+        async def _record_cancel() -> int:
+            _queue_empty_at_cancel.append(q.empty())
+            return 0
+
+        gated.cancel_verify = AsyncMock(side_effect=_record_cancel)
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+
+        # Trigger operator halt
+        worker._operator_halt.set()
+
+        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        gate_release.set()
+
+        result = await verify_future
+
+        # Status must be REQUEUED
+        assert result.status == 'REQUEUED'
+
+        # RED: cancel_verify not fired → await_count == 0
+        # GREEN: cancel_verify called once
+        assert gated.cancel_verify.await_count == 1, (
+            f'Expected cancel_verify awaited once; got {gated.cancel_verify.await_count}'
+        )
+
+        # GREEN: cancel was fired BEFORE re-queue (queue was empty at cancel time)
+        assert _queue_empty_at_cancel == [True], (
+            f'cancel_verify must fire before put_nowait; '
+            f'queue-empty-at-cancel={_queue_empty_at_cancel}'
+        )
+
+        # req was put back onto the queue after cancel
+        assert not q.empty(), 'req should be back on queue after halt'
+
+    async def test_local_lease_abort_does_not_fire_remote_cancel(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """LOCAL lease abandon → cancel_verify is NOT called (no remote process).
+
+        Regression guard for the `if not lease.is_local` guard introduced in
+        step-2 / step-4.  LocalRunner has no cancel_verify; an unguarded call
+        would AttributeError.  Even with a MagicMock runner, verify that
+        cancel_verify.await_count == 0 on the local path.
+
+        Uses a local HostLease + monkeypatched _run_post_merge_verify that blocks
+        on a gate so the abort-poll fires before the verify completes.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        # Gated async stub for _run_post_merge_verify (the local path's verify)
+        async def _gated_verify(*args: Any, **kwargs: Any) -> Any:
+            gate_entered.set()
+            await gate_release.wait()
+            from orchestrator.verify import VerifyResult
+            return VerifyResult(passed=True, summary='', category='')
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'rca-local-a', 'rca_local_a.py', 'l=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        # LOCAL lease — runner is a MagicMock that has cancel_verify as AsyncMock
+        # so we can assert it is NOT called.
+        mock_runner = MagicMock()
+        mock_runner.cancel_verify = AsyncMock(return_value=0)
+        lease = HostLease(name='local', runner=mock_runner, is_local=True)
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _gated_verify):
+            verify_future = asyncio.ensure_future(
+                worker._run_inflight_verify(item, lease)
+            )
+            await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+
+            # Trigger abandon
+            req.result.cancel()
+            await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+            gate_release.set()
+
+            result = await verify_future
+
+        assert result.status == 'DROPPED'
+
+        # The local path must NOT call cancel_verify
+        mock_runner.cancel_verify.assert_not_awaited()
