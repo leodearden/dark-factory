@@ -7053,6 +7053,67 @@ class TestTerminalOutcomeRetention:
             'Expected rec_b (newer) to survive eviction of rec_a via identity guard'
         )
 
+    # ── step-5/6: alias resolution ────────────────────────────────────────────
+
+    def test_alias_resolves_to_primary(self) -> None:
+        """record_alias(alias, primary_id) then get(alias) returns the primary record."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        primary = TerminalOutcomeRecord(
+            request_id='mr-primary-P',
+            task_id='task-P',
+            branch='task/P',
+            state='done',
+        )
+        ring.record(primary)
+        ring.record_alias('mr-coalesced', 'mr-primary-P')
+        result = ring.get('mr-coalesced')
+        assert result is primary, f'Expected primary record, got {result!r}'
+
+    def test_alias_order_independent(self) -> None:
+        """record_alias registered before the primary is recorded still resolves lazily."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        ring.record_alias('mr-c2', 'mr-primary-P2')  # registered before primary
+        primary2 = TerminalOutcomeRecord(
+            request_id='mr-primary-P2',
+            task_id='task-P2',
+            branch='task/P2',
+            state='done',
+        )
+        ring.record(primary2)
+        result = ring.get('mr-c2')
+        assert result is primary2, f'Expected lazy alias resolution after record, got {result!r}'
+
+    def test_dangling_alias_returns_none(self) -> None:
+        """An alias pointing to a never-recorded (or evicted) primary returns None."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        ring.record_alias('mr-dangling', 'mr-never-recorded')
+        result = ring.get('mr-dangling')
+        assert result is None, f'Expected None for dangling alias, got {result!r}'
+
+    def test_direct_index_takes_precedence_over_alias(self) -> None:
+        """A request_id with both a direct _index record and an alias uses direct record."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        direct = TerminalOutcomeRecord(
+            request_id='mr-both',
+            task_id='task-direct',
+            branch='task/direct',
+            state='done',
+        )
+        other = TerminalOutcomeRecord(
+            request_id='mr-other',
+            task_id='task-other',
+            branch='task/other',
+            state='blocked',
+        )
+        ring.record(direct)
+        ring.record(other)
+        # Register 'mr-both' as alias to 'mr-other' — direct index must win
+        ring.record_alias('mr-both', 'mr-other')
+        result = ring.get('mr-both')
+        assert result is direct, (
+            f'Expected direct _index entry to take precedence over alias, got {result!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMergeWorkerDequeueEvent — step-5
