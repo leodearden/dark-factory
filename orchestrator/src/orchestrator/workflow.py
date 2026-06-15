@@ -915,7 +915,10 @@ class TaskWorkflow:
         The branch name for a task follows the established convention:
         task_id (bare, same as ``branch_name = self.task_id`` in run()).
         """
-        all_tasks: list[dict] = await self.scheduler.get_tasks()
+        # Server-side filter: only in-progress tasks are candidates; applying
+        # the tightest filter here minimises the payload on this per-tick path.
+        # The client-side status check below is kept as defence-in-depth.
+        all_tasks: list[dict] = await self.scheduler.get_tasks(statuses=['in-progress'])
         # Quick filters that require no git I/O.
         pre_filtered: list[dict] = []
         for task in all_tasks:
@@ -924,7 +927,8 @@ class TaskWorkflow:
             if task_id == self.task_id:
                 continue
             # Exclude non-in-progress statuses (done, blocked, cancelled,
-            # merge-deferred, deferred, …).
+            # merge-deferred, deferred, …) — defence-in-depth against the
+            # server-side filter missing any edge case.
             if task.get('status') != 'in-progress':
                 continue
             # Exclude tasks already assigned to a train.
