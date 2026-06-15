@@ -45,6 +45,43 @@ def test_shape_orchestrators_marks_inactive_known_projects():
     assert by_id['reify']['active'] is False
 
 
+def test_shape_orchestrators_copies_last_update_when_present():
+    """last_update ISO string from the raw dict is copied to the ORCHESTRATORS entry."""
+    raw = [{
+        'pids': [1000],
+        'prd': '/home/leo/src/dark-factory/prd.md',
+        'label': 'dark-factory/main',
+        'project_root': '/home/leo/src/dark-factory',
+        'running': True,
+        'started': '2h ago',
+        'last_update': '2026-06-14T20:00:00',
+        'tasks': [],
+        'worktrees': {},
+        'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
+    }]
+    body = redux_api.shape_orchestrators(raw)
+    [orch] = body['ORCHESTRATORS']
+    assert orch['last_update'] == '2026-06-14T20:00:00'
+
+
+def test_shape_orchestrators_last_update_none_when_absent():
+    """last_update is None on the ORCHESTRATORS entry when the raw dict omits the field."""
+    raw = [{
+        'pids': [2000],
+        'prd': None,
+        'label': 'proj',
+        'project_root': '/home/leo/src/proj',
+        'running': False,
+        'started': '',
+        'tasks': [],
+        'worktrees': {},
+        'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
+    }]
+    body = redux_api.shape_orchestrators(raw)
+    [orch] = body['ORCHESTRATORS']
+    assert orch['last_update'] is None
+
+
 # ---------------------------------------------------------------------------
 # shape_memory
 # ---------------------------------------------------------------------------
