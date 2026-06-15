@@ -554,3 +554,50 @@ class TestReconciliationConfigBulkResetGuardFields:
     def test_write_failure_backoff_override_accepted(self):
         cfg = ReconciliationConfig(bulk_reset_guard_write_failure_backoff_seconds=120.5)
         assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 120.5
+
+
+class TestReconciliationConfigStormKnobs:
+    """Tests for the dead_owner_shielded suppression-storm knobs (task 1755 / PRD β).
+
+    Two new fields on ReconciliationConfig:
+      - dead_owner_suppression_storm_threshold (int, ge=1, default 6)
+      - dead_owner_suppression_storm_window_seconds (float, gt=0, default 3600.0)
+    """
+
+    # --- defaults ---
+
+    def test_default_storm_threshold_is_6(self):
+        assert ReconciliationConfig().dead_owner_suppression_storm_threshold == 6
+
+    def test_default_storm_window_is_3600(self):
+        assert ReconciliationConfig().dead_owner_suppression_storm_window_seconds == 3600.0
+
+    # --- override accepted ---
+
+    def test_storm_threshold_override_accepted(self):
+        cfg = ReconciliationConfig(dead_owner_suppression_storm_threshold=3)
+        assert cfg.dead_owner_suppression_storm_threshold == 3
+
+    def test_storm_window_override_accepted(self):
+        cfg = ReconciliationConfig(dead_owner_suppression_storm_window_seconds=1800.0)
+        assert cfg.dead_owner_suppression_storm_window_seconds == 1800.0
+
+    # --- ge=1 bound: dead_owner_suppression_storm_threshold ---
+
+    def test_storm_threshold_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(dead_owner_suppression_storm_threshold=0)
+
+    def test_storm_threshold_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(dead_owner_suppression_storm_threshold=-1)
+
+    # --- gt=0 bound: dead_owner_suppression_storm_window_seconds ---
+
+    def test_storm_window_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(dead_owner_suppression_storm_window_seconds=0)
+
+    def test_storm_window_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(dead_owner_suppression_storm_window_seconds=-1.0)
