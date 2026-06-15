@@ -439,3 +439,71 @@ async def test_task_interceptor_add_task_ok_when_under_limit(
                     _wt.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await _wt
+
+
+# ── Per-project override mechanism (step-1 / step-3) ─────────────────────
+
+
+class TestBacklogPolicyPerProjectOverride:
+    """RED tests for hard_limit_overrides kwarg and hard_limit_for() resolver."""
+
+    @pytest.mark.asyncio
+    async def test_hard_limit_for_returns_override_when_present(self, event_buffer):
+        """hard_limit_for('reify') returns the override, not the global default."""
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: False,
+            hard_limit=10,
+            hard_limit_overrides={'reify': 100},
+        )
+        assert policy.hard_limit_for('reify') == 100
+
+    @pytest.mark.asyncio
+    async def test_hard_limit_for_returns_default_when_no_override(self, event_buffer):
+        """hard_limit_for('unmapped') falls back to global hard_limit."""
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: False,
+            hard_limit=10,
+            hard_limit_overrides={'reify': 100},
+        )
+        assert policy.hard_limit_for('unmapped') == 10
+
+    @pytest.mark.asyncio
+    async def test_check_ok_when_backlog_under_override(self, event_buffer, tmp_path):
+        """12 events for 'reify' with override=100 → ok (would be over flat 10)."""
+        await _seed_buffered(event_buffer, 'reify', n=12)
+        project_root = tmp_path / 'reify_root'
+        project_root.mkdir()
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: False,
+            hard_limit=10,
+            hard_limit_overrides={'reify': 100},
+        )
+        verdict = await policy.check('reify', project_root=str(project_root))
+        assert verdict.outcome == 'ok'
+
+    @pytest.mark.asyncio
+    async def test_check_rejection_for_unmapped_project_uses_flat_limit(
+        self, event_buffer, tmp_path,
+    ):
+        """12 events for 'small' (no override) with flat=10 → rejection, threshold==10."""
+        await _seed_buffered(event_buffer, 'small', n=12)
+        project_root = tmp_path / 'small_root'
+        project_root.mkdir()
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: False,
+            hard_limit=10,
+            hard_limit_overrides={'reify': 100},
+        )
+        verdict = await policy.check('small', project_root=str(project_root))
+        assert verdict.outcome == 'rejection'
+        assert verdict.threshold == 10
