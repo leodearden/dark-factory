@@ -3397,7 +3397,7 @@ class TestRunVerificationMergeArchival:
             f'Expected empty archive_log_paths on pass; got {result.archive_log_paths!r}'
         )
         assert not (archive_root / '1768').exists(), (
-            f'Expected no archive dir for passing result'
+            'Expected no archive dir for passing result'
         )
 
     # (c) role='merge', archive_root=None → no files, no crash
@@ -5099,7 +5099,7 @@ class TestArchiveMergeVerifyLogs:
         """Each active run produces a .log file in <archive_root>/<task_id>/."""
         runs = _make_runs(test_rc=1, include_lint=True)
         archive_root = tmp_path / 'data' / 'verify-logs'
-        paths = self._archive(runs, archive_root, '1768', 1, 'test_failure')
+        self._archive(runs, archive_root, '1768', 1, 'test_failure')
 
         task_dir = archive_root / '1768'
         assert task_dir.is_dir(), f'Expected dir: {task_dir}'
