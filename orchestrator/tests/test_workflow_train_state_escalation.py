@@ -24,6 +24,7 @@ from _orch_helpers import pydantic_spec
 from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.task_status import ACTIVE_TASK_STATUSES
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -289,3 +290,50 @@ async def test_l1_escalation_train_state_none_for_non_train():
     f.queue.submit.assert_called_once()
     submitted: Escalation = f.queue.submit.call_args.args[0]
     assert submitted.train_state is None
+
+
+# ---------------------------------------------------------------------------
+# step-11 RED: _build_train_state fallback scan fetches ACTIVE_TASK_STATUSES
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_train_state_fallback_fetches_active_statuses():
+    """Fallback scan (no members cache) must call get_tasks(statuses=ACTIVE_TASK_STATUSES).
+
+    Done siblings are not parked (merge-deferred ∈ active), so active-only
+    is correct for the fallback.  The test also verifies that the
+    merge-deferred sibling (still active) still appears in parked_members.
+
+    Fails today: fallback calls self.scheduler.get_tasks() with no statuses.
+    """
+    sibling_tasks = [
+        # merge-deferred sibling — still active, should appear in parked_members
+        {'id': '101', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
+        # self (task_id='103') — excluded from parked_members
+        {'id': '103', 'status': 'blocked', 'metadata': {'train': {'id': 'T1', 'order': 2}}},
+        # done sibling: would be excluded from active fetch — not in parked_members anyway
+    ]
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': 'T1', 'order': 2}},  # no 'members' key → forces fallback
+        get_tasks_return=sibling_tasks,
+    )
+
+    result = await f.wf._build_train_state()
+
+    # Fallback get_tasks must have been called with ACTIVE_TASK_STATUSES.
+    f.scheduler.get_tasks.assert_awaited_once()
+    call_kwargs = f.scheduler.get_tasks.call_args.kwargs
+    assert 'statuses' in call_kwargs, (
+        f"_build_train_state fallback must call get_tasks with statuses=ACTIVE_TASK_STATUSES, "
+        f"but call_args.kwargs was: {call_kwargs}"
+    )
+    assert set(call_kwargs['statuses']) == ACTIVE_TASK_STATUSES, (
+        f"Expected statuses {ACTIVE_TASK_STATUSES}, got {set(call_kwargs['statuses'])}"
+    )
+    # The merge-deferred sibling must still appear in parked_members.
+    assert result is not None
+    assert '101' in result['parked_members'], (
+        f"merge-deferred sibling '101' must be in parked_members, got {result}"
+    )
