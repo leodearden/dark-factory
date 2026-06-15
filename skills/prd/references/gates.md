@@ -148,7 +148,9 @@ Thresholds are **[overlay]**-tunable. When any condition holds, prompt: "This PR
 
    **Field-population sub-check (the result-field twin).** When the signal *samples or reduces a field off a result value* (`result.stress`, `mode.shape`, `elastic.displacement`), the required capability is not "the field is declared on the type" but "the producer **populates** it with a real, sampleable value". Require evidence the producer writes a **non-sentinel** value (not a placeholder / `Undef` / `None` / trivial default) into that field on the **production** path — a declared-but-never-populated field FAILS even though the type checks and the signal reads as plausible. **[overlay]** names the project's empty-value sentinel. (This is the FEA/modal hot zone: `ElasticResult.{stress,displacement}` and `ModalResult.shape` declared but left `Undef`, so every downstream sampler inherits a false premise.)
 
-Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scientific projects and rarely for CRUD/web/tooling projects. **[overlay]** sets the project's domain flag and supplies domain-specific premise hazards (e.g. FEA element locking, spline end-conditions). Branch 3 is **universal** — it's a dependency-correctness check that applies to every project.
+4. **Negative assertion / rejection** ("X is rejected", "errors", "fails to compile", "is forbidden", "is not accepted"). Any signal making such an assertion **must bind that the rejection mechanism exists and fires on X**: author X, run the substrate check, and observe whether the asserted diagnostic appears — observed ABSENCE of the diagnostic ⇒ rejection capability absent ⇒ FAIL. *Worked case:* a signal asserted that a call with a mismatched argument is rejected, but the compiler performs no argument-vs-parameter nominal checking — the substrate check exits 0 with no diagnostic — and the manifest logged the contradicting silent-accept evidence as test MOTIVATION instead of binding the rejection capability.
+
+Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scientific projects and rarely for CRUD/web/tooling projects. **[overlay]** sets the project's domain flag and supplies domain-specific premise hazards (e.g. FEA element locking, spline end-conditions). Branches 3 and 4 are **universal** — branch 3 is a dependency-correctness check and branch 4 is a rejection-mechanism check; both apply to every project (compilers, web 4xx, input validation).
 
 **Resolution when a premise fails:**
 - **(a)** Move the signal to the task that can actually produce it (fixes misattribution).
@@ -167,11 +169,14 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 | Check | PASS evidence | FAIL (blocks queue) |
 |---|---|---|
-| Capability→producer (anti-orphan, shape 1) | `grep:<file>:<line>` shows it **wired into the consuming entry path** on main, OR `producer:task-<N>` in the **transitive dependency closure** whose deliverable *is* this capability | `declared-only` · `test-only` · `producer-absent` |
+| Capability→producer (anti-orphan, shape 1) | `grep:<file>:<line>` shows it **wired into the consuming entry path** on main, OR `producer:task-<N>` in the **transitive dependency closure** whose deliverable **covers the specific extent** of this capability (task name-matching the area is not sufficient) | `declared-only` · `test-only` · `producer-absent` · `producer-extent-short` |
 | DAG-direction (anti-inversion, shape 2) | the producer task is **upstream** of this leaf | `producer-downstream` (the owner *depends on* this leaf) |
 | Field-population (the result-field twin) | `grep` shows the producer writes a **non-sentinel sampleable** value into the field on the production path | `declared-only` (field present, producer leaves it the empty sentinel) |
 | Grammar reality (anti-mismatch, shape 4) | `grammar-fixture:<path>` parses with **0 ERROR nodes**, OR a named grammar-producer task is upstream | `fixture-ERROR` |
 | Numeric floor (anti-floor, shape 3) | `floor:<bound> > <method-floor>`, floor stated | `bound≤floor` |
+| Rejection-mechanism (anti-silent-accept, shape 5) | `rejection-check:<X>` — authored X, ran the substrate check, and the asserted diagnostic was **observed to fire** | `rejection-absent` (substrate check exits 0 with no diagnostic — rejection capability absent) |
+
+*`producer-extent-short` worked cases:* (a) a task that "owns Transform3" delivers the Type/Value/builtins extent but NOT type-name resolution — a bare `Transform3` type-name does not resolve though the owner name-matches; (b) a prerequisite migrated only the `param: Scalar` extent, not the `-> Scalar` codomain extent — the manifest verified DAG-direction but not extent, and the prereq's own completeness grep was structurally blind to the codomain form.
 
 Any capability resolving to a FAIL value **blocks** queueing until resolved by one of the G3/G6 resolutions: rewrite to an existing capability, queue the prerequisite **upstream** + wire the dep, move the signal to the producing leaf, or relax the bound.
 
