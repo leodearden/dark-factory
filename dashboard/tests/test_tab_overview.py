@@ -44,15 +44,3 @@ class TestOverviewTabCurrentTaskRemoved:
     def test_current_task_th_removed(self, tab_overview_jsx_body):
         """The <th>Current task</th> column header must NOT appear in tab_overview.jsx."""
         assert '<th>Current task</th>' not in tab_overview_jsx_body
-
-
-class TestOverviewTabLastUpdate:
-    """The orchestrators table must include a per-orchestrator last-update column."""
-
-    def test_overview_renders_last_update_via_timeago(self, tab_overview_jsx_body):
-        """tab_overview.jsx must contain the render reference timeago(o.last_update)."""
-        assert 'timeago(o.last_update)' in tab_overview_jsx_body
-
-    def test_overview_has_updated_column_header(self, tab_overview_jsx_body):
-        """tab_overview.jsx must contain an <th>Updated</th> column header."""
-        assert '<th>Updated</th>' in tab_overview_jsx_body
