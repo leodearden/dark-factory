@@ -2370,23 +2370,27 @@ class TerminalOutcomeRetention:
     a secondary-index entry that is now owned by a newer live record (see
     ``record()`` docstring).
 
-    A fourth ``_aliases`` dict maps coalesced/absorbed request_ids to the
-    primary request_id whose terminal record they should resolve to.  Aliases
-    resolve lazily through ``_index``; a dangling alias (primary evicted or
-    not-yet-recorded) returns None — matching the ring's existing lossless
-    eviction contract.  Aliases are not actively evicted (see ``record_alias()``
-    docstring).
+    A fourth ``_aliases`` ordered dict maps coalesced/absorbed request_ids to
+    the primary request_id whose terminal record they should resolve to.
+    Aliases resolve lazily through ``_index``; a dangling alias (primary
+    evicted or not-yet-recorded) returns None — matching the ring's existing
+    lossless eviction contract.  ``_aliases`` is capped at ``maxlen * 4``
+    entries; when the cap is exceeded the oldest alias is dropped first
+    (FIFO), as oldest entries are the most likely to be dangling and the
+    least likely to be polled (see ``record_alias()`` docstring).
 
     The event store is the durable tier so eviction is lossless — α3's
     merge_status falls through to event-store queries for evicted ids.
     """
 
     def __init__(self, maxlen: int = 200) -> None:
+        self._maxlen = maxlen
         self._ring: collections.deque[TerminalOutcomeRecord] = collections.deque(maxlen=maxlen)
         self._index: dict[str, TerminalOutcomeRecord] = {}
         self._by_branch: dict[str, TerminalOutcomeRecord] = {}
         self._by_task: dict[str, TerminalOutcomeRecord] = {}
-        self._aliases: dict[str, str] = {}  # alias request_id → primary request_id
+        # OrderedDict so oldest alias can be FIFO-trimmed when the cap is hit.
+        self._aliases: collections.OrderedDict[str, str] = collections.OrderedDict()
 
     def record(self, rec: TerminalOutcomeRecord) -> None:
         """Append *rec* to the ring, evicting the oldest entry from all indexes if full.
@@ -2441,11 +2445,16 @@ class TerminalOutcomeRetention:
         finalises.  Dangling aliases (primary evicted or never recorded) return
         None, matching the ring's lossless eviction contract.
 
-        Aliases are not actively evicted — they accumulate until the ring object
-        is discarded.  This is intentional for the β era; γ3 can add pruning if
-        needed once live retention threading is wired.
+        ``_aliases`` is capped at ``maxlen * 4`` entries (default 800).  When
+        the cap is exceeded the oldest alias is dropped first (FIFO); oldest
+        aliases are most likely dangling and least likely to be polled.  The
+        cap prevents unbounded growth proportional to total coalesce traffic
+        for long-running orchestrator processes.
         """
         self._aliases[alias_id] = primary_request_id
+        _cap = self._maxlen * 4
+        while len(self._aliases) > _cap:
+            self._aliases.popitem(last=False)  # drop oldest alias FIFO
 
     def get_by_branch(self, branch: str) -> TerminalOutcomeRecord | None:
         """Return the most-recently recorded record for *branch*, or None if unknown."""
@@ -3163,7 +3172,11 @@ async def coalesce_or_enqueue_merge_request(
             except OSError:
                 age = 0.0  # stat failed — treat as alive to be safe
             if age <= liveness_secs:
-                # ALIVE: coalesce without enqueuing or reaping
+                # ALIVE: coalesce without enqueuing or reaping.
+                # No alias is registered here: the primary request_id belongs to
+                # a different process, so there is no in-process registry entry
+                # to alias onto.  Callers polling the coalesced id fall through
+                # to the event-store / git-authority tiers on a ring miss.
                 _emit_merge_coalesced(event_store, req, source='worktree', eta=None)
                 return MergeDispatchResult(
                     dispatched=False,

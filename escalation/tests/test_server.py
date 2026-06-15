@@ -2380,10 +2380,10 @@ class TestGetMergeQueue:
         merge_wt.mkdir()
 
         # Capture the LIVE phase that snapshot() would surface at advance_main
-        # time: read it through snapshot()'s verify_in_progress (the real
-        # observability path), plus the singular compat field and the live
-        # finalize-head entry's per-entry phase (worker._finalizing_head, set by
-        # _finalize_inflight — the production object, not a test-held reference).
+        # time: read it through the live finalize-head entry's per-entry phase
+        # (worker._finalizing_head, set by _finalize_inflight — the production
+        # object, not a test-held reference) and snapshot()'s verify_in_progress
+        # (the real merge_status observability path).
         captured_phases: list[str | None] = []
         captured_snapshot_phases: list[str | None] = []
 
@@ -2392,7 +2392,6 @@ class TestGetMergeQueue:
         # defined below — without it, embedding fake_advance_main in git_ops_stub
         # makes pyright report it as self-referential.
         async def fake_advance_main(*args, **kwargs) -> str:
-            captured_phases.append(worker._verify_phase)
             fh = worker._finalizing_head
             captured_phases.append(fh.phase if fh is not None else None)
             snap = worker.snapshot()
@@ -2443,11 +2442,11 @@ class TestGetMergeQueue:
 
         await worker._finalize_inflight(entry)
 
-        # advance_main ran; phase was 'finalizing' at that point — on the entry,
-        # on the singular compat field, AND surfaced via snapshot()'s live
+        # advance_main ran; phase was 'finalizing' at that point — on the
+        # finalize-head entry AND surfaced via snapshot()'s live
         # verify_in_progress (the real merge_status observability path).
-        assert captured_phases == ['finalizing', 'finalizing'], (
-            f'Expected finalizing on both _verify_phase and entry.phase at '
+        assert captured_phases == ['finalizing'], (
+            f'Expected finalizing on entry.phase at '
             f'advance_main, got: {captured_phases}'
         )
         assert captured_snapshot_phases == ['finalizing'], (
@@ -3239,6 +3238,70 @@ class TestMergeStatus:
         )
         assert result.get('request_id') == 'mr-primary-alias', (
             f'Expected resolved primary request_id, got: {result}'
+        )
+
+    async def test_ring_request_id_over_branch_precedence(self, tmp_path: Path) -> None:
+        """When request_id is supplied and misses the ring, branch is NOT consulted.
+
+        The Tier-2 elif chain applies request_id > branch > task_id precedence:
+        if request_id is given (even if it misses the ring), the branch key is
+        never checked in the ring.  This pins the deliberate precedence choice
+        so a regression that accidentally fell through to get_by_branch on a
+        request_id miss would be caught.
+        """
+        # Ring has a record for branch 'prec-branch' but NOT for request_id 'mr-miss'
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-other-prec',
+            task_id='T-prec',
+            branch='prec-branch',
+            state='done',
+        ))
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        # Supply both request_id (ring-miss) and branch (ring-hit).
+        # The ring tier must NOT resolve via branch because request_id is present.
+        result = await _call_merge_status(server, request_id='mr-miss', branch='prec-branch')
+
+        # Should fall through to unknown (not 'done' from the ring's branch record)
+        assert result.get('state') == 'unknown', (
+            f'Expected unknown (request_id-only lookup; branch ignored on ring-miss), '
+            f'got: {result}'
+        )
+
+    async def test_ring_wins_over_event_store_by_task_id(self, tmp_path: Path) -> None:
+        """Ring task_id= record wins over event store when both have the same task_id."""
+        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev-task')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-rtask',
+            data={'request_id': 'mr-evtask', 'branch': 'b-rtask', 'state': 'done'},
+        )
+
+        # Ring says 'conflict' for this task_id — ring must win over event store's 'done'
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-ringtask',
+            task_id='T-rtask',
+            branch='b-rtask',
+            state='conflict',
+        ))
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, task_id='T-rtask')
+
+        assert result.get('state') == 'conflict', (
+            f'Expected ring value (conflict) to beat event store (done) on task_id= poll, '
+            f'got: {result}'
+        )
+        assert result.get('outcome') == 'conflict', (
+            f'Expected outcome=conflict from ring, got: {result}'
         )
 
     # ── step-11: live-snapshot tier ───────────────────────────────────────────
