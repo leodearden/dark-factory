@@ -109,6 +109,11 @@ reconciliation:
   escalation_port: ${RECON_ESCALATION_PORT:8103}
   escalation_host: "127.0.0.1"
   escalation_queue_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}/escalations"
+  # Aggregate storm alarm — dead_owner_shielded suppression burst (task 1755 / PRD β).
+  # When >=threshold suppressions occur in a rolling window, one loud
+  # recon_watchdog_kill_storm escalation fires. Per-event suppression (task 1731) is kept.
+  dead_owner_suppression_storm_threshold: 6
+  dead_owner_suppression_storm_window_seconds: 3600.0
   # Tiered models
   sonnet_model: "sonnet"
   opus_model: "opus"

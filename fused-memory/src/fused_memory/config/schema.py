@@ -454,6 +454,33 @@ class ReconciliationConfig(BaseModel):
     escalation_host: str = Field(default='127.0.0.1')
     escalation_queue_dir: str = Field(default='./data/reconciliation/escalations')
 
+    # Aggregate storm alarm for dead_owner_shielded suppression bursts (task 1755 / PRD β).
+    # When >=threshold suppressions occur within a rolling window_seconds, a single loud
+    # 'recon_watchdog_kill_storm' escalation fires — the per-event suppression (task 1731)
+    # is preserved. Default threshold=6 per 3600s (~= 24× the ~6/day benign-restart
+    # baseline) ensures a single benign restart (count=1) never trips the storm.
+    dead_owner_suppression_storm_threshold: int = Field(
+        default=6,
+        ge=1,
+        description=(
+            'Number of dead_owner_shielded recon_stale_run suppressions within '
+            'dead_owner_suppression_storm_window_seconds that triggers a single '
+            'loud recon_watchdog_kill_storm escalation. Default 6 per 3600s is '
+            '~24× the ~6/day benign-restart baseline. Task 1755 / PRD β.'
+        ),
+    )
+    dead_owner_suppression_storm_window_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'Rolling time window (seconds) for counting dead_owner_shielded '
+            'suppressions. A single storm alarm is emitted per window when the '
+            'count crosses dead_owner_suppression_storm_threshold. Also doubles '
+            'as the per-window rate limit: the alarm cannot re-fire within this '
+            'window. Task 1755 / PRD β.'
+        ),
+    )
+
     # Tiered models
     sonnet_model: str = Field(default='sonnet')
     opus_model: str = Field(default='opus')
