@@ -3129,7 +3129,11 @@ async def coalesce_or_enqueue_merge_request(
     the ring alongside the workflow path (see
     :func:`register_and_enqueue_merge_request`).  Coalesced requests
     are NOT recorded — their terminal outcome is owned by the in-flight
-    entry's callback.
+    entry's callback.  However, when *retention* is supplied and an in-flight
+    registry entry is available, the coalesced request's ``request_id`` is
+    registered as an alias onto the in-flight entry's ``request_id`` via
+    :meth:`TerminalOutcomeRetention.record_alias`, so callers polling the
+    coalesced id will resolve to the primary outcome once it is recorded.
     """
     branch = req.branch
 
@@ -3137,6 +3141,8 @@ async def coalesce_or_enqueue_merge_request(
     if registry.is_inflight(branch):
         eta = registry.eta_seconds(branch)
         entry = registry.entry(branch)
+        if retention is not None and entry is not None and entry.request_id is not None:
+            retention.record_alias(req.request_id, entry.request_id)
         _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
         return MergeDispatchResult(
             dispatched=False,
@@ -3207,6 +3213,8 @@ async def coalesce_or_enqueue_merge_request(
     # Concurrent dispatch won the race during the (currently no-op) scan await
     eta = registry.eta_seconds(branch)
     entry = registry.entry(branch)
+    if retention is not None and entry is not None and entry.request_id is not None:
+        retention.record_alias(req.request_id, entry.request_id)
     _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
     return MergeDispatchResult(
         dispatched=False,
