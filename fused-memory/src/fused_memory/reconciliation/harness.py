@@ -86,6 +86,11 @@ _RECON_DEDUP_CONFIG = (
             'recon_failure',
             'recon_stale_run',
             'recon_backlog_overflow',
+            # Task 1755 / PRD β: aggregate storm alarm for dead_owner_shielded
+            # suppression bursts.  Adding it here ensures submit_or_dedupe folds
+            # repeated storm alarms (stable _DEAD_OWNER_STORM_FINDING fingerprint)
+            # into a single pending escalation for the 8103 watcher.
+            'recon_watchdog_kill_storm',
         ),
     )
     if HAS_ESCALATION else None
