@@ -6060,9 +6060,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """Build the env_overrides dict for this agent invocation.
 
         Implementer and debugger inherit env_overrides and REIFY_DEBUG_PORT.
-        Architect, implementer, and debugger also get the jobserver task-pool env
-        (CARGO_MAKEFLAGS) so their cargo build/test/metadata calls participate in
-        the FIFO jobserver instead of running uncoordinated.
+        Architect, implementer, and debugger also get:
+        - CARGO_MAKEFLAGS (jobserver task-pool env) so their cargo build/test/metadata
+          calls participate in the FIFO jobserver instead of running uncoordinated.
+        - DF_AGENT_CPU_NICE (CPU nice de-prioritization env) so cli_invoke prepends
+          ``nice -n N`` to the Claude CLI spawn, causing agents to yield CPU to
+          reify's negatively-niced merge/task verifies.
         Other roles (merger, judge, reviewer) receive None.
         """
         if role.name not in ('architect', 'implementer', 'debugger'):
@@ -6073,6 +6076,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if self._reify_debug_port is not None:
                 merged['REIFY_DEBUG_PORT'] = str(self._reify_debug_port)
         merged.update(self.config.jobserver.agent_env())
+        merged.update(self.config.cpu_priority.agent_env())
         return merged or None
 
     async def _invoke(
