@@ -139,6 +139,9 @@ class CuratorEscalator:
         zero_output_timeout: bool = False,
         account_name: str | None = None,
         proc_tree: str | None = None,
+        subtype: str | None = None,
+        cost_usd: float | None = None,
+        pool_sizes: dict[str, int] | None = None,
     ) -> None:
         """Route a curator failure. Raises :class:`CuratorFailureError` when no
         orchestrator is running so the MCP caller sees a loud error.
@@ -241,6 +244,10 @@ class CuratorEscalator:
             detail_lines.append(f'timed_out={timed_out}')
         if duration_ms is not None:
             detail_lines.append(f'duration_ms={duration_ms}')
+        if cost_usd is not None:
+            detail_lines.append(f'cost_usd={cost_usd}')
+        if pool_sizes is not None:
+            detail_lines.append(f'pool_sizes={pool_sizes}')
         detail_lines.append(f'justification={justification}')
 
         if count == self._ESCALATE_FIRST_N:
