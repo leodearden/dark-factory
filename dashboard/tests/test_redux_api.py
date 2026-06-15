@@ -100,6 +100,46 @@ def test_shape_memory_offline_keeps_required_keys():
     assert ms['offline'] is True
 
 
+def test_shape_memory_uptime_threaded_when_present():
+    """online status with uptime fields → both appear in MEMORY_STATUS."""
+    body = redux_api.shape_memory(
+        {
+            'graphiti': {'node_count': 10},
+            'mem0': {'memory_count': 5},
+            'uptime_seconds': 277020,
+            'started_at': '2026-06-12T10:00:00+00:00',
+        },
+        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
+    )
+    ms = body['MEMORY_STATUS']
+    assert ms['uptime_seconds'] == 277020
+    assert ms['started_at'] == '2026-06-12T10:00:00+00:00'
+
+
+def test_shape_memory_uptime_none_when_absent():
+    """online status missing uptime fields → keys present but None."""
+    body = redux_api.shape_memory(
+        {'graphiti': {'node_count': 1}, 'mem0': {'memory_count': 1}},
+        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
+    )
+    ms = body['MEMORY_STATUS']
+    assert ms['uptime_seconds'] is None
+    assert ms['started_at'] is None
+
+
+def test_shape_memory_offline_uptime_keys_none():
+    """offline status → uptime_seconds and started_at present and None."""
+    body = redux_api.shape_memory(
+        {'offline': True, 'error': 'unreachable'},
+        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
+    )
+    ms = body['MEMORY_STATUS']
+    assert 'uptime_seconds' in ms
+    assert ms['uptime_seconds'] is None
+    assert 'started_at' in ms
+    assert ms['started_at'] is None
+
+
 def test_shape_memory_online_passes_through_plus_defaults():
     body = redux_api.shape_memory(
         {'graphiti': {'node_count': 100}, 'mem0': {'memory_count': 50},

@@ -244,6 +244,7 @@ function OverviewTab({ paused }) {
             { l: 'Graphiti', sub: `${D.MEMORY_STATUS.graphiti.node_count.toLocaleString()} nodes · ${D.MEMORY_STATUS.graphiti.edge_count.toLocaleString()} edges`, ok: true },
             { l: 'Mem0',     sub: `${D.MEMORY_STATUS.mem0.memory_count.toLocaleString()} memories`, ok: true },
             { l: 'Taskmaster', sub: 'mcp v0.18 · responsive', ok: true },
+            { l: 'fused-memory', sub: `up ${window.DF_SHELL.fmtUptime(D.MEMORY_STATUS.uptime_seconds)}`, ok: !D.MEMORY_STATUS.offline, title: D.MEMORY_STATUS.started_at || undefined },
             { l: 'Write queue', sub: `${queue.pending} pending · ${queue.retry} retry · ${queue.dead} dead`, ok: queue.dead === 0, warn: queue.pending > 5 || queue.retry > 0 },
             (() => {
               const v = D.RECON_STATE.verdict;
