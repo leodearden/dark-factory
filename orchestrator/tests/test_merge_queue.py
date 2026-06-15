@@ -12035,6 +12035,54 @@ class TestRunPostMergeVerify:
         call_kwargs = git_ops.prune_stale_merge_worktrees.await_args.kwargs
         assert call_kwargs['keep'] == {merge_wt}
 
+    async def test_local_path_archive_root_wired(self, tmp_path: Path) -> None:
+        """(task 1768 step-7 RED) On the local path, the inline LocalRunner is built with
+        archive_root == req.config.project_root / 'data' / 'verify-logs'.
+
+        Fails today because the inline LocalRunner construction at merge_queue.py:788
+        passes no archive_root (→ default None), so run_scoped_verification receives
+        archive_root=None.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        # Use a real Path so we can check the derived archive_root value.
+        req.config.project_root = tmp_path
+        merge_wt = MagicMock()
+
+        captured_kwargs: list[dict] = []
+
+        async def spy_run_scoped(*args, **kwargs):
+            captured_kwargs.append(kwargs)
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='', summary='ok',
+            )
+
+        expected_archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', spy_run_scoped),
+            patch('orchestrator.merge_queue._run_unscoped_typechecks', AsyncMock(
+                return_value=MagicMock(broken=False, timed_out=False, failing_subprojects=[],
+                                       timed_out_subprojects=[]),
+            )),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is None, f'Expected None (pass), got {result!r}'
+        assert captured_kwargs, 'run_scoped_verification must have been called'
+        actual_archive_root = captured_kwargs[0].get('archive_root')
+        assert actual_archive_root == expected_archive_root, (
+            f'Expected archive_root={expected_archive_root!r}, '
+            f'got {actual_archive_root!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests
