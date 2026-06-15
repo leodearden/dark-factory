@@ -1305,6 +1305,7 @@ def create_server(
                 full_branch = key if key.startswith(prefix) else f'{prefix}{key}'
                 tip = await git_ops.resolve_branch_sha(full_branch)
                 if tip is not None and await git_ops.is_ancestor(tip, orch_config.git.main_branch):
+                    # Live branch is already an ancestor of main (normal merged case).
                     return {
                         'state': 'done',
                         'request_id': request_id,
@@ -1313,6 +1314,22 @@ def create_server(
                         'merge_sha': tip,
                         'outcome': 'found_on_main',
                     }
+                elif tip is None:
+                    # Branch ref gone — the canonical 4352 deleted-branch shape.
+                    # find_merge_marker internally gates on branch existence so it only
+                    # fires when the ref is gone (consistent with the cheaper-common-path
+                    # ordering: cheaper is_ancestor check first, find_merge_marker only
+                    # when the branch has been deleted).
+                    marker = await git_ops.find_merge_marker(full_branch)
+                    if marker is not None:
+                        return {
+                            'state': 'done',
+                            'request_id': request_id,
+                            'generation': 1,
+                            'kind': 'found_on_main',
+                            'merge_sha': marker,
+                            'outcome': 'found_on_main',
+                        }
 
         # Tier 4: honest unknown
         return {
