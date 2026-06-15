@@ -507,3 +507,52 @@ class TestBacklogPolicyPerProjectOverride:
         verdict = await policy.check('small', project_root=str(project_root))
         assert verdict.outcome == 'rejection'
         assert verdict.threshold == 10
+
+    # ── step-3: per-project effective limit reported in threshold / escalation ──
+
+    @pytest.mark.asyncio
+    async def test_escalation_threshold_reflects_override(self, event_buffer, tmp_path):
+        """25 events for 'reify' (override=20), orchestrator live → escalation JSON threshold==20."""
+        await _seed_buffered(event_buffer, 'reify', n=25)
+        project_root = tmp_path / 'reify_root'
+        project_root.mkdir()
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,  # orchestrator live
+            hard_limit=10,
+            hard_limit_overrides={'reify': 20},
+        )
+        verdict = await policy.check('reify', project_root=str(project_root))
+        assert verdict.outcome == 'escalated'
+        assert verdict.threshold == 20, (
+            f'verdict.threshold should be override 20, got {verdict.threshold}'
+        )
+        body = json.loads(Path(verdict.escalation_path).read_text())
+        assert body['threshold'] == 20, (
+            f"escalation JSON threshold should be override 20, got {body['threshold']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejection_threshold_reflects_override(self, event_buffer, tmp_path):
+        """25 events for 'reify' (override=20), no orchestrator → rejection threshold==20."""
+        await _seed_buffered(event_buffer, 'reify', n=25)
+        project_root = tmp_path / 'reify_root'
+        project_root.mkdir()
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: False,  # no orchestrator
+            hard_limit=10,
+            hard_limit_overrides={'reify': 20},
+        )
+        verdict = await policy.check('reify', project_root=str(project_root))
+        assert verdict.outcome == 'rejection'
+        assert verdict.threshold == 20, (
+            f'verdict.threshold should be override 20, got {verdict.threshold}'
+        )
+        err = verdict.to_error_dict()
+        assert err['threshold'] == 20
+        assert 'limit 20' in err['error']
