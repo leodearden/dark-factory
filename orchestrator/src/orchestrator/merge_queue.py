@@ -2381,21 +2381,27 @@ class TerminalOutcomeRetention:
         self._by_task: dict[str, TerminalOutcomeRecord] = {}
 
     def record(self, rec: TerminalOutcomeRecord) -> None:
-        """Append *rec* to the ring, evicting the oldest entry from the index if full.
+        """Append *rec* to the ring, evicting the oldest entry from all indexes if full.
 
         Eviction uses an identity guard on each index: ``if index[key] is evicted``
-        before deleting, so a newer record that already claimed the same branch/task_id
-        key is never accidentally removed (Case B in the eviction-discipline tests).
+        before deleting, so a newer record that already claimed the same
+        branch/task_id key is never accidentally removed (Case B in the
+        eviction-discipline tests).  The secondary-index prune runs BEFORE the
+        new record is indexed, so a new record with the same branch/task_id
+        replaces rather than loses its secondary entry.
         """
         if len(self._ring) == self._ring.maxlen:
             # Capture the about-to-be-evicted entry before appending.
             evicted = self._ring[0]
             self._ring.append(rec)
-            # Only remove the index entry if it still points to *evicted* — a
-            # duplicate request_id (pathological case) should not evict the
-            # newer entry.
+            # Only remove each index entry if it still points to *evicted* — a
+            # newer record that already claimed the same key must be preserved.
             if self._index.get(evicted.request_id) is evicted:
                 del self._index[evicted.request_id]
+            if self._by_branch.get(evicted.branch) is evicted:
+                del self._by_branch[evicted.branch]
+            if self._by_task.get(evicted.task_id) is evicted:
+                del self._by_task[evicted.task_id]
         else:
             self._ring.append(rec)
         self._index[rec.request_id] = rec
