@@ -367,3 +367,181 @@ async def test_submit_failure_does_not_register_halt_owner(
         'is_wip_halted must be False when submit() raises — '
         'no escalation was registered so the halt state must be clean'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 1765: HALT-WITHOUT-OWNER guard — submit failure releases orphan halt
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_submit_halt_owning_escalation_releases_orphan_halt_on_submit_failure(
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """If submit() raises while a merger halt is engaged (ownerless), the helper
+    must release the orphan halt before re-raising.
+
+    Without the guard (pre-fix), submit raises and propagates before
+    set_halt_owner; the halt stays engaged with no owner — silently blocking
+    all merges on the lane until force_unhalt_merge_queue.
+
+    Must FAIL today (pre-fix): _submit_halt_owning_escalation has no guard.
+    """
+    from escalation.models import Escalation
+
+    # Pre-engage the merger halt (ownerless — mirrors _map_advance_failure).
+    fake_worker.halt_for_wip('wip_overlap')
+    assert fake_worker.is_wip_halted
+    assert fake_worker.halt_owner_esc_id is None
+
+    # Monkeypatch submit to raise.
+    assert workflow.escalation_queue is not None
+    original_submit = workflow.escalation_queue.submit
+
+    def _raise_on_submit(esc):
+        raise RuntimeError('disk full')
+
+    workflow.escalation_queue.submit = _raise_on_submit  # type: ignore[method-assign]
+
+    # Build a minimal Escalation to pass to the helper.
+    esc = Escalation(
+        id=workflow.escalation_queue.make_id(workflow.task_id),
+        task_id=workflow.task_id,
+        agent_role='orchestrator',
+        severity='blocking',
+        category='wip_conflict',
+        summary='WIP overlap test',
+        level=1,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match='disk full'):
+            workflow._submit_halt_owning_escalation(esc)
+    finally:
+        workflow.escalation_queue.submit = original_submit  # type: ignore[method-assign]
+
+    # (a) Halt must be released — no silent orphan halt.
+    assert fake_worker.is_wip_halted is False, (
+        'is_wip_halted must be False after submit() raises — '
+        'orphan halt guard must release it before re-raising'
+    )
+    # (b) Owner must still be None (set_halt_owner was never reached).
+    assert fake_worker.halt_owner_esc_id is None, (
+        'halt_owner_esc_id must remain None — set_halt_owner was never reached'
+    )
+    # (c) Unhalt reason must be set (guard fired).
+    assert fake_worker.last_unhalt_reason is not None, (
+        'last_unhalt_reason must be set — guard must call unhalt_wip with a reason'
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_wip_conflict_releases_orphan_halt_on_submit_failure(
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """A pre-engaged merger halt is released when submit() raises inside
+    _handle_wip_conflict, via the new guard in _submit_halt_owning_escalation.
+
+    _submit_halt_escalation_and_wait's existing try/except does NOT cover this
+    case: it wraps emit+await (lines after the _submit_halt_owning_escalation
+    call), so a submit failure escapes before the try. The guard in the shared
+    helper closes the gap for both the single-task path and the train path.
+
+    Must FAIL today (pre-fix): no guard in _submit_halt_owning_escalation.
+    """
+    # Pre-engage the merger halt (ownerless).
+    fake_worker.halt_for_wip('wip_overlap')
+    assert fake_worker.is_wip_halted
+
+    # Monkeypatch submit to raise.
+    assert workflow.escalation_queue is not None
+    original_submit = workflow.escalation_queue.submit
+
+    def _raise_on_submit(esc):
+        raise RuntimeError('disk full')
+
+    workflow.escalation_queue.submit = _raise_on_submit  # type: ignore[method-assign]
+
+    try:
+        with pytest.raises(RuntimeError, match='disk full'):
+            await workflow._handle_wip_conflict(
+                MergeOutcome(status='wip_halted', overlap_files=['x.py']),
+                'task/1765',
+            )
+    finally:
+        workflow.escalation_queue.submit = original_submit  # type: ignore[method-assign]
+
+    # Orphan halt must be released.
+    assert fake_worker.is_wip_halted is False, (
+        'is_wip_halted must be False after submit() raises — orphan halt released'
+    )
+    assert fake_worker.halt_owner_esc_id is None, (
+        'halt_owner_esc_id must remain None — set_halt_owner was never reached'
+    )
+    assert fake_worker.last_unhalt_reason is not None, (
+        'last_unhalt_reason must be set — guard fired on ownerless orphan halt'
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_failure_does_not_release_foreign_owned_halt(
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """Guard is a no-op when the halt is already owned by a FOREIGN escalation.
+
+    Pins the ``halt_owner_esc_id is None`` conjunct: the guard must only release
+    genuine ownerless orphans — never steal or clear a foreign owner's halt.
+
+    Mirrors test_consumer_halt_already_owned_skips_escalate (which guards the
+    same probe predicate in the consumer).
+
+    This test is a green pin — it passes before and after the fix because the
+    guard must not fire when the halt is already owned.
+    """
+    from escalation.models import Escalation
+
+    # Pre-engage the halt AND set a FOREIGN owner (bypass the assertion in set_halt_owner).
+    fake_worker.halt_for_wip('wip_overlap')
+    fake_worker._owner = 'esc-other-1'  # type: ignore[attr-defined]
+    assert fake_worker.is_wip_halted
+    assert fake_worker.halt_owner_esc_id == 'esc-other-1'
+
+    # Monkeypatch submit to raise.
+    assert workflow.escalation_queue is not None
+    original_submit = workflow.escalation_queue.submit
+
+    def _raise_on_submit(esc):
+        raise RuntimeError('disk full')
+
+    workflow.escalation_queue.submit = _raise_on_submit  # type: ignore[method-assign]
+
+    esc = Escalation(
+        id=workflow.escalation_queue.make_id(workflow.task_id),
+        task_id=workflow.task_id,
+        agent_role='orchestrator',
+        severity='blocking',
+        category='wip_conflict',
+        summary='Foreign owner test',
+        level=1,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match='disk full'):
+            workflow._submit_halt_owning_escalation(esc)
+    finally:
+        workflow.escalation_queue.submit = original_submit  # type: ignore[method-assign]
+
+    # (a) Foreign owner must be preserved — guard must NOT fire.
+    assert fake_worker.halt_owner_esc_id == 'esc-other-1', (
+        f'halt_owner_esc_id must remain "esc-other-1", got {fake_worker.halt_owner_esc_id!r}'
+    )
+    # (b) Halt must remain engaged.
+    assert fake_worker.is_wip_halted is True, (
+        'is_wip_halted must be True — guard must NOT release a foreign-owned halt'
+    )
+    # (c) Unhalt must NOT have fired.
+    assert fake_worker.last_unhalt_reason is None, (
+        'last_unhalt_reason must be None — guard was a no-op for foreign-owned halt'
+    )

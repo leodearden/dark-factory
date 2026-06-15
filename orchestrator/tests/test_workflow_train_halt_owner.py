@@ -754,3 +754,58 @@ async def test_consumer_no_merge_worker_preserves_existing_path(
     ), f'Expected escalate_to_human=True: {call_args!r}'
 
     assert result == WorkflowOutcome.BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# Task 1765: HALT-WITHOUT-OWNER guard — submit failure releases orphan halt
+#            (train path via _escalate_train_halt)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_escalate_train_halt_releases_orphan_halt_on_submit_failure(
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """A pre-engaged merger halt is released when submit() raises inside
+    _escalate_train_halt, via the new guard in _submit_halt_owning_escalation.
+
+    _escalate_train_halt calls _submit_halt_owning_escalation (line 5747) which
+    calls escalation_queue.submit(esc). If submit raises, the halt is ownerless
+    (set_halt_owner unreachable) and would silently block the whole lane.
+
+    Must FAIL today (pre-fix): _submit_halt_owning_escalation has no guard.
+    """
+    # Pre-engage the merger halt (ownerless — mirrors _map_advance_failure).
+    fake_worker.halt_for_wip('wip_overlap')
+    assert fake_worker.is_wip_halted
+    assert fake_worker.halt_owner_esc_id is None
+
+    # Monkeypatch submit to raise.
+    assert workflow.escalation_queue is not None
+    original_submit = workflow.escalation_queue.submit
+
+    def _raise_on_submit(esc):
+        raise RuntimeError('disk full')
+
+    workflow.escalation_queue.submit = _raise_on_submit  # type: ignore[method-assign]
+
+    try:
+        with pytest.raises(RuntimeError, match='disk full'):
+            await workflow._escalate_train_halt(  # type: ignore[attr-defined]
+                MergeOutcome(status='wip_halted', overlap_files=['a.py']),
+                'T-train-1',
+            )
+    finally:
+        workflow.escalation_queue.submit = original_submit  # type: ignore[method-assign]
+
+    # Orphan halt must be released.
+    assert fake_worker.is_wip_halted is False, (
+        'is_wip_halted must be False after submit() raises — '
+        'orphan halt guard must release it before re-raising (train path)'
+    )
+    assert fake_worker.halt_owner_esc_id is None, (
+        'halt_owner_esc_id must remain None — set_halt_owner was never reached'
+    )
+    assert fake_worker.last_unhalt_reason is not None, (
+        'last_unhalt_reason must be set — guard fired on ownerless orphan halt'
+    )
