@@ -389,3 +389,28 @@ class TestFetchTasksCache:
         assert second != [], 'mutating first result must not clear the cache entry'
         assert len(second) == 2, 'cache should still hold both shaped tasks after mutation'
         assert mock_mcp.call_count == 1, 'only one MCP call should have been issued'
+
+    async def test_fetch_tasks_ttl_expiry_refetches(
+        self, monkeypatch, dummy_client, dummy_config
+    ):
+        """When the cached entry exceeds TTL the next call issues a fresh MCP call.
+
+        Monkeypatches _FETCH_TASKS_TTL_SECONDS=0.0 so any stored entry is
+        immediately stale.  Two sequential calls must produce call_count == 2.
+
+        RED until step-4: step-2 serves on presence (no freshness check) so
+        count stays 1, failing this assertion.
+        """
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.tasks import fetch_tasks
+
+        monkeypatch.setattr(tasks_mod, '_FETCH_TASKS_TTL_SECONDS', 0.0)
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/E')
+            await fetch_tasks(dummy_client, dummy_config, '/proj/E')
+
+        assert mock_mcp.call_count == 2, (
+            f'expected 2 MCP calls after TTL expiry (TTL=0.0), got {mock_mcp.call_count}'
+        )
