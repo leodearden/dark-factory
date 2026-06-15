@@ -118,3 +118,61 @@ def orch_config(git_repo: Path) -> OrchestratorConfig:
 @pytest.fixture
 def git_ops(orch_config: OrchestratorConfig) -> GitOps:
     return GitOps(orch_config.git, orch_config.project_root)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — in-memory stubs, no real git required
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestMergeStatusGitAuthority:
+    """Unit tests for the git-authority Tier-3.5 inside merge_status."""
+
+    # ── step-1: is_ancestor live-branch path ─────────────────────────────────
+
+    async def test_live_branch_on_main_returns_done(self, tmp_path: Path) -> None:
+        """When tip is not None and is_ancestor(tip, 'main') → state='done'/found_on_main.
+
+        Verifies:
+        - state == 'done', kind == 'found_on_main', merge_sha == tip, generation == 1
+        - is_ancestor was called with (tip, 'main')
+        - find_merge_marker was NOT called (cheaper-common-path ordering: skip
+          the find_merge_marker scan when the branch ref is still live)
+        """
+        tip = 'a' * 40
+        rsb = AsyncMock(return_value=tip)
+        ia = AsyncMock(return_value=True)
+        fmm = AsyncMock(return_value=None)
+        stub_git = _stub_git_ops(
+            resolve_branch_sha=rsb,
+            is_ancestor=ia,
+            find_merge_marker=fmm,
+        )
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=None,
+            _terminal_retention=None,
+            git_ops=stub_git,
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            max_concurrent_tasks=1,
+            git=GitConfig(main_branch='main', branch_prefix='task/', remote='origin',
+                          worktree_dir='.worktrees'),
+        )
+        # NO event_store — durable tiers miss, so Tier-3.5 must fire
+        server = create_server(esc_queue, harness=stub_harness, orch_config=config)
+
+        result = await _call_merge_status(server, task_id='123')
+
+        assert result.get('state') == 'done', f'Expected state=done, got: {result}'
+        assert result.get('kind') == 'found_on_main', f'Expected kind=found_on_main, got: {result}'
+        assert result.get('merge_sha') == tip, f'Expected merge_sha={tip!r}, got: {result}'
+        assert result.get('generation') == 1, f'Expected generation=1, got: {result}'
+
+        # Verify routing: is_ancestor called with (tip, 'main')
+        ia.assert_called_once_with(tip, 'main')
+        # find_merge_marker must NOT be called when tip is present
+        fmm.assert_not_called()
