@@ -2358,9 +2358,17 @@ class TerminalOutcomeRecord:
 class TerminalOutcomeRetention:
     """Bounded in-memory ring of recent terminal merge outcomes.
 
-    Backed by a ``collections.deque(maxlen=maxlen)`` for eviction and a
-    ``dict`` index keyed by ``request_id`` for O(1) lookups.  When the ring
-    is full, the oldest entry is evicted from both structures atomically.
+    Backed by a ``collections.deque(maxlen=maxlen)`` for eviction and three
+    dict indexes for O(1) lookups:
+
+    * ``_index`` — keyed by ``request_id`` (primary).
+    * ``_by_branch`` — keyed by ``branch`` (secondary, newest-wins).
+    * ``_by_task`` — keyed by ``task_id`` (secondary, newest-wins).
+
+    When the ring is full, the oldest entry is evicted from all three indexes
+    atomically using an identity guard — so evicting an old record never drops
+    a secondary-index entry that is now owned by a newer live record (see
+    ``record()`` docstring).
 
     The event store is the durable tier so eviction is lossless — α3's
     merge_status falls through to event-store queries for evicted ids.
@@ -2369,9 +2377,16 @@ class TerminalOutcomeRetention:
     def __init__(self, maxlen: int = 200) -> None:
         self._ring: collections.deque[TerminalOutcomeRecord] = collections.deque(maxlen=maxlen)
         self._index: dict[str, TerminalOutcomeRecord] = {}
+        self._by_branch: dict[str, TerminalOutcomeRecord] = {}
+        self._by_task: dict[str, TerminalOutcomeRecord] = {}
 
     def record(self, rec: TerminalOutcomeRecord) -> None:
-        """Append *rec* to the ring, evicting the oldest entry from the index if full."""
+        """Append *rec* to the ring, evicting the oldest entry from the index if full.
+
+        Eviction uses an identity guard on each index: ``if index[key] is evicted``
+        before deleting, so a newer record that already claimed the same branch/task_id
+        key is never accidentally removed (Case B in the eviction-discipline tests).
+        """
         if len(self._ring) == self._ring.maxlen:
             # Capture the about-to-be-evicted entry before appending.
             evicted = self._ring[0]
@@ -2384,10 +2399,20 @@ class TerminalOutcomeRetention:
         else:
             self._ring.append(rec)
         self._index[rec.request_id] = rec
+        self._by_branch[rec.branch] = rec
+        self._by_task[rec.task_id] = rec
 
     def get(self, request_id: str) -> TerminalOutcomeRecord | None:
         """Return the record for *request_id*, or None if evicted / not yet recorded."""
         return self._index.get(request_id)
+
+    def get_by_branch(self, branch: str) -> TerminalOutcomeRecord | None:
+        """Return the most-recently recorded record for *branch*, or None if unknown."""
+        return self._by_branch.get(branch)
+
+    def get_by_task(self, task_id: str) -> TerminalOutcomeRecord | None:
+        """Return the most-recently recorded record for *task_id*, or None if unknown."""
+        return self._by_task.get(task_id)
 
 
 class InFlightMergeRegistry:
