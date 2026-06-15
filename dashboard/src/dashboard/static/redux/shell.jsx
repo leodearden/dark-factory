@@ -51,6 +51,22 @@ function timeago(iso) {
   return `${d}d`;
 }
 
+// Format a duration in seconds as a compact two-unit string: "3d 7h" (>=1 day),
+// "7h 4m" (>=1 hour), "4m" (>=1 minute), "30s" otherwise.
+// Returns "—" for null/undefined/NaN/negative input.
+function fmtUptime(seconds) {
+  if (seconds == null || isNaN(seconds) || seconds < 0) return '—';
+  const s = Math.floor(seconds);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
+  if (d >= 1) return `${d}d ${h}h`;
+  if (h >= 1) return `${h}h ${m}m`;
+  if (m >= 1) return `${m}m`;
+  return `${rem}s`;
+}
+
 // Replace any ISO8601 timestamps embedded inside a free-form string with the
 // minute-precision UTC form. Used for fields like cost-event `detail` where
 // the API returns a stringified JSON blob containing raw timestamps.
@@ -433,4 +449,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtDateTime, scrubIsos, taskId, dailyDeltas };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId, dailyDeltas };
