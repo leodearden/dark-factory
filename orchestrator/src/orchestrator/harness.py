@@ -2504,7 +2504,8 @@ Output JSON matching the schema. Every task must appear in the output.
             return False
 
         try:
-            verdict = substrate_gate.run_substrate_recheck(
+            verdict = await asyncio.to_thread(
+                substrate_gate.run_substrate_recheck,
                 task=assignment.task,
                 worktree=gate_path,
             )
