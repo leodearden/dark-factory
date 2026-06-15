@@ -202,3 +202,136 @@ class TestBuildCheckerArgv:
     def test_returns_none_when_descriptor_not_dict(self):
         from orchestrator.substrate_gate import build_checker_argv
         assert build_checker_argv('not-a-dict') is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Step-3 RED: run_substrate_recheck exit-code→verdict mapping
+# ---------------------------------------------------------------------------
+
+
+class TestRunSubstrateRecheck:
+    """Tests for ``orchestrator.substrate_gate.run_substrate_recheck``."""
+
+    def test_rc0_returns_pass_not_flipped(self):
+        """rc=0: all probes pass → PASS, not flipped."""
+        from orchestrator.substrate_gate import PASS, run_substrate_recheck
+        task = make_probe_task()
+        checker = fake_checker(rc=0, stdout='all good', stderr='')
+        verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == PASS
+        assert verdict.flipped is False
+        assert verdict.exit_code == 0
+
+    def test_rc1_returns_flip(self):
+        """rc=1: ≥1 FAIL → FLIP."""
+        from orchestrator.substrate_gate import FLIP, run_substrate_recheck
+        task = make_probe_task()
+        checker = fake_checker(rc=1, stderr='probe failed')
+        verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == FLIP
+        assert verdict.flipped is True
+        assert verdict.exit_code == 1
+        assert 'FAIL' in verdict.reason
+
+    def test_rc2_returns_flip_unprovable(self):
+        """rc=2: ≥1 UNPROVABLE → FLIP with UNPROVABLE reason."""
+        from orchestrator.substrate_gate import FLIP, run_substrate_recheck
+        task = make_probe_task()
+        checker = fake_checker(rc=2)
+        verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == FLIP
+        assert verdict.flipped is True
+        assert verdict.exit_code == 2
+        assert 'UNPROVABLE' in verdict.reason
+
+    def test_rc127_returns_flip_unverifiable(self):
+        """rc=127 (command not found) → FLIP with unverifiable reason."""
+        from orchestrator.substrate_gate import FLIP, run_substrate_recheck
+        task = make_probe_task()
+        checker = fake_checker(rc=127, stderr='command not found')
+        verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == FLIP
+        assert verdict.flipped is True
+        assert verdict.exit_code == 127
+        assert 'rc=127' in verdict.reason or 'unverifiable' in verdict.reason
+
+    def test_other_nonzero_rc_returns_flip_unverifiable(self):
+        """Any other non-zero rc → FLIP with 'unverifiable' reason."""
+        from orchestrator.substrate_gate import FLIP, run_substrate_recheck
+        task = make_probe_task()
+        checker = fake_checker(rc=255)
+        verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == FLIP
+        assert verdict.flipped is True
+        assert verdict.exit_code == 255
+        assert 'unverifiable' in verdict.reason.lower() or 'rc=255' in verdict.reason
+
+    def test_no_descriptor_returns_skip(self):
+        """Task with no substrate_probe → SKIP, not flipped (gate no-op)."""
+        from orchestrator.substrate_gate import SKIP, run_substrate_recheck
+        task = {'id': '1', 'title': 'plain', 'metadata': {}}
+        checker = fake_checker(rc=0)
+        verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == SKIP
+        assert verdict.flipped is False
+        # Checker must NOT have been invoked for a task with no descriptor
+        assert checker.calls == []
+
+    def test_descriptor_but_no_checker_returns_flip(self):
+        """Descriptor present but no resolvable checker → FLIP."""
+        from orchestrator.substrate_gate import FLIP, run_substrate_recheck
+        task = {'id': '1', 'metadata': {'substrate_probe': {'probe_set': 'probes/foo.json', 'checker': []}}}
+        checker = fake_checker(rc=0)
+        verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == FLIP
+        assert verdict.flipped is True
+        assert 'no checker command' in verdict.reason or 'probe set declared' in verdict.reason
+
+    def test_checker_called_with_correct_argv_and_cwd(self):
+        """Checker is invoked with the built argv and cwd=worktree."""
+        from orchestrator.substrate_gate import run_substrate_recheck
+        task = make_probe_task(checker=['run_check'], probe_set='probes/suite.json')
+        checker = fake_checker(rc=0)
+        verdict = run_substrate_recheck(task=task, worktree='/wt/gate', run_subprocess=checker)
+        assert len(checker.calls) == 1
+        called_argv, called_cwd = checker.calls[0]
+        assert called_argv == ['run_check', 'probes/suite.json']
+        assert called_cwd == '/wt/gate'
+
+    def test_prd_s10_two_way_boundary_pass(self):
+        """PRD §10 boundary: same descriptor, rc=0 → PASS (author-time PASS holds)."""
+        from orchestrator.substrate_gate import PASS, run_substrate_recheck
+        task = make_probe_task()
+        verdict = run_substrate_recheck(
+            task=task, worktree='/gate', run_subprocess=fake_checker(rc=0)
+        )
+        assert verdict.verdict == PASS
+        assert not verdict.flipped
+
+    def test_prd_s10_two_way_boundary_flip(self):
+        """PRD §10 boundary: same descriptor, rc=1 → FLIP (4352 drift case)."""
+        from orchestrator.substrate_gate import FLIP, run_substrate_recheck
+        task = make_probe_task()
+        verdict = run_substrate_recheck(
+            task=task, worktree='/gate', run_subprocess=fake_checker(rc=1)
+        )
+        assert verdict.verdict == FLIP
+        assert verdict.flipped
+
+    def test_stdout_stderr_captured_in_verdict(self):
+        """Stdout/stderr from checker are captured in the verdict."""
+        from orchestrator.substrate_gate import run_substrate_recheck
+        task = make_probe_task()
+        checker = fake_checker(rc=1, stdout='some output', stderr='some error')
+        verdict = run_substrate_recheck(task=task, worktree='/wt', run_subprocess=checker)
+        assert verdict.stdout == 'some output'
+        assert verdict.stderr == 'some error'
+
+    def test_metadata_as_json_string_works(self):
+        """Task with metadata as JSON string is handled (normalization)."""
+        from orchestrator.substrate_gate import PASS, run_substrate_recheck
+        task = make_probe_task(metadata_as_json_string=True)
+        verdict = run_substrate_recheck(
+            task=task, worktree='/gate', run_subprocess=fake_checker(rc=0)
+        )
+        assert verdict.verdict == PASS
