@@ -3569,3 +3569,165 @@ class TestStopDrainFiresRemoteCancel:
 
         # (b) Local lease must NOT trigger cancel_verify (is_local guard).
         local_runner.cancel_verify.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task-1762 step-3 RED: head-failure cascade fires remote cancel before cancel()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCascadeFiresRemoteCancel:
+    """_verifier_loop head-failure cascade fires remote cancel BEFORE task.cancel().
+
+    RED (step-3) until step-4 GREEN inserts _abort_remote_verify before
+    _entry.verify_task.cancel() in the cascade loop inside _verifier_loop.
+
+    RED marker: ``fake.remote_cancels_while_live == []`` — the cascade calls
+    _entry.verify_task.cancel() first, which clears live=False in the fake's
+    finally; the subsequent cancel_and_release→cancel_verify sees a dead id.
+
+    GREEN: ``_abort_remote_verify`` fires while live=True →
+    ``remote_cancels_while_live == [1]``.
+
+    Template: test_n_fail_aborts_downstream_verify_reruns_remerge (:2018).
+    N is a gated LOCAL verify that fails; N+1's remote runner is the
+    id-liveness fake (pre-1) injected via _inject_two_host_allocator.
+    """
+
+    async def test_cascade_fires_remote_cancel_before_task_cancel(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Head-fail cascade remote-cancels N+1's LIVE id BEFORE task.cancel().
+
+        N (local) fails → head-failure cascade fires against N+1 (remote,
+        id-liveness fake).
+
+        RED: cascade calls _entry.verify_task.cancel() first → live cleared
+             → cancel_and_release→cancel_verify sees dead id →
+             remote_cancels_while_live stays [].
+        GREEN (step-4): _abort_remote_verify fires before task.cancel() → [1].
+        """
+        # ── N's gated local verify: fails when gate_a_release is set ─────────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # N's verify: gate and fail
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False,
+                    summary='test_failure',
+                    test_output='FAILED',
+                    lint_output='',
+                    type_output='',
+                    category='test_failure',
+                    timed_out=False,
+                    verify_skipped=False,
+                )
+            # N+1 re-dispatched locally after cascade (pass immediately)
+            return MagicMock(
+                passed=True,
+                summary='ok',
+                test_output='ok',
+                lint_output='',
+                type_output='',
+                category='',
+                timed_out=False,
+                verify_skipped=False,
+            )
+
+        # ── N+1's remote verify: id-liveness fake ────────────────────────────
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        fake_remote = _id_liveness_fake_runner(
+            gate_b_release, gate_b_entered, name='id-live-cascade',
+        )
+
+        # ── Branches ─────────────────────────────────────────────────────────
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/casc-a', 'casc_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/casc-b', 'casc_b.py', 'b = 2\n',
+        )
+
+        # ── Worker setup ─────────────────────────────────────────────────────
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, fake_remote)
+
+        loop = asyncio.get_event_loop()
+        req_a = MergeRequest(
+            task_id='casc-a', branch='task/casc-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='casc-b', branch='task/casc-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        outcome_b: MergeOutcome | None = None
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for both verifies to enter (true concurrent overlap)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # N's verify fails → triggers head-failure cascade for N+1
+            gate_a_release.set()
+
+            # N must resolve with a fail status
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status not in ('done', 'already_merged'), (
+                f'Expected N to fail, got status={outcome_a.status!r}.'
+            )
+
+            # Release N+1's gate to unblock the leaked inner task (the cascade
+            # already cancelled the outer verify_task; this unblocks the inner
+            # run_merge_verify coroutine so the test can complete cleanly).
+            gate_b_release.set()
+
+            # Wait for N+1 to resolve 'done' after cascade re-merge/re-verify
+            with contextlib.suppress(TimeoutError):
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=10.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── N+1 must resolve done (cascade re-merged and re-verified) ────────
+        assert outcome_b is not None and outcome_b.status == 'done', (
+            f'Expected N+1 to resolve "done" after cascade re-merge/re-verify, '
+            f'got {outcome_b!r}.'
+        )
+
+        # ── Remote cancel must have reached N+1's LIVE id ────────────────────
+        # RED: cascade calls _entry.verify_task.cancel() first → live cleared
+        #      → cancel_verify (from cancel_and_release) sees dead id →
+        #      remote_cancels_while_live stays [].
+        # GREEN (step-4): _abort_remote_verify fires before task.cancel() → [1].
+        assert fake_remote.remote_cancels_while_live == [1], (
+            f'Expected remote_cancels_while_live==[1] (cancel reached live id), '
+            f'got {fake_remote.remote_cancels_while_live!r}. '
+            'RED: cascade calls verify_task.cancel() before remote cancel → '
+            'live cleared → cancel_verify sees dead id → no entry appended. '
+            'GREEN (step-4): _abort_remote_verify fires before task.cancel().'
+        )
