@@ -285,7 +285,13 @@ To abandon a submitted merge (e.g. the task needs redesign after submission):
 ```
 mcp__escalation__merge_cancel(request_id=request_id)
 ```
-Cancel using the `request_id` you received — for both `queued` and `attached` responses this is already the in-flight entry's id (`attached` responses set `req_id_override=dispatch.inflight_request_id`). If `merge_cancel` returns `{state: "unknown"}`, the entry has no live waiter in this server instance (restarted or finalized) — fall back to `mcp__escalation__merge_status(request_id)` or `git log main --oneline | head -5` to confirm whether the merge landed before deciding next steps.
+Cancel using the `request_id` you received — for both `queued` and `attached` responses this is already the in-flight entry's id (`attached` responses set `req_id_override=dispatch.inflight_request_id`). If `merge_cancel` returns `{state: "unknown"}`, the entry has no live waiter in this server instance (restarted or finalized) — poll `mcp__escalation__merge_status(request_id)` first (it now self-resolves via the git-authority tier and returns `state: "done"` / `kind: "found_on_main"` / `merge_sha` when the branch is provably on main). If `merge_status` still returns `unknown`, confirm deterministically:
+```bash
+git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
+# exit 0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
+# exit 1 (not on main): the merge did not land; decide whether to resubmit or discard
+```
+Never fall back to direct merge in response to `unknown` — `unknown` means the server lost its record, not that the merge failed.
 
 *If this is an escalated task (pending escalation, agent is paused):*
 
