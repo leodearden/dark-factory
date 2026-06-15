@@ -99,6 +99,11 @@ class CuratorEscalator:
         # escalation queue with N identical entries for a single outage event.
         # Stays monotonic — in-process dedup, intentionally reset on restart.
         self._zot_last_submitted: dict[str, float] = {}
+        # Serialise concurrent _persist_state calls so only one write is ever
+        # in flight.  Mirrors the asyncio.Lock instances held by TaskInterceptor
+        # (task_interceptor.py:288-289,1308,1332) for per-project mutations.
+        # Constructed without a running loop (valid on py>=3.10).
+        self._persist_lock: asyncio.Lock = asyncio.Lock()
         # Reload persisted burst log if state_path is set and exists.
         if self._state_path is not None and self._state_path.exists():
             self._load_state()
@@ -159,49 +164,74 @@ class CuratorEscalator:
         window) before writing so the file stays bounded to the active window —
         not just the key that was most recently touched.  The write is offloaded
         via :func:`asyncio.to_thread` to avoid blocking the event loop under
-        burst load (especially with multiple concurrent ``report_failure`` calls).
+        burst load.
+
+        Concurrent ``report_failure`` calls (e.g. from a batch ZOT bisect that
+        spawns N concurrent size-1 curate() calls) are serialised by
+        ``_persist_lock``: only one persist is ever in flight at a time.  This
+        means the later-acquiring coroutine takes a fresh snapshot of the full
+        current ``_failure_log`` (containing all keys updated so far) — a stale
+        snapshot can never overwrite a fresher one, and a single writer always
+        touches the temp file at a time.
+
+        Each ``_write`` closure gets a unique temp filename
+        ``<state>.{pid}.{id(payload)}.tmp`` (mirroring event_queue.py's
+        disjoint-path discipline) so two writers can never share a temp path,
+        with ``finally`` cleanup to ensure a failed/garbage temp never lingers.
 
         Uses write-to-temp + os.replace so a crash mid-write never corrupts
         the existing file.  Only called when state_path is set.
         """
         if self._state_path is None:
             return
-        # Prune globally before serialising so stale (project_id, subtype)
-        # pairs do not accumulate in memory or on disk across long-lived processes.
-        now = time.time()
-        cutoff = now - self._cooldown_secs
-        for key in list(self._failure_log.keys()):
-            pruned = [t for t in self._failure_log[key] if t >= cutoff]
-            if pruned:
-                self._failure_log[key] = pruned
-            else:
-                del self._failure_log[key]
-        records = [
-            {
-                'project_id': project_id,
-                'subtype': subtype,
-                'timestamps': timestamps,
-            }
-            for (project_id, subtype), timestamps in self._failure_log.items()
-        ]
-        # Serialise the snapshot on the calling thread; only the I/O runs in the
-        # thread pool so we don't hold the dict lock during the blocking write.
-        payload = json.dumps(records)
-        state_path = self._state_path
+        async with self._persist_lock:
+            # Prune globally before serialising so stale (project_id, subtype)
+            # pairs do not accumulate in memory or on disk across long-lived
+            # processes.  Snapshot is taken inside the lock so the later-
+            # acquiring coroutine always sees the complete current log.
+            now = time.time()
+            cutoff = now - self._cooldown_secs
+            for key in list(self._failure_log.keys()):
+                pruned = [t for t in self._failure_log[key] if t >= cutoff]
+                if pruned:
+                    self._failure_log[key] = pruned
+                else:
+                    del self._failure_log[key]
+            records = [
+                {
+                    'project_id': project_id,
+                    'subtype': subtype,
+                    'timestamps': timestamps,
+                }
+                for (project_id, subtype), timestamps in self._failure_log.items()
+            ]
+            # Serialise the snapshot on the calling thread; only the I/O runs
+            # in the thread pool so we don't hold the lock during the blocking
+            # write.
+            payload = json.dumps(records)
+            state_path = self._state_path
 
-        def _write() -> None:
-            tmp_path = state_path.with_suffix('.tmp')
-            try:
-                tmp_path.write_text(payload)
-                os.replace(tmp_path, state_path)
-            except Exception:
-                logger.warning(
-                    'curator_escalator: failed to persist state to %s',
-                    state_path,
-                    exc_info=True,
+            def _write() -> None:
+                # Unique temp path per write: pid + id(payload) ensures two
+                # concurrent writers (if they somehow bypass the lock) never
+                # share a temp file name.  Defense-in-depth: mirrors
+                # event_queue.py's disjoint-indexed-path discipline.
+                tmp_path = state_path.parent / (
+                    f'{state_path.name}.{os.getpid()}.{id(payload)}.tmp'
                 )
+                try:
+                    tmp_path.write_text(payload)
+                    os.replace(tmp_path, state_path)
+                except Exception:
+                    logger.warning(
+                        'curator_escalator: failed to persist state to %s',
+                        state_path,
+                        exc_info=True,
+                    )
+                finally:
+                    tmp_path.unlink(missing_ok=True)
 
-        await asyncio.to_thread(_write)
+            await asyncio.to_thread(_write)
 
     def _orchestrator_running(self, project_root: str) -> bool:
         """Return True if the project's orchestrator holds its exclusive lock.
