@@ -227,6 +227,54 @@ def _make_fake_remote(name: str = 'laptop') -> MagicMock:
     return fake
 
 
+def _id_liveness_fake_runner(
+    gate_release: asyncio.Event,
+    gate_entered: asyncio.Event,
+    name: str = 'id-live-laptop',
+) -> MagicMock:
+    """Faithful fake RemoteRunner that models verify_runner.py:799/814.
+
+    ``run_merge_verify``: sets ``live=True`` on entry (after signalling
+    *gate_entered*), awaits *gate_release*, then clears ``live=False`` in
+    a ``finally``.  This mirrors the real RemoteRunner's
+    ``finally: self._inflight_request_id = None`` — so that task cancellation
+    (direct or via an enclosing task) clears the id exactly like production.
+
+    ``cancel_verify``: appends ``1`` to ``remote_cancels_while_live`` ONLY
+    while ``live is True``, mirroring verify_runner.py:814 returning 0
+    (no-op) when ``_inflight_request_id is None``.  Always returns 0.
+
+    Expose ``remote_cancels_while_live`` on the mock for assertions:
+      - ``== [1]`` GREEN: _abort_remote_verify fired before task.cancel()
+      - ``== []``  RED:   cancel reached a dead id (neutered)
+    """
+    state: dict[str, bool] = {'live': False}
+    remote_cancels_while_live: list[int] = []
+
+    async def _run_merge_verify_side(*args: Any, **kwargs: Any) -> Any:
+        state['live'] = True
+        gate_entered.set()
+        try:
+            await gate_release.wait()
+            return _mock_verify_result(True)
+        finally:
+            state['live'] = False
+
+    async def _cancel_verify_side(*args: Any, **kwargs: Any) -> int:
+        if state['live']:
+            remote_cancels_while_live.append(1)
+        return 0
+
+    runner = MagicMock()
+    runner.name = name
+    runner.is_local = False
+    runner.run_merge_verify = AsyncMock(side_effect=_run_merge_verify_side)
+    runner.cancel_verify = AsyncMock(side_effect=_cancel_verify_side)
+    runner.probe_clean = AsyncMock(return_value=True)
+    runner.remote_cancels_while_live = remote_cancels_while_live
+    return runner
+
+
 def _inject_two_host_allocator(
     worker: SpeculativeMergeWorker,
     fake_remote: Any,
@@ -3386,3 +3434,138 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
 
         # The local path must NOT call cancel_verify
         mock_runner.cancel_verify.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task-1762 step-1 RED: stop() fires remote cancel before task.cancel()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStopDrainFiresRemoteCancel:
+    """stop() fires remote cancel-verify BEFORE cancelling in-flight verify tasks.
+
+    RED (step-1) until step-2 GREEN inserts ``_abort_remote_verify`` before
+    ``verify_task.cancel()`` in the _inflight drain loop inside stop().
+
+    RED marker: ``fake.remote_cancels_while_live == []`` — stop() cancels the
+    verify_task first, which clears live=False in the fake's finally (mirroring
+    verify_runner.py:799 clearing _inflight_request_id), so the subsequent
+    cancel_verify call finds a dead id and appends nothing.
+
+    GREEN: ``_abort_remote_verify`` is called while live=True →
+    ``remote_cancels_while_live == [1]``.
+    """
+
+    async def test_stop_fires_remote_cancel_before_task_cancel(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """stop() remote-cancels an in-flight REMOTE verify BEFORE task.cancel().
+
+        Uses an id-liveness fake (pre-1) that models verify_runner.py:799/814:
+          run_merge_verify:  live=True on entry, live=False in finally (mirrors
+                             _inflight_request_id clearing on CancelledError).
+          cancel_verify:     appends 1 only while live=True.
+
+        worker._host_allocator is None so cancel_and_release is never called —
+        the ONLY possible cancel_verify path is the new _abort_remote_verify.
+
+        RED: stop() cancels verify_task before any remote cancel → live cleared
+             → remote_cancels_while_live stays [].
+        GREEN (step-2): _abort_remote_verify fires while live=True → [1].
+        """
+        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.verify_runner import HostLease
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+        fake_remote = _id_liveness_fake_runner(
+            gate_release, gate_entered, name='id-live-laptop',
+        )
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = None     # cancel_and_release never called
+        worker._shutdown_timeout = 0.5
+
+        # ── REMOTE entry: id-liveness fake ──────────────────────────────────
+        req_remote = _make_request(
+            'stop-rc-remote', 'task/stop-rc-remote',
+            git_ops.project_root, config,
+        )
+        item_remote = SpeculativeItem(
+            request=req_remote,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='abc',
+            speculative=False,
+            skip_verify=False,
+        )
+        # Start run_merge_verify so the id is live (gate_entered set, awaits release).
+        verify_task = asyncio.ensure_future(
+            fake_remote.run_merge_verify(
+                'branch', '/wt', 'sha', {}, 0, 0, 'id-live-laptop',
+            )
+        )
+        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+
+        remote_lease = HostLease(
+            name=fake_remote.name, runner=fake_remote, is_local=False,
+        )
+        entry_remote = InflightEntry(
+            item=item_remote,
+            lease=remote_lease,
+            verify_task=verify_task,
+            merge_wt=None,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+        # ── LOCAL entry: negative control — _abort_remote_verify must skip ──
+        local_runner = MagicMock()
+        local_runner.cancel_verify = AsyncMock(return_value=0)
+        local_lease = HostLease(name='local', runner=local_runner, is_local=True)
+        req_local = _make_request(
+            'stop-rc-local', 'task/stop-rc-local',
+            git_ops.project_root, config,
+        )
+        item_local = SpeculativeItem(
+            request=req_local,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='def',
+            speculative=False,
+            skip_verify=False,
+        )
+        verify_task_local = asyncio.ensure_future(asyncio.sleep(999))
+        entry_local = InflightEntry(
+            item=item_local,
+            lease=local_lease,
+            verify_task=verify_task_local,
+            merge_wt=None,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+        worker._inflight.append(entry_remote)
+        worker._inflight.append(entry_local)
+
+        await worker.stop()
+        gate_release.set()   # cleanup: unblock leaked inner task if any
+
+        # (a) Remote cancel must have reached the LIVE id.
+        # RED: remote_cancels_while_live == [] (stop() cancelled verify_task first
+        #      → live cleared → cancel_verify sees dead id).
+        # GREEN (step-2): _abort_remote_verify fires before task.cancel() → [1].
+        assert fake_remote.remote_cancels_while_live == [1], (
+            f'Expected remote_cancels_while_live==[1] (cancel reached live id), '
+            f'got {fake_remote.remote_cancels_while_live!r}. '
+            'RED: stop() cancels verify_task before remote cancel → live cleared '
+            '→ cancel_verify sees dead id → no entry appended. '
+            'GREEN (step-2): _abort_remote_verify fires before task.cancel().'
+        )
+
+        # (b) Local lease must NOT trigger cancel_verify (is_local guard).
+        local_runner.cancel_verify.assert_not_awaited()
