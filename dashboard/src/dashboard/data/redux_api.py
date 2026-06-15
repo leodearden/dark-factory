@@ -60,6 +60,7 @@ def shape_orchestrators(
             'project_root': str(project_root),
             'running': bool(o.get('running')),
             'started': o.get('started') or '',
+            'last_update': o.get('last_update'),
             'summary': dict(o.get('summary') or {}),
         })
 
