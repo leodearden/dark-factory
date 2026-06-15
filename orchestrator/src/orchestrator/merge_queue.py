@@ -7484,6 +7484,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         'and re-queuing merge for re-verify after un-halt',
                         req.task_id,
                     )
+                    if not lease.is_local:
+                        with contextlib.suppress(Exception):
+                            await lease.runner.cancel_verify()
                     verify_task.cancel()
                     with contextlib.suppress(BaseException):
                         await verify_task
