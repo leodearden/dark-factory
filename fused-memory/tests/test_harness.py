@@ -3545,6 +3545,110 @@ async def test_recover_stale_runs_suppresses_escalation_for_dead_owner_shielded(
     )
 
 
+# ── suppression-site storm integration test ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_emits_storm_escalation_for_dead_owner_shielded_burst(
+    journal, event_buffer, mock_memory_service,
+):
+    """_recover_stale_runs() must emit recon_watchdog_kill_storm when the
+    dead_owner_shielded suppression threshold is crossed (task 1755 / PRD β).
+
+    Scenario: threshold=1 (overridden via mutable pydantic config), single
+    dead_owner_shielded orphan.  After _recover_stale_runs():
+      - NO _escalate call with category 'recon_stale_run' (suppression kept)
+      - Exactly ONE _escalate call with category 'recon_watchdog_kill_storm'
+      - Storm call's summary contains: project_id, count, window hint, and
+        'watchdog SIGABRT churn'
+      - Run was still reaped (status=failed, error_type=StaleRunRecovery)
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    # Override threshold=1 via the mutable pydantic config so a single
+    # suppression trips the storm (mirrors the config mutation pattern used
+    # across the existing test suite, e.g. harness.config.stale_run_recovery_seconds).
+    harness.config.dead_owner_suppression_storm_threshold = 1
+
+    project_id = 'project-storm-test'
+    cutoff = harness.config.stale_run_recovery_seconds  # 1800s
+
+    run = ReconciliationRun(
+        id='run-storm-0001',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test-storm',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run)
+
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    # Backdate heartbeat_at past the cutoff → dead_owner_shielded
+    dead_heartbeat = (
+        datetime.now(UTC) - timedelta(seconds=cutoff + 100)
+    ).isoformat()
+    async with event_buffer._txn() as db:
+        await db.execute(
+            'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
+            (dead_heartbeat, project_id),
+        )
+
+    await harness._recover_stale_runs()
+
+    # Run must still have been reaped
+    after = await journal.get_run('run-storm-0001')
+    assert after is not None
+    assert after.status == RunStatus.failed, (
+        'dead_owner_shielded orphan must be reaped even when storm fires'
+    )
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+
+    all_calls = harness._escalate.call_args_list
+
+    # No per-event recon_stale_run escalation
+    stale_run_calls = [
+        c for c in all_calls
+        if (c.args[0] if c.args else c.kwargs.get('category')) == 'recon_stale_run'
+    ]
+    assert len(stale_run_calls) == 0, (
+        f'recon_stale_run must be suppressed for dead_owner_shielded; got {stale_run_calls}'
+    )
+
+    # Exactly one storm escalation
+    storm_calls = [
+        c for c in all_calls
+        if (c.args[0] if c.args else c.kwargs.get('category')) == 'recon_watchdog_kill_storm'
+    ]
+    assert len(storm_calls) == 1, (
+        f'Expected exactly one recon_watchdog_kill_storm call; got {storm_calls}'
+    )
+
+    # Check summary contents
+    storm_call = storm_calls[0]
+    summary = storm_call.args[2] if len(storm_call.args) >= 3 else storm_call.kwargs.get('summary', '')
+    assert project_id in summary, (
+        f'Storm summary must contain project_id {project_id!r}; got {summary!r}'
+    )
+    # count=1 or higher should appear
+    assert any(str(n) in summary for n in range(1, 10)), (
+        f'Storm summary must contain the count; got {summary!r}'
+    )
+    # Window hint (seconds or minutes)
+    assert any(hint in summary for hint in ('3600', '60 min', '60min', '1 hour', '1h')), (
+        f'Storm summary must mention the window; got {summary!r}'
+    )
+    assert 'watchdog SIGABRT churn' in summary, (
+        f'Storm summary must contain cause hint; got {summary!r}'
+    )
+
+
 # ── _record_dead_owner_suppression unit tests ─────────────────────────────────
 
 
