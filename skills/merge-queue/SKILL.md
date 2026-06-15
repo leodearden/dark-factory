@@ -97,7 +97,8 @@ Poll the train request with the same 15 s→60 s backoff until it reaches a term
 ```bash
 git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
 # If exit 0 (on main): treat as done/found_on_main — use done_provenance kind='found_on_main',
-#   commit=<landing sha from: git merge-base task/<TASK_ID> main OR git log --format=%H -1 main>
+#   commit=<landing sha: git log --format=%H -1 main>
+#   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
 # If exit 1 (not on main) AND queue is healthy: resubmit (go back to step 3).
 ```
 **Never fall back to a direct merge in response to `unknown`** — `unknown` means the server lost its record, NOT that the merge failed. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested.

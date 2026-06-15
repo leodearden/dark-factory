@@ -274,7 +274,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
   ```bash
   git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
   # exit 0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
-  #   commit=<sha from: git log --format=%H -1 main OR git merge-base task/<TASK_ID> main>
+  #   commit=<landing sha: git log --format=%H -1 main>
+  #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
   # exit 1 (not on main) AND queue healthy: loop back to step 7 (resubmit).
   ```
   **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed.
