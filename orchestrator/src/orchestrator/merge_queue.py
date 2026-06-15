@@ -7350,6 +7350,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if not req.result.done():
             req.result.set_result(outcome)
 
+    async def _abort_remote_verify(self, lease: Any, task_id: str) -> None:
+        """Fire remote cancel-verify while *_inflight_request_id* is still live.
+
+        Must be called BEFORE ``verify_task.cancel()`` in each abort branch.
+        The verify coroutine's finally clause (verify_runner.py:799) clears
+        ``_inflight_request_id`` when the coroutine is cancelled, which makes a
+        subsequent ``cancel_verify()`` a no-op (verify_runner.py:814).
+
+        Guards:
+        - No-op for local leases (LocalRunner has no ``cancel_verify`` method).
+        - Logs a warning on non-zero return code or unexpected exception so
+          orphaned remote verify-merge processes are visible in logs for
+          diagnosis, while never blocking the load-bearing abort return.
+        """
+        if not lease.is_local:
+            try:
+                rc = await lease.runner.cancel_verify()
+                if rc:
+                    logger.warning(
+                        'Task %s: remote cancel_verify returned rc=%d '
+                        '(remote verify-merge process may be orphaned)',
+                        task_id, rc,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    'Task %s: remote cancel_verify raised (remote verify-merge '
+                    'process may be orphaned): %s',
+                    task_id, exc,
+                )
+
     async def _run_inflight_verify(
         self,
         item: SpeculativeItem,
@@ -7463,9 +7493,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # DROP the request.  Checked first so a gave-up waiter wins
                 # over the operator-halt re-queue when both hold simultaneously.
                 if self._request_abandoned(req):
-                    if not lease.is_local:
-                        with contextlib.suppress(Exception):
-                            await lease.runner.cancel_verify()
+                    await self._abort_remote_verify(lease, req.task_id)
                     verify_task.cancel()
                     with contextlib.suppress(BaseException):
                         await verify_task
@@ -7484,9 +7512,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         'and re-queuing merge for re-verify after un-halt',
                         req.task_id,
                     )
-                    if not lease.is_local:
-                        with contextlib.suppress(Exception):
-                            await lease.runner.cancel_verify()
+                    await self._abort_remote_verify(lease, req.task_id)
                     verify_task.cancel()
                     with contextlib.suppress(BaseException):
                         await verify_task

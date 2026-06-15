@@ -3225,6 +3225,14 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
 
         lease = HostLease(name='rca-abandon', runner=gated, is_local=False)
 
+        # Wrap cancel_verify to signal when it fires so the test can wait
+        # deterministically rather than relying on a fixed timing sleep.
+        cancel_fired = asyncio.Event()
+        async def _signaling_cancel() -> int:
+            cancel_fired.set()
+            return 0
+        gated.cancel_verify = AsyncMock(side_effect=_signaling_cancel)
+
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
 
         # Wait for the gated runner to enter verify
@@ -3233,10 +3241,11 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         # Trigger sole-waiter abandon
         req.result.cancel()
 
-        # Give poll loop a chance to fire
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        # Wait until cancel_verify fires (observable signal replaces timing sleep)
+        await asyncio.wait_for(cancel_fired.wait(), timeout=2.0)
 
-        # Release gate so RED case doesn't hang
+        # Release gate (belt-and-suspenders; verify_task is already being
+        # cancelled by the abort branch but gate_release is harmless here)
         gate_release.set()
 
         result = await verify_future
@@ -3278,10 +3287,13 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         lease = HostLease(name='rca-halt', runner=gated, is_local=False)
 
         # Patch cancel_verify to record whether queue was empty at call time
+        # and to signal deterministically when the cancel fires.
         _queue_empty_at_cancel: list[bool] = []
+        cancel_fired = asyncio.Event()
 
         async def _record_cancel() -> int:
             _queue_empty_at_cancel.append(q.empty())
+            cancel_fired.set()
             return 0
 
         gated.cancel_verify = AsyncMock(side_effect=_record_cancel)
@@ -3292,7 +3304,8 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         # Trigger operator halt
         worker._operator_halt.set()
 
-        await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
+        # Wait until cancel_verify fires (observable signal replaces timing sleep)
+        await asyncio.wait_for(cancel_fired.wait(), timeout=2.0)
         gate_release.set()
 
         result = await verify_future
@@ -3360,12 +3373,14 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
             )
             await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
 
-            # Trigger abandon
+            # Trigger abandon.  The abort poll will cancel verify_task
+            # (propagating CancelledError into _gated_verify's gate wait),
+            # so verify_future completes with DROPPED without needing the
+            # gate to be released.  Await directly with a timeout instead
+            # of a fixed timing sleep.
             req.result.cancel()
-            await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
-            gate_release.set()
-
-            result = await verify_future
+            result = await asyncio.wait_for(verify_future, timeout=2.0)
+            gate_release.set()  # cleanup: no-op if already cancelled
 
         assert result.status == 'DROPPED'
 
