@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -24,6 +25,23 @@ from dashboard.config import DashboardConfig
 from dashboard.data.memory import _sessions, mcp_tool_call
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Per-project_root TTL cache for fetch_tasks
+# (mirrors app._load_task_cards / merge_queue.load_task_titles pattern)
+# ---------------------------------------------------------------------------
+
+# Within the PRD's recommended 15-30 s staleness window.  Slightly longer than
+# the 10 s caller caches (_TASK_CARDS_TTL_SECONDS / _TASK_TITLES_TTL_SECONDS)
+# because fetch_tasks is the dominant full-tree seam — a monitoring view
+# tolerates brief staleness; the inner TTL dominates net MCP cadence.
+_FETCH_TASKS_TTL_SECONDS = 20.0
+_fetch_tasks_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _fetch_tasks_cache_clear() -> None:
+    """Clear the per-project_root fetch_tasks TTL cache (test/admin hook)."""
+    _fetch_tasks_cache.clear()
 
 
 def _shape_task(task: dict) -> dict | None:
@@ -76,9 +94,20 @@ async def fetch_tasks(
 
     Returns a ``list[dict]`` on success, or an offline marker
     ``{'offline': True, 'error': str}`` if every configured server fails.
+
+    Results are cached per *project_root* for ``_FETCH_TASKS_TTL_SECONDS``
+    (~20 s) to avoid hammering the MCP server on every render.  All statuses
+    (including done tasks and their completed timestamps) are cached unchanged.
+    Offline/error markers are never cached so a transient failure does not pin
+    empty results for the TTL window.  Returns a shallow ``list()`` copy on
+    every call so callers cannot mutate the internally stored list.
     """
     errors: list[str] = []
     project_root_str = str(project_root)
+    now = time.monotonic()
+    cached = _fetch_tasks_cache.get(project_root_str)
+    if cached is not None:
+        return list(cached[1])
     for url in config.fused_memory_urls:
         try:
             result = await mcp_tool_call(
@@ -101,7 +130,8 @@ async def fetch_tasks(
             row = _shape_task(task)
             if row is not None:
                 shaped.append(row)
-        return shaped
+        _fetch_tasks_cache[project_root_str] = (now, shaped)
+        return list(shaped)
 
     return {'offline': True, 'error': '; '.join(errors)}
 
