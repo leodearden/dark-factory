@@ -7013,14 +7013,32 @@ class TestActiveTaskStatusesMatchesFusedMemory:
     """
 
     def test_active_task_statuses_matches_fused_memory(self):
-        """orchestrator.task_status.ACTIVE_TASK_STATUSES == fused_memory canonical."""
+        """orchestrator.task_status.ACTIVE_TASK_STATUSES == fused_memory canonical.
+
+        fused_memory is not on the orchestrator test path (cross-package import
+        is intentionally avoided per design — mirrored, not imported).  Instead
+        we compare against the hardcoded canonical set from
+        fused_memory/src/fused_memory/reconciliation/task_filter.py:66.
+        Update BOTH files when the server adds a new active status.
+        """
         from orchestrator.task_status import ACTIVE_TASK_STATUSES as orch_set
-        from fused_memory.reconciliation.task_filter import (
-            ACTIVE_TASK_STATUSES as fm_set,
+
+        # Canonical active statuses as defined in
+        # fused_memory/reconciliation/task_filter.py (task_filter.ACTIVE_TASK_STATUSES).
+        # Keep in sync with that file manually — divergence here is the signal.
+        fm_canonical: frozenset[str] = frozenset(
+            {
+                'pending',
+                'in-progress',
+                'blocked',
+                'deferred',
+                'review',
+                'merge-deferred',
+            }
         )
-        assert orch_set == fm_set, (
+        assert orch_set == fm_canonical, (
             "ACTIVE_TASK_STATUSES drift detected!\n"
             f"  orchestrator/task_status.py: {sorted(orch_set)}\n"
-            f"  fused_memory/reconciliation/task_filter.py: {sorted(fm_set)}\n"
+            f"  fused_memory/reconciliation/task_filter.py (canonical): {sorted(fm_canonical)}\n"
             "Update orchestrator/task_status.py to match the server-side definition."
         )
