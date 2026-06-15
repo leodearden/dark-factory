@@ -19,6 +19,7 @@ See: task 1448 (Protect merge-queue halt owner registration from workflow cancel
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -28,7 +29,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.merge_queue import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
 class _FakeMergeWorker:
@@ -112,6 +113,44 @@ def workflow(
         briefing=FakeBriefing(),    # type: ignore[arg-type]
         mcp=FakeMcp(),              # type: ignore[arg-type]
         escalation_queue=queue,
+        escalation_event=escalation_event,
+        merge_worker=fake_worker,
+    )
+
+
+@pytest.fixture
+def workflow_no_esc(
+    tmp_path: Path,
+    fake_worker: _FakeMergeWorker,
+    mock_orch_config: MagicMock,
+) -> TaskWorkflow:
+    """Same as workflow but with escalation_queue=None (config-absent deployment).
+
+    Mirrors test_workflow_train_halt_owner.workflow_no_esc for the single-task
+    handler paths.
+    """
+    assignment = TaskAssignment(
+        task_id='1765-noesc',
+        task={
+            'id': '1765-noesc',
+            'title': 'Single-task tip — no escalation queue',
+            'description': 'Degrade gracefully when esc_queue=None',
+            'status': 'in-progress',
+            'metadata': {},
+            'dependencies': [],
+        },
+        modules=[],
+    )
+    git_ops = MagicMock()
+    escalation_event = asyncio.Event()
+    return TaskWorkflow(
+        assignment=assignment,
+        config=mock_orch_config,
+        git_ops=git_ops,
+        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        briefing=FakeBriefing(),    # type: ignore[arg-type]
+        mcp=FakeMcp(),              # type: ignore[arg-type]
+        escalation_queue=None,
         escalation_event=escalation_event,
         merge_worker=fake_worker,
     )
@@ -544,4 +583,93 @@ async def test_submit_failure_does_not_release_foreign_owned_halt(
     # (c) Unhalt must NOT have fired.
     assert fake_worker.last_unhalt_reason is None, (
         'last_unhalt_reason must be None — guard was a no-op for foreign-owned halt'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 1765 (fold-in): orphan-halt warning when escalation_queue=None
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('handler_id,expected_outcome', [
+    ('wip_conflict', WorkflowOutcome.REQUEUED),
+    ('wip_recovery', WorkflowOutcome.DONE),
+    ('wip_recovery_no_advance', WorkflowOutcome.BLOCKED),
+    ('unmerged_state', WorkflowOutcome.BLOCKED),
+], ids=['wip_conflict', 'wip_recovery', 'wip_recovery_no_advance', 'unmerged_state'])
+async def test_handler_warns_on_orphan_halt_when_no_escalation_queue(
+    handler_id: str,
+    expected_outcome: WorkflowOutcome,
+    workflow_no_esc: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each of the four single-task handlers logs a distinct orphan-halt WARNING
+    when escalation_queue=None and the merger pre-engaged the halt.
+
+    The train path's ``_escalate_train_halt`` already logs this diagnostic
+    (workflow.py:5752-5758). The four single-task handlers currently have
+    ``if self.escalation_queue:`` with NO else, so a merger-engaged halt is
+    left ownerless and silent when escalation_queue=None.
+
+    Must FAIL today (pre-fix): no ``else:`` branch in the four handlers.
+
+    After step-4 impl, each handler emits a WARNING containing both:
+      - 'orphan halt'  (distinguishes from the pre-existing 'creating level-1
+                        escalation' warning each handler already emits before the if)
+      - 'unhalt_merge_queue'
+    Control flow is unchanged: each handler still returns its existing outcome.
+    """
+    assert workflow_no_esc.escalation_queue is None
+
+    # Pre-engage the merger halt (ownerless — mirrors _map_advance_failure precondition).
+    fake_worker.halt_for_wip('wip_overlap')
+    assert fake_worker.is_wip_halted
+    assert fake_worker.halt_owner_esc_id is None
+
+    with caplog.at_level(logging.WARNING):
+        if handler_id == 'wip_conflict':
+            outcome = await workflow_no_esc._handle_wip_conflict(
+                MergeOutcome(status='wip_halted', overlap_files=['x.py']),
+                'task/1765',
+            )
+        elif handler_id == 'wip_recovery':
+            outcome = await workflow_no_esc._handle_wip_recovery(
+                MergeOutcome(
+                    status='done_wip_recovery',
+                    recovery_branch='wip/r',
+                    merge_sha='deadbeef',
+                ),
+            )
+        elif handler_id == 'wip_recovery_no_advance':
+            outcome = await workflow_no_esc._handle_wip_recovery_no_advance(
+                MergeOutcome(
+                    status='wip_recovery_no_advance',
+                    recovery_branch='wip/r',
+                ),
+            )
+        else:  # unmerged_state
+            outcome = await workflow_no_esc._handle_unmerged_state(
+                MergeOutcome(status='unmerged_state'),
+                'task/1765',
+            )
+
+    # (a) A WARNING must be emitted containing the orphan-halt diagnostic tokens.
+    warning_messages = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ]
+    orphan_warnings = [
+        msg for msg in warning_messages
+        if 'orphan halt' in msg and 'unhalt_merge_queue' in msg
+    ]
+    assert orphan_warnings, (
+        f'handler {handler_id!r}: expected a WARNING containing both '
+        f'"orphan halt" and "unhalt_merge_queue", '
+        f'but got: {warning_messages!r}'
+    )
+
+    # (b) Control flow unchanged — returns the expected outcome.
+    assert outcome == expected_outcome, (
+        f'handler {handler_id!r}: expected {expected_outcome!r}, got {outcome!r}'
     )
