@@ -68,6 +68,7 @@ class TestModuleLevelAll:
             'classify_agent_failure',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
+            'is_zero_output_timeout',
         }
 
     def test_usage_gate_all(self):
