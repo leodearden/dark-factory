@@ -1882,9 +1882,9 @@ class HostAllocator:
         For a local lease only the slot is freed — local is the trust anchor
         and is never added to the shared quarantine set.
 
-        Note: wired into production by task 1762.  Called at
-        merge_queue.py:7717 on the RUNNER_UNAVAILABLE path — quarantine the
-        unhealthy remote host and free its lease before re-merge.  It is
+        Note: wired into production by task 1762.  Called in
+        ``_finalize_inflight()`` on the RUNNER_UNAVAILABLE path — quarantine
+        the unhealthy remote host and free its lease before re-merge.  It is
         exercised by :class:`TestHostAllocatorQuarantine` unit tests.
         """
         if not lease.is_local:
@@ -1919,11 +1919,11 @@ class HostAllocator:
         max_attempts: maximum number of probe polls before giving up (slot stays
                       PARKED on exhaustion).
 
-        Note: wired into production by tasks 1757 & 1762.  Called at
-        merge_queue.py:5748 (shutdown drain of ``_inflight`` in-flight
-        entries), :7034 (_verifier_loop head-failure cascade / operator-halt
-        REQUEUED abandon path), and :7964 (finalize-head ``finally``
-        cancel-release path).  It is exercised by
+        Note: wired into production by tasks 1757 & 1762.  Called in
+        ``stop()`` (shutdown drain of ``_inflight`` in-flight entries), in
+        ``_verifier_loop()`` (head-failure cascade / operator-halt REQUEUED
+        abandon path), and in ``_finalize_inflight()`` (finalize-head
+        ``finally`` cancel-release path).  It is exercised by
         :class:`TestHostAllocatorCancelRelease` and
         :class:`TestHostAllocatorCancelFail` unit tests.
         """
