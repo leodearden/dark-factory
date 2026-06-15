@@ -6870,3 +6870,60 @@ class TestAcquireNextFetchesActiveOnly:
         assert set(call_kwargs['statuses']) == ACTIVE_TASK_STATUSES, (
             f"Expected statuses {ACTIVE_TASK_STATUSES}, got {set(call_kwargs['statuses'])}"
         )
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: correctness crux — done dep absent from active fetch still satisfies
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextDepBackfillFromGetStatuses:
+    """A task whose dep is DONE (absent from active get_tasks) still dispatches.
+
+    Active-only fetch drops terminal tasks from the result. acquire_next must
+    backfill their status via get_statuses so _deps_satisfied can resolve them.
+
+    Fails today: acquire_next derives status_map only from [B], so dep A
+    resolves to 'unknown' → B is blocked → acquire_next returns None, and
+    get_statuses is never called.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_done_dep_absent_from_active_fetch_still_dispatches(
+        self, scheduler: Scheduler
+    ):
+        """Task B dispatches even when its dep A is absent from the active get_tasks result."""
+        # A is done and excluded by the active filter.
+        task_b = {
+            'id': 'B',
+            'title': 'Task B — depends on A',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['backend/module_b']},
+        }
+        # get_tasks returns only B (A is terminal → excluded by active filter).
+        scheduler.get_tasks = AsyncMock(return_value=[task_b])
+        # get_statuses is called to backfill the missing dep A → returns done.
+        scheduler.get_statuses = AsyncMock(return_value=({'A': 'done'}, None))
+
+        result = await scheduler.acquire_next()
+
+        # B should have been dispatched.
+        assert result is not None, (
+            'Expected task B to be dispatched when its done dep A is backfilled '
+            'from get_statuses, but acquire_next returned None'
+        )
+        assert result.task_id == 'B'
+
+        # get_statuses must have been called with dep A to resolve the missing status.
+        scheduler.get_statuses.assert_awaited()
+        call_kwargs = scheduler.get_statuses.call_args.kwargs
+        ids_called = call_kwargs.get('ids', scheduler.get_statuses.call_args[0][0] if scheduler.get_statuses.call_args[0] else [])
+        assert 'A' in ids_called, (
+            f"Expected get_statuses to be called with 'A' in ids, "
+            f"but got ids={ids_called}"
+        )
