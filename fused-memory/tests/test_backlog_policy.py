@@ -529,6 +529,7 @@ class TestBacklogPolicyPerProjectOverride:
         assert verdict.threshold == 20, (
             f'verdict.threshold should be override 20, got {verdict.threshold}'
         )
+        assert verdict.escalation_path is not None
         body = json.loads(Path(verdict.escalation_path).read_text())
         assert body['threshold'] == 20, (
             f"escalation JSON threshold should be override 20, got {body['threshold']}"

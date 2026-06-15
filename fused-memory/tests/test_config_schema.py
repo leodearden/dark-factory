@@ -672,4 +672,4 @@ class TestReconciliationConfigBacklogHardLimitOverrides:
 
     def test_non_int_value_rejected(self):
         with pytest.raises(ValidationError):
-            ReconciliationConfig(backlog_hard_limit_overrides={'reify': 'not-an-int'})
+            ReconciliationConfig(backlog_hard_limit_overrides={'reify': 'not-an-int'})  # type: ignore[arg-type]
