@@ -545,6 +545,63 @@ class SqliteTaskBackend:
             out['id'] = int(out['id'])
         return out
 
+    async def get_statuses_raw(
+        self,
+        project_root: str,
+        tag: str | None = None,
+        ids: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Return ``{id_str: status_str}`` for tasks, reading ONLY ``id`` and ``status``.
+
+        This is the O(K) status-only path — it never calls
+        ``_get_tasks_internal``, ``_row_to_task``, or ``json.loads``,
+        so metadata columns are never decoded.
+
+        Args:
+            project_root: Absolute path to the project root.
+            tag: Tag context; defaults to ``DEFAULT_TAG`` when ``None``.
+            ids: When given, only return entries for these task ids (as strings;
+                 cast to int for the SQL IN clause; non-numeric ids silently
+                 omitted).  ``None`` returns all tasks.  ``[]`` returns ``{}``.
+
+        Returns:
+            ``{str(id): status}`` mapping.  Unknown ids are silently omitted.
+            A ``NULL`` status (defensive; unreachable via normal writes) maps to
+            ``'unknown'``.
+        """
+        # ensure_connected is idempotent; the double-call here (interceptor's
+        # _ensure_taskmaster also calls it) is harmless and keeps the backend
+        # safely callable in isolation without relying on the caller to connect first.
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        conn = await self._get_connection(project_root)
+
+        if ids is not None:
+            if not ids:
+                return {}
+            int_ids: list[int] = []
+            for raw_id in ids:
+                with contextlib.suppress(ValueError, TypeError):
+                    int_ids.append(int(raw_id))
+            if not int_ids:
+                return {}
+            placeholders = ','.join('?' * len(int_ids))
+            cursor = await conn.execute(
+                f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})',
+                (tag, *int_ids),
+            )
+        else:
+            cursor = await conn.execute(
+                'SELECT id, status FROM tasks WHERE tag = ?',
+                (tag,),
+            )
+
+        rows = await cursor.fetchall()
+        return {
+            str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
+            for row in rows
+        }
+
     async def set_task_status(
         self,
         task_id: str,
