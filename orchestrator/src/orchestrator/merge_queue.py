@@ -2424,8 +2424,11 @@ class InFlightMergeRegistry:
         *branch* was already in-flight (caller should coalesce).
 
         On success, registers a ``done_callback`` on *future* so that
-        ``_release(branch)`` fires automatically on every terminal path
-        (result set, exception set, or cancellation).
+        ``_release_if_current(branch, entry)`` fires automatically on every
+        terminal path (result set, exception set, or cancellation).  The
+        identity guard ensures that a late callback from a cancelled stale
+        future does NOT clobber a subsequently re-acquired slot for the same
+        branch (see ``_release_if_current`` for details).
 
         *request_id* is the stable per-instance identity of the dispatched
         :class:`MergeRequest` (e.g. ``'mr-a1b2c3d4'``).  Stored on the
@@ -2462,7 +2465,7 @@ class InFlightMergeRegistry:
             submitted_tip=submitted_tip,
         )]
         self._slots[branch] = entry
-        future.add_done_callback(lambda _: self._release(branch))
+        future.add_done_callback(lambda _: self._release_if_current(branch, entry))
         return True
 
     def is_inflight(self, branch: str) -> bool:
@@ -2629,10 +2632,35 @@ class InFlightMergeRegistry:
                 entry.waiters.clear()
         self._slots.pop(branch, None)
 
-    # Keep the private alias so existing done_callbacks installed by acquire()
-    # continue to fire correctly without any change to those lambda closures.
-    # The alias calls with the default detach_waiters=False so NORMAL terminal
-    # resolution still fans the outcome to attached waiters via _mirror.
+    def _release_if_current(self, branch: str, entry: '_InFlightEntry') -> None:
+        """Identity-aware acquire-time done-callback.
+
+        Pops *branch* from ``_slots`` only when the stored entry is still
+        *entry* (object-identity check via ``is``).
+
+        **Why identity matters.**  ``Future.cancel()`` / ``Future.set_result()``
+        schedule done-callbacks via ``loop.call_soon``, so they run on a LATER
+        event-loop turn — not synchronously.  The stale-reap path in
+        :func:`coalesce_or_enqueue_merge_request` calls
+        ``release(branch, detach_waiters=True)``, which cancels the stale
+        primary future and immediately re-acquires the slot for the same branch
+        with a fresh request.  A branch-keyed ``_release(branch)`` would then
+        pop the FRESH entry on the next loop turn, leaving the branch with no
+        registry slot for the rest of the freshly-dispatched merge — so a
+        concurrent :func:`merge_request` would not coalesce and would
+        double-dispatch, the exact failure the registry exists to prevent.
+
+        The identity guard makes the late callback a no-op once the slot has
+        moved on (``self._slots.get(branch)`` returns the FRESH entry, not
+        *entry*).  On the NORMAL terminal-resolution path the slot still IS the
+        entry, so it pops exactly as before.
+        """
+        if self._slots.get(branch) is entry:
+            self._slots.pop(branch, None)
+
+    # Keep the private alias so callers that hold a reference to ``_release``
+    # continue to work, and for the legacy path.  The acquire-time done-callback
+    # now uses ``_release_if_current(branch, entry)`` instead (identity-aware).
     _release = release
 
 
