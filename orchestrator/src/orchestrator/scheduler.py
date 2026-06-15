@@ -1070,6 +1070,24 @@ class Scheduler:
         task['metadata'] = {}
 
     @staticmethod
+    def carries_substrate_probe(task: dict) -> bool:
+        """Return True iff *task* carries a non-empty ``substrate_probe`` descriptor.
+
+        This is the single source of truth the harness uses to decide whether
+        to run the dispatch-time substrate re-check gate (D4).  Delegates to
+        ``substrate_gate.extract_probe_set`` so the descriptor-extraction
+        logic lives in one place.
+
+        Lazy import keeps substrate_gate dependency-light and avoids import
+        cycles (substrate_gate imports nothing from orchestrator).
+        """
+        # Lazy import — substrate_gate is stdlib-only; deferred to avoid
+        # loading it at scheduler import time (mirrors b3_gate lazy-import
+        # of orchestrator.config at resolution time).
+        from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
+        return extract_probe_set(task) is not None
+
+    @staticmethod
     def _parse_tool_text_result(result: dict, key: str) -> Any:
         """Parse a text-content MCP result block and return ``inner[key]``.
 
