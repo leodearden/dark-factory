@@ -9876,6 +9876,66 @@ class TestInFlightMergeRegistryReleaseDetach:
         # via the _mirror callbacks that run after _release.
         assert f1.cancelled() is False
 
+    async def test_stale_late_callback_does_not_clobber_reacquired_slot(self):
+        """(d) 1756 step-7 RED: stale future's LATE done-callback must not clobber a re-acquired slot.
+
+        Sequence:
+          1. acquire('B', ..., f_dead)  → registers done-callback lambda _: _release('B')
+          2. release('B', detach_waiters=True) → cancels f_dead (schedules its
+             done-callback via loop.call_soon — it runs on the NEXT loop turn, NOT now)
+          3. acquire('B', ..., f_fresh)  → fresh slot
+          4. await asyncio.sleep(0)  → the dead future's late callback fires;
+             with branch-keyed _release(branch) it unconditionally pops by branch
+             and clobbers the fresh entry (registry slot becomes None — RED failure).
+             With identity-aware _release_if_current(branch, entry) the late callback
+             is a no-op (slot is now the fresh entry, not the dead one) — GREEN.
+        """
+        registry = InFlightMergeRegistry()
+        f_dead = self._make_future()
+        f_fresh = self._make_future()
+
+        # Step 1: acquire the dead slot.
+        registry.acquire('B', 'task-dead', f_dead, request_id='mr-dead')
+        # Step 2: stale-reap — cancels f_dead, schedules its done-callback for next turn.
+        registry.release('B', detach_waiters=True)
+        # Step 3: immediately re-acquire the same branch.
+        registry.acquire('B', 'task-fresh', f_fresh, request_id='mr-fresh')
+
+        # Synchronous check: fresh slot is present.
+        assert registry.entry('B') is not None
+        assert registry.entry('B').request_id == 'mr-fresh'  # type: ignore[union-attr]
+
+        # Step 4: one loop turn — the dead future's scheduled done-callback runs.
+        await asyncio.sleep(0)
+
+        # Fresh slot must have survived the late callback.
+        assert registry.entry('B') is not None, (
+            'fresh slot was clobbered by stale future late done-callback'
+        )
+        assert registry.entry('B').request_id == 'mr-fresh'  # type: ignore[union-attr]
+        assert registry.is_inflight('B') is True
+
+        f_fresh.cancel()  # clean up
+
+    async def test_normal_resolution_still_releases_slot(self):
+        """(e) 1756 step-7: identity-aware callback must STILL release on normal resolution.
+
+        No-regression guard: when the primary future resolves normally (the slot IS
+        the original entry), the done-callback must still pop the slot so the branch
+        becomes free.  This must be GREEN both before and after step-8's fix.
+        """
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+
+        # Normal terminal resolution: set result on the primary.
+        f1.set_result(MergeOutcome('done'))
+        await asyncio.sleep(0)  # let the done-callback fire
+
+        assert registry.is_inflight('B') is False, (
+            'slot must be released after normal terminal resolution'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueue — registry-only path (git_ops=None)
@@ -10283,6 +10343,59 @@ class TestCoalesceSnapshotReconcile:
         )
 
         fut.cancel()  # clean up
+
+    async def test_stale_reap_fresh_slot_survives_loop_turn(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(g) 1756 step-7 RED: after stale-reap + re-acquire via coalesce gate, fresh slot
+        survives one loop turn so a concurrent merge_request still coalesces correctly.
+
+        Sequence inside coalesce_or_enqueue_merge_request with an empty snapshot:
+          1. Detect stale slot (mr-dead absent from snapshot).
+          2. release('B', detach_waiters=True) → cancels stale_fut, schedules its
+             done-callback via loop.call_soon (fires on the NEXT loop turn).
+          3. acquire('B', ..., req.result) → fresh slot (mr-fresh).
+          Returns: dispatched=True.
+        Then await asyncio.sleep(0) — stale_fut's late callback fires.
+          With branch-keyed _release(branch): clobbers the fresh slot → entry is None
+          → a concurrent merge_request would NOT coalesce → double-dispatch (RED).
+          With identity-aware _release_if_current: late callback is a no-op → GREEN.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        stale_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', stale_fut, request_id='mr-dead')
+
+        def snap() -> dict:
+            return {'entries': [], 'depth': 0}
+
+        req = _make_request('B', 'B', tmp_path, config)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=snap,
+        )
+
+        assert result.dispatched is True
+        entry = registry.entry('B')
+        assert entry is not None
+        fresh_rid = entry.request_id
+        assert fresh_rid != 'mr-dead'
+
+        # Let the event loop run one turn so stale_fut's done-callback fires.
+        await asyncio.sleep(0)
+
+        # Fresh slot must survive the stale future's late callback.
+        assert registry.entry('B') is not None, (
+            'fresh slot was clobbered by stale future late done-callback '
+            '(would cause double-dispatch on concurrent merge_request for same branch)'
+        )
+        assert registry.entry('B').request_id == fresh_rid  # type: ignore[union-attr]
+        assert registry.is_inflight('B') is True
+
+        # Clean up the fresh future so it doesn't leak across tests.
+        if not req.result.done():
+            req.result.cancel()
 
 
 # ---------------------------------------------------------------------------
