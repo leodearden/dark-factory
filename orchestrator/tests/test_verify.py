@@ -3185,6 +3185,41 @@ class TestPruneArchive:
         assert not old.exists(), 'Old log file should be deleted'
         assert sub.exists(), 'Sub-directory should remain'
 
+    # (e) *.json files are pruned alongside *.log files (amendment: resource_cleanup)
+    def test_old_json_deleted_fresh_kept(self, tmp_path: Path):
+        """Old *.json summary files are pruned just like *.log files."""
+        import os
+        import time
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        old_json = archive_root / 'attempt-1.summary-20260101T000000_000000Z.json'
+        fresh_log = archive_root / 'attempt-2.test-20260615T120000_000000Z.log'
+        old_json.write_text('{}')
+        fresh_log.write_text('output')
+        old_mtime = time.time() - 31 * 86_400
+        os.utime(old_json, (old_mtime, old_mtime))
+        self._prune(archive_root, max_age_days=30)
+        assert not old_json.exists(), 'Old .json file should have been deleted'
+        assert fresh_log.exists(), 'Fresh .log file should remain'
+
+    def test_json_counted_toward_size_budget(self, tmp_path: Path):
+        """*.json files count toward size budget and are deleted when over cap."""
+        import os
+        import time
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        t = time.time() - 60
+        # Two 60-byte JSON files; cap at 100 bytes → oldest must be deleted
+        older = archive_root / 'attempt-1.summary-old.json'
+        newer = archive_root / 'attempt-2.summary-new.json'
+        older.write_text('x' * 60)
+        newer.write_text('x' * 60)
+        os.utime(older, (t, t))
+        os.utime(newer, (t + 10, t + 10))
+        self._prune(archive_root, max_age_days=365, max_total_bytes=100)
+        assert not older.exists(), 'Oldest .json file should be deleted to satisfy cap'
+        assert newer.exists(), 'Newer .json file should remain'
+
 
 @pytest.mark.asyncio
 class TestRunVerificationPersistence:

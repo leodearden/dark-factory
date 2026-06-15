@@ -671,7 +671,10 @@ def _archive_merge_verify_logs(
     else:
         infix = ''
 
-    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
+    # Use microsecond precision so rapid back-to-back merge-verify retries for
+    # the same task (same attempt_id=1 default, same second) never overwrite each
+    # other.  The format is still lexicographically sortable.
+    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
     archived: list[Path] = []
 
     # Write per-command log files directly to the archive.
@@ -741,10 +744,16 @@ def _prune_archive(
     now = time.time()
     cutoff = now - max_age_days * 86_400
 
-    # Single rglob walk — collect all log files once, avoiding a second
-    # directory scan for the size-cap pass.
+    # Single rglob walk — collect all archivable files once, avoiding a second
+    # directory scan for the size-cap pass.  Both *.log and *.json are counted
+    # because _archive_merge_verify_logs emits summary.json files into the same
+    # tree and they would otherwise accumulate unbounded (never counted toward the
+    # size budget, never pruned).
+    _PRUNE_SUFFIXES = frozenset(('.log', '.json'))
     all_entries: list[tuple[Path, float, int]] = []
-    for path in archive_root.rglob('*.log'):
+    for path in archive_root.rglob('*'):
+        if path.suffix not in _PRUNE_SUFFIXES:
+            continue
         try:
             st = path.stat()
             if not path.is_file():
