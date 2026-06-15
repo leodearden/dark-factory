@@ -2778,6 +2778,32 @@ Output JSON matching the schema. Every task must appear in the output.
                     )
                 steward_factory = _make_steward
 
+            # ── D4 substrate gate ────────────────────────────────────────────
+            # Re-run the committed probe set against current main BEFORE
+            # spinning up the agent.  A PASS→FAIL flip (e.g. a sibling deleted
+            # Type::Real between author and dispatch) blocks dispatch +
+            # escalates rather than wasting an agent spin-up and an L2.
+            #
+            # The gate runs here — after the slot's initialization bookkeeping
+            # but BEFORE TaskWorkflow construction (which spins up the agent).
+            # Non-probe tasks (no substrate_probe descriptor) skip the gate
+            # entirely so existing dispatch performance is unaffected.
+            if self.scheduler.carries_substrate_probe(assignment.task):
+                if not await self._run_substrate_gate(assignment):
+                    # FLIP detected: task is already blocked + escalated inside
+                    # the gate.  Return a BLOCKED report so the caller (and
+                    # reconciliation) can observe the outcome; arm the requeue
+                    # cooldown so the task is not immediately re-dispatched
+                    # before the blocked-status propagation window closes.
+                    arm_requeue_cooldown = True
+                    return TaskReport(
+                        task_id=assignment.task_id,
+                        title=assignment.task.get('title', ''),
+                        outcome=WorkflowOutcome.BLOCKED,
+                        block_reason='substrate_flip',
+                    )
+            # ────────────────────────────────────────────────────────────────
+
             workflow = TaskWorkflow(
                 assignment=assignment,
                 config=self.config,
