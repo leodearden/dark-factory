@@ -2370,6 +2370,13 @@ class TerminalOutcomeRetention:
     a secondary-index entry that is now owned by a newer live record (see
     ``record()`` docstring).
 
+    A fourth ``_aliases`` dict maps coalesced/absorbed request_ids to the
+    primary request_id whose terminal record they should resolve to.  Aliases
+    resolve lazily through ``_index``; a dangling alias (primary evicted or
+    not-yet-recorded) returns None — matching the ring's existing lossless
+    eviction contract.  Aliases are not actively evicted (see ``record_alias()``
+    docstring).
+
     The event store is the durable tier so eviction is lossless — α3's
     merge_status falls through to event-store queries for evicted ids.
     """
@@ -2379,6 +2386,7 @@ class TerminalOutcomeRetention:
         self._index: dict[str, TerminalOutcomeRecord] = {}
         self._by_branch: dict[str, TerminalOutcomeRecord] = {}
         self._by_task: dict[str, TerminalOutcomeRecord] = {}
+        self._aliases: dict[str, str] = {}  # alias request_id → primary request_id
 
     def record(self, rec: TerminalOutcomeRecord) -> None:
         """Append *rec* to the ring, evicting the oldest entry from all indexes if full.
@@ -2409,8 +2417,35 @@ class TerminalOutcomeRetention:
         self._by_task[rec.task_id] = rec
 
     def get(self, request_id: str) -> TerminalOutcomeRecord | None:
-        """Return the record for *request_id*, or None if evicted / not yet recorded."""
-        return self._index.get(request_id)
+        """Return the record for *request_id*, or None if evicted / not yet recorded.
+
+        When *request_id* is not in ``_index``, falls back to alias resolution:
+        ``_aliases[request_id]`` → ``_index[primary]``.  A direct ``_index`` hit
+        always takes precedence over an alias for the same id.  A dangling alias
+        (primary evicted or not-yet-recorded) returns None — lossless fall-through.
+        """
+        rec = self._index.get(request_id)
+        if rec is not None:
+            return rec
+        primary = self._aliases.get(request_id)
+        if primary is not None:
+            return self._index.get(primary)
+        return None
+
+    def record_alias(self, alias_id: str, primary_request_id: str) -> None:
+        """Register *alias_id* as an alias for *primary_request_id*.
+
+        Aliases resolve lazily through ``_index`` in ``get()``, so the primary
+        record need not be recorded before the alias is registered — useful when
+        a coalesced request_id is registered at coalesce time before the primary
+        finalises.  Dangling aliases (primary evicted or never recorded) return
+        None, matching the ring's lossless eviction contract.
+
+        Aliases are not actively evicted — they accumulate until the ring object
+        is discarded.  This is intentional for the β era; γ3 can add pruning if
+        needed once live retention threading is wired.
+        """
+        self._aliases[alias_id] = primary_request_id
 
     def get_by_branch(self, branch: str) -> TerminalOutcomeRecord | None:
         """Return the most-recently recorded record for *branch*, or None if unknown."""
