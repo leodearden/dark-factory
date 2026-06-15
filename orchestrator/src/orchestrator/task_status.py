@@ -10,6 +10,22 @@ from __future__ import annotations
 
 TERMINAL_STATUSES: frozenset[str] = frozenset({'done', 'cancelled'})
 
+# Non-terminal (active) statuses — the complement of TERMINAL_STATUSES.
+# Mirrors fused-memory's reconciliation/task_filter.py:66 definition; kept
+# here as a local constant to avoid a cross-package import.  Passed to
+# get_tasks(statuses=...) on the scheduler's hot paths (acquire_next,
+# _train_candidates, _build_train_state fallback) to shrink the payload.
+ACTIVE_TASK_STATUSES: frozenset[str] = frozenset(
+    {
+        'pending',
+        'in-progress',
+        'blocked',
+        'deferred',
+        'review',
+        'merge-deferred',
+    }
+)
+
 # Statuses the workflow must NOT overwrite after the steward has set them.
 # Superset of TERMINAL_STATUSES: also includes 'deferred', 'blocked', and
 # 'merge-deferred'. 'deferred' / 'blocked' signal "leave this alone, human
