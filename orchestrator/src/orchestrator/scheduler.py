@@ -30,7 +30,7 @@ from orchestrator.config import (
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.overrides import OverrideRow, OverrideStore
-from orchestrator.task_status import TERMINAL_STATUSES
+from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
 # task_skipped events for "effectively infinite" skip thresholds (>= this
 # value) are rate-limited to a geometric schedule so the event store is not
@@ -2404,7 +2404,7 @@ class Scheduler:
             )
             return None
 
-        tasks = await self.get_tasks()
+        tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES)
         if not tasks:
             return None
 
