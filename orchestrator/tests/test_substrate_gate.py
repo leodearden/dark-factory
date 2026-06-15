@@ -599,3 +599,138 @@ class TestBlockAndEscalateSubstrateFlip:
 
         # set_task_status is still called (blocking the task is unconditional)
         h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')
+
+
+# ---------------------------------------------------------------------------
+# Step-9 RED: dispatch-level wiring through _run_slot (PRD §10 two-way boundary)
+# ---------------------------------------------------------------------------
+
+
+def _make_slot_harness(tmp_path: Path):
+    """Build a Harness whose _run_slot can be called directly in tests.
+
+    Extends _make_harness with:
+    - scheduler.release = MagicMock (non-async, mirroring production)
+    - scheduler._dispatched = set()
+    - _run_id = None (so _apply_retry_cap fast-returns)
+    - event_store = None (so event emit branches are skipped)
+    """
+    h = _make_harness(tmp_path)
+    h.scheduler.release = MagicMock()
+    h.scheduler._dispatched = set()
+    h._run_id = None
+    h.event_store = None
+    return h
+
+
+def _make_mock_workflow():
+    """Return a minimal AsyncMock workflow whose run() is awaitable."""
+    from orchestrator.workflow import WorkflowOutcome
+    wf = AsyncMock()
+    wf.run = AsyncMock(return_value=WorkflowOutcome.DONE)
+    wf.metrics = MagicMock(
+        total_cost_usd=0.0,
+        total_duration_ms=0,
+        agent_invocations=0,
+        execute_iterations=0,
+        verify_attempts=0,
+        review_cycles=0,
+    )
+    wf._steward = None
+    wf._last_block_reason = None
+    wf._last_block_detail = None
+    wf._last_block_phase = None
+    return wf
+
+
+class TestRunSlotSubstrateGateWiring:
+    """PRD §10 two-way boundary: _run_slot wiring for the substrate gate.
+
+    Tests verify the gate integration in _run_slot BEFORE TaskWorkflow construction:
+    (a) FLIP → TaskWorkflow never constructed / workflow.run never awaited, cooldown armed.
+    (b) PASS → TaskWorkflow IS constructed and workflow.run IS awaited.
+    (c) NO-PROBE → gate never invoked (carries_substrate_probe=False), workflow proceeds.
+    """
+
+    @pytest.mark.asyncio
+    async def test_flip_blocks_workflow_construction(self, tmp_path: Path):
+        """(a) FLIP: TaskWorkflow must NOT be constructed when gate returns False."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(probe=True)
+        h.scheduler.carries_substrate_probe = MagicMock(return_value=True)
+        h._run_substrate_gate = AsyncMock(return_value=False)
+        # _block_and_escalate_substrate_flip is called inside _run_substrate_gate (already mocked);
+        # stub it here too so the gate-returning-False path is clean.
+        h._block_and_escalate_substrate_flip = AsyncMock()
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            MockWorkflow.return_value = _make_mock_workflow()
+            report = await h._run_slot(assignment, sem)
+
+        # (a1) TaskWorkflow must NOT have been constructed.
+        assert not MockWorkflow.called, (
+            'TaskWorkflow must NOT be constructed on a substrate flip — '
+            'agent must not spin up'
+        )
+
+        # (a2) _run_substrate_gate must have been awaited.
+        h._run_substrate_gate.assert_awaited_once()
+
+        # (a3) Scheduler.release must be called with requeued=True (cooldown armed).
+        h.scheduler.release.assert_called_once()
+        call_kwargs = h.scheduler.release.call_args
+        requeued = call_kwargs.kwargs.get('requeued', None)
+        assert requeued is True, (
+            f'scheduler.release must be called with requeued=True on flip; got {call_kwargs!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_allows_workflow_construction(self, tmp_path: Path):
+        """(b) PASS: TaskWorkflow MUST be constructed and workflow.run awaited."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(probe=True)
+        h.scheduler.carries_substrate_probe = MagicMock(return_value=True)
+        h._run_substrate_gate = AsyncMock(return_value=True)
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            mock_wf = _make_mock_workflow()
+            MockWorkflow.return_value = mock_wf
+            await h._run_slot(assignment, sem)
+
+        # (b1) TaskWorkflow must have been constructed.
+        assert MockWorkflow.called, 'TaskWorkflow must be constructed on PASS gate verdict'
+
+        # (b2) workflow.run must have been awaited.
+        mock_wf.run.assert_awaited_once()
+
+        # (b3) _run_substrate_gate must have been awaited.
+        h._run_substrate_gate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_probe_skips_gate(self, tmp_path: Path):
+        """(c) NO-PROBE: gate must NOT be invoked when carries_substrate_probe is False."""
+        h = _make_slot_harness(tmp_path)
+        assignment = _make_assignment(probe=False)
+        h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+        gate_mock = AsyncMock(return_value=True)
+        h._run_substrate_gate = gate_mock
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            mock_wf = _make_mock_workflow()
+            MockWorkflow.return_value = mock_wf
+            await h._run_slot(assignment, sem)
+
+        # (c1) _run_substrate_gate must NOT have been called.
+        gate_mock.assert_not_awaited()
+
+        # (c2) Workflow still runs (non-probe tasks unaffected).
+        mock_wf.run.assert_awaited_once()
