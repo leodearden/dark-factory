@@ -533,3 +533,91 @@ class TestOverBudgetDetail:
             assert 'pool_sizes=' in body
         finally:
             handle.close()
+
+
+# ----------------------------------------------------------------------
+# Restart-durable burst counter (step-11 RED / step-12 GREEN)
+# ----------------------------------------------------------------------
+
+
+class TestRestartDurableBurstCounter:
+    """Lever 2b — the burst counter survives a process restart via state_path.
+
+    When CuratorEscalator is constructed with a state_path, it persists
+    _failure_log to that file after each generic-path mutation.  A fresh
+    escalator constructed with the same path reloads the log so the "N of
+    3" count is correct even after a watchdog restart.
+
+    Wall-clock teeth: the persisted timestamps must be wall-clock
+    time.time() values (not monotonic uptime), so reloaded values remain
+    valid across restarts.
+    """
+
+    @pytest.mark.asyncio
+    async def test_burst_counter_survives_restart(self, tmp_path):
+        """Three report_failure calls split across a simulated restart must
+        read '3 of 3', not '1 of 3'.
+        """
+        import json
+        import time
+
+        state_path = tmp_path / 'curator_escalator_state.json'
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            # ── First "process": two failures ───────────────────────────────
+            escalator1 = CuratorEscalator(cooldown_secs=3600.0, state_path=state_path)
+            await escalator1.report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='budget exceeded (1)',
+                candidate_title='T',
+                subtype='error_max_budget_usd',
+            )
+            await escalator1.report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='budget exceeded (2)',
+                candidate_title='T',
+                subtype='error_max_budget_usd',
+            )
+
+            # State file must exist and contain timestamps ≈ wall-clock now.
+            assert state_path.exists(), 'state_path must be written after report_failure'
+            records = json.loads(state_path.read_text())
+            assert len(records) >= 1
+            # Find the record for our (project_id, subtype).
+            our_record = next(
+                (r for r in records
+                 if r['project_id'] == 'proj-x' and r['subtype'] == 'error_max_budget_usd'),
+                None,
+            )
+            assert our_record is not None, 'record not found in persisted state'
+            assert len(our_record['timestamps']) == 2
+            for ts in our_record['timestamps']:
+                assert abs(ts - time.time()) < 5, (
+                    f'persisted timestamp {ts} is not within 5s of time.time() — '
+                    f'check that wall-clock time.time() is used, not monotonic'
+                )
+
+            # ── Simulated restart: fresh escalator reloads the same file ────
+            escalator2 = CuratorEscalator(cooldown_secs=3600.0, state_path=state_path)
+            await escalator2.report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='budget exceeded (3)',
+                candidate_title='T',
+                subtype='error_max_budget_usd',
+            )
+
+            # The third call should count as 3 of 3, not 1 of 3.
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            # Find the newest file (third escalation).
+            assert len(files) == 3, (
+                f'Expected 3 escalation files (one per failure in-window), got {len(files)}'
+            )
+            newest_body = files[-1].read_text()
+            assert 'failures_in_window=3 of 3' in newest_body, (
+                f'Expected "3 of 3" after restart-reload; got:\n{newest_body}'
+            )
+        finally:
+            handle.close()
