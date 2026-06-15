@@ -346,3 +346,91 @@ class TestMergeStatusGitAuthority:
         assert result.get('state') == 'unknown', (
             f'No git_ops must yield unknown, got: {result}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Real-git integration test — the canonical 4352 lost-record shape end-to-end
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestMergeStatusGitAuthorityIntegration:
+    """End-to-end integration test using real git operations.
+
+    Exercises the canonical 4352 shape:
+        land branch to main → advance main → delete branch + worktree →
+        no ring/event-store record → merge_status must return done/found_on_main.
+
+    Real git subprocess is required to validate the find_merge_marker code
+    path that the SimpleNamespace stubs cannot exercise.
+    """
+
+    async def test_4352_lost_record_returns_done_found_on_main(
+        self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig
+    ) -> None:
+        """After merge+delete with no ring/event-store record, merge_status returns done.
+
+        Sequence:
+        1. Create worktree for task '770', commit a file.
+        2. merge_to_main → advance_main (branch lands on main).
+        3. cleanup_merge_worktree + cleanup_worktree (branch+worktree deleted).
+        4. Build server with NO event_store, stub_harness with real git_ops.
+        5. Call merge_status(task_id='770').
+        6. Assert: state='done', kind='found_on_main', merge_sha==result.merge_commit,
+           len(merge_sha)==40.
+        """
+        tid = '770'
+
+        # --- Step 1: create worktree and commit ---
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'{tid}.py').write_text(f'{tid} = True\n')
+        await git_ops.commit(wt_info.path, f'Add {tid}')
+
+        # --- Step 2: merge to main ---
+        merge_result = await git_ops.merge_to_main(wt_info.path, tid)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        adv = await git_ops.advance_main(merge_result.merge_commit)
+        assert adv == 'advanced'
+
+        expected_sha = merge_result.merge_commit
+
+        # --- Step 3: delete branch + worktree (4352 shape) ---
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        await git_ops.cleanup_worktree(wt_info.path, tid)
+
+        # Verify branch is gone (confirms the find_merge_marker path will fire)
+        rc, sha_out, _ = await _run(
+            ['git', 'rev-parse', '--verify', f'task/{tid}'],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, f'Branch should be gone (non-zero rc) but rc={rc}, sha={sha_out!r}'
+
+        # --- Step 4: server with NO event_store (ring/event-store miss) ---
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=None,
+            _terminal_retention=None,
+            git_ops=git_ops,
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue, harness=stub_harness, orch_config=orch_config)
+
+        # --- Step 5 & 6: call merge_status and assert ---
+        result = await _call_merge_status(server, task_id=tid)
+
+        assert result.get('state') == 'done', (
+            f'Expected done/found_on_main after 4352 shape, got: {result}'
+        )
+        assert result.get('kind') == 'found_on_main', (
+            f'Expected kind=found_on_main, got: {result}'
+        )
+        assert result.get('merge_sha') == expected_sha, (
+            f'Expected merge_sha={expected_sha!r}, got: {result.get("merge_sha")!r}'
+        )
+        assert len(result['merge_sha']) == 40, (
+            f'merge_sha must be a 40-char SHA, got: {result["merge_sha"]!r}'
+        )
