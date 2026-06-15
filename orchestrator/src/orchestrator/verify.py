@@ -427,6 +427,51 @@ def _should_archive_category(category: str) -> bool:
     return category.endswith('_error')
 
 
+def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> dict:
+    """Build the summary.json payload dict from a list of run dicts.
+
+    Extracted from ``_persist_attempt_logs`` so both the task-path summary
+    (written into ``<worktree>/.task/verify/``) and the merge-path summary
+    (written directly to the durable archive) share an identical shape.
+
+    Top-level rc/cmd/timed_out/started_at/duration_secs fields come from the
+    run with the highest numeric rc (timed_out used as a tiebreaker).  This
+    intentionally differs from the 'category' field, which uses _worst_category
+    priority semantics.  The rationale: rc is the most unambiguous exit-code
+    signal for the outermost process, while category conveys semantic severity
+    across tools that may use different rc scales.  Downstream readers should
+    treat top-level metadata as "the loudest raw exit code" and 'category' as
+    "the highest-severity classification".
+    """
+    active_runs = [r for r in runs if r.get('cmd') is not None]
+    if active_runs:
+        worst = max(active_runs, key=lambda r: (r['rc'], r['timed_out']))
+    else:
+        worst = {'rc': 0, 'timed_out': False, 'cmd': None,
+                 'started_at': '', 'duration_secs': 0.0}
+
+    return {
+        'category': category,
+        'cause_hint': cause_hint,
+        'rc': worst['rc'],
+        'timed_out': worst['timed_out'],
+        'cmd': worst['cmd'],
+        'started_at': worst['started_at'],
+        'duration_secs': worst['duration_secs'],
+        'commands': [
+            {
+                'label': r['label'],
+                'cmd': r['cmd'],
+                'rc': r['rc'],
+                'timed_out': r['timed_out'],
+                'started_at': r['started_at'],
+                'duration_secs': r['duration_secs'],
+            }
+            for r in active_runs
+        ],
+    }
+
+
 def _persist_attempt_logs(
     worktree: Path,
     attempt_id: int,
@@ -508,42 +553,8 @@ def _persist_attempt_logs(
         except OSError as exc:
             logger.warning('_persist_attempt_logs: could not write %s: %s', log_path, exc)
 
-    # Build summary.json.
-    # Top-level rc/cmd/timed_out/started_at/duration_secs fields come from the
-    # run with the highest numeric rc (timed_out used as a tiebreaker).  This
-    # intentionally differs from the 'category' field, which uses _worst_category
-    # priority semantics.  The rationale: rc is the most unambiguous exit-code
-    # signal for the outermost process, while category conveys semantic severity
-    # across tools that may use different rc scales.  Downstream readers should
-    # treat top-level metadata as "the loudest raw exit code" and 'category' as
-    # "the highest-severity classification".
-    active_runs = [r for r in runs if r.get('cmd') is not None]
-    if active_runs:
-        worst = max(active_runs, key=lambda r: (r['rc'], r['timed_out']))
-    else:
-        worst = {'rc': 0, 'timed_out': False, 'cmd': None,
-                 'started_at': '', 'duration_secs': 0.0}
-
-    summary_payload: dict = {
-        'category': category,
-        'cause_hint': cause_hint,
-        'rc': worst['rc'],
-        'timed_out': worst['timed_out'],
-        'cmd': worst['cmd'],
-        'started_at': worst['started_at'],
-        'duration_secs': worst['duration_secs'],
-        'commands': [
-            {
-                'label': r['label'],
-                'cmd': r['cmd'],
-                'rc': r['rc'],
-                'timed_out': r['timed_out'],
-                'started_at': r['started_at'],
-                'duration_secs': r['duration_secs'],
-            }
-            for r in active_runs
-        ],
-    }
+    # Build summary.json via the shared helper (same shape as merge-path summary).
+    summary_payload = _build_summary_payload(runs, category, cause_hint)
 
     summary_path = verify_dir / f'attempt-{attempt_id}{infix}.summary.json'
     try:
@@ -605,6 +616,90 @@ def _archive_attempt_log(
             archived.append(dest)
         except OSError as exc:
             logger.warning('_archive_attempt_log: could not copy %s → %s: %s', src, dest, exc)
+
+    return archived
+
+
+def _archive_merge_verify_logs(
+    runs: list[dict],
+    archive_root: 'Path | None',
+    task_id: str,
+    attempt_id: int,
+    category: str,
+    cause_hint: str,
+    *,
+    module_prefix: 'str | None' = None,
+) -> list[Path]:
+    """Write merge-verify run outputs + summary DIRECTLY to the durable archive.
+
+    Unlike ``_archive_attempt_log`` (which copies files from the worktree's
+    ``.task/verify/``), this function writes directly to
+    ``<archive_root>/<task_id>/`` because merge worktrees have ``.task/``
+    scrubbed by design (git_ops.py) and there are no intermediate worktree
+    log files to copy from.
+
+    Differences from the task-path helpers:
+    - **No deny-list check**: on the merge path there is no debugger loop;
+      every failure reaches a human.  ``infra_timeout`` and ``test_failure``
+      (the exact categories that distinguish timeout-vs-real-failure) are
+      archived unconditionally.
+    - **Direct-to-archive**: bypasses ``.task/verify/``; the archive is the
+      only persistence target that survives merge_wt cleanup.
+
+    Filename convention mirrors ``_archive_attempt_log``:
+        ``attempt-{N}[.{safe_prefix}].{label}-{utc_ts}.log``
+        ``attempt-{N}[.{safe_prefix}].summary-{utc_ts}.json``
+
+    Returns the list of paths actually written (both .log and .json).
+    Returns ``[]`` when ``archive_root`` is ``None``.
+    All filesystem errors are caught, logged, and swallowed (best-effort).
+    """
+    if archive_root is None:
+        return []
+
+    target_dir = archive_root / task_id
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning('_archive_merge_verify_logs: could not create %s: %s', target_dir, exc)
+        return []
+
+    # Sanitize module_prefix the same way as _persist_attempt_logs.
+    if module_prefix is not None:
+        safe_prefix = module_prefix.replace('/', '_').replace(' ', '_')
+        infix = f'.{safe_prefix}'
+    else:
+        infix = ''
+
+    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
+    archived: list[Path] = []
+
+    # Write per-command log files directly to the archive.
+    for run in runs:
+        if run.get('cmd') is None:
+            continue
+        log_path = target_dir / f'attempt-{attempt_id}{infix}.{run["label"]}-{utc_ts}.log'
+        try:
+            log_path.write_text(run.get('output', ''), encoding='utf-8')
+            archived.append(log_path)
+        except OSError as exc:
+            logger.warning(
+                '_archive_merge_verify_logs: could not write %s: %s', log_path, exc,
+            )
+
+    # Write summary.json using the shared payload builder.
+    summary_path = target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json'
+    try:
+        summary_payload = _build_summary_payload(runs, category, cause_hint)
+        summary_path.write_text(
+            json.dumps(summary_payload, indent=2, ensure_ascii=False),
+            encoding='utf-8',
+        )
+        archived.append(summary_path)
+    except OSError as exc:
+        logger.warning(
+            '_archive_merge_verify_logs: could not write %s: %s', summary_path, exc,
+        )
 
     return archived
 
