@@ -2709,6 +2709,21 @@ async def _maybe_auto_chain_generation(
     InFlightMergeRegistry and TerminalOutcomeRetention from the harness into the
     workers — harness.py:3238 omits both) belongs to γ3's ATTACH_AND_CHAIN scope
     and is the second precondition guarded by the kill-switch.
+
+    KNOWN RACE (accepted until γ3 slot-handoff lands):
+    :func:`_inflight_entry_is_stale` has a sub-tick window in this code path.
+    After gen-1's future resolves as ``'superseded'`` and gen_next is enqueued,
+    the registry slot still holds gen-1's request_id until the done-callback
+    ``_release`` fires (scheduled via ``call_soon``).  An inbound
+    ``merge_request`` arriving in that window sees a registry slot pointing at
+    gen-1's id (absent from the live snapshot, which now shows gen_next's id),
+    causing :func:`_inflight_entry_is_stale` to judge the slot stale and reap
+    it — dispatching a third concurrent request alongside *gen_next* (double
+    dispatch).  Resolving this requires γ3's ATTACH_AND_CHAIN to update the
+    registry entry's ``request_id`` to gen_next atomically with the enqueue,
+    so the slot always tracks the live generation.  While the kill-switch is
+    OFF (the production default) this code path is unreachable, so the race is
+    accepted.
     """
     if not merged_branch_tip:
         return None
@@ -3060,13 +3075,16 @@ def _inflight_entry_is_stale(
     None (legacy entries predating the request_id field) the match falls back
     to branch-name comparison.
 
-    Returns **False** (not stale → keep coalescing) in three cases:
+    Returns **False** (not stale → keep coalescing) in four cases:
 
     1. *live_snapshot* is None — no provider wired (back-compat default; all
        existing callers without a worker).
     2. ``live_snapshot()`` raises — transient error (fail-safe to coalesce;
        avoids double-dispatch storms on transient worker hiccups).
-    3. The entry's ``request_id`` IS present in the snapshot — slot is live.
+    3. The snapshot is not a dict or lacks the ``'entries'`` key — malformed
+       response (fail-safe to coalesce; mirrors case 2's philosophy: when the
+       snapshot cannot be trusted, assume live rather than risk a double-dispatch).
+    4. The entry's ``request_id`` IS present in the snapshot — slot is live.
     """
     if live_snapshot is None:
         return False
@@ -3074,7 +3092,9 @@ def _inflight_entry_is_stale(
         snap = live_snapshot()
     except Exception:
         return False  # fail-safe: transient error → not stale → coalesce
-    entries = snap.get('entries', [])
+    if not isinstance(snap, dict) or 'entries' not in snap:
+        return False  # malformed snapshot → fail-safe: not stale → coalesce
+    entries = snap['entries']
     rid = entry.request_id if entry is not None else None
     if rid is not None:
         return not any(e.get('request_id') == rid for e in entries)

@@ -10239,6 +10239,51 @@ class TestCoalesceSnapshotReconcile:
 
         fut.cancel()  # clean up
 
+    async def test_snapshot_malformed_trusts_registry(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(f) Malformed snapshot (missing 'entries' key or non-dict) → fail-safe → coalesce.
+
+        A snapshot that returns {} or a non-dict must NOT be treated as "empty queue"
+        (which would false-positive as stale and reap the slot).  The fail-safe
+        philosophy (case 3 in _inflight_entry_is_stale) is: when the snapshot
+        cannot be trusted, assume live rather than risk a double-dispatch.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', fut, request_id='mr-existing')
+        req = _make_request('B', 'B', tmp_path, config)
+
+        # Case 1: snapshot dict lacks 'entries' key entirely.
+        def _no_entries_key() -> dict:
+            return {'depth': 0}  # missing 'entries'
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=_no_entries_key,
+        )
+        assert result.in_flight is True
+        assert result.dispatched is False, (
+            'malformed snapshot (missing entries key) must not reap the live slot'
+        )
+        assert fut.cancelled() is False, 'live primary must NOT be cancelled'
+
+        # Case 2: snapshot returns a non-dict entirely.
+        def _non_dict_snap():
+            return ['not', 'a', 'dict']  # type: ignore[return-value]
+
+        result2 = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=_non_dict_snap,
+        )
+        assert result2.in_flight is True
+        assert result2.dispatched is False, (
+            'malformed snapshot (non-dict) must not reap the live slot'
+        )
+
+        fut.cancel()  # clean up
+
 
 # ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueueWorktreePath — disk-scan coalesces alive worktrees
