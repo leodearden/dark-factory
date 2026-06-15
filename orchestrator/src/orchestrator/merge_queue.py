@@ -6990,6 +6990,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     for _entry in _downstream:
                         _entry_status: str | None = None
                         if _entry.verify_task is not None:
+                            # Fire remote cancel BEFORE task.cancel() so the
+                            # remote verify-merge process is signalled while
+                            # _inflight_request_id is still live (mirrors
+                            # task-1757 _run_inflight_verify fix).  Bare await
+                            # mirrors 1757's cascade-style call; the helper
+                            # swallows Exception internally, and CancelledError
+                            # propagates to stop the loop (correct behaviour).
+                            if _entry.lease is not None:
+                                await self._abort_remote_verify(
+                                    _entry.lease, _entry.item.request.task_id,
+                                )
                             _entry.verify_task.cancel()
                             with contextlib.suppress(BaseException):
                                 await _entry.verify_task

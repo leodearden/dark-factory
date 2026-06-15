@@ -390,8 +390,11 @@ class TestB2ChainInvalidationUnderOverlap:
             f'Expected N to fail, got status={outcome_a.status!r}'
         )
 
-        # (2) N+1's in-flight verify was aborted (cancel_verify called)
-        gated_remote.cancel_verify.assert_called_once()
+        # (2) N+1's in-flight verify was aborted (cancel_verify called).
+        # Relaxed from assert_called_once() to assert_called(): task-1762 step-4
+        # legitimately adds a second cancel_verify per aborted downstream entry
+        # (_abort_remote_verify pre-cancel + cancel_and_release post-cancel).
+        gated_remote.cancel_verify.assert_called()
 
         # (3) N+1 was re-merged onto actual main
         assert 'b2-b' in remerge_task_ids, (
@@ -599,8 +602,11 @@ class TestB4CancelBehavior:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        # (1) cancel_verify called for the clean cancel (rc=0)
-        gated_remote.cancel_verify.assert_called_once()
+        # (1) cancel_verify called for the clean cancel (rc=0).
+        # Relaxed from assert_called_once() to assert_called(): task-1762 step-4
+        # legitimately adds a second cancel_verify per aborted downstream entry
+        # (_abort_remote_verify pre-cancel + cancel_and_release post-cancel).
+        gated_remote.cancel_verify.assert_called()
 
         # (2) Remote slot freed after cancel confirm
         assert not allocator.is_busy(remote_name), (
@@ -701,8 +707,11 @@ class TestB4CancelBehavior:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        # (1) cancel_verify called → cancel-fail path taken
-        gated_remote.cancel_verify.assert_called_once()
+        # (1) cancel_verify called → cancel-fail path taken.
+        # Relaxed from assert_called_once() to assert_called(): task-1762 step-4
+        # legitimately adds a second cancel_verify per aborted downstream entry
+        # (_abort_remote_verify pre-cancel + cancel_and_release post-cancel).
+        gated_remote.cancel_verify.assert_called()
 
         # (2) probe_clean called → slot was PARKED during probe
         assert probe_entered.is_set(), 'Expected probe_clean to be called (PARK → probe path)'
