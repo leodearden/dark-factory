@@ -11,9 +11,15 @@ from __future__ import annotations
 TERMINAL_STATUSES: frozenset[str] = frozenset({'done', 'cancelled'})
 
 # Non-terminal (active) statuses — the complement of TERMINAL_STATUSES.
-# Mirrors fused-memory's reconciliation/task_filter.py:66 definition; kept
-# here as a local constant to avoid a cross-package import.  Passed to
-# get_tasks(statuses=...) on the scheduler's hot paths (acquire_next,
+# Mirrors fused-memory's reconciliation/task_filter.ACTIVE_TASK_STATUSES;
+# kept as a local constant to avoid a cross-package import at runtime.
+# DRIFT RISK: if the server adds a new active status, update this set too —
+# stale values would cause tasks in that status to be silently dropped from
+# the active fetch and never dispatched.  The guard test
+# ``test_active_task_statuses_matches_fused_memory`` in test_scheduler.py
+# imports the canonical server-side set and asserts equality, so divergence
+# fails CI rather than silently stranding tasks.
+# Passed to get_tasks(statuses=...) on the scheduler's hot paths (acquire_next,
 # _train_candidates, _build_train_state fallback) to shrink the payload.
 ACTIVE_TASK_STATUSES: frozenset[str] = frozenset(
     {

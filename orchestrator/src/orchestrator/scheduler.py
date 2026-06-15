@@ -2430,9 +2430,12 @@ class Scheduler:
         # 'unknown'), so those deps would block dispatching forever. Fix: collect
         # local dep-ids referenced by the fetched tasks that are NOT already in
         # status_map, then backfill them via the lean get_statuses(ids=missing).
-        # Backfill fires only when a dep is absent, so existing tests whose
-        # get_tasks AsyncMocks return the full set (incl. done deps) make zero
-        # get_statuses calls and stay network-free/deterministic.
+        # In production this backfill commonly fires every tick (most pending tasks
+        # have at least one done dep), but the two-call total (active get_tasks +
+        # compact get_statuses) is still a net win over the old single full get_tasks
+        # call (~95% smaller payload per γ1's get_statuses path).  In unit tests
+        # whose get_tasks mocks return the full set (incl. done deps), status_map
+        # is already complete → missing_dep_ids is empty → zero get_statuses calls.
         _all_dep_ids: set[str] = set()
         for _t in tasks:
             for _d in (_t.get('dependencies') or []):
@@ -2477,8 +2480,8 @@ class Scheduler:
                     data={'reason': reason},
                 )
 
-        # Drop _last_dispatch_at, _skip_count, _module_cache, and sub-threshold
-        # _external_unresolved_counts entries for tasks that are:
+        # Drop _last_dispatch_at, _skip_count, _module_cache, _pending_anchor,
+        # and sub-threshold _external_unresolved_counts entries for tasks that are:
         #   (a) in a terminal status in status_map, OR
         #   (b) absent from tasks_by_id (active-only filter dropped them because
         #       they completed between ticks — γ2: previously the full get_tasks
@@ -2488,20 +2491,32 @@ class Scheduler:
         # re-architect, or a freshly-created task reusing the id) starts from a
         # clean slate.  Resurrection-safe: a re-queued task re-derives modules
         # and re-accumulates its skip count fresh.
-        # Mirrors the _pending_anchor clearing in _update_age_anchors.
+        # _pending_anchor and _was_non_pending are handled here directly (not only
+        # in _update_age_anchors) because active-only filtering means terminal
+        # tasks are absent from the `tasks` list that _update_age_anchors iterates.
+        # Without this, a task that goes pending → terminal (e.g. cancelled while
+        # pending, never dispatched) leaks its _pending_anchor entry permanently.
+        # Recording _was_non_pending preserves resurrection semantics: if the task
+        # is re-queued to pending, it gets a fresh max_id anchor instead of
+        # re-using its old (stale) numeric id as the age anchor.
         _stale_ids: set[str] = set()
         # Iterate the union of all tracked bookkeeping keys so we catch ids that
         # are absent from status_map entirely (completed, dropped by active filter).
+        # _pending_anchor is included so anchor-only entries (tasks that went
+        # pending → terminal without ever being dispatched) are also caught.
         _all_tracked: set[str] = (
             set(self._last_dispatch_at)
             | set(self._skip_count)
             | set(self._module_cache)
+            | set(self._pending_anchor)
         )
         for tid_str in _all_tracked:
             if status_map.get(tid_str) in TERMINAL_STATUSES or tid_str not in tasks_by_id:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
+                self._pending_anchor.pop(tid_str, None)
+                self._was_non_pending.add(tid_str)
                 _stale_ids.add(tid_str)
         # _external_unresolved_counts is keyed by (task_id, dep); sweep
         # separately to avoid mutating while iterating.  A sub-threshold counter

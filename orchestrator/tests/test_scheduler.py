@@ -6953,11 +6953,19 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
 
     @pytest.mark.asyncio
     async def test_bookkeeping_purged_for_absent_task(self, scheduler: Scheduler):
-        """Bookkeeping entries for a task absent from the active fetch must be purged."""
+        """Bookkeeping entries for a task absent from the active fetch must be purged.
+
+        Includes _pending_anchor: a task that went pending → terminal without
+        ever being dispatched would leak its anchor entry permanently under
+        active-only filtering because _update_age_anchors only iterates the
+        fetched tasks list (and terminal tasks are absent from it).
+        """
         # Seed bookkeeping for task 'X' that is now completed/absent.
         scheduler._skip_count['X'] = 3
         scheduler._last_dispatch_at['X'] = 123.0
         scheduler._module_cache['X'] = ['backend/module_x']
+        # Seed _pending_anchor as if X was pending once and assigned an anchor.
+        scheduler._pending_anchor['X'] = 5
 
         # Unrelated pending task (not X); X is terminal → excluded from active fetch.
         other_task = {
@@ -6981,4 +6989,38 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
         )
         assert 'X' not in scheduler._module_cache, (
             f"Expected 'X' purged from _module_cache but it's still there: {scheduler._module_cache}"
+        )
+        # _pending_anchor must also be purged so the dict stays bounded.
+        assert 'X' not in scheduler._pending_anchor, (
+            f"Expected 'X' purged from _pending_anchor but it's still there: {scheduler._pending_anchor}"
+        )
+        # _was_non_pending must record X so that if it is resurrected to pending
+        # it gets a fresh max_id anchor (resurrection semantics) instead of
+        # re-using its old stale numeric id.
+        assert 'X' in scheduler._was_non_pending, (
+            f"Expected 'X' recorded in _was_non_pending for resurrection semantics: {scheduler._was_non_pending}"
+        )
+
+
+class TestActiveTaskStatusesMatchesFusedMemory:
+    """Guard: ACTIVE_TASK_STATUSES in task_status.py must stay in sync with
+    fused-memory's canonical definition.
+
+    If the server adds a new active status and the orchestrator's local copy
+    is not updated, tasks in that status would be silently excluded from the
+    active get_tasks fetch and never dispatched.  This test makes divergence
+    fail CI rather than strand tasks silently.
+    """
+
+    def test_active_task_statuses_matches_fused_memory(self):
+        """orchestrator.task_status.ACTIVE_TASK_STATUSES == fused_memory canonical."""
+        from orchestrator.task_status import ACTIVE_TASK_STATUSES as orch_set
+        from fused_memory.reconciliation.task_filter import (
+            ACTIVE_TASK_STATUSES as fm_set,
+        )
+        assert orch_set == fm_set, (
+            "ACTIVE_TASK_STATUSES drift detected!\n"
+            f"  orchestrator/task_status.py: {sorted(orch_set)}\n"
+            f"  fused_memory/reconciliation/task_filter.py: {sorted(fm_set)}\n"
+            "Update orchestrator/task_status.py to match the server-side definition."
         )
