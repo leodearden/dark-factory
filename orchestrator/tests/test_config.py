@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from orchestrator.config import (
     ConfigRequiredError,
+    CpuPriorityConfig,
     JobserverConfig,
     ModuleConfig,
     OrchestratorConfig,
@@ -1312,3 +1313,62 @@ class TestJobserverConfig:
         cfg = OrchestratorConfig()
         assert isinstance(cfg.jobserver, JobserverConfig)
         assert cfg.jobserver.enabled is False
+
+
+class TestCpuPriorityConfig:
+    """Unit tests for CpuPriorityConfig.agent_env()."""
+
+    def test_default_is_enabled_with_nice_10(self):
+        """Default CpuPriorityConfig() is enabled=True, nice=10."""
+        cfg = CpuPriorityConfig()
+        assert cfg.enabled is True
+        assert cfg.nice == 10
+
+    def test_default_agent_env_returns_df_agent_cpu_nice_10(self):
+        """Default agent_env() returns {'DF_AGENT_CPU_NICE': '10'}."""
+        cfg = CpuPriorityConfig()
+        assert cfg.agent_env() == {'DF_AGENT_CPU_NICE': '10'}
+
+    def test_custom_nice_agent_env(self):
+        """CpuPriorityConfig(nice=15).agent_env() returns {'DF_AGENT_CPU_NICE': '15'}."""
+        cfg = CpuPriorityConfig(nice=15)
+        assert cfg.agent_env() == {'DF_AGENT_CPU_NICE': '15'}
+
+    def test_disabled_returns_empty(self):
+        """CpuPriorityConfig(enabled=False).agent_env() returns {}."""
+        cfg = CpuPriorityConfig(enabled=False)
+        assert cfg.agent_env() == {}
+
+    def test_validator_rejects_enabled_with_nice_zero(self):
+        """enabled=True with nice=0 raises ValidationError (not de-prioritizing)."""
+        with pytest.raises(ValidationError):
+            CpuPriorityConfig(enabled=True, nice=0)
+
+    def test_validator_rejects_enabled_with_nice_negative(self):
+        """enabled=True with nice=-1 raises ValidationError (needs privilege)."""
+        with pytest.raises(ValidationError):
+            CpuPriorityConfig(enabled=True, nice=-1)
+
+    def test_validator_rejects_enabled_with_nice_above_19(self):
+        """enabled=True with nice=20 raises ValidationError (out of range 1..19)."""
+        with pytest.raises(ValidationError):
+            CpuPriorityConfig(enabled=True, nice=20)
+
+    def test_validator_accepts_nice_boundary_1(self):
+        """enabled=True with nice=1 is valid (minimum positive de-prioritization)."""
+        cfg = CpuPriorityConfig(enabled=True, nice=1)
+        assert cfg.nice == 1
+        assert cfg.agent_env() == {'DF_AGENT_CPU_NICE': '1'}
+
+    def test_validator_accepts_nice_boundary_19(self):
+        """enabled=True with nice=19 is valid (maximum privilege-free)."""
+        cfg = CpuPriorityConfig(enabled=True, nice=19)
+        assert cfg.nice == 19
+        assert cfg.agent_env() == {'DF_AGENT_CPU_NICE': '19'}
+
+    def test_orchestrator_config_has_cpu_priority_field(self):
+        """OrchestratorConfig exposes a cpu_priority field defaulting to enabled."""
+        cfg = OrchestratorConfig()
+        assert isinstance(cfg.cpu_priority, CpuPriorityConfig)
+        assert cfg.cpu_priority.enabled is True
+        assert cfg.cpu_priority.nice == 10
