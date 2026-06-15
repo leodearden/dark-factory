@@ -3317,6 +3317,136 @@ class TestRunVerificationPersistence:
         )
 
 
+@pytest.mark.asyncio
+class TestRunVerificationMergeArchival:
+    """Integration tests for run_verification merge-path archival (task 1768, step-3).
+
+    These tests use a fake worktree with NO .task/ dir (mimicking a merge
+    worktree) and verify that passing role='merge' + archive_root causes
+    _archive_merge_verify_logs to be called directly.
+
+    Tests are RED until step-4 adds the role=='merge' branch to run_verification.
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+    def _make_failing_cmd(self, test_output: str = 'test FAILED'):
+        """Return a fake _run_cmd that fails the test command."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+            if 'cargo test' in cmd:
+                return 1, test_output, False
+            return 0, 'ok', False
+        return fake_run_cmd
+
+    # (a) role='merge', archive_root set, task_id set, failing → files + non-empty paths
+    async def test_merge_role_failing_archives_to_task_dir(self, tmp_path: Path):
+        """Failing merge verify writes .log + summary.json under archive_root/task_id/."""
+        # No .task/ dir — simulates a merge worktree
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        config = self._make_config(tmp_path)
+
+        with patch('orchestrator.verify._run_cmd', side_effect=self._make_failing_cmd('test FAILED: x')):
+            result = await run_verification(
+                tmp_path, config,
+                max_retries=0,
+                role='merge',
+                archive_root=archive_root,
+                task_id='1768',
+            )
+
+        task_dir = archive_root / '1768'
+        assert task_dir.is_dir(), f'Expected archive dir to be created: {task_dir}'
+        log_files = list(task_dir.glob('*.log'))
+        assert log_files, f'Expected .log files in {task_dir}, got none'
+        json_files = list(task_dir.glob('*.json'))
+        assert json_files, f'Expected summary.json in {task_dir}, got none'
+        assert result.archive_log_paths, (
+            f'Expected non-empty archive_log_paths; got {result.archive_log_paths!r}'
+        )
+        # At least one path contains the task_id and 'attempt'
+        assert any('1768' in p for p in result.archive_log_paths), (
+            f'Expected task_id in archive paths: {result.archive_log_paths}'
+        )
+
+    # (b) role='merge', passes → no files, empty archive_log_paths
+    async def test_merge_role_passing_does_not_archive(self, tmp_path: Path):
+        """Passing merge verify → no archive files written, empty archive_log_paths."""
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        config = self._make_config(tmp_path)
+
+        async def fake_pass(cmd, cwd, timeout, env=None, log_path=None):
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_pass):
+            result = await run_verification(
+                tmp_path, config,
+                max_retries=0,
+                role='merge',
+                archive_root=archive_root,
+                task_id='1768',
+            )
+
+        assert result.passed is True
+        assert result.archive_log_paths == [], (
+            f'Expected empty archive_log_paths on pass; got {result.archive_log_paths!r}'
+        )
+        assert not (archive_root / '1768').exists(), (
+            f'Expected no archive dir for passing result'
+        )
+
+    # (c) role='merge', archive_root=None → no files, no crash
+    async def test_merge_role_none_archive_root_noop(self, tmp_path: Path):
+        """role='merge' + archive_root=None → no crash, empty paths."""
+        config = self._make_config(tmp_path)
+
+        with patch('orchestrator.verify._run_cmd', side_effect=self._make_failing_cmd()):
+            result = await run_verification(
+                tmp_path, config,
+                max_retries=0,
+                role='merge',
+                archive_root=None,
+                task_id='1768',
+            )
+
+        # Should complete without error
+        assert result.archive_log_paths == [], (
+            f'Expected empty archive_log_paths when archive_root=None; got {result.archive_log_paths!r}'
+        )
+
+    # (d) role='task' (default), archive_root set, attempt_id=None, no .task/ → no merge archive
+    async def test_task_role_without_attempt_id_does_not_use_merge_path(self, tmp_path: Path):
+        """role='task' (default) does NOT trigger merge archival even with archive_root set."""
+        # No .task/ dir — task path would also be a no-op (no .task/), but
+        # the point is: the merge branch must not activate for role='task'.
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        config = self._make_config(tmp_path)
+
+        with patch('orchestrator.verify._run_cmd', side_effect=self._make_failing_cmd()):
+            result = await run_verification(
+                tmp_path, config,
+                max_retries=0,
+                role='task',  # default — task path, not merge path
+                archive_root=archive_root,
+                task_id='1768',
+                # attempt_id NOT passed — task path gated on attempt_id
+            )
+
+        assert result.archive_log_paths == [], (
+            f'Expected empty archive on task path without attempt_id; '
+            f'got {result.archive_log_paths!r}'
+        )
+        # Crucially, no archive dir should be created by the merge path
+        assert not (archive_root / '1768').exists(), (
+            'Merge path must not be triggered for role=task'
+        )
+
+
 class TestPersistAttemptLogsModulePrefix:
     """Tests for the ``module_prefix`` parameter added to ``_persist_attempt_logs``.
 
