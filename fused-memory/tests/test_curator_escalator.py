@@ -625,3 +625,102 @@ class TestRestartDurableBurstCounter:
             )
         finally:
             handle.close()
+
+
+# ----------------------------------------------------------------------
+# Concurrent persist-state serialization (step-15 RED / step-16 GREEN)
+# ----------------------------------------------------------------------
+
+
+class TestPersistStateConcurrency:
+    """_persist_state must serialize concurrent writes (addresses race flagged in review).
+
+    A batch ZOT bisect spawns N concurrent size-1 curate() calls, each of
+    which eventually calls report_failure → _persist_state.  Without a
+    mutual-exclusion lock, all N calls await asyncio.to_thread(_write)
+    concurrently, every one targeting the SAME `<state>.tmp` path.  Two
+    in-flight writes can clobber each other's bytes, and the second
+    os.replace can hit an already-moved tmp (FileNotFoundError), both
+    swallowed as WARNING — silently degrading the durable burst counter.
+
+    Step-16 adds an asyncio.Lock around (prune + snapshot + to_thread) so
+    only one persist is ever in flight, and gives each _write call a unique
+    temp filename so no two writers ever share a temp path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_persist_state_serializes_writes(self, tmp_path, monkeypatch):
+        """Concurrent report_failure calls must serialize their writes (max 1 in-flight)
+        and must not corrupt or lose any burst-log entry."""
+        import asyncio
+        import json
+
+        state_path = tmp_path / 'curator_escalator_state.json'
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0, state_path=state_path)
+
+            # ── Instrumentation ─────────────────────────────────────────────────
+            in_flight = 0
+            max_in_flight = 0
+            real_to_thread = asyncio.to_thread
+
+            async def _patched_to_thread(func, *args, **kwargs):
+                nonlocal in_flight, max_in_flight
+                in_flight += 1
+                if in_flight > max_in_flight:
+                    max_in_flight = in_flight
+                # Widen the interleave window so concurrent coroutines can enter
+                # before the first one returns — exposes the race without the lock.
+                await asyncio.sleep(0.02)
+                try:
+                    return await real_to_thread(func, *args, **kwargs)
+                finally:
+                    in_flight -= 1
+
+            monkeypatch.setattr(asyncio, 'to_thread', _patched_to_thread)
+
+            # ── Fire 5 concurrent report_failure calls ───────────────────────
+            # Same project_id, DISTINCT subtypes → independent _failure_log keys
+            # so each call goes through the generic burst path (one _persist_state
+            # per call) rather than being coalesced before the lock.
+            subtypes = [
+                'error_max_budget_usd',
+                'error_max_turns',
+                'error_max_tokens',
+                'error_a',
+                'error_b',
+            ]
+            await asyncio.gather(*[
+                escalator.report_failure(
+                    project_root=str(tmp_path),
+                    project_id='proj-x',
+                    justification=f'failure {subtype}',
+                    candidate_title='T',
+                    subtype=subtype,
+                    zero_output_timeout=False,
+                    schema_tool_denied=False,
+                )
+                for subtype in subtypes
+            ])
+
+            # ── Deterministic assertion: writes must be serialized ────────────
+            assert max_in_flight == 1, (
+                f'Expected max concurrent in-flight writes == 1 (serialized via '
+                f'asyncio.Lock), got {max_in_flight}. _persist_state has no '
+                f'mutual exclusion — add asyncio.Lock around (prune+snapshot+'
+                f'to_thread) in _persist_state.'
+            )
+
+            # ── Outcome assertion: all 5 keys must survive in the state file ──
+            assert state_path.exists(), 'state_path must be written'
+            records = json.loads(state_path.read_text())
+            persisted_keys = {(r['project_id'], r['subtype']) for r in records}
+            for subtype in subtypes:
+                assert ('proj-x', subtype) in persisted_keys, (
+                    f'Missing key (proj-x, {subtype!r}) in persisted state — '
+                    f'a concurrent write clobbered or lost this entry. '
+                    f'Persisted keys: {persisted_keys}'
+                )
+        finally:
+            handle.close()
