@@ -472,6 +472,71 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
     }
 
 
+def _make_infix(module_prefix: 'str | None') -> str:
+    """Return the dot-prefixed filename infix for *module_prefix*, or '' if None.
+
+    Sanitizes by replacing ``/`` and spaces with ``_``, mirroring
+    :func:`_warm_marker_name`.
+
+    Examples::
+
+        _make_infix('src/my module') -> '.src_my_module'
+        _make_infix(None)            -> ''
+    """
+    if module_prefix is None:
+        return ''
+    safe = module_prefix.replace('/', '_').replace(' ', '_')
+    return f'.{safe}'
+
+
+def _write_run_log(
+    target_dir: Path,
+    attempt_id: int,
+    infix: str,
+    run: dict,
+    *,
+    ts_suffix: str = '',
+    skip_if_exists: bool = False,
+    caller: str = '_write_run_log',
+) -> 'Path | None':
+    """Write a single run's output to a log file; return the path or None on error.
+
+    Filename: ``attempt-{attempt_id}{infix}.{run['label']}{ts_suffix}.log``
+
+    Parameters
+    ----------
+    target_dir:
+        Directory to write into (must already exist).
+    attempt_id:
+        Attempt counter embedded in the filename stem.
+    infix:
+        Module-prefix infix (including leading ``.``), or ``''``.  Build via
+        :func:`_make_infix`.
+    run:
+        Run dict with at least ``label`` (str) and optionally ``output`` (str).
+    ts_suffix:
+        Timestamp suffix to append before ``.log`` (e.g. ``'-20260615T120000_000000Z'``).
+        Empty string on the task path (no timestamp); non-empty on the merge path.
+    skip_if_exists:
+        When True and the target path already exists, return the path without
+        rewriting.  Used on the task path where ``_run_cmd`` may have already
+        streamed output there.
+    caller:
+        Name embedded in warning log messages for attribution.
+
+    Returns ``None`` on OSError (logged at warning level).
+    """
+    log_path = target_dir / f'attempt-{attempt_id}{infix}.{run["label"]}{ts_suffix}.log'
+    if skip_if_exists and log_path.exists():
+        return log_path
+    try:
+        log_path.write_text(run.get('output', ''), encoding='utf-8')
+        return log_path
+    except OSError as exc:
+        logger.warning('%s: could not write %s: %s', caller, log_path, exc)
+        return None
+
+
 def _persist_attempt_logs(
     worktree: Path,
     attempt_id: int,
@@ -527,13 +592,7 @@ def _persist_attempt_logs(
         logger.warning('_persist_attempt_logs: could not create %s: %s', verify_dir, exc)
         return []
 
-    # Sanitize the module prefix for use in filenames (mirrors _warm_marker_name).
-    if module_prefix is not None:
-        safe_prefix = module_prefix.replace('/', '_').replace(' ', '_')
-        infix = f'.{safe_prefix}'
-    else:
-        infix = ''
-
+    infix = _make_infix(module_prefix)
     written: list[Path] = []
 
     # Write per-command log files.  When the file already exists on disk it
@@ -543,15 +602,13 @@ def _persist_attempt_logs(
     for run in runs:
         if run.get('cmd') is None:
             continue
-        log_path = verify_dir / f'attempt-{attempt_id}{infix}.{run["label"]}.log'
-        if log_path.exists():
-            written.append(log_path)
-            continue
-        try:
-            log_path.write_text(run['output'], encoding='utf-8')
-            written.append(log_path)
-        except OSError as exc:
-            logger.warning('_persist_attempt_logs: could not write %s: %s', log_path, exc)
+        # No ts_suffix on the task path; skip_if_exists handles streamed files.
+        path = _write_run_log(
+            verify_dir, attempt_id, infix, run,
+            skip_if_exists=True, caller='_persist_attempt_logs',
+        )
+        if path is not None:
+            written.append(path)
 
     # Build summary.json via the shared helper (same shape as merge-path summary).
     summary_payload = _build_summary_payload(runs, category, cause_hint)
@@ -664,31 +721,24 @@ def _archive_merge_verify_logs(
         logger.warning('_archive_merge_verify_logs: could not create %s: %s', target_dir, exc)
         return []
 
-    # Sanitize module_prefix the same way as _persist_attempt_logs.
-    if module_prefix is not None:
-        safe_prefix = module_prefix.replace('/', '_').replace(' ', '_')
-        infix = f'.{safe_prefix}'
-    else:
-        infix = ''
-
+    infix = _make_infix(module_prefix)
     # Use microsecond precision so rapid back-to-back merge-verify retries for
     # the same task (same attempt_id=1 default, same second) never overwrite each
     # other.  The format is still lexicographically sortable.
     utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+    ts_suffix = f'-{utc_ts}'
     archived: list[Path] = []
 
     # Write per-command log files directly to the archive.
     for run in runs:
         if run.get('cmd') is None:
             continue
-        log_path = target_dir / f'attempt-{attempt_id}{infix}.{run["label"]}-{utc_ts}.log'
-        try:
-            log_path.write_text(run.get('output', ''), encoding='utf-8')
-            archived.append(log_path)
-        except OSError as exc:
-            logger.warning(
-                '_archive_merge_verify_logs: could not write %s: %s', log_path, exc,
-            )
+        path = _write_run_log(
+            target_dir, attempt_id, infix, run,
+            ts_suffix=ts_suffix, caller='_archive_merge_verify_logs',
+        )
+        if path is not None:
+            archived.append(path)
 
     # Write summary.json using the shared payload builder.
     summary_path = target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json'
