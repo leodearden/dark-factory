@@ -6895,6 +6895,225 @@ class TestTerminalOutcomeRetention:
         assert stored is not None
         assert stored.generation == 2
 
+    # ── step-1/2: secondary indexes (get_by_branch / get_by_task) ────────────
+
+    def test_get_by_branch_returns_recorded_record(self) -> None:
+        """get_by_branch(branch) returns the recorded TerminalOutcomeRecord."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-b1',
+            task_id='task-b1',
+            branch='task/branch-one',
+            state='done',
+        )
+        ring.record(rec)
+        result = ring.get_by_branch('task/branch-one')
+        assert result is rec
+
+    def test_get_by_task_returns_recorded_record(self) -> None:
+        """get_by_task(task_id) returns the recorded TerminalOutcomeRecord."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = TerminalOutcomeRecord(
+            request_id='mr-t1',
+            task_id='task-T42',
+            branch='task/42',
+            state='blocked',
+        )
+        ring.record(rec)
+        result = ring.get_by_task('task-T42')
+        assert result is rec
+
+    def test_get_by_branch_miss_returns_none(self) -> None:
+        """get_by_branch on an unknown branch returns None."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        assert ring.get_by_branch('task/nonexistent') is None
+
+    def test_get_by_task_miss_returns_none(self) -> None:
+        """get_by_task on an unknown task_id returns None."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        assert ring.get_by_task('task-nonexistent') is None
+
+    def test_get_by_branch_newest_wins(self) -> None:
+        """When two records share the same branch, get_by_branch returns the newer one."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec_a = TerminalOutcomeRecord(
+            request_id='mr-ba1',
+            task_id='task-ba1',
+            branch='task/shared-branch',
+            state='blocked',
+        )
+        rec_b = TerminalOutcomeRecord(
+            request_id='mr-ba2',
+            task_id='task-ba2',
+            branch='task/shared-branch',
+            state='done',
+        )
+        ring.record(rec_a)
+        ring.record(rec_b)
+        result = ring.get_by_branch('task/shared-branch')
+        assert result is rec_b, f'Expected newest record rec_b, got {result!r}'
+
+    def test_get_by_task_newest_wins(self) -> None:
+        """When two records share the same task_id, get_by_task returns the newer one."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec_a = TerminalOutcomeRecord(
+            request_id='mr-ta1',
+            task_id='task-shared',
+            branch='task/ta1',
+            state='blocked',
+        )
+        rec_b = TerminalOutcomeRecord(
+            request_id='mr-ta2',
+            task_id='task-shared',
+            branch='task/ta2',
+            state='done',
+        )
+        ring.record(rec_a)
+        ring.record(rec_b)
+        result = ring.get_by_task('task-shared')
+        assert result is rec_b, f'Expected newest record rec_b, got {result!r}'
+
+    # ── step-3/4: eviction-discipline for secondary indexes ───────────────────
+
+    def test_eviction_drops_secondary_indexes_case_a(self) -> None:
+        """Case A: evicting an old record drops it from _by_branch/_by_task.
+
+        With maxlen=2: record rec_a(branch=A, task=ta), rec_b(branch=B, task=tb),
+        rec_c(branch=C, task=tc). After rec_c evicts rec_a, assert
+        get_by_branch(A) and get_by_task(ta) are None, while C/tc still resolve.
+        """
+        ring = TerminalOutcomeRetention(maxlen=2)
+        rec_a = TerminalOutcomeRecord(
+            request_id='mr-evict-a',
+            task_id='task-ta',
+            branch='task/branch-A',
+            state='done',
+        )
+        rec_b = TerminalOutcomeRecord(
+            request_id='mr-evict-b',
+            task_id='task-tb',
+            branch='task/branch-B',
+            state='done',
+        )
+        rec_c = TerminalOutcomeRecord(
+            request_id='mr-evict-c',
+            task_id='task-tc',
+            branch='task/branch-C',
+            state='blocked',
+        )
+        ring.record(rec_a)
+        ring.record(rec_b)
+        ring.record(rec_c)  # evicts rec_a
+
+        # Evicted record's secondary entries must be gone
+        assert ring.get_by_branch('task/branch-A') is None, (
+            'Expected None after eviction of rec_a from branch index'
+        )
+        assert ring.get_by_task('task-ta') is None, (
+            'Expected None after eviction of rec_a from task index'
+        )
+        # Still-live records must resolve correctly
+        assert ring.get_by_branch('task/branch-C') is rec_c
+        assert ring.get_by_task('task-tc') is rec_c
+
+    def test_eviction_identity_guard_preserves_newer_secondary_entry_case_b(self) -> None:
+        """Case B: identity guard must NOT drop a secondary entry owned by a newer record.
+
+        With maxlen=2: record rec_a(branch=A, task=ta), rec_b(branch=A, task=ta)
+        (same branch+task, newer), rec_c(branch=C, task=tc) which evicts rec_a.
+        Assert get_by_branch(A) is rec_b and get_by_task(ta) is rec_b (NOT None).
+        """
+        ring = TerminalOutcomeRetention(maxlen=2)
+        rec_a = TerminalOutcomeRecord(
+            request_id='mr-guard-a',
+            task_id='task-shared-guard',
+            branch='task/shared-guard',
+            state='blocked',
+        )
+        rec_b = TerminalOutcomeRecord(
+            request_id='mr-guard-b',
+            task_id='task-shared-guard',  # same task_id as rec_a
+            branch='task/shared-guard',   # same branch as rec_a
+            state='done',
+        )
+        rec_c = TerminalOutcomeRecord(
+            request_id='mr-guard-c',
+            task_id='task-guard-c',
+            branch='task/branch-guard-c',
+            state='done',
+        )
+        ring.record(rec_a)
+        ring.record(rec_b)   # rec_b now owns branch/task secondary entries
+        ring.record(rec_c)   # evicts rec_a; identity guard must NOT drop rec_b's entries
+
+        assert ring.get_by_branch('task/shared-guard') is rec_b, (
+            'Expected rec_b (newer) to survive eviction of rec_a via identity guard'
+        )
+        assert ring.get_by_task('task-shared-guard') is rec_b, (
+            'Expected rec_b (newer) to survive eviction of rec_a via identity guard'
+        )
+
+    # ── step-5/6: alias resolution ────────────────────────────────────────────
+
+    def test_alias_resolves_to_primary(self) -> None:
+        """record_alias(alias, primary_id) then get(alias) returns the primary record."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        primary = TerminalOutcomeRecord(
+            request_id='mr-primary-P',
+            task_id='task-P',
+            branch='task/P',
+            state='done',
+        )
+        ring.record(primary)
+        ring.record_alias('mr-coalesced', 'mr-primary-P')
+        result = ring.get('mr-coalesced')
+        assert result is primary, f'Expected primary record, got {result!r}'
+
+    def test_alias_order_independent(self) -> None:
+        """record_alias registered before the primary is recorded still resolves lazily."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        ring.record_alias('mr-c2', 'mr-primary-P2')  # registered before primary
+        primary2 = TerminalOutcomeRecord(
+            request_id='mr-primary-P2',
+            task_id='task-P2',
+            branch='task/P2',
+            state='done',
+        )
+        ring.record(primary2)
+        result = ring.get('mr-c2')
+        assert result is primary2, f'Expected lazy alias resolution after record, got {result!r}'
+
+    def test_dangling_alias_returns_none(self) -> None:
+        """An alias pointing to a never-recorded (or evicted) primary returns None."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        ring.record_alias('mr-dangling', 'mr-never-recorded')
+        result = ring.get('mr-dangling')
+        assert result is None, f'Expected None for dangling alias, got {result!r}'
+
+    def test_direct_index_takes_precedence_over_alias(self) -> None:
+        """A request_id with both a direct _index record and an alias uses direct record."""
+        ring = TerminalOutcomeRetention(maxlen=10)
+        direct = TerminalOutcomeRecord(
+            request_id='mr-both',
+            task_id='task-direct',
+            branch='task/direct',
+            state='done',
+        )
+        other = TerminalOutcomeRecord(
+            request_id='mr-other',
+            task_id='task-other',
+            branch='task/other',
+            state='blocked',
+        )
+        ring.record(direct)
+        ring.record(other)
+        # Register 'mr-both' as alias to 'mr-other' — direct index must win
+        ring.record_alias('mr-both', 'mr-other')
+        result = ring.get('mr-both')
+        assert result is direct, (
+            f'Expected direct _index entry to take precedence over alias, got {result!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMergeWorkerDequeueEvent — step-5
@@ -10148,6 +10367,53 @@ class TestCoalesceOrEnqueueRegistryOnly:
 
         # merge_finalized row must exist in the event store
         assert _count_events(event_store.db_path, 'merge_finalized') == 1
+
+    # ── step-7/8: coalesce path records an alias ──────────────────────────────
+
+    async def test_coalesce_registers_alias_for_coalesced_id(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """coalesce_or_enqueue_merge_request registers an alias for the coalesced id.
+
+        After req2 (request_id=C) is coalesced onto in-flight req1 (request_id=P),
+        recording the primary's terminal record (P) into the retention ring must
+        allow resolution of C via get(C).
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        retention = TerminalOutcomeRetention()
+
+        # req1 acquires the slot (primary)
+        req1 = _make_request('alias-primary', 'branch-alias', tmp_path, config)
+        result1 = await coalesce_or_enqueue_merge_request(
+            queue, req1, event_store, registry, git_ops=None, retention=retention,
+        )
+        assert result1.dispatched is True, f'Expected dispatched=True for req1, got {result1}'
+        primary_request_id = req1.request_id
+
+        # req2 is a second request for the same branch — should coalesce
+        req2 = _make_request('alias-coalesced', 'branch-alias', tmp_path, config)
+        result2 = await coalesce_or_enqueue_merge_request(
+            queue, req2, event_store, registry, git_ops=None, retention=retention,
+        )
+        assert result2.in_flight is True, f'Expected in_flight=True (coalesced), got {result2}'
+        coalesced_request_id = req2.request_id
+
+        # Now record the primary's terminal record — alias C→P must resolve it
+        primary_rec = TerminalOutcomeRecord(
+            request_id=primary_request_id,
+            task_id=req1.task_id,
+            branch=req1.branch,
+            state='done',
+        )
+        retention.record(primary_rec)
+
+        resolved = retention.get(coalesced_request_id)
+        assert resolved is primary_rec, (
+            f'Expected coalesced id {coalesced_request_id!r} to alias to primary '
+            f'{primary_request_id!r}, got {resolved!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
