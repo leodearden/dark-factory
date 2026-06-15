@@ -1218,6 +1218,30 @@ def create_server(
 
         return None
 
+    def _found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, Any]:
+        """Build the git-authority Tier-3.5 done/found_on_main response.
+
+        ``merge_sha`` semantics differ between the two resolution paths:
+
+        - **Live-branch path** (``is_ancestor`` hit): ``merge_sha`` is the
+          *branch tip* SHA — an ancestor of main but, for ``--no-ff`` merges,
+          NOT the merge-commit SHA (they are distinct commits).
+        - **Deleted-branch path** (``find_merge_marker`` hit): ``merge_sha``
+          is the *merge-commit* SHA found on main via ``git log``.
+
+        Callers that specifically need the merge commit (e.g. for provenance
+        that must reference the commit on main's first-parent chain) should
+        prefer the deleted-branch path's value or resolve via ``git log``.
+        """
+        return {
+            'state': 'done',
+            'request_id': request_id,
+            'generation': 1,
+            'kind': 'found_on_main',
+            'merge_sha': merge_sha,
+            'outcome': 'found_on_main',
+        }
+
     @mcp.tool()
     async def merge_status(
         request_id: str | None = None,
@@ -1238,10 +1262,17 @@ def create_server(
         ``task_id`` (prepending ``orch_config.git.branch_prefix`` unless the
         value already starts with the prefix), then:
         - If the branch still exists: calls ``is_ancestor(tip, main)``.
-          On hit → returns state='done', kind='found_on_main', merge_sha=tip.
+          An additional ``tip != main_tip`` guard prevents a false-positive
+          ``done`` when the branch sits at exactly main's HEAD with no extra
+          commits (a commit is its own ancestor).  On hit →
+          state='done', kind='found_on_main',
+          merge_sha=<branch-tip SHA>.
+          Note: for ``--no-ff`` merges the branch tip is NOT the merge-commit;
+          see ``_found_on_main_response`` for the semantic distinction.
         - If the branch ref is gone (tip is None): calls ``find_merge_marker``
           which searches git log for the merge commit subject.
-          On hit → returns state='done', kind='found_on_main', merge_sha=<sha>.
+          On hit → state='done', kind='found_on_main',
+          merge_sha=<merge-commit SHA on main>.
         Fire-safe: any git failure degrades to the honest Tier-4 unknown
         (``logger.warning(exc_info=True)``), never raises.  The tier is skipped
         when ``harness.git_ops`` or ``orch_config`` are absent.
@@ -1252,7 +1283,9 @@ def create_server(
         Live entries also carry: position, enqueued_at, eta_seconds.
         Terminal entries carry: outcome (raw state), finished_at.
         git-authority terminal shape: state='done', kind='found_on_main',
-            merge_sha=<40-char SHA on main>, outcome='found_on_main'.
+            merge_sha=<branch-tip or merge-commit SHA — see
+            ``_found_on_main_response`` docstring for path-specific
+            semantics>, outcome='found_on_main'.
         Unknown carries: hint.
         """
         # Validation — at least one key required
@@ -1328,32 +1361,26 @@ def create_server(
                     prefix = orch_config.git.branch_prefix
                     full_branch = key if key.startswith(prefix) else f'{prefix}{key}'
                     tip = await git_ops.resolve_branch_sha(full_branch)
-                    if tip is not None and await git_ops.is_ancestor(tip, orch_config.git.main_branch):
+                    main_tip = await git_ops.resolve_branch_sha(orch_config.git.main_branch)
+                    if (tip is not None and tip != main_tip
+                            and await git_ops.is_ancestor(tip, orch_config.git.main_branch)):
                         # Live branch is already an ancestor of main (normal merged case).
-                        return {
-                            'state': 'done',
-                            'request_id': request_id,
-                            'generation': 1,
-                            'kind': 'found_on_main',
-                            'merge_sha': tip,
-                            'outcome': 'found_on_main',
-                        }
+                        # tip != main_tip guards against the no-op case: a branch sitting at
+                        # exactly main's HEAD satisfies is_ancestor trivially (a commit is
+                        # its own ancestor) but nothing has been merged.
+                        # merge_sha = branch tip (NOT the merge commit for --no-ff; see
+                        # _found_on_main_response docstring for the semantic distinction).
+                        return _found_on_main_response(request_id, tip)
                     elif tip is None:
                         # Branch ref gone — the canonical 4352 deleted-branch shape.
                         # find_merge_marker internally gates on branch existence so it only
                         # fires when the ref is gone (consistent with the cheaper-common-path
                         # ordering: cheaper is_ancestor check first, find_merge_marker only
                         # when the branch has been deleted).
+                        # merge_sha = merge-commit SHA on main (via git log scan).
                         marker = await git_ops.find_merge_marker(full_branch)
                         if marker is not None:
-                            return {
-                                'state': 'done',
-                                'request_id': request_id,
-                                'generation': 1,
-                                'kind': 'found_on_main',
-                                'merge_sha': marker,
-                                'outcome': 'found_on_main',
-                            }
+                            return _found_on_main_response(request_id, marker)
                 except Exception:
                     logger.warning(
                         'merge_status: git-authority probe failed, returning unknown',

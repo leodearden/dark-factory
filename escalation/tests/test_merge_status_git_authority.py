@@ -145,7 +145,8 @@ class TestMergeStatusGitAuthority:
           the find_merge_marker scan when the branch ref is still live)
         """
         tip = 'a' * 40
-        rsb = AsyncMock(return_value=tip)
+        main_sha = 'm' * 40  # distinct from tip so the tip != main_tip guard passes
+        rsb = AsyncMock(side_effect=lambda b: tip if b == 'task/123' else main_sha)
         ia = AsyncMock(return_value=True)
         fmm = AsyncMock(return_value=None)
         stub_git = _stub_git_ops(
@@ -350,6 +351,43 @@ class TestMergeStatusGitAuthority:
             f'No git_ops must yield unknown, got: {result}'
         )
 
+    # ── suggestion-1: branch-at-main-HEAD no-op guard ────────────────────────
+
+    async def test_branch_at_main_head_returns_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """Branch tip == main tip (no extra commits) must return unknown, not done.
+
+        A commit is its own ancestor, so is_ancestor(tip, main) would return
+        True even when the branch has no extra commits and nothing has been
+        merged — a false-positive 'done'.
+
+        The tip != main_tip guard prevents this: when the branch sits at
+        exactly main's HEAD, Tier-3.5 falls through to the honest Tier-4
+        unknown.  is_ancestor must NOT be called (Python short-circuit).
+        """
+        tip = 'f' * 40  # branch and main both at the same SHA
+        rsb = AsyncMock(return_value=tip)   # returns same SHA for ALL resolve calls
+        ia = AsyncMock(return_value=True)   # would satisfy is_ancestor if called
+        fmm = AsyncMock(return_value=None)
+        stub_git = _stub_git_ops(
+            resolve_branch_sha=rsb,
+            is_ancestor=ia,
+            find_merge_marker=fmm,
+        )
+        server = await self._make_server_with_git_ops(tmp_path, stub_git)
+
+        result = await _call_merge_status(server, task_id='same-as-main')
+
+        assert result.get('state') == 'unknown', (
+            f'Branch at main HEAD must return unknown (not false-positive done): {result}'
+        )
+        # is_ancestor must NOT be called — tip==main_tip guard short-circuits first
+        ia.assert_not_called()
+        # find_merge_marker must NOT be called — tip is not None so deleted-branch
+        # path is not entered
+        fmm.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Real-git integration test — the canonical 4352 lost-record shape end-to-end
@@ -436,4 +474,85 @@ class TestMergeStatusGitAuthorityIntegration:
         )
         assert len(result['merge_sha']) == 40, (
             f'merge_sha must be a 40-char SHA, got: {result["merge_sha"]!r}'
+        )
+
+    async def test_live_branch_merge_sha_is_branch_tip_not_merge_commit(
+        self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig  # type: ignore[reportInvalidTypeForm]
+    ) -> None:
+        """Live-branch path: merge_sha is the branch tip SHA, not the merge commit.
+
+        Pins the documented semantic distinction (see ``_found_on_main_response``
+        docstring): when ``is_ancestor(tip, main)`` fires, ``merge_sha=tip``
+        (the branch tip).  For ``--no-ff`` merges, ``tip != merge_commit``.
+
+        Sequence:
+        1. Create worktree for task '771', commit a file.
+        2. Capture branch tip SHA before merging.
+        3. merge_to_main → advance_main.
+        4. Do NOT clean up branch — keep it alive (live-branch path fires).
+        5. Build server with NO event_store.
+        6. Call merge_status(task_id='771').
+        7. Assert: merge_sha == branch tip (NOT the merge commit on main).
+        """
+        tid = '771'
+
+        # --- Step 1: create worktree and commit ---
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'{tid}.py').write_text(f'{tid} = True\n')
+        await git_ops.commit(wt_info.path, f'Add {tid}')
+
+        # --- Step 2: capture branch tip before merge ---
+        rc, branch_tip_raw, _ = await _run(
+            ['git', 'rev-parse', f'task/{tid}'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'Expected rc=0 resolving branch tip, got rc={rc}'
+        branch_tip = branch_tip_raw.strip()
+        assert len(branch_tip) == 40, f'Expected 40-char SHA, got {branch_tip!r}'
+
+        # --- Step 3: merge to main (--no-ff creates a distinct merge commit) ---
+        merge_result = await git_ops.merge_to_main(wt_info.path, tid)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        assert merge_result.merge_commit is not None
+        # For --no-ff the merge commit is distinct from the branch tip
+        assert merge_result.merge_commit != branch_tip, (
+            'merge_to_main did a fast-forward — branch_tip == merge_commit; '
+            'this test requires --no-ff to demonstrate the semantic distinction'
+        )
+        adv = await git_ops.advance_main(merge_result.merge_commit)
+        assert adv == 'advanced'
+
+        # --- Step 4: intentionally keep branch alive → is_ancestor path fires ---
+        # (no cleanup_worktree / cleanup_merge_worktree)
+
+        # --- Step 5: server with NO event_store ---
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=None,
+            _terminal_retention=None,
+            git_ops=git_ops,
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue, harness=stub_harness, orch_config=orch_config)
+
+        # --- Steps 6 & 7: call merge_status and assert merge_sha == branch_tip ---
+        result = await _call_merge_status(server, task_id=tid)
+
+        assert result.get('state') == 'done', (
+            f'Expected done/found_on_main for live branch on main, got: {result}'
+        )
+        assert result.get('kind') == 'found_on_main', (
+            f'Expected kind=found_on_main, got: {result}'
+        )
+        # Live-branch path returns the branch tip, NOT the merge commit
+        assert result.get('merge_sha') == branch_tip, (
+            f'Live-branch path must return branch-tip SHA. '
+            f'Expected merge_sha={branch_tip!r}, '
+            f'merge_commit={merge_result.merge_commit!r}, '
+            f'got merge_sha={result.get("merge_sha")!r}'
+        )
+        # Explicitly pin the semantic distinction: tip != merge_commit for --no-ff
+        assert result['merge_sha'] != merge_result.merge_commit, (
+            'merge_sha must be the branch tip, not the merge commit '
+            '(--no-ff creates a distinct merge commit on main)'
         )
