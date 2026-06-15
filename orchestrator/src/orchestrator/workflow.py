@@ -5822,6 +5822,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP conflict resolved — retrying merge')
+        else:
+            logger.warning(
+                'Task %s: merge queue is halted (%s) but escalation_queue is None — '
+                'halt owner cannot be registered; manual unhalt_merge_queue required '
+                'to clear the orphan halt',
+                self.task_id, result.status,
+            )
 
         return WorkflowOutcome.REQUEUED
 
@@ -5864,6 +5871,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
+        else:
+            logger.warning(
+                'Task %s: merge queue is halted (%s, recovery_branch=%r) but escalation_queue '
+                'is None — halt owner cannot be registered; manual unhalt_merge_queue required '
+                'to clear the orphan halt',
+                self.task_id, result.status, recovery_branch,
+            )
 
         return WorkflowOutcome.DONE
 
@@ -5905,6 +5919,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: wip_recovery_no_advance escalation resolved')
+        else:
+            logger.warning(
+                'Task %s: merge queue is halted (%s, recovery_branch=%r) but escalation_queue '
+                'is None — halt owner cannot be registered; manual unhalt_merge_queue required '
+                'to clear the orphan halt',
+                self.task_id, result.status, recovery_branch,
+            )
 
         return WorkflowOutcome.BLOCKED
 
@@ -5946,6 +5967,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(
                 f'Task {self.task_id}: unmerged_state escalation resolved'
+            )
+        else:
+            logger.warning(
+                'Task %s: merge queue is halted (%s) but escalation_queue is None — '
+                'halt owner cannot be registered; manual unhalt_merge_queue required '
+                'to clear the orphan halt',
+                self.task_id, result.status,
             )
 
         return WorkflowOutcome.BLOCKED
