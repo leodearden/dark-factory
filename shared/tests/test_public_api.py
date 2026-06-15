@@ -25,6 +25,7 @@ class TestTopLevelImports:
             files_to_modules,
             invoke_claude_agent,
             invoke_with_cap_retry,
+            is_zero_output_timeout,
             modules_conflict,
             normalize_lock,
         )
@@ -32,6 +33,7 @@ class TestTopLevelImports:
         assert AgentResult is not None
         assert invoke_claude_agent is not None
         assert invoke_with_cap_retry is not None
+        assert is_zero_output_timeout is not None
         assert UsageGate is not None
         assert AccountState is not None
         assert SessionBudgetExhausted is not None
@@ -66,6 +68,7 @@ class TestModuleLevelAll:
             'classify_agent_failure',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
+            'is_zero_output_timeout',
         }
 
     def test_usage_gate_all(self):
