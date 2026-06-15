@@ -29,7 +29,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.merge_queue import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, _ORPHAN_HALT_NO_QUEUE_TOKENS
 
 
 class _FakeMergeWorker:
@@ -655,21 +655,34 @@ async def test_handler_warns_on_orphan_halt_when_no_escalation_queue(
             )
 
     # (a) A WARNING must be emitted containing the orphan-halt diagnostic tokens.
+    # Assert against _ORPHAN_HALT_NO_QUEUE_TOKENS (the stable constant defined
+    # alongside _warn_orphan_halt_no_queue) so a prose change in the helper
+    # is caught at the constant definition rather than silently breaking tests.
     warning_messages = [
         r.getMessage() for r in caplog.records
         if r.levelno >= logging.WARNING
     ]
     orphan_warnings = [
         msg for msg in warning_messages
-        if 'orphan halt' in msg and 'unhalt_merge_queue' in msg
+        if all(tok in msg for tok in _ORPHAN_HALT_NO_QUEUE_TOKENS)
     ]
     assert orphan_warnings, (
-        f'handler {handler_id!r}: expected a WARNING containing both '
-        f'"orphan halt" and "unhalt_merge_queue", '
+        f'handler {handler_id!r}: expected a WARNING containing all tokens in '
+        f'_ORPHAN_HALT_NO_QUEUE_TOKENS={_ORPHAN_HALT_NO_QUEUE_TOKENS!r}, '
         f'but got: {warning_messages!r}'
     )
 
     # (b) Control flow unchanged — returns the expected outcome.
     assert outcome == expected_outcome, (
         f'handler {handler_id!r}: expected {expected_outcome!r}, got {outcome!r}'
+    )
+
+    # (c) Halt remains engaged — documented degraded behavior when esc_queue is None.
+    # No escalation was filed, no owner was registered, and only
+    # force_unhalt_merge_queue can recover the lane. The handler must NOT
+    # silently clear the halt here; that would hide the production queue blockage.
+    assert fake_worker.is_wip_halted, (
+        f'handler {handler_id!r}: is_wip_halted must stay True when escalation_queue '
+        'is None — no esc was filed and no auto-recovery path exists; '
+        'operator must run force_unhalt_merge_queue'
     )

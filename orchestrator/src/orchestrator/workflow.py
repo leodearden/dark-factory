@@ -86,6 +86,11 @@ _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
     and name not in {'steward', 'deep_reviewer'}
 )
 
+# Stable diagnostic tokens guaranteed to appear in the orphan-halt warning emitted
+# by ``_warn_orphan_halt_no_queue``.  Referenced by tests so wording changes are
+# caught at the constant definition rather than silently diverging across assertions.
+_ORPHAN_HALT_NO_QUEUE_TOKENS: tuple[str, ...] = ('orphan halt', 'unhalt_merge_queue')
+
 
 def _is_gating_escalation(e: Escalation) -> bool:
     """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
@@ -5146,7 +5151,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 and self.merge_worker.is_wip_halted
                 and self.merge_worker.halt_owner_esc_id is None
             ):
-                self.merge_worker.unhalt_wip(reason='halt_escalation_submit_failed')
+                try:
+                    self.merge_worker.unhalt_wip(reason='halt_escalation_submit_failed')
+                except Exception:
+                    # Swallow unhalt_wip failures so the original submit exception
+                    # always propagates to the caller — masking a disk-full or
+                    # serialization error with a secondary unhalt failure would make
+                    # diagnosis much harder.
+                    logger.exception(
+                        'Task %s: unhalt_wip failed during submit-failure cleanup '
+                        '(original submit exception will still propagate)',
+                        self.task_id,
+                    )
             raise
         if self.merge_worker is not None:
             self.merge_worker.set_halt_owner(esc.id)
@@ -5361,6 +5377,48 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
 
         return category, summary, detail
+
+    def _warn_orphan_halt_no_queue(
+        self,
+        status: str,
+        *,
+        recovery_branch: str | None = None,
+        train_id: str | None = None,
+    ) -> None:
+        """Log the orphan-halt diagnostic when ``escalation_queue`` is ``None``.
+
+        Called by the five WIP-halt handlers when the merger has already engaged a
+        per-lane halt but ``escalation_queue`` is ``None`` — the halt is left
+        ownerless with no escalation filed and no human notified.
+
+        Always contains the tokens in ``_ORPHAN_HALT_NO_QUEUE_TOKENS``
+        (``'orphan halt'`` and ``'unhalt_merge_queue'``) so operators can grep
+        for the actionable hint and tests can assert without coupling to free-text
+        prose.  Use the module-level constant in assertions rather than the
+        literal strings.
+
+        Parameters
+        ----------
+        status:
+            The ``MergeOutcome.status`` string (e.g. ``'wip_halted'``).
+        recovery_branch:
+            For WIP-recovery outcomes; appended to the context label.
+        train_id:
+            For the train path (``_escalate_train_halt``); replaces the
+            status-based context label with ``'train <train_id>'``.
+        """
+        if train_id is not None:
+            context = f'train {train_id!r}'
+        elif recovery_branch is not None:
+            context = f'{status}, recovery_branch={recovery_branch!r}'
+        else:
+            context = status
+        logger.warning(
+            'Task %s: merge queue is halted (%s) but escalation_queue is None — '
+            'halt owner cannot be registered; manual unhalt_merge_queue required '
+            'to clear the orphan halt',
+            self.task_id, context,
+        )
 
     async def _reverify_one_member(
         self,
@@ -5782,12 +5840,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     self.task_id, esc.id,
                 )
         else:
-            logger.warning(
-                'Task %s: merge queue is halted (train %r) but escalation_queue is '
-                'None — halt owner cannot be registered; manual unhalt_merge_queue '
-                'required to clear the orphan halt',
-                self.task_id, train_id,
-            )
+            self._warn_orphan_halt_no_queue(result.status, train_id=train_id)
 
         return await self._mark_blocked(reason, detail=detail, skip_escalation=True)
 
@@ -5823,12 +5876,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP conflict resolved — retrying merge')
         else:
-            logger.warning(
-                'Task %s: merge queue is halted (%s) but escalation_queue is None — '
-                'halt owner cannot be registered; manual unhalt_merge_queue required '
-                'to clear the orphan halt',
-                self.task_id, result.status,
-            )
+            self._warn_orphan_halt_no_queue(result.status)
 
         return WorkflowOutcome.REQUEUED
 
@@ -5872,12 +5920,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
         else:
-            logger.warning(
-                'Task %s: merge queue is halted (%s, recovery_branch=%r) but escalation_queue '
-                'is None — halt owner cannot be registered; manual unhalt_merge_queue required '
-                'to clear the orphan halt',
-                self.task_id, result.status, recovery_branch,
-            )
+            self._warn_orphan_halt_no_queue(result.status, recovery_branch=recovery_branch)
 
         return WorkflowOutcome.DONE
 
@@ -5920,12 +5963,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: wip_recovery_no_advance escalation resolved')
         else:
-            logger.warning(
-                'Task %s: merge queue is halted (%s, recovery_branch=%r) but escalation_queue '
-                'is None — halt owner cannot be registered; manual unhalt_merge_queue required '
-                'to clear the orphan halt',
-                self.task_id, result.status, recovery_branch,
-            )
+            self._warn_orphan_halt_no_queue(result.status, recovery_branch=recovery_branch)
 
         return WorkflowOutcome.BLOCKED
 
@@ -5969,12 +6007,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 f'Task {self.task_id}: unmerged_state escalation resolved'
             )
         else:
-            logger.warning(
-                'Task %s: merge queue is halted (%s) but escalation_queue is None — '
-                'halt owner cannot be registered; manual unhalt_merge_queue required '
-                'to clear the orphan halt',
-                self.task_id, result.status,
-            )
+            self._warn_orphan_halt_no_queue(result.status)
 
         return WorkflowOutcome.BLOCKED
 
