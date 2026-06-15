@@ -601,3 +601,37 @@ class TestReconciliationConfigStormKnobs:
     def test_storm_window_negative_rejected(self):
         with pytest.raises(ValidationError):
             ReconciliationConfig(dead_owner_suppression_storm_window_seconds=-1.0)
+
+
+class TestReconciliationConfigBacklogHardLimitOverrides:
+    """Tests for ReconciliationConfig.backlog_hard_limit_overrides (task 1764).
+
+    New field: backlog_hard_limit_overrides: dict[str, int] = Field(default_factory=dict)
+    Per-project override map keyed by project_id; empty map = flat hard_limit for all.
+    """
+
+    # --- defaults ---
+
+    def test_default_overrides_is_empty_dict(self):
+        assert ReconciliationConfig().backlog_hard_limit_overrides == {}
+
+    def test_default_backlog_hard_limit_unchanged(self):
+        """Global default 500 must remain unchanged for small projects."""
+        assert ReconciliationConfig().backlog_hard_limit == 500
+
+    # --- override accepted / round-trips ---
+
+    def test_override_map_accepted(self):
+        cfg = ReconciliationConfig(backlog_hard_limit_overrides={'reify': 1500})
+        assert cfg.backlog_hard_limit_overrides == {'reify': 1500}
+
+    def test_override_map_multi_project_round_trips(self):
+        overrides = {'reify': 1500, 'autopilot_video': 800}
+        cfg = ReconciliationConfig(backlog_hard_limit_overrides=overrides)
+        assert cfg.backlog_hard_limit_overrides == overrides
+
+    # --- dict[str, int] guard: non-int value rejected ---
+
+    def test_non_int_value_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(backlog_hard_limit_overrides={'reify': 'not-an-int'})
