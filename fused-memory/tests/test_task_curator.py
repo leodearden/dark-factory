@@ -2011,6 +2011,52 @@ class TestCuratorFailureErrorSubtype:
         assert err.subtype is None
 
 
+# ----------------------------------------------------------------------
+# CuratorFailureError carries cost_usd from AgentResult (Fix R-cost)
+# ----------------------------------------------------------------------
+
+
+class TestCuratorFailureErrorCostUsd:
+    """CuratorFailureError.cost_usd carries the underlying AgentResult.cost_usd.
+
+    When _call_llm raises CuratorFailureError for an error_max_budget_usd
+    failure, the exc carries the actual cost_usd so CuratorEscalator can
+    render it in the escalation detail for operator triage.
+    Defaults to None when constructed without cost_usd (e.g. outside LLM sites).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cost_usd_propagated_from_call_llm_single(self):
+        """cost_usd on AgentResult is surfaced via CuratorFailureError.cost_usd."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        failed = AgentResult(
+            success=False, output='budget exceeded',
+            subtype='error_max_budget_usd',
+            turns=2, timed_out=False, duration_ms=4500,
+            cost_usd=0.30574,
+        )
+        mock = AsyncMock(return_value=failed)
+        with (
+            pytest.raises(CuratorFailureError) as exc_info,
+            patch(
+                'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                new=mock,
+            ),
+        ):
+            await curator._call_llm(
+                CandidateTask(title='X'),
+                pool=[], pool_sizes={'anchor': 0},
+                start=0.0, project_id='p', project_root='/x',
+            )
+        assert exc_info.value.cost_usd == pytest.approx(0.30574)
+
+    def test_cost_usd_defaults_to_none_when_omitted(self):
+        """Defensive: CuratorFailureError constructed without cost_usd → None."""
+        err = CuratorFailureError('some other failure')
+        assert err.cost_usd is None
+
+
 class TestCuratorFailureErrorSchemaToolDenied:
     """CLI 2.1.168 guard — ``CuratorFailureError`` carries the underlying agent
     result's ``schema_tool_denied`` from both LLM call sites so the curate()
