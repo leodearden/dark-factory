@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import traceback
+from collections import deque
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -287,6 +288,13 @@ class ReconciliationHarness:
         # WP-D: track which halted projects we've already escalated so we
         # don't re-fire every harness tick.
         self._halt_escalated: set[str] = set()
+
+        # Task 1755 / PRD β: rolling-window counter for dead_owner_shielded
+        # recon_stale_run suppressions.  Each entry is (timestamp, project_id).
+        # Pruned on each call to _record_dead_owner_suppression().
+        self._dead_owner_suppressions: deque[tuple[datetime, str]] = deque()
+        # Timestamp of the last storm escalation — None means never fired.
+        self._last_suppression_storm_escalation_at: datetime | None = None
 
         # Usage gate (multi-account cap failover)
         self.usage_gate: UsageGate | None = None
@@ -730,6 +738,55 @@ class ReconciliationHarness:
                     f'Run stale (>{cutoff}s, lock expired), recovered',
                     detail,
                 )
+
+    # ── Dead-owner suppression storm counter ─────────────────────────
+
+    def _record_dead_owner_suppression(
+        self, project_id: str, *, now: datetime | None = None
+    ) -> dict | None:
+        """Record one dead_owner_shielded suppression and check for a storm.
+
+        Appends (effective_now, project_id) to the rolling deque, prunes
+        entries older than the configured window, then:
+        - Returns None if the count is below the threshold.
+        - Returns None if the alarm already fired within this window
+          (rate limit: <=1 per window).
+        - Otherwise sets _last_suppression_storm_escalation_at = effective_now
+          and returns a storm summary dict with 'count', 'window_seconds', and
+          'projects' (sorted distinct project labels seen in the window).
+
+        The now= parameter follows the ``_finding_recently_resolved(..., now=None)``
+        time-injection convention (harness.py:1592) for deterministic unit tests.
+        Task 1755 / PRD β.
+        """
+        effective_now = now if now is not None else datetime.now(UTC)
+
+        # Append and prune the rolling window.
+        self._dead_owner_suppressions.append((effective_now, project_id))
+        window = timedelta(seconds=self.config.dead_owner_suppression_storm_window_seconds)
+        cutoff_ts = effective_now - window
+        while self._dead_owner_suppressions and self._dead_owner_suppressions[0][0] < cutoff_ts:
+            self._dead_owner_suppressions.popleft()
+
+        count = len(self._dead_owner_suppressions)
+        if count < self.config.dead_owner_suppression_storm_threshold:
+            return None
+
+        # Threshold crossed — apply the per-window rate limit.
+        if (
+            self._last_suppression_storm_escalation_at is not None
+            and (effective_now - self._last_suppression_storm_escalation_at) < window
+        ):
+            return None
+
+        # Fire: set rate-limit timestamp and build the storm summary dict.
+        self._last_suppression_storm_escalation_at = effective_now
+        projects = sorted({pid for _, pid in self._dead_owner_suppressions})
+        return {
+            'count': count,
+            'window_seconds': self.config.dead_owner_suppression_storm_window_seconds,
+            'projects': projects,
+        }
 
     # ── Deferred write replay ─────────────────────────────────────────
 
