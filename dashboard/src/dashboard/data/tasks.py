@@ -106,7 +106,7 @@ async def fetch_tasks(
     project_root_str = str(project_root)
     now = time.monotonic()
     cached = _fetch_tasks_cache.get(project_root_str)
-    if cached is not None:
+    if cached is not None and (now - cached[0]) < _FETCH_TASKS_TTL_SECONDS:
         return list(cached[1])
     for url in config.fused_memory_urls:
         try:
