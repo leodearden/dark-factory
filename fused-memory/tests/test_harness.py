@@ -3636,9 +3636,11 @@ async def test_recover_stale_runs_emits_storm_escalation_for_dead_owner_shielded
     assert project_id in summary, (
         f'Storm summary must contain project_id {project_id!r}; got {summary!r}'
     )
-    # count=1 or higher should appear
-    assert any(str(n) in summary for n in range(1, 10)), (
-        f'Storm summary must contain the count; got {summary!r}'
+    # threshold is overridden to 1, so the first suppression trips the storm and
+    # count=1 — assert the specific token "storm: 1 in" rather than a loose
+    # digit scan (e.g. "60 min" contains '6' and '0' and would pass vacuously).
+    assert 'storm: 1 in' in summary, (
+        f'Storm summary must contain "storm: 1 in" (count token); got {summary!r}'
     )
     # Window hint (seconds or minutes)
     assert any(hint in summary for hint in ('3600', '60 min', '60min', '1 hour', '1h')), (

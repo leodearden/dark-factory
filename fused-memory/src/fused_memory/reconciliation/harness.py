@@ -308,6 +308,21 @@ class ReconciliationHarness:
         # Task 1755 / PRD β: rolling-window counter for dead_owner_shielded
         # recon_stale_run suppressions.  Each entry is (timestamp, project_id).
         # Pruned on each call to _record_dead_owner_suppression().
+        #
+        # ⚠ In-process lifetime limitation: these counters are reset on every
+        # harness restart.  dead_owner_shielded orphans are by definition left
+        # by a *prior* killed incarnation, so a rapid single-orphan-per-restart
+        # churn (watchdog SIGABRT → relaunch → 1 orphan reaped → killed again)
+        # keeps count=1 per lifetime and never crosses the threshold of 6.  The
+        # storm alarm is designed for scenarios where >=threshold orphans surface
+        # WITHIN a single harness lifetime — e.g. a systemic failure that leaves
+        # many projects' runs orphaned simultaneously (the 2026-06-15 event that
+        # triggered this task: 38 in 8h across multiple projects, making count≫6
+        # in the first live incarnation that swept them all up).  Single-orphan
+        # churn is instead observable via the per-event INFO log emitted at
+        # harness.py:741.  If single-orphan restart churn must also alarm,
+        # count recent dead_owner_shielded _error records from the journal over
+        # the window instead of the in-memory deque.
         self._dead_owner_suppressions: deque[tuple[datetime, str]] = deque()
         # Timestamp of the last storm escalation — None means never fired.
         self._last_suppression_storm_escalation_at: datetime | None = None
@@ -751,6 +766,16 @@ class ReconciliationHarness:
                 # suppression above is kept; the counter fires ONE loud
                 # 'recon_watchdog_kill_storm' escalation when the burst
                 # threshold is crossed within the rolling window.
+                #
+                # Observability note: storm['count'] is the rolling-window count
+                # at the moment the threshold was first crossed in this window —
+                # not the total orphans reaped in this single _recover_stale_runs
+                # pass.  Within one pass, the first storm return sets the rate-
+                # limit timestamp; subsequent orphans in the same pass are
+                # rate-limited to None, so they do not add to the reported count.
+                # Operators who need the per-tick total should check the INFO
+                # log lines ("recon_stale_run suppressed: dead_owner_shielded
+                # orphan recovered") emitted for every suppression regardless.
                 storm = self._record_dead_owner_suppression(run.project_id)
                 if storm is not None:
                     window_min = storm['window_seconds'] / 60
