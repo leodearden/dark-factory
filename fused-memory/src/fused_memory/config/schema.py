@@ -297,6 +297,10 @@ class ReconciliationConfig(BaseModel):
     # orchestrator is live for the project, an L1 escalation JSON is written
     # instead. Rate-limited per project to avoid spam.
     backlog_hard_limit: int = Field(default=500)
+    # Per-project override map keyed by project_id. Empty map = flat
+    # backlog_hard_limit for all projects (default behaviour unchanged).
+    # Example: {reify: 1500} raises reify's bound while leaving all others at 500.
+    backlog_hard_limit_overrides: dict[str, int] = Field(default_factory=dict)
     backlog_escalation_rate_limit_seconds: float = Field(default=900.0)
 
     # Defence-in-depth bulk-reset circuit-breaker (task 918, refined task 1016).
