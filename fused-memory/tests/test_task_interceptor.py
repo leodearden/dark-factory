@@ -1754,6 +1754,40 @@ async def test_get_statuses_missing_status_key_defaults_to_unknown(taskmaster, e
     assert result == {'1': 'unknown', '2': 'done'}
 
 
+@pytest.mark.asyncio
+async def test_get_statuses_routes_through_get_statuses_raw(event_buffer):
+    """interceptor.get_statuses delegates to tm.get_statuses_raw, not tm.get_tasks.
+
+    Proves the O(K) routing fix: get_statuses_raw is called once with the
+    correct arguments; get_tasks is never called; result is verbatim passthrough;
+    no events are emitted.
+    """
+    tm = AsyncMock()
+    tm.ensure_connected = AsyncMock()
+    tm.get_statuses_raw = AsyncMock(return_value={'1': 'pending'})
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+
+    event_buffer.push = AsyncMock(wraps=event_buffer.push)
+    interceptor = TaskInterceptor(tm, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project', ids=['1'], tag='master')
+
+    # Verbatim passthrough from get_statuses_raw.
+    assert result == {'1': 'pending'}
+
+    # Routing: get_statuses_raw called; get_tasks NOT called.
+    tm.get_statuses_raw.assert_awaited_once()
+    call_kwargs = tm.get_statuses_raw.call_args
+    # project_root, ids and tag must be forwarded.
+    assert call_kwargs.args[0] == '/project' or call_kwargs.kwargs.get('project_root') == '/project'
+    tm.get_tasks.assert_not_called()
+
+    # Pure read: no events.
+    event_buffer.push.assert_not_called()
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+
+
 # ── Tests for None / disconnected taskmaster ───────────────────────
 
 
