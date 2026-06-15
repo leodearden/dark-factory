@@ -1904,40 +1904,62 @@ async def run_verification(
         cause_hint = ' | '.join(hint_parts)
         category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
-    # Persist attempt logs when requested (opt-in via attempt_id kwarg).
-    # No-op when attempt_id is None (existing callers: merge_queue, review_checkpoint).
+    # Hoist runs list so both the merge-path and task-path branches can use it.
+    runs = [
+        {
+            'label': 'test',
+            'cmd': test_cmd,
+            'rc': test_rc,
+            'output': test_out,
+            'timed_out': test_timed_out,
+            'started_at': test_started_at or '',
+            'duration_secs': test_duration,
+        },
+        {
+            'label': 'lint',
+            'cmd': lint_cmd,
+            'rc': lint_rc,
+            'output': lint_out,
+            'timed_out': lint_timed_out,
+            'started_at': lint_started_at or '',
+            'duration_secs': lint_duration,
+        },
+        {
+            'label': 'type',
+            'cmd': type_cmd,
+            'rc': type_rc,
+            'output': type_out,
+            'timed_out': type_timed_out,
+            'started_at': type_started_at or '',
+            'duration_secs': type_duration,
+        },
+    ]
+
     worktree_log_paths: list[str] = []
     archive_log_paths: list[str] = []
-    if attempt_id is not None and task_id is not None:
-        runs = [
-            {
-                'label': 'test',
-                'cmd': test_cmd,
-                'rc': test_rc,
-                'output': test_out,
-                'timed_out': test_timed_out,
-                'started_at': test_started_at or '',
-                'duration_secs': test_duration,
-            },
-            {
-                'label': 'lint',
-                'cmd': lint_cmd,
-                'rc': lint_rc,
-                'output': lint_out,
-                'timed_out': lint_timed_out,
-                'started_at': lint_started_at or '',
-                'duration_secs': lint_duration,
-            },
-            {
-                'label': 'type',
-                'cmd': type_cmd,
-                'rc': type_rc,
-                'output': type_out,
-                'timed_out': type_timed_out,
-                'started_at': type_started_at or '',
-                'duration_secs': type_duration,
-            },
-        ]
+    if role == 'merge':
+        # Merge worktrees have .task/ scrubbed by design (git_ops.py); there
+        # are no worktree log files to copy.  Write directly to the durable
+        # archive instead.  No deny-list check: on the merge path there is no
+        # debugger loop — every failure goes straight to a human/steward —
+        # so infra_timeout and test_failure (the exact categories that
+        # distinguish timeout-vs-real-failure) must be archived
+        # unconditionally.  archive_root is not None is the discriminator
+        # that auto-excludes cold-shadow / drift paths (left at None).
+        if archive_root is not None and task_id is not None and not passed:
+            try:
+                arch_paths = _archive_merge_verify_logs(
+                    runs, archive_root, task_id, attempt_id or 1,
+                    category, cause_hint, module_prefix=module_prefix,
+                )
+                archive_log_paths = [str(p) for p in arch_paths]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'run_verification: merge archival error (non-fatal): %s', exc,
+                )
+    elif attempt_id is not None and task_id is not None:
+        # Task path: persist to worktree/.task/verify/ then optionally copy
+        # to the durable archive when category warrants it.
         try:
             wt_paths = _persist_attempt_logs(
                 worktree, attempt_id, runs, category, cause_hint,
