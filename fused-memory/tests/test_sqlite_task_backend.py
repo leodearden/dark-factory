@@ -1631,3 +1631,32 @@ async def test_get_statuses_raw_returns_all_and_skips_decode(backend, project_ro
     ref = await backend.get_tasks(project_root)
     ref_mapping = {str(t['id']): t['status'] for t in ref['tasks']}
     assert mapping == ref_mapping
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_raw_filters_by_ids(backend, project_root):
+    """get_statuses_raw(ids=...) filters to the requested subset.
+
+    (a) ids=['1','3'] -> only those two; id 2 absent.
+    (b) unknown id: ids=['1','9999'] -> {'1':<s1>} and '9999' absent.
+    (c) empty: ids=[] -> {} (NOT the full tree).
+    """
+    await backend.add_task(project_root=project_root, title='T1')  # id=1 pending
+    await backend.add_task(project_root=project_root, title='T2', status='done')
+    await backend.add_task(project_root=project_root, title='T3', status='in-progress')
+
+    # (a) subset filter
+    result_a = await backend.get_statuses_raw(project_root, ids=['1', '3'])
+    assert result_a == {'1': 'pending', '3': 'in-progress'}, (
+        f'Expected subset {{1,3}}, got: {result_a}'
+    )
+    assert '2' not in result_a
+
+    # (b) unknown id silently omitted
+    result_b = await backend.get_statuses_raw(project_root, ids=['1', '9999'])
+    assert result_b == {'1': 'pending'}, f'Expected only id 1, got: {result_b}'
+    assert '9999' not in result_b
+
+    # (c) empty ids -> {} (must NOT return all 3 tasks)
+    result_c = await backend.get_statuses_raw(project_root, ids=[])
+    assert result_c == {}, f'Expected empty dict, got: {result_c}'
