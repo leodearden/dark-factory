@@ -5728,6 +5728,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if not _ie_req.result.done():
                 _ie_req.result.set_result(shutdown)
             if _ie.verify_task is not None and not _ie.verify_task.done():
+                # Fire remote cancel BEFORE task.cancel() so the remote
+                # verify-merge process is signalled while _inflight_request_id
+                # is still live (mirrors task-1757 _run_inflight_verify fix).
+                # suppress(BaseException) matches the drain's shutdown-defensive
+                # pattern (cf. cancel_and_release suppress below) so a
+                # SIGTERM-driven CancelledError cannot abort the drain loop.
+                if _ie.lease is not None:
+                    with contextlib.suppress(BaseException):
+                        await self._abort_remote_verify(_ie.lease, _ie_req.task_id)
                 _ie.verify_task.cancel()
                 with contextlib.suppress(BaseException):
                     await _ie.verify_task
