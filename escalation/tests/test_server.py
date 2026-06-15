@@ -3062,6 +3062,115 @@ class TestMergeStatus:
             f'Expected conflict from event-store fallback, got: {result}'
         )
 
+    # ── step-9 (1749): ring tier branch/task_id/alias lookup ─────────────────
+
+    async def test_ring_tier_returns_terminal_record_by_branch(
+        self, tmp_path: Path,
+    ) -> None:
+        """Ring tier: a branch= poll resolves to the ring's recorded terminal state."""
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-branchpoll',
+            task_id='T-bpoll',
+            branch='branch-bylookup',
+            state='done',
+        ))
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, branch='branch-bylookup')
+
+        assert result.get('state') == 'done', (
+            f'Expected done from ring branch lookup, got: {result}'
+        )
+        assert result.get('request_id') == 'mr-branchpoll', (
+            f'Expected resolved record request_id, got: {result}'
+        )
+        assert result.get('outcome') == 'done', (
+            f'Expected outcome=done, got: {result}'
+        )
+
+    async def test_ring_tier_returns_terminal_record_by_task_id(
+        self, tmp_path: Path,
+    ) -> None:
+        """Ring tier: a task_id= poll resolves to the ring's recorded terminal state."""
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-taskpoll',
+            task_id='T-ltask',
+            branch='branch-ltask',
+            state='blocked',
+        ))
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, task_id='T-ltask')
+
+        assert result.get('state') == 'blocked', (
+            f'Expected blocked from ring task_id lookup, got: {result}'
+        )
+        assert result.get('request_id') == 'mr-taskpoll', (
+            f'Expected resolved record request_id, got: {result}'
+        )
+
+    async def test_ring_wins_over_event_store_by_branch(self, tmp_path: Path) -> None:
+        """Ring branch= record wins over event store when both have the same branch."""
+        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev-branch')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-rb',
+            data={'request_id': 'mr-evbranch', 'branch': 'branch-ring-wins', 'state': 'done'},
+        )
+
+        # Ring says 'blocked' for this branch — ring must win over event store's 'done'
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-ringbranch',
+            task_id='T-rb',
+            branch='branch-ring-wins',
+            state='blocked',
+        ))
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
+
+        result = await _call_merge_status(server, branch='branch-ring-wins')
+
+        assert result.get('state') == 'blocked', (
+            f'Expected ring value (blocked) to beat event store (done) on branch= poll, '
+            f'got: {result}'
+        )
+
+    async def test_ring_tier_coalesced_id_via_alias(self, tmp_path: Path) -> None:
+        """Coalesced id resolves to primary's terminal record via alias."""
+        ring = TerminalOutcomeRetention()
+        primary = TerminalOutcomeRecord(
+            request_id='mr-primary-alias',
+            task_id='T-alias',
+            branch='branch-alias',
+            state='done',
+        )
+        ring.record(primary)
+        ring.record_alias('mr-coalesced-alias', 'mr-primary-alias')
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result = await _call_merge_status(server, request_id='mr-coalesced-alias')
+
+        assert result.get('state') == 'done', (
+            f'Expected done from coalesced-id alias resolution, got: {result}'
+        )
+        assert result.get('request_id') == 'mr-primary-alias', (
+            f'Expected resolved primary request_id, got: {result}'
+        )
+
     # ── step-11: live-snapshot tier ───────────────────────────────────────────
 
     def _make_orch_config(self, tmp_path: Path):
