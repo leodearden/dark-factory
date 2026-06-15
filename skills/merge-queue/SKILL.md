@@ -93,11 +93,14 @@ mcp__escalation__merge_status(request_id="<superseded_by value>")
 
 Poll the train request with the same 15 s→60 s backoff until it reaches a terminal state (`done`, `conflict`, `blocked`, `abandoned`). Your absorbed branch lands when the train lands. Handle the train's terminal state per step 4.
 
-**`state: "unknown"`** — the orchestrator restarted and the retention ring no longer holds this request. The response includes `hint: "check git log main"`. Run:
+**`state: "unknown"`** — the orchestrator restarted and the retention ring no longer holds this request. `merge_status` now self-resolves a landed merge via its git-authority tier: if the branch is provably on `main` it returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` directly. If `merge_status` still returns `unknown`, confirm deterministically:
 ```bash
-git log main --oneline -20  # confirm whether the merge already landed
+git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
+# If exit 0 (on main): treat as done/found_on_main — use done_provenance kind='found_on_main',
+#   commit=<landing sha from: git merge-base task/<TASK_ID> main OR git log --format=%H -1 main>
+# If exit 1 (not on main) AND queue is healthy: resubmit (go back to step 3).
 ```
-If the commit is on main: treat as `done`. If not: resubmit (go back to step 3).
+**Never fall back to a direct merge in response to `unknown`** — `unknown` means the server lost its record, NOT that the merge failed. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested.
 
 ### 4. Handle the outcome
 
@@ -162,6 +165,8 @@ If your submit returned `status: "attached"`, your submission was coalesced with
 
 ### 6. Fallback: direct merge
 
+**This fallback is ONLY for orchestrator down/congested — NEVER a response to `state: "unknown"`.**
+
 If the escalation MCP is down (orchestrator not running), merge directly. There's no queue to race with.
 
 ```bash
@@ -185,7 +190,7 @@ After a successful direct merge:
 | Orchestrator running | Submit via `merge_request(wait_secs=100)`, then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
 | Submit returns `queued` or `attached` | Submission succeeded (durable intent); poll `merge_status(request_id)` with 15 s→60 s backoff |
-| `merge_status` returns `state: "unknown"` | Run `git log main` to confirm whether merge landed; resubmit if not |
+| `merge_status` returns `state: "unknown"` | Check `git merge-base --is-ancestor task/<TASK_ID> main` (exit 0 → done/found_on_main; exit 1 + healthy queue → resubmit). Never direct-merge in response to `unknown`. |
 | Outcome `conflict` | Fix in worktree, resubmit |
 | Outcome `blocked` | Read reason, fix, resubmit |
 | Outcome `done` or `already_merged` | Update task status, clean up |
