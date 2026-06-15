@@ -1287,3 +1287,102 @@ async def test_get_tasks_pagination_validation_and_backward_compat(
     assert bad_off.get('error_type') == 'ValidationError', f'Expected ValidationError for offset=-1, got: {bad_off}'
     assert 'offset' in bad_off.get('error', '').lower(), f'Error message should mention offset: {bad_off}'
     task_interceptor.get_tasks.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# get_tasks statuses filter (task 1758)
+# ---------------------------------------------------------------------------
+
+_PENDING_TASKS = [
+    {'id': '1', 'title': 'task 1', 'status': 'pending'},
+    {'id': '3', 'title': 'task 3', 'status': 'pending'},
+]
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_forwarded_and_composes(
+    mcp_server_with_tasks, task_interceptor
+):
+    """get_tasks tool: statuses forwarded to interceptor; composes with pagination; validation.
+
+    (a) statuses=['pending'] forwarded as kwarg; result tasks + provenance stamps pass through.
+    (b) statuses=['pending'] + page_size=1 → pagination slices the already-filtered list.
+    (c) no statuses (default) → interceptor called with statuses=None, full result returned.
+    (d) statuses=[] → forwarded as-is (NOT a ValidationError).
+    (e) statuses='done' (non-list) → ValidationError, interceptor NOT awaited.
+    """
+    # (a) Forwarding: statuses=['pending'] kwarg forwarded, result + provenance pass through
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_PENDING_TASKS)})
+    result_a = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'statuses': ['pending']},
+    )
+    task_interceptor.get_tasks.assert_awaited_once()
+    _, kwargs_a = task_interceptor.get_tasks.call_args
+    assert kwargs_a.get('statuses') == ['pending'], (
+        f'Expected statuses kwarg forwarded, got call_args: {task_interceptor.get_tasks.call_args}'
+    )
+    assert result_a.get('tasks') == _PENDING_TASKS, (
+        f'Expected pending tasks passed through, got: {result_a.get("tasks")}'
+    )
+    assert result_a.get('project_id') == 'dark_factory', f'Missing project_id: {result_a}'
+    assert result_a.get('project_root') == '/home/leo/src/dark-factory', f'Missing project_root: {result_a}'
+
+    # (b) Compose: statuses + page_size → pagination slices the already-filtered list
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_PENDING_TASKS)})
+    result_b = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'statuses': ['pending'], 'page_size': 1},
+    )
+    assert result_b.get('tasks') == _PENDING_TASKS[:1], (
+        f'Expected first 1 task from filtered list, got: {result_b.get("tasks")}'
+    )
+    assert result_b.get('pagination') == {
+        'total': 2,
+        'offset': 0,
+        'page_size': 1,
+        'returned': 1,
+        'has_more': True,
+    }, f'Unexpected pagination: {result_b.get("pagination")}'
+
+    # (c) Default (no statuses) → interceptor called with statuses=None, full result returned
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': list(_PENDING_TASKS)})
+    result_c = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory'},
+    )
+    task_interceptor.get_tasks.assert_awaited_once()
+    _, kwargs_c = task_interceptor.get_tasks.call_args
+    assert kwargs_c.get('statuses') is None, (
+        f'Expected statuses=None when omitted, got: {kwargs_c.get("statuses")}'
+    )
+    assert result_c.get('tasks') == _PENDING_TASKS, f'Expected full result, got: {result_c}'
+
+    # (d) statuses=[] is valid ("match nothing") — forwarded as-is, not a ValidationError
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    result_d = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'statuses': []},
+    )
+    assert result_d.get('error_type') != 'ValidationError', (
+        f'statuses=[] should not be a ValidationError, got: {result_d}'
+    )
+    task_interceptor.get_tasks.assert_awaited_once()
+    _, kwargs_d = task_interceptor.get_tasks.call_args
+    assert kwargs_d.get('statuses') == [], (
+        f'Expected statuses=[] forwarded, got: {kwargs_d.get("statuses")}'
+    )
+
+    # (e) statuses='done' (bare string, non-list) → ValidationError, interceptor NOT awaited
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    result_e = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/home/leo/src/dark-factory', 'statuses': 'done'},
+    )
+    assert result_e.get('error_type') == 'ValidationError', (
+        f'Expected ValidationError for non-list statuses, got: {result_e}'
+    )
+    assert 'statuses' in result_e.get('error', '').lower(), (
+        f'Error message should mention statuses: {result_e}'
+    )
+    task_interceptor.get_tasks.assert_not_awaited()
