@@ -6,7 +6,7 @@ fetch_external_statuses short-circuit + fail-safe semantics.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -210,3 +210,182 @@ async def test_fetch_external_statuses_failover_on_empty_dict(two_url_config):
 
     assert result == good_map, 'should fall through to second URL on empty dict'
     assert len(calls) == 2, 'both URLs should have been tried'
+
+
+# ---------------------------------------------------------------------------
+# TestFetchTasksCache — per-project_root TTL cache inside fetch_tasks
+# (step-1 core-contract tests RED; step-3 TTL-expiry test RED)
+# ---------------------------------------------------------------------------
+
+# Canned raw MCP get_tasks rows used across cache tests.
+_CACHE_DONE_TASK_RAW = {
+    'id': '7',
+    'title': 'A done task',
+    'status': 'done',
+    'updatedAt': '2026-05-29T10:00:00+00:00',
+    'description': 'finished',
+    'details': '',
+    'dependencies': [],
+    'metadata': {},
+}
+_CACHE_PENDING_TASK_RAW = {
+    'id': '8',
+    'title': 'A pending task',
+    'status': 'pending',
+    'description': '',
+    'details': '',
+    'dependencies': [],
+    'metadata': {},
+}
+_CANNED_GET_TASKS_RESULT = {'tasks': [_CACHE_DONE_TASK_RAW, _CACHE_PENDING_TASK_RAW]}
+
+
+class TestFetchTasksCache:
+    """Per-project_root TTL cache inside fetch_tasks.
+
+    RED sources (step-1): _fetch_tasks_cache_clear does not yet exist in
+    dashboard.data.tasks — the autouse fixture raises AttributeError on every
+    test, giving the expected RED for the whole class.
+
+    After step-2 adds the cache infrastructure, tests (a)-(d) go GREEN.
+    test_fetch_tasks_ttl_expiry_refetches (step-3) stays RED until step-4
+    wires the monotonic freshness check.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_fetch_tasks_cache(self):
+        """Clear the per-project cache before (and after) each test.
+
+        RED until step-2 adds dashboard.data.tasks._fetch_tasks_cache_clear.
+        """
+        import dashboard.data.tasks as tasks_mod
+        tasks_mod._fetch_tasks_cache_clear()
+        yield
+        tasks_mod._fetch_tasks_cache_clear()
+
+    async def test_fetch_tasks_within_ttl_issues_single_mcp_call(
+        self, dummy_client, dummy_config
+    ):
+        """Two fetch_tasks calls for the same root within the TTL issue exactly ONE MCP call.
+
+        Also asserts the shaped DONE task preserves updated_at == the input updatedAt
+        and status == 'done', proving the cached set includes done tasks unchanged.
+
+        RED until step-2: no cache → call_count == 2.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            result1 = await fetch_tasks(dummy_client, dummy_config, '/proj/A')
+            result2 = await fetch_tasks(dummy_client, dummy_config, '/proj/A')
+
+        assert mock_mcp.call_count == 1, (
+            f'expected exactly 1 MCP call within TTL, got {mock_mcp.call_count}'
+        )
+        # The single call was 'get_tasks' for the correct project_root.
+        positional = mock_mcp.call_args_list[0].args
+        assert positional[2] == 'get_tasks'
+        assert positional[3] == {'project_root': '/proj/A'}
+        # Both calls return equal shaped lists.
+        assert isinstance(result1, list)
+        assert result1 == result2
+        # The shaped DONE task preserves updated_at (recency key for ordering + display).
+        done_tasks = [t for t in result1 if t.get('status') == 'done']
+        assert len(done_tasks) == 1
+        assert done_tasks[0]['updated_at'] == '2026-05-29T10:00:00+00:00'
+
+    async def test_fetch_tasks_distinct_projects_cached_separately(
+        self, dummy_client, dummy_config
+    ):
+        """Two distinct project_roots each trigger their own MCP call (no cross-keying).
+
+        Guards against a global/un-keyed cache; per-root results must match
+        the respective canned data (call_count == 2).
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        task_a_raw = {
+            'id': '1', 'title': 'Task A', 'status': 'pending',
+            'dependencies': [], 'metadata': {},
+        }
+        task_b_raw = {
+            'id': '2', 'title': 'Task B', 'status': 'done',
+            'updatedAt': '2026-06-01T00:00:00+00:00',
+            'dependencies': [], 'metadata': {},
+        }
+
+        async def _per_root(client, url, tool, args):
+            root = args.get('project_root', '')
+            if root == '/proj/A':
+                return {'tasks': [task_a_raw]}
+            if root == '/proj/B':
+                return {'tasks': [task_b_raw]}
+            return {'tasks': []}
+
+        mock_mcp = AsyncMock(side_effect=_per_root)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            result_a = await fetch_tasks(dummy_client, dummy_config, '/proj/A')
+            result_b = await fetch_tasks(dummy_client, dummy_config, '/proj/B')
+
+        assert mock_mcp.call_count == 2, (
+            f'expected 2 MCP calls for 2 distinct project_roots, got {mock_mcp.call_count}'
+        )
+        assert len(result_a) == 1
+        assert result_a[0]['title'] == 'Task A'
+        assert len(result_b) == 1
+        assert result_b[0]['title'] == 'Task B'
+
+    async def test_fetch_tasks_offline_not_cached(
+        self, dummy_client, dummy_config
+    ):
+        """Offline markers ({offline: True}) are never pinned in the cache.
+
+        First call: ConnectError → offline dict returned.
+        Second call: mock recovers → MCP call issued (call_count == 2); list returned.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        task_c_raw = {
+            'id': '3', 'title': 'Task C', 'status': 'pending',
+            'dependencies': [], 'metadata': {},
+        }
+        mock_mcp = AsyncMock(side_effect=[
+            httpx.ConnectError('refused'),
+            {'tasks': [task_c_raw]},
+        ])
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            offline_result = await fetch_tasks(dummy_client, dummy_config, '/proj/C')
+            success_result = await fetch_tasks(dummy_client, dummy_config, '/proj/C')
+
+        assert mock_mcp.call_count == 2, (
+            f'expected 2 MCP calls (offline not cached), got {mock_mcp.call_count}'
+        )
+        # First result is the offline marker dict.
+        assert isinstance(offline_result, dict)
+        assert offline_result.get('offline') is True
+        # Second result is a list with the recovered task.
+        assert isinstance(success_result, list)
+        assert len(success_result) == 1
+        assert success_result[0]['title'] == 'Task C'
+
+    async def test_fetch_tasks_returned_list_is_a_copy(
+        self, dummy_client, dummy_config
+    ):
+        """Mutating the returned list must not corrupt the cached entry (copy isolation).
+
+        A shallow list() copy is returned on each cache hit so callers cannot
+        mutate the internally stored list.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            first = await fetch_tasks(dummy_client, dummy_config, '/proj/D')
+            # Mutate the returned list — must NOT affect the cached entry.
+            first.clear()
+            second = await fetch_tasks(dummy_client, dummy_config, '/proj/D')
+
+        assert second != [], 'mutating first result must not clear the cache entry'
+        assert len(second) == 2, 'cache should still hold both shaped tasks after mutation'
+        assert mock_mcp.call_count == 1, 'only one MCP call should have been issued'
