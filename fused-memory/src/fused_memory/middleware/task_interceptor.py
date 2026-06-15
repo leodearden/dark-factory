@@ -3212,22 +3212,7 @@ class TaskInterceptor:
             ``'unknown'`` value as indeterminate.
         """
         tm = await self._ensure_taskmaster()
-        raw = await tm.get_tasks(project_root, tag)
-        task_list = raw.get('tasks', [])
-
-        ids_set: set[str] | None = {str(i) for i in ids} if ids is not None else None
-        mapping: dict[str, str] = {}
-        for t in task_list:
-            tid = str(t.get('id', ''))
-            if not tid:
-                continue
-            # Filter early: if the caller supplied an ids list, skip tasks
-            # that are not in it rather than building the full mapping first.
-            if ids_set is not None and tid not in ids_set:
-                continue
-            mapping[tid] = str(t.get('status', 'unknown'))
-
-        return mapping
+        return await tm.get_statuses_raw(project_root, tag=tag, ids=ids)
 
     async def search_tasks(
         self,
