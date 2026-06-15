@@ -2252,6 +2252,7 @@ class TestGetMergeQueue:
         import types
 
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InflightEntry,
             MergeRequest,
             SpeculativeItem,
             SpeculativeMergeWorker,
@@ -2285,7 +2286,12 @@ class TestGetMergeQueue:
         )
         await worker._verifier_queue.put(item_A)
 
-        # V — currently being verified (phase = verify_phase param)
+        # V — currently being verified (phase = verify_phase param).
+        # Per-entry phase now lives on an InflightEntry in worker._inflight —
+        # the singular _verify_item/_verify_phase fields were retired in task
+        # 1736 and snapshot() no longer reads them.  snapshot() iterates
+        # _inflight head-first (section 1), so this entry is head-of-line at
+        # position 0, ahead of the awaiting_verify (A) and merging (M) sections.
         merge_wt_V = tmp_path / 'mergeV'
         merge_wt_V.mkdir()
         item_V = SpeculativeItem(
@@ -2293,8 +2299,14 @@ class TestGetMergeQueue:
             merge_result=None, merge_wt=merge_wt_V,
             base_sha='base', speculative=False, skip_verify=False,
         )
-        worker._verify_item = item_V
-        worker._verify_phase = verify_phase
+        worker._inflight.append(InflightEntry(
+            item=item_V,
+            lease=None,
+            verify_task=None,
+            merge_wt=merge_wt_V,
+            was_speculative=False,
+            phase=verify_phase,
+        ))
 
         # WIP halt
         worker.halt_for_wip('test-wip')
@@ -2339,14 +2351,22 @@ class TestGetMergeQueue:
     # ── step-11: pipeline instrumentation sets/clears verify_phase ────────
 
     async def test_pipeline_sets_and_clears_verify_phase(self, tmp_path: Path):
-        """_verify_and_advance sets _verify_phase='verifying' before verify and
-        'finalizing' before advance_main; worker._verify_item is None after.
+        """_finalize_inflight sets phase='finalizing' before advance_main and
+        clears the finalize-head window afterwards.
+
+        The CAS/advance/gate finalize half moved out of _verify_and_advance into
+        _finalize_inflight (task 1735, commit 2a9db6ac83); the VERIFY half (which
+        sets phase='verifying') now lives in _run_inflight_verify/_dispatch_item.
+        This test drives the real finalize path: an InflightEntry whose verify
+        already passed (verify_task=None) is finalized, and we capture the live
+        phase that snapshot() would surface at the moment advance_main runs.
         """
         import asyncio
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InflightEntry,
             MergeRequest,
             SpeculativeItem,
             SpeculativeMergeWorker,
@@ -2359,15 +2379,25 @@ class TestGetMergeQueue:
         merge_wt = tmp_path / 'merge'
         merge_wt.mkdir()
 
-        # Tracking lists so we can record the phase at call time
+        # Capture the LIVE phase that snapshot() would surface at advance_main
+        # time: read it through snapshot()'s verify_in_progress (the real
+        # observability path), plus the singular compat field and the live
+        # finalize-head entry's per-entry phase (worker._finalizing_head, set by
+        # _finalize_inflight — the production object, not a test-held reference).
         captured_phases: list[str | None] = []
+        captured_snapshot_phases: list[str | None] = []
 
-        async def fake_run_scoped_verification(*args, **kwargs):
+        # Explicit return annotation: breaks the pyright inference cycle between
+        # this closure (which reads `worker`) and the git_ops_stub/worker bindings
+        # defined below — without it, embedding fake_advance_main in git_ops_stub
+        # makes pyright report it as self-referential.
+        async def fake_advance_main(*args, **kwargs) -> str:
             captured_phases.append(worker._verify_phase)
-            return types.SimpleNamespace(passed=True, timed_out=False, enospc=False)
-
-        async def fake_advance_main(*args, **kwargs):
-            captured_phases.append(worker._verify_phase)
+            fh = worker._finalizing_head
+            captured_phases.append(fh.phase if fh is not None else None)
+            snap = worker.snapshot()
+            vip = snap.get('verify_in_progress')
+            captured_snapshot_phases.append(vip['phase'] if vip else None)
             # Return 'not_descendant' — terminal non-advanced path
             return 'not_descendant'
 
@@ -2400,34 +2430,40 @@ class TestGetMergeQueue:
             speculative=False,
             skip_verify=False,
         )
-
-        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
-        original_rsv = mq_module.run_scoped_verification
-        mq_module.run_scoped_verification = fake_run_scoped_verification
-        try:
-            await worker._verify_and_advance(item)
-        finally:
-            mq_module.run_scoped_verification = original_rsv
-
-        # Phases: first call (verify) should be 'verifying', second (advance_main) 'finalizing'
-        assert len(captured_phases) >= 2, (
-            f'Expected at least 2 phase captures, got: {captured_phases}'
+        # verify_task=None → verify already passed (no fail/skip); _finalize_inflight
+        # goes straight to the CAS advance_main loop where it sets phase='finalizing'.
+        entry = InflightEntry(
+            item=item,
+            lease=None,
+            verify_task=None,
+            merge_wt=merge_wt,
+            was_speculative=False,
+            phase='verifying',
         )
-        assert captured_phases[0] == 'verifying', (
-            f'Expected verifying before verify, got: {captured_phases[0]!r}'
+
+        await worker._finalize_inflight(entry)
+
+        # advance_main ran; phase was 'finalizing' at that point — on the entry,
+        # on the singular compat field, AND surfaced via snapshot()'s live
+        # verify_in_progress (the real merge_status observability path).
+        assert captured_phases == ['finalizing', 'finalizing'], (
+            f'Expected finalizing on both _verify_phase and entry.phase at '
+            f'advance_main, got: {captured_phases}'
         )
-        assert captured_phases[1] == 'finalizing', (
-            f'Expected finalizing before advance_main, got: {captured_phases[1]!r}'
+        assert captured_snapshot_phases == ['finalizing'], (
+            f'Expected snapshot().verify_in_progress.phase==finalizing during '
+            f'finalize, got: {captured_snapshot_phases}'
         )
 
         # Request future should be resolved (not_descendant → blocked)
         assert req.result.done(), 'request future should be resolved after terminal advance_main'
 
-        # _verify_item is None — _verify_and_advance doesn't set it
-        # (that's _verifier_loop's job); just confirm it was never set
-        assert worker._verify_item is None
+        # Finalize-head window cleared after _finalize_inflight returns.
+        assert worker._finalizing_head is None, (
+            f'Expected _finalizing_head cleared, got: {worker._finalizing_head!r}'
+        )
 
-        # snapshot has no verifying/finalizing entries
+        # snapshot has no active verifier states (entry was popped/finalized).
         snap = worker.snapshot()
         bad_states = {e['state'] for e in snap['entries']} & {'verifying', 'finalizing', 'gate_reverify'}
         assert not bad_states, f'Snapshot should have no active verifier states, got: {bad_states}'
@@ -2435,15 +2471,22 @@ class TestGetMergeQueue:
     # ── amend: gate_reverify phase set/cleared by production code ─────────
 
     async def test_gate_reverify_phase_set_and_cleared(self, tmp_path: Path):
-        """_verify_and_advance sets _verify_phase='gate_reverify' when advance_main
-        returns 'rebased_pending_reverify', and resets to 'finalizing' after the gate
-        clears (so subsequent advance_main retries report the correct phase).
+        """_finalize_inflight sets phase='gate_reverify' when advance_main returns
+        'rebased_pending_reverify', and resets to 'finalizing' after the gate clears
+        (so subsequent advance_main retries report the correct phase).
+
+        The CAS/advance/gate loop — including the gate_reverify phase and the
+        _reverify_rebased_tree call — moved out of _verify_and_advance into
+        _finalize_inflight (task 1735, commit 2a9db6ac83).  This test drives the
+        real finalize path via an already-passed InflightEntry (verify_task=None),
+        and captures the LIVE phase surfaced by snapshot() at the reverify call.
         """
         import asyncio
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InflightEntry,
             MergeRequest,
             SpeculativeItem,
             SpeculativeMergeWorker,
@@ -2458,22 +2501,29 @@ class TestGetMergeQueue:
 
         advance_calls: list[int] = []
         captured_phases_reverify: list[str | None] = []
+        captured_snapshot_reverify: list[str | None] = []
         captured_phases_advance2: list[str | None] = []
 
-        async def fake_advance_main(*args, **kwargs):
+        # Explicit return annotation breaks the pyright inference cycle between
+        # this closure (reads `worker`) and git_ops_stub/worker below.
+        async def fake_advance_main(*args, **kwargs) -> str:
             advance_calls.append(len(advance_calls) + 1)
             if len(advance_calls) == 1:
                 # First call: trigger rebase path
                 return 'rebased_pending_reverify'
             else:
-                # Second call (after gate cleared): terminal failure
-                captured_phases_advance2.append(worker._verify_phase)
+                # Second call (after gate cleared): terminal failure.
+                # Read the live finalize-head entry (production object set by
+                # _finalize_inflight), not a test-held reference, to avoid a
+                # forward closure ref to the later-bound `entry`.
+                fh = worker._finalizing_head
+                captured_phases_advance2.append(fh.phase if fh is not None else None)
                 return 'not_descendant'
 
         async def fake_cleanup_merge_worktree(path):
             pass
 
-        # Side-channel attributes read by _verify_and_advance after
+        # Side-channel attributes read by _finalize_inflight after
         # 'rebased_pending_reverify' to extract the post-rebase SHAs.
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
@@ -2500,8 +2550,9 @@ class TestGetMergeQueue:
             merge_commit='deadbeef00000001',
             merge_worktree=merge_wt,
         )
-        # skip_verify=True: bypass Step 4 and go straight to the advance_main loop,
-        # which is where 'gate_reverify' is triggered.
+        # skip_verify=True is preserved for fidelity, though _finalize_inflight's
+        # PASS path (verify_task=None) goes straight to the advance_main loop where
+        # 'gate_reverify' is triggered.
         item = SpeculativeItem(
             request=req,
             merge_result=merge_result,
@@ -2510,19 +2561,33 @@ class TestGetMergeQueue:
             speculative=False,
             skip_verify=True,
         )
+        # verify_task=None → verify already passed; _finalize_inflight runs the
+        # CAS advance_main loop that owns the gate_reverify phase transition.
+        entry = InflightEntry(
+            item=item,
+            lease=None,
+            verify_task=None,
+            merge_wt=merge_wt,
+            was_speculative=False,
+            phase='verifying',
+        )
 
         import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
 
         async def fake_reverify_rebased_tree(*args, **kwargs):
-            # Capture the phase at the moment _reverify_rebased_tree is invoked.
-            captured_phases_reverify.append(worker._verify_phase)
+            # Capture the phase at the moment _reverify_rebased_tree is invoked,
+            # both on the entry and via the live snapshot() observability path.
+            captured_phases_reverify.append(entry.phase)
+            snap = worker.snapshot()
+            vip = snap.get('verify_in_progress')
+            captured_snapshot_reverify.append(vip['phase'] if vip else None)
             # Return None → gate cleared (disjoint/green), advance proceeds.
             return None
 
         original_reverify = mq_module._reverify_rebased_tree
         mq_module._reverify_rebased_tree = fake_reverify_rebased_tree  # type: ignore[attr-defined]
         try:
-            await worker._verify_and_advance(item)
+            await worker._finalize_inflight(entry)
         finally:
             mq_module._reverify_rebased_tree = original_reverify  # type: ignore[attr-defined]
 
@@ -2530,9 +2595,14 @@ class TestGetMergeQueue:
         assert len(captured_phases_reverify) == 1, (
             f'Expected _reverify_rebased_tree called once, got: {len(captured_phases_reverify)}'
         )
-        # Phase must be 'gate_reverify' when _reverify_rebased_tree is invoked
+        # Phase must be 'gate_reverify' when _reverify_rebased_tree is invoked —
+        # on the entry AND as surfaced by snapshot()'s live verify_in_progress.
         assert captured_phases_reverify[0] == 'gate_reverify', (
             f'Expected gate_reverify at reverify call, got: {captured_phases_reverify[0]!r}'
+        )
+        assert captured_snapshot_reverify == ['gate_reverify'], (
+            f'Expected snapshot().verify_in_progress.phase==gate_reverify during '
+            f'reverify, got: {captured_snapshot_reverify}'
         )
 
         # advance_main must have been called twice
@@ -3218,6 +3288,10 @@ class TestMergeStatus:
             module_configs=[], config=config, result=loop.create_future(),
         )
 
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InflightEntry,
+        )
+
         if verify_phase == 'queued':
             await mq.put(req)
         else:
@@ -3234,8 +3308,20 @@ class TestMergeStatus:
             elif verify_phase == 'awaiting_verify':
                 await worker._verifier_queue.put(item)
             else:
-                worker._verify_item = item
-                worker._verify_phase = verify_phase
+                # verifying / gate_reverify / finalizing: the per-entry phase
+                # now lives on an InflightEntry in worker._inflight (the singular
+                # _verify_item/_verify_phase fields were retired in task 1736 —
+                # snapshot() no longer reads them).  snapshot() derives the entry
+                # 'state' from InflightEntry.phase, which the server maps via
+                # _map_live_state.
+                worker._inflight.append(InflightEntry(
+                    item=item,
+                    lease=None,
+                    verify_task=None,
+                    merge_wt=merge_wt,
+                    was_speculative=False,
+                    phase=verify_phase,
+                ))
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
