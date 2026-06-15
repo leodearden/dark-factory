@@ -300,6 +300,16 @@ async def discover_orchestrators(
             'blocked': sum(1 for t in tasks if t.get('status') == 'blocked'),
             'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
         }
+        # Lexicographic max over ISO-8601 strings is correct here because
+        # tasks.py copies updatedAt verbatim from a single upstream source, so
+        # all values share the same format and UTC offset.  If the source ever
+        # emits mixed offsets, switch to key=datetime.fromisoformat.
+        # Scope: top-level tasks only, matching the summary counts above.
+        # If subtask recency should count, flatten the task tree first.
+        last_update = max(
+            (t['updated_at'] for t in tasks if t.get('updated_at')),
+            default=None,
+        )
 
         # Display label: prefer PRD path, fall back to project root path
         prd = next((p['prd'] for p in group if p.get('prd')), None)
@@ -312,6 +322,7 @@ async def discover_orchestrators(
             'project_root': str(project_root),
             'running': any(p['running'] for p in group),
             'started': group[0]['started'],
+            'last_update': last_update,
             'tasks': tasks,
             'worktrees': worktrees,
             'summary': summary,

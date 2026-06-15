@@ -192,7 +192,7 @@ function OverviewTab({ paused }) {
         <div className="panel-body flush">
           <table className="tbl">
             <thead>
-              <tr><th>Orch</th><th>Project</th><th className="num">Modules</th><th className="num">Done</th><th className="num">⏱</th></tr>
+              <tr><th>Orch</th><th>Project</th><th className="num">Modules</th><th className="num">Done</th><th className="num">⏱</th><th>Updated</th></tr>
             </thead>
             <tbody>
               {D.ORCHESTRATORS.map(o => (
@@ -226,6 +226,7 @@ function OverviewTab({ paused }) {
                   })()}</td>
                   <td className="num"><span className="mono">{o.summary.done}/{o.summary.total}</span></td>
                   <td className="num" style={{ color: 'var(--fg-3)', fontSize: 11 }}>{o.started}</td>
+                  <td style={{ color: 'var(--fg-3)', fontSize: 11 }}>{window.DF_SHELL.timeago(o.last_update)}</td>
                 </tr>
               ))}
             </tbody>

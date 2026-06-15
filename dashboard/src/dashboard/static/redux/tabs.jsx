@@ -325,6 +325,7 @@ function OrchTab({ projectFilter, search }) {
                   </div>
                   <div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Started · {o.started}</div>
+                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Updated · {window.DF_SHELL.timeago(o.last_update)}</div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · 30d</div>
                     {(() => {
                       const pb = DF.BURNDOWN_BY_PROJECT[o.project];

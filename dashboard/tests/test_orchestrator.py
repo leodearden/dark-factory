@@ -34,6 +34,7 @@ def _shape_task(task: dict) -> dict | None:
         'priority': task.get('priority'),
         'dependencies': deps,
         'metadata': metadata,
+        'updated_at': task.get('updated_at'),
     }
 
 
@@ -1004,3 +1005,70 @@ class TestDiscoverOrchestratorsPerProject:
 
         assert len(result) == 1
         assert result[0]['project_root'] == str(real_dir)
+
+    async def test_last_update_is_max_updated_at_when_all_tasks_dated(self, tmp_path, fake_fetch_tasks, dummy_client):
+        """last_update equals the most-recent updated_at when all tasks carry the field."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+        fake_fetch_tasks(tmp_path, [
+            {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {},
+             'updated_at': '2026-06-10T10:00:00'},
+            {'id': '2', 'title': 'B', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {},
+             'updated_at': '2026-06-12T15:30:00'},
+            {'id': '3', 'title': 'C', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {},
+             'updated_at': '2026-06-11T08:00:00'},
+        ])
+
+        mock_procs = [{'pid': 1234, 'prd': str(tmp_path / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = await discover_orchestrators(client=dummy_client, config=config)
+
+        assert len(result) == 1
+        assert result[0]['last_update'] == '2026-06-12T15:30:00'
+
+    async def test_last_update_is_none_when_no_task_has_updated_at(self, tmp_path, fake_fetch_tasks, dummy_client):
+        """last_update is None when no task in the tree carries an updated_at value."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+        fake_fetch_tasks(tmp_path, [
+            {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+            {'id': '2', 'title': 'B', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
+        ])
+
+        mock_procs = [{'pid': 5678, 'prd': str(tmp_path / 'prd.md'), 'config_path': None, 'running': True, 'started': '10:30'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = await discover_orchestrators(client=dummy_client, config=config)
+
+        assert len(result) == 1
+        assert result[0]['last_update'] is None
+
+    async def test_last_update_ignores_tasks_without_updated_at(self, tmp_path, fake_fetch_tasks, dummy_client):
+        """last_update equals max over dated tasks; tasks without updated_at are skipped."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+        fake_fetch_tasks(tmp_path, [
+            {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {},
+             'updated_at': '2026-06-09T09:00:00'},
+            {'id': '2', 'title': 'B', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
+            {'id': '3', 'title': 'C', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {},
+             'updated_at': '2026-06-14T20:00:00'},
+        ])
+
+        mock_procs = [{'pid': 9001, 'prd': str(tmp_path / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Apr01'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = await discover_orchestrators(client=dummy_client, config=config)
+
+        assert len(result) == 1
+        assert result[0]['last_update'] == '2026-06-14T20:00:00'
