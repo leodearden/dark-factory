@@ -1541,14 +1541,15 @@ Output JSON matching the schema. Every task must appear in the output.
         if not worktree_base.exists():
             return
 
-        tasks = await self.scheduler.get_tasks()
-        if not tasks:
+        statuses, err = await self.scheduler.get_statuses()
+        if err is not None or not statuses:
             logger.warning(
-                'Orphan reaper: get_tasks() returned empty — aborting sweep '
-                '(fail-safe against transient DB failure)'
+                'Orphan reaper: get_statuses() returned %s — aborting sweep '
+                '(fail-safe against transient DB failure or empty task tree)',
+                'error' if err is not None else 'empty',
             )
             return
-        live_ids = {str(t['id']) for t in tasks}
+        live_ids = {str(k) for k in statuses}
 
         reaped = 0
         quarantined = 0

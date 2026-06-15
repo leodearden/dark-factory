@@ -25,7 +25,7 @@ def harness(tmp_path: Path, mock_orch_config):
 
     h.scheduler = MagicMock()
     h.scheduler._dispatched = set()
-    h.scheduler.get_tasks = AsyncMock(return_value=[{'id': 100}, {'id': 101}])
+    h.scheduler.get_statuses = AsyncMock(return_value=({'100': 'pending', '101': 'done'}, None))
 
     base = (tmp_path / '.worktrees').resolve()
     base.mkdir(parents=True, exist_ok=True)
@@ -104,9 +104,9 @@ class TestOrphanReaper:
         harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
 
     async def test_noop_on_empty_get_tasks(self, harness: Harness):
-        """Empty task list (transient DB failure) aborts the sweep entirely."""
+        """Empty statuses map (transient DB failure) aborts the sweep entirely."""
         _mk(harness.git_ops.worktree_base, '500')
-        harness.scheduler.get_tasks = AsyncMock(return_value=[])
+        harness.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
         await harness._reap_orphan_worktrees()
 
@@ -121,7 +121,7 @@ class TestOrphanReaper:
 
         await harness._reap_orphan_worktrees()
 
-        harness.scheduler.get_tasks.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.prune_worktrees.assert_not_called()  # type: ignore[attr-defined]
 
