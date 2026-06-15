@@ -5728,6 +5728,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if not _ie_req.result.done():
                 _ie_req.result.set_result(shutdown)
             if _ie.verify_task is not None and not _ie.verify_task.done():
+                # Fire remote cancel BEFORE task.cancel() so the remote
+                # verify-merge process is signalled while _inflight_request_id
+                # is still live (mirrors task-1757 _run_inflight_verify fix).
+                # suppress(BaseException) matches the drain's shutdown-defensive
+                # pattern (cf. cancel_and_release suppress below) so a
+                # SIGTERM-driven CancelledError cannot abort the drain loop.
+                if _ie.lease is not None:
+                    with contextlib.suppress(BaseException):
+                        await self._abort_remote_verify(_ie.lease, _ie_req.task_id)
                 _ie.verify_task.cancel()
                 with contextlib.suppress(BaseException):
                     await _ie.verify_task
@@ -6978,9 +6987,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         except BaseException:
                             pass
 
+                    # Cancellation safety note: _downstream entries have been
+                    # moved out of self._inflight, so stop()'s inflight drain
+                    # will not reach any entry that hasn't been processed yet.
+                    # CancelledError from the bare awaits below (_abort_remote_verify
+                    # or cancel_and_release) would leave remaining entries with
+                    # unreleased leases and unresolved futures — the same pre-existing
+                    # risk as the cancel_and_release at line 7022.  In practice,
+                    # stop() terminates the loop via a None sentinel rather than
+                    # direct task cancellation, so the cascade always completes
+                    # before the sentinel is processed.  External task cancellation
+                    # (e.g. test harness timeout) can still hit this window; it is
+                    # accepted as an edge case given the sentinel-based shutdown design.
                     for _entry in _downstream:
                         _entry_status: str | None = None
                         if _entry.verify_task is not None:
+                            # Fire remote cancel BEFORE task.cancel() so the
+                            # remote verify-merge process is signalled while
+                            # _inflight_request_id is still live (mirrors
+                            # task-1757 _run_inflight_verify fix).  Bare await
+                            # mirrors 1757's cascade-style call; the helper
+                            # swallows Exception internally, and CancelledError
+                            # propagates to stop the loop (correct behaviour).
+                            if _entry.lease is not None:
+                                await self._abort_remote_verify(
+                                    _entry.lease, _entry.item.request.task_id,
+                                )
                             _entry.verify_task.cancel()
                             with contextlib.suppress(BaseException):
                                 await _entry.verify_task
