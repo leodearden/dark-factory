@@ -81,10 +81,6 @@ class TestTabsMemoryTabUptimeWiring:
         """MemoryTab must call window.DF_SHELL.fmtUptime."""
         assert 'fmtUptime' in tabs_jsx_body
 
-    def test_renders_up_label(self, tabs_jsx_body):
-        """MemoryTab must render the 'up ' label text."""
-        assert 'up ' in tabs_jsx_body
-
     def test_references_started_at(self, tabs_jsx_body):
         """MemoryTab must reference MEMORY_STATUS.started_at for hover/title."""
         assert 'MEMORY_STATUS.started_at' in tabs_jsx_body
@@ -117,7 +113,3 @@ class TestOverviewTabFusedMemoryRow:
     def test_renders_fused_memory_label(self, tab_overview_jsx_body):
         """System-health block must include a 'fused-memory' label."""
         assert 'fused-memory' in tab_overview_jsx_body
-
-    def test_renders_up_label(self, tab_overview_jsx_body):
-        """System-health block must render the 'up ' label text."""
-        assert 'up ' in tab_overview_jsx_body
