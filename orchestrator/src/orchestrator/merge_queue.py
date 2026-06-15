@@ -7463,6 +7463,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # DROP the request.  Checked first so a gave-up waiter wins
                 # over the operator-halt re-queue when both hold simultaneously.
                 if self._request_abandoned(req):
+                    if not lease.is_local:
+                        with contextlib.suppress(Exception):
+                            await lease.runner.cancel_verify()
                     verify_task.cancel()
                     with contextlib.suppress(BaseException):
                         await verify_task
