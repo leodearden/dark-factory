@@ -12083,6 +12083,97 @@ class TestRunPostMergeVerify:
             f'got {actual_archive_root!r}'
         )
 
+    async def test_failure_reason_contains_infra_timeout_category(self) -> None:
+        """(task 1768 step-9 RED) Timed-out verify → reason contains '[category: infra_timeout]'.
+
+        Fails today because the generic failure block (merge_queue.py:890) does not
+        append the category to the reason string.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        timed_out_result = MagicMock(
+            passed=False,
+            summary='timed out after 7200s',
+            timed_out=True,
+            category='infra_timeout',
+            cause_hint='',
+        )
+        timed_out_result.failure_report.return_value = ''
+        timed_out_result.test_output = ''
+        timed_out_result.lint_output = ''
+        timed_out_result.type_output = ''
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=timed_out_result)),
+            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=99, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        assert result.reason.startswith('Post-merge verification failed:'), (
+            f'Reason prefix must be preserved: {result.reason!r}'
+        )
+        assert '[category: infra_timeout]' in result.reason, (
+            f'Expected "[category: infra_timeout]" in reason; got: {result.reason!r}'
+        )
+
+    async def test_failure_reason_contains_test_failure_category(self) -> None:
+        """(task 1768 step-9 RED) Real test failure → reason contains '[category: test_failure]'.
+
+        Fails today because the generic failure block does not append the category.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        merge_wt = MagicMock()
+
+        test_fail_result = MagicMock(
+            passed=False,
+            summary='test-fail',
+            timed_out=False,
+            category='test_failure',
+            cause_hint='assert x == y',
+        )
+        test_fail_result.failure_report.return_value = ''
+        test_fail_result.test_output = ''
+        test_fail_result.lint_output = ''
+        test_fail_result.type_output = ''
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.run_scoped_verification', AsyncMock(return_value=test_fail_result)),
+            patch('orchestrator.merge_queue._classify_main_health_red', AsyncMock(return_value=None)),
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+            )
+
+        assert result is not None
+        assert result.status == 'blocked'
+        # Existing assertions must still pass (prefix + known substring)
+        assert result.reason.startswith('Post-merge verification failed:'), (
+            f'Reason prefix must be preserved: {result.reason!r}'
+        )
+        assert 'Post-merge verification failed: test-fail' in result.reason, (
+            f'Summary substring must survive: {result.reason!r}'
+        )
+        assert '[category: test_failure]' in result.reason, (
+            f'Expected "[category: test_failure]" in reason; got: {result.reason!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests
