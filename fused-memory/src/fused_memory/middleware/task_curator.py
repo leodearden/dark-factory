@@ -907,6 +907,9 @@ class TaskCurator:
                     zero_output_timeout=exc.zero_output_timeout,
                     account_name=exc.account_name or None,
                     proc_tree=exc.proc_tree or None,
+                    subtype=exc.subtype,
+                    cost_usd=exc.cost_usd,
+                    pool_sizes=pool_sizes,
                 )
             else:
                 logger.warning(
