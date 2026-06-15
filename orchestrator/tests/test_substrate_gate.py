@@ -335,3 +335,267 @@ class TestRunSubstrateRecheck:
             task=task, worktree='/gate', run_subprocess=fake_checker(rc=0)
         )
         assert verdict.verdict == PASS
+
+
+# ---------------------------------------------------------------------------
+# Step-7 RED: harness _run_substrate_gate + _block_and_escalate_substrate_flip
+# ---------------------------------------------------------------------------
+
+from pathlib import Path
+
+
+def _make_harness(tmp_path: Path):
+    """Build a bare Harness with mocked internals for substrate-gate tests.
+
+    Patches:
+    - McpLifecycle, OverrideStore, Scheduler, BriefingAssembler (construction)
+    - harness.git_ops.resolve_branch_sha → returns a fake main SHA
+    - harness.git_ops.worktree_base → tmp_path / '.worktrees'
+    - harness.scheduler.set_task_status → AsyncMock
+    """
+    from unittest.mock import MagicMock, AsyncMock, patch
+    from orchestrator.harness import Harness
+    from orchestrator.config import OrchestratorConfig
+
+    config = OrchestratorConfig(project_root=tmp_path, max_per_module=1)
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.OverrideStore'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        h = Harness(config)
+
+    # Wire stub scheduler
+    h.scheduler = MagicMock()
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.carries_substrate_probe = MagicMock(return_value=True)
+
+    # Wire stub git_ops
+    h.git_ops = MagicMock()
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' * 5)  # 40-char SHA
+    h.git_ops.worktree_base = tmp_path / '.worktrees'
+    h.git_ops.project_root = tmp_path
+
+    # No escalation queue by default — tests that need one attach it explicitly
+    h._escalation_queue = None
+
+    return h
+
+
+def _make_assignment(task_id: str = '42', probe: bool = True):
+    """Build a minimal TaskAssignment-like object."""
+    task = make_probe_task() if probe else {'id': task_id, 'title': 'Plain', 'metadata': {}}
+    task['id'] = task_id
+
+    from unittest.mock import MagicMock
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = task
+    return assignment
+
+
+def _pass_verdict():
+    from orchestrator.substrate_gate import SubstrateVerdict, PASS
+    return SubstrateVerdict(
+        verdict=PASS,
+        exit_code=0,
+        checker_argv=['run_check', 'probes/foo.json'],
+        probe_set='probes/foo.json',
+        reason='all probes PASS',
+    )
+
+
+def _flip_verdict():
+    from orchestrator.substrate_gate import SubstrateVerdict, FLIP
+    return SubstrateVerdict(
+        verdict=FLIP,
+        exit_code=1,
+        checker_argv=['run_check', 'probes/foo.json'],
+        probe_set='probes/foo.json',
+        reason='PASS→FAIL flip detected',
+    )
+
+
+def _skip_verdict():
+    from orchestrator.substrate_gate import SubstrateVerdict, SKIP
+    return SubstrateVerdict(
+        verdict=SKIP,
+        exit_code=None,
+        checker_argv=None,
+        probe_set=None,
+        reason='no descriptor',
+    )
+
+
+class TestRunSubstrateGate:
+    """Unit tests for ``Harness._run_substrate_gate``."""
+
+    @pytest.mark.asyncio
+    async def test_returns_true_on_pass(self, tmp_path: Path, monkeypatch):
+        """PASS verdict → gate returns True (dispatch allowed)."""
+        h = _make_harness(tmp_path)
+        assignment = _make_assignment()
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+        # Patch asyncio subprocess calls for worktree add/remove
+        with patch('asyncio.create_subprocess_exec', new=AsyncMock(
+            return_value=_fake_proc(0)
+        )):
+            result = await h._run_substrate_gate(assignment)
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_returns_true_on_skip(self, tmp_path: Path, monkeypatch):
+        """SKIP verdict (no descriptor) → gate returns True (dispatch allowed)."""
+        h = _make_harness(tmp_path)
+        assignment = _make_assignment(probe=False)
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _skip_verdict(),
+        )
+        with patch('asyncio.create_subprocess_exec', new=AsyncMock(
+            return_value=_fake_proc(0)
+        )):
+            result = await h._run_substrate_gate(assignment)
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_flip_and_calls_escalate(self, tmp_path: Path, monkeypatch):
+        """FLIP verdict → gate returns False AND invokes _block_and_escalate_substrate_flip."""
+        h = _make_harness(tmp_path)
+        assignment = _make_assignment()
+        escalate_calls: list = []
+
+        async def _fake_escalate(task_id, *, verdict):
+            escalate_calls.append((task_id, verdict))
+
+        h._block_and_escalate_substrate_flip = _fake_escalate
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _flip_verdict(),
+        )
+        with patch('asyncio.create_subprocess_exec', new=AsyncMock(
+            return_value=_fake_proc(0)
+        )):
+            result = await h._run_substrate_gate(assignment)
+
+        assert result is False
+        assert len(escalate_calls) == 1
+        assert escalate_calls[0][0] == '42'
+
+    @pytest.mark.asyncio
+    async def test_gate_worktree_torn_down_in_finally(self, tmp_path: Path, monkeypatch):
+        """Gate worktree is removed in finally even when run_substrate_recheck raises."""
+        h = _make_harness(tmp_path)
+        assignment = _make_assignment()
+        remove_calls: list = []
+
+        def _track_create_subprocess_exec(*args, **kwargs):
+            # Track 'git worktree remove' calls to verify cleanup
+            if 'remove' in args:
+                remove_calls.append(args)
+            return _fake_proc(0)
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            MagicMock(side_effect=RuntimeError('checker crashed')),
+        )
+
+        proc_mock = AsyncMock(return_value=_fake_proc(0))
+
+        with patch('asyncio.create_subprocess_exec', proc_mock):
+            # Should not propagate the error (gate catches it and returns False or raises)
+            try:
+                result = await h._run_substrate_gate(assignment)
+            except Exception:
+                pass
+
+        # Regardless of how _run_substrate_gate handles the exception,
+        # verify that 'git worktree remove' was called (finally ran)
+        all_calls = [list(c.args) for c in proc_mock.call_args_list]
+        remove_seen = any('remove' in str(call) for call in all_calls)
+        assert remove_seen, (
+            f'Expected git worktree remove to be called in finally; calls={all_calls!r}'
+        )
+
+
+def _fake_proc(returncode: int):
+    """Return a minimal asyncio.Process mock."""
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.communicate = AsyncMock(return_value=(b'', b''))
+    proc.wait = AsyncMock(return_value=returncode)
+    return proc
+
+
+class TestBlockAndEscalateSubstrateFlip:
+    """Unit tests for ``Harness._block_and_escalate_substrate_flip``."""
+
+    @pytest.mark.asyncio
+    async def test_sets_task_blocked(self, tmp_path: Path):
+        """set_task_status('blocked') is called with the task_id."""
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+
+        verdict = _flip_verdict()
+        await h._block_and_escalate_substrate_flip('99', verdict=verdict)
+
+        h.scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')
+
+    @pytest.mark.asyncio
+    async def test_files_l1_escalation_design_concern(self, tmp_path: Path):
+        """Files exactly one L1 with category='design_concern' and severity='blocking'."""
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        verdict = _flip_verdict()
+        await h._block_and_escalate_substrate_flip('77', verdict=verdict)
+
+        pending = esc_queue.get_pending()
+        l1s = [e for e in pending if e.task_id == '77' and e.level == 1]
+        assert len(l1s) == 1, f'Expected exactly 1 L1 for task 77; got {l1s!r}'
+        esc = l1s[0]
+        assert esc.category == 'design_concern'
+        assert esc.severity == 'blocking'
+
+    @pytest.mark.asyncio
+    async def test_deduped_by_has_open_l1(self, tmp_path: Path):
+        """Second call with open L1 is suppressed (no duplicate filed)."""
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+
+        verdict = _flip_verdict()
+        await h._block_and_escalate_substrate_flip('55', verdict=verdict)
+        await h._block_and_escalate_substrate_flip('55', verdict=verdict)
+
+        pending = esc_queue.get_pending()
+        l1s = [e for e in pending if e.task_id == '55' and e.level == 1]
+        assert len(l1s) == 1, f'Expected exactly 1 L1 after dedup; got {l1s!r}'
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_escalation_queue(self, tmp_path: Path):
+        """No-ops gracefully when _escalation_queue is None (bare-harness tests)."""
+        h = _make_harness(tmp_path)
+        h._escalation_queue = None  # bare-harness scenario
+
+        verdict = _flip_verdict()
+        # Should not raise
+        await h._block_and_escalate_substrate_flip('33', verdict=verdict)
+
+        # set_task_status is still called (blocking the task is unconditional)
+        h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')
