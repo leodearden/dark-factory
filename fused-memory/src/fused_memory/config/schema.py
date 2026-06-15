@@ -589,6 +589,19 @@ class CuratorConfig(BaseModel):
     # net for occasional stalls. Tunable.
     batch_token_threshold: int = Field(default=50_000)
 
+    # Single-call budget scaling — mirrors the batch formula but scales by
+    # pool size (the prompt-token cost driver for single-candidate calls):
+    #   budget = min(max_budget_usd + per_pool_entry_budget_usd * len(pool),
+    #                single_call_budget_cap_usd)
+    # Numeric basis: full 30-entry pool (pool_total_cap=30) →
+    #   0.30 + 0.0125*30 = $0.675 ≈ 2.2× the measured legitimate full-pool
+    #   cost of $0.30574 (esc-task-curator-191), inside the $0.60–$0.75 PRD
+    #   target.  Empty pool stays at the $0.30 max_budget_usd baseline.
+    #   The cap (0.75) sits above the realistic max for pool_total_cap=30
+    #   so it is a pure safety net against pathological pool sizes (>36).
+    per_pool_entry_budget_usd: float = Field(default=0.0125)
+    single_call_budget_cap_usd: float = Field(default=0.75)
+
     # Background janitor that surfaces failed tickets to the orchestrator.
     janitor: TicketJanitorConfig = Field(default_factory=TicketJanitorConfig)
 

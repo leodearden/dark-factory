@@ -30,8 +30,11 @@ note makes the burst visible to operators without flooding the queue.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
+import json
 import logging
+import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,17 +78,160 @@ class CuratorEscalator:
     # Queue the first N failures in a burst window; suppress the rest.
     _ESCALATE_FIRST_N = 3
 
-    def __init__(self, cooldown_secs: float = _DEFAULT_COOLDOWN_SECS) -> None:
+    def __init__(
+        self,
+        cooldown_secs: float = _DEFAULT_COOLDOWN_SECS,
+        state_path: str | Path | None = None,
+    ) -> None:
         self._cooldown_secs = cooldown_secs
-        # project_id → monotonic timestamps of recent failures in the window.
-        # Pruned on every ``report_failure`` call; a server restart resets
-        # the burst, which is desired (operator gets fresh visibility).
-        self._failure_log: dict[str, list[float]] = {}
+        self._state_path: Path | None = Path(state_path) if state_path is not None else None
+        # (project_id, subtype) → wall-clock timestamps (time.time()) of recent
+        # failures in the window.  Keyed by the composite so different subtypes
+        # for the same project are counted independently (e.g. error_max_budget_usd
+        # and error_max_turns don't share quota).  Wall-clock is used so timestamps
+        # survive a process restart when persisted; monotonic resets on restart
+        # making reloaded values meaningless.
+        # Pruned on every report_failure call.
+        self._failure_log: dict[tuple[str, str | None], list[float]] = {}
         self._queues: dict[str, EscalationQueue] = {}
         # project_id → monotonic timestamp of the last submitted ZOT escalation.
         # Prevents a batch of N concurrent curate() ZOT calls from flooding the
         # escalation queue with N identical entries for a single outage event.
+        # Stays monotonic — in-process dedup, intentionally reset on restart.
         self._zot_last_submitted: dict[str, float] = {}
+        # Serialise concurrent _persist_state calls so only one write is ever
+        # in flight.  Mirrors the asyncio.Lock instances held by TaskInterceptor
+        # (task_interceptor.py:288-289,1308,1332) for per-project mutations.
+        # Constructed without a running loop (valid on py>=3.10).
+        self._persist_lock: asyncio.Lock = asyncio.Lock()
+        # Reload persisted burst log if state_path is set and exists.
+        if self._state_path is not None and self._state_path.exists():
+            self._load_state()
+
+    # ------------------------------------------------------------------
+    # State persistence helpers (burst log, restart-durable)
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        """Load _failure_log from state_path JSON on construction.
+
+        Format: a JSON array of records::
+
+            [{"project_id": str, "subtype": str|null, "timestamps": [float, ...]}, ...]
+
+        Entries older than cooldown_secs are pruned on load.  A missing,
+        empty, or corrupt file is tolerated (logged at WARNING; starts empty)
+        because the curator has a best-effort contract — a broken state file
+        must never prevent ``add_task`` from succeeding.
+        """
+        assert self._state_path is not None
+        now = time.time()
+        cutoff = now - self._cooldown_secs
+        try:
+            text = self._state_path.read_text()
+            if not text.strip():
+                return
+            records = json.loads(text)
+            dropped = 0
+            for rec in records:
+                try:
+                    project_id = rec['project_id']
+                    subtype = rec.get('subtype')  # may be None
+                    timestamps = [t for t in rec['timestamps'] if t >= cutoff]
+                    if timestamps:
+                        self._failure_log[(project_id, subtype)] = timestamps
+                except (KeyError, TypeError, ValueError):
+                    dropped += 1
+                    continue
+            if dropped:
+                logger.warning(
+                    'curator_escalator: skipped %d malformed record(s) while '
+                    'loading state from %s; remaining records loaded normally',
+                    dropped,
+                    self._state_path,
+                )
+        except Exception:
+            logger.warning(
+                'curator_escalator: failed to load state from %s; starting empty',
+                self._state_path,
+                exc_info=True,
+            )
+
+    async def _persist_state(self) -> None:
+        """Atomically write _failure_log to state_path as JSON.
+
+        Prunes all globally stale entries (timestamps older than the cooldown
+        window) before writing so the file stays bounded to the active window —
+        not just the key that was most recently touched.  The write is offloaded
+        via :func:`asyncio.to_thread` to avoid blocking the event loop under
+        burst load.
+
+        Concurrent ``report_failure`` calls (e.g. from a batch ZOT bisect that
+        spawns N concurrent size-1 curate() calls) are serialised by
+        ``_persist_lock``: only one persist is ever in flight at a time.  This
+        means the later-acquiring coroutine takes a fresh snapshot of the full
+        current ``_failure_log`` (containing all keys updated so far) — a stale
+        snapshot can never overwrite a fresher one, and a single writer always
+        touches the temp file at a time.
+
+        Each ``_write`` closure gets a unique temp filename
+        ``<state>.{pid}.{id(payload)}.tmp`` (mirroring event_queue.py's
+        disjoint-path discipline) so two writers can never share a temp path,
+        with ``finally`` cleanup to ensure a failed/garbage temp never lingers.
+
+        Uses write-to-temp + os.replace so a crash mid-write never corrupts
+        the existing file.  Only called when state_path is set.
+        """
+        if self._state_path is None:
+            return
+        async with self._persist_lock:
+            # Prune globally before serialising so stale (project_id, subtype)
+            # pairs do not accumulate in memory or on disk across long-lived
+            # processes.  Snapshot is taken inside the lock so the later-
+            # acquiring coroutine always sees the complete current log.
+            now = time.time()
+            cutoff = now - self._cooldown_secs
+            for key in list(self._failure_log.keys()):
+                pruned = [t for t in self._failure_log[key] if t >= cutoff]
+                if pruned:
+                    self._failure_log[key] = pruned
+                else:
+                    del self._failure_log[key]
+            records = [
+                {
+                    'project_id': project_id,
+                    'subtype': subtype,
+                    'timestamps': timestamps,
+                }
+                for (project_id, subtype), timestamps in self._failure_log.items()
+            ]
+            # Serialise the snapshot on the calling thread; only the I/O runs
+            # in the thread pool so we don't hold the lock during the blocking
+            # write.
+            payload = json.dumps(records)
+            state_path = self._state_path
+
+            def _write() -> None:
+                # Unique temp path per write: pid + id(payload) ensures two
+                # concurrent writers (if they somehow bypass the lock) never
+                # share a temp file name.  Defense-in-depth: mirrors
+                # event_queue.py's disjoint-indexed-path discipline.
+                tmp_path = state_path.parent / (
+                    f'{state_path.name}.{os.getpid()}.{id(payload)}.tmp'
+                )
+                try:
+                    tmp_path.write_text(payload)
+                    os.replace(tmp_path, state_path)
+                except Exception:
+                    logger.warning(
+                        'curator_escalator: failed to persist state to %s',
+                        state_path,
+                        exc_info=True,
+                    )
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+
+            await asyncio.to_thread(_write)
 
     def _orchestrator_running(self, project_root: str) -> bool:
         """Return True if the project's orchestrator holds its exclusive lock.
@@ -139,6 +285,9 @@ class CuratorEscalator:
         zero_output_timeout: bool = False,
         account_name: str | None = None,
         proc_tree: str | None = None,
+        subtype: str | None = None,
+        cost_usd: float | None = None,
+        pool_sizes: dict[str, int] | None = None,
     ) -> None:
         """Route a curator failure. Raises :class:`CuratorFailureError` when no
         orchestrator is running so the MCP caller sees a loud error.
@@ -209,11 +358,14 @@ class CuratorEscalator:
             )
             return
 
-        now = time.monotonic()
+        now = time.time()  # wall-clock: stable across restarts (unlike monotonic)
         cutoff = now - self._cooldown_secs
-        log = [t for t in self._failure_log.get(project_id, []) if t >= cutoff]
+        log_key = (project_id, subtype)
+        log = [t for t in self._failure_log.get(log_key, []) if t >= cutoff]
         log.append(now)
-        self._failure_log[project_id] = log
+        self._failure_log[log_key] = log
+        # Persist the updated burst log so the counter survives a watchdog restart.
+        await self._persist_state()
         count = len(log)
         burst_started = log[0]
 
@@ -241,6 +393,10 @@ class CuratorEscalator:
             detail_lines.append(f'timed_out={timed_out}')
         if duration_ms is not None:
             detail_lines.append(f'duration_ms={duration_ms}')
+        if cost_usd is not None:
+            detail_lines.append(f'cost_usd={cost_usd}')
+        if pool_sizes is not None:
+            detail_lines.append(f'pool_sizes={pool_sizes}')
         detail_lines.append(f'justification={justification}')
 
         if count == self._ESCALATE_FIRST_N:

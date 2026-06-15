@@ -108,6 +108,30 @@ def test_resolve_curator_cost_store_path(reconciliation_cfg, expected):
 
 
 # ---------------------------------------------------------------------------
+# step-13: _resolve_curator_escalator_state_path helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('reconciliation_cfg', 'expected'),
+    [
+        (None, Path('./data/curator_escalator_state.json')),
+        (MagicMock(data_dir='/tmp/recon'), Path('/tmp/recon/curator_escalator_state.json')),
+    ],
+    ids=['fallback', 'with_data_dir'],
+)
+def test_resolve_curator_escalator_state_path(reconciliation_cfg, expected):
+    """Path helper returns correct state-file path based on reconciliation config."""
+    # Lazy import so a missing helper produces a test failure, not a module
+    # import error that would break ALL tests in this file.
+    from fused_memory.server.main import _resolve_curator_escalator_state_path  # noqa: PLC0415
+
+    config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+    config.reconciliation = reconciliation_cfg
+    assert _resolve_curator_escalator_state_path(config) == expected
+
+
+# ---------------------------------------------------------------------------
 # step-1 / step-3: TestCuratorUsageGateLeakGuard
 #
 # Tests for the extracted _setup_curator_usage_gate helper that guards the
