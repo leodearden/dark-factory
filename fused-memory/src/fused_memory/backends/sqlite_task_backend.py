@@ -545,6 +545,43 @@ class SqliteTaskBackend:
             out['id'] = int(out['id'])
         return out
 
+    async def get_statuses_raw(
+        self,
+        project_root: str,
+        tag: str | None = None,
+        ids: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Return ``{id_str: status_str}`` for tasks, reading ONLY ``id`` and ``status``.
+
+        This is the O(K) status-only path — it never calls
+        ``_get_tasks_internal``, ``_row_to_task``, or ``json.loads``,
+        so metadata columns are never decoded.
+
+        Args:
+            project_root: Absolute path to the project root.
+            tag: Tag context; defaults to ``DEFAULT_TAG`` when ``None``.
+            ids: Reserved for the ids-filter path (step-4).  Currently ignored;
+                 all tasks are always returned.
+
+        Returns:
+            ``{str(id): status}`` mapping.
+            A ``NULL`` status (defensive; unreachable via normal writes) maps to
+            ``'unknown'``.
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        conn = await self._get_connection(project_root)
+
+        cursor = await conn.execute(
+            'SELECT id, status FROM tasks WHERE tag = ?',
+            (tag,),
+        )
+        rows = await cursor.fetchall()
+        return {
+            str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
+            for row in rows
+        }
+
     async def set_task_status(
         self,
         task_id: str,

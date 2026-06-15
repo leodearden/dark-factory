@@ -26,7 +26,7 @@ from fused_memory.backends.task_backend_types import (
 
 @runtime_checkable
 class TaskBackendProtocol(Protocol):
-    """The 11-method + lifecycle surface every task backend must implement."""
+    """The 12-method + lifecycle surface every task backend must implement."""
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -65,6 +65,15 @@ class TaskBackendProtocol(Protocol):
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict: ...
+
+    async def get_statuses_raw(
+        self,
+        project_root: str,
+        tag: str | None = None,
+        ids: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Return ``{id_str: status_str}`` without decoding metadata columns."""
+        ...
 
     # ── Mutations ──────────────────────────────────────────────────────
 
