@@ -7153,3 +7153,80 @@ def test_escalate_suppressed_when_dismissed_within_window(
     assert len(suppression_records) >= 1, (
         f'Expected a suppression log for dismissed status, got: {[r.getMessage() for r in caplog.records]}'
     )
+
+
+# ── Storm alarm dedup-fold test (task 1755 step-7) ────────────────────────────
+
+
+def test_dead_owner_storm_alarm_folds_to_single_pending_escalation(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+):
+    """Two storm alarm submissions with the SAME stable finding identity must fold
+    to a SINGLE pending escalation (dedup via _RECON_DEDUP_CONFIG).
+
+    Simulates two consecutive storm windows firing different summaries/run_ids
+    but the same _DEAD_OWNER_STORM_FINDING.  The expected fingerprint is
+    compute_content_fingerprint('recon_watchdog_kill_storm',
+        'recon_watchdog_kill_storm',
+        ['dead_owner_shielded_suppression_storm'],
+        'dead_owner_shielded recon_stale_run suppression storm').
+
+    RED:  'recon_watchdog_kill_storm' not yet in infra_dedupe_categories →
+          submit_or_dedupe treats it like an un-tracked category and creates
+          two separate pending escalations.
+    GREEN (step-8): adding it to infra_dedupe_categories folds them to one.
+
+    Also asserts the storm escalation's severity is 'blocking' (new category
+    not in the info-category list in _escalate, so it maps to 'blocking').
+    """
+    from escalation.dedupe import compute_content_fingerprint  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import _DEAD_OWNER_STORM_FINDING
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    # Compute the expected fingerprint from the STABLE finding identity
+    expected_fp = compute_content_fingerprint(
+        'recon_watchdog_kill_storm',
+        _DEAD_OWNER_STORM_FINDING['category'],
+        list(_DEAD_OWNER_STORM_FINDING['affected_ids']),
+        _DEAD_OWNER_STORM_FINDING['description'],
+    )
+
+    # First storm window
+    harness._escalate(
+        'recon_watchdog_kill_storm',
+        'run-aaaa1111',
+        'dead_owner_shielded suppression storm: 6 in 60 min (projects: project-a) — '
+        'watchdog SIGABRT churn — full recon runs not completing',
+        detail='detail-a',
+        finding=_DEAD_OWNER_STORM_FINDING,
+    )
+
+    # Second storm window — different summary/run_id, same finding identity
+    harness._escalate(
+        'recon_watchdog_kill_storm',
+        'run-bbbb2222',
+        'dead_owner_shielded suppression storm: 9 in 60 min (projects: project-a, project-b) — '
+        'watchdog SIGABRT churn — full recon runs not completing',
+        detail='detail-b',
+        finding=_DEAD_OWNER_STORM_FINDING,
+    )
+
+    # Exactly one pending escalation carrying the stable fingerprint
+    pending_with_fp = [e for e in esc_queue.get_pending() if e.dedupe_fingerprint == expected_fp]
+    assert len(pending_with_fp) == 1, (
+        f'Expected exactly one pending storm escalation (dedup fold); '
+        f'got {len(pending_with_fp)}: {pending_with_fp}'
+    )
+
+    # The storm escalation must be blocking (new category not in info list)
+    assert pending_with_fp[0].severity == 'blocking', (
+        f'Storm alarm must be blocking; got {pending_with_fp[0].severity!r}'
+    )
