@@ -11,7 +11,7 @@ This skill is the **front-end discipline that runs before any task reaches the o
 - **Fake-done leaves** — a task marked done with load-bearing wiring absent because its only "signal" was a synthetic-input unit test (G2).
 - **Integration starvation** — cross-crate/cross-module integration steps get starved or never queued under narrow file locks; the fix is upfront contracts + two-way boundary tests on high-stakes seams (G5).
 - **Grammar/substrate fictions** — the PRD assumes a substrate capability (parser production, API endpoint, schema, CLI flag, library fn) that doesn't exist (G3).
-- **False premises** — a leaf signal asserts a number / exactness / capability that is impossible or misattributed to a task that can't produce it (G6).
+- **False premises** — a leaf signal asserts a number / exactness / capability / rejection that is impossible, misattributed, or unbacked by an active rejection mechanism (G6).
 
 These are **orchestrator-level** failure modes, not project-specific ones — which is why this skill generalizes. Project-specific knowledge (signal vocabulary, the G3 verifier, exemplars, domain hazards, memory namespace) is supplied by a per-project **overlay**; the gates themselves are universal.
 
@@ -65,7 +65,7 @@ Each gate has a calibrated response level. See `references/gates.md` for what ea
 | **G3** | Every assumed substrate capability (syntax, endpoint, schema, flag, library fn) is verified to exist OR queued as an explicit prerequisite | **block** |
 | **G4** | Cross-PRD seams have a named owner; reciprocal "the other owns it" patterns resolved | **prompt** |
 | **G5** | High-stakes / architecturally-complex PRDs use approach **B + H** (contracts + two-way boundary tests) rather than bare B | **prompt with heuristic** |
-| **G6** | Every signal asserting a number/exactness/end-to-end capability has its premise validated — achievable, true, and producible from the task's own dependency set | **block** |
+| **G6** | Every signal asserting a number/exactness/end-to-end capability/rejection has its premise validated — achievable, true, producible from the task's own dependency set, and rejection-mechanism-backed | **block** |
 | **Manifest** | Per-leaf capability→evidence bindings committed beside the PRD (mechanizes G3+G6: anti-orphan/wired, anti-inversion, field-population, grammar-fixture, numeric-floor); any FAIL binding blocks queueing | **block** (decompose) |
 | **META** | The "yes" question above | **block** at PRD save |
 
