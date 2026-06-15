@@ -414,3 +414,43 @@ class TestFetchTasksCache:
         assert mock_mcp.call_count == 2, (
             f'expected 2 MCP calls after TTL expiry (TTL=0.0), got {mock_mcp.call_count}'
         )
+
+    async def test_fetch_tasks_list_copy_is_shallow_not_deep(
+        self, dummy_client, dummy_config
+    ):
+        """Documents shallow-copy contract: inner task dict mutation IS visible in cache.
+
+        ``list()`` provides list-level isolation only (proven by
+        ``test_fetch_tasks_returned_list_is_a_copy``).  Inner task dicts are
+        *shared* references between the returned list and the cached tuple;
+        mutating a field in a returned task dict WILL be reflected in
+        subsequent within-TTL cache hits.
+
+        This test documents the contract boundary so that:
+        (a) callers know not to mutate returned task dicts in place, and
+        (b) if the implementation switches to ``copy.deepcopy`` this test will
+            fail, flagging the contract change.
+
+        Current callers (active_tasks, shape_escalations) build fresh rows and
+        do not mutate source dicts, so there is no live bug today.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            first = await fetch_tasks(dummy_client, dummy_config, '/proj/G')
+            assert first, 'expected at least one task from canned result'
+            # Mutate a field in the first task dict — this touches the shared
+            # object stored in the cache (shallow copy only guards the list wrapper).
+            first[0]['__shallow_copy_marker__'] = True
+            # Second call within TTL — served from cache without a new MCP call.
+            second = await fetch_tasks(dummy_client, dummy_config, '/proj/G')
+
+        assert mock_mcp.call_count == 1, 'expected single MCP call (both within TTL)'
+        # Shallow copy: the inner dict mutation IS visible in the cached entry.
+        # This assertion documents the known contract; if it fails, the
+        # implementation has switched to deepcopy (update docstring accordingly).
+        assert second[0].get('__shallow_copy_marker__') is True, (
+            'list() is shallow — inner dict mutation is shared with the cache; '
+            'callers must not mutate returned task dicts in place'
+        )
