@@ -2466,16 +2466,36 @@ Output JSON matching the schema. Every task must appear in the output.
         gate_path = self.git_ops.worktree_base / f'_substrate-gate-{task_id}'
 
         # Resolve current-main SHA for a deterministic, drift-isolated gate run.
-        main_sha = await self.git_ops.resolve_branch_sha('main')
+        # Use self.config.git.main_branch (not the literal 'main') so any configured
+        # non-default branch (e.g. 'master', 'trunk') works correctly.
+        main_sha = await self.git_ops.resolve_branch_sha(self.config.git.main_branch)
         if main_sha is None:
-            # Fallback: use 'main' symbolic ref; if that also fails the worktree
-            # add will error and we map to FLIP in the exception handler below.
-            main_sha = 'main'
+            # Fallback: use the configured branch name as a symbolic ref.  If that
+            # also fails the worktree add will error and map to FLIP below.
+            main_sha = self.config.git.main_branch
             logger.warning(
                 'substrate_gate: resolve_branch_sha returned None for task %s; '
-                'falling back to "main" symbolic ref',
-                task_id,
+                'falling back to %r symbolic ref',
+                task_id, self.config.git.main_branch,
             )
+
+        # Best-effort cleanup of any stale gate worktree left by a prior interrupted
+        # run.  Without this, 'worktree add' fails with 'already exists' and maps to
+        # a spurious FLIP + L1, requiring manual intervention.
+        for _cleanup_argv in (
+            ('git', 'worktree', 'remove', '--force', str(gate_path)),
+            ('git', 'worktree', 'prune'),
+        ):
+            try:
+                _cleanup_proc = await asyncio.create_subprocess_exec(
+                    *_cleanup_argv,
+                    cwd=str(self.git_ops.project_root),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await _cleanup_proc.communicate()
+            except Exception:
+                pass  # best-effort; path may simply not exist
 
         # Build ephemeral detached worktree — mirrors evals/snapshots.py pattern.
         proc = await asyncio.create_subprocess_exec(
@@ -2484,12 +2504,18 @@ Output JSON matching the schema. Every task must appear in the output.
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await proc.communicate()
+        _add_stdout, _add_stderr = await proc.communicate()
         if proc.returncode != 0:
+            stderr_snippet = _add_stderr.decode('utf-8', errors='replace').strip()[:200]
+            reason = (
+                f'substrate unverifiable / git worktree add failed (rc={proc.returncode})'
+            )
+            if stderr_snippet:
+                reason = f'{reason}: {stderr_snippet}'
             logger.warning(
-                'substrate_gate: git worktree add failed for task %s (rc=%s); '
+                'substrate_gate: git worktree add failed for task %s (rc=%s) stderr=%r; '
                 'treating as FLIP (substrate unverifiable)',
-                task_id, proc.returncode,
+                task_id, proc.returncode, stderr_snippet,
             )
             await self._block_and_escalate_substrate_flip(
                 task_id,
@@ -2498,7 +2524,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     exit_code=proc.returncode,
                     checker_argv=None,
                     probe_set=None,
-                    reason=f'substrate unverifiable / git worktree add failed (rc={proc.returncode})',
+                    reason=reason,
                 ),
             )
             return False

@@ -571,6 +571,98 @@ class TestRunSubstrateGate:
             'the entire asyncio event loop during a 120s subprocess.run call'
         )
 
+    @pytest.mark.asyncio
+    async def test_worktree_add_uses_resolved_sha_and_gate_path(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """git worktree add is called with the resolved main SHA and the correct gate path.
+
+        Regression guard: a wrong SHA variable or wrong gate_path in the argv would
+        build the worktree at the wrong commit or path and silently let drift through.
+        """
+        h = _make_harness(tmp_path)
+        assignment = _make_assignment()
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+
+        exec_mock = AsyncMock(return_value=_fake_proc(0))
+        with patch('asyncio.create_subprocess_exec', exec_mock):
+            result = await h._run_substrate_gate(assignment)
+
+        assert result is True
+
+        # Locate the 'git worktree add' call among all subprocess calls
+        # (pre-cleanup remove/prune + actual add + finally remove).
+        all_calls = exec_mock.call_args_list
+        add_calls = [c for c in all_calls if 'add' in c.args]
+        assert len(add_calls) == 1, (
+            f'Expected exactly 1 worktree add call; found {len(add_calls)}; '
+            f'calls={[c.args for c in all_calls]!r}'
+        )
+        add_args = add_calls[0].args
+
+        # The resolved SHA (from _make_harness: resolve_branch_sha returns 'deadbeef' * 5)
+        expected_sha = 'deadbeef' * 5
+        # The expected gate path (worktree_base / '_substrate-gate-<task_id>')
+        expected_gate_path = str(tmp_path / '.worktrees' / '_substrate-gate-42')
+
+        assert expected_sha in add_args, (
+            f'Resolved main SHA not found in worktree add argv: {add_args!r}'
+        )
+        assert expected_gate_path in add_args, (
+            f'Gate path not found in worktree add argv: {add_args!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_worktree_add_uses_symbolic_ref_fallback_when_sha_none(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """When resolve_branch_sha returns None the fallback branch name is used as ref.
+
+        Exercises the None-fallback branch: the gate should still proceed (dispatch
+        is allowed when the worktree add succeeds on the fallback ref), and the
+        worktree add argv should contain the branch name rather than a resolved SHA.
+        """
+        h = _make_harness(tmp_path)
+        # Override the mock so resolve_branch_sha returns None → triggers fallback
+        h.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+        assignment = _make_assignment()
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+
+        exec_mock = AsyncMock(return_value=_fake_proc(0))
+        with patch('asyncio.create_subprocess_exec', exec_mock):
+            result = await h._run_substrate_gate(assignment)
+
+        # Gate still returns True — PASS verdict proceeds even on the fallback path.
+        assert result is True, 'gate should return True (PASS) even with SHA-None fallback'
+
+        # Find the 'git worktree add' call
+        all_calls = exec_mock.call_args_list
+        add_calls = [c for c in all_calls if 'add' in c.args]
+        assert len(add_calls) == 1, (
+            f'Expected exactly 1 worktree add call; found {len(add_calls)}; '
+            f'calls={[c.args for c in all_calls]!r}'
+        )
+        add_args = add_calls[0].args
+
+        # With the fallback, the configured main_branch name ('main') is used instead
+        # of a resolved SHA.  It must appear as the ref argument to 'git worktree add'.
+        assert 'main' in add_args, (
+            f'Fallback branch name ("main") not found in worktree add argv: {add_args!r}'
+        )
+        # No 40-char hex SHA should appear (SHA was None → fallback is the branch name)
+        assert 'deadbeef' * 5 not in add_args, (
+            f'Resolved SHA should NOT appear in worktree add argv when resolve returned None: '
+            f'{add_args!r}'
+        )
+
 
 def _fake_proc(returncode: int):
     """Return a minimal asyncio.Process mock."""
