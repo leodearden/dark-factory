@@ -797,6 +797,22 @@ def create_server(
             snapshot_tip=resolved_tip,
         )
 
+        # Build a live_snapshot provider from the live worker handle so the
+        # coalesce gate can reconcile its registry slot against the worker's
+        # live snapshot.  This makes merge_request and get_merge_queue read
+        # the same source of truth: if a slot's request_id is absent from
+        # the snapshot (the request finalized abnormally without releasing
+        # the slot), the gate reaps it and dispatches a fresh request instead
+        # of silently attaching onto a dead id.
+        # _nonblocking_state_response (below) already resolves the same worker
+        # handle for position/queue_depth; keep both accessors consistent.
+        _live_merge_worker = getattr(harness, '_merge_worker', None)
+        live_snapshot = (
+            _live_merge_worker.snapshot
+            if _live_merge_worker is not None and hasattr(_live_merge_worker, 'snapshot')
+            else None
+        )
+
         # De-dup gate: consults the in-memory registry (and optionally the on-disk
         # _merge-* worktree scan via harness.git_ops) before enqueuing.  On coalesce
         # returns immediately with in_flight=True — no future await, no duplicate
@@ -808,6 +824,7 @@ def create_server(
             event_store,
             _registry,
             git_ops=git_ops_for_scan,
+            live_snapshot=live_snapshot,
         )
 
         def _nonblocking_state_response(
