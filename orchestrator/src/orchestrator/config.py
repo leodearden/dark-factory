@@ -529,6 +529,17 @@ class CpuPriorityConfig(BaseModel):
         The value is consumed by cli_invoke._cpu_priority_prefix, which pops
         the key (keeping the child env clean) and prepends ['nice', '-n', N]
         to the subprocess argv.
+
+        .. note::
+            ``DF_AGENT_CPU_NICE`` is an orchestrator-internal signal and must
+            **not** be exported in the parent process environment.  When
+            ``enabled=False`` this method returns ``{}`` (no override), so an
+            inherited ``DF_AGENT_CPU_NICE`` from the parent shell would pass
+            through the ``os.environ`` copy in ``_run_subprocess`` unchanged.
+            In practice this is not a concern because the variable is never
+            part of a normal login environment — it exists only to carry the
+            priority level from ``_build_agent_env`` to ``_cpu_priority_prefix``
+            within the same orchestrator invocation.
         """
         if not self.enabled:
             return {}

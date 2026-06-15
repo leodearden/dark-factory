@@ -2365,6 +2365,15 @@ class TestCpuPriorityPrefix:
         _cpu_priority_prefix(env)
         assert 'DF_AGENT_CPU_NICE' not in env
 
+    def test_nice_binary_absent_returns_empty(self):
+        """Returns [] when nice is not on PATH — degrades to no-renice, never fails spawn."""
+        env = {'DF_AGENT_CPU_NICE': '10'}
+        with patch('shared.cli_invoke.shutil.which', return_value=None):
+            result = _cpu_priority_prefix(env)
+        assert result == []
+        # Key is still popped so a nested invocation won't try again.
+        assert 'DF_AGENT_CPU_NICE' not in env
+
 
 @pytest.mark.asyncio
 class TestRunSubprocessCpuPriorityPrefix:
@@ -2373,9 +2382,11 @@ class TestRunSubprocessCpuPriorityPrefix:
     async def test_nice_prefix_prepended_to_argv(self, tmp_path):
         """_run_subprocess spawns ['nice', '-n', '10', 'claude', '--x'] when DF_AGENT_CPU_NICE='10'."""
         captured_args = []
+        captured_kwargs: dict = {}
 
         async def fake_exec(*args, **kwargs):
             captured_args.extend(args)
+            captured_kwargs.update(kwargs)
             proc = MagicMock()
             proc.communicate = AsyncMock(return_value=(b'', b''))
             proc.returncode = 0
@@ -2391,6 +2402,11 @@ class TestRunSubprocessCpuPriorityPrefix:
 
         assert captured_args[:3] == ['nice', '-n', '10'], f'Expected nice prefix; got {captured_args[:3]}'
         assert captured_args[3:5] == ['claude', '--x']
+        # DF_AGENT_CPU_NICE must be stripped from the env so it does not leak
+        # to the child and cannot double-renice nested invocations.
+        assert 'DF_AGENT_CPU_NICE' not in captured_kwargs.get('env', {}), (
+            'DF_AGENT_CPU_NICE leaked into the subprocess env'
+        )
 
     async def test_no_prefix_without_df_agent_cpu_nice(self, tmp_path):
         """_run_subprocess spawns ['claude', '--x'] exactly when env has no DF_AGENT_CPU_NICE."""
