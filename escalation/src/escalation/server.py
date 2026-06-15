@@ -1295,6 +1295,25 @@ def create_server(
                 resp['superseded_by'] = meta['superseded_by']
             return resp
 
+        # Tier 3.5: git-authority — probe main directly when no durable record exists.
+        # Obtain git_ops via the same accessor as the merge_request fast-path (server.py:766).
+        git_ops = getattr(harness, 'git_ops', None) if harness is not None else None
+        if git_ops is not None and orch_config is not None:
+            key = branch if branch is not None else task_id
+            if key is not None:
+                prefix = orch_config.git.branch_prefix
+                full_branch = key if key.startswith(prefix) else f'{prefix}{key}'
+                tip = await git_ops.resolve_branch_sha(full_branch)
+                if tip is not None and await git_ops.is_ancestor(tip, orch_config.git.main_branch):
+                    return {
+                        'state': 'done',
+                        'request_id': request_id,
+                        'generation': 1,
+                        'kind': 'found_on_main',
+                        'merge_sha': tip,
+                        'outcome': 'found_on_main',
+                    }
+
         # Tier 4: honest unknown
         return {
             'state': 'unknown',
