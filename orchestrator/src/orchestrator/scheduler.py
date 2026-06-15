@@ -1144,7 +1144,7 @@ class Scheduler:
         if not train_id:
             return []
 
-        tasks = await self.get_tasks()
+        tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES)
 
         def _order_key(t: dict) -> tuple[int, int]:
             train = (t.get('metadata') or {}).get('train') or {}
