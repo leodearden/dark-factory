@@ -77,14 +77,19 @@ class CuratorEscalator:
 
     def __init__(self, cooldown_secs: float = _DEFAULT_COOLDOWN_SECS) -> None:
         self._cooldown_secs = cooldown_secs
-        # project_id → monotonic timestamps of recent failures in the window.
-        # Pruned on every ``report_failure`` call; a server restart resets
-        # the burst, which is desired (operator gets fresh visibility).
-        self._failure_log: dict[str, list[float]] = {}
+        # (project_id, subtype) → wall-clock timestamps (time.time()) of recent
+        # failures in the window.  Keyed by the composite so different subtypes
+        # for the same project are counted independently (e.g. error_max_budget_usd
+        # and error_max_turns don't share quota).  Wall-clock is used so timestamps
+        # survive a process restart when persisted (step-12); monotonic resets on
+        # restart making reloaded values meaningless.
+        # Pruned on every report_failure call.
+        self._failure_log: dict[tuple[str, str | None], list[float]] = {}
         self._queues: dict[str, EscalationQueue] = {}
         # project_id → monotonic timestamp of the last submitted ZOT escalation.
         # Prevents a batch of N concurrent curate() ZOT calls from flooding the
         # escalation queue with N identical entries for a single outage event.
+        # Stays monotonic — in-process dedup, intentionally reset on restart.
         self._zot_last_submitted: dict[str, float] = {}
 
     def _orchestrator_running(self, project_root: str) -> bool:
@@ -212,11 +217,12 @@ class CuratorEscalator:
             )
             return
 
-        now = time.monotonic()
+        now = time.time()  # wall-clock: stable across restarts (unlike monotonic)
         cutoff = now - self._cooldown_secs
-        log = [t for t in self._failure_log.get(project_id, []) if t >= cutoff]
+        log_key = (project_id, subtype)
+        log = [t for t in self._failure_log.get(log_key, []) if t >= cutoff]
         log.append(now)
-        self._failure_log[project_id] = log
+        self._failure_log[log_key] = log
         count = len(log)
         burst_started = log[0]
 
