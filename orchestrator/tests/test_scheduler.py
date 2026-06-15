@@ -5880,6 +5880,64 @@ class TestTasksByTrain:
             f'Expected statuses {ACTIVE_TASK_STATUSES}, got {set(call_kwargs["statuses"])}'
         )
 
+    @pytest.mark.asyncio
+    async def test_tasks_by_train_excludes_terminal_members_via_server_filter(
+        self, scheduler: Scheduler
+    ):
+        """Active-only server filter excludes done/cancelled T1 members from results.
+
+        Pins the behavioural consequence of the active-only fetch (not just the
+        kwarg shape): when get_tasks respects statuses=ACTIVE_TASK_STATUSES, a
+        cancelled train member is absent from the returned list.
+
+        Uses a side_effect mock that honours the statuses kwarg — simulating the
+        server-side SQL filter — so the exclusion of terminal members is actually
+        exercised rather than assumed.
+
+        Regression target: a train member cancelled mid-flight must NOT appear in
+        tasks_by_train() results.  If it did, the all-merge-deferred guard in
+        _maybe_enqueue_group_merge (workflow.py:770) would stall waiting for it.
+        """
+        active_members = [
+            {
+                'id': '199',
+                'title': 'T1 order 0 (active)',
+                'status': 'merge-deferred',
+                'metadata': {'train': {'id': 'T1', 'order': 0}},
+            },
+            {
+                'id': '200',
+                'title': 'T1 order 1 (active)',
+                'status': 'merge-deferred',
+                'metadata': {'train': {'id': 'T1', 'order': 1}},
+            },
+        ]
+        cancelled_member = {
+            'id': '998',
+            'title': 'T1 cancelled member',
+            'status': 'cancelled',
+            'metadata': {'train': {'id': 'T1', 'order': 2}},
+        }
+        all_tasks = active_members + [cancelled_member]
+
+        async def _get_tasks_with_filter(*, statuses=None, **_kw):
+            """Simulate server-side statuses filter."""
+            if statuses is not None:
+                return [t for t in all_tasks if t['status'] in statuses]
+            return all_tasks
+
+        scheduler.get_tasks = AsyncMock(side_effect=_get_tasks_with_filter)
+
+        result = await scheduler.tasks_by_train('T1')
+
+        returned_ids = {str(t['id']) for t in result}
+        assert '998' not in returned_ids, (
+            'Cancelled T1 member must be excluded by active-only server-side filter'
+        )
+        assert returned_ids == {'199', '200'}, (
+            f'Expected only the two active members {{199, 200}}, got {returned_ids}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestGetExternalStatuses (task 1580 — step-1 RED / step-2 GREEN)

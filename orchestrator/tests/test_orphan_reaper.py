@@ -150,11 +150,17 @@ async def test_reaper_uses_get_statuses_and_spares_done_task_worktree(harness: H
       - live_ids derives from get_statuses → {'500', '999'} → worktree '500' is live.
       - cleanup_worktree / quarantine_worktree NOT called for '500'.
 
-    Current (wrong) behaviour that makes this RED:
-      - Reaper calls get_tasks, gets live_ids={'999'}, treats '500' as orphan, reaps it.
-      - get_statuses is never awaited.
+    Regression guard — do NOT narrow to active-only:
+      - The OLD reaper called get_tasks() with NO statuses filter; that returns ALL
+        tasks including done task 500, so done worktrees were already spared.
+      - The NEW reaper calls get_statuses() instead — same full id set, ~95% less
+        payload.  Routing changes; done-worktree-is-live behaviour must NOT change.
+      - This test guards against accidentally introducing an active-only filter
+        (e.g. get_tasks(statuses=ACTIVE_TASK_STATUSES)) which WOULD drop done task
+        500 from live_ids and wrongly reap its worktree.
     """
-    # Override the fixture's get_tasks to the "old active-only" path.
+    # Simulate the old active-only path that this test guards against regressing to:
+    # get_tasks returns only [{id: 999}], omitting the done task 500.
     harness.scheduler.get_tasks = AsyncMock(return_value=[{'id': 999}])
     # Add get_statuses stub — returns full id map incl. done task 500.
     harness.scheduler.get_statuses = AsyncMock(

@@ -1130,6 +1130,22 @@ class Scheduler:
         is negligible, and a stale cache would cause the all-deferred check to
         fire on outdated data.
 
+        **Active-only filter rationale (γ3b):** uses
+        ``statuses=ACTIVE_TASK_STATUSES`` to reduce payload.  Terminal members
+        are intentionally excluded:
+
+        - *done* — group-merge is the atomic done-transition, so no member is
+          ever ``done`` while ``_maybe_enqueue_group_merge`` evaluates this
+          list.  The authoritative done check at merge time uses
+          ``get_statuses`` (workflow.py ``_status_check``), so the
+          discovery/verify split the PRD prescribes is already in place.
+        - *cancelled* — a human-cancelled member is dropped from the returned
+          list.  The remaining active members can then all reach
+          ``merge-deferred``, causing the group-merge guard in
+          ``_maybe_enqueue_group_merge`` to fire on the reduced set.  Whether
+          a partially-cancelled train should still group-merge is a policy
+          decision in the trigger (workflow.py:770), not in this helper.
+
         Args:
             train_id: The ``metadata.train.id`` value to filter by.  Returns
                 ``[]`` immediately when falsy (avoids a spurious get_tasks
