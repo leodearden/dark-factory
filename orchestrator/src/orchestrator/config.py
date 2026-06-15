@@ -477,6 +477,64 @@ class JobserverConfig(BaseModel):
         return {self.env_var: f'--jobserver-auth=fifo:{self.task_fifo}'}
 
 
+class CpuPriorityConfig(BaseModel):
+    """CPU nice-level de-prioritization for agent inner-loop subprocesses.
+
+    When enabled, injects DF_AGENT_CPU_NICE into architect/implementer/debugger
+    subprocesses so that ``cli_invoke._cpu_priority_prefix`` prepends
+    ``nice -n <nice>`` to the Claude CLI spawn.  This causes the agent process
+    (and all cargo/rustc children it forks) to run at a lower CPU priority,
+    yielding to reify's negatively-niced merge/task verifies.
+
+    ``nice`` must be in the range 1..19: positive values de-prioritize without
+    requiring CAP_SYS_NICE; 0 is a no-op; negative values need privilege.
+    The validator rejects ``enabled=True`` with ``nice`` outside 1..19 to fail
+    fast on a misconfiguration.
+
+    Defaults to ``enabled=True, nice=10``:
+    - No external setup required (unlike the jobserver FIFO), so default-on is safe.
+    - nice +10 vs merge verify nice -5 → 15-step CFS spread ≈ 28x weight to the
+      verify; vs task verify nice -15 → ≈ 260x — decisive yield.
+    - Default-on means the reify orchestrator restart alone activates the fix;
+      no orchestrator.yaml edit required.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description='Enable CPU nice de-prioritization for agent subprocesses.',
+    )
+    nice: int = Field(
+        default=10,
+        description=(
+            'nice(1) increment to apply to agent subprocesses (1..19). '
+            'Positive values de-prioritize without CAP_SYS_NICE. '
+            'Consumed by cli_invoke._cpu_priority_prefix via DF_AGENT_CPU_NICE.'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _reject_enabled_with_invalid_nice(self) -> 'CpuPriorityConfig':
+        if self.enabled and not (1 <= self.nice <= 19):
+            raise ValueError(
+                f'CpuPriorityConfig.enabled is True but nice={self.nice} is outside '
+                'the privilege-free de-prioritizing range 1..19; '
+                'set nice to a value in 1..19 or set enabled: false.'
+            )
+        return self
+
+    def agent_env(self) -> dict[str, str]:
+        """Return CPU-priority env dict when enabled, else {}.
+
+        Returns {'DF_AGENT_CPU_NICE': str(self.nice)} when enabled.
+        The value is consumed by cli_invoke._cpu_priority_prefix, which pops
+        the key (keeping the child env clean) and prepends ['nice', '-n', N]
+        to the subprocess argv.
+        """
+        if not self.enabled:
+            return {}
+        return {'DF_AGENT_CPU_NICE': str(self.nice)}
+
+
 class GitConfig(BaseModel):
     """Git operations configuration."""
 
@@ -1419,6 +1477,11 @@ class OrchestratorConfig(BaseSettings):
     # An absent stanza in orchestrator.yaml yields the disabled default.
     # Reify enables this in /home/leo/src/reify/orchestrator.yaml.
     jobserver: JobserverConfig = Field(default_factory=JobserverConfig)
+
+    # CPU nice de-prioritization for agent inner-loop subprocesses.
+    # An absent stanza in orchestrator.yaml yields the enabled-by-default instance;
+    # no extra orchestrator.yaml edit is required — the reify restart alone activates it.
+    cpu_priority: CpuPriorityConfig = Field(default_factory=CpuPriorityConfig)
 
     # Lever C: remote verify runner pool configuration.
     # Adding this field makes a verify_runners: block in orchestrator.yaml live;
