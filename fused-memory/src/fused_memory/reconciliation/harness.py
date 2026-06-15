@@ -93,6 +93,17 @@ _RECON_DEDUP_CONFIG = (
 
 logger = logging.getLogger(__name__)
 
+# Task 1755 / PRD β: stable finding identity for the dead_owner_shielded storm alarm.
+# The fingerprint is keyed on finding['category'] / affected_ids / description
+# (harness.py:_escalate), so keeping these fields constant — and putting all
+# variable data (count, window, affected projects) only in summary/detail — ensures
+# submit_or_dedupe folds repeated storm alarms into a single pending escalation.
+_DEAD_OWNER_STORM_FINDING: dict[str, object] = {
+    'category': 'recon_watchdog_kill_storm',
+    'affected_ids': ['dead_owner_shielded_suppression_storm'],
+    'description': 'dead_owner_shielded recon_stale_run suppression storm',
+}
+
 # Task 1512: minimum number of completed runs that must contain a finding
 # before it is escalated from _run_remediation_pass.  Below this count the
 # finding is suppressed (emitting a structured log instead) on the grounds
@@ -731,6 +742,26 @@ class ReconciliationHarness:
                         'age_seconds': diag['age_seconds'],
                     },
                 )
+                # Task 1755 / PRD β: aggregate storm alarm.  The per-event
+                # suppression above is kept; the counter fires ONE loud
+                # 'recon_watchdog_kill_storm' escalation when the burst
+                # threshold is crossed within the rolling window.
+                storm = self._record_dead_owner_suppression(run.project_id)
+                if storm is not None:
+                    window_min = storm['window_seconds'] / 60
+                    proj_label = ', '.join(storm['projects']) or run.project_id
+                    summary = (
+                        f"dead_owner_shielded suppression storm: {storm['count']} in "
+                        f"{window_min:.0f} min (projects: {proj_label}) — "
+                        f'watchdog SIGABRT churn — full recon runs not completing'
+                    )
+                    self._escalate(
+                        'recon_watchdog_kill_storm',
+                        run.id,
+                        summary,
+                        detail,
+                        finding=_DEAD_OWNER_STORM_FINDING,
+                    )
             else:
                 self._escalate(
                     'recon_stale_run',
