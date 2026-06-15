@@ -6927,3 +6927,58 @@ class TestAcquireNextDepBackfillFromGetStatuses:
             f"Expected get_statuses to be called with 'A' in ids, "
             f"but got ids={ids_called}"
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: bookkeeping purged for tasks absent from active fetch (not only terminal)
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextBookkeepingPurgesAbsentTasks:
+    """Per-tick bookkeeping must be purged for completed tasks absent from active fetch.
+
+    Active-only filtering drops completed tasks from get_tasks. The existing
+    terminal-cleanup sweep only purges ids observed TERMINAL in status_map.
+    Tasks absent from the active result won't appear in status_map at all,
+    so their _skip_count/_last_dispatch_at/_module_cache entries would leak.
+
+    Fails today because the sweep iterates status_map items looking for
+    TERMINAL status — but 'X' is absent from the active result → not in
+    status_map → never purged.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_bookkeeping_purged_for_absent_task(self, scheduler: Scheduler):
+        """Bookkeeping entries for a task absent from the active fetch must be purged."""
+        # Seed bookkeeping for task 'X' that is now completed/absent.
+        scheduler._skip_count['X'] = 3
+        scheduler._last_dispatch_at['X'] = 123.0
+        scheduler._module_cache['X'] = ['backend/module_x']
+
+        # Unrelated pending task (not X); X is terminal → excluded from active fetch.
+        other_task = {
+            'id': '99',
+            'title': 'Other pending task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend/module_other']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[other_task])
+        scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+        await scheduler.acquire_next()
+
+        # X is absent from the active result → bookkeeping must have been purged.
+        assert 'X' not in scheduler._skip_count, (
+            f"Expected 'X' purged from _skip_count but it's still there: {scheduler._skip_count}"
+        )
+        assert 'X' not in scheduler._last_dispatch_at, (
+            f"Expected 'X' purged from _last_dispatch_at but it's still there: {scheduler._last_dispatch_at}"
+        )
+        assert 'X' not in scheduler._module_cache, (
+            f"Expected 'X' purged from _module_cache but it's still there: {scheduler._module_cache}"
+        )
