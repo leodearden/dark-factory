@@ -2632,7 +2632,7 @@ class InFlightMergeRegistry:
                 entry.waiters.clear()
         self._slots.pop(branch, None)
 
-    def _release_if_current(self, branch: str, entry: '_InFlightEntry') -> None:
+    def _release_if_current(self, branch: str, entry: _InFlightEntry) -> None:
         """Identity-aware acquire-time done-callback.
 
         Pops *branch* from ``_slots`` only when the stored entry is still
