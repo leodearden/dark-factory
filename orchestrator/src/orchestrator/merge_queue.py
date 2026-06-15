@@ -895,6 +895,13 @@ async def _run_post_merge_verify(
             return main_health_outcome
         detail = verify.failure_report()
         reason = f'Post-merge verification failed: {verify.summary}'
+        # Append the failure category so the timeout-vs-real-failure
+        # distinction is visible in the surviving human-facing signal
+        # without requiring log spelunking.  Append-only (after the
+        # summary, before the detail block) keeps all existing
+        # prefix/substring reason assertions green.
+        if verify.category:
+            reason = f'{reason} [category: {verify.category}]'
         if detail:
             reason = f'{reason}\n\n{detail}'
         # Loop-breaker bookkeeping: bump only when the failure was a
