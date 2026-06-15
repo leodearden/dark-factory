@@ -815,3 +815,36 @@ class TestMaybeFormTrainStackBranches:
         assert set(member_ids) == {'200', '201'}, (
             f'stack_train_branches should be called with selected members, got {member_ids}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED: _train_candidates fetches statuses=['in-progress'] only
+# ---------------------------------------------------------------------------
+
+class TestTrainCandidatesFetchesInProgressOnly:
+    """_train_candidates must call get_tasks with statuses=['in-progress'].
+
+    Fails today because _train_candidates calls self.scheduler.get_tasks()
+    with no statuses argument.
+    """
+
+    @pytest.mark.asyncio
+    async def test_train_candidates_passes_in_progress_statuses(self):
+        """_train_candidates must call get_tasks(statuses=['in-progress'])."""
+        fix = _make(
+            former_enabled=True,
+            get_tasks_return=[
+                {'id': '201', 'status': 'in-progress', 'metadata': {}},
+            ],
+        )
+        await fix.wf._train_candidates()
+
+        fix.scheduler.get_tasks.assert_awaited_once()
+        call_kwargs = fix.scheduler.get_tasks.call_args.kwargs
+        assert 'statuses' in call_kwargs, (
+            f"_train_candidates must call get_tasks with statuses=['in-progress'], "
+            f"but call_args.kwargs was: {call_kwargs}"
+        )
+        assert call_kwargs['statuses'] == ['in-progress'], (
+            f"Expected statuses=['in-progress'], got {call_kwargs['statuses']}"
+        )

@@ -15,6 +15,7 @@ Pins four contracts:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
@@ -61,7 +62,7 @@ class _Scheduler:
     def release(self, tid):
         pass
 
-    async def get_tasks(self) -> list[dict]:
+    async def get_tasks(self, *, statuses: Iterable[str] | None = None) -> list[dict]:
         return []
 
     async def get_statuses(

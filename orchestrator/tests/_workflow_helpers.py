@@ -8,6 +8,7 @@ rationale.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from escalation.queue import EscalationQueue
@@ -77,7 +78,7 @@ class FakeScheduler:
     async def get_task(self, task_id: str) -> dict | None:
         return self.task_data.get(task_id)
 
-    async def get_tasks(self) -> list[dict]:
+    async def get_tasks(self, *, statuses: Iterable[str] | None = None) -> list[dict]:
         """Return all tracked task data as a list."""
         return list(self.task_data.values())
 
