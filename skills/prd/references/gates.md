@@ -174,6 +174,7 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 | Field-population (the result-field twin) | `grep` shows the producer writes a **non-sentinel sampleable** value into the field on the production path | `declared-only` (field present, producer leaves it the empty sentinel) |
 | Grammar reality (anti-mismatch, shape 4) | `grammar-fixture:<path>` parses with **0 ERROR nodes**, OR a named grammar-producer task is upstream | `fixture-ERROR` |
 | Numeric floor (anti-floor, shape 3) | `floor:<bound> > <method-floor>`, floor stated | `bound≤floor` |
+| Rejection-mechanism (anti-silent-accept, shape 5) | `rejection-check:<X>` — authored X, ran the substrate check, and the asserted diagnostic was **observed to fire** | `rejection-absent` (substrate check exits 0 with no diagnostic — rejection capability absent) |
 
 *`producer-extent-short` worked cases:* (a) a task that "owns Transform3" delivers the Type/Value/builtins extent but NOT type-name resolution — a bare `Transform3` type-name does not resolve though the owner name-matches; (b) a prerequisite migrated only the `param: Scalar` extent, not the `-> Scalar` codomain extent — the manifest verified DAG-direction but not extent, and the prereq's own completeness grep was structurally blind to the codomain form.
 
