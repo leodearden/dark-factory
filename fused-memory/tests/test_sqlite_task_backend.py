@@ -1599,8 +1599,9 @@ async def test_get_statuses_raw_returns_all_and_skips_decode(backend, project_ro
     - _row_to_task (the sole json.loads gateway) is NEVER called on this path
     - result matches the reference from the existing full-tree get_tasks path
     """
-    import fused_memory.backends.sqlite_task_backend as _sb
     from unittest.mock import MagicMock
+
+    import fused_memory.backends.sqlite_task_backend as _sb
 
     # Seed 3 tasks with distinct statuses; give one non-trivial metadata to
     # represent the amplification scenario (the decode we must avoid).

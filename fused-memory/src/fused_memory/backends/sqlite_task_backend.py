@@ -578,10 +578,8 @@ class SqliteTaskBackend:
                 return {}
             int_ids: list[int] = []
             for raw_id in ids:
-                try:
+                with contextlib.suppress(ValueError, TypeError):
                     int_ids.append(int(raw_id))
-                except (ValueError, TypeError):
-                    pass  # silently omit non-numeric ids
             if not int_ids:
                 return {}
             placeholders = ','.join('?' * len(int_ids))
