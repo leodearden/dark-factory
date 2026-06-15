@@ -1179,12 +1179,21 @@ def create_server(
         request absent from _waiters cannot be a live waiter of this server (a
         live entry's future is still pending and thus still registered).
         """
-        # Tier 2: retention ring (request_id-keyed lookup only).
+        # Tier 2: retention ring (request_id > branch > task_id precedence).
+        # request_id lookup also resolves aliases registered via record_alias()
+        # (e.g. coalesced ids that never get their own terminal record).
         # finished_at is stored as epoch float; normalise to ISO-8601 so the
         # same logical merge returns the same type regardless of which tier serves it.
         ring = getattr(harness, '_terminal_retention', None) if harness is not None else None
-        if ring is not None and request_id is not None:
-            rec = ring.get(request_id)
+        if ring is not None:
+            if request_id is not None:
+                rec = ring.get(request_id)
+            elif branch is not None:
+                rec = ring.get_by_branch(branch)
+            elif task_id is not None:
+                rec = ring.get_by_task(task_id)
+            else:
+                rec = None
             if rec is not None:
                 meta: dict = {
                     'request_id': rec.request_id,
