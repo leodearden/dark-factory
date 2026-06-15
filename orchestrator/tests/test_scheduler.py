@@ -6761,3 +6761,68 @@ class TestSuppressBlockedWrite:
 
         scheduler.dispatch_tool.assert_called_once()
         assert scheduler.parked_live_count == 1
+
+
+# ---------------------------------------------------------------------------
+# step-1 RED: Scheduler.get_tasks forwards statuses kwarg into dispatch_tool
+# ---------------------------------------------------------------------------
+
+class TestGetTasksStatusesParam:
+    """get_tasks(statuses=[...]) must forward 'statuses' into dispatch_tool args.
+
+    get_tasks() with no arg must omit 'statuses' entirely (full-fetch preserved).
+    """
+
+    @staticmethod
+    def _envelope(tasks: list) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': _json.dumps({'tasks': tasks})}
+                ]
+            }
+        }
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_with_statuses_forwards_arg(self, scheduler: Scheduler):
+        """Passing statuses=[...] results in 'statuses' present in dispatch_tool args."""
+        scheduler.dispatch_tool = AsyncMock(return_value=self._envelope([]))
+        await scheduler.get_tasks(statuses=['pending', 'in-progress'])
+        call_args = scheduler.dispatch_tool.call_args
+        # Second positional arg is the arguments dict
+        arguments = call_args[0][1] if call_args[0] else call_args.kwargs.get('arguments', {})
+        # Support both positional and keyword call styles
+        if not arguments and len(call_args[0]) > 1:
+            arguments = call_args[0][1]
+        assert 'statuses' in arguments, (
+            f"Expected 'statuses' key in dispatch_tool arguments but got: {arguments}"
+        )
+        assert arguments['statuses'] == ['pending', 'in-progress']
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_no_arg_omits_statuses(self, scheduler: Scheduler):
+        """Calling get_tasks() without statuses must NOT include 'statuses' in dispatch_tool args."""
+        scheduler.dispatch_tool = AsyncMock(return_value=self._envelope([]))
+        await scheduler.get_tasks()
+        call_args = scheduler.dispatch_tool.call_args
+        arguments = call_args[0][1] if (call_args[0] and len(call_args[0]) > 1) else {}
+        assert 'statuses' not in arguments, (
+            f"'statuses' should be absent from dispatch_tool arguments but got: {arguments}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_statuses_none_omits_statuses(self, scheduler: Scheduler):
+        """get_tasks(statuses=None) must NOT include 'statuses' in dispatch_tool args."""
+        scheduler.dispatch_tool = AsyncMock(return_value=self._envelope([]))
+        await scheduler.get_tasks(statuses=None)
+        call_args = scheduler.dispatch_tool.call_args
+        arguments = call_args[0][1] if (call_args[0] and len(call_args[0]) > 1) else {}
+        assert 'statuses' not in arguments, (
+            f"'statuses' should be absent when None but got: {arguments}"
+        )
