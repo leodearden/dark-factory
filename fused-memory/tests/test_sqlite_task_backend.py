@@ -1585,3 +1585,49 @@ async def test_set_status_cancellation_leaves_connection_clean(
     res = await backend.set_task_status('1', 'done', project_root)
     assert res['tasks'][0]['newStatus'] == 'done'
     assert (await backend.get_task('1', project_root))['status'] == 'done'
+
+
+# ── get_statuses_raw ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_raw_returns_all_and_skips_decode(backend, project_root, monkeypatch):
+    """get_statuses_raw(ids=None) returns all {str(id): status} without calling _row_to_task.
+
+    Proves:
+    - str-keyed, verbatim status passthrough (incl. 'merge-deferred' holding status)
+    - _row_to_task (the sole json.loads gateway) is NEVER called on this path
+    - result matches the reference from the existing full-tree get_tasks path
+    """
+    import fused_memory.backends.sqlite_task_backend as _sb
+    from unittest.mock import MagicMock
+
+    # Seed 3 tasks with distinct statuses; give one non-trivial metadata to
+    # represent the amplification scenario (the decode we must avoid).
+    await backend.add_task(project_root=project_root, title='T1')  # id=1, status=pending
+    await backend.add_task(
+        project_root=project_root, title='T2', status='done',
+        metadata=json.dumps({'memory_hints': ['search(project context)'], 'files': ['a.py']}),
+    )
+    await backend.add_task(
+        project_root=project_root, title='T3', status='merge-deferred',
+    )
+
+    # Spy on _row_to_task to confirm it is NOT called on the get_statuses_raw path.
+    spy = MagicMock(wraps=_sb._row_to_task)
+    monkeypatch.setattr(_sb, '_row_to_task', spy)
+
+    mapping = await backend.get_statuses_raw(project_root)
+
+    # Contract: str-keyed, verbatim status (including 'merge-deferred').
+    assert mapping == {'1': 'pending', '2': 'done', '3': 'merge-deferred'}
+
+    # Oracle: no metadata decode on this path.
+    spy.assert_not_called()
+
+    # Cross-check against the full-tree reference path.
+    # (We restore _row_to_task first so get_tasks works normally.)
+    monkeypatch.undo()
+    ref = await backend.get_tasks(project_root)
+    ref_mapping = {str(t['id']): t['status'] for t in ref['tasks']}
+    assert mapping == ref_mapping
