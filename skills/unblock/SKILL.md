@@ -260,7 +260,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 - `status: "conflict"` or `status: "blocked"` → read `result["reason"]`, fix the conflict in the worktree, rebase on main, then **loop back to step 7** (resubmit).
 - `status: "unknown_branch"` → the branch was not found by the merge queue. Verify the branch exists in this repo (`git branch`) and you are targeting the correct escalation MCP endpoint. Push the branch if needed, then loop back to step 7.
 - `status: "failed"` → read `result["reason"]` and address accordingly, then loop back to step 7.
-- `{"error": "Merge queue not available — orchestrator not running"}` → orchestrator is down; fall back to a direct merge:
+- `{"error": "Merge queue not available — orchestrator not running"}` → orchestrator is down; fall back to a direct merge (**this is the ONLY situation where a direct merge is appropriate — NEVER use it in response to `state: "unknown"`**):
   ```
   git merge --no-ff task/<TASK_ID>   # run from the main branch checkout
   git push origin main               # advance the remote ref so downstream dispatch sees it
@@ -270,11 +270,15 @@ The merge procedure is iterative — don't assume one pass will be enough:
 *Polled terminal failures (from `merge_status`):*
 
 - `poll["state"] == "conflict"`, `poll["state"] == "blocked"`, or `poll["state"] == "abandoned"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7. (For `abandoned`, also verify the cancellation was not intentional before resubmitting.)
-- `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → fall back to confirming whether the merge already landed:
+- `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → `merge_status` now self-resolves a landed merge via its git-authority tier and returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` when the branch is provably on main. If `merge_status` still returns `unknown`, confirm deterministically:
+  ```bash
+  git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
+  # exit 0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
+  #   commit=<landing sha: git log --format=%H -1 main>
+  #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
+  # exit 1 (not on main) AND queue healthy: loop back to step 7 (resubmit).
   ```
-  git log main --oneline | head -5
-  ```
-  If the merge commit is present, proceed to step 8 with that SHA. If not, loop back to step 7.
+  **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed.
 
 *Abandonment (`merge_cancel`):*
 
@@ -282,7 +286,13 @@ To abandon a submitted merge (e.g. the task needs redesign after submission):
 ```
 mcp__escalation__merge_cancel(request_id=request_id)
 ```
-Cancel using the `request_id` you received — for both `queued` and `attached` responses this is already the in-flight entry's id (`attached` responses set `req_id_override=dispatch.inflight_request_id`). If `merge_cancel` returns `{state: "unknown"}`, the entry has no live waiter in this server instance (restarted or finalized) — fall back to `mcp__escalation__merge_status(request_id)` or `git log main --oneline | head -5` to confirm whether the merge landed before deciding next steps.
+Cancel using the `request_id` you received — for both `queued` and `attached` responses this is already the in-flight entry's id (`attached` responses set `req_id_override=dispatch.inflight_request_id`). If `merge_cancel` returns `{state: "unknown"}`, the entry has no live waiter in this server instance (restarted or finalized) — poll `mcp__escalation__merge_status(request_id)` first (it now self-resolves via the git-authority tier and returns `state: "done"` / `kind: "found_on_main"` / `merge_sha` when the branch is provably on main). If `merge_status` still returns `unknown`, confirm deterministically:
+```bash
+git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
+# exit 0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
+# exit 1 (not on main): the merge did not land; decide whether to resubmit or discard
+```
+Never fall back to direct merge in response to `unknown` — `unknown` means the server lost its record, not that the merge failed.
 
 *If this is an escalated task (pending escalation, agent is paused):*
 
