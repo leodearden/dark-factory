@@ -21,6 +21,7 @@ from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
     AgentFailureKind,
     AgentResult,
+    _cpu_priority_prefix,
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
@@ -2304,3 +2305,110 @@ class TestIsZeroOutputTimeout:
             cost_usd=0.25,
         )
         assert is_zero_output_timeout(result) is False
+
+
+# ── _cpu_priority_prefix helper ───────────────────────────────────────────────
+
+
+class TestCpuPriorityPrefix:
+    """Unit tests for _cpu_priority_prefix(env) helper in cli_invoke."""
+
+    def test_returns_nice_prefix_for_valid_nice_10(self):
+        """env with DF_AGENT_CPU_NICE='10' returns ['nice', '-n', '10']."""
+        env = {'DF_AGENT_CPU_NICE': '10'}
+        assert _cpu_priority_prefix(env) == ['nice', '-n', '10']
+
+    def test_returns_nice_prefix_for_nice_1(self):
+        """DF_AGENT_CPU_NICE='1' (minimum valid) returns ['nice', '-n', '1']."""
+        env = {'DF_AGENT_CPU_NICE': '1'}
+        assert _cpu_priority_prefix(env) == ['nice', '-n', '1']
+
+    def test_returns_nice_prefix_for_nice_19(self):
+        """DF_AGENT_CPU_NICE='19' (maximum valid) returns ['nice', '-n', '19']."""
+        env = {'DF_AGENT_CPU_NICE': '19'}
+        assert _cpu_priority_prefix(env) == ['nice', '-n', '19']
+
+    def test_returns_empty_for_absent_key(self):
+        """Empty dict (key absent) → []."""
+        assert _cpu_priority_prefix({}) == []
+
+    def test_returns_empty_for_empty_string(self):
+        """DF_AGENT_CPU_NICE='' (empty string) → []."""
+        env = {'DF_AGENT_CPU_NICE': ''}
+        assert _cpu_priority_prefix(env) == []
+
+    def test_returns_empty_for_zero(self):
+        """DF_AGENT_CPU_NICE='0' (not de-prioritizing) → []."""
+        env = {'DF_AGENT_CPU_NICE': '0'}
+        assert _cpu_priority_prefix(env) == []
+
+    def test_returns_empty_for_negative(self):
+        """DF_AGENT_CPU_NICE='-3' (needs privilege) → []."""
+        env = {'DF_AGENT_CPU_NICE': '-3'}
+        assert _cpu_priority_prefix(env) == []
+
+    def test_returns_empty_for_garbage(self):
+        """DF_AGENT_CPU_NICE='garbage' (malformed) → []."""
+        env = {'DF_AGENT_CPU_NICE': 'garbage'}
+        assert _cpu_priority_prefix(env) == []
+
+    def test_pops_df_agent_cpu_nice_from_env(self):
+        """_cpu_priority_prefix pops DF_AGENT_CPU_NICE from the env dict."""
+        env = {'DF_AGENT_CPU_NICE': '10', 'OTHER': 'val'}
+        _cpu_priority_prefix(env)
+        assert 'DF_AGENT_CPU_NICE' not in env
+        assert env.get('OTHER') == 'val'  # other keys untouched
+
+    def test_pops_key_even_when_returning_empty(self):
+        """DF_AGENT_CPU_NICE='0' is popped (returns []) — key is still removed."""
+        env = {'DF_AGENT_CPU_NICE': '0'}
+        _cpu_priority_prefix(env)
+        assert 'DF_AGENT_CPU_NICE' not in env
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessCpuPriorityPrefix:
+    """Integration: _run_subprocess prepends nice prefix when DF_AGENT_CPU_NICE is set."""
+
+    async def test_nice_prefix_prepended_to_argv(self, tmp_path):
+        """_run_subprocess spawns ['nice', '-n', '10', 'claude', '--x'] when DF_AGENT_CPU_NICE='10'."""
+        captured_args = []
+
+        async def fake_exec(*args, **kwargs):
+            captured_args.extend(args)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await _run_subprocess(
+                ['claude', '--x'], tmp_path, env={'DF_AGENT_CPU_NICE': '10'}, model='test',
+            )
+
+        assert captured_args[:3] == ['nice', '-n', '10'], f'Expected nice prefix; got {captured_args[:3]}'
+        assert captured_args[3:5] == ['claude', '--x']
+
+    async def test_no_prefix_without_df_agent_cpu_nice(self, tmp_path):
+        """_run_subprocess spawns ['claude', '--x'] exactly when env has no DF_AGENT_CPU_NICE."""
+        captured_args = []
+
+        async def fake_exec(*args, **kwargs):
+            captured_args.extend(args)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await _run_subprocess(
+                ['claude', '--x'], tmp_path, env={}, model='test',
+            )
+
+        assert captured_args == ['claude', '--x'], f'Expected bare argv; got {captured_args}'
