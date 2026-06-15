@@ -1227,14 +1227,32 @@ def create_server(
         """Return the current merge state for a merge request.
 
         Accepts one of: request_id (authoritative), branch (most-recent), or
-        task_id (most-recent).  Lookup order: live snapshot → retention ring →
-        event store → {state:'unknown', hint}.
+        task_id (most-recent).  Lookup order:
+
+            live snapshot → retention ring → event store
+            → git-authority (is_ancestor / find_merge_marker against main)
+            → {state:'unknown', hint}
+
+        The git-authority tier (Tier-3.5) fires when the durable tiers miss.
+        It derives the full branch ref from the passed ``branch`` or
+        ``task_id`` (prepending ``orch_config.git.branch_prefix`` unless the
+        value already starts with the prefix), then:
+        - If the branch still exists: calls ``is_ancestor(tip, main)``.
+          On hit → returns state='done', kind='found_on_main', merge_sha=tip.
+        - If the branch ref is gone (tip is None): calls ``find_merge_marker``
+          which searches git log for the merge commit subject.
+          On hit → returns state='done', kind='found_on_main', merge_sha=<sha>.
+        Fire-safe: any git failure degrades to the honest Tier-4 unknown
+        (``logger.warning(exc_info=True)``), never raises.  The tier is skipped
+        when ``harness.git_ops`` or ``orch_config`` are absent.
 
         Returns a dict with at minimum:
             state, request_id, generation (always 1 in α3).
 
         Live entries also carry: position, enqueued_at, eta_seconds.
         Terminal entries carry: outcome (raw state), finished_at.
+        git-authority terminal shape: state='done', kind='found_on_main',
+            merge_sha=<40-char SHA on main>, outcome='found_on_main'.
         Unknown carries: hint.
         """
         # Validation — at least one key required
