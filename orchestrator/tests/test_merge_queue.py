@@ -10120,7 +10120,8 @@ class TestCoalesceSnapshotReconcile:
         registry.acquire('B', 'task-B', stale_fut, request_id='mr-dead')
 
         # Snapshot shows an empty queue (branch 'B' absent).
-        snap = lambda: {'entries': [], 'depth': 0}
+        def snap() -> dict:
+            return {'entries': [], 'depth': 0}
 
         req = _make_request('B', 'B', tmp_path, config)
         result = await coalesce_or_enqueue_merge_request(
@@ -10146,7 +10147,8 @@ class TestCoalesceSnapshotReconcile:
         stale_fut: asyncio.Future = asyncio.get_running_loop().create_future()
         registry.acquire('B', 'task-B', stale_fut, request_id='mr-dead')
 
-        snap = lambda: {'entries': [], 'depth': 0}
+        def snap() -> dict:
+            return {'entries': [], 'depth': 0}
 
         req = _make_request('B', 'B', tmp_path, config)
         await coalesce_or_enqueue_merge_request(
@@ -10168,7 +10170,8 @@ class TestCoalesceSnapshotReconcile:
         registry.acquire('B', 'task-B', live_fut, request_id='mr-live')
 
         # Snapshot confirms 'mr-live' is present.
-        snap = lambda: {'entries': [{'branch': 'B', 'request_id': 'mr-live'}], 'depth': 1}
+        def snap() -> dict:
+            return {'entries': [{'branch': 'B', 'request_id': 'mr-live'}], 'depth': 1}
 
         req = _make_request('B', 'B', tmp_path, config)
         result = await coalesce_or_enqueue_merge_request(

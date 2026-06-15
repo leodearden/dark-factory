@@ -3049,9 +3049,9 @@ class _FindInflightWorktreeP(Protocol):
 
 
 def _inflight_entry_is_stale(
-    entry: '_InFlightEntry | None',
+    entry: _InFlightEntry | None,
     branch: str,
-    live_snapshot: 'Callable[[], dict] | None',
+    live_snapshot: Callable[[], dict] | None,
 ) -> bool:
     """Return True when *entry* appears stale relative to the live worker snapshot.
 
