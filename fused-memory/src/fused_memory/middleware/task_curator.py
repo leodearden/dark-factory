@@ -1673,6 +1673,20 @@ class TaskCurator:
         cwd = self._cwd or Path(project_root)
         user_prompt = self._build_user_prompt(candidate, pool)
 
+        # Scale max_budget_usd by pool size — pool size is the prompt-token
+        # cost driver for single-candidate calls (a full 30-entry corpus
+        # yields a ~41K-token prompt costing ~$0.30574, tripping the flat
+        # $0.30 cap; esc-task-curator-191).  Mirror the R1 batch formula
+        # but scale by len(pool) rather than (n-1):
+        #   budget = min(max_budget_usd + per_pool_entry_budget_usd*len(pool),
+        #                single_call_budget_cap_usd)
+        # Empty pool stays at the $0.30 baseline; full 30-entry pool → $0.675.
+        budget = min(
+            self._config.curator.max_budget_usd
+            + self._config.curator.per_pool_entry_budget_usd * len(pool),
+            self._config.curator.single_call_budget_cap_usd,
+        )
+
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
             label=f'task-curator[{project_id}]',
@@ -1689,7 +1703,7 @@ class TaskCurator:
             # the default of 8 leaves headroom for harder combine-vs-create
             # decisions. Schema salvage in cli_invoke.py covers the boundary.
             max_turns=self._config.curator.max_turns,
-            max_budget_usd=self._config.curator.max_budget_usd,
+            max_budget_usd=budget,
             disallowed_tools=['*'],  # no tool access — this is a pure classifier
             output_schema=CURATOR_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
