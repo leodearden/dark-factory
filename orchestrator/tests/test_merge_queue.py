@@ -10275,7 +10275,7 @@ class TestCoalesceSnapshotReconcile:
             return ['not', 'a', 'dict']  # type: ignore[return-value]
 
         result2 = await coalesce_or_enqueue_merge_request(
-            queue, req, event_store, registry, git_ops=None, live_snapshot=_non_dict_snap,
+            queue, req, event_store, registry, git_ops=None, live_snapshot=_non_dict_snap,  # type: ignore[arg-type]
         )
         assert result2.in_flight is True
         assert result2.dispatched is False, (
