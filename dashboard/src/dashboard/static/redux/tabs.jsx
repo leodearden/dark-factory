@@ -556,7 +556,7 @@ function MemoryTab({ projectFilter }) {
   const ts = DF.MEMORY_TIMESERIES;
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
-      <div className="col-span-12 grid cols-4">
+      <div className="col-span-12 grid cols-5">
         <ST label="Graphiti nodes" value={DF.MEMORY_STATUS.graphiti.node_count.toLocaleString()}
             hint={`${DF.MEMORY_STATUS.graphiti.edge_count.toLocaleString()} edges`}
             spark={(DF.MEMORY_STATUS.graphiti.spark?.values || []).slice(-30)} sparkColor={CP.accent} />
@@ -577,6 +577,9 @@ function MemoryTab({ projectFilter }) {
                 spark={combined} sparkColor={CP.accent} hint="last 24h" />
           );
         })()}
+        <ST label="fused-memory"
+            value={`up ${window.DF_SHELL.fmtUptime(DF.MEMORY_STATUS.uptime_seconds)}`}
+            hint={DF.MEMORY_STATUS.started_at || '—'} />
       </div>
 
       <div className="col-span-8 panel">
