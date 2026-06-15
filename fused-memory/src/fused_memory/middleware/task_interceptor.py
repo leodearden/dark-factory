@@ -3184,9 +3184,12 @@ class TaskInterceptor:
 
     # ── Pure reads (direct pass-through) ───────────────────────────────
 
-    async def get_tasks(self, project_root: str, tag: str | None = None) -> dict:
+    async def get_tasks(
+        self, project_root: str, tag: str | None = None,
+        statuses: list[str] | None = None,
+    ) -> dict:
         tm = await self._ensure_taskmaster()
-        return dict(await tm.get_tasks(project_root, tag))
+        return dict(await tm.get_tasks(project_root, tag, statuses=statuses))
 
     async def get_statuses(
         self,

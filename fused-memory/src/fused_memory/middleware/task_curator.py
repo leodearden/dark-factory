@@ -65,8 +65,8 @@ class CuratorFailureError(RuntimeError):
     errors; instead the interceptor translates this into an L1 escalation or
     a hard failure at the MCP boundary so operators notice breakage.
 
-    Attaches ``timed_out``, ``duration_ms``, ``subtype``, and
-    ``schema_tool_denied`` from the underlying ``AgentResult`` so
+    Attaches ``timed_out``, ``duration_ms``, ``subtype``, ``schema_tool_denied``,
+    and ``cost_usd`` from the underlying ``AgentResult`` so
     :class:`CuratorEscalator` can surface them in the L1 escalation detail and
     so the bisecting fallback in
     :meth:`TaskCurator._call_llm_batch_with_fallback` can branch on the
@@ -92,6 +92,7 @@ class CuratorFailureError(RuntimeError):
         zero_output_timeout: bool = False,
         proc_tree: str = '',
         account_name: str = '',
+        cost_usd: float | None = None,
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
@@ -101,6 +102,7 @@ class CuratorFailureError(RuntimeError):
         self.zero_output_timeout = zero_output_timeout
         self.proc_tree = proc_tree
         self.account_name = account_name
+        self.cost_usd = cost_usd
 
 
 Action = Literal['drop', 'combine', 'create']
@@ -455,6 +457,20 @@ def normalize_title(title: str | None) -> str:
     and the intra-batch dedup key helper (``TaskCurator._intra_batch_key``).
     """
     return ' '.join((title or '').strip().lower().split())
+
+
+def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float:
+    """Compute a scaled LLM budget clamped at ``cap``.
+
+    Both the single-call and batch budget-scaling formulas share this shape::
+
+        budget = min(base + per_entry * size, cap)
+
+    where ``size`` is ``len(pool)`` for single-call and ``(n - 1)`` for batch.
+    Extracting the formula avoids drift between the two call sites when either
+    constant is tuned.
+    """
+    return min(base + per_entry * size, cap)
 
 
 class TaskCurator:
@@ -905,6 +921,9 @@ class TaskCurator:
                     zero_output_timeout=exc.zero_output_timeout,
                     account_name=exc.account_name or None,
                     proc_tree=exc.proc_tree or None,
+                    subtype=exc.subtype,
+                    cost_usd=exc.cost_usd,
+                    pool_sizes=pool_sizes,
                 )
             else:
                 logger.warning(
@@ -1673,6 +1692,21 @@ class TaskCurator:
         cwd = self._cwd or Path(project_root)
         user_prompt = self._build_user_prompt(candidate, pool)
 
+        # Scale max_budget_usd by pool size — pool size is the prompt-token
+        # cost driver for single-candidate calls (a full 30-entry corpus
+        # yields a ~41K-token prompt costing ~$0.30574, tripping the flat
+        # $0.30 cap; esc-task-curator-191).  Mirror the R1 batch formula
+        # but scale by len(pool) rather than (n-1):
+        #   budget = min(max_budget_usd + per_pool_entry_budget_usd*len(pool),
+        #                single_call_budget_cap_usd)
+        # Empty pool stays at the $0.30 baseline; full 30-entry pool → $0.675.
+        budget = _scale_budget(
+            self._config.curator.max_budget_usd,
+            self._config.curator.per_pool_entry_budget_usd,
+            len(pool),
+            self._config.curator.single_call_budget_cap_usd,
+        )
+
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
             label=f'task-curator[{project_id}]',
@@ -1689,7 +1723,7 @@ class TaskCurator:
             # the default of 8 leaves headroom for harder combine-vs-create
             # decisions. Schema salvage in cli_invoke.py covers the boundary.
             max_turns=self._config.curator.max_turns,
-            max_budget_usd=self._config.curator.max_budget_usd,
+            max_budget_usd=budget,
             disallowed_tools=['*'],  # no tool access — this is a pure classifier
             output_schema=CURATOR_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
@@ -1713,6 +1747,7 @@ class TaskCurator:
                 zero_output_timeout=is_zero_output_timeout(agent_result),
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
+                cost_usd=agent_result.cost_usd,
             )
 
         return _parse_decision(
@@ -1758,9 +1793,10 @@ class TaskCurator:
         # R1: scale max_budget_usd. Batch prompts are several × bigger than
         # single-call prompts and burn the flat per-call budget in 1–2 turns,
         # tripping error_max_budget_usd before the model can answer.
-        budget = min(
-            self._config.curator.max_budget_usd
-            + self._config.curator.per_item_budget_usd * (n - 1),
+        budget = _scale_budget(
+            self._config.curator.max_budget_usd,
+            self._config.curator.per_item_budget_usd,
+            n - 1,
             self._config.curator.batch_budget_cap_usd,
         )
 
@@ -1798,6 +1834,7 @@ class TaskCurator:
                 zero_output_timeout=is_zero_output_timeout(agent_result),
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
+                cost_usd=agent_result.cost_usd,
             )
 
         return _parse_batch_decisions(

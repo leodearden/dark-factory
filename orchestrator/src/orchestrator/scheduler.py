@@ -10,7 +10,7 @@ import os
 import re
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,7 +30,7 @@ from orchestrator.config import (
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.overrides import OverrideRow, OverrideStore
-from orchestrator.task_status import TERMINAL_STATUSES
+from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
 # task_skipped events for "effectively infinite" skip thresholds (>= this
 # value) are rate-limited to a geometric schedule so the event store is not
@@ -1145,12 +1145,27 @@ class Scheduler:
             key=_order_key,
         )
 
-    async def get_tasks(self) -> list[dict]:
-        """Fetch all tasks from fused-memory/taskmaster."""
+    async def get_tasks(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+    ) -> list[dict]:
+        """Fetch tasks from fused-memory/taskmaster.
+
+        Args:
+            statuses: Optional iterable of status strings to filter by (server-side
+                SQL ``status IN (...)`` predicate).  When ``None`` (default), the
+                argument is omitted and the server returns the full task tree —
+                byte-identical to the previous behaviour.  Pass
+                ``ACTIVE_TASK_STATUSES`` on hot paths to shrink the payload.
+        """
         try:
+            arguments: dict = {'project_root': self._project_root}
+            if statuses is not None:
+                arguments['statuses'] = list(statuses)
             result = await self.dispatch_tool(
                 'get_tasks',
-                {'project_root': self._project_root},
+                arguments,
                 timeout=15,
             )
             tasks = self._parse_tool_text_result(result, 'tasks')
@@ -2389,7 +2404,7 @@ class Scheduler:
             )
             return None
 
-        tasks = await self.get_tasks()
+        tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES)
         if not tasks:
             return None
 
@@ -2408,6 +2423,34 @@ class Scheduler:
 
         # Maintain age anchors (resurrected tasks reset their anchor).
         self._update_age_anchors(tasks, max_id)
+
+        # Correctness crux (γ2): the active-only filter drops terminal tasks
+        # from the result, so dep-ids referencing DONE/CANCELLED tasks will be
+        # absent from status_map. _deps_satisfied reads status_map.get(dep_id,
+        # 'unknown'), so those deps would block dispatching forever. Fix: collect
+        # local dep-ids referenced by the fetched tasks that are NOT already in
+        # status_map, then backfill them via the lean get_statuses(ids=missing).
+        # In production this backfill commonly fires every tick (most pending tasks
+        # have at least one done dep), but the two-call total (active get_tasks +
+        # compact get_statuses) is still a net win over the old single full get_tasks
+        # call (~95% smaller payload per γ1's get_statuses path).  In unit tests
+        # whose get_tasks mocks return the full set (incl. done deps), status_map
+        # is already complete → missing_dep_ids is empty → zero get_statuses calls.
+        _all_dep_ids: set[str] = set()
+        for _t in tasks:
+            for _d in (_t.get('dependencies') or []):
+                _dep_id = str(
+                    _d.get('id', _d) if isinstance(_d, dict) else _d
+                )
+                if _dep_id:
+                    _all_dep_ids.add(_dep_id)
+        _missing_dep_ids = sorted(_all_dep_ids - set(status_map))
+        if _missing_dep_ids:
+            _backfilled, _backfill_err = await self.get_statuses(
+                ids=_missing_dep_ids
+            )
+            if _backfilled:
+                status_map.update(_backfilled)
 
         # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
         # a park whose owner is terminal / missing / deps-unsatisfied has no
@@ -2437,28 +2480,52 @@ class Scheduler:
                     data={'reason': reason},
                 )
 
-        # Drop _last_dispatch_at, _skip_count, _module_cache, and sub-threshold
-        # _external_unresolved_counts entries for tasks now in a terminal status
+        # Drop _last_dispatch_at, _skip_count, _module_cache, _pending_anchor,
+        # and sub-threshold _external_unresolved_counts entries for tasks that are:
+        #   (a) in a terminal status in status_map, OR
+        #   (b) absent from tasks_by_id (active-only filter dropped them because
+        #       they completed between ticks — γ2: previously the full get_tasks
+        #       result kept completed tasks visible so the terminal sweep could
+        #       clean them up; active-only filtering removes them from the result).
         # so a future legitimate re-dispatch (e.g. cancelled -> pending
         # re-architect, or a freshly-created task reusing the id) starts from a
         # clean slate.  Resurrection-safe: a re-queued task re-derives modules
         # and re-accumulates its skip count fresh.
-        # Mirrors the _pending_anchor clearing in _update_age_anchors.
-        _terminal_ids: set[str] = set()
-        for tid_str, status in status_map.items():
-            if status in TERMINAL_STATUSES:
+        # _pending_anchor and _was_non_pending are handled here directly (not only
+        # in _update_age_anchors) because active-only filtering means terminal
+        # tasks are absent from the `tasks` list that _update_age_anchors iterates.
+        # Without this, a task that goes pending → terminal (e.g. cancelled while
+        # pending, never dispatched) leaks its _pending_anchor entry permanently.
+        # Recording _was_non_pending preserves resurrection semantics: if the task
+        # is re-queued to pending, it gets a fresh max_id anchor instead of
+        # re-using its old (stale) numeric id as the age anchor.
+        _stale_ids: set[str] = set()
+        # Iterate the union of all tracked bookkeeping keys so we catch ids that
+        # are absent from status_map entirely (completed, dropped by active filter).
+        # _pending_anchor is included so anchor-only entries (tasks that went
+        # pending → terminal without ever being dispatched) are also caught.
+        _all_tracked: set[str] = (
+            set(self._last_dispatch_at)
+            | set(self._skip_count)
+            | set(self._module_cache)
+            | set(self._pending_anchor)
+        )
+        for tid_str in _all_tracked:
+            if status_map.get(tid_str) in TERMINAL_STATUSES or tid_str not in tasks_by_id:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
-                _terminal_ids.add(tid_str)
+                self._pending_anchor.pop(tid_str, None)
+                self._was_non_pending.add(tid_str)
+                _stale_ids.add(tid_str)
         # _external_unresolved_counts is keyed by (task_id, dep); sweep
         # separately to avoid mutating while iterating.  A sub-threshold counter
         # entry would otherwise leak permanently if the task terminates before
         # crossing the escalation threshold (e.g. manually cancelled while count=1).
-        if _terminal_ids and self._external_unresolved_counts:
+        if _stale_ids and self._external_unresolved_counts:
             _stale_ext_keys = [
                 k for k in self._external_unresolved_counts
-                if k[0] in _terminal_ids
+                if k[0] in _stale_ids
             ]
             for k in _stale_ext_keys:
                 del self._external_unresolved_counts[k]

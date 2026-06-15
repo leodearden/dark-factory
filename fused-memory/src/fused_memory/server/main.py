@@ -513,7 +513,9 @@ async def run_server():
         known_project_roots_from_env,
     )
 
-    curator_escalator = CuratorEscalator()
+    curator_escalator = CuratorEscalator(
+        state_path=_resolve_curator_escalator_state_path(config),
+    )
 
     # Multi-project path-scope guard: built from the configured project +
     # DASHBOARD_KNOWN_PROJECT_ROOTS env var so the same registry covers
@@ -1288,6 +1290,22 @@ def _resolve_curator_cost_store_path(config: FusedMemoryConfig) -> Path:
     if config.reconciliation:
         return Path(config.reconciliation.data_dir) / 'curator_events.db'
     return Path('./data/curator_events.db')
+
+
+def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
+    """Return the JSON state-file path for the CuratorEscalator burst log.
+
+    Mirrors _resolve_curator_cost_store_path: places the file under
+    ``<reconciliation.data_dir>/curator_escalator_state.json`` when
+    reconciliation is configured, ``./data/curator_escalator_state.json``
+    otherwise.  Isolated from the CostStore SQLite file so there is no
+    schema coupling between the two.
+
+    Extracted as a module-level helper so it can be tested in isolation.
+    """
+    if config.reconciliation:
+        return Path(config.reconciliation.data_dir) / 'curator_escalator_state.json'
+    return Path('./data/curator_escalator_state.json')
 
 
 async def _setup_curator_usage_gate(

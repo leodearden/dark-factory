@@ -10029,6 +10029,134 @@ class TestInFlightMergeRegistry:
 
 
 # ---------------------------------------------------------------------------
+# TestInFlightMergeRegistryReleaseDetach — 1756 step-1 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInFlightMergeRegistryReleaseDetach:
+    """1756 step-1 RED: release(detach_waiters=True) cancels stranded waiters.
+
+    RED until step-2 impl: release() has no detach_waiters keyword →
+    TypeError on (a)/(b); (c) characterises the unchanged default path.
+    """
+
+    def _make_future(self) -> asyncio.Future:
+        return asyncio.get_running_loop().create_future()
+
+    async def test_release_detach_waiters_cancels_primary_and_waiters(self):
+        """(a) release(detach_waiters=True) cancels all pending waiters and pops slot."""
+        from orchestrator.merge_queue import WaiterRecord
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        f2 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        registry.attach('B', WaiterRecord(request_id='mr-2', future=f2, source='mcp'))
+
+        registry.release('B', detach_waiters=True)
+
+        assert registry.is_inflight('B') is False
+        # Both the primary (waiter #1) and the attached waiter (#2) must be cancelled.
+        assert f1.cancelled() is True
+        assert f2.cancelled() is True
+
+    async def test_release_detach_waiters_skips_done_futures(self):
+        """(b) release(detach_waiters=True) does not raise on already-done futures.
+
+        Simulates a finalized request whose done_callback has not fired yet —
+        the slot still exists, but the primary future is already resolved.
+        The guard (if not w.future.done(): w.future.cancel()) must prevent
+        calling cancel() on the already-resolved future so no InvalidStateError
+        or unexpected exception is raised.
+        """
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+        # Resolve the primary (simulating an abnormal finalize path where the
+        # future is done but the registry slot hasn't been auto-released yet).
+        f1.set_result(MergeOutcome('done'))
+
+        # Must not raise even though the waiter future is already done.
+        registry.release('B', detach_waiters=True)
+
+        assert registry.is_inflight('B') is False
+
+    async def test_release_default_still_pops_slot(self):
+        """(c) release() with no kwargs pops the slot (default path unchanged)."""
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1)
+
+        registry.release('B')
+
+        assert registry.is_inflight('B') is False
+        # The default release path must NOT cancel the primary future —
+        # normal terminal resolution fans the outcome to attached waiters
+        # via the _mirror callbacks that run after _release.
+        assert f1.cancelled() is False
+
+    async def test_stale_late_callback_does_not_clobber_reacquired_slot(self):
+        """(d) 1756 step-7 RED: stale future's LATE done-callback must not clobber a re-acquired slot.
+
+        Sequence:
+          1. acquire('B', ..., f_dead)  → registers done-callback lambda _: _release('B')
+          2. release('B', detach_waiters=True) → cancels f_dead (schedules its
+             done-callback via loop.call_soon — it runs on the NEXT loop turn, NOT now)
+          3. acquire('B', ..., f_fresh)  → fresh slot
+          4. await asyncio.sleep(0)  → the dead future's late callback fires;
+             with branch-keyed _release(branch) it unconditionally pops by branch
+             and clobbers the fresh entry (registry slot becomes None — RED failure).
+             With identity-aware _release_if_current(branch, entry) the late callback
+             is a no-op (slot is now the fresh entry, not the dead one) — GREEN.
+        """
+        registry = InFlightMergeRegistry()
+        f_dead = self._make_future()
+        f_fresh = self._make_future()
+
+        # Step 1: acquire the dead slot.
+        registry.acquire('B', 'task-dead', f_dead, request_id='mr-dead')
+        # Step 2: stale-reap — cancels f_dead, schedules its done-callback for next turn.
+        registry.release('B', detach_waiters=True)
+        # Step 3: immediately re-acquire the same branch.
+        registry.acquire('B', 'task-fresh', f_fresh, request_id='mr-fresh')
+
+        # Synchronous check: fresh slot is present.
+        assert registry.entry('B') is not None
+        assert registry.entry('B').request_id == 'mr-fresh'  # type: ignore[union-attr]
+
+        # Step 4: one loop turn — the dead future's scheduled done-callback runs.
+        await asyncio.sleep(0)
+
+        # Fresh slot must have survived the late callback.
+        assert registry.entry('B') is not None, (
+            'fresh slot was clobbered by stale future late done-callback'
+        )
+        assert registry.entry('B').request_id == 'mr-fresh'  # type: ignore[union-attr]
+        assert registry.is_inflight('B') is True
+
+        f_fresh.cancel()  # clean up
+
+    async def test_normal_resolution_still_releases_slot(self):
+        """(e) 1756 step-7: identity-aware callback must STILL release on normal resolution.
+
+        No-regression guard: when the primary future resolves normally (the slot IS
+        the original entry), the done-callback must still pop the slot so the branch
+        becomes free.  This must be GREEN both before and after step-8's fix.
+        """
+        registry = InFlightMergeRegistry()
+        f1 = self._make_future()
+        registry.acquire('B', 'task-B', f1, request_id='mr-1')
+
+        # Normal terminal resolution: set result on the primary.
+        f1.set_result(MergeOutcome('done'))
+        await asyncio.sleep(0)  # let the done-callback fire
+
+        assert registry.is_inflight('B') is False, (
+            'slot must be released after normal terminal resolution'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueue — registry-only path (git_ops=None)
 # ---------------------------------------------------------------------------
 
@@ -10286,6 +10414,254 @@ class TestCoalesceOrEnqueueRegistryOnly:
             f'Expected coalesced id {coalesced_request_id!r} to alias to primary '
             f'{primary_request_id!r}, got {resolved!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceSnapshotReconcile — 1756 step-3 RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceSnapshotReconcile:
+    """1756 step-3 RED: coalesce gate reconciles stale registry slot with live snapshot.
+
+    RED until step-4 impl: coalesce_or_enqueue_merge_request has no
+    live_snapshot keyword → TypeError on (a)-(c),(e).
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'snap_reconcile_events.db'
+        return EventStore(db_path=db, run_id='snap-reconcile-test')
+
+    async def test_stale_slot_dispatches_fresh(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(a) Stale slot (request_id absent from snapshot) → fresh dispatch, not coalesce."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        # Pre-seed a stale slot: future is pending but not in the live snapshot.
+        stale_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', stale_fut, request_id='mr-dead')
+
+        # Snapshot shows an empty queue (branch 'B' absent).
+        def snap() -> dict:
+            return {'entries': [], 'depth': 0}
+
+        req = _make_request('B', 'B', tmp_path, config)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=snap,
+        )
+
+        assert result.dispatched is True
+        assert result.in_flight is False
+        assert queue.qsize() == 1
+        # Fresh slot must carry a different request_id than the dead one.
+        entry = registry.entry('B')
+        assert entry is not None
+        assert entry.request_id != 'mr-dead'
+
+    async def test_stale_slot_cancels_dead_primary(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(b) After stale-slot reap, the dead primary future is cancelled."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        stale_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', stale_fut, request_id='mr-dead')
+
+        def snap() -> dict:
+            return {'entries': [], 'depth': 0}
+
+        req = _make_request('B', 'B', tmp_path, config)
+        await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=snap,
+        )
+
+        # release(detach_waiters=True) must have cancelled the stale primary.
+        assert stale_fut.cancelled() is True
+
+    async def test_live_slot_still_coalesces(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(c) Live slot (request_id present in snapshot) → coalesces, no over-reap."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        live_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', live_fut, request_id='mr-live')
+
+        # Snapshot confirms 'mr-live' is present.
+        def snap() -> dict:
+            return {'entries': [{'branch': 'B', 'request_id': 'mr-live'}], 'depth': 1}
+
+        req = _make_request('B', 'B', tmp_path, config)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=snap,
+        )
+
+        assert result.in_flight is True
+        assert result.dispatched is False
+        assert result.inflight_request_id == 'mr-live'
+        # Live slot must be untouched — future NOT cancelled.
+        assert live_fut.cancelled() is False
+        assert queue.qsize() == 0
+
+        live_fut.cancel()  # clean up
+
+    async def test_no_live_snapshot_trusts_registry(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(d) live_snapshot=None (default) → trust registry → coalesce (back-compat).
+
+        Matches existing TestCoalesceOrEnqueueRegistryOnly.test_second_call_coalesces
+        — behavior unchanged when no provider is wired.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', fut, request_id='mr-existing')
+
+        req = _make_request('B', 'B', tmp_path, config)
+        # No live_snapshot kwarg → default None → reconcile skipped.
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None,
+        )
+
+        assert result.in_flight is True
+        assert result.dispatched is False
+        assert result.inflight_request_id == 'mr-existing'
+
+        fut.cancel()  # clean up
+
+    async def test_snapshot_provider_raises_trusts_registry(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(e) Snapshot provider raises → fail-safe → treat as live → coalesce."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', fut, request_id='mr-existing')
+
+        def _raising_snap():
+            raise RuntimeError('worker unavailable')
+
+        req = _make_request('B', 'B', tmp_path, config)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=_raising_snap,
+        )
+
+        # Fail-safe: snapshot error → not stale → coalesce.
+        assert result.in_flight is True
+        assert result.dispatched is False
+
+        fut.cancel()  # clean up
+
+    async def test_snapshot_malformed_trusts_registry(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(f) Malformed snapshot (missing 'entries' key or non-dict) → fail-safe → coalesce.
+
+        A snapshot that returns {} or a non-dict must NOT be treated as "empty queue"
+        (which would false-positive as stale and reap the slot).  The fail-safe
+        philosophy (case 3 in _inflight_entry_is_stale) is: when the snapshot
+        cannot be trusted, assume live rather than risk a double-dispatch.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', fut, request_id='mr-existing')
+        req = _make_request('B', 'B', tmp_path, config)
+
+        # Case 1: snapshot dict lacks 'entries' key entirely.
+        def _no_entries_key() -> dict:
+            return {'depth': 0}  # missing 'entries'
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=_no_entries_key,
+        )
+        assert result.in_flight is True
+        assert result.dispatched is False, (
+            'malformed snapshot (missing entries key) must not reap the live slot'
+        )
+        assert fut.cancelled() is False, 'live primary must NOT be cancelled'
+
+        # Case 2: snapshot returns a non-dict entirely.
+        def _non_dict_snap():
+            return ['not', 'a', 'dict']  # type: ignore[return-value]
+
+        result2 = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=_non_dict_snap,  # type: ignore[arg-type]
+        )
+        assert result2.in_flight is True
+        assert result2.dispatched is False, (
+            'malformed snapshot (non-dict) must not reap the live slot'
+        )
+
+        fut.cancel()  # clean up
+
+    async def test_stale_reap_fresh_slot_survives_loop_turn(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """(g) 1756 step-7 RED: after stale-reap + re-acquire via coalesce gate, fresh slot
+        survives one loop turn so a concurrent merge_request still coalesces correctly.
+
+        Sequence inside coalesce_or_enqueue_merge_request with an empty snapshot:
+          1. Detect stale slot (mr-dead absent from snapshot).
+          2. release('B', detach_waiters=True) → cancels stale_fut, schedules its
+             done-callback via loop.call_soon (fires on the NEXT loop turn).
+          3. acquire('B', ..., req.result) → fresh slot (mr-fresh).
+          Returns: dispatched=True.
+        Then await asyncio.sleep(0) — stale_fut's late callback fires.
+          With branch-keyed _release(branch): clobbers the fresh slot → entry is None
+          → a concurrent merge_request would NOT coalesce → double-dispatch (RED).
+          With identity-aware _release_if_current: late callback is a no-op → GREEN.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        stale_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire('B', 'task-B', stale_fut, request_id='mr-dead')
+
+        def snap() -> dict:
+            return {'entries': [], 'depth': 0}
+
+        req = _make_request('B', 'B', tmp_path, config)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None, live_snapshot=snap,
+        )
+
+        assert result.dispatched is True
+        entry = registry.entry('B')
+        assert entry is not None
+        fresh_rid = entry.request_id
+        assert fresh_rid != 'mr-dead'
+
+        # Let the event loop run one turn so stale_fut's done-callback fires.
+        await asyncio.sleep(0)
+
+        # Fresh slot must survive the stale future's late callback.
+        assert registry.entry('B') is not None, (
+            'fresh slot was clobbered by stale future late done-callback '
+            '(would cause double-dispatch on concurrent merge_request for same branch)'
+        )
+        assert registry.entry('B').request_id == fresh_rid  # type: ignore[union-attr]
+        assert registry.is_inflight('B') is True
+
+        # Clean up the fresh future so it doesn't leak across tests.
+        if not req.result.done():
+            req.result.cancel()
 
 
 # ---------------------------------------------------------------------------

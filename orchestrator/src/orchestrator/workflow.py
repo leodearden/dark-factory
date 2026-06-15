@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -58,7 +59,11 @@ from orchestrator.scheduler import (
     files_to_modules,
     normalize_lock,
 )
-from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUSES
+from orchestrator.task_status import (
+    ACTIVE_TASK_STATUSES,
+    TERMINAL_STATUSES,
+    WORKFLOW_PRESERVE_STATUSES,
+)
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
@@ -160,7 +165,7 @@ class _SchedulerLike(Protocol):
     async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = ...,
     ) -> dict: ...
-    async def get_tasks(self) -> list[dict]: ...
+    async def get_tasks(self, *, statuses: Iterable[str] | None = ...) -> list[dict]: ...
     async def get_statuses(
         self, ids: list[str] | None = ...,
     ) -> tuple[dict[str, str], Exception | None]: ...
@@ -915,7 +920,10 @@ class TaskWorkflow:
         The branch name for a task follows the established convention:
         task_id (bare, same as ``branch_name = self.task_id`` in run()).
         """
-        all_tasks: list[dict] = await self.scheduler.get_tasks()
+        # Server-side filter: only in-progress tasks are candidates; applying
+        # the tightest filter here minimises the payload on this per-tick path.
+        # The client-side status check below is kept as defence-in-depth.
+        all_tasks: list[dict] = await self.scheduler.get_tasks(statuses=['in-progress'])
         # Quick filters that require no git I/O.
         pre_filtered: list[dict] = []
         for task in all_tasks:
@@ -924,7 +932,8 @@ class TaskWorkflow:
             if task_id == self.task_id:
                 continue
             # Exclude non-in-progress statuses (done, blocked, cancelled,
-            # merge-deferred, deferred, …).
+            # merge-deferred, deferred, …) — defence-in-depth against the
+            # server-side filter missing any edge case.
             if task.get('status') != 'in-progress':
                 continue
             # Exclude tasks already assigned to a train.
@@ -7203,9 +7212,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             candidates: list[str] = [str(m) for m in members_cache]
             statuses, _ = await self.scheduler.get_statuses(candidates)
         else:
-            # Fallback scan — discover siblings via get_tasks().
+            # Fallback scan — discover siblings via get_tasks() filtered to the
+            # active set (ACTIVE_TASK_STATUSES).  Done siblings are not parked
+            # (merge-deferred ∈ active), so excluding terminal is correct and
+            # shrinks the payload on this fallback path.
             # Status is already embedded in each task dict; avoid a second round-trip.
-            tasks = await self.scheduler.get_tasks()
+            tasks = await self.scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
             statuses: dict[str, str] = {str(t['id']): str(t.get('status', 'unknown')) for t in tasks}
             candidates = [
                 str(t['id'])

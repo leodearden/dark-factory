@@ -52,6 +52,25 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
+def _get_merge_worker(harness: Any | None) -> Any | None:
+    """Return the live merge worker from *harness*, or None if not available.
+
+    Centralises the ``getattr(harness, '_merge_worker', None)`` probe so that
+    the private attribute name lives in exactly one place.  When *harness* is
+    None (standalone mode / unit tests that wire no harness) returns None.
+    Returns None — rather than raising — when the attribute is absent, so a
+    future rename degrades gracefully rather than crashing; callers should warn
+    if the worker is unexpectedly None.
+
+    The ideal long-term fix is a public ``harness.merge_worker_snapshot()``
+    accessor that removes the duck-typed coupling entirely; that requires a
+    harness module change scoped to a separate task.
+    """
+    if harness is None:
+        return None
+    return getattr(harness, '_merge_worker', None)
+
+
 # C1 action enum for resolve_issue — five valid values, two disposition buckets.
 RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'close_only')
 _DISMISS_ACTIONS: frozenset[str] = frozenset({'park', 'abandon', 'close_only'})
@@ -797,6 +816,22 @@ def create_server(
             snapshot_tip=resolved_tip,
         )
 
+        # Build a live_snapshot provider from the live worker handle so the
+        # coalesce gate can reconcile its registry slot against the worker's
+        # live snapshot.  This makes merge_request and get_merge_queue read
+        # the same source of truth: if a slot's request_id is absent from
+        # the snapshot (the request finalized abnormally without releasing
+        # the slot), the gate reaps it and dispatches a fresh request instead
+        # of silently attaching onto a dead id.
+        # _nonblocking_state_response (below) resolves the same worker handle
+        # for position/queue_depth via _get_merge_worker; keep both consistent.
+        _live_merge_worker = _get_merge_worker(harness)
+        live_snapshot = (
+            _live_merge_worker.snapshot
+            if _live_merge_worker is not None and hasattr(_live_merge_worker, 'snapshot')
+            else None
+        )
+
         # De-dup gate: consults the in-memory registry (and optionally the on-disk
         # _merge-* worktree scan via harness.git_ops) before enqueuing.  On coalesce
         # returns immediately with in_flight=True — no future await, no duplicate
@@ -808,6 +843,7 @@ def create_server(
             event_store,
             _registry,
             git_ops=git_ops_for_scan,
+            live_snapshot=live_snapshot,
         )
 
         def _nonblocking_state_response(
@@ -824,7 +860,7 @@ def create_server(
             eta_seconds from the in-flight registry; generation is always 0 in β1.
             """
             request_id_val = req_id_override if req_id_override is not None else req.request_id
-            worker = getattr(harness, '_merge_worker', None)
+            worker = _get_merge_worker(harness)
             position: int = 0
             queue_depth: int = merge_queue.qsize()  # type: ignore[union-attr]
             if worker is not None:
@@ -1057,7 +1093,7 @@ def create_server(
         """
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
-        worker = getattr(harness, '_merge_worker', None)
+        worker = _get_merge_worker(harness)
         if worker is None or not hasattr(worker, 'snapshot'):
             return {'error': 'Merge worker not available'}
         return worker.snapshot()
@@ -1303,7 +1339,7 @@ def create_server(
 
         # Tier 1: live snapshot — wrapped fire-safe so a transient worker-introspection
         # failure degrades to the durable tiers rather than erroring the read-only probe.
-        worker = getattr(harness, '_merge_worker', None) if harness is not None else None
+        worker = _get_merge_worker(harness)
         if worker is not None and hasattr(worker, 'snapshot'):
             try:
                 snap = worker.snapshot()

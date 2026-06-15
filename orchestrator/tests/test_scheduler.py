@@ -18,6 +18,7 @@ from orchestrator.config import (
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
+from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
 @pytest.fixture
@@ -6761,3 +6762,283 @@ class TestSuppressBlockedWrite:
 
         scheduler.dispatch_tool.assert_called_once()
         assert scheduler.parked_live_count == 1
+
+
+# ---------------------------------------------------------------------------
+# step-1 RED: Scheduler.get_tasks forwards statuses kwarg into dispatch_tool
+# ---------------------------------------------------------------------------
+
+class TestGetTasksStatusesParam:
+    """get_tasks(statuses=[...]) must forward 'statuses' into dispatch_tool args.
+
+    get_tasks() with no arg must omit 'statuses' entirely (full-fetch preserved).
+    """
+
+    @staticmethod
+    def _envelope(tasks: list) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': _json.dumps({'tasks': tasks})}
+                ]
+            }
+        }
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_with_statuses_forwards_arg(self, scheduler: Scheduler):
+        """Passing statuses=[...] results in 'statuses' present in dispatch_tool args."""
+        scheduler.dispatch_tool = AsyncMock(return_value=self._envelope([]))
+        await scheduler.get_tasks(statuses=['pending', 'in-progress'])
+        call_args = scheduler.dispatch_tool.call_args
+        # Second positional arg is the arguments dict
+        arguments = call_args[0][1] if call_args[0] else call_args.kwargs.get('arguments', {})
+        # Support both positional and keyword call styles
+        if not arguments and len(call_args[0]) > 1:
+            arguments = call_args[0][1]
+        assert 'statuses' in arguments, (
+            f"Expected 'statuses' key in dispatch_tool arguments but got: {arguments}"
+        )
+        assert arguments['statuses'] == ['pending', 'in-progress']
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_no_arg_omits_statuses(self, scheduler: Scheduler):
+        """Calling get_tasks() without statuses must NOT include 'statuses' in dispatch_tool args."""
+        scheduler.dispatch_tool = AsyncMock(return_value=self._envelope([]))
+        await scheduler.get_tasks()
+        call_args = scheduler.dispatch_tool.call_args
+        arguments = call_args[0][1] if (call_args[0] and len(call_args[0]) > 1) else {}
+        assert 'statuses' not in arguments, (
+            f"'statuses' should be absent from dispatch_tool arguments but got: {arguments}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_statuses_none_omits_statuses(self, scheduler: Scheduler):
+        """get_tasks(statuses=None) must NOT include 'statuses' in dispatch_tool args."""
+        scheduler.dispatch_tool = AsyncMock(return_value=self._envelope([]))
+        await scheduler.get_tasks(statuses=None)
+        call_args = scheduler.dispatch_tool.call_args
+        arguments = call_args[0][1] if (call_args[0] and len(call_args[0]) > 1) else {}
+        assert 'statuses' not in arguments, (
+            f"'statuses' should be absent when None but got: {arguments}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED: acquire_next() calls get_tasks with ACTIVE_TASK_STATUSES
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextFetchesActiveOnly:
+    """acquire_next() must call get_tasks with statuses=ACTIVE_TASK_STATUSES.
+
+    Fails today because acquire_next calls self.get_tasks() with no statuses arg.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_passes_active_statuses_to_get_tasks(
+        self, scheduler: Scheduler
+    ):
+        """acquire_next() must issue get_tasks with statuses==ACTIVE_TASK_STATUSES."""
+        pending_task = {
+            'id': '42',
+            'title': 'A pending task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend/module_a']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[pending_task])
+        scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+        await scheduler.acquire_next()
+
+        scheduler.get_tasks.assert_awaited_once()
+        call_kwargs = scheduler.get_tasks.call_args.kwargs
+        assert 'statuses' in call_kwargs, (
+            f"acquire_next must call get_tasks with statuses=ACTIVE_TASK_STATUSES, "
+            f"but call_args.kwargs was: {call_kwargs}"
+        )
+        assert set(call_kwargs['statuses']) == ACTIVE_TASK_STATUSES, (
+            f"Expected statuses {ACTIVE_TASK_STATUSES}, got {set(call_kwargs['statuses'])}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: correctness crux — done dep absent from active fetch still satisfies
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextDepBackfillFromGetStatuses:
+    """A task whose dep is DONE (absent from active get_tasks) still dispatches.
+
+    Active-only fetch drops terminal tasks from the result. acquire_next must
+    backfill their status via get_statuses so _deps_satisfied can resolve them.
+
+    Fails today: acquire_next derives status_map only from [B], so dep A
+    resolves to 'unknown' → B is blocked → acquire_next returns None, and
+    get_statuses is never called.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_done_dep_absent_from_active_fetch_still_dispatches(
+        self, scheduler: Scheduler
+    ):
+        """Task B dispatches even when its dep A is absent from the active get_tasks result."""
+        # A is done and excluded by the active filter.
+        task_b = {
+            'id': 'B',
+            'title': 'Task B — depends on A',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['backend/module_b']},
+        }
+        # get_tasks returns only B (A is terminal → excluded by active filter).
+        scheduler.get_tasks = AsyncMock(return_value=[task_b])
+        # get_statuses is called to backfill the missing dep A → returns done.
+        scheduler.get_statuses = AsyncMock(return_value=({'A': 'done'}, None))
+
+        result = await scheduler.acquire_next()
+
+        # B should have been dispatched.
+        assert result is not None, (
+            'Expected task B to be dispatched when its done dep A is backfilled '
+            'from get_statuses, but acquire_next returned None'
+        )
+        assert result.task_id == 'B'
+
+        # get_statuses must have been called with dep A to resolve the missing status.
+        scheduler.get_statuses.assert_awaited()
+        call_kwargs = scheduler.get_statuses.call_args.kwargs
+        ids_called = call_kwargs.get('ids', scheduler.get_statuses.call_args[0][0] if scheduler.get_statuses.call_args[0] else [])
+        assert 'A' in ids_called, (
+            f"Expected get_statuses to be called with 'A' in ids, "
+            f"but got ids={ids_called}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: bookkeeping purged for tasks absent from active fetch (not only terminal)
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextBookkeepingPurgesAbsentTasks:
+    """Per-tick bookkeeping must be purged for completed tasks absent from active fetch.
+
+    Active-only filtering drops completed tasks from get_tasks. The existing
+    terminal-cleanup sweep only purges ids observed TERMINAL in status_map.
+    Tasks absent from the active result won't appear in status_map at all,
+    so their _skip_count/_last_dispatch_at/_module_cache entries would leak.
+
+    Fails today because the sweep iterates status_map items looking for
+    TERMINAL status — but 'X' is absent from the active result → not in
+    status_map → never purged.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_bookkeeping_purged_for_absent_task(self, scheduler: Scheduler):
+        """Bookkeeping entries for a task absent from the active fetch must be purged.
+
+        Includes _pending_anchor: a task that went pending → terminal without
+        ever being dispatched would leak its anchor entry permanently under
+        active-only filtering because _update_age_anchors only iterates the
+        fetched tasks list (and terminal tasks are absent from it).
+        """
+        # Seed bookkeeping for task 'X' that is now completed/absent.
+        scheduler._skip_count['X'] = 3
+        scheduler._last_dispatch_at['X'] = 123.0
+        scheduler._module_cache['X'] = ['backend/module_x']
+        # Seed _pending_anchor as if X was pending once and assigned an anchor.
+        scheduler._pending_anchor['X'] = 5
+
+        # Unrelated pending task (not X); X is terminal → excluded from active fetch.
+        other_task = {
+            'id': '99',
+            'title': 'Other pending task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend/module_other']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[other_task])
+        scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+        await scheduler.acquire_next()
+
+        # X is absent from the active result → bookkeeping must have been purged.
+        assert 'X' not in scheduler._skip_count, (
+            f"Expected 'X' purged from _skip_count but it's still there: {scheduler._skip_count}"
+        )
+        assert 'X' not in scheduler._last_dispatch_at, (
+            f"Expected 'X' purged from _last_dispatch_at but it's still there: {scheduler._last_dispatch_at}"
+        )
+        assert 'X' not in scheduler._module_cache, (
+            f"Expected 'X' purged from _module_cache but it's still there: {scheduler._module_cache}"
+        )
+        # _pending_anchor must also be purged so the dict stays bounded.
+        assert 'X' not in scheduler._pending_anchor, (
+            f"Expected 'X' purged from _pending_anchor but it's still there: {scheduler._pending_anchor}"
+        )
+        # _was_non_pending must record X so that if it is resurrected to pending
+        # it gets a fresh max_id anchor (resurrection semantics) instead of
+        # re-using its old stale numeric id.
+        assert 'X' in scheduler._was_non_pending, (
+            f"Expected 'X' recorded in _was_non_pending for resurrection semantics: {scheduler._was_non_pending}"
+        )
+
+
+class TestActiveTaskStatusesMatchesFusedMemory:
+    """Guard: ACTIVE_TASK_STATUSES in task_status.py must stay in sync with
+    fused-memory's canonical definition.
+
+    If the server adds a new active status and the orchestrator's local copy
+    is not updated, tasks in that status would be silently excluded from the
+    active get_tasks fetch and never dispatched.  This test makes divergence
+    fail CI rather than strand tasks silently.
+    """
+
+    def test_active_task_statuses_matches_fused_memory(self):
+        """orchestrator.task_status.ACTIVE_TASK_STATUSES == fused_memory canonical.
+
+        fused_memory is not on the orchestrator test path (cross-package import
+        is intentionally avoided per design — mirrored, not imported).  Instead
+        we compare against the hardcoded canonical set from
+        fused_memory/src/fused_memory/reconciliation/task_filter.py:66.
+        Update BOTH files when the server adds a new active status.
+        """
+        from orchestrator.task_status import ACTIVE_TASK_STATUSES as orch_set
+
+        # Canonical active statuses as defined in
+        # fused_memory/reconciliation/task_filter.py (task_filter.ACTIVE_TASK_STATUSES).
+        # Keep in sync with that file manually — divergence here is the signal.
+        fm_canonical: frozenset[str] = frozenset(
+            {
+                'pending',
+                'in-progress',
+                'blocked',
+                'deferred',
+                'review',
+                'merge-deferred',
+            }
+        )
+        assert orch_set == fm_canonical, (
+            "ACTIVE_TASK_STATUSES drift detected!\n"
+            f"  orchestrator/task_status.py: {sorted(orch_set)}\n"
+            f"  fused_memory/reconciliation/task_filter.py (canonical): {sorted(fm_canonical)}\n"
+            "Update orchestrator/task_status.py to match the server-side definition."
+        )

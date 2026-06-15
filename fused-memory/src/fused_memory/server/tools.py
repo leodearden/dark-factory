@@ -2022,6 +2022,7 @@ def create_mcp_server(
         tag: str | None = None,
         page_size: int | None = None,
         offset: int = 0,
+        statuses: Any = None,
     ) -> dict[str, Any]:
         """List all tasks in the project.
 
@@ -2034,6 +2035,12 @@ def create_mcp_server(
                 all existing callers.
             offset: Zero-based index of the first task to return (default 0).  Only
                 meaningful when page_size is provided.
+            statuses: Opt-in status filter.  When omitted or None, the full unfiltered
+                task tree is returned (byte-identical to the current behaviour).  Pass a
+                list of status strings (e.g. ``['pending', 'in-progress']``) to restrict
+                results to matching tasks via a SQL ``status IN (...)`` predicate.  An
+                empty list (``[]``) is valid and returns no tasks.  A bare string is
+                rejected with a ValidationError.
         """
         # Input validation — early-exit before touching the interceptor.
         if page_size is not None and (not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0):
@@ -2046,13 +2053,23 @@ def create_mcp_server(
                 'error': 'offset must be a non-negative integer',
                 'error_type': 'ValidationError',
             }
+        if statuses is not None and not isinstance(statuses, list):
+            return {
+                'error': 'statuses must be a list of status strings',
+                'error_type': 'ValidationError',
+            }
+        if statuses is not None and any(not isinstance(s, str) for s in statuses):
+            return {
+                'error': 'statuses must be a list of status strings',
+                'error_type': 'ValidationError',
+            }
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
         try:
-            result = await task_interceptor.get_tasks(project_root=project_root, tag=tag)
+            result = await task_interceptor.get_tasks(project_root=project_root, tag=tag, statuses=statuses)
             if isinstance(result, dict) and 'error' not in result:
                 pid = resolve_project_id(project_root)
                 # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.

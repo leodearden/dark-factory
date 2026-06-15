@@ -59,7 +59,8 @@ class TaskBackendProtocol(Protocol):
     # ── Reads ──────────────────────────────────────────────────────────
 
     async def get_tasks(
-        self, project_root: str, tag: str | None = None
+        self, project_root: str, tag: str | None = None,
+        statuses: list[str] | None = None,
     ) -> GetTasksResult: ...
 
     async def get_task(
