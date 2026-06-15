@@ -106,6 +106,8 @@ class MemoryService:
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
+        # Process-start baselines for uptime reporting
+        self._started_at: datetime = datetime.now(UTC)
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
@@ -1965,6 +1967,9 @@ class MemoryService:
                 status['queue'] = await self.durable_queue.get_stats(group_id=project_id)
             except Exception as e:
                 status['queue'] = {'error': str(e)}
+
+        # Server uptime fields (informational; dashboard reads uptime_seconds as primary)
+        status['started_at'] = self._started_at.isoformat()
 
         return status
 
