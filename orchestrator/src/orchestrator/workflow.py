@@ -58,7 +58,11 @@ from orchestrator.scheduler import (
     files_to_modules,
     normalize_lock,
 )
-from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUSES
+from orchestrator.task_status import (
+    ACTIVE_TASK_STATUSES,
+    TERMINAL_STATUSES,
+    WORKFLOW_PRESERVE_STATUSES,
+)
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
@@ -7207,9 +7211,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             candidates: list[str] = [str(m) for m in members_cache]
             statuses, _ = await self.scheduler.get_statuses(candidates)
         else:
-            # Fallback scan — discover siblings via get_tasks().
+            # Fallback scan — discover siblings via get_tasks() filtered to the
+            # active set (ACTIVE_TASK_STATUSES).  Done siblings are not parked
+            # (merge-deferred ∈ active), so excluding terminal is correct and
+            # shrinks the payload on this fallback path.
             # Status is already embedded in each task dict; avoid a second round-trip.
-            tasks = await self.scheduler.get_tasks()
+            tasks = await self.scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
             statuses: dict[str, str] = {str(t['id']): str(t.get('status', 'unknown')) for t in tasks}
             candidates = [
                 str(t['id'])
