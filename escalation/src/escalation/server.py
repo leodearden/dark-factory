@@ -1297,39 +1297,50 @@ def create_server(
 
         # Tier 3.5: git-authority — probe main directly when no durable record exists.
         # Obtain git_ops via the same accessor as the merge_request fast-path (server.py:766).
+        # Guards: git_ops present AND orch_config present AND a resolvable key (branch or
+        # task_id).  Any absent → straight to honest Tier-4 unknown (unchanged behaviour).
+        # FIRE-SAFE: the entire probe is try/except Exception so a git failure degrades to
+        # the honest unknown rather than raising.  Mirrors the Tier-1 snapshot fire-safe
+        # wrapper at server.py:1278.
         git_ops = getattr(harness, 'git_ops', None) if harness is not None else None
         if git_ops is not None and orch_config is not None:
             key = branch if branch is not None else task_id
             if key is not None:
-                prefix = orch_config.git.branch_prefix
-                full_branch = key if key.startswith(prefix) else f'{prefix}{key}'
-                tip = await git_ops.resolve_branch_sha(full_branch)
-                if tip is not None and await git_ops.is_ancestor(tip, orch_config.git.main_branch):
-                    # Live branch is already an ancestor of main (normal merged case).
-                    return {
-                        'state': 'done',
-                        'request_id': request_id,
-                        'generation': 1,
-                        'kind': 'found_on_main',
-                        'merge_sha': tip,
-                        'outcome': 'found_on_main',
-                    }
-                elif tip is None:
-                    # Branch ref gone — the canonical 4352 deleted-branch shape.
-                    # find_merge_marker internally gates on branch existence so it only
-                    # fires when the ref is gone (consistent with the cheaper-common-path
-                    # ordering: cheaper is_ancestor check first, find_merge_marker only
-                    # when the branch has been deleted).
-                    marker = await git_ops.find_merge_marker(full_branch)
-                    if marker is not None:
+                try:
+                    prefix = orch_config.git.branch_prefix
+                    full_branch = key if key.startswith(prefix) else f'{prefix}{key}'
+                    tip = await git_ops.resolve_branch_sha(full_branch)
+                    if tip is not None and await git_ops.is_ancestor(tip, orch_config.git.main_branch):
+                        # Live branch is already an ancestor of main (normal merged case).
                         return {
                             'state': 'done',
                             'request_id': request_id,
                             'generation': 1,
                             'kind': 'found_on_main',
-                            'merge_sha': marker,
+                            'merge_sha': tip,
                             'outcome': 'found_on_main',
                         }
+                    elif tip is None:
+                        # Branch ref gone — the canonical 4352 deleted-branch shape.
+                        # find_merge_marker internally gates on branch existence so it only
+                        # fires when the ref is gone (consistent with the cheaper-common-path
+                        # ordering: cheaper is_ancestor check first, find_merge_marker only
+                        # when the branch has been deleted).
+                        marker = await git_ops.find_merge_marker(full_branch)
+                        if marker is not None:
+                            return {
+                                'state': 'done',
+                                'request_id': request_id,
+                                'generation': 1,
+                                'kind': 'found_on_main',
+                                'merge_sha': marker,
+                                'outcome': 'found_on_main',
+                            }
+                except Exception:
+                    logger.warning(
+                        'merge_status: git-authority probe failed, returning unknown',
+                        exc_info=True,
+                    )
 
         # Tier 4: honest unknown
         return {
