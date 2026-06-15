@@ -30,6 +30,7 @@ note makes the burst visible to operators without flooding the queue.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import logging
@@ -126,12 +127,24 @@ class CuratorEscalator:
             if not text.strip():
                 return
             records = json.loads(text)
+            dropped = 0
             for rec in records:
-                project_id = rec['project_id']
-                subtype = rec.get('subtype')  # may be None
-                timestamps = [t for t in rec['timestamps'] if t >= cutoff]
-                if timestamps:
-                    self._failure_log[(project_id, subtype)] = timestamps
+                try:
+                    project_id = rec['project_id']
+                    subtype = rec.get('subtype')  # may be None
+                    timestamps = [t for t in rec['timestamps'] if t >= cutoff]
+                    if timestamps:
+                        self._failure_log[(project_id, subtype)] = timestamps
+                except (KeyError, TypeError, ValueError):
+                    dropped += 1
+                    continue
+            if dropped:
+                logger.warning(
+                    'curator_escalator: skipped %d malformed record(s) while '
+                    'loading state from %s; remaining records loaded normally',
+                    dropped,
+                    self._state_path,
+                )
         except Exception:
             logger.warning(
                 'curator_escalator: failed to load state from %s; starting empty',
@@ -139,14 +152,30 @@ class CuratorEscalator:
                 exc_info=True,
             )
 
-    def _persist_state(self) -> None:
+    async def _persist_state(self) -> None:
         """Atomically write _failure_log to state_path as JSON.
+
+        Prunes all globally stale entries (timestamps older than the cooldown
+        window) before writing so the file stays bounded to the active window —
+        not just the key that was most recently touched.  The write is offloaded
+        via :func:`asyncio.to_thread` to avoid blocking the event loop under
+        burst load (especially with multiple concurrent ``report_failure`` calls).
 
         Uses write-to-temp + os.replace so a crash mid-write never corrupts
         the existing file.  Only called when state_path is set.
         """
         if self._state_path is None:
             return
+        # Prune globally before serialising so stale (project_id, subtype)
+        # pairs do not accumulate in memory or on disk across long-lived processes.
+        now = time.time()
+        cutoff = now - self._cooldown_secs
+        for key in list(self._failure_log.keys()):
+            pruned = [t for t in self._failure_log[key] if t >= cutoff]
+            if pruned:
+                self._failure_log[key] = pruned
+            else:
+                del self._failure_log[key]
         records = [
             {
                 'project_id': project_id,
@@ -154,18 +183,25 @@ class CuratorEscalator:
                 'timestamps': timestamps,
             }
             for (project_id, subtype), timestamps in self._failure_log.items()
-            if timestamps
         ]
-        tmp_path = self._state_path.with_suffix('.tmp')
-        try:
-            tmp_path.write_text(json.dumps(records))
-            os.replace(tmp_path, self._state_path)
-        except Exception:
-            logger.warning(
-                'curator_escalator: failed to persist state to %s',
-                self._state_path,
-                exc_info=True,
-            )
+        # Serialise the snapshot on the calling thread; only the I/O runs in the
+        # thread pool so we don't hold the dict lock during the blocking write.
+        payload = json.dumps(records)
+        state_path = self._state_path
+
+        def _write() -> None:
+            tmp_path = state_path.with_suffix('.tmp')
+            try:
+                tmp_path.write_text(payload)
+                os.replace(tmp_path, state_path)
+            except Exception:
+                logger.warning(
+                    'curator_escalator: failed to persist state to %s',
+                    state_path,
+                    exc_info=True,
+                )
+
+        await asyncio.to_thread(_write)
 
     def _orchestrator_running(self, project_root: str) -> bool:
         """Return True if the project's orchestrator holds its exclusive lock.
@@ -299,7 +335,7 @@ class CuratorEscalator:
         log.append(now)
         self._failure_log[log_key] = log
         # Persist the updated burst log so the counter survives a watchdog restart.
-        self._persist_state()
+        await self._persist_state()
         count = len(log)
         burst_started = log[0]
 

@@ -4027,7 +4027,15 @@ class TestCallLlmSingleBudgetScaling:
 
     @pytest.mark.asyncio
     async def test_oversized_pool_clamped_at_cap(self):
-        """N=50 → unclamped would be 0.30 + 0.0125*50 = 0.925; clamped at $0.75."""
+        """N=50 → unclamped would be 0.30 + 0.0125*50 = 0.925; clamped at $0.75.
+
+        NOTE: In production _trim_pool caps the pool at pool_total_cap (default 30)
+        before _call_llm is invoked via curate(), so len(pool) can never exceed 30
+        on the normal code path.  The cap (0.75) is a pure safety net against
+        pathological pool sizes >36 entries.  This test verifies the clamping
+        arithmetic but does NOT represent a reachable runtime scenario — it bypasses
+        _trim_pool by calling _call_llm directly with an oversized pool.
+        """
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._success_ar())

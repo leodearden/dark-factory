@@ -459,6 +459,20 @@ def normalize_title(title: str | None) -> str:
     return ' '.join((title or '').strip().lower().split())
 
 
+def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float:
+    """Compute a scaled LLM budget clamped at ``cap``.
+
+    Both the single-call and batch budget-scaling formulas share this shape::
+
+        budget = min(base + per_entry * size, cap)
+
+    where ``size`` is ``len(pool)`` for single-call and ``(n - 1)`` for batch.
+    Extracting the formula avoids drift between the two call sites when either
+    constant is tuned.
+    """
+    return min(base + per_entry * size, cap)
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 
@@ -1686,9 +1700,10 @@ class TaskCurator:
         #   budget = min(max_budget_usd + per_pool_entry_budget_usd*len(pool),
         #                single_call_budget_cap_usd)
         # Empty pool stays at the $0.30 baseline; full 30-entry pool → $0.675.
-        budget = min(
-            self._config.curator.max_budget_usd
-            + self._config.curator.per_pool_entry_budget_usd * len(pool),
+        budget = _scale_budget(
+            self._config.curator.max_budget_usd,
+            self._config.curator.per_pool_entry_budget_usd,
+            len(pool),
             self._config.curator.single_call_budget_cap_usd,
         )
 
@@ -1778,9 +1793,10 @@ class TaskCurator:
         # R1: scale max_budget_usd. Batch prompts are several × bigger than
         # single-call prompts and burn the flat per-call budget in 1–2 turns,
         # tripping error_max_budget_usd before the model can answer.
-        budget = min(
-            self._config.curator.max_budget_usd
-            + self._config.curator.per_item_budget_usd * (n - 1),
+        budget = _scale_budget(
+            self._config.curator.max_budget_usd,
+            self._config.curator.per_item_budget_usd,
+            n - 1,
             self._config.curator.batch_budget_cap_usd,
         )
 
