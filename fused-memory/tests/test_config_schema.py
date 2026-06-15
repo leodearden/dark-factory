@@ -603,6 +603,44 @@ class TestReconciliationConfigStormKnobs:
             ReconciliationConfig(dead_owner_suppression_storm_window_seconds=-1.0)
 
 
+class TestConfigYamlBacklogHardLimitOverrides:
+    """Deployment test: config.yaml must carry the reify override (task 1764).
+
+    Mirrors TestConfigYamlReconciliationFlags: loads the real YAML via CONFIG_PATH,
+    constructs FusedMemoryConfig(), and asserts the deployed values.
+    """
+
+    def test_config_yaml_reify_override_in_recommended_band(self, monkeypatch):
+        """config.yaml must set reconciliation.backlog_hard_limit_overrides.reify >= 1000.
+
+        reify's steady-state backlog (~500-520) sits just over the flat 500,
+        causing benign recon_backlog_overflow escalations (esc-fused-memory-237).
+        The recommended band is 1000-1500; asserting >= 1000 pins the intent while
+        leaving room for operators to re-tune within the band.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        reify_limit = cfg.reconciliation.backlog_hard_limit_overrides.get('reify', 0)
+        assert reify_limit >= 1000, (
+            f'fused-memory/config/config.yaml must set '
+            f'reconciliation.backlog_hard_limit_overrides.reify >= 1000 '
+            f'(got {reify_limit!r}) to clear benign esc-fused-memory-237 noise.'
+        )
+
+    def test_config_yaml_global_default_unchanged(self, monkeypatch):
+        """config.yaml must not override backlog_hard_limit from its default of 500."""
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.reconciliation.backlog_hard_limit == 500, (
+            'reconciliation.backlog_hard_limit in config.yaml must remain 500 '
+            '(the per-project override is separate).'
+        )
+
+
 class TestReconciliationConfigBacklogHardLimitOverrides:
     """Tests for ReconciliationConfig.backlog_hard_limit_overrides (task 1764).
 
