@@ -3279,3 +3279,32 @@ class TestGetMemoriesByMetadata:
         )
 
         svc.mem0.search.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 1752: get_status uptime fields
+# ---------------------------------------------------------------------------
+
+class TestGetStatusUptime:
+    """get_status() reports server started_at and uptime_seconds."""
+
+    @pytest.mark.asyncio
+    async def test_started_at_present_and_utc(self, service):
+        """get_status() returns a top-level 'started_at' UTC ISO-format string."""
+        from datetime import timedelta
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        result = await service.get_status()
+
+        assert 'started_at' in result, (
+            f'Expected "started_at" in result; got keys={list(result)}'
+        )
+        dt = datetime.fromisoformat(result['started_at'])
+        assert dt.utcoffset() == timedelta(0), (
+            f'started_at must be UTC; utcoffset={dt.utcoffset()}'
+        )
+        assert result['started_at'] == service._started_at.isoformat(), (
+            f'started_at should match construction-time stamp; '
+            f'got {result["started_at"]!r}, expected {service._started_at.isoformat()!r}'
+        )
