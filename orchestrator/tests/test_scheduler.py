@@ -7042,3 +7042,112 @@ class TestActiveTaskStatusesMatchesFusedMemory:
             f"  fused_memory/reconciliation/task_filter.py (canonical): {sorted(fm_canonical)}\n"
             "Update orchestrator/task_status.py to match the server-side definition."
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-5 RED: Scheduler.carries_substrate_probe
+# ---------------------------------------------------------------------------
+
+
+class TestCarriesSubstrateProbe:
+    """``Scheduler.carries_substrate_probe(task)`` single-source-of-truth.
+
+    The staticmethod is a thin delegate to
+    ``substrate_gate.extract_probe_set(task) is not None`` so that the harness
+    uses a single entry-point to decide whether to run the gate.
+    """
+
+    # --- True cases ---
+
+    def test_returns_true_for_probe_task_dict_metadata(self):
+        task = {
+            'id': '1',
+            'status': 'pending',
+            'metadata': {
+                'substrate_probe': {
+                    'probe_set': 'probes/suite.json',
+                    'checker': ['python', '-m', 'checker'],
+                }
+            },
+        }
+        assert Scheduler.carries_substrate_probe(task) is True
+
+    def test_returns_true_for_probe_task_json_string_metadata(self):
+        import json as _json
+        meta = _json.dumps({
+            'substrate_probe': {
+                'probe_set': 'probes/suite.json',
+                'checker': ['run_check'],
+            }
+        })
+        task = {'id': '1', 'status': 'pending', 'metadata': meta}
+        assert Scheduler.carries_substrate_probe(task) is True
+
+    # --- False cases ---
+
+    def test_returns_false_for_plain_task(self):
+        task = {'id': '1', 'status': 'pending', 'metadata': {'files': ['src/foo.py']}}
+        assert Scheduler.carries_substrate_probe(task) is False
+
+    def test_returns_false_when_metadata_is_empty_dict(self):
+        task = {'id': '1', 'metadata': {}}
+        assert Scheduler.carries_substrate_probe(task) is False
+
+    def test_returns_false_when_metadata_absent(self):
+        task = {'id': '1', 'status': 'pending'}
+        assert Scheduler.carries_substrate_probe(task) is False
+
+    def test_returns_false_when_metadata_is_none(self):
+        task = {'id': '1', 'metadata': None}
+        assert Scheduler.carries_substrate_probe(task) is False
+
+    def test_returns_false_for_json_string_without_substrate_probe(self):
+        import json as _json
+        task = {'id': '1', 'metadata': _json.dumps({'other_key': 'value'})}
+        assert Scheduler.carries_substrate_probe(task) is False
+
+    def test_returns_false_when_descriptor_has_no_probe_set(self):
+        task = {
+            'id': '1',
+            'metadata': {
+                'substrate_probe': {'checker': ['run_check']}  # no probe_set
+            },
+        }
+        assert Scheduler.carries_substrate_probe(task) is False
+
+    def test_returns_false_when_substrate_probe_is_not_dict(self):
+        task = {'id': '1', 'metadata': {'substrate_probe': 'bad-value'}}
+        assert Scheduler.carries_substrate_probe(task) is False
+
+    # --- Regression guard: acquire_next is untouched ---
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_still_dispatches_probe_carrying_task(self):
+        """Substrate gate lives in harness._run_slot, not acquire_next.
+
+        A probe-carrying pending task must be returned by acquire_next()
+        exactly as a plain task would be — the scoring/locking hot loop
+        must be unaffected.
+        """
+        probe_task = {
+            'id': '42',
+            'title': 'Probe task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'files': ['src/foo.py'],
+                'substrate_probe': {
+                    'probe_set': 'probes/suite.json',
+                    'checker': ['python', '-m', 'checker'],
+                },
+            },
+        }
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler.get_tasks = AsyncMock(return_value=[probe_task])
+
+        assignment = await scheduler.acquire_next()
+        assert assignment is not None
+        assert assignment.task_id == '42'
+        # The task dict is unchanged — acquire_next does not remove substrate_probe
+        assert assignment.task['metadata']['substrate_probe']['probe_set'] == 'probes/suite.json'
