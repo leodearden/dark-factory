@@ -490,7 +490,17 @@ class LocalRunner:
         run_scoped: Callable[..., Awaitable[VerifyResult]],
         run_unscoped: Callable[..., Awaitable[Any]],
         task_id: str | None = None,
+        archive_root: Path | None = None,
     ) -> None:
+        """Initialise LocalRunner.
+
+        *archive_root* threads merge-verify logs to ``data/verify-logs/<task_id>/``
+        when set.  Default ``None`` preserves byte-identical behaviour for all
+        existing constructions and the CLI ``run_merge_verify_on_worktree`` path.
+        Policy lives in the caller (merge_queue.py wires the concrete path);
+        cold-shadow / drift intentionally leave this ``None`` so they are
+        auto-excluded from archival without any extra deny-list logic.
+        """
         self._merge_wt = merge_wt
         self._config = config
         self._module_configs = module_configs
@@ -498,6 +508,7 @@ class LocalRunner:
         self._run_scoped = run_scoped
         self._run_unscoped = run_unscoped
         self._task_id = task_id
+        self._archive_root = archive_root
 
     async def health(self) -> bool:
         return True
@@ -529,6 +540,8 @@ class LocalRunner:
             is_merge_verify=True,
             force_workspace=self._config.merge_verify_workspace,
             role='merge',
+            task_id=self._task_id,
+            archive_root=self._archive_root,
         )
         if not scoped.passed:
             return scoped

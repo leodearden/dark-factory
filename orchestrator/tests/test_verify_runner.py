@@ -607,6 +607,8 @@ class TestLocalRunnerBundle:
             is_merge_verify=True,
             force_workspace=True,
             role='merge',
+            task_id=None,
+            archive_root=None,
         )
 
 
