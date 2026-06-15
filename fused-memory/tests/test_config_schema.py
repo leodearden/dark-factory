@@ -611,22 +611,24 @@ class TestConfigYamlBacklogHardLimitOverrides:
     """
 
     def test_config_yaml_reify_override_in_recommended_band(self, monkeypatch):
-        """config.yaml must set reconciliation.backlog_hard_limit_overrides.reify >= 1000.
+        """config.yaml must set reconciliation.backlog_hard_limit_overrides.reify in [1000, 1500].
 
         reify's steady-state backlog (~500-520) sits just over the flat 500,
         causing benign recon_backlog_overflow escalations (esc-fused-memory-237).
-        The recommended band is 1000-1500; asserting >= 1000 pins the intent while
-        leaving room for operators to re-tune within the band.
+        The recommended band is 1000-1500. Asserting the full band pins the intent
+        while leaving operators room to re-tune within the range — and catches an
+        edit that silently disables the guard (e.g. setting reify to 50000).
         """
         yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
         assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
         monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
         cfg = FusedMemoryConfig()
         reify_limit = cfg.reconciliation.backlog_hard_limit_overrides.get('reify', 0)
-        assert reify_limit >= 1000, (
+        assert 1000 <= reify_limit <= 1500, (
             f'fused-memory/config/config.yaml must set '
-            f'reconciliation.backlog_hard_limit_overrides.reify >= 1000 '
-            f'(got {reify_limit!r}) to clear benign esc-fused-memory-237 noise.'
+            f'reconciliation.backlog_hard_limit_overrides.reify in [1000, 1500] '
+            f'(got {reify_limit!r}) — the recommended band that clears benign '
+            f'esc-fused-memory-237 noise without masking a real runaway.'
         )
 
     def test_config_yaml_global_default_unchanged(self, monkeypatch):
@@ -673,3 +675,20 @@ class TestReconciliationConfigBacklogHardLimitOverrides:
     def test_non_int_value_rejected(self):
         with pytest.raises(ValidationError):
             ReconciliationConfig(backlog_hard_limit_overrides={'reify': 'not-an-int'})  # type: ignore[arg-type]
+
+    # --- positivity guard: non-positive override values rejected ---
+
+    def test_zero_override_rejected(self):
+        """Zero override would make every check exceed limit — reject at config load."""
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(backlog_hard_limit_overrides={'reify': 0})
+
+    def test_negative_override_rejected(self):
+        """Negative override must also be caught by the positivity guard."""
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(backlog_hard_limit_overrides={'reify': -1})
+
+    def test_mixed_valid_and_zero_rejected(self):
+        """A map with one valid and one zero entry must be rejected (not partially accepted)."""
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(backlog_hard_limit_overrides={'reify': 1500, 'bad': 0})
