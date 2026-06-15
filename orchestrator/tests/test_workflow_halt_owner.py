@@ -29,7 +29,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.merge_queue import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, _ORPHAN_HALT_NO_QUEUE_TOKENS
+from orchestrator.workflow import _ORPHAN_HALT_NO_QUEUE_TOKENS, TaskWorkflow, WorkflowOutcome
 
 
 class _FakeMergeWorker:
