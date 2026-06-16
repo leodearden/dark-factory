@@ -65,6 +65,7 @@ from orchestrator.task_status import (
     WORKFLOW_PRESERVE_STATUSES,
 )
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
+from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
@@ -75,6 +76,27 @@ from orchestrator.verify import (
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
+
+
+def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
+    """Inject the plan-tools stdio MCP server entry into *mcp_config*.
+
+    Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
+    ``None``; otherwise preserves all pre-existing server entries and adds
+    (or replaces) the ``plan-tools`` key.
+
+    The plan-tools server is launched with fast-start flags (``--no-sync``,
+    ``--frozen``) via :func:`~orchestrator.mcp_lifecycle.plan_tools_mcp_server`
+    to reuse the already-synced orchestrator venv instead of cold-resolving
+    under load (reify esc-4415-240, esc-4437-123).
+    """
+    if not mcp_config:
+        mcp_config = {'mcpServers': {}}
+    mcp_config.setdefault('mcpServers', {})['plan-tools'] = plan_tools_mcp_server(
+        _ORCH_PROJECT_DIR, cwd
+    )
+    return mcp_config
+
 
 # Roles whose allowed_tools include at least one 'mcp__escalation__escalate*' tool.
 # 'steward' and 'deep_reviewer' are excluded: they run in their own dispatchers
@@ -6138,18 +6160,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         # Plan-tools stdio MCP server — architect builds plans, implementer/
         # debugger marks steps done.  Per-invocation isolation: each agent
-        # gets its own server bound to the worktree path.
+        # gets its own server bound to the worktree path.  Fast-start flags
+        # (--no-sync, --frozen) reuse the already-synced orchestrator venv to
+        # avoid cold-resolve stalls under load (reify esc-4415-240/esc-4437-123).
         if role.name in ('architect', 'implementer', 'debugger') and cwd:
-            if not mcp_config:
-                mcp_config = {'mcpServers': {}}
-            mcp_config.setdefault('mcpServers', {})['plan-tools'] = {
-                'command': 'uv',
-                'args': [
-                    'run', '--project', str(_ORCH_PROJECT_DIR),
-                    'python', '-m', 'orchestrator.mcp.plan_tools',
-                    '--worktree', str(cwd),
-                ],
-            }
+            mcp_config = _inject_plan_tools_mcp(mcp_config, cwd)
 
         # Session-resume lifecycle: if the harness recovered a sidecar that
         # matches the role we're about to invoke, resume the prior session
