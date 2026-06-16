@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -207,7 +208,18 @@ async def verify_plan_tools_startup(
 
     interp = python_executable or sys.executable
     cfg = plan_tools_mcp_server(orch_project_dir, worktree, python_executable=interp)
-    params = StdioServerParameters(command=cfg['command'], args=cfg['args'])
+    # Pass the full process environment and an explicit cwd so the preflight
+    # mirrors the production launch faithfully (e.g. OPENAI_API_KEY visible,
+    # PATH unchanged, cwd is the orchestrator project root).  Without env=,
+    # mcp's StdioServerParameters defaults to get_default_environment() — a
+    # reduced PATH with no project-specific vars — which could produce probe
+    # results that diverge from production behaviour.
+    params = StdioServerParameters(
+        command=cfg['command'],
+        args=cfg['args'],
+        env=dict(os.environ),
+        cwd=str(orch_project_dir),
+    )
 
     async def _probe() -> PlanToolsProbeResult:
         t0 = time.monotonic()

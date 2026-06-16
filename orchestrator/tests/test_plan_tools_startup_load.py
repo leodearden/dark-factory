@@ -10,8 +10,15 @@ under a bounded per-probe anyio deadline, proving:
 - The no-uv hot path (sys.executable) is what the production launch config
   uses — reintroducing uv would trip the per-probe deadline under contention
 
-Task 1776's static tests (test_mcp_lifecycle.py) assert config-dict shape;
-this module asserts RUNTIME behaviour.  The two are non-overlapping.
+Task 1776's static tests (test_mcp_lifecycle.py) assert config-dict shape for
+plan_tools_mcp_server.  This module asserts RUNTIME behaviour (live initialize
+handshakes) and cross-checks the same no-uv property end-to-end.
+
+Note: ``test_concurrent_startup_no_hang`` is heavyweight (6 real subprocesses).
+It is marked ``@pytest.mark.slow`` so it can be deselected with ``-m "not slow"``
+in fast unit runs.  The ``slow`` marker must be registered in pyproject.toml for
+strict-marker mode; omit ``--strict-markers`` or add the marker to suppress the
+PytestUnknownMarkWarning.
 """
 
 from __future__ import annotations
@@ -65,6 +72,7 @@ def worktree(tmp_path: Path) -> Path:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)  # overrides global timeout=60; per-probe anyio deadline is primary
+@pytest.mark.slow  # heavyweight: 6 real subprocesses; deselect with -m "not slow"
 async def test_concurrent_startup_no_hang(orch_project_dir: Path, worktree: Path) -> None:
     """6 concurrent plan-tools servers each complete MCP initialize < 30s each.
 
@@ -140,11 +148,11 @@ async def test_nonexistent_interpreter_returns_failed_report(
     """A bogus interpreter path yields all_succeeded=False without raising or hanging.
 
     Proves the preflight reports launch failures gracefully — returning a report
-    with ok=False probes rather than propagating the exception or wedging.  This
-    is RED after step-2 because verify_plan_tools_startup only catches TimeoutError;
-    a nonexistent interpreter raises FileNotFoundError (ENOENT) from stdio_client's
-    subprocess spawn, which propagates out of the function instead of being recorded
-    as a failed probe.  Step-4 will broaden per-probe error handling to catch this.
+    with ok=False probes rather than propagating the exception or wedging.  A
+    nonexistent interpreter raises FileNotFoundError (ENOENT) from stdio_client's
+    subprocess spawn; the broad per-probe ``except Exception`` handler in
+    ``verify_plan_tools_startup`` records it as a failed probe outcome
+    (ok=False, error populated) without propagating or aborting sibling probes.
     """
     report = await verify_plan_tools_startup(
         orch_project_dir,
