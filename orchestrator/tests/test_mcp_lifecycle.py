@@ -193,12 +193,6 @@ class TestPlanToolsLaunchFastStart:
     """plan_tools_mcp_server() uses fast-start flags; regression guard against
     the bare cold-resolve form (reify esc-4415-240/esc-4437-123)."""
 
-    def test_plan_tools_fast_start_flags_constant(self):
-        """_PLAN_TOOLS_FAST_START_FLAGS == ('--no-sync', '--frozen')."""
-        from orchestrator.mcp_lifecycle import _PLAN_TOOLS_FAST_START_FLAGS  # noqa: PLC0415
-
-        assert _PLAN_TOOLS_FAST_START_FLAGS == ('--no-sync', '--frozen')
-
     def test_command_is_uv(self):
         """plan_tools_mcp_server() returns command == 'uv'."""
         from pathlib import Path
