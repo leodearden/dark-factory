@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -42,6 +43,53 @@ def apply_mcp_startup_env(
     merged: dict[str, str] = dict(env_overrides or {})
     merged.setdefault('MCP_TIMEOUT', MCP_STARTUP_TIMEOUT_MS)
     return merged
+
+
+# ---------------------------------------------------------------------------
+# plan-tools stdio MCP launch contract (single source of truth)
+# ---------------------------------------------------------------------------
+
+# Fast-start flags for `uv run` that reuse the already-synced orchestrator
+# venv instead of cold-resolving/building under load.  The orchestrator itself
+# runs under `uv run --project orchestrator` (so _ORCH_PROJECT_DIR/.venv is
+# guaranteed present and synced), and _sync_subprojects (workflow.py) pre-syncs
+# task venvs.  Skipping the implicit pre-run sync (--no-sync) and lockfile
+# re-resolution (--frozen) eliminates the resolve/build stall that caused the
+# 0-turn MCP-startup wedge under load (reify esc-4415-240, esc-4437-123).
+# This is the plan_tools analog of the jcodemunch "don't re-resolve/rebuild
+# per launch" durable fix.
+_PLAN_TOOLS_FAST_START_FLAGS: tuple[str, ...] = ('--no-sync', '--frozen')
+
+
+def plan_tools_mcp_server(orch_project_dir: Path, worktree: Path) -> dict:
+    """Return a stdio MCP server config dict for the plan-tools server.
+
+    Uses fast-start flags (``--no-sync``, ``--frozen``) so ``uv run`` reuses
+    the already-synced orchestrator venv instead of cold-resolving under load.
+    This avoids the MCP-initialize handshake wedge that caused 0-turn
+    ``error_empty_output`` failures under high host load (reify esc-4415-240,
+    esc-4437-123).  Combined with the ``MCP_TIMEOUT`` injection in
+    ``apply_mcp_startup_env``, this provides the (a)+(b) durable per-MCP
+    hardening: the timeout bounds worst-case damage; the fast-start flags
+    prevent plan-tools from being dropped at all.
+
+    Args:
+        orch_project_dir: Path to the orchestrator package root (used for
+            ``--project`` so uv resolves the correct venv).
+        worktree: Path to the agent's worktree (bound as ``--worktree``).
+
+    Returns:
+        Claude Code MCP server config dict with ``command`` and ``args``.
+    """
+    return {
+        'command': 'uv',
+        'args': [
+            'run', '--project', str(orch_project_dir),
+            *_PLAN_TOOLS_FAST_START_FLAGS,
+            'python', '-m', 'orchestrator.mcp.plan_tools',
+            '--worktree', str(worktree),
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
