@@ -538,3 +538,92 @@ async def test_buffer_owned_request_terminal_removal_policy(
     assert req_d.request_id in ids, (
         f'Case (d): cancelled entry should be KEPT but was removed; ids={ids}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-23 (task 1772) — end-to-end anti-retry: deterministic failure does NOT
+#                        survive across restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_anti_retry_deterministic_failure_not_requeued(
+    git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+) -> None:
+    """A deterministically-failing 'blocked' outcome is removed from the journal
+    and is NOT re-enqueued by recover_pending_merges on the next restart.
+
+    Procedure:
+      1. Worker A processes a request; run_scoped_verification raises, yielding
+         MergeOutcome('blocked', reason='Verification error: ...').
+      2. Assert the journal entry is REMOVED (not kept).
+      3. Simulate restart: fresh queue + recover_pending_merges finds nothing.
+
+    RED against pre-step-22 code (where status=='blocked' kept the entry and
+    recover would re-enqueue it); GREEN after step-22 adds reason discrimination.
+    """
+    store_path = tmp_path / 'data' / 'orchestrator' / 'merge_queue.json'
+    store = MergeQueueStore(store_path)
+
+    branch_name = 'anti-retry-test'
+    wt = await _make_branch_with_file(git_ops, branch_name, 'anti_retry.py', 'x = 42\n')
+    req = _make_request('anti-retry-test', branch_name, wt, config)
+
+    async def _failing_verify(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError('Test verification failure')
+
+    queue_a: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    worker_a = SpeculativeMergeWorker(git_ops, queue_a, merge_store=store)
+
+    with patch('orchestrator.merge_queue.run_scoped_verification', _failing_verify):
+        worker_task_a = asyncio.create_task(worker_a.run())
+        await queue_a.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=60)
+
+    assert outcome.status == 'blocked', f'Expected blocked, got: {outcome}'
+    assert 'Merge worker shutting down' not in outcome.reason, (
+        f'Expected a non-shutdown reason; got {outcome.reason!r}'
+    )
+
+    await worker_a.stop()
+    await worker_task_a
+
+    # Branch is still live but NOT an ancestor of main (verification failed,
+    # so main was not advanced).
+    full_branch = f'{config.git.branch_prefix}{branch_name}'
+    branch_sha = await git_ops.resolve_branch_sha(full_branch)
+    assert branch_sha is not None, 'Branch should still exist after verification failure'
+
+    is_on_main = await git_ops.is_ancestor(full_branch, config.git.main_branch)
+    assert not is_on_main, (
+        'Branch should NOT be an ancestor of main after a verification failure'
+    )
+
+    # Journal entry must be REMOVED (not kept for indefinite retry).
+    for _ in range(20):
+        if not any(r.request_id == req.request_id for r in store.load()):
+            break
+        await asyncio.sleep(0.05)
+    remaining = {r.request_id for r in store.load()}
+    assert req.request_id not in remaining, (
+        f'Blocked/error entry should be REMOVED from journal; store: {store.load()!r}'
+    )
+
+    # Simulate restart: recover_pending_merges finds nothing to re-enqueue.
+    queue_b: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    report = await recover_pending_merges(
+        store,
+        queue_b,
+        git_ops,
+        config,
+        event_store=None,
+        main_branch=config.git.main_branch,
+        branch_prefix=config.git.branch_prefix,
+    )
+
+    assert report['recovered'] == 0, (
+        f'Expected 0 recovered after deterministic failure; got {report}'
+    )
+    assert queue_b.empty(), (
+        'Queue should be empty — deterministic failures must not be retried on restart'
+    )
