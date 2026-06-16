@@ -245,6 +245,12 @@ MERGE_LANES: tuple[str, ...] = ('high', 'normal')
 """Priority-ordered lane names (high first).  Used by SpeculativeMergeWorker to
 drain and pick requests: the first non-halted non-empty lane wins."""
 
+MERGE_WORKER_SHUTDOWN_REASON = 'Merge worker shutting down'
+"""Reason string set on MergeOutcome('blocked') by stop() and the _merger_loop
+finally block.  Used by _buffer_owned_request._on_terminal to distinguish a
+graceful-stop / crash path (keep in journal for recovery) from a deterministic
+terminal failure (remove — not retried on restart)."""
+
 
 def _normalize_lane(lane: str) -> str:
     """Map an unrecognised lane value to 'normal' (defensive; prevents starvation)."""
@@ -4579,7 +4585,7 @@ class MergeWorker(_WipHaltMixin):
     async def stop(self) -> None:
         """Graceful shutdown: drain queues and resolve all pending Futures."""
         self._running = False
-        shutdown = MergeOutcome('blocked', reason='Merge worker shutting down')
+        shutdown = MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
 
         # Drain urgent buffer
         while self._urgent:
@@ -5290,26 +5296,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 def _on_terminal(fut: asyncio.Future, *, _rid: str = item.request_id) -> None:  # type: ignore[type-arg]
                     # Decide whether to remove from the durable journal.
                     #
-                    # KEEP in journal (return early) when the outcome indicates the
-                    # merge should be retried on the next restart:
+                    # KEEP in journal (return early) when the outcome is from the
+                    # graceful-stop / crash path — branch is still live, recovery
+                    # should retry:
                     #   • fut.cancelled() — explicitly cancelled future; keep.
-                    #   • result.status == 'blocked' — covers the crash path (the
-                    #     _merger_loop finally block converts CancelledError to
-                    #     MergeOutcome('blocked') via set_result) as well as the
-                    #     graceful-stop path (stop() drains lane buffers the same
-                    #     way).  In both cases the branch is still live and recovery
-                    #     should retry.
+                    #   • result.status == 'blocked' AND reason == SHUTDOWN_REASON
+                    #     — stop() and the _merger_loop finally block both set this
+                    #     exact reason; a true process crash leaves the future
+                    #     unresolved so the callback never fires regardless.
                     #
-                    # REMOVE from journal for all other decided terminals
-                    # (done, already_merged, error, conflict, superseded,
-                    # wip_halted, unknown_branch, …) so permanently-failing
-                    # merges (e.g. unresolvable conflict) are not retried
-                    # indefinitely on every restart.
+                    # REMOVE from journal for ALL other terminals, including other
+                    # 'blocked' outcomes (drop-guard, ENOSPC, merge conflict, merger
+                    # error, verification error, chain-generation bound) — those
+                    # branches are still live but the failure is deterministic, so
+                    # keep-for-recovery would cause indefinite cross-restart retries
+                    # and unbounded merge_queue.json growth.
                     #
-                    # Also prune _journaled_request_ids on removal so the set
-                    # does not grow without bound over the worker's lifetime, and
-                    # so a later re-dispatch of the same request_id with a fresh
-                    # Future can register a new cleanup callback.
+                    # Prune _journaled_request_ids on removal so the set does not
+                    # grow without bound and a later re-dispatch with a fresh Future
+                    # can register a new cleanup callback.
                     try:
                         if self._merge_store is None:
                             return
@@ -5317,7 +5322,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             return  # explicitly cancelled: keep in journal
                         try:
                             result = fut.result()
-                            if result.status == 'blocked':
+                            if (
+                                result.status == 'blocked'
+                                and result.reason == MERGE_WORKER_SHUTDOWN_REASON
+                            ):
                                 return  # crash / graceful-stop path: keep for recovery
                         except Exception:  # noqa: BLE001
                             pass  # exception-set future: fall through to remove
@@ -5741,7 +5749,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     async def stop(self) -> None:
         """Graceful shutdown: drain queues and resolve all pending Futures."""
         self._running = False
-        shutdown = MergeOutcome('blocked', reason='Merge worker shutting down')
+        shutdown = MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
         # Release speculation-depth permits, all lane halts, and merge-ahead cap
         # so the merger doesn't hang waiting at any synchronisation point.
         # Over-releasing a plain Semaphore is safe (it just increments the counter).
@@ -6814,7 +6822,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # the inner except clause above.
             if self._inflight_req is not None and not self._inflight_req.result.done():
                 self._inflight_req.result.set_result(
-                    MergeOutcome('blocked', reason='Merge worker shutting down')
+                    MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
                 )
             # Always send shutdown sentinel so the verifier exits cleanly,
             # even if an unexpected exception propagates from the loop body.
