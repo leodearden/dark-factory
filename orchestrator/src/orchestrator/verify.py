@@ -1074,6 +1074,44 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
     )
 
 
+async def _verify_pipeline_guard_requires_full_gate(
+    worktree: Path,
+    changed_files: list[str],
+) -> bool:
+    """Return True iff reify's verify-pipeline-guard.sh says the full gate is required.
+
+    Shells out to ``<worktree>/scripts/verify-pipeline-guard.sh requires-full-gate
+    <changed_files...>`` and returns ``True`` when the script exits 0 (conventional
+    Unix predicate: exit 0 ⟹ condition is true ⟹ full gate is required).
+
+    Fail-open contract — returns False for ANY of:
+    - ``scripts/verify-pipeline-guard.sh`` absent in the worktree (backward-compat:
+      dark-factory's own merges, pre-4626 reify, non-reify projects).
+    - ``changed_files`` is empty.
+    - Script exits non-zero (guard says fast-path is safe).
+    - Script non-executable, spawn fails, WorktreeMissing, or any other exception
+      (guard hiccup must never wedge the merge pipeline → log WARNING, return False).
+
+    Mirrors GitOps._provision_reify_debug_port (the canonical cross-repo seam).
+    """
+    try:
+        script = worktree / 'scripts' / 'verify-pipeline-guard.sh'
+        if not script.exists() or not changed_files:
+            return False
+        from orchestrator.git_ops import _run  # noqa: PLC0415 — lazy, mirrors verify_failure_is_preexisting_on_main
+        rc, _out, _err = await _run(
+            [str(script), 'requires-full-gate', *changed_files],
+            cwd=worktree,
+        )
+        return rc == 0
+    except Exception:
+        logger.warning(
+            '_verify_pipeline_guard_requires_full_gate: unexpected error for %s',
+            worktree, exc_info=True,
+        )
+        return False
+
+
 def scope_module_config(
     mc: ModuleConfig,
     task_files: list[str],
