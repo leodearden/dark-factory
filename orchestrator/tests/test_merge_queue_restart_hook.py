@@ -459,3 +459,82 @@ async def test_idempotency_already_landed_branch_dropped(
     assert main_sha_before == main_sha_after, (
         f'main advanced unexpectedly during recovery: {main_sha_before!r} -> {main_sha_after!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-21 (task 1772) — _buffer_owned_request terminal-removal discriminates
+#                        by MergeOutcome.reason, NOT by status == 'blocked'
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_buffer_owned_request_terminal_removal_policy(
+    git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+) -> None:
+    """_buffer_owned_request's done-callback must discriminate by reason, not status.
+
+    Cases:
+      (a) blocked / reason != shutdown  → REMOVED  (fails until step-22)
+      (b) blocked / reason == shutdown  → KEPT
+      (c) done                          → REMOVED
+      (d) cancelled future              → KEPT
+    """
+    store_path = tmp_path / 'data' / 'orchestrator' / 'merge_queue.json'
+    store = MergeQueueStore(store_path)
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    worker = SpeculativeMergeWorker(git_ops, queue, merge_store=store)
+
+    _SHUTDOWN_REASON = 'Merge worker shutting down'
+
+    def _unit_req(label: str) -> MergeRequest:
+        fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        return MergeRequest(
+            task_id=label,
+            branch=label,
+            worktree=tmp_path,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=fut,
+        )
+
+    # (a) deterministic blocked terminal (error) → REMOVED
+    req_a = _unit_req('unit-a')
+    worker._buffer_owned_request(req_a)
+    req_a.result.set_result(MergeOutcome('blocked', reason='Merge worker error: boom'))
+    await asyncio.sleep(0)
+    ids = {r.request_id for r in store.load()}
+    assert req_a.request_id not in ids, (
+        f'Case (a): blocked/error entry should be REMOVED but found in store; ids={ids}'
+    )
+
+    # (b) graceful-shutdown blocked terminal → KEPT
+    req_b = _unit_req('unit-b')
+    worker._buffer_owned_request(req_b)
+    req_b.result.set_result(MergeOutcome('blocked', reason=_SHUTDOWN_REASON))
+    await asyncio.sleep(0)
+    ids = {r.request_id for r in store.load()}
+    assert req_b.request_id in ids, (
+        f'Case (b): shutdown blocked entry should be KEPT but was removed; ids={ids}'
+    )
+
+    # (c) done terminal → REMOVED
+    req_c = _unit_req('unit-c')
+    worker._buffer_owned_request(req_c)
+    req_c.result.set_result(MergeOutcome('done'))
+    await asyncio.sleep(0)
+    ids = {r.request_id for r in store.load()}
+    assert req_c.request_id not in ids, (
+        f'Case (c): done entry should be REMOVED but found in store; ids={ids}'
+    )
+
+    # (d) cancelled future → KEPT
+    req_d = _unit_req('unit-d')
+    worker._buffer_owned_request(req_d)
+    req_d.result.cancel()
+    await asyncio.sleep(0)
+    ids = {r.request_id for r in store.load()}
+    assert req_d.request_id in ids, (
+        f'Case (d): cancelled entry should be KEPT but was removed; ids={ids}'
+    )
