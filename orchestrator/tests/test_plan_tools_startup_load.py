@@ -24,7 +24,6 @@ import pytest
 import orchestrator.mcp_lifecycle as _lcmod
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verify_plan_tools_startup
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------

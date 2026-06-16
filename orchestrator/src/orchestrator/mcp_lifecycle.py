@@ -244,8 +244,8 @@ async def verify_plan_tools_startup(
             )
 
     async def _run_all() -> list[PlanToolsProbeResult]:
+        results: list[PlanToolsProbeResult] = []
         async with anyio.create_task_group() as tg:
-            results: list[PlanToolsProbeResult] = []
 
             async def _slot(slot_results: list[PlanToolsProbeResult]) -> None:
                 outcome = await _probe()
