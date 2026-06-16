@@ -14,6 +14,37 @@ from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# MCP startup-timeout constant and helper (bounded drop-on-fail)
+# ---------------------------------------------------------------------------
+
+# Generous for the prebuilt pinned stdio launcher (starts in <1s) and
+# already-running HTTP MCPs (connect near-instantly), yet ~40x faster than
+# the 1200s SIGTERM wall for a hung/incompatible server.
+# The Claude Code CLI drops any MCP server that doesn't become ready within
+# MCP_TIMEOUT ms; the agent still reaches turn 1 with that server absent.
+MCP_STARTUP_TIMEOUT_MS: str = '30000'
+
+
+def apply_mcp_startup_env(
+    env_overrides: dict[str, str] | None,
+) -> dict[str, str]:
+    """Return a copy of *env_overrides* with MCP_TIMEOUT set as a default.
+
+    Injects the Claude Code CLI MCP-server startup-timeout env var so that a
+    slow, hung, or incompatible stdio MCP is dropped within a bounded time and
+    the agent still reaches turn 1 — instead of hanging to the 1200s SIGTERM
+    wall (the 0-turn MCP-startup wedge, reify esc-4415-232).
+
+    Uses ``setdefault`` so an explicit caller value wins (e.g. a test or
+    per-invocation override that passes ``{'MCP_TIMEOUT': '5000'}``).
+    """
+    merged: dict[str, str] = dict(env_overrides or {})
+    merged.setdefault('MCP_TIMEOUT', MCP_STARTUP_TIMEOUT_MS)
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Retry settings for transient MCP failures (e.g. server restarting)
 _RETRYABLE_STATUS = frozenset({502, 503, 504})
 _MCP_MAX_RETRIES = 3
