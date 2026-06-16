@@ -262,3 +262,111 @@ class TestPlanToolsLaunchFastStart:
                 f"Expected {flag!r} before 'python', "
                 f"but {flag!r} at {flag_idx}, 'python' at {python_idx}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Step-1/Step-2 (task 1776): plan_tools_mcp_server() direct-interpreter path
+# ---------------------------------------------------------------------------
+
+
+class TestPlanToolsLaunchDirectInterpreter:
+    """plan_tools_mcp_server(python_executable=...) uses the direct-interpreter
+    no-uv hot path; regression guard that eliminates the uv-futex wedge under
+    load (reify esc-4415-240, esc-4437-123, task 1776)."""
+
+    def test_command_is_python_executable(self):
+        """command IS the supplied interpreter, not 'uv'."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['command'] == '/venv/bin/python'
+
+    def test_args_exact_module_invocation_sequence(self):
+        """args equals ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt'] exactly."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['args'] == ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt']
+
+    def test_args_module_flag_at_index_0(self):
+        """args[0] == '-m' (direct interpreter invocation, no run subcommand)."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['args'][0] == '-m'
+
+    def test_args_module_name_at_index_1(self):
+        """args[1] == 'orchestrator.mcp.plan_tools'."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['args'][1] == 'orchestrator.mcp.plan_tools'
+
+    def test_args_worktree_flag_at_index_2(self):
+        """args[2] == '--worktree'."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['args'][2] == '--worktree'
+
+    def test_args_worktree_path_at_index_3(self):
+        """args[3] == '/wt' (the worktree path string)."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['args'][3] == '/wt'
+
+    def test_no_uv_tokens_anywhere_in_full_command(self):
+        """None of {'uv', 'run', '--no-sync', '--frozen', '--project'} appear
+        in [command] + args (locks no-uv hot path against regression)."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        full = [cfg['command'], *cfg['args']]
+        forbidden = {'uv', 'run', '--no-sync', '--frozen', '--project'}
+        found = forbidden & set(full)
+        assert not found, (
+            f"uv tokens {found!r} must not appear in direct-interpreter command: {full}"
+        )
