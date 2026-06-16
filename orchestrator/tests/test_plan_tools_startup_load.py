@@ -126,3 +126,45 @@ async def test_production_launch_config_uses_no_uv(
         f"Expected command == sys.executable ({sys.executable!r}); "
         f"got {cfg['command']!r} — uv or another wrapper was reintroduced"
     )
+
+
+# ---------------------------------------------------------------------------
+# Negative / robustness: bogus interpreter is reported as failure, no raise
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_nonexistent_interpreter_returns_failed_report(
+    orch_project_dir: Path, worktree: Path
+) -> None:
+    """A bogus interpreter path yields all_succeeded=False without raising or hanging.
+
+    Proves the preflight reports launch failures gracefully — returning a report
+    with ok=False probes rather than propagating the exception or wedging.  This
+    is RED after step-2 because verify_plan_tools_startup only catches TimeoutError;
+    a nonexistent interpreter raises FileNotFoundError (ENOENT) from stdio_client's
+    subprocess spawn, which propagates out of the function instead of being recorded
+    as a failed probe.  Step-4 will broaden per-probe error handling to catch this.
+    """
+    report = await verify_plan_tools_startup(
+        orch_project_dir,
+        worktree,
+        python_executable='/nonexistent/python',
+        concurrency=2,
+        deadline_s=10,
+    )
+
+    assert report.all_succeeded is False, (
+        f'Expected all_succeeded=False for bogus interpreter; got {report.all_succeeded!r}'
+    )
+    assert len(report.probes) == 2, (
+        f'Expected 2 probe outcomes recorded (not raised); got {len(report.probes)}'
+    )
+    for i, probe in enumerate(report.probes):
+        assert probe.ok is False, (
+            f'Probe {i}: expected ok=False for failed launch; got {probe.ok!r}'
+        )
+        assert probe.error is not None, (
+            f'Probe {i}: error must be populated for a failed probe; got {probe.error!r}'
+        )
