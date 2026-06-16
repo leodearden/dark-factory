@@ -458,6 +458,23 @@ else
   warn "Fused-memory: not running (check: journalctl --user -u fused-memory)"
 fi
 
+# Fused-memory unit parity check — guard host-invariant safety switches
+# (Environment=MEM0_TELEMETRY=false, WatchdogSec=120).  Warn-only: drift does
+# not abort the install; re-run with --fix to correct in-place without clobbering
+# host-specific lines (e.g. extra DASHBOARD_KNOWN_PROJECT_ROOTS entries).
+if python3 "$REPO_ROOT/scripts/check_fused_memory_unit_parity.py" \
+     --installed "$UNIT_DIR/fused-memory.service" \
+     --template  "$REPO_ROOT/scripts/fused-memory.service.template"; then
+  ok "Fused-memory unit: parity with template (all safety directives present)"
+else
+  _parity_exit=$?
+  if [ "$_parity_exit" -eq 2 ]; then
+    warn "Fused-memory unit: not installed at $UNIT_DIR/fused-memory.service (skipping parity check)"
+  else
+    warn "Fused-memory unit: DRIFT detected — run: python3 $REPO_ROOT/scripts/check_fused_memory_unit_parity.py --fix"
+  fi
+fi
+
 # jCodeMunch watcher
 if systemctl --user is-active jcodemunch-watcher &>/dev/null; then
   ok "jCodeMunch watcher: running"

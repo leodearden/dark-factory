@@ -43,6 +43,11 @@ ExecStart=__UV_PATH__ run --project fused-memory \
 
 # Environment: secrets loaded by dotenv from fused-memory/.env
 # These are the non-secret vars the config.yaml ${} expansion needs
+# Defense-in-depth: pin mem0 Posthog telemetry OFF at the systemd/process layer,
+# independent of Python import ordering in server/main.py (belt-and-suspenders).
+# Historical context: mem0 telemetry spawned ~8000 threads/day and pegged CPU at
+# 1400% when this line was absent. Both mechanisms (systemd + in-process) are kept.
+Environment=MEM0_TELEMETRY=false
 Environment=CONFIG_PATH=__REPO_ROOT__/fused-memory/config/config.yaml
 Environment=PROJECT_ROOT=__REPO_ROOT__
 Environment=TASKMASTER_DIR=__REPO_ROOT__/taskmaster-ai
