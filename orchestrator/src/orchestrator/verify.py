@@ -2361,9 +2361,13 @@ async def run_scoped_verification(
                     #       out per-subproject so each runs in its own venv
                     #       with its own pyproject options.
                     if not _has_source_files(existing_files):
-                        if role == 'merge' and await _verify_pipeline_guard_requires_full_gate(
-                            worktree, existing_files,
-                        ):
+                        should_override = (
+                            role == 'merge'
+                            and await _verify_pipeline_guard_requires_full_gate(
+                                worktree, existing_files,
+                            )
+                        )
+                        if should_override:
                             logger.info(
                                 'config-only fast-path overridden by verify-pipeline-guard'
                                 ' — running full gate (module_configs merge path)',
@@ -2409,9 +2413,13 @@ async def run_scoped_verification(
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
             if not _has_source_files(existing_files):
-                if role == 'merge' and await _verify_pipeline_guard_requires_full_gate(
-                    worktree, existing_files,
-                ):
+                should_override = (
+                    role == 'merge'
+                    and await _verify_pipeline_guard_requires_full_gate(
+                        worktree, existing_files,
+                    )
+                )
+                if should_override:
                     logger.info(
                         'config-only fast-path overridden by verify-pipeline-guard'
                         ' — running full gate (no-module_configs merge path)',

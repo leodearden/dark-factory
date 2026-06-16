@@ -5248,6 +5248,33 @@ class TestArchiveMergeVerifyLogs:
             )
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers for TestVerifyPipelineGuard / TestMergeGuard* test classes
+# ---------------------------------------------------------------------------
+
+
+def _write_guard_script(worktree: Path, exit_code: int = 0) -> Path:
+    """Write scripts/verify-pipeline-guard.sh that exits with *exit_code* (chmod 0o755)."""
+    scripts_dir = worktree / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'verify-pipeline-guard.sh'
+    script.write_text(f'#!/usr/bin/env bash\nexit {exit_code}\n')
+    script.chmod(0o755)
+    return script
+
+
+@pytest.fixture
+def guard_spy():
+    """Return (spy, calls) where spy is a fake _run_cmd that records command strings."""
+    calls: list[str] = []
+
+    async def _spy(cmd, cwd, timeout, env=None, log_path=None):
+        calls.append(cmd)
+        return 0, '', False
+
+    return _spy, calls
+
+
 class TestVerifyPipelineGuard:
     """Unit tests for _verify_pipeline_guard_requires_full_gate.
 
@@ -5332,7 +5359,7 @@ exit 0
 
     @pytest.mark.asyncio
     async def test_non_executable_script_returns_false(self, tmp_path: Path):
-        """Non-executable script → PermissionError absorbed → False (fail-open)."""
+        """Non-executable script → False (fail-open); exception absorbed by broad except."""
         from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
 
         self._write_guard_script(tmp_path, """\
@@ -5353,14 +5380,6 @@ class TestMergeGuardNoModuleConfigs:
     executable guard script, _run_cmd spy, asserts on calls and result.summary.
     """
 
-    def _write_guard_script(self, worktree: Path, exit_code: int = 0) -> Path:
-        scripts_dir = worktree / 'scripts'
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        script = scripts_dir / 'verify-pipeline-guard.sh'
-        script.write_text(f'#!/usr/bin/env bash\nexit {exit_code}\n')
-        script.chmod(0o755)
-        return script
-
     def _write_verify_sh(self, worktree: Path) -> None:
         """Create scripts/verify.sh so it appears in existing_files."""
         scripts_dir = worktree / 'scripts'
@@ -5374,16 +5393,12 @@ class TestMergeGuardNoModuleConfigs:
         )
 
     @pytest.mark.asyncio
-    async def test_guard_exit_0_merge_overrides_trivial_pass(self, tmp_path: Path):
+    async def test_guard_exit_0_merge_overrides_trivial_pass(self, tmp_path: Path, guard_spy):
         """Guard exits 0 + role='merge' → trivial-pass overridden; global test command runs."""
         self._write_verify_sh(tmp_path)
-        self._write_guard_script(tmp_path, exit_code=0)
+        _write_guard_script(tmp_path, exit_code=0)
 
-        calls: list[str] = []
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
-            calls.append(cmd)
-            return 0, '', False
+        fake_run_cmd, calls = guard_spy
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(
@@ -5404,16 +5419,12 @@ class TestMergeGuardNoModuleConfigs:
         )
 
     @pytest.mark.asyncio
-    async def test_guard_exit_1_merge_preserves_trivial_pass(self, tmp_path: Path):
+    async def test_guard_exit_1_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
         """Guard exits 1 + role='merge' → trivial pass preserved; no commands run."""
         self._write_verify_sh(tmp_path)
-        self._write_guard_script(tmp_path, exit_code=1)
+        _write_guard_script(tmp_path, exit_code=1)
 
-        calls: list[str] = []
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
-            calls.append(cmd)
-            return 0, '', False
+        fake_run_cmd, calls = guard_spy
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(
@@ -5429,16 +5440,12 @@ class TestMergeGuardNoModuleConfigs:
         assert 'No source files' in result.summary
 
     @pytest.mark.asyncio
-    async def test_guard_absent_merge_preserves_trivial_pass(self, tmp_path: Path):
+    async def test_guard_absent_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
         """No guard script + role='merge' → trivial pass preserved (backward compat)."""
         self._write_verify_sh(tmp_path)
         # Deliberately no guard script written.
 
-        calls: list[str] = []
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
-            calls.append(cmd)
-            return 0, '', False
+        fake_run_cmd, calls = guard_spy
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(
@@ -5454,16 +5461,12 @@ class TestMergeGuardNoModuleConfigs:
         assert 'No source files' in result.summary
 
     @pytest.mark.asyncio
-    async def test_guard_exit_0_task_role_preserves_trivial_pass(self, tmp_path: Path):
+    async def test_guard_exit_0_task_role_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
         """Guard exits 0 but role='task' (default) → trivial pass preserved (role gating)."""
         self._write_verify_sh(tmp_path)
-        self._write_guard_script(tmp_path, exit_code=0)
+        _write_guard_script(tmp_path, exit_code=0)
 
-        calls: list[str] = []
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
-            calls.append(cmd)
-            return 0, '', False
+        fake_run_cmd, calls = guard_spy
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(
@@ -5488,14 +5491,6 @@ class TestMergeGuardModuleConfigs:
     After step-6 wiring, guard exit 0 + role='merge' routes to per-subproject fan-out.
     """
 
-    def _write_guard_script(self, worktree: Path, exit_code: int = 0) -> Path:
-        scripts_dir = worktree / 'scripts'
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        script = scripts_dir / 'verify-pipeline-guard.sh'
-        script.write_text(f'#!/usr/bin/env bash\nexit {exit_code}\n')
-        script.chmod(0o755)
-        return script
-
     def _write_config_yaml(self, worktree: Path) -> None:
         """Write orchestrator/config.yaml so it appears in existing_files."""
         (worktree / 'orchestrator').mkdir(parents=True, exist_ok=True)
@@ -5508,16 +5503,12 @@ class TestMergeGuardModuleConfigs:
         return [ModuleConfig(prefix='orchestrator', test_command='__orch_cmd__')]
 
     @pytest.mark.asyncio
-    async def test_guard_exit_0_merge_overrides_trivial_pass(self, tmp_path: Path):
+    async def test_guard_exit_0_merge_overrides_trivial_pass(self, tmp_path: Path, guard_spy):
         """Guard exits 0 + role='merge' → trivial-pass overridden; per-subproject fan-out runs."""
         self._write_config_yaml(tmp_path)
-        self._write_guard_script(tmp_path, exit_code=0)
+        _write_guard_script(tmp_path, exit_code=0)
 
-        calls: list[str] = []
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
-            calls.append(cmd)
-            return 0, '', False
+        fake_run_cmd, calls = guard_spy
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(
@@ -5538,16 +5529,12 @@ class TestMergeGuardModuleConfigs:
         )
 
     @pytest.mark.asyncio
-    async def test_guard_exit_1_merge_preserves_trivial_pass(self, tmp_path: Path):
+    async def test_guard_exit_1_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
         """Guard exits 1 + role='merge' → trivial pass preserved; no commands run."""
         self._write_config_yaml(tmp_path)
-        self._write_guard_script(tmp_path, exit_code=1)
+        _write_guard_script(tmp_path, exit_code=1)
 
-        calls: list[str] = []
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
-            calls.append(cmd)
-            return 0, '', False
+        fake_run_cmd, calls = guard_spy
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(
@@ -5563,16 +5550,12 @@ class TestMergeGuardModuleConfigs:
         assert 'No source files' in result.summary
 
     @pytest.mark.asyncio
-    async def test_guard_absent_merge_preserves_trivial_pass(self, tmp_path: Path):
+    async def test_guard_absent_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
         """Guard absent + role='merge' → trivial pass preserved (backward compat)."""
         self._write_config_yaml(tmp_path)
         # No guard script.
 
-        calls: list[str] = []
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
-            calls.append(cmd)
-            return 0, '', False
+        fake_run_cmd, calls = guard_spy
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(
