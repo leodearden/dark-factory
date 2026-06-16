@@ -18,9 +18,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-# MCP startup-timeout injection (bounded drop-on-fail for all projects)
-from orchestrator.mcp_lifecycle import apply_mcp_startup_env
-
 # Re-export shared Claude invocation primitives for backwards compatibility
 from shared.cli_invoke import (  # noqa: F401
     CAP_HIT_RESUME_PROMPT,
@@ -35,6 +32,9 @@ from shared.cli_invoke import (  # noqa: F401
 
 # Process-group termination helper for subprocess tree cleanup
 from shared.proc_group import terminate_process_group
+
+# MCP startup-timeout injection (bounded drop-on-fail for all projects)
+from orchestrator.mcp_lifecycle import apply_mcp_startup_env
 
 logger = logging.getLogger(__name__)
 

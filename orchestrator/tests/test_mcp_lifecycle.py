@@ -12,9 +12,9 @@ MCP_TIMEOUT into env_overrides (step-5/step-6).
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # Step-1/Step-2: apply_mcp_startup_env + MCP_STARTUP_TIMEOUT_MS
@@ -27,7 +27,10 @@ class TestApplyMcpStartupEnv:
 
     def test_imports_succeed(self):
         """MCP_STARTUP_TIMEOUT_MS and apply_mcp_startup_env are importable."""
-        from orchestrator.mcp_lifecycle import MCP_STARTUP_TIMEOUT_MS, apply_mcp_startup_env  # noqa: F401
+        from orchestrator.mcp_lifecycle import (  # noqa: F401
+            MCP_STARTUP_TIMEOUT_MS,
+            apply_mcp_startup_env,
+        )
 
     def test_none_input_returns_dict_with_mcp_timeout(self):
         """apply_mcp_startup_env(None) returns dict containing MCP_TIMEOUT==MCP_STARTUP_TIMEOUT_MS."""
