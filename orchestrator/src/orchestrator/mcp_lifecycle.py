@@ -406,9 +406,18 @@ class McpLifecycle:
                     'type': 'http',
                     'url': f'{self.config.url}/mcp',
                 },
+                # jcodemunch: launch the PREBUILT, version-pinned tool installed
+                # via `uv tool install --python 3.13 jcodemunch-mcp==<pin>` (see
+                # reify scripts/setup-dev.sh). Invoking the installed launcher on
+                # PATH (~/.local/bin, same dir as the `uv`/`uvx` resolved above)
+                # avoids `uvx`'s per-launch re-resolve + from-source build of
+                # tree-sitter C-extension sdists, which under host load stalled
+                # agent startup past the 1200s wall — the 0-turn MCP-startup wedge
+                # (reify esc-4415-232). Missing prebuild now fails fast instead of
+                # hanging. JCODEMUNCH_NO_VERSION_HINT silences the stderr drift note.
                 'jcodemunch': {
-                    'command': 'uvx',
-                    'args': ['jcodemunch-mcp'],
+                    'command': 'jcodemunch-mcp',
+                    'env': {'JCODEMUNCH_NO_VERSION_HINT': '1'},
                 },
             },
         }
