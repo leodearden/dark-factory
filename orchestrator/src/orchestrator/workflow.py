@@ -52,6 +52,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, TrainMembership, _run
+from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
     TaskAssignment,
@@ -65,7 +66,6 @@ from orchestrator.task_status import (
     WORKFLOW_PRESERVE_STATUSES,
 )
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
-from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
