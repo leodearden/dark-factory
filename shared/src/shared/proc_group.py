@@ -77,7 +77,10 @@ def snapshot_process_group(pgid: int) -> str:
 
     Walks ``/proc`` to find processes whose process-group id matches *pgid*,
     then formats one line per process with pid, ppid, state, wchan (the kernel
-    function the process is currently blocked in), and comm (executable name).
+    function the process is currently blocked in), comm (executable name, capped
+    at 15 chars by the kernel), and cmdline (full argv from ``/proc/<pid>/cmdline``,
+    truncated to 200 chars — identifies the culprit process by name and arguments
+    rather than just the short comm).
 
     Designed to be called from ``_run_subprocess``'s ``TimeoutError`` handler
     **before** ``proc.terminate()`` / ``terminate_process_group`` — at that
@@ -157,7 +160,25 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         except OSError:
             wchan = '?'
 
-        rows.append(f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm}')
+        # Read /proc/<pid>/cmdline (NUL-separated argv → spaces) for the full
+        # command-line.  Kernel threads have an empty cmdline; fall back to
+        # comm so the field is always populated.  Truncate to ~200 chars for
+        # log friendliness.  Mirrors the comm/wchan try/except idiom so
+        # snapshot_process_group never raises (module invariant).
+        try:
+            raw = (entry / 'cmdline').read_bytes()
+            cmdline = raw.replace(b'\x00', b' ').decode('utf-8', 'replace').strip()
+            if not cmdline:
+                cmdline = comm  # kernel thread — fall back to short comm
+            if len(cmdline) > 200:
+                cmdline = cmdline[:200] + '…'
+        except OSError:
+            cmdline = '?'
+
+        rows.append(
+            f'  pid={pid} ppid={ppid} state={state} wchan={wchan} comm={comm}'
+            f' cmdline={cmdline}'
+        )
 
     if not rows:
         return f'snapshot_process_group({pgid}): no processes found in group'
