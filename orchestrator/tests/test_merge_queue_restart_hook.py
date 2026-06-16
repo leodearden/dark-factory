@@ -16,6 +16,7 @@ Verifies that:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -305,10 +306,8 @@ async def test_restart_recovery_integration(
 
         # Simulate crash: cancel the worker WITHOUT calling stop().
         worker_task_a.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task_a
-        except asyncio.CancelledError:
-            pass
 
     # The journal must still hold the request after the crash.
     persisted_ids = {r.request_id for r in store.load()}

@@ -214,7 +214,7 @@ async def recover_pending_merges(
     main_branch: str,
     branch_prefix: str,
     retention: Any = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Re-enqueue surviving merge requests from the durable journal.
 
     For each journaled record:

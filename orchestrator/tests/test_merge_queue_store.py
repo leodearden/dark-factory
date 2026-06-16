@@ -16,14 +16,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, MergeRequest
+from orchestrator.merge_queue import GroupMergeRequest, MergeRequest
 
 # Import the module under test — will fail (ImportError) until step-2 creates it.
 from orchestrator.merge_queue_store import (
