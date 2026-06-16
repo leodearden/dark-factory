@@ -45,6 +45,18 @@ def apply_mcp_startup_env(
 
 
 # ---------------------------------------------------------------------------
+# jcodemunch-mcp launch contract (single source of truth for all projects)
+# ---------------------------------------------------------------------------
+
+# Prebuilt, version-pinned launcher on PATH (installed via
+# `uv tool install --python 3.13 jcodemunch-mcp==<pin>`; see
+# reify scripts/setup-dev.sh).  Named constants centralise the launch contract
+# so every project's mcp_config_json() injection references one definition and
+# a regression test can lock this against reverting to the unpinned uvx form.
+JCODEMUNCH_COMMAND: str = 'jcodemunch-mcp'
+JCODEMUNCH_ENV: dict[str, str] = {'JCODEMUNCH_NO_VERSION_HINT': '1'}
+
+# ---------------------------------------------------------------------------
 # Retry settings for transient MCP failures (e.g. server restarting)
 _RETRYABLE_STATUS = frozenset({502, 503, 504})
 _MCP_MAX_RETRIES = 3
@@ -446,9 +458,11 @@ class McpLifecycle:
                 # agent startup past the 1200s wall — the 0-turn MCP-startup wedge
                 # (reify esc-4415-232). Missing prebuild now fails fast instead of
                 # hanging. JCODEMUNCH_NO_VERSION_HINT silences the stderr drift note.
+                # Launch contract is centralised in JCODEMUNCH_COMMAND/JCODEMUNCH_ENV
+                # (module constants above) so all projects share one source of truth.
                 'jcodemunch': {
-                    'command': 'jcodemunch-mcp',
-                    'env': {'JCODEMUNCH_NO_VERSION_HINT': '1'},
+                    'command': JCODEMUNCH_COMMAND,
+                    'env': dict(JCODEMUNCH_ENV),
                 },
             },
         }
