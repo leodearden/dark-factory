@@ -464,7 +464,7 @@ fi
 # host-specific lines (e.g. extra DASHBOARD_KNOWN_PROJECT_ROOTS entries).
 if python3 "$REPO_ROOT/scripts/check_fused_memory_unit_parity.py" \
      --installed "$UNIT_DIR/fused-memory.service" \
-     --template  "$REPO_ROOT/scripts/fused-memory.service.template" 2>/dev/null; then
+     --template  "$REPO_ROOT/scripts/fused-memory.service.template"; then
   ok "Fused-memory unit: parity with template (all safety directives present)"
 else
   _parity_exit=$?

@@ -11,6 +11,8 @@ mirroring the pattern in tests/scripts/test_orchestrator_watchdog.py::_load_watc
 
 import importlib.util
 import pathlib
+import subprocess
+import sys
 import types
 
 import pytest
@@ -285,35 +287,41 @@ def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path, monkeypatch: pytes
 
 
 # ---------------------------------------------------------------------------
-# setup-host.sh wiring test  (step-11 / step-12)
+# CLI subprocess test  (step-11 / step-12)
 # ---------------------------------------------------------------------------
 
 
-def test_setup_host_sh_invokes_parity_checker():
-    """scripts/setup-host.sh must reference check_fused_memory_unit_parity.py."""
-    setup_sh = REPO_ROOT / "scripts" / "setup-host.sh"
-    content = setup_sh.read_text(encoding="utf-8")
-    assert "check_fused_memory_unit_parity.py" in content, (
-        "setup-host.sh must invoke scripts/check_fused_memory_unit_parity.py "
-        "as part of its health-check / post-install parity verification."
+def test_parity_checker_callable_as_subprocess(tmp_path: pathlib.Path):
+    """The checker is invokable as a standalone subprocess.
+
+    Validates the actual CLI entry point (the interface that setup-host.sh and
+    operators use) by running it against tmp_path fixtures and asserting on
+    exit codes rather than on source-text substrings.
+
+    - Clean unit  → exit 0
+    - Drifted unit → exit 1 and prints the missing directive to stdout
+    """
+    clean = _write_unit(tmp_path, _CLEAN_UNIT, name="clean.service")
+    result_clean = subprocess.run(
+        [sys.executable, str(CHECKER_PATH), "--installed", str(clean)],
+        capture_output=True,
+        text=True,
+    )
+    assert result_clean.returncode == 0, (
+        f"Expected exit 0 for clean unit; got {result_clean.returncode}. "
+        f"stderr: {result_clean.stderr}"
     )
 
-
-def test_setup_host_sh_parity_checker_passes_installed_arg():
-    """The parity checker invocation in setup-host.sh must pass --installed."""
-    setup_sh = REPO_ROOT / "scripts" / "setup-host.sh"
-    content = setup_sh.read_text(encoding="utf-8")
-    assert "--installed" in content, (
-        "setup-host.sh parity-checker call must pass --installed so the path is "
-        "explicit and not dependent on the default."
+    drifted = _write_unit(tmp_path, _MISSING_MEM0_UNIT, name="drifted.service")
+    result_drifted = subprocess.run(
+        [sys.executable, str(CHECKER_PATH), "--installed", str(drifted)],
+        capture_output=True,
+        text=True,
     )
-
-
-def test_setup_host_sh_parity_checker_passes_template_arg():
-    """The parity checker invocation in setup-host.sh must pass --template."""
-    setup_sh = REPO_ROOT / "scripts" / "setup-host.sh"
-    content = setup_sh.read_text(encoding="utf-8")
-    assert "--template" in content, (
-        "setup-host.sh parity-checker call must pass --template so the path is "
-        "explicit and not dependent on the default."
+    assert result_drifted.returncode == 1, (
+        f"Expected exit 1 for drifted unit; got {result_drifted.returncode}. "
+        f"stderr: {result_drifted.stderr}"
+    )
+    assert "MEM0_TELEMETRY" in result_drifted.stdout, (
+        "Expected drift output to name the missing directive on stdout."
     )

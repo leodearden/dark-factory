@@ -111,7 +111,8 @@ def find_drift(
         required:  Ordered tuple of exact directive strings to check.
 
     Returns:
-        Sorted list of missing directives (empty if all are present).
+        List of missing directives in the same order as ``required`` (empty if
+        all are present).
     """
     sections = parse_unit_sections(unit_text)
     service_lines = sections.get("Service", [])
@@ -147,27 +148,27 @@ def fix_unit_text(
         return unit_text
 
     lines = unit_text.splitlines(keepends=True)
-    # Find the insertion index: the line AFTER the last [Service] content line,
-    # i.e. just before the next section header or end-of-file.
+    # Find the insertion index: just before the next section header after [Service],
+    # or at end-of-file if [Service] is the last section.
     in_service = False
-    last_service_content_idx = -1
     next_section_idx = len(lines)  # default: append at end
 
     for i, raw in enumerate(lines):
         stripped = raw.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
             if in_service:
-                # We were in [Service] and hit the next section
+                # Hit the section after [Service]
                 next_section_idx = i
                 break
             if stripped == "[Service]":
                 in_service = True
-            continue
-        if in_service and stripped and not stripped.startswith("#") and not stripped.startswith(";"):
-            last_service_content_idx = i
 
-    # Insert the missing directives just before the next section header
-    # (or at end-of-file if [Service] is the last section).
+    # Ensure the line just before the insertion point ends with '\n' so the
+    # appended directives are not concatenated onto it (edge case: [Service]
+    # is the last section and the file lacks a trailing newline).
+    if lines and next_section_idx > 0 and not lines[next_section_idx - 1].endswith("\n"):
+        lines[next_section_idx - 1] += "\n"
+
     insertion_lines = [d + "\n" for d in missing]
     new_lines = lines[:next_section_idx] + insertion_lines + lines[next_section_idx:]
     return "".join(new_lines)
