@@ -468,6 +468,34 @@ class TestSnapshotProcessGroup:
             f'Expected comm {comm_name!r} or pid {fake_pid} in snapshot:\n{result}'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_snapshot_includes_cmdline(self, tmp_path):
+        """Snapshot includes the full cmdline of each process, not just the 15-char comm.
+
+        Spawn a child with a DISTINCTIVE argv token ('31.4159') that cannot
+        appear in the 15-char comm field (which is just 'sleep').  Assert that
+        the token appears in the snapshot — it can only come from
+        /proc/<pid>/cmdline, proving the new field is captured.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            'sleep', '31.4159',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+        try:
+            snapshot = snapshot_process_group(pgid)
+            assert snapshot, f'Expected non-empty snapshot for pgid={pgid}'
+            assert '31.4159' in snapshot, (
+                f"Expected distinctive arg '31.4159' (from /proc/cmdline) in snapshot; "
+                f"got:\n{snapshot}"
+            )
+        finally:
+            proc.kill()
+            await proc.wait()
+
 
 def _snapshot_impl_with_proc_dir(pgid: int, proc_dir) -> str:
     """Re-implementation of _snapshot_process_group_unsafe with an injectable proc_dir.
