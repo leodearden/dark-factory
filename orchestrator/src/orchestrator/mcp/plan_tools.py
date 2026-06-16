@@ -10,8 +10,12 @@ go through ``TaskArtifacts`` methods, preserving ``_session_id`` and
 enforcing correct schema.
 
 Usage (stdio transport, spawned by orchestrator):
-    uv run --project <orchestrator-dir> python -m orchestrator.mcp.plan_tools \
-        --worktree /path/to/worktree
+    # Direct-interpreter no-uv hot path (production, task 1776):
+    <sys.executable> -m orchestrator.mcp.plan_tools --worktree /path/to/worktree
+
+    # uv fallback with fast-start flags (task 1775, backward-compat):
+    uv run --project <orchestrator-dir> --no-sync --frozen \
+        python -m orchestrator.mcp.plan_tools --worktree /path/to/worktree
 """
 
 from __future__ import annotations
