@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import re
+import sys
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -85,15 +86,26 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
     ``None``; otherwise preserves all pre-existing server entries and adds
     (or replaces) the ``plan-tools`` key.
 
-    The plan-tools server is launched with fast-start flags (``--no-sync``,
-    ``--frozen``) via :func:`~orchestrator.mcp_lifecycle.plan_tools_mcp_server`
-    to reuse the already-synced orchestrator venv instead of cold-resolving
-    under load (reify esc-4415-240, esc-4437-123).
+    The plan-tools server is launched via the direct-interpreter no-uv hot path
+    (task 1776): ``sys.executable -m orchestrator.mcp.plan_tools --worktree <wt>``.
+    This eliminates ``uv``-internal lock contention that caused 0-turn
+    ``error_empty_output`` failures when many agents launch concurrently under
+    load (reify esc-4415-240, esc-4437-123).  The orchestrator process runs
+    inside the already-synced orchestrator venv, so ``sys.executable`` is a
+    guaranteed-present interpreter with the ``orchestrator`` package importable.
+
+    Defense-in-depth composition:
+    - Task 1771: ``apply_mcp_startup_env`` injects ``MCP_TIMEOUT=30000`` so any
+      residual slow start is bounded rather than hanging to the 1200s wall.
+    - Task 1775: the ``uv --no-sync --frozen`` fallback is retained in
+      ``plan_tools_mcp_server`` for callers that cannot supply an interpreter.
+    - Task 1776 (this): ``python_executable=sys.executable`` eliminates ``uv``
+      from the hot path entirely, collapsing the proc tree to ``claude → python3``.
     """
     if not mcp_config:
         mcp_config = {'mcpServers': {}}
     mcp_config.setdefault('mcpServers', {})['plan-tools'] = plan_tools_mcp_server(
-        _ORCH_PROJECT_DIR, cwd
+        _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable
     )
     return mcp_config
 
