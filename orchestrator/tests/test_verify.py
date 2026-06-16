@@ -5246,3 +5246,101 @@ class TestArchiveMergeVerifyLogs:
             assert 'attempt-5' in Path(p).name, (
                 f'Expected attempt-5 in filename, got: {Path(p).name!r}'
             )
+
+
+class TestVerifyPipelineGuard:
+    """Unit tests for _verify_pipeline_guard_requires_full_gate.
+
+    Each test writes a real executable bash script into tmp_path so the
+    real git_ops._run subprocess executes it — no subprocess mock.
+    """
+
+    def _write_guard_script(
+        self, worktree: Path, script_content: str, executable: bool = True,
+    ) -> Path:
+        scripts_dir = worktree / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script = scripts_dir / 'verify-pipeline-guard.sh'
+        script.write_text(script_content)
+        if executable:
+            script.chmod(0o755)
+        return script
+
+    @pytest.mark.asyncio
+    async def test_script_exits_0_returns_true_and_receives_correct_args(
+        self, tmp_path: Path,
+    ):
+        """Script present, exits 0 → True; receives 'requires-full-gate' subcommand + file args."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        sentinel = tmp_path / 'received_args.txt'
+        self._write_guard_script(tmp_path, f"""\
+#!/usr/bin/env bash
+echo "$@" > {sentinel}
+exit 0
+""")
+
+        result = await _verify_pipeline_guard_requires_full_gate(
+            tmp_path, ['scripts/verify.sh', 'scripts/lib.sh'],
+        )
+
+        assert result is True
+        received = sentinel.read_text().strip()
+        assert received == 'requires-full-gate scripts/verify.sh scripts/lib.sh', (
+            f'Guard script received unexpected args: {received!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_script_exits_nonzero_returns_false(self, tmp_path: Path):
+        """Script present but exits non-zero → False (full gate not required)."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        self._write_guard_script(tmp_path, """\
+#!/usr/bin/env bash
+exit 1
+""")
+
+        result = await _verify_pipeline_guard_requires_full_gate(
+            tmp_path, ['scripts/verify.sh'],
+        )
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_script_absent_returns_false(self, tmp_path: Path):
+        """Script absent → False without spawning any subprocess (fail-open)."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        # No script/ dir written at all.
+        result = await _verify_pipeline_guard_requires_full_gate(
+            tmp_path, ['scripts/verify.sh'],
+        )
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_empty_changed_files_returns_false(self, tmp_path: Path):
+        """changed_files == [] → False without consulting the script (fail-open)."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        # Write a script that would exit 0 if invoked.
+        self._write_guard_script(tmp_path, """\
+#!/usr/bin/env bash
+exit 0
+""")
+
+        result = await _verify_pipeline_guard_requires_full_gate(tmp_path, [])
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_non_executable_script_returns_false(self, tmp_path: Path):
+        """Non-executable script → PermissionError absorbed → False (fail-open)."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        self._write_guard_script(tmp_path, """\
+#!/usr/bin/env bash
+exit 0
+""", executable=False)
+
+        result = await _verify_pipeline_guard_requires_full_gate(
+            tmp_path, ['scripts/verify.sh'],
+        )
+        assert result is False
