@@ -18,6 +18,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+# MCP startup-timeout injection (bounded drop-on-fail for all projects)
+from orchestrator.mcp_lifecycle import apply_mcp_startup_env
+
 # Re-export shared Claude invocation primitives for backwards compatibility
 from shared.cli_invoke import (  # noqa: F401
     CAP_HIT_RESUME_PROMPT,
@@ -141,6 +144,14 @@ async def _invoke_claude_with_sandbox(
     Delegates to shared.cli_invoke for the core invocation; adds
     orchestrator-specific sandbox wrapping.
     """
+    # Inject MCP_TIMEOUT into every claude agent's subprocess env so a slow,
+    # hung, or incompatible stdio MCP is dropped within a bounded time and the
+    # agent still reaches turn 1 (bounded drop-on-fail; reify esc-4415-232).
+    # Both sub-paths below consume env_overrides, so this single transform is
+    # project-agnostic and cannot miss a dispatch site.  setdefault lets
+    # explicit caller values win.
+    env_overrides = apply_mcp_startup_env(env_overrides)
+
     # For sandboxed invocations we need to build the command ourselves
     # and use the lower-level shared primitives
     if sandbox_modules is not None:
