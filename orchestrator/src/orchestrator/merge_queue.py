@@ -4897,6 +4897,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         escalation_queue: Any = None,
         train_callback_factory: TrainCallbackFactory | None = None,
         merge_ready_predicate: MergeReadyPredicate | None = None,
+        merge_store: Any = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -4905,6 +4906,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # advanced_sha) after each 'done' merge.  Wrapped in try/except so a
         # coordinator bug never blocks or fails the merge.  See task 1592.
         self._on_merge_landed = on_merge_landed
+        # Durable journal (task 1772): records worker-owned requests on accept,
+        # removes them on terminal.  None-safe so bare-worker tests (no store) are
+        # unaffected.  Typed Any to keep merge_queue.py free of an import from
+        # merge_queue_store.py (one-directional dependency).
+        self._merge_store: Any = merge_store
+        # Set of request_ids for which a done-callback has already been registered
+        # (avoids duplicate removal callbacks on redispatch / chain of the same id).
+        self._journaled_request_ids: set[str] = set()
         # K = number of verify runners; sizes both caps so speculation depth
         # and merger-ahead bound track runner count as a single knob (PRD D4).
         # Default = _MERGE_AHEAD_BOUND (1) → byte-identical to prior behaviour.
@@ -5251,6 +5260,61 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
     # ── lane-buffer helpers ───────────────────────────────────────────────
 
+    def _buffer_owned_request(self, item: MergeRequest) -> None:
+        """Append *item* to its lane buffer and record it in the durable journal.
+
+        Registers a once-only done-callback on ``item.result`` so the journal
+        entry is removed on ANY terminal outcome (done/error/abandoned/
+        superseded).  The ``_journaled_request_ids`` set prevents duplicate
+        callbacks when the same request_id is re-dispatched (e.g. CAS retry).
+
+        Fail-open: store errors are logged and never propagate so a broken
+        journal never stalls the merge pipeline.
+        """
+        lane = _normalize_lane(item.lane)
+        self._lane_buffers[lane].append(item)
+
+        if self._merge_store is not None:
+            try:
+                self._merge_store.record(item)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    'merge_queue: _buffer_owned_request: store.record failed for %s',
+                    item.request_id,
+                    exc_info=True,
+                )
+
+            if item.request_id not in self._journaled_request_ids:
+                self._journaled_request_ids.add(item.request_id)
+
+                def _on_terminal(fut: asyncio.Future, *, _rid: str = item.request_id) -> None:  # type: ignore[type-arg]
+                    # Only remove from journal on successful outcomes.
+                    # For blocked/error/cancelled (including crash-path CancelledError
+                    # propagated through _merger_loop's finally), keep the journal
+                    # entry so recover_pending_merges can retry the merge after restart.
+                    # Stale-branch / already-merged entries are cleaned up by the
+                    # is_ancestor pre-check in recover_pending_merges, not here.
+                    try:
+                        if self._merge_store is None:
+                            return
+                        if fut.cancelled():
+                            return
+                        try:
+                            result = fut.result()
+                            if result.status not in ('done', 'already_merged'):
+                                return
+                        except Exception:  # noqa: BLE001
+                            return
+                        self._merge_store.remove(_rid)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            'merge_queue: _on_terminal: store.remove failed for %s',
+                            _rid,
+                            exc_info=True,
+                        )
+
+                item.result.add_done_callback(_on_terminal)
+
     def _drain_queue_into_lanes(self) -> None:
         """Non-blocking drain of _queue into per-lane buffers.
 
@@ -5266,8 +5330,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if item is None:
                 self._shutdown_signaled = True
                 return  # sentinel consumed — all prior items already buffered
-            lane = _normalize_lane(item.lane)
-            self._lane_buffers[lane].append(item)
+            self._buffer_owned_request(item)
 
     def _pop_next_pickable(self) -> MergeRequest | None:
         """Return the next pickable request (highest-priority non-halted lane, FIFO).
@@ -5333,7 +5396,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if item is None:
                     self._shutdown_signaled = True
                 else:
-                    self._lane_buffers[_normalize_lane(item.lane)].append(item)
+                    self._buffer_owned_request(item)
             # Loop to try _pop_next_pickable again (maybe the resume unblocked a lane).
 
     def snapshot(self) -> dict:
@@ -6631,7 +6694,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         if _item is None:
                             self._shutdown_signaled = True
                         else:
-                            self._lane_buffers[_normalize_lane(_item.lane)].append(_item)
+                            self._buffer_owned_request(_item)
                     self._drain_queue_into_lanes()
                     next_req = self._pop_next_pickable()
                     if next_req is not None:

@@ -238,6 +238,7 @@ async def recover_pending_merges(
     records = store.load()
     recovered = 0
     dropped = 0
+    recovered_requests: list[MergeRequest] = []
 
     for record in records:
         full_branch = f'{branch_prefix}{record.branch}'
@@ -269,6 +270,7 @@ async def recover_pending_merges(
             # Branch exists and is not yet merged — reconstruct and re-enqueue.
             req = reconstruct_merge_request(record, config)
             await enqueue_merge_request(queue, req, event_store, retention=retention)
+            recovered_requests.append(req)
             recovered += 1
             logger.info(
                 'merge_queue_store: recovered %s (branch %s)',
@@ -283,4 +285,4 @@ async def recover_pending_merges(
                 exc_info=True,
             )
 
-    return {'recovered': recovered, 'dropped': dropped}
+    return {'recovered': recovered, 'dropped': dropped, 'requests': recovered_requests}

@@ -418,3 +418,5 @@ class TestRecoverPendingMerges:
         # --- report ---
         assert report['recovered'] == 1
         assert report['dropped'] == 2
+        assert len(report['requests']) == 1
+        assert report['requests'][0].request_id == req_a.request_id
