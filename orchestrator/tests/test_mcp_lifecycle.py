@@ -25,13 +25,6 @@ class TestApplyMcpStartupEnv:
     """apply_mcp_startup_env injects MCP_TIMEOUT, is copy-safe, and lets
     explicit caller values win."""
 
-    def test_imports_succeed(self):
-        """MCP_STARTUP_TIMEOUT_MS and apply_mcp_startup_env are importable."""
-        from orchestrator.mcp_lifecycle import (  # noqa: F401
-            MCP_STARTUP_TIMEOUT_MS,
-            apply_mcp_startup_env,
-        )
-
     def test_none_input_returns_dict_with_mcp_timeout(self):
         """apply_mcp_startup_env(None) returns dict containing MCP_TIMEOUT==MCP_STARTUP_TIMEOUT_MS."""
         from orchestrator.mcp_lifecycle import MCP_STARTUP_TIMEOUT_MS, apply_mcp_startup_env
@@ -75,10 +68,6 @@ class TestJcodemunchLaunchPinned:
     """mcp_config_json() uses the named constants and is pinned to the prebuilt
     launcher (not uvx), guarding against regressions."""
 
-    def test_constants_importable(self):
-        """JCODEMUNCH_COMMAND and JCODEMUNCH_ENV are importable."""
-        from orchestrator.mcp_lifecycle import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV  # noqa: F401
-
     def test_command_is_prebuilt_launcher_not_uvx(self):
         """JCODEMUNCH_COMMAND is 'jcodemunch-mcp' (prebuilt, not 'uvx')."""
         from orchestrator.mcp_lifecycle import JCODEMUNCH_COMMAND
@@ -116,8 +105,13 @@ class TestJcodemunchLaunchPinned:
 
 
 class TestInvokeInjectsMcpStartupTimeout:
-    """_invoke_claude_with_sandbox transforms env_overrides before delegating,
-    ensuring MCP_TIMEOUT is present for both sandbox and non-sandbox paths."""
+    """_invoke_claude_with_sandbox transforms env_overrides before delegating.
+
+    Both test cases use sandbox_modules=None, which exercises the non-sandbox
+    delegate path (invoke_claude_agent).  The injection site is at the top of
+    the function — before the branch — so it covers both paths by construction,
+    but only the delegate path is directly observed here.
+    """
 
     @pytest.mark.asyncio
     async def test_none_env_overrides_gets_mcp_timeout(self, tmp_path):

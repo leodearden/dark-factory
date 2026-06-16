@@ -79,7 +79,7 @@ def snapshot_process_group(pgid: int) -> str:
     then formats one line per process with pid, ppid, state, wchan (the kernel
     function the process is currently blocked in), comm (executable name, capped
     at 15 chars by the kernel), and cmdline (full argv from ``/proc/<pid>/cmdline``,
-    truncated to 200 chars — identifies the culprit process by name and arguments
+    truncated to ~200 chars — identifies the culprit process by name and arguments
     rather than just the short comm).
 
     Designed to be called from ``_run_subprocess``'s ``TimeoutError`` handler
