@@ -182,3 +182,89 @@ class TestInvokeInjectsMcpStartupTimeout:
         assert env.get('MCP_TIMEOUT') == MCP_STARTUP_TIMEOUT_MS, (
             f"Expected MCP_TIMEOUT={MCP_STARTUP_TIMEOUT_MS!r} in env_overrides, got {env!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-1/Step-2 (task 1775): _PLAN_TOOLS_FAST_START_FLAGS + plan_tools_mcp_server
+# ---------------------------------------------------------------------------
+
+
+class TestPlanToolsLaunchFastStart:
+    """plan_tools_mcp_server() uses fast-start flags; regression guard against
+    the bare cold-resolve form (reify esc-4415-240/esc-4437-123)."""
+
+    def test_plan_tools_fast_start_flags_constant(self):
+        """_PLAN_TOOLS_FAST_START_FLAGS == ('--no-sync', '--frozen')."""
+        from orchestrator.mcp_lifecycle import _PLAN_TOOLS_FAST_START_FLAGS  # noqa: PLC0415
+
+        assert _PLAN_TOOLS_FAST_START_FLAGS == ('--no-sync', '--frozen')
+
+    def test_command_is_uv(self):
+        """plan_tools_mcp_server() returns command == 'uv'."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        assert cfg['command'] == 'uv'
+
+    def test_args_contain_fast_start_flags(self):
+        """args contains both --no-sync AND --frozen (regression: bare form has neither)."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        args = cfg['args']
+        assert '--no-sync' in args, f"Expected '--no-sync' in args, got {args}"
+        assert '--frozen' in args, f"Expected '--frozen' in args, got {args}"
+
+    def test_args_contain_project_then_orch_dir(self):
+        """args contains '--project' immediately followed by '/orch'."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        args = cfg['args']
+        idx = args.index('--project')
+        assert args[idx + 1] == '/orch'
+
+    def test_args_contain_module_path_sequence(self):
+        """args contains the sequence 'python', '-m', 'orchestrator.mcp.plan_tools'."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        args = cfg['args']
+        python_idx = args.index('python')
+        assert args[python_idx + 1] == '-m'
+        assert args[python_idx + 2] == 'orchestrator.mcp.plan_tools'
+
+    def test_args_contain_worktree_then_path(self):
+        """args contains '--worktree' immediately followed by '/wt'."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        args = cfg['args']
+        wt_idx = args.index('--worktree')
+        assert args[wt_idx + 1] == '/wt'
+
+    def test_run_level_flags_before_python(self):
+        """All run-level flags (--project, --no-sync, --frozen) appear before 'python' token."""
+        from pathlib import Path
+
+        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
+
+        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        args = cfg['args']
+        python_idx = args.index('python')
+        for flag in ('--project', '--no-sync', '--frozen'):
+            flag_idx = args.index(flag)
+            assert flag_idx < python_idx, (
+                f"Expected {flag!r} before 'python', "
+                f"but {flag!r} at {flag_idx}, 'python' at {python_idx}"
+            )
