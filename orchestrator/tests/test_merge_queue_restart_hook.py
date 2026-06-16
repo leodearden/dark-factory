@@ -332,21 +332,22 @@ async def test_restart_recovery_integration(
     assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
     assert report['dropped'] == 0, f'Expected 0 dropped; got {report}'
 
+    # Capture the recovered request object from the report so we can await
+    # its result — the worker races for queue_b so we can't get_nowait later.
+    recovered_reqs = report['requests']
+    assert len(recovered_reqs) == 1, f'Expected 1 recovered request; got {recovered_reqs!r}'
+    recovered_req: MergeRequest = recovered_reqs[0]
+    assert recovered_req.request_id == req.request_id, (
+        f'Recovered wrong request; expected {req.request_id}, '
+        f'got {recovered_req.request_id}'
+    )
+
     worker_b = SpeculativeMergeWorker(git_ops, queue_b, merge_store=store)
     with patch(
         'orchestrator.merge_queue.run_scoped_verification',
         _mock_verify_pass(),
     ):
         worker_task_b = asyncio.create_task(worker_b.run())
-
-        # Drain the recovered item from queue_b to get the fresh request.
-        recovered_req: MergeRequest = await asyncio.wait_for(
-            queue_b.get(), timeout=5,
-        )
-        assert recovered_req.request_id == req.request_id, (
-            f'Recovered wrong request; expected {req.request_id}, '
-            f'got {recovered_req.request_id}'
-        )
 
         # Await the recovered merge to complete.
         outcome = await asyncio.wait_for(recovered_req.result, timeout=60)
