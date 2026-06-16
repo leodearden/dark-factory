@@ -2352,18 +2352,30 @@ async def run_scoped_verification(
                     #   (a) Diff has no .py/.rs at all (docs, YAML, JSON …) —
                     #       every existing scope branch would no-op anyway; the
                     #       previous global-pytest fall-through was unsafe in
-                    #       this layout. Trivially pass.
+                    #       this layout. Trivially pass — UNLESS the merge-role
+                    #       verify-pipeline-guard says a full gate is required
+                    #       (e.g. diff touches verify.sh which shifts plan-line
+                    #       counts — the drift-ambush class).
                     #   (b) Source files exist but don't fit any prefix
                     #       (e.g. root-level conftest.py + skills/*.md). Fan
                     #       out per-subproject so each runs in its own venv
                     #       with its own pyproject options.
                     if not _has_source_files(existing_files):
-                        logger.info(
-                            'Verification mode: trivial pass (no source files in diff)',
-                        )
-                        return _trivial_pass(
-                            'No source files changed — verify trivially passes',
-                        )
+                        if role == 'merge' and await _verify_pipeline_guard_requires_full_gate(
+                            worktree, existing_files,
+                        ):
+                            logger.info(
+                                'config-only fast-path overridden by verify-pipeline-guard'
+                                ' — running full gate (module_configs merge path)',
+                            )
+                            # Fall through to per-subproject fan-out below.
+                        else:
+                            logger.info(
+                                'Verification mode: trivial pass (no source files in diff)',
+                            )
+                            return _trivial_pass(
+                                'No source files changed — verify trivially passes',
+                            )
                     logger.info(
                         'Verification mode: per-subproject fan-out (%d subprojects)',
                         len(module_configs),
