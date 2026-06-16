@@ -1098,7 +1098,7 @@ async def _verify_pipeline_guard_requires_full_gate(
         script = worktree / 'scripts' / 'verify-pipeline-guard.sh'
         if not script.exists() or not changed_files:
             return False
-        from orchestrator.git_ops import _run  # noqa: PLC0415 — lazy, mirrors verify_failure_is_preexisting_on_main
+        from orchestrator.git_ops import _run  # noqa: PLC0415, I001 — lazy, mirrors verify_failure_is_preexisting_on_main
         rc, _out, _err = await _run(
             [str(script), 'requires-full-gate', *changed_files],
             cwd=worktree,
