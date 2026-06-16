@@ -2397,12 +2397,21 @@ async def run_scoped_verification(
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
             if not _has_source_files(existing_files):
-                logger.info(
-                    'Verification mode: trivial pass (no source files, no module configs)',
-                )
-                return _trivial_pass(
-                    'No source files changed — verify trivially passes',
-                )
+                if role == 'merge' and await _verify_pipeline_guard_requires_full_gate(
+                    worktree, existing_files,
+                ):
+                    logger.info(
+                        'config-only fast-path overridden by verify-pipeline-guard'
+                        ' — running full gate (no-module_configs merge path)',
+                    )
+                    # Fall through to the existing global run_verification path.
+                else:
+                    logger.info(
+                        'Verification mode: trivial pass (no source files, no module configs)',
+                    )
+                    return _trivial_pass(
+                        'No source files changed — verify trivially passes',
+                    )
             fallback = _build_fallback_config(existing_files, config)
             if fallback is not None:
                 fallback = _apply_cargo_scope(
