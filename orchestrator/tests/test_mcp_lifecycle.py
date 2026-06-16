@@ -12,9 +12,12 @@ MCP_TIMEOUT into env_overrides (step-5/step-6).
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 
 # ---------------------------------------------------------------------------
 # Step-1/Step-2: apply_mcp_startup_env + MCP_STARTUP_TIMEOUT_MS
@@ -193,67 +196,41 @@ class TestPlanToolsLaunchFastStart:
     """plan_tools_mcp_server() uses fast-start flags; regression guard against
     the bare cold-resolve form (reify esc-4415-240/esc-4437-123)."""
 
-    def test_command_is_uv(self):
+    @pytest.fixture
+    def cfg(self):
+        return plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+
+    def test_command_is_uv(self, cfg):
         """plan_tools_mcp_server() returns command == 'uv'."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
         assert cfg['command'] == 'uv'
 
-    def test_args_contain_fast_start_flags(self):
+    def test_args_contain_fast_start_flags(self, cfg):
         """args contains both --no-sync AND --frozen (regression: bare form has neither)."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
         args = cfg['args']
         assert '--no-sync' in args, f"Expected '--no-sync' in args, got {args}"
         assert '--frozen' in args, f"Expected '--frozen' in args, got {args}"
 
-    def test_args_contain_project_then_orch_dir(self):
+    def test_args_contain_project_then_orch_dir(self, cfg):
         """args contains '--project' immediately followed by '/orch'."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
         args = cfg['args']
         idx = args.index('--project')
         assert args[idx + 1] == '/orch'
 
-    def test_args_contain_module_path_sequence(self):
+    def test_args_contain_module_path_sequence(self, cfg):
         """args contains the sequence 'python', '-m', 'orchestrator.mcp.plan_tools'."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
         args = cfg['args']
         python_idx = args.index('python')
         assert args[python_idx + 1] == '-m'
         assert args[python_idx + 2] == 'orchestrator.mcp.plan_tools'
 
-    def test_args_contain_worktree_then_path(self):
+    def test_args_contain_worktree_then_path(self, cfg):
         """args contains '--worktree' immediately followed by '/wt'."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
         args = cfg['args']
         wt_idx = args.index('--worktree')
         assert args[wt_idx + 1] == '/wt'
 
-    def test_run_level_flags_before_python(self):
+    def test_run_level_flags_before_python(self, cfg):
         """All run-level flags (--project, --no-sync, --frozen) appear before 'python' token."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
         args = cfg['args']
         python_idx = args.index('python')
         for flag in ('--project', '--no-sync', '--frozen'):
@@ -274,99 +251,45 @@ class TestPlanToolsLaunchDirectInterpreter:
     no-uv hot path; regression guard that eliminates the uv-futex wedge under
     load (reify esc-4415-240, esc-4437-123, task 1776)."""
 
-    def test_command_is_python_executable(self):
-        """command IS the supplied interpreter, not 'uv'."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(
+    @pytest.fixture
+    def cfg(self):
+        return plan_tools_mcp_server(
             orch_project_dir=Path('/orch'),
             worktree=Path('/wt'),
             python_executable='/venv/bin/python',
         )
+
+    def test_command_is_python_executable(self, cfg):
+        """command IS the supplied interpreter, not 'uv'."""
         assert cfg['command'] == '/venv/bin/python'
 
-    def test_args_exact_module_invocation_sequence(self):
+    def test_args_exact_module_invocation_sequence(self, cfg):
         """args equals ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt'] exactly."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(
-            orch_project_dir=Path('/orch'),
-            worktree=Path('/wt'),
-            python_executable='/venv/bin/python',
-        )
         assert cfg['args'] == ['-m', 'orchestrator.mcp.plan_tools', '--worktree', '/wt']
 
-    def test_args_module_flag_at_index_0(self):
-        """args[0] == '-m' (direct interpreter invocation, no run subcommand)."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(
-            orch_project_dir=Path('/orch'),
-            worktree=Path('/wt'),
-            python_executable='/venv/bin/python',
-        )
-        assert cfg['args'][0] == '-m'
-
-    def test_args_module_name_at_index_1(self):
-        """args[1] == 'orchestrator.mcp.plan_tools'."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(
-            orch_project_dir=Path('/orch'),
-            worktree=Path('/wt'),
-            python_executable='/venv/bin/python',
-        )
-        assert cfg['args'][1] == 'orchestrator.mcp.plan_tools'
-
-    def test_args_worktree_flag_at_index_2(self):
-        """args[2] == '--worktree'."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(
-            orch_project_dir=Path('/orch'),
-            worktree=Path('/wt'),
-            python_executable='/venv/bin/python',
-        )
-        assert cfg['args'][2] == '--worktree'
-
-    def test_args_worktree_path_at_index_3(self):
-        """args[3] == '/wt' (the worktree path string)."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(
-            orch_project_dir=Path('/orch'),
-            worktree=Path('/wt'),
-            python_executable='/venv/bin/python',
-        )
-        assert cfg['args'][3] == '/wt'
-
-    def test_no_uv_tokens_anywhere_in_full_command(self):
+    def test_no_uv_tokens_anywhere_in_full_command(self, cfg):
         """None of {'uv', 'run', '--no-sync', '--frozen', '--project'} appear
         in [command] + args (locks no-uv hot path against regression)."""
-        from pathlib import Path
-
-        from orchestrator.mcp_lifecycle import plan_tools_mcp_server  # noqa: PLC0415
-
-        cfg = plan_tools_mcp_server(
-            orch_project_dir=Path('/orch'),
-            worktree=Path('/wt'),
-            python_executable='/venv/bin/python',
-        )
         full = [cfg['command'], *cfg['args']]
         forbidden = {'uv', 'run', '--no-sync', '--frozen', '--project'}
         found = forbidden & set(full)
         assert not found, (
             f"uv tokens {found!r} must not appear in direct-interpreter command: {full}"
+        )
+
+    def test_empty_string_python_executable_falls_back_to_uv(self):
+        """python_executable='' is falsy → falls back to the uv path (command == 'uv').
+
+        Documents the intended `if python_executable:` falsy-fallback semantics so a
+        future refactor to `if python_executable is not None:` would surface a failing
+        test rather than silently launching with command=''.
+        """
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='',
+        )
+        assert cfg['command'] == 'uv', (
+            "Empty string python_executable must fall back to uv path, "
+            f"not launch with command={cfg['command']!r}"
         )
