@@ -61,26 +61,60 @@ def apply_mcp_startup_env(
 _PLAN_TOOLS_FAST_START_FLAGS: tuple[str, ...] = ('--no-sync', '--frozen')
 
 
-def plan_tools_mcp_server(orch_project_dir: Path, worktree: Path) -> dict:
+def plan_tools_mcp_server(
+    orch_project_dir: Path,
+    worktree: Path,
+    python_executable: str | None = None,
+) -> dict:
     """Return a stdio MCP server config dict for the plan-tools server.
 
-    Uses fast-start flags (``--no-sync``, ``--frozen``) so ``uv run`` reuses
-    the already-synced orchestrator venv instead of cold-resolving under load.
-    This avoids the MCP-initialize handshake wedge that caused 0-turn
-    ``error_empty_output`` failures under high host load (reify esc-4415-240,
-    esc-4437-123).  Combined with the ``MCP_TIMEOUT`` injection in
-    ``apply_mcp_startup_env``, this provides the (a)+(b) durable per-MCP
-    hardening: the timeout bounds worst-case damage; the fast-start flags
-    prevent plan-tools from being dropped at all.
+    **No-uv hot path (production, task 1776):** When *python_executable* is
+    supplied, the config launches plan-tools directly via that interpreter
+    without involving ``uv`` at all::
+
+        <python_executable> -m orchestrator.mcp.plan_tools --worktree <wt>
+
+    This eliminates the ``uv``-induced startup stalls that caused 0-turn
+    ``error_empty_output`` failures under load: ``uv run`` acquires a
+    per-invocation environment lock (futex) regardless of ``--no-sync
+    --frozen``; when many agents launch concurrently they contend on that lock
+    and the unlucky ones exceed the MCP-initialize handshake window (reify
+    esc-4415-240, esc-4437-123, task 1776).  The orchestrator process itself
+    runs inside the already-synced orchestrator venv (started via
+    ``uv run --project orchestrator``), so ``sys.executable`` is a
+    guaranteed-present, correct interpreter with the ``orchestrator`` package
+    importable.  The proc tree collapses to ``claude → python3``.
+
+    **uv fallback (backward-compat, tasks 1775/this):** When
+    *python_executable* is ``None`` (default), the existing fast-start form is
+    returned unchanged::
+
+        uv run --project <orch> --no-sync --frozen python -m orchestrator.mcp.plan_tools --worktree <wt>
+
+    The fallback preserves task 1775's ``TestPlanToolsLaunchFastStart``
+    regression tests and serves any caller that cannot supply an interpreter.
+
+    Task 1771's ``MCP_TIMEOUT`` backstop (``apply_mcp_startup_env``) is
+    retained as defense-in-depth for both paths.
 
     Args:
         orch_project_dir: Path to the orchestrator package root (used for
-            ``--project`` so uv resolves the correct venv).
+            ``--project`` in the uv fallback path).
         worktree: Path to the agent's worktree (bound as ``--worktree``).
+        python_executable: Full path to the Python interpreter to use for the
+            direct-interpreter no-uv hot path.  When ``None``, falls back to
+            the ``uv run --no-sync --frozen`` form.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
+    if python_executable:
+        # Direct-interpreter no-uv hot path: eliminates the uv futex wedge.
+        return {
+            'command': python_executable,
+            'args': ['-m', 'orchestrator.mcp.plan_tools', '--worktree', str(worktree)],
+        }
+    # uv fallback: backward-compatible form with fast-start flags (task 1775).
     return {
         'command': 'uv',
         'args': [
