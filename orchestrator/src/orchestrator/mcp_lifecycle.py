@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 from shared.proc_group import terminate_process_group
 
@@ -124,6 +128,130 @@ def plan_tools_mcp_server(
             '--worktree', str(worktree),
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Concurrent-startup preflight: verify plan-tools can cold-start under load
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PlanToolsProbeResult:
+    """Outcome of a single plan-tools startup probe.
+
+    Attributes:
+        ok: True iff the probe completed the MCP initialize handshake.
+        server_name: Server name returned by ``initialize``, or None on failure.
+        elapsed_s: Wall time for the probe (seconds), or None if not measured.
+        error: ``repr(exc)`` for a failed probe, or None on success.
+    """
+
+    ok: bool
+    server_name: str | None = None
+    elapsed_s: float | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class PlanToolsStartupReport:
+    """Aggregate report from ``verify_plan_tools_startup``.
+
+    Attributes:
+        probes: Per-probe results, one per concurrency slot.
+        all_succeeded: True iff probes is non-empty and every probe has ok=True.
+    """
+
+    probes: list[PlanToolsProbeResult] = field(default_factory=list)
+
+    @property
+    def all_succeeded(self) -> bool:
+        return bool(self.probes) and all(p.ok for p in self.probes)
+
+
+async def verify_plan_tools_startup(
+    orch_project_dir: Path,
+    worktree: Path,
+    *,
+    python_executable: str | None = None,
+    concurrency: int = 1,
+    deadline_s: float = 30.0,
+) -> PlanToolsStartupReport:
+    """Launch *concurrency* plan-tools servers concurrently and probe each via MCP initialize.
+
+    Drives K real plan-tools servers through an actual MCP ``initialize``
+    handshake concurrently, under a bounded per-probe anyio deadline.  This is
+    the executable form of the acceptance criterion: "plan_tools cannot hang the
+    agent pre-turn-1 under realistic load."
+
+    Each probe is independent — one timed-out or failed probe does not abort
+    siblings.  The function always returns a complete :class:`PlanToolsStartupReport`.
+
+    Args:
+        orch_project_dir: Path to the orchestrator project root (passed to
+            :func:`plan_tools_mcp_server`).
+        worktree: Path to the agent worktree (must have a ``.task/`` subdirectory;
+            passed to :func:`plan_tools_mcp_server`).
+        python_executable: Interpreter for the no-uv hot path.  When ``None``,
+            defaults to ``sys.executable`` — the production hot path.
+        concurrency: Number of servers to launch concurrently.
+        deadline_s: Per-probe anyio deadline in seconds (graceful timeout via
+            :func:`anyio.fail_after`; tears down the subprocess on expiry).
+
+    Returns:
+        :class:`PlanToolsStartupReport` with one :class:`PlanToolsProbeResult`
+        per concurrency slot and an ``all_succeeded`` summary.
+    """
+    # Lazy import — keeps module-load cost off the orchestrator hot path.
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    interp = python_executable or sys.executable
+    cfg = plan_tools_mcp_server(orch_project_dir, worktree, python_executable=interp)
+    params = StdioServerParameters(command=cfg['command'], args=cfg['args'])
+
+    async def _probe() -> PlanToolsProbeResult:
+        t0 = time.monotonic()
+        try:
+            with anyio.fail_after(deadline_s):
+                async with stdio_client(params) as (r, w):
+                    async with ClientSession(r, w) as session:
+                        result = await session.initialize()
+                        elapsed = time.monotonic() - t0
+                        server_name = (
+                            result.serverInfo.name
+                            if result.serverInfo is not None
+                            else None
+                        )
+                        return PlanToolsProbeResult(
+                            ok=True,
+                            server_name=server_name,
+                            elapsed_s=elapsed,
+                            error=None,
+                        )
+        except TimeoutError:
+            elapsed = time.monotonic() - t0
+            return PlanToolsProbeResult(
+                ok=False,
+                server_name=None,
+                elapsed_s=elapsed,
+                error='deadline exceeded',
+            )
+
+    async def _run_all() -> list[PlanToolsProbeResult]:
+        async with anyio.create_task_group() as tg:
+            results: list[PlanToolsProbeResult] = []
+
+            async def _slot(slot_results: list[PlanToolsProbeResult]) -> None:
+                outcome = await _probe()
+                slot_results.append(outcome)
+
+            for _ in range(concurrency):
+                tg.start_soon(_slot, results)
+
+        return results
+
+    probes = await _run_all()
+    return PlanToolsStartupReport(probes=probes)
 
 
 # ---------------------------------------------------------------------------
