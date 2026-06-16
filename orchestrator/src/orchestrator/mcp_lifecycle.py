@@ -228,13 +228,19 @@ async def verify_plan_tools_startup(
                             elapsed_s=elapsed,
                             error=None,
                         )
-        except TimeoutError:
+        except Exception as exc:
+            # Catch ALL normal failures: TimeoutError (deadline), FileNotFoundError
+            # (bogus interpreter path), OSError (spawn failure), and any handshake
+            # or protocol exception from stdio_client/ClientSession.
+            # BaseException subclasses (CancelledError) are NOT caught so that anyio
+            # task cancellation propagates correctly for graceful teardown.
             elapsed = time.monotonic() - t0
+            error_msg = repr(exc) if not isinstance(exc, TimeoutError) else 'deadline exceeded'
             return PlanToolsProbeResult(
                 ok=False,
                 server_name=None,
                 elapsed_s=elapsed,
-                error='deadline exceeded',
+                error=error_msg,
             )
 
     async def _run_all() -> list[PlanToolsProbeResult]:
