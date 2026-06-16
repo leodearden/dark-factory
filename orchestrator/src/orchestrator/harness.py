@@ -27,6 +27,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.overrides import OverrideStore
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
@@ -561,6 +562,12 @@ class Harness:
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: MergeWorker | SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
+        # Durable journal for in-flight merge requests (task 1772).
+        # Persisted at data/orchestrator/merge_queue.json; recovered on restart
+        # by _recover_pending_merges (called from run() after _rehydrate_merge_halt).
+        self._merge_store: MergeQueueStore = MergeQueueStore(
+            config.project_root / 'data' / 'orchestrator' / 'merge_queue.json'
+        )
 
         # Post-merge staleness hook — restart fused-memory.service when a
         # landed diff touches fused-memory/src/.  Built in _start_merge_worker
@@ -745,6 +752,14 @@ class Harness:
                 self._rehydrate_merge_halt()
             except Exception as e:
                 logger.warning(f'Failed to rehydrate merge halt: {e}')
+
+            # 1c0a. Recover in-flight merge requests from the durable journal
+            # (task 1772). Runs after _rehydrate_merge_halt so a halted queue
+            # holds re-enqueued items rather than racing to merge them.
+            try:
+                await self._recover_pending_merges()
+            except Exception as e:
+                logger.warning(f'Failed to recover pending merges: {e}')
 
             # 1c0b. File the L1 escalation for a pause restored from a prior
             # run (deferred from _load_persisted_scheduler_pause, which ran
@@ -3641,6 +3656,7 @@ Output JSON matching the schema. Every task must appear in the output.
             on_merge_landed=self._service_restart_coordinator.note_merge,
             escalation_queue=self._escalation_queue,
             train_callback_factory=train_callback_factory,
+            merge_store=self._merge_store,
         )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',
@@ -3821,6 +3837,34 @@ Output JSON matching the schema. Every task must appear in the output.
         self._merge_worker.set_halt_owner(esc.id)
         logger.warning(reason)
         return esc.id
+
+    async def _recover_pending_merges(self) -> None:
+        """Rehydrate in-flight merge requests from the durable journal (task 1772).
+
+        Delegates to ``recover_pending_merges`` which:
+        - Drops records whose branch is missing or already landed on main.
+        - Re-enqueues surviving records via ``enqueue_merge_request`` so a
+          polling ``merge_request`` caller resolves once the merge finishes.
+
+        Called once from ``run()`` immediately after ``_rehydrate_merge_halt``
+        so a halted queue buffers the re-enqueued items rather than merging
+        them.  Non-fatal: a corrupt or partial journal logs a warning and lets
+        startup continue rather than blocking the orchestrator.
+        """
+        report = await recover_pending_merges(
+            self._merge_store,
+            self._merge_queue,
+            self.git_ops,
+            self.config,
+            event_store=self.event_store,
+            main_branch=self.config.git.main_branch,
+            branch_prefix=self.config.git.branch_prefix,
+        )
+        logger.info(
+            '_recover_pending_merges: recovered=%d dropped=%d',
+            report.get('recovered', 0),
+            report.get('dropped', 0),
+        )
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
