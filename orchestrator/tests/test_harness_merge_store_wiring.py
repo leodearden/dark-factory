@@ -16,8 +16,9 @@ Verifies that:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -124,10 +125,8 @@ class TestStartMergeWorkerInjectsMergeStore:
         task = getattr(h, '_merge_worker_task', None)
         if task is not None and not task.done():
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
 
 # ---------------------------------------------------------------------------
