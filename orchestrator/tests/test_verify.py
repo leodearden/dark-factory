@@ -5246,3 +5246,326 @@ class TestArchiveMergeVerifyLogs:
             assert 'attempt-5' in Path(p).name, (
                 f'Expected attempt-5 in filename, got: {Path(p).name!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for TestVerifyPipelineGuard / TestMergeGuard* test classes
+# ---------------------------------------------------------------------------
+
+
+def _write_guard_script(worktree: Path, exit_code: int = 0) -> Path:
+    """Write scripts/verify-pipeline-guard.sh that exits with *exit_code* (chmod 0o755)."""
+    scripts_dir = worktree / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'verify-pipeline-guard.sh'
+    script.write_text(f'#!/usr/bin/env bash\nexit {exit_code}\n')
+    script.chmod(0o755)
+    return script
+
+
+@pytest.fixture
+def guard_spy():
+    """Return (spy, calls) where spy is a fake _run_cmd that records command strings."""
+    calls: list[str] = []
+
+    async def _spy(cmd, cwd, timeout, env=None, log_path=None):
+        calls.append(cmd)
+        return 0, '', False
+
+    return _spy, calls
+
+
+class TestVerifyPipelineGuard:
+    """Unit tests for _verify_pipeline_guard_requires_full_gate.
+
+    Each test writes a real executable bash script into tmp_path so the
+    real git_ops._run subprocess executes it — no subprocess mock.
+    """
+
+    def _write_guard_script(
+        self, worktree: Path, script_content: str, executable: bool = True,
+    ) -> Path:
+        scripts_dir = worktree / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script = scripts_dir / 'verify-pipeline-guard.sh'
+        script.write_text(script_content)
+        if executable:
+            script.chmod(0o755)
+        return script
+
+    @pytest.mark.asyncio
+    async def test_script_exits_0_returns_true_and_receives_correct_args(
+        self, tmp_path: Path,
+    ):
+        """Script present, exits 0 → True; receives 'requires-full-gate' subcommand + file args."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        sentinel = tmp_path / 'received_args.txt'
+        self._write_guard_script(tmp_path, f"""\
+#!/usr/bin/env bash
+echo "$@" > {sentinel}
+exit 0
+""")
+
+        result = await _verify_pipeline_guard_requires_full_gate(
+            tmp_path, ['scripts/verify.sh', 'scripts/lib.sh'],
+        )
+
+        assert result is True
+        received = sentinel.read_text().strip()
+        assert received == 'requires-full-gate scripts/verify.sh scripts/lib.sh', (
+            f'Guard script received unexpected args: {received!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_script_exits_nonzero_returns_false(self, tmp_path: Path):
+        """Script present but exits non-zero → False (full gate not required)."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        self._write_guard_script(tmp_path, """\
+#!/usr/bin/env bash
+exit 1
+""")
+
+        result = await _verify_pipeline_guard_requires_full_gate(
+            tmp_path, ['scripts/verify.sh'],
+        )
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_script_absent_returns_false(self, tmp_path: Path):
+        """Script absent → False without spawning any subprocess (fail-open)."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        # No script/ dir written at all.
+        result = await _verify_pipeline_guard_requires_full_gate(
+            tmp_path, ['scripts/verify.sh'],
+        )
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_empty_changed_files_returns_false(self, tmp_path: Path):
+        """changed_files == [] → False without consulting the script (fail-open)."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        # Write a script that would exit 0 if invoked.
+        self._write_guard_script(tmp_path, """\
+#!/usr/bin/env bash
+exit 0
+""")
+
+        result = await _verify_pipeline_guard_requires_full_gate(tmp_path, [])
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_non_executable_script_returns_false(self, tmp_path: Path):
+        """Non-executable script → False (fail-open); exception absorbed by broad except."""
+        from orchestrator.verify import _verify_pipeline_guard_requires_full_gate
+
+        self._write_guard_script(tmp_path, """\
+#!/usr/bin/env bash
+exit 0
+""", executable=False)
+
+        result = await _verify_pipeline_guard_requires_full_gate(
+            tmp_path, ['scripts/verify.sh'],
+        )
+        assert result is False
+
+
+class TestMergeGuardNoModuleConfigs:
+    """Integration: guard wires into the no-module_configs trivial-pass branch.
+
+    Mirrors TestRunScopedVerificationSkipsUntouched: tmp_path worktree, real
+    executable guard script, _run_cmd spy, asserts on calls and result.summary.
+    """
+
+    def _write_verify_sh(self, worktree: Path) -> None:
+        """Create scripts/verify.sh so it appears in existing_files."""
+        scripts_dir = worktree / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / 'verify.sh').write_text('#!/usr/bin/env bash\n')
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__scope_all_cmd__',
+        )
+
+    @pytest.mark.asyncio
+    async def test_guard_exit_0_merge_overrides_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Guard exits 0 + role='merge' → trivial-pass overridden; global test command runs."""
+        self._write_verify_sh(tmp_path)
+        _write_guard_script(tmp_path, exit_code=0)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['scripts/verify.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, (
+            f'Expected full-gate test command in calls; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass overridden; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_guard_exit_1_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Guard exits 1 + role='merge' → trivial pass preserved; no commands run."""
+        self._write_verify_sh(tmp_path)
+        _write_guard_script(tmp_path, exit_code=1)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['scripts/verify.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run when guard exits 1; got: {calls}'
+        assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_guard_absent_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """No guard script + role='merge' → trivial pass preserved (backward compat)."""
+        self._write_verify_sh(tmp_path)
+        # Deliberately no guard script written.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['scripts/verify.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run when guard absent; got: {calls}'
+        assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_guard_exit_0_task_role_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Guard exits 0 but role='task' (default) → trivial pass preserved (role gating)."""
+        self._write_verify_sh(tmp_path)
+        _write_guard_script(tmp_path, exit_code=0)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['scripts/verify.sh'],
+                # role='task' is the default
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run for task role; got: {calls}'
+        assert 'No source files' in result.summary
+
+
+class TestMergeGuardModuleConfigs:
+    """Integration: guard wires into the module_configs trivial-pass branch.
+
+    Setup: config-only diff (orchestrator/config.yaml, no .py/.rs) with
+    module_configs=[ModuleConfig(prefix='orchestrator', ...)]. scope_module_config
+    returns None for .yaml files → scoped=[] → hits the trivial-pass branch.
+    After step-6 wiring, guard exit 0 + role='merge' routes to per-subproject fan-out.
+    """
+
+    def _write_config_yaml(self, worktree: Path) -> None:
+        """Write orchestrator/config.yaml so it appears in existing_files."""
+        (worktree / 'orchestrator').mkdir(parents=True, exist_ok=True)
+        (worktree / 'orchestrator' / 'config.yaml').write_text('foo: bar\n')
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path)
+
+    def _module_configs(self) -> list[ModuleConfig]:
+        return [ModuleConfig(prefix='orchestrator', test_command='__orch_cmd__')]
+
+    @pytest.mark.asyncio
+    async def test_guard_exit_0_merge_overrides_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Guard exits 0 + role='merge' → trivial-pass overridden; per-subproject fan-out runs."""
+        self._write_config_yaml(tmp_path)
+        _write_guard_script(tmp_path, exit_code=0)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                self._module_configs(),
+                task_files=['orchestrator/config.yaml'],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__orch_cmd__' in joined, (
+            f'Expected per-subproject fan-out command in calls; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass overridden; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_guard_exit_1_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Guard exits 1 + role='merge' → trivial pass preserved; no commands run."""
+        self._write_config_yaml(tmp_path)
+        _write_guard_script(tmp_path, exit_code=1)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                self._module_configs(),
+                task_files=['orchestrator/config.yaml'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run when guard exits 1; got: {calls}'
+        assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_guard_absent_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Guard absent + role='merge' → trivial pass preserved (backward compat)."""
+        self._write_config_yaml(tmp_path)
+        # No guard script.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                self._module_configs(),
+                task_files=['orchestrator/config.yaml'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run when guard absent; got: {calls}'
+        assert 'No source files' in result.summary

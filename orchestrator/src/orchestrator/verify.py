@@ -1074,6 +1074,44 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
     )
 
 
+async def _verify_pipeline_guard_requires_full_gate(
+    worktree: Path,
+    changed_files: list[str],
+) -> bool:
+    """Return True iff reify's verify-pipeline-guard.sh says the full gate is required.
+
+    Shells out to ``<worktree>/scripts/verify-pipeline-guard.sh requires-full-gate
+    <changed_files...>`` and returns ``True`` when the script exits 0 (conventional
+    Unix predicate: exit 0 ⟹ condition is true ⟹ full gate is required).
+
+    Fail-open contract — returns False for ANY of:
+    - ``scripts/verify-pipeline-guard.sh`` absent in the worktree (backward-compat:
+      dark-factory's own merges, pre-4626 reify, non-reify projects).
+    - ``changed_files`` is empty.
+    - Script exits non-zero (guard says fast-path is safe).
+    - Script non-executable, spawn fails, WorktreeMissing, or any other exception
+      (guard hiccup must never wedge the merge pipeline → log WARNING, return False).
+
+    Mirrors GitOps._provision_reify_debug_port (the canonical cross-repo seam).
+    """
+    try:
+        script = worktree / 'scripts' / 'verify-pipeline-guard.sh'
+        if not script.exists() or not changed_files:
+            return False
+        from orchestrator.git_ops import _run  # noqa: PLC0415, I001 — lazy, mirrors verify_failure_is_preexisting_on_main
+        rc, _out, _err = await _run(
+            [str(script), 'requires-full-gate', *changed_files],
+            cwd=worktree,
+        )
+        return rc == 0
+    except Exception:
+        logger.warning(
+            '_verify_pipeline_guard_requires_full_gate: unexpected error for %s',
+            worktree, exc_info=True,
+        )
+        return False
+
+
 def scope_module_config(
     mc: ModuleConfig,
     task_files: list[str],
@@ -2314,18 +2352,34 @@ async def run_scoped_verification(
                     #   (a) Diff has no .py/.rs at all (docs, YAML, JSON …) —
                     #       every existing scope branch would no-op anyway; the
                     #       previous global-pytest fall-through was unsafe in
-                    #       this layout. Trivially pass.
+                    #       this layout. Trivially pass — UNLESS the merge-role
+                    #       verify-pipeline-guard says a full gate is required
+                    #       (e.g. diff touches verify.sh which shifts plan-line
+                    #       counts — the drift-ambush class).
                     #   (b) Source files exist but don't fit any prefix
                     #       (e.g. root-level conftest.py + skills/*.md). Fan
                     #       out per-subproject so each runs in its own venv
                     #       with its own pyproject options.
                     if not _has_source_files(existing_files):
-                        logger.info(
-                            'Verification mode: trivial pass (no source files in diff)',
+                        should_override = (
+                            role == 'merge'
+                            and await _verify_pipeline_guard_requires_full_gate(
+                                worktree, existing_files,
+                            )
                         )
-                        return _trivial_pass(
-                            'No source files changed — verify trivially passes',
-                        )
+                        if should_override:
+                            logger.info(
+                                'config-only fast-path overridden by verify-pipeline-guard'
+                                ' — running full gate (module_configs merge path)',
+                            )
+                            # Fall through to per-subproject fan-out below.
+                        else:
+                            logger.info(
+                                'Verification mode: trivial pass (no source files in diff)',
+                            )
+                            return _trivial_pass(
+                                'No source files changed — verify trivially passes',
+                            )
                     logger.info(
                         'Verification mode: per-subproject fan-out (%d subprojects)',
                         len(module_configs),
@@ -2359,12 +2413,25 @@ async def run_scoped_verification(
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
             if not _has_source_files(existing_files):
-                logger.info(
-                    'Verification mode: trivial pass (no source files, no module configs)',
+                should_override = (
+                    role == 'merge'
+                    and await _verify_pipeline_guard_requires_full_gate(
+                        worktree, existing_files,
+                    )
                 )
-                return _trivial_pass(
-                    'No source files changed — verify trivially passes',
-                )
+                if should_override:
+                    logger.info(
+                        'config-only fast-path overridden by verify-pipeline-guard'
+                        ' — running full gate (no-module_configs merge path)',
+                    )
+                    # Fall through to the existing global run_verification path.
+                else:
+                    logger.info(
+                        'Verification mode: trivial pass (no source files, no module configs)',
+                    )
+                    return _trivial_pass(
+                        'No source files changed — verify trivially passes',
+                    )
             fallback = _build_fallback_config(existing_files, config)
             if fallback is not None:
                 fallback = _apply_cargo_scope(
