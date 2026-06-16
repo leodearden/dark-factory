@@ -5288,23 +5288,39 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._journaled_request_ids.add(item.request_id)
 
                 def _on_terminal(fut: asyncio.Future, *, _rid: str = item.request_id) -> None:  # type: ignore[type-arg]
-                    # Only remove from journal on successful outcomes.
-                    # For blocked/error/cancelled (including crash-path CancelledError
-                    # propagated through _merger_loop's finally), keep the journal
-                    # entry so recover_pending_merges can retry the merge after restart.
-                    # Stale-branch / already-merged entries are cleaned up by the
-                    # is_ancestor pre-check in recover_pending_merges, not here.
+                    # Decide whether to remove from the durable journal.
+                    #
+                    # KEEP in journal (return early) when the outcome indicates the
+                    # merge should be retried on the next restart:
+                    #   • fut.cancelled() — explicitly cancelled future; keep.
+                    #   • result.status == 'blocked' — covers the crash path (the
+                    #     _merger_loop finally block converts CancelledError to
+                    #     MergeOutcome('blocked') via set_result) as well as the
+                    #     graceful-stop path (stop() drains lane buffers the same
+                    #     way).  In both cases the branch is still live and recovery
+                    #     should retry.
+                    #
+                    # REMOVE from journal for all other decided terminals
+                    # (done, already_merged, error, conflict, superseded,
+                    # wip_halted, unknown_branch, …) so permanently-failing
+                    # merges (e.g. unresolvable conflict) are not retried
+                    # indefinitely on every restart.
+                    #
+                    # Also prune _journaled_request_ids on removal so the set
+                    # does not grow without bound over the worker's lifetime, and
+                    # so a later re-dispatch of the same request_id with a fresh
+                    # Future can register a new cleanup callback.
                     try:
                         if self._merge_store is None:
                             return
                         if fut.cancelled():
-                            return
+                            return  # explicitly cancelled: keep in journal
                         try:
                             result = fut.result()
-                            if result.status not in ('done', 'already_merged'):
-                                return
+                            if result.status == 'blocked':
+                                return  # crash / graceful-stop path: keep for recovery
                         except Exception:  # noqa: BLE001
-                            return
+                            pass  # exception-set future: fall through to remove
                         self._merge_store.remove(_rid)
                     except Exception:  # noqa: BLE001
                         logger.warning(
@@ -5312,6 +5328,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             _rid,
                             exc_info=True,
                         )
+                    # Prune regardless of whether store.remove succeeded: if the
+                    # write failed the entry is still semantically terminal, and a
+                    # future re-dispatch with a new Future will re-register cleanup.
+                    self._journaled_request_ids.discard(_rid)
 
                 item.result.add_done_callback(_on_terminal)
 

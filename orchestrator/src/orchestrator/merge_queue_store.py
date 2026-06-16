@@ -73,6 +73,11 @@ class MergeQueueStore:
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        # In-memory mirror of the on-disk journal, warmed at construction time.
+        # All mutations go through this dict so record()/remove() never re-read
+        # the file — they just update the cache and write it out atomically.
+        # This keeps blocking I/O off the hot merge-drain path (suggestion 3).
+        self._cache: dict[str, Any] = self._load_raw()
 
     # ------------------------------------------------------------------
     # Public API
@@ -105,28 +110,28 @@ class MergeQueueStore:
             enqueued_at=req.enqueued_at,
         )
 
-        state = self._load_raw()
-        state[req.request_id] = asdict(persisted)
-        self._save_raw(state)
+        # Update in-memory mirror first; then flush atomically without re-reading.
+        self._cache[req.request_id] = asdict(persisted)
+        self._save_raw(self._cache)
 
     def remove(self, request_id: str) -> None:
         """Remove *request_id* from the journal.
 
         No-op if the id is not present (idempotent terminal cleanup).
         """
-        state = self._load_raw()
-        if request_id in state:
-            del state[request_id]
-            self._save_raw(state)
+        if request_id in self._cache:
+            del self._cache[request_id]
+            self._save_raw(self._cache)
 
     def load(self) -> list[PersistedMergeRequest]:
         """Return all journaled records as ``PersistedMergeRequest`` objects.
 
-        Returns ``[]`` if the file is missing, empty, or corrupt (fail-open).
+        Reads from the in-memory mirror (warmed at construction; kept in sync
+        by record/remove).  Returns ``[]`` if the journal is empty or was
+        corrupt at startup (fail-open).
         """
-        state = self._load_raw()
         result: list[PersistedMergeRequest] = []
-        for entry in state.values():
+        for entry in self._cache.values():
             try:
                 result.append(PersistedMergeRequest(**entry))
             except (TypeError, KeyError) as exc:
@@ -182,6 +187,14 @@ def reconstruct_merge_request(
     loop = asyncio.get_running_loop()
     future: asyncio.Future[Any] = loop.create_future()
 
+    # NOTE — module_configs divergence (suggestion 4):
+    # The original request may have been scoped to a narrower set of verification
+    # modules.  That information is not persisted (it holds live objects).  The
+    # recovered request therefore runs the *default* verification scope ([] means
+    # "all configured modules").  This is intentionally conservative — it errs on
+    # the side of verifying more than the original, never less.  Callers that care
+    # about scope parity should persist a scope hint in task_files (which IS
+    # preserved) and filter inside the verifier.
     return MergeRequest(
         task_id=persisted.task_id,
         branch=persisted.branch,
@@ -223,7 +236,10 @@ async def recover_pending_merges(
         - ``git_ops.resolve_branch_sha(full_branch)`` is ``None``
           (branch was deleted after the crash), OR
         - ``git_ops.is_ancestor(full_branch, main_branch)`` is ``True``
-          (branch already landed on main — idempotency guard).
+          (branch already landed on main — idempotency guard), OR
+        - The persisted worktree path no longer exists on disk
+          (pruned by crash cleanup / redeploy — drop so the scheduler can
+          rediscover and re-dispatch through normal channels).
     * Otherwise reconstructs a fresh ``MergeRequest`` and enqueues it via
       ``enqueue_merge_request`` so ``_on_finalized`` re-arms the durable
       ``merge_finalized`` event for any polling caller.
@@ -267,7 +283,26 @@ async def recover_pending_merges(
                 )
                 continue
 
-            # Branch exists and is not yet merged — reconstruct and re-enqueue.
+            # Worktree-existence check (suggestion 5):
+            # A crash or redeploy may have pruned the worktree directory.  If
+            # the worktree is gone the worker cannot rebase/merge and would
+            # produce an 'error' outcome that (without this guard) would be
+            # re-enqueued on every subsequent restart — an indefinite retry loop.
+            # Drop the record so the next scheduler pass can rediscover and
+            # re-dispatch the task through normal channels.
+            worktree_path = Path(record.worktree)
+            if not worktree_path.exists():
+                store.remove(record.request_id)
+                dropped += 1
+                logger.info(
+                    'merge_queue_store: dropping %s (worktree %s gone)',
+                    record.request_id,
+                    record.worktree,
+                )
+                continue
+
+            # Branch exists, is not yet merged, and worktree is present —
+            # reconstruct and re-enqueue.
             req = reconstruct_merge_request(record, config)
             await enqueue_merge_request(queue, req, event_store, retention=retention)
             recovered_requests.append(req)
