@@ -1076,7 +1076,11 @@ async def _invoke_claude(
             await bridge.start()
             env['ANTHROPIC_BASE_URL'] = bridge.url
 
-        result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
+        result = await _run_subprocess(
+            cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data,
+            session_id=(resume_session_id or session_id),
+            config_dir=config_dir,
+        )
         return _parse_claude_output(result)
     finally:
         for path in temp_files:
@@ -1236,6 +1240,8 @@ async def _run_subprocess(
     model: str,
     timeout_seconds: float | None = None,
     stdin_data: bytes | None = None,
+    session_id: str | None = None,
+    config_dir: Path | None = None,
 ) -> _SubprocessResult:
     """Run a subprocess, log output.
 
@@ -1315,6 +1321,11 @@ async def _run_subprocess(
                     + stderr_text
                 )
             duration_ms = int(time.monotonic() * 1000) - start_ms
+            tt = (
+                count_transcript_turns(config_dir, cwd, session_id)
+                if (config_dir and session_id)
+                else None
+            )
             return _SubprocessResult(
                 stdout=stdout_text,
                 stderr=stderr_text,
@@ -1322,6 +1333,7 @@ async def _run_subprocess(
                 duration_ms=duration_ms,
                 timed_out=True,
                 proc_tree=proc_tree,
+                transcript_turns=tt,
             )
     except asyncio.CancelledError:
         # Orchestrator shutdown path: the awaiting task was cancelled. Kill the
