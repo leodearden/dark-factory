@@ -6326,6 +6326,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 effort=effort_val,
                 backend=backend_val,
                 timeout_seconds=timeout_val,
+                startup_grace_secs=timeouts_cfg.startup_grace_secs,
                 session_id=session_id_val,
                 resume_session_id=resume_session_id,
                 # Judge always hits Claude API — propagating ANTHROPIC_BASE_URL
