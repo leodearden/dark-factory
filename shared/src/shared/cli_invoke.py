@@ -1360,10 +1360,8 @@ async def _run_subprocess(
                         f'model={model} — cancelling comm_task and killing'
                     )
                     comm_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
                         await comm_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
                     raise TimeoutError
 
                 # Absolute-ceiling kill.
@@ -1373,10 +1371,8 @@ async def _run_subprocess(
                         f'(ceiling={timeout_seconds}s): model={model} — killing'
                     )
                     comm_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
                         await comm_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
                     raise TimeoutError
 
         except TimeoutError:
@@ -1443,10 +1439,8 @@ async def _run_subprocess(
         # coroutine is not left dangling after the process group is killed.
         if comm_task is not None and not comm_task.done():
             comm_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await comm_task
-            except (asyncio.CancelledError, Exception):
-                pass
         if proc.returncode is None:
             logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
             await terminate_process_group(proc, pgid, grace_secs=5.0)
