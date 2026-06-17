@@ -29,6 +29,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
     invoke_with_cap_retry,
+    is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
 )
@@ -3827,6 +3828,22 @@ class TaskWorkflow:
                 if self.config.recycle_config_dir_on_zero_output:
                     self._recycle_config_dir()
                 continue  # skip judge on zero-output; increment next iteration
+            elif is_timed_out_with_progress(result):
+                # γ: a productive implementer iteration was killed at the wall
+                # (transcript_turns > 0 — real work done).  Resume the SAME Claude
+                # session next iteration so the ~20 min of context continues instead
+                # of being discarded.  The existing _invoke resume lifecycle
+                # (workflow.py:6240-6253) picks these up because
+                # _pending_resume_role == role.name == 'implementer'.
+                self._pending_resume_session_id = self._last_invoke_session_id
+                self._pending_resume_role = IMPLEMENTER.name
+                logger.info(
+                    'Task %s: implementer timed out with progress '
+                    '(transcript_turns=%s) — resuming session %s next iteration',
+                    self.task_id, result.transcript_turns,
+                    self._last_invoke_session_id,
+                )
+                continue  # re-dispatch with --resume; skip judge this iteration
             else:
                 # Non-zero-output result: reset the consecutive counter.
                 consecutive_zero_output = 0
