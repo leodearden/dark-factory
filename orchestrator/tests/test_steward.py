@@ -2313,6 +2313,21 @@ class TestIsEmptyOutput:
         result = _make_result(success=True, subtype='')
         assert _is_empty_output(result) is False
 
+    def test_progress_run_returns_false(self):
+        """error_empty_output + timed_out=True + transcript_turns=5 → False.
+
+        Step-19 RED: a SIGTERM-killed productive run (43 assistant turns, cf. reify-4415)
+        produces subtype='error_empty_output' AND transcript_turns > 0.  The predicate
+        must return False so the steward does not misclassify it as an instant empty-output
+        (resume-miss / bad-arg) and clear the session id.
+        """
+        result = _make_result(success=False, subtype='error_empty_output', timed_out=True)
+        result.transcript_turns = 5
+        assert _is_empty_output(result) is False, (
+            'Expected False for error_empty_output with transcript_turns=5 (progress run); '
+            'predicate must guard with is_timed_out_with_progress'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Empty-output recovery

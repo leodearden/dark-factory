@@ -23,7 +23,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+    is_timed_out_with_progress,
+)
 from shared.proc_group import terminate_process_group
 
 from orchestrator.agents.invoke import invoke_agent
@@ -815,5 +819,18 @@ def _is_empty_output(result) -> bool:
     has ``cost_usd=0, duration_ms=0, turns=0, success=False``: no real work
     was done, so this attempt should NOT consume retry budget (mirrors the
     ``_is_timeout_kill`` carve-out).
+
+    Note: a SIGTERM/SIGKILL-killed productive run (e.g. reify-4415: 43 assistant
+    turns over 1198s) can ALSO produce subtype='error_empty_output' because the
+    CLI emits its JSON only at exit.  ``is_timed_out_with_progress`` (keyed on
+    transcript_turns) distinguishes that case — those runs DID do real work and
+    must NOT be treated as instant empty-output failures.
     """
-    return result.subtype == 'error_empty_output'
+    if result.timed_out and result.transcript_turns is None and result.subtype == 'error_empty_output':
+        logger.debug(
+            '_is_empty_output: timed_out=True but transcript_turns=None '
+            '(transcript could not be located for session %r) — '
+            'conservative empty-output classification may misidentify a productive run',
+            getattr(result, 'session_id', ''),
+        )
+    return result.subtype == 'error_empty_output' and not is_timed_out_with_progress(result)

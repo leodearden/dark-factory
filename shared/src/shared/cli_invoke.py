@@ -122,9 +122,12 @@ __all__ = [
     'AllAccountsCappedException',
     'build_failure_message',
     'classify_agent_failure',
+    'count_transcript_turns',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    'is_timed_out_with_progress',
     'is_zero_output_timeout',
+    'read_transcript_records',
 ]
 
 
@@ -246,16 +249,107 @@ class AgentResult:
     schema_tool_denied: bool = False
     api_error_status: int | None = None
     proc_tree: str = ''
+    transcript_turns: int | None = None
+    """Number of assistant turns found in the on-disk JSONL transcript, or None
+    when the transcript was not read (non-timeout paths) or could not be located.
+    Stamped only on the SIGTERM/SIGKILL timeout path via count_transcript_turns."""
+
+
+def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
+    """Locate the transcript file for *session_id* under *config_dir*.
+
+    Globs ``<config_dir>/projects/*/<session_id>.jsonl`` and returns the first
+    match, or None if nothing is found or an error occurs.  Uses session_id
+    (a unique UUID) as the glob anchor — version-robust per PRD decision #2.
+    """
+    try:
+        matches = list(config_dir.glob(f'projects/*/{session_id}.jsonl'))
+        return matches[0] if matches else None
+    except Exception:
+        logger.debug(
+            f'_resolve_transcript_path: failed to glob for session {session_id} under {config_dir}'
+        )
+        return None
+
+
+def read_transcript_records(
+    config_dir: Path,
+    session_id: str,
+) -> list[dict] | None:
+    """Read and return all parsed records from the transcript for *session_id*.
+
+    Locates ``<config_dir>/projects/*/<session_id>.jsonl`` via glob and parses
+    each line as JSON, returning a list of dicts in order.  Parsing is TOLERANT:
+    unparseable lines (e.g. a truncated final line left by SIGKILL) are silently
+    skipped.
+
+    Returns:
+    - ``list[dict]`` — all successfully-parsed records (may be empty).
+    - ``None`` — transcript file could not be located, or the whole read raised
+      a catastrophic error.  Never raises; logs at debug/warning on failure.
+    """
+    try:
+        path = _resolve_transcript_path(config_dir, session_id)
+        if path is None:
+            return None
+        records: list[dict] = []
+        with path.open(encoding='utf-8') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    if isinstance(record, dict):
+                        records.append(record)
+                except json.JSONDecodeError:
+                    logger.debug(
+                        f'read_transcript_records: skipping unparseable line in {path}'
+                    )
+        return records
+    except Exception:
+        logger.warning(
+            f'read_transcript_records: failed to read transcript for session {session_id}'
+        )
+        return None
+
+
+def count_transcript_turns(
+    config_dir: Path,
+    session_id: str,
+) -> int | None:
+    """Count assistant turns in the on-disk JSONL transcript for *session_id*.
+
+    Delegates to ``read_transcript_records`` and counts records with
+    ``type == "assistant"``.  Inherits the same TOLERANT parsing semantics
+    (truncated lines skipped, None on file-not-found or catastrophic error).
+
+    Returns:
+    - ``int`` — number of assistant records found (may be 0).
+    - ``None`` — transcript file could not be located, or the whole read raised
+      a catastrophic error.  Never raises; logs at debug/warning on failure.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    if records is None:
+        return None
+    return sum(1 for r in records if r.get('type') == 'assistant')
 
 
 def is_zero_output_timeout(result: AgentResult) -> bool:
     """Return True when *result* is a fresh-invocation zero-output CLI wedge.
 
-    The three-field condition (timed_out=True, turns=0, cost_usd=0.0) means
-    the subprocess hung for the full invocation_timeout and produced no output
-    — the CLI never executed any agentic work.
+    Classification is transcript-authoritative when ``transcript_turns`` is
+    available (i.e. not None):
 
-    This predicate is the single canonical definition shared by:
+    - ``transcript_turns == 0`` → True  (no real work; genuine pre-turn wedge)
+    - ``transcript_turns > 0``  → False (work was done; reify-4415 case)
+
+    When ``transcript_turns is None`` (transcript not read or not available),
+    falls back to the legacy heuristic: ``turns == 0 and cost_usd == 0.0``.
+    An unreadable transcript NEVER upgrades a wedge to "progress" — the None
+    case always degrades to today's conservative behavior (PRD decision #3).
+
+    The predicate is the single canonical definition shared by:
 
     - The RESUME-variant wedge guard in ``invoke_with_cap_retry`` (~line 644,
       task 1532): clears the wedged ``resume_session_id`` so the cap-retry
@@ -266,10 +360,47 @@ def is_zero_output_timeout(result: AgentResult) -> bool:
       ``config.max_consecutive_zero_output_timeouts`` consecutive such results
       instead of burning the full ``max_execute_iterations`` budget (~3.3h).
 
-    Root cause observed: reify-4429 (2026-06-11) — 10/10 implementer
-    iterations hung pre-first-turn with no recoverable session state.
+    Root causes:
+    - reify-4429 (2026-06-11): 10/10 implementer iterations hung pre-first-turn
+      with no recoverable session state → zero_output_timeout True (correct).
+    - reify-4415: 43 assistant turns over 1198s, killed mid-work → zero turns
+      and cost in JSON output → previously mis-classified as wedge (now fixed
+      when transcript_turns is stamped by _run_subprocess).
     """
-    return result.timed_out and result.turns == 0 and result.cost_usd == 0.0
+    if not result.timed_out:
+        return False
+    if result.transcript_turns is not None:
+        return result.transcript_turns == 0
+    # Legacy fallback: transcript not available — use JSON-output fields.
+    # Log so that 'transcript not located for a possibly-productive run' is
+    # diagnosable rather than silently degrading to the conservative wedge path.
+    logger.debug(
+        'is_zero_output_timeout: timed_out=True but transcript_turns=None '
+        '(transcript could not be located for session %r) — '
+        'falling back to legacy turns==0 and cost_usd==0.0 heuristic',
+        result.session_id,
+    )
+    return result.turns == 0 and result.cost_usd == 0.0
+
+
+def is_timed_out_with_progress(result: AgentResult) -> bool:
+    """Return True when *result* is a timed-out run that did real agentic work.
+
+    Specifically: ``timed_out=True`` and ``transcript_turns > 0``.  This is the
+    complement of ``is_zero_output_timeout`` when ``transcript_turns is not
+    None``.
+
+    Mutual-exclusivity invariant: when ``result.timed_out`` is True and
+    ``result.transcript_turns is not None``, exactly one of
+    {``is_zero_output_timeout``, ``is_timed_out_with_progress``} returns True.
+
+    Callers:
+    - ``steward._is_empty_output``: guards against misclassifying a productive
+      SIGTERM-killed run (subtype=error_empty_output) as "no real work done".
+    - ``workflow._capture_zero_output_evidence``: enriches the evidence JSON.
+    - task γ: decides whether to resume a killed productive run.
+    """
+    return result.timed_out and (result.transcript_turns or 0) > 0
 
 
 class AgentFailureKind(enum.StrEnum):
@@ -442,6 +573,7 @@ class _SubprocessResult:
     duration_ms: int
     timed_out: bool = False
     proc_tree: str = ''
+    transcript_turns: int | None = None
 
 
 async def invoke_claude_agent(
@@ -950,7 +1082,11 @@ async def _invoke_claude(
             await bridge.start()
             env['ANTHROPIC_BASE_URL'] = bridge.url
 
-        result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
+        result = await _run_subprocess(
+            cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data,
+            session_id=(resume_session_id or session_id),
+            config_dir=config_dir,
+        )
         return _parse_claude_output(result)
     finally:
         for path in temp_files:
@@ -962,7 +1098,8 @@ async def _invoke_claude(
 def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     """Parse Claude Code JSON output into AgentResult.
 
-    timed_out is propagated directly from result.timed_out on every return path.
+    timed_out and transcript_turns are propagated directly from result on every
+    return path.
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -973,6 +1110,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             timed_out=result.timed_out,
             duration_ms=result.duration_ms,
             proc_tree=result.proc_tree,
+            transcript_turns=result.transcript_turns,
         )
 
     try:
@@ -985,6 +1123,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             stderr=result.stderr,
             timed_out=result.timed_out,
             proc_tree=result.proc_tree,
+            transcript_turns=result.transcript_turns,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -1062,6 +1201,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         schema_tool_denied=schema_tool_denied,
         api_error_status=api_error_status,
         proc_tree=result.proc_tree,
+        transcript_turns=result.transcript_turns,
     )
 
 
@@ -1106,6 +1246,8 @@ async def _run_subprocess(
     model: str,
     timeout_seconds: float | None = None,
     stdin_data: bytes | None = None,
+    session_id: str | None = None,
+    config_dir: Path | None = None,
 ) -> _SubprocessResult:
     """Run a subprocess, log output.
 
@@ -1185,6 +1327,11 @@ async def _run_subprocess(
                     + stderr_text
                 )
             duration_ms = int(time.monotonic() * 1000) - start_ms
+            tt = (
+                count_transcript_turns(config_dir, session_id)
+                if (config_dir and session_id)
+                else None
+            )
             return _SubprocessResult(
                 stdout=stdout_text,
                 stderr=stderr_text,
@@ -1192,6 +1339,7 @@ async def _run_subprocess(
                 duration_ms=duration_ms,
                 timed_out=True,
                 proc_tree=proc_tree,
+                transcript_turns=tt,
             )
     except asyncio.CancelledError:
         # Orchestrator shutdown path: the awaiting task was cancelled. Kill the

@@ -28,9 +28,12 @@ from shared.cli_invoke import (
     _to_token_count,
     build_failure_message,
     classify_agent_failure,
+    count_transcript_turns,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    is_timed_out_with_progress,
     is_zero_output_timeout,
+    read_transcript_records,
 )
 from shared.testing import make_gate_mock
 
@@ -1381,6 +1384,73 @@ class TestRunSubprocessTimedOut:
         assert 'Process terminated after' in result.stderr
         assert result.returncode == 0  # grace path preserves returncode
 
+    async def test_run_subprocess_stamps_transcript_turns_on_sigkill(self, tmp_path):
+        """SIGKILL path stamps transcript_turns from the on-disk transcript."""
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        transcript_dir = cfg_dir / 'projects' / 'slug-abc'
+        transcript_dir.mkdir(parents=True)
+        # Write a transcript with 3 assistant records (interleaved with non-assistant)
+        records = [
+            {'type': 'system', 'content': 'init'},
+            {'type': 'assistant', 'content': 'turn 1'},
+            {'type': 'user', 'content': 'reply'},
+            {'type': 'assistant', 'content': 'turn 2'},
+            {'type': 'user', 'content': 'reply 2'},
+            {'type': 'assistant', 'content': 'turn 3'},
+        ]
+        (transcript_dir / f'{sid}.jsonl').write_text(
+            '\n'.join(json.dumps(r) for r in records) + '\n'
+        )
+
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = None
+        proc.pid = 12345
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is True
+        assert result.transcript_turns == 3
+
+    async def test_run_subprocess_transcript_turns_none_when_no_session_id(self, tmp_path):
+        """When session_id is None, transcript_turns remains None on timeout path."""
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = None
+        proc.pid = 12345
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=None, config_dir=tmp_path,
+            )
+
+        assert result.timed_out is True
+        assert result.transcript_turns is None
+
 
 # ── _parse_claude_output timed_out propagation ───────────────────────────────
 
@@ -1427,6 +1497,65 @@ class TestParseClaudeOutputPropagatesTimedOut:
         assert agent.subtype == 'error_empty_output'
         assert agent.timed_out is True
         assert agent.duration_ms == 240_003
+
+
+# ── transcript_turns field + propagation ─────────────────────────────────────
+
+
+class TestTranscriptTurnsFieldAndPropagation:
+    """Tests for transcript_turns field on _SubprocessResult + AgentResult,
+    and propagation through _parse_claude_output on all three return paths.
+
+    transcript_turns defaults to None and is propagated from the subprocess
+    result to the AgentResult on every code path in _parse_claude_output.
+    """
+
+    def test_subprocess_result_defaults_transcript_turns_none(self):
+        """_SubprocessResult.transcript_turns defaults to None."""
+        r = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=10)
+        assert r.transcript_turns is None
+
+    def test_agent_result_defaults_transcript_turns_none(self):
+        """AgentResult.transcript_turns defaults to None."""
+        r = AgentResult(success=True, output='ok')
+        assert r.transcript_turns is None
+
+    def test_propagation_empty_stdout_path(self):
+        """Empty stdout path: _SubprocessResult(transcript_turns=7) → AgentResult.transcript_turns==7."""
+        sub = _SubprocessResult(
+            stdout='', stderr='', returncode=1,
+            duration_ms=100, timed_out=True, transcript_turns=7,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_empty_output'
+        assert agent.transcript_turns == 7
+
+    def test_propagation_json_decode_error_path(self):
+        """JSON decode error path: transcript_turns=4 → AgentResult.transcript_turns==4."""
+        sub = _SubprocessResult(
+            stdout='not json at all', stderr='', returncode=1,
+            duration_ms=100, timed_out=True, transcript_turns=4,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'text_output'
+        assert agent.transcript_turns == 4
+
+    def test_propagation_valid_json_path(self):
+        """Valid JSON parsed path: transcript_turns=2 → AgentResult.transcript_turns==2."""
+        sub = _SubprocessResult(
+            stdout=_CLAUDE_VALID_JSON_STDOUT, stderr='', returncode=0,
+            duration_ms=100, transcript_turns=2,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.transcript_turns == 2
+
+    def test_propagation_default_none(self):
+        """Default (transcript_turns not set) → AgentResult.transcript_turns is None."""
+        sub = _SubprocessResult(
+            stdout='', stderr='', returncode=1, duration_ms=100,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.transcript_turns is None
 
 
 # ── schema salvage (R1) ────────────────────────────────────────────────────────
@@ -2306,6 +2435,117 @@ class TestIsZeroOutputTimeout:
         )
         assert is_zero_output_timeout(result) is False
 
+    # ── transcript_turns-driven cases (task 1778) ─────────────────────────────
+
+    def test_transcript_turns_zero_is_true(self):
+        """timed_out=True, transcript_turns=0 → True (transcript says no work)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=0, cost_usd=0.0, transcript_turns=0,
+        )
+        assert is_zero_output_timeout(result) is True
+
+    def test_transcript_turns_nonzero_beats_legacy_zero_defaults(self):
+        """timed_out=True, transcript_turns=5, turns=0, cost_usd=0.0 → False.
+
+        transcript_turns authoritative: work was done even though legacy
+        fields show zero (reify-4415 case: 43 assistant turns, 0 JSON output).
+        """
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=0, cost_usd=0.0, transcript_turns=5,
+        )
+        assert is_zero_output_timeout(result) is False
+
+    def test_transcript_turns_none_legacy_fallback_zero(self):
+        """timed_out=True, transcript_turns=None, turns=0, cost_usd=0.0 → True (legacy fallback)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=0, cost_usd=0.0, transcript_turns=None,
+        )
+        assert is_zero_output_timeout(result) is True
+
+    def test_transcript_turns_none_legacy_fallback_nonzero_turns(self):
+        """timed_out=True, transcript_turns=None, turns=3 → False (legacy: turns>0)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=3, cost_usd=0.0, transcript_turns=None,
+        )
+        assert is_zero_output_timeout(result) is False
+
+    def test_transcript_turns_none_legacy_fallback_nonzero_cost(self):
+        """timed_out=True, transcript_turns=None, cost_usd=0.01 → False (legacy: cost>0)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=0, cost_usd=0.01, transcript_turns=None,
+        )
+        assert is_zero_output_timeout(result) is False
+
+    def test_not_timed_out_transcript_zero(self):
+        """timed_out=False, transcript_turns=0 → False (not a timeout at all)."""
+        result = AgentResult(
+            success=True, output='done', timed_out=False,
+            turns=0, cost_usd=0.0, transcript_turns=0,
+        )
+        assert is_zero_output_timeout(result) is False
+
+
+class TestIsTimedOutWithProgress:
+    """Tests for is_timed_out_with_progress() and mutual-exclusivity invariant.
+
+    Mutual-exclusivity invariant: when timed_out=True and transcript_turns is
+    not None, exactly one of {is_zero_output_timeout, is_timed_out_with_progress}
+    is True.
+    """
+
+    def test_timed_out_with_nonzero_turns_is_true(self):
+        """timed_out=True, transcript_turns=5 → True."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=5,
+        )
+        assert is_timed_out_with_progress(result) is True
+
+    def test_timed_out_with_zero_turns_is_false(self):
+        """timed_out=True, transcript_turns=0 → False (no progress)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=0,
+        )
+        assert is_timed_out_with_progress(result) is False
+
+    def test_timed_out_with_none_turns_is_false(self):
+        """timed_out=True, transcript_turns=None → False (transcript unknown)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=None,
+        )
+        assert is_timed_out_with_progress(result) is False
+
+    def test_not_timed_out_with_nonzero_turns_is_false(self):
+        """timed_out=False, transcript_turns=5 → False (not a timeout)."""
+        result = AgentResult(
+            success=True, output='done', timed_out=False, transcript_turns=5,
+        )
+        assert is_timed_out_with_progress(result) is False
+
+    def test_mutual_exclusivity_zero_turns(self):
+        """timed_out=True, transcript_turns=0: exactly zero_output=True, progress=False."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=0,
+        )
+        zero = is_zero_output_timeout(result)
+        progress = is_timed_out_with_progress(result)
+        assert zero is True and progress is False
+        assert zero != progress  # mutually exclusive
+
+    def test_mutual_exclusivity_nonzero_turns(self):
+        """timed_out=True, transcript_turns=5: exactly zero_output=False, progress=True."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=5,
+        )
+        zero = is_zero_output_timeout(result)
+        progress = is_timed_out_with_progress(result)
+        assert zero is False and progress is True
+        assert zero != progress  # mutually exclusive
+
 
 # ── _cpu_priority_prefix helper ───────────────────────────────────────────────
 
@@ -2428,3 +2668,128 @@ class TestRunSubprocessCpuPriorityPrefix:
             )
 
         assert captured_args == ['claude', '--x'], f'Expected bare argv; got {captured_args}'
+
+
+# ── Transcript readers ────────────────────────────────────────────────────────
+
+
+class TestCountTranscriptTurns:
+    """Unit tests for count_transcript_turns(config_dir, session_id).
+
+    The function reads a JSONL transcript file named <session_id>.jsonl under
+    <config_dir>/projects/*/ and counts records with type=='assistant'.
+    It is tolerant: truncated/unparseable lines are skipped (not None).
+    None is returned only when the file cannot be located or the whole read
+    raises catastrophically.
+    """
+
+    def _write_transcript(self, base: Path, session_id: str, lines: list[str]) -> Path:
+        """Write a JSONL transcript under base/projects/<slug>/<session_id>.jsonl."""
+        slug_dir = base / 'projects' / 'myproject'
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        transcript = slug_dir / f'{session_id}.jsonl'
+        transcript.write_text('\n'.join(lines) + '\n')
+        return transcript
+
+    def test_counts_assistant_records(self, tmp_path):
+        """3 assistant records interleaved with user/system → returns 3."""
+        sid = 'session-abc-001'
+        lines = [
+            json.dumps({'type': 'system', 'content': 'hello'}),
+            json.dumps({'type': 'assistant', 'content': 'turn 1'}),
+            json.dumps({'type': 'user', 'content': 'prompt 2'}),
+            json.dumps({'type': 'assistant', 'content': 'turn 2'}),
+            json.dumps({'type': 'user', 'content': 'prompt 3'}),
+            json.dumps({'type': 'assistant', 'content': 'turn 3'}),
+        ]
+        self._write_transcript(tmp_path, sid, lines)
+        result = count_transcript_turns(
+            config_dir=tmp_path, session_id=sid
+        )
+        assert result == 3
+
+    def test_truncated_final_line_skipped_tolerantly(self, tmp_path):
+        """2 complete assistant records + truncated final line → returns 2 (not None)."""
+        sid = 'session-abc-002'
+        lines = [
+            json.dumps({'type': 'assistant', 'content': 'turn 1'}),
+            json.dumps({'type': 'user', 'content': 'prompt'}),
+            json.dumps({'type': 'assistant', 'content': 'turn 2'}),
+            '{"type": "assistant", "content": "trunc',  # truncated / unparseable
+        ]
+        self._write_transcript(tmp_path, sid, lines)
+        result = count_transcript_turns(
+            config_dir=tmp_path, session_id=sid
+        )
+        assert result == 2
+
+    def test_absent_session_returns_none(self, tmp_path):
+        """No matching transcript file for the session id → None."""
+        sid = 'session-does-not-exist'
+        # Create projects dir but no matching file
+        (tmp_path / 'projects' / 'myproject').mkdir(parents=True, exist_ok=True)
+        result = count_transcript_turns(
+            config_dir=tmp_path, session_id=sid
+        )
+        assert result is None
+
+
+class TestReadTranscriptRecords:
+    """Unit tests for read_transcript_records(config_dir, session_id).
+
+    The function reads a JSONL transcript file and returns ALL parsed records as
+    a list of dicts, preserving order.  Tolerant: unparseable lines are skipped,
+    not None.  None is returned only when the file cannot be located or the
+    whole read raises.
+    """
+
+    def _write_transcript(self, base: Path, session_id: str, lines: list[str]) -> Path:
+        slug_dir = base / 'projects' / 'myproject'
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        transcript = slug_dir / f'{session_id}.jsonl'
+        transcript.write_text('\n'.join(lines) + '\n')
+        return transcript
+
+    def test_returns_all_records_in_order(self, tmp_path):
+        """4 well-formed records (mixed types) → list of 4 dicts in order."""
+        sid = 'sess-read-001'
+        records_in = [
+            {'type': 'system', 'content': 'init'},
+            {'type': 'user', 'content': 'prompt'},
+            {'type': 'assistant', 'content': [{'type': 'tool_use', 'name': 'Bash', 'input': {}}]},
+            {'type': 'tool', 'content': 'result'},
+        ]
+        lines = [json.dumps(r) for r in records_in]
+        self._write_transcript(tmp_path, sid, lines)
+        result = read_transcript_records(
+            config_dir=tmp_path, session_id=sid
+        )
+        assert isinstance(result, list)
+        assert len(result) == 4
+        # Verify order and content
+        for i, rec in enumerate(records_in):
+            assert result[i] == rec
+
+    def test_truncated_final_line_skipped(self, tmp_path):
+        """Truncated final line skipped; complete records returned."""
+        sid = 'sess-read-002'
+        complete = [
+            {'type': 'user', 'content': 'hi'},
+            {'type': 'assistant', 'content': 'hello'},
+        ]
+        lines = [json.dumps(r) for r in complete]
+        lines.append('{"type": "assistant", "content": "trunc')  # truncated
+        self._write_transcript(tmp_path, sid, lines)
+        result = read_transcript_records(
+            config_dir=tmp_path, session_id=sid
+        )
+        assert result == complete
+
+    def test_absent_file_returns_none(self, tmp_path):
+        """No matching transcript file → None."""
+        sid = 'sess-absent-xyz'
+        (tmp_path / 'projects' / 'proj').mkdir(parents=True, exist_ok=True)
+        result = read_transcript_records(
+            config_dir=tmp_path, session_id=sid
+        )
+        assert result is None
