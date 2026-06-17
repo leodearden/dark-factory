@@ -7283,6 +7283,176 @@ class TestBuildAgentEnvCpuPriority:
         assert env.get('DF_AGENT_CPU_NICE') == '15'
 
 
+@pytest.mark.asyncio
+class TestBuildAgentEnvCpuGovern:
+    """Unit tests for TaskWorkflow._build_agent_env with cpu_governance config (DF-1 env + DF-2 PATH)."""
+
+    def _make_workflow(self, config, git_ops, task_assignment):
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        return workflow
+
+    async def test_architect_receives_df_agent_cpu_govern_and_path(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """ARCHITECT gets DF_AGENT_CPU_GOVERN and PATH prepend when cpu_governance enabled."""
+        from orchestrator.config import CpuGovernConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+        agent_bin = scripts / 'agent-bin'
+        agent_bin.mkdir()
+
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.worktree = tmp_path
+        workflow.config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+            shim_dir='scripts/agent-bin',
+        )
+        env = workflow._build_agent_env(ARCHITECT)
+        assert env is not None
+        assert env.get('DF_AGENT_CPU_GOVERN') == str(exec_file.resolve())
+        assert env.get('PATH', '').startswith(str(agent_bin.resolve()) + os.pathsep)
+
+    async def test_implementer_receives_df_agent_cpu_govern(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """IMPLEMENTER gets DF_AGENT_CPU_GOVERN when cpu_governance enabled."""
+        from orchestrator.config import CpuGovernConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.worktree = tmp_path
+        workflow.config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+        )
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+        assert env.get('DF_AGENT_CPU_GOVERN') == str(exec_file.resolve())
+
+    async def test_debugger_receives_df_agent_cpu_govern(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """DEBUGGER gets DF_AGENT_CPU_GOVERN when cpu_governance enabled."""
+        from orchestrator.config import CpuGovernConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.worktree = tmp_path
+        workflow.config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+        )
+        env = workflow._build_agent_env(DEBUGGER)
+        assert env is not None
+        assert env.get('DF_AGENT_CPU_GOVERN') == str(exec_file.resolve())
+
+    async def test_merger_returns_none_governance_enabled(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """MERGER returns None even when cpu_governance is enabled (role guard fires first)."""
+        from orchestrator.config import CpuGovernConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.worktree = tmp_path
+        workflow.config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+        )
+        assert workflow._build_agent_env(MERGER) is None
+
+    async def test_judge_returns_none_governance_enabled(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """JUDGE returns None even when cpu_governance is enabled (role guard fires first)."""
+        from orchestrator.config import CpuGovernConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.worktree = tmp_path
+        workflow.config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+        )
+        assert workflow._build_agent_env(JUDGE) is None
+
+    async def test_governance_disabled_by_default_no_df_agent_cpu_govern(
+        self, config, git_ops, task_assignment,
+    ):
+        """cpu_governance disabled by default: ARCHITECT does not get DF_AGENT_CPU_GOVERN."""
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        # cpu_governance is disabled by default
+        env = workflow._build_agent_env(ARCHITECT)
+        assert 'DF_AGENT_CPU_GOVERN' not in (env or {})
+
+    async def test_enabled_but_worktree_none_fails_open(
+        self, config, git_ops, task_assignment,
+    ):
+        """enabled + worktree=None -> DF_AGENT_CPU_GOVERN absent (cannot resolve, fail-open)."""
+        from orchestrator.config import CpuGovernConfig
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.worktree = None
+        workflow.config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+        )
+        env = workflow._build_agent_env(ARCHITECT)
+        assert 'DF_AGENT_CPU_GOVERN' not in (env or {})
+
+    async def test_df_agent_cpu_govern_coexists_with_df_agent_cpu_nice_and_cargo(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """DF_AGENT_CPU_GOVERN, DF_AGENT_CPU_NICE, CARGO_MAKEFLAGS coexist in IMPLEMENTER env."""
+        from orchestrator.config import CpuGovernConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+        agent_bin = scripts / 'agent-bin'
+        agent_bin.mkdir()
+        fifo = tmp_path / 'task.fifo'
+        os.mkfifo(fifo)
+
+        workflow = self._make_workflow(config, git_ops, task_assignment)
+        workflow.worktree = tmp_path
+        workflow.config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+            shim_dir='scripts/agent-bin',
+        )
+        workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
+        # cpu_priority is enabled by default (nice=10)
+
+        env = workflow._build_agent_env(IMPLEMENTER)
+        assert env is not None
+        assert env.get('DF_AGENT_CPU_GOVERN') == str(exec_file.resolve())
+        assert env.get('PATH', '').startswith(str(agent_bin.resolve()) + os.pathsep)
+        assert env.get('DF_AGENT_CPU_NICE') == '10'
+        assert env.get('CARGO_MAKEFLAGS', '').startswith('--jobserver-auth=fifo:')
+
+
 if TYPE_CHECKING:
     from orchestrator.scheduler import Scheduler
     from orchestrator.workflow import _SchedulerLike
