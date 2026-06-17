@@ -1431,6 +1431,65 @@ class TestParseClaudeOutputPropagatesTimedOut:
         assert agent.duration_ms == 240_003
 
 
+# ── transcript_turns field + propagation ─────────────────────────────────────
+
+
+class TestTranscriptTurnsFieldAndPropagation:
+    """Tests for transcript_turns field on _SubprocessResult + AgentResult,
+    and propagation through _parse_claude_output on all three return paths.
+
+    transcript_turns defaults to None and is propagated from the subprocess
+    result to the AgentResult on every code path in _parse_claude_output.
+    """
+
+    def test_subprocess_result_defaults_transcript_turns_none(self):
+        """_SubprocessResult.transcript_turns defaults to None."""
+        r = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=10)
+        assert r.transcript_turns is None
+
+    def test_agent_result_defaults_transcript_turns_none(self):
+        """AgentResult.transcript_turns defaults to None."""
+        r = AgentResult(success=True, output='ok')
+        assert r.transcript_turns is None
+
+    def test_propagation_empty_stdout_path(self):
+        """Empty stdout path: _SubprocessResult(transcript_turns=7) → AgentResult.transcript_turns==7."""
+        sub = _SubprocessResult(
+            stdout='', stderr='', returncode=1,
+            duration_ms=100, timed_out=True, transcript_turns=7,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_empty_output'
+        assert agent.transcript_turns == 7
+
+    def test_propagation_json_decode_error_path(self):
+        """JSON decode error path: transcript_turns=4 → AgentResult.transcript_turns==4."""
+        sub = _SubprocessResult(
+            stdout='not json at all', stderr='', returncode=1,
+            duration_ms=100, timed_out=True, transcript_turns=4,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'text_output'
+        assert agent.transcript_turns == 4
+
+    def test_propagation_valid_json_path(self):
+        """Valid JSON parsed path: transcript_turns=2 → AgentResult.transcript_turns==2."""
+        sub = _SubprocessResult(
+            stdout=_CLAUDE_VALID_JSON_STDOUT, stderr='', returncode=0,
+            duration_ms=100, transcript_turns=2,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.transcript_turns == 2
+
+    def test_propagation_default_none(self):
+        """Default (transcript_turns not set) → AgentResult.transcript_turns is None."""
+        sub = _SubprocessResult(
+            stdout='', stderr='', returncode=1, duration_ms=100,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.transcript_turns is None
+
+
 # ── schema salvage (R1) ────────────────────────────────────────────────────────
 
 
