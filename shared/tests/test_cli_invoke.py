@@ -1384,6 +1384,73 @@ class TestRunSubprocessTimedOut:
         assert 'Process terminated after' in result.stderr
         assert result.returncode == 0  # grace path preserves returncode
 
+    async def test_run_subprocess_stamps_transcript_turns_on_sigkill(self, tmp_path):
+        """SIGKILL path stamps transcript_turns from the on-disk transcript."""
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        transcript_dir = cfg_dir / 'projects' / 'slug-abc'
+        transcript_dir.mkdir(parents=True)
+        # Write a transcript with 3 assistant records (interleaved with non-assistant)
+        records = [
+            {'type': 'system', 'content': 'init'},
+            {'type': 'assistant', 'content': 'turn 1'},
+            {'type': 'user', 'content': 'reply'},
+            {'type': 'assistant', 'content': 'turn 2'},
+            {'type': 'user', 'content': 'reply 2'},
+            {'type': 'assistant', 'content': 'turn 3'},
+        ]
+        (transcript_dir / f'{sid}.jsonl').write_text(
+            '\n'.join(json.dumps(r) for r in records) + '\n'
+        )
+
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = None
+        proc.pid = 12345
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is True
+        assert result.transcript_turns == 3
+
+    async def test_run_subprocess_transcript_turns_none_when_no_session_id(self, tmp_path):
+        """When session_id is None, transcript_turns remains None on timeout path."""
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = None
+        proc.pid = 12345
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=None, config_dir=tmp_path,
+            )
+
+        assert result.timed_out is True
+        assert result.transcript_turns is None
+
 
 # ── _parse_claude_output timed_out propagation ───────────────────────────────
 
