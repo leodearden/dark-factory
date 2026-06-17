@@ -337,11 +337,18 @@ def count_transcript_turns(
 def is_zero_output_timeout(result: AgentResult) -> bool:
     """Return True when *result* is a fresh-invocation zero-output CLI wedge.
 
-    The three-field condition (timed_out=True, turns=0, cost_usd=0.0) means
-    the subprocess hung for the full invocation_timeout and produced no output
-    — the CLI never executed any agentic work.
+    Classification is transcript-authoritative when ``transcript_turns`` is
+    available (i.e. not None):
 
-    This predicate is the single canonical definition shared by:
+    - ``transcript_turns == 0`` → True  (no real work; genuine pre-turn wedge)
+    - ``transcript_turns > 0``  → False (work was done; reify-4415 case)
+
+    When ``transcript_turns is None`` (transcript not read or not available),
+    falls back to the legacy heuristic: ``turns == 0 and cost_usd == 0.0``.
+    An unreadable transcript NEVER upgrades a wedge to "progress" — the None
+    case always degrades to today's conservative behavior (PRD decision #3).
+
+    The predicate is the single canonical definition shared by:
 
     - The RESUME-variant wedge guard in ``invoke_with_cap_retry`` (~line 644,
       task 1532): clears the wedged ``resume_session_id`` so the cap-retry
@@ -352,10 +359,19 @@ def is_zero_output_timeout(result: AgentResult) -> bool:
       ``config.max_consecutive_zero_output_timeouts`` consecutive such results
       instead of burning the full ``max_execute_iterations`` budget (~3.3h).
 
-    Root cause observed: reify-4429 (2026-06-11) — 10/10 implementer
-    iterations hung pre-first-turn with no recoverable session state.
+    Root causes:
+    - reify-4429 (2026-06-11): 10/10 implementer iterations hung pre-first-turn
+      with no recoverable session state → zero_output_timeout True (correct).
+    - reify-4415: 43 assistant turns over 1198s, killed mid-work → zero turns
+      and cost in JSON output → previously mis-classified as wedge (now fixed
+      when transcript_turns is stamped by _run_subprocess).
     """
-    return result.timed_out and result.turns == 0 and result.cost_usd == 0.0
+    if not result.timed_out:
+        return False
+    if result.transcript_turns is not None:
+        return result.transcript_turns == 0
+    # Legacy fallback: transcript not available — use JSON-output fields.
+    return result.turns == 0 and result.cost_usd == 0.0
 
 
 class AgentFailureKind(enum.StrEnum):
