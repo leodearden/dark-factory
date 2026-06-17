@@ -2955,3 +2955,53 @@ class TestRunSubprocessWatchdog:
             f'Expected kill at ceiling (~0.3s), but killed early at {wall:.3f}s '
             f'— seen_turn=True (5 turns) should prevent startup-grace fast kill'
         )
+
+    async def test_none_transcript_post_grace_does_not_busy_loop(self, tmp_path):
+        """Regression: post-grace tight-spin when transcript is unreadable (None).
+
+        After startup_grace_secs expires with live_turns=None (unreadable transcript),
+        the poll must NOT degenerate to 0.0 (causing a tight-spin that hammers
+        count_transcript_turns hundreds/thousands of times).
+
+        Asserts that count_transcript_turns is called at most 20 times across the
+        full 0.4s window (~8 calls expected at the 0.05s poll cadence).
+
+        Fails before step-8: once elapsed >= startup_grace_secs with live_turns=None,
+        time_to_grace = max(0.0, grace - elapsed) = 0.0, so
+        poll = min(_WATCHDOG_POLL_SECS=0.05, 0.0, time_to_ceiling) = 0.0;
+        asyncio.wait(timeout=0.0) returns immediately and the loop tight-spins,
+        calling count_transcript_turns hundreds/thousands of times in the 0.4s window.
+        """
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        call_counter = [0]
+
+        def counting_count_turns(config_dir, session_id):
+            call_counter[0] += 1
+            return None
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=counting_count_turns),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.4, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is True, 'Expected timed_out=True (killed at ceiling)'
+        assert call_counter[0] <= 20, (
+            f'count_transcript_turns called {call_counter[0]} times — '
+            f'busy-loop detected; expected ≤20 (bounded by ~0.05s poll cadence)'
+        )
