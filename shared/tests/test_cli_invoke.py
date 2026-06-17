@@ -2700,6 +2700,64 @@ class TestRunSubprocessCpuPriorityPrefix:
         assert captured_args == ['claude', '--x'], f'Expected bare argv; got {captured_args}'
 
 
+class TestCpuGovernPrefix:
+    """Unit tests for _cpu_govern_prefix(env) helper in cli_invoke."""
+
+    def test_returns_empty_for_absent_key(self):
+        """Empty dict (key absent) → []."""
+        from shared.cli_invoke import _cpu_govern_prefix
+        assert _cpu_govern_prefix({}) == []
+
+    def test_returns_empty_for_empty_string(self, tmp_path):
+        """DF_AGENT_CPU_GOVERN='' (empty string) → []."""
+        from shared.cli_invoke import _cpu_govern_prefix
+        env = {'DF_AGENT_CPU_GOVERN': ''}
+        assert _cpu_govern_prefix(env) == []
+
+    def test_returns_govern_prefix_for_executable(self, tmp_path):
+        """DF_AGENT_CPU_GOVERN set to an executable → [<path>, '--role', 'task', '--']."""
+        from shared.cli_invoke import _cpu_govern_prefix
+        exec_file = tmp_path / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+        env = {'DF_AGENT_CPU_GOVERN': str(exec_file)}
+        result = _cpu_govern_prefix(env)
+        assert result == [str(exec_file), '--role', 'task', '--']
+
+    def test_returns_empty_for_non_executable_path(self, tmp_path):
+        """DF_AGENT_CPU_GOVERN set to a non-executable path → [] (fail-open)."""
+        from shared.cli_invoke import _cpu_govern_prefix
+        f = tmp_path / 'not-exec.sh'
+        f.write_text('#!/bin/sh\n')
+        f.chmod(0o644)
+        env = {'DF_AGENT_CPU_GOVERN': str(f)}
+        assert _cpu_govern_prefix(env) == []
+
+    def test_returns_empty_for_missing_path(self, tmp_path):
+        """DF_AGENT_CPU_GOVERN set to a nonexistent path → [] (fail-open)."""
+        from shared.cli_invoke import _cpu_govern_prefix
+        env = {'DF_AGENT_CPU_GOVERN': str(tmp_path / 'nonexistent.sh')}
+        assert _cpu_govern_prefix(env) == []
+
+    def test_pops_df_agent_cpu_govern_from_env(self, tmp_path):
+        """_cpu_govern_prefix pops DF_AGENT_CPU_GOVERN from the env dict."""
+        from shared.cli_invoke import _cpu_govern_prefix
+        exec_file = tmp_path / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\n')
+        exec_file.chmod(0o755)
+        env = {'DF_AGENT_CPU_GOVERN': str(exec_file), 'OTHER': 'val'}
+        _cpu_govern_prefix(env)
+        assert 'DF_AGENT_CPU_GOVERN' not in env
+        assert env.get('OTHER') == 'val'
+
+    def test_pops_key_even_when_returning_empty(self, tmp_path):
+        """DF_AGENT_CPU_GOVERN pointing at non-executable is popped (returns []) — key removed."""
+        from shared.cli_invoke import _cpu_govern_prefix
+        env = {'DF_AGENT_CPU_GOVERN': '/tmp/nonexistent-govern.sh'}
+        _cpu_govern_prefix(env)
+        assert 'DF_AGENT_CPU_GOVERN' not in env
+
+
 # ── Transcript readers ────────────────────────────────────────────────────────
 
 
