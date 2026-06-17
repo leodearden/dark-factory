@@ -253,3 +253,63 @@ class TestResumeOnProgressWiring:
             f'Expected _pending_resume_role=None for success, '
             f'got {wf._pending_resume_role!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-3 RED test: progress-timeout resets the consecutive-zero-output counter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestProgressResetsZeroOutputCounter:
+    """A progress-timeout resets consecutive_zero_output (proof-of-life).
+
+    Before γ, a progress-timeout fell into the `else` branch which reset the counter.
+    The new `elif … continue` bypasses that else, so without an explicit reset a mixed
+    wedge/progress/wedge sequence trips the zero-output circuit breaker prematurely.
+
+    Sequence: zero_output, progress, zero_output, zero_output
+    With reset    (step-4): counter: 1 → 0 → 1 → 2 → BLOCKED, call_count == 4 ✓
+    Without reset (step-2): counter: 1 → 1 → 2 → BLOCKED,     call_count == 3 ✗
+
+    Fails RED at step-2 because the elif does not reset consecutive_zero_output yet.
+    """
+
+    async def test_progress_resets_consecutive_counter(self, tmp_path: Path):
+        """Progress-timeout resets the zero-output counter so breaker requires
+        max_consecutive_zero_output_timeouts=2 NEW consecutive failures after reset.
+
+        Sequence [zero, progress, zero, zero] trips at call_count==4.
+        Without the reset the breaker would trip at call_count==3.
+        Padding items let the loop reach max_execute_iterations when breaker absent (RED path).
+        """
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=10,
+            max_consecutive_zero_output_timeouts=2,
+        )
+        mock_invoke = _stub_iteration_helpers(wf, _zero_output_agent_result())
+        # Pre-set session-id stash (real _invoke sets this; mocked _invoke skips it)
+        wf._last_invoke_session_id = 'killed-sid'  # type: ignore[attr-defined]
+
+        mock_invoke.side_effect = [
+            _zero_output_agent_result(),    # iter 1: count=1 (< 2, continue)
+            _progress_timeout_agent_result(),  # iter 2: reset count=0 + set fields + continue
+            _zero_output_agent_result(),    # iter 3: count=1 (< 2, continue)
+            _zero_output_agent_result(),    # iter 4: count=2 → BLOCKED (circuit breaker)
+            # Padding: consumed only when circuit breaker is absent (RED path)
+            _zero_output_agent_result(),
+            _zero_output_agent_result(),
+            _zero_output_agent_result(),
+            _zero_output_agent_result(),
+            _zero_output_agent_result(),
+            _zero_output_agent_result(),
+        ]
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert mock_invoke.call_count == 4, (
+            f'Expected 4 _invoke calls (counter resets after progress), '
+            f'got {mock_invoke.call_count}'
+        )
