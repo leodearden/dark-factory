@@ -31,6 +31,7 @@ from shared.cli_invoke import (
     count_transcript_turns,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
 )
@@ -2420,6 +2421,63 @@ class TestIsZeroOutputTimeout:
             turns=0, cost_usd=0.0, transcript_turns=0,
         )
         assert is_zero_output_timeout(result) is False
+
+
+class TestIsTimedOutWithProgress:
+    """Tests for is_timed_out_with_progress() and mutual-exclusivity invariant.
+
+    Mutual-exclusivity invariant: when timed_out=True and transcript_turns is
+    not None, exactly one of {is_zero_output_timeout, is_timed_out_with_progress}
+    is True.
+    """
+
+    def test_timed_out_with_nonzero_turns_is_true(self):
+        """timed_out=True, transcript_turns=5 → True."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=5,
+        )
+        assert is_timed_out_with_progress(result) is True
+
+    def test_timed_out_with_zero_turns_is_false(self):
+        """timed_out=True, transcript_turns=0 → False (no progress)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=0,
+        )
+        assert is_timed_out_with_progress(result) is False
+
+    def test_timed_out_with_none_turns_is_false(self):
+        """timed_out=True, transcript_turns=None → False (transcript unknown)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=None,
+        )
+        assert is_timed_out_with_progress(result) is False
+
+    def test_not_timed_out_with_nonzero_turns_is_false(self):
+        """timed_out=False, transcript_turns=5 → False (not a timeout)."""
+        result = AgentResult(
+            success=True, output='done', timed_out=False, transcript_turns=5,
+        )
+        assert is_timed_out_with_progress(result) is False
+
+    def test_mutual_exclusivity_zero_turns(self):
+        """timed_out=True, transcript_turns=0: exactly zero_output=True, progress=False."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=0,
+        )
+        zero = is_zero_output_timeout(result)
+        progress = is_timed_out_with_progress(result)
+        assert zero is True and progress is False
+        assert zero != progress  # mutually exclusive
+
+    def test_mutual_exclusivity_nonzero_turns(self):
+        """timed_out=True, transcript_turns=5: exactly zero_output=False, progress=True."""
+        result = AgentResult(
+            success=False, output='', timed_out=True, transcript_turns=5,
+        )
+        zero = is_zero_output_timeout(result)
+        progress = is_timed_out_with_progress(result)
+        assert zero is False and progress is True
+        assert zero != progress  # mutually exclusive
 
 
 # ── _cpu_priority_prefix helper ───────────────────────────────────────────────
