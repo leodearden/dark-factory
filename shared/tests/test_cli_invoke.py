@@ -1712,6 +1712,35 @@ class TestClaudeCallerPropagatesTimedOut:
         assert agent.timed_out is True
 
 
+class TestInvokeClaudeAgentForwardsStartupGraceSecs:
+    """invoke_claude_agent must forward startup_grace_secs down to _run_subprocess."""
+
+    async def test_invoke_claude_agent_forwards_startup_grace_secs(self, tmp_path):
+        """startup_grace_secs passed to invoke_claude_agent reaches _run_subprocess.
+
+        Fails today: invoke_claude_agent has no startup_grace_secs param → TypeError.
+        After step-10 it is forwarded via _invoke_claude to _run_subprocess.
+        """
+        captured: dict = {}
+        minimal_result = _SubprocessResult(
+            stdout='', stderr='', returncode=0, duration_ms=0,
+        )
+
+        async def capturing_run_subprocess(*args, **kwargs):
+            captured.update(kwargs)
+            # positional args: cmd, cwd, env, model, timeout_seconds
+            return minimal_result
+
+        with patch('shared.cli_invoke._run_subprocess', side_effect=capturing_run_subprocess):
+            await invoke_claude_agent(
+                prompt='x', system_prompt='s', cwd=tmp_path,
+                startup_grace_secs=33.0,
+            )
+
+        assert captured.get('startup_grace_secs') == 33.0, (
+            f'startup_grace_secs not forwarded to _run_subprocess; captured={captured!r}'
+        )
+
 
 def _make_gate(
     *,
