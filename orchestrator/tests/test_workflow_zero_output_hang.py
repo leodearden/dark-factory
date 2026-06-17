@@ -669,15 +669,30 @@ class TestCaptureZeroOutputEvidenceEnriched:
 
     Step-17 RED: fails because _capture_zero_output_evidence does not yet emit
     these keys and _last_invoke_session_id is not initialised in __init__.
+
+    Step-21 RED (review-fix): the step-17 fixture used a flattened schema
+    (``rec['content']``) that does NOT match the real Claude CLI transcript
+    format.  Real assistant records carry NO top-level ``content`` key; the
+    content-block list lives at ``rec['message']['content']``.  This class now
+    uses the real nested schema and asserts ``last_records`` entries have a
+    ``message`` key.  The ``last_tool`` assertion fails against the pre-fix
+    production code (which reads ``rec.get('content')`` → None for nested
+    records).
     """
 
     def test_evidence_enriched_with_transcript_data(self, tmp_path: Path):
         """Evidence JSON includes transcript_turns, last_tool (from transcript), and last_records.
 
-        Writes a transcript at <cfg>/projects/<slug>/sid.jsonl with two assistant
-        records — the second containing a tool_use block named 'Bash'.  Then calls
-        _capture_zero_output_evidence with transcript_turns=0 on an AgentResult and
-        asserts the evidence file carries the three enrichment keys.
+        Uses the REAL nested Claude CLI transcript schema:
+          assistant records have NO top-level 'content' key;
+          the content-block list is at rec['message']['content'].
+
+        Writes a transcript at <cfg>/projects/<slug>/sid.jsonl with records in
+        the real schema — the last assistant record has a tool_use block named
+        'Bash'.  Calls _capture_zero_output_evidence and asserts:
+          - evidence['last_tool'] == 'Bash'
+          - evidence['last_records'] entries have a 'message' key (nested shape)
+          - evidence['transcript_turns'] == 0
         """
         wf = _make_workflow(tmp_path=tmp_path)
         assert wf.artifacts is not None
@@ -686,17 +701,40 @@ class TestCaptureZeroOutputEvidenceEnriched:
         config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
         wf._config_dir = config_dir  # type: ignore[attr-defined]
 
-        # Write a JSONL transcript with assistant records, one of which has a tool_use block
+        # Write a JSONL transcript using the REAL nested CLI schema.
+        # Real assistant records: keys include type, message, uuid, parentUuid, ...
+        # The content-block list lives at rec['message']['content'], NOT rec['content'].
         projects_dir = config_dir.path / 'projects' / 'myslug'
         projects_dir.mkdir(parents=True, exist_ok=True)
         session_id = 'sid-enrich-test'
         transcript_path = projects_dir / f'{session_id}.jsonl'
         records = [
-            {'type': 'user', 'content': 'hello'},
-            {'type': 'assistant', 'content': [{'type': 'text', 'text': 'I will run a command.'}]},
+            # User record — real shape also nests under 'message'
+            {
+                'type': 'user',
+                'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'hello'}]},
+                'uuid': 'u-1',
+                'parentUuid': None,
+            },
+            # Assistant text record — content under message, NO top-level 'content' key
             {
                 'type': 'assistant',
-                'content': [{'type': 'tool_use', 'name': 'Bash', 'id': 'tu-1', 'input': {}}],
+                'message': {
+                    'role': 'assistant',
+                    'content': [{'type': 'text', 'text': 'I will run a command.'}],
+                },
+                'uuid': 'a-1',
+                'parentUuid': 'u-1',
+            },
+            # Assistant tool_use record — content under message, tool_use block named 'Bash'
+            {
+                'type': 'assistant',
+                'message': {
+                    'role': 'assistant',
+                    'content': [{'type': 'tool_use', 'name': 'Bash', 'id': 'tu-1', 'input': {}}],
+                },
+                'uuid': 'a-2',
+                'parentUuid': 'a-1',
             },
         ]
         transcript_path.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
@@ -730,15 +768,15 @@ class TestCaptureZeroOutputEvidenceEnriched:
             f'Expected transcript_turns==0; got {data["transcript_turns"]!r}'
         )
 
-        # last_tool extracted from the transcript
+        # last_tool extracted from the transcript's nested message.content blocks
         assert 'last_tool' in data, (
             f'Expected "last_tool" key in evidence; got {list(data.keys())!r}'
         )
         assert data['last_tool'] == 'Bash', (
-            f'Expected last_tool=="Bash"; got {data["last_tool"]!r}'
+            f'Expected last_tool=="Bash" (from nested message.content); got {data["last_tool"]!r}'
         )
 
-        # last_records — last ≤5 records from the transcript
+        # last_records — last ≤5 records from the transcript, preserving nested shape
         assert 'last_records' in data, (
             f'Expected "last_records" key in evidence; got {list(data.keys())!r}'
         )
@@ -748,3 +786,9 @@ class TestCaptureZeroOutputEvidenceEnriched:
         assert len(data['last_records']) <= 5, (
             f'Expected at most 5 last_records; got {len(data["last_records"])}'
         )
+        # Each entry must preserve the nested schema (has a 'message' key)
+        for rec in data['last_records']:
+            assert 'message' in rec, (
+                f'Expected each last_records entry to have a "message" key '
+                f'(real nested CLI schema); got keys {list(rec.keys())!r}'
+            )
