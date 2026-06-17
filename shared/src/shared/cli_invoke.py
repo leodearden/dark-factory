@@ -43,6 +43,11 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+# Poll interval for the two-regime liveness watchdog in _run_subprocess.
+# Each tick reads the on-disk transcript to check for assistant turns; the
+# actual sleep per tick is min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling)
+# so grace and ceiling are never overshot by a full poll interval.
+_WATCHDOG_POLL_SECS = 5.0
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -1248,6 +1253,7 @@ async def _run_subprocess(
     stdin_data: bytes | None = None,
     session_id: str | None = None,
     config_dir: Path | None = None,
+    startup_grace_secs: float = 120.0,
 ) -> _SubprocessResult:
     """Run a subprocess, log output.
 
@@ -1279,12 +1285,100 @@ async def _run_subprocess(
     # refresh via os.getpgid() later — the PID may be reused post-reap.
     pgid = proc.pid
 
+    comm_task: asyncio.Task[tuple[bytes, bytes]] | None = None
     try:
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdin_data),
-                timeout=timeout_seconds,
+            # ── Two-regime liveness watchdog ────────────────────────────────
+            # STARTUP regime (pre-turn-1): if no assistant turn appears within
+            # startup_grace_secs, kill fast — catches from-source-build / uv /
+            # MCP-startup wedges.
+            # WORKING regime (≥1 turn seen): liveness proven; only the absolute
+            # ceiling (timeout_seconds) triggers a kill.
+            #
+            # Conservative degrade: kill fires ONLY on an explicit observed
+            # live_turns == 0 (a successful read returning 0).  A None /
+            # unreadable transcript never triggers the fast kill — the watchdog
+            # cannot prove a wedge and degrades through to the ceiling.
+            #
+            # asyncio.wait({comm_task}, timeout=poll) does NOT raise on a task
+            # exception — it returns the task in `done`; comm_task.result()
+            # re-raises.  Existing tests that mock communicate(side_effect=
+            # TimeoutError) land in `done` on the first poll, result() re-raises,
+            # and the unchanged except-TimeoutError kill block runs as today.
+            watchdog_start = time.monotonic()
+            seen_turn = False  # latched True once ≥1 assistant turn observed
+            live_turns: int | None = None  # last non-None turn count read
+
+            comm_task = asyncio.ensure_future(
+                proc.communicate(input=stdin_data)
             )
+
+            while True:
+                elapsed = time.monotonic() - watchdog_start
+                # How long until the next mandatory check-point?
+                time_to_grace = (
+                    max(0.0, startup_grace_secs - elapsed)
+                    if not seen_turn
+                    else float('inf')
+                )
+                time_to_ceiling = (
+                    max(0.0, timeout_seconds - elapsed)
+                    if timeout_seconds is not None
+                    else float('inf')
+                )
+                poll = min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling)
+
+                done, _ = await asyncio.wait({comm_task}, timeout=poll)
+
+                if comm_task in done:
+                    # Process exited (or communicate raised) — retrieve result.
+                    # result() re-raises any exception the coroutine completed with
+                    # (e.g. TimeoutError from mocked communicate in existing tests).
+                    stdout, stderr = comm_task.result()
+                    break  # normal exit → skip the kill block
+
+                # Comm task still pending — check liveness.
+                if config_dir and session_id:
+                    n = count_transcript_turns(config_dir, session_id)
+                    if n is not None:
+                        live_turns = n
+                        if n >= 1:
+                            seen_turn = True
+
+                elapsed = time.monotonic() - watchdog_start
+
+                # Startup-regime kill: explicit 0-turn read AND grace expired.
+                # NEVER kill on None (unreadable transcript) — conservative degrade.
+                if (
+                    not seen_turn
+                    and live_turns == 0
+                    and elapsed >= startup_grace_secs
+                ):
+                    logger.warning(
+                        f'Startup wedge detected after {elapsed:.1f}s '
+                        f'(grace={startup_grace_secs}s, turns=0): '
+                        f'model={model} — cancelling comm_task and killing'
+                    )
+                    comm_task.cancel()
+                    try:
+                        await comm_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    raise TimeoutError
+
+                # Absolute-ceiling kill.
+                if timeout_seconds is not None and elapsed >= timeout_seconds:
+                    logger.warning(
+                        f'Absolute ceiling reached after {elapsed:.1f}s '
+                        f'(ceiling={timeout_seconds}s): model={model} — killing'
+                    )
+                    comm_task.cancel()
+                    try:
+                        await comm_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    raise TimeoutError
+
         except TimeoutError:
             # Snapshot the process group FIRST — before terminate() — while the
             # wedged children are still alive and their /proc entries readable.
@@ -1345,6 +1439,14 @@ async def _run_subprocess(
         # Orchestrator shutdown path: the awaiting task was cancelled. Kill the
         # entire process group (not just the direct child) so cargo/rustc
         # grandchildren are also reaped.
+        # Also cancel comm_task (initialised to None above) so the communicate
+        # coroutine is not left dangling after the process group is killed.
+        if comm_task is not None and not comm_task.done():
+            comm_task.cancel()
+            try:
+                await comm_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if proc.returncode is None:
             logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
             await terminate_process_group(proc, pgid, grace_secs=5.0)
