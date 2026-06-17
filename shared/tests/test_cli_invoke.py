@@ -2700,6 +2700,106 @@ class TestRunSubprocessCpuPriorityPrefix:
         assert captured_args == ['claude', '--x'], f'Expected bare argv; got {captured_args}'
 
 
+@pytest.mark.asyncio
+class TestRunSubprocessCpuGovernPrefix:
+    """Integration: _run_subprocess prepends govern prefix when DF_AGENT_CPU_GOVERN is set."""
+
+    async def test_govern_prefix_prepended_to_argv(self, tmp_path):
+        """_run_subprocess spawns [<exec>, '--role', 'task', '--', 'claude', '--x'] with govern env."""
+        exec_file = tmp_path / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+
+        captured_args = []
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_args.extend(args)
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await _run_subprocess(
+                ['claude', '--x'],
+                tmp_path,
+                env={'DF_AGENT_CPU_GOVERN': str(exec_file)},
+                model='test',
+            )
+
+        assert captured_args[:4] == [str(exec_file), '--role', 'task', '--'], (
+            f'Expected govern prefix; got {captured_args[:4]}'
+        )
+        assert captured_args[4:6] == ['claude', '--x']
+        assert 'DF_AGENT_CPU_GOVERN' not in captured_kwargs.get('env', {}), (
+            'DF_AGENT_CPU_GOVERN leaked into the subprocess env'
+        )
+
+    async def test_govern_outermost_nice_inner(self, tmp_path):
+        """With both govern + nice, argv is [<exec>, '--role', 'task', '--', 'nice', '-n', '10', 'claude', '--x']."""
+        exec_file = tmp_path / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+
+        captured_args = []
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_args.extend(args)
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await _run_subprocess(
+                ['claude', '--x'],
+                tmp_path,
+                env={'DF_AGENT_CPU_GOVERN': str(exec_file), 'DF_AGENT_CPU_NICE': '10'},
+                model='test',
+            )
+
+        expected_prefix = [str(exec_file), '--role', 'task', '--', 'nice', '-n', '10']
+        assert captured_args[:7] == expected_prefix, (
+            f'Expected govern-outermost nice-inner prefix; got {captured_args[:7]}'
+        )
+        assert captured_args[7:9] == ['claude', '--x']
+        # Both DF_* keys stripped from child env
+        child_env = captured_kwargs.get('env', {})
+        assert 'DF_AGENT_CPU_GOVERN' not in child_env
+        assert 'DF_AGENT_CPU_NICE' not in child_env
+
+    async def test_no_prefix_without_govern_or_nice(self, tmp_path):
+        """_run_subprocess spawns ['claude', '--x'] exactly when no DF_* keys set (regression guard)."""
+        captured_args = []
+
+        async def fake_exec(*args, **kwargs):
+            captured_args.extend(args)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await _run_subprocess(
+                ['claude', '--x'], tmp_path, env={}, model='test',
+            )
+
+        assert captured_args == ['claude', '--x'], f'Expected bare argv; got {captured_args}'
+
+
 class TestCpuGovernPrefix:
     """Unit tests for _cpu_govern_prefix(env) helper in cli_invoke."""
 
