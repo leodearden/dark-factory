@@ -1772,6 +1772,23 @@ def _maybe_govern_merge_cmd(
 
     Does NOT alter ``_run_cmd``'s signature, the ``use_cgroup_scope`` path, or
     any merge PSI/semaphore bypass.
+
+    **Interaction with verify_use_cgroup_scope**: when both
+    ``config.cpu_governance.enabled`` *and* ``config.verify_use_cgroup_scope``
+    are ``True``, ``_run_or_skip_timed`` wraps the command here first
+    (so ``cpu-governed-exec.sh`` becomes ``argv[0]``), then passes
+    ``use_cgroup_scope=True`` to ``_run_cmd``.  ``_run_cmd`` in turn launches
+    the already-wrapped command inside a ``systemd-run --user --scope``
+    (outer ``df-verify`` scope).  ``cpu-governed-exec.sh``, on its governed
+    path, tries to create an *inner* ``systemd-run --user --scope`` scope —
+    a nested transient scope inside the outer ``df-verify`` scope.  Nested
+    ``--user --scope`` invocations are allowed by systemd (each creates a
+    distinct cgroup slice), so this is not a correctness or leak bug; the
+    outer scope's cgroup kill still reaps the entire subtree regardless.
+    The live reify deployment currently sets ``verify_use_cgroup_scope=False``,
+    so this combination does not occur in practice.  ``cpu-governed-exec.sh``
+    also has a runtime probe + fail-open, so a nested-scope failure degrades
+    gracefully.
     """
     if cmd is None or role != 'merge':
         return cmd

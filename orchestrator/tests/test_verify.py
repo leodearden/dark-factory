@@ -5655,3 +5655,137 @@ class TestMaybeGovernMergeCmd:
         abs_exec = str(exec_file.resolve())
         expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
         assert result == expected
+
+    # -----------------------------------------------------------------------
+    # Integration tests: wiring of _maybe_govern_merge_cmd into run_verification
+    # (suggestion: test that the cmd= line in _run_or_skip_timed actually routes
+    # wrapped commands through _run_cmd, not just _maybe_govern_merge_cmd in isolation)
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_run_verification_merge_role_wraps_commands(self, tmp_path):
+        """run_verification with role='merge' + governance enabled routes wrapped cmds to _run_cmd.
+
+        Verifies the wiring at verify.py:_run_or_skip_timed — that the
+        ``cmd = _maybe_govern_merge_cmd(cmd, config, worktree, role)`` line
+        actually fires and transforms the command before _run_cmd sees it.
+        Without this integration test, removing that line leaves the unit
+        tests of _maybe_govern_merge_cmd in isolation still passing.
+        """
+        import shlex
+
+        from orchestrator.config import ModuleConfig
+        config, exec_file = self._make_govern_config(tmp_path)
+        # Use a ModuleConfig so we can set commands to None (skip) — OrchestratorConfig
+        # commands are non-nullable str fields so we cannot set them to None directly.
+        module_config = ModuleConfig(
+            prefix='pkg',
+            test_command='cargo test --workspace',
+            lint_command='cargo clippy --workspace',
+            type_check_command=None,
+        )
+
+        abs_exec = str(exec_file.resolve())
+        captured_cmds: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config=module_config, max_retries=0, role='merge',
+            )
+
+        assert len(captured_cmds) == 2, f'Expected 2 cmds (test+lint); got {captured_cmds}'
+        for cmd in captured_cmds:
+            assert cmd.startswith(shlex.quote(abs_exec)), (
+                f'Expected cmd to start with govern prefix {shlex.quote(abs_exec)!r}; got {cmd!r}'
+            )
+            assert '--role merge --' in cmd, f'Expected --role merge -- in cmd; got {cmd!r}'
+            assert '/bin/bash -c' in cmd, f'Expected /bin/bash -c in cmd; got {cmd!r}'
+
+    @pytest.mark.asyncio
+    async def test_run_verification_task_role_no_wrap(self, tmp_path):
+        """run_verification with role='task' (default) routes bare cmds to _run_cmd — no governance wrap."""
+        from orchestrator.config import ModuleConfig
+        config, _ = self._make_govern_config(tmp_path)
+        module_config = ModuleConfig(
+            prefix='pkg',
+            test_command='cargo test --workspace',
+            lint_command=None,
+            type_check_command=None,
+        )
+
+        captured_cmds: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            # role='task' is the default; governance must NOT wrap task-role commands
+            await run_verification(
+                tmp_path, config, module_config=module_config, max_retries=0, role='task',
+            )
+
+        assert len(captured_cmds) == 1
+        assert captured_cmds[0] == 'cargo test --workspace', (
+            f'Expected bare command for role=task; got {captured_cmds[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_verification_governance_and_cgroup_scope_coexist(self, tmp_path):
+        """Governance + verify_use_cgroup_scope both enabled: commands are govern-wrapped and no crash.
+
+        When both flags are active, _run_or_skip_timed first wraps the command
+        via _maybe_govern_merge_cmd (so cpu-governed-exec.sh becomes argv[0])
+        and then passes use_cgroup_scope=True to _run_cmd, which would launch
+        the wrapped command inside a systemd --user --scope (if systemd-run is
+        present).  This creates a potential nested scope: the outer df-verify
+        scope contains the cpu-governed-exec.sh invocation, which on its
+        governed path itself tries to create an inner systemd-run --user --scope.
+
+        In the real environment reify currently sets verify_use_cgroup_scope=False,
+        so this combination does not occur on the live path.  cpu-governed-exec.sh
+        has a runtime probe + fail-open that handles systemd-run absence or
+        failures; the outer scope's cgroup kill still reaps the whole subtree.
+        This test confirms the code paths compose without crashing and that
+        governance wrapping still fires (the nested scope interaction is a
+        runtime-environment concern, not a code-correctness bug).
+        """
+        import shlex
+
+        from orchestrator.config import ModuleConfig
+        config, exec_file = self._make_govern_config(tmp_path)
+        config.verify_use_cgroup_scope = True  # both flags enabled
+        module_config = ModuleConfig(
+            prefix='pkg',
+            test_command='cargo test --workspace',
+            lint_command=None,
+            type_check_command=None,
+        )
+
+        abs_exec = str(exec_file.resolve())
+        captured_cmds: list[str] = []
+        captured_scope_flags: list[bool] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, use_cgroup_scope=False, **_kwargs):
+            captured_cmds.append(cmd)
+            captured_scope_flags.append(use_cgroup_scope)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config=module_config, max_retries=0, role='merge',
+            )
+
+        assert len(captured_cmds) == 1
+        # Governance wrapping fires even when cgroup scope is also active
+        assert captured_cmds[0].startswith(shlex.quote(abs_exec)), (
+            f'Govern prefix expected even with cgroup scope; got {captured_cmds[0]!r}'
+        )
+        # _run_cmd also received use_cgroup_scope=True (outer df-verify scope)
+        assert captured_scope_flags[0] is True, (
+            'verify_use_cgroup_scope=True must still propagate to _run_cmd'
+        )

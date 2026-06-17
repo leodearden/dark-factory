@@ -1247,6 +1247,15 @@ def _cpu_govern_prefix(env: dict[str, str]) -> list[str]:
     raw = env.pop('DF_AGENT_CPU_GOVERN', None)
     if not raw:
         return []
+    # Belt-and-suspenders executability check: DF_AGENT_CPU_GOVERN is always
+    # populated from CpuGovernConfig.resolved_exec_path(), which already
+    # validated the path with os.access(path, os.X_OK).  shutil.which() is a
+    # second layer of defence for the edge case where the path was constructed
+    # outside that gate (e.g. injected directly in tests or a future caller).
+    # The two predicates differ subtly (os.access honours real-UID/ACL
+    # semantics; shutil.which uses the effective UID) — this is intentional
+    # belt-and-suspenders redundancy, not an attempt at equivalence.  Both
+    # always fail-open: a rejected path returns [] and never breaks the spawn.
     if not shutil.which(raw):
         return []
     return [raw, '--role', 'task', '--']
