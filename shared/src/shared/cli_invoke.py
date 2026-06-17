@@ -1368,7 +1368,14 @@ async def _run_subprocess(
                     break  # normal exit → skip the kill block
 
                 # Comm task still pending — check liveness.
-                if config_dir and session_id:
+                # Short-circuit once seen_turn is latched True: the startup-kill
+                # guard requires `not seen_turn`, so live_turns is never consulted
+                # again in the working regime.  Skip the on-disk read to avoid
+                # redundant FS I/O for the (potentially 20-40 min) post-turn-1
+                # lifetime of a healthy long-running agent.
+                # The post-kill transcript_turns re-read in the except block is
+                # unaffected — it is a separate, one-shot read outside this loop.
+                if not seen_turn and config_dir and session_id:
                     n = count_transcript_turns(config_dir, session_id)
                     if n is not None:
                         live_turns = n
