@@ -1307,12 +1307,17 @@ async def _run_subprocess(
 
     start_ms = int(time.monotonic() * 1000)
 
-    # Prepend `nice -n N` when DF_AGENT_CPU_NICE is set.  This de-prioritizes
-    # the Claude CLI and its inherited cargo/rustc subtree so they yield CPU to
-    # reify's negatively-niced merge/task verifies.  _cpu_priority_prefix pops
-    # the signal from env so it does not leak to the child.  nice execvp's in
-    # place, so start_new_session/pgid logic below is unaffected.
-    spawn_cmd = _cpu_priority_prefix(env) + cmd
+    # Compose the spawn prefix (govern OUTERMOST, then nice, then cmd):
+    #   _cpu_govern_prefix  — places the agent and its inherited cargo/rustc/test
+    #     subtree into a reify cpu.weight-weighted cgroup scope via
+    #     cpu-governed-exec.sh (reify-owned).  Pops DF_AGENT_CPU_GOVERN so it
+    #     does not leak to the child and cannot re-wrap.  cpu-governed-exec.sh
+    #     execs in place, so start_new_session/pgid kill logic below is unaffected.
+    #   _cpu_priority_prefix — prepends `nice -n N` to de-prioritize the agent.
+    #     Pops DF_AGENT_CPU_NICE.  nice also execvp's in place.
+    # Govern is outermost so the cgroup scope wraps nice wraps the Claude CLI
+    # (PRD C-G1).
+    spawn_cmd = _cpu_govern_prefix(env) + _cpu_priority_prefix(env) + cmd
 
     proc = await asyncio.create_subprocess_exec(
         *spawn_cmd,
