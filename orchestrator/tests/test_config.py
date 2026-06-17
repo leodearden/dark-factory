@@ -164,6 +164,18 @@ class TestDefaults:
         assert config.timeouts.steward == 1800.0
         assert config.timeouts.steward >= config.steward_completion_timeout
 
+    def test_startup_grace_secs_default_is_120(self, monkeypatch, tmp_path):
+        """TimeoutsConfig.startup_grace_secs defaults to 120.0 (pre-turn-1 startup grace window).
+
+        Documents the two-regime liveness watchdog: 120s is ~20x the observed ~6s
+        turn-1 latency, so genuine startups never trip it while a true pre-turn-1
+        wedge is killed fast (vs. burning the full 1200s per-role ceiling).
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.timeouts.startup_grace_secs == 120.0
+
     def test_verify_cold_command_timeout_secs_from_defaults_yaml(self, monkeypatch, tmp_path):
         """verify_cold_command_timeout_secs is loaded from defaults.yaml (expected 5400)."""
         monkeypatch.chdir(tmp_path)

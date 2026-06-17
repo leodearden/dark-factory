@@ -43,6 +43,15 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+# Poll interval for the two-regime liveness watchdog in _run_subprocess.
+# Each tick reads the on-disk transcript to check for assistant turns; the
+# actual sleep per tick is min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling)
+# so grace and ceiling are never overshot by a full poll interval.
+_WATCHDOG_POLL_SECS = 5.0
+# Minimum poll duration — prevents the poll from degenerating to 0.0 when both
+# time_to_grace and time_to_ceiling have already elapsed (would otherwise cause an
+# asyncio.wait(timeout=0) tight-spin hammering count_transcript_turns).
+_WATCHDOG_MIN_POLL_SECS = 0.01
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -595,6 +604,7 @@ async def invoke_claude_agent(
     session_id: str | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
+    startup_grace_secs: float = 120.0,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -623,6 +633,7 @@ async def invoke_claude_agent(
         resume_session_id=resume_session_id, session_id=session_id,
         config_dir=config_dir,
         env_overrides=env_overrides,
+        startup_grace_secs=startup_grace_secs,
     )
 
 
@@ -989,6 +1000,7 @@ async def _invoke_claude(
     session_id: str | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
+    startup_grace_secs: float = 120.0,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd = ['claude', '--print', '--output-format', 'json']
@@ -1086,6 +1098,7 @@ async def _invoke_claude(
             cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data,
             session_id=(resume_session_id or session_id),
             config_dir=config_dir,
+            startup_grace_secs=startup_grace_secs,
         )
         return _parse_claude_output(result)
     finally:
@@ -1248,6 +1261,7 @@ async def _run_subprocess(
     stdin_data: bytes | None = None,
     session_id: str | None = None,
     config_dir: Path | None = None,
+    startup_grace_secs: float = 120.0,
 ) -> _SubprocessResult:
     """Run a subprocess, log output.
 
@@ -1279,12 +1293,125 @@ async def _run_subprocess(
     # refresh via os.getpgid() later — the PID may be reused post-reap.
     pgid = proc.pid
 
+    comm_task: asyncio.Task[tuple[bytes, bytes]] | None = None
     try:
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdin_data),
-                timeout=timeout_seconds,
+            # ── Two-regime liveness watchdog ────────────────────────────────
+            # STARTUP regime (pre-turn-1): if no assistant turn appears within
+            # startup_grace_secs, kill fast — catches from-source-build / uv /
+            # MCP-startup wedges.
+            # WORKING regime (≥1 turn seen): liveness proven; only the absolute
+            # ceiling (timeout_seconds) triggers a kill.
+            #
+            # Conservative degrade: kill fires ONLY on an explicit observed
+            # live_turns == 0 (a successful read returning 0).  A None /
+            # unreadable transcript never triggers the fast kill — the watchdog
+            # cannot prove a wedge and degrades through to the ceiling.
+            #
+            # asyncio.wait({comm_task}, timeout=poll) does NOT raise on a task
+            # exception — it returns the task in `done`; comm_task.result()
+            # re-raises.  Existing tests that mock communicate(side_effect=
+            # TimeoutError) land in `done` on the first poll, result() re-raises,
+            # and the unchanged except-TimeoutError kill block runs as today.
+            watchdog_start = time.monotonic()
+            seen_turn = False  # latched True once ≥1 assistant turn observed
+            live_turns: int | None = None  # last non-None turn count read
+
+            comm_task = asyncio.ensure_future(
+                proc.communicate(input=stdin_data)
             )
+
+            while True:
+                elapsed = time.monotonic() - watchdog_start
+                # How long until the next mandatory check-point?
+                #
+                # time_to_grace: collapse to inf once the startup-grace kill can
+                # no longer fire — avoids a 0.0-poll tight-spin after grace expires.
+                # The kill is permanently non-actionable when:
+                #   • seen_turn: ≥1 assistant turn seen → working regime, never kills
+                #   • elapsed >= startup_grace_secs: grace already passed; the kill
+                #     check at the bottom of the loop fires on the first read that
+                #     returns live_turns==0, no early wake-up needed
+                #   • not (config_dir and session_id): transcript cannot be read →
+                #     live_turns stays None → startup-kill requires live_turns==0 →
+                #     can never trigger
+                _grace_spent = (
+                    seen_turn
+                    or elapsed >= startup_grace_secs
+                    or not (config_dir and session_id)
+                )
+                time_to_grace = (
+                    float('inf') if _grace_spent
+                    else max(0.0, startup_grace_secs - elapsed)
+                )
+                time_to_ceiling = (
+                    max(0.0, timeout_seconds - elapsed)
+                    if timeout_seconds is not None
+                    else float('inf')
+                )
+                # Floor at _WATCHDOG_MIN_POLL_SECS so the poll never degenerates
+                # to 0.0 (which would make asyncio.wait return immediately and
+                # tight-spin, hammering count_transcript_turns and starving the
+                # event loop).
+                poll = max(
+                    min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling),
+                    _WATCHDOG_MIN_POLL_SECS,
+                )
+
+                done, _ = await asyncio.wait({comm_task}, timeout=poll)
+
+                if comm_task in done:
+                    # Process exited (or communicate raised) — retrieve result.
+                    # result() re-raises any exception the coroutine completed with
+                    # (e.g. TimeoutError from mocked communicate in existing tests).
+                    stdout, stderr = comm_task.result()
+                    break  # normal exit → skip the kill block
+
+                # Comm task still pending — check liveness.
+                # Short-circuit once seen_turn is latched True: the startup-kill
+                # guard requires `not seen_turn`, so live_turns is never consulted
+                # again in the working regime.  Skip the on-disk read to avoid
+                # redundant FS I/O for the (potentially 20-40 min) post-turn-1
+                # lifetime of a healthy long-running agent.
+                # The post-kill transcript_turns re-read in the except block is
+                # unaffected — it is a separate, one-shot read outside this loop.
+                if not seen_turn and config_dir and session_id:
+                    n = count_transcript_turns(config_dir, session_id)
+                    if n is not None:
+                        live_turns = n
+                        if n >= 1:
+                            seen_turn = True
+
+                elapsed = time.monotonic() - watchdog_start
+
+                # Startup-regime kill: explicit 0-turn read AND grace expired.
+                # NEVER kill on None (unreadable transcript) — conservative degrade.
+                if (
+                    not seen_turn
+                    and live_turns == 0
+                    and elapsed >= startup_grace_secs
+                ):
+                    logger.warning(
+                        f'Startup wedge detected after {elapsed:.1f}s '
+                        f'(grace={startup_grace_secs}s, turns=0): '
+                        f'model={model} — cancelling comm_task and killing'
+                    )
+                    comm_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await comm_task
+                    raise TimeoutError
+
+                # Absolute-ceiling kill.
+                if timeout_seconds is not None and elapsed >= timeout_seconds:
+                    logger.warning(
+                        f'Absolute ceiling reached after {elapsed:.1f}s '
+                        f'(ceiling={timeout_seconds}s): model={model} — killing'
+                    )
+                    comm_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await comm_task
+                    raise TimeoutError
+
         except TimeoutError:
             # Snapshot the process group FIRST — before terminate() — while the
             # wedged children are still alive and their /proc entries readable.
@@ -1345,6 +1472,12 @@ async def _run_subprocess(
         # Orchestrator shutdown path: the awaiting task was cancelled. Kill the
         # entire process group (not just the direct child) so cargo/rustc
         # grandchildren are also reaped.
+        # Also cancel comm_task (initialised to None above) so the communicate
+        # coroutine is not left dangling after the process group is killed.
+        if comm_task is not None and not comm_task.done():
+            comm_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await comm_task
         if proc.returncode is None:
             logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
             await terminate_process_group(proc, pgid, grace_secs=5.0)

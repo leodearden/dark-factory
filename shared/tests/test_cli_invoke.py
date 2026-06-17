@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
 import logging
@@ -1712,6 +1713,35 @@ class TestClaudeCallerPropagatesTimedOut:
         assert agent.timed_out is True
 
 
+class TestInvokeClaudeAgentForwardsStartupGraceSecs:
+    """invoke_claude_agent must forward startup_grace_secs down to _run_subprocess."""
+
+    async def test_invoke_claude_agent_forwards_startup_grace_secs(self, tmp_path):
+        """startup_grace_secs passed to invoke_claude_agent reaches _run_subprocess.
+
+        Fails today: invoke_claude_agent has no startup_grace_secs param → TypeError.
+        After step-10 it is forwarded via _invoke_claude to _run_subprocess.
+        """
+        captured: dict = {}
+        minimal_result = _SubprocessResult(
+            stdout='', stderr='', returncode=0, duration_ms=0,
+        )
+
+        async def capturing_run_subprocess(*args, **kwargs):
+            captured.update(kwargs)
+            # positional args: cmd, cwd, env, model, timeout_seconds
+            return minimal_result
+
+        with patch('shared.cli_invoke._run_subprocess', side_effect=capturing_run_subprocess):
+            await invoke_claude_agent(
+                prompt='x', system_prompt='s', cwd=tmp_path,
+                startup_grace_secs=33.0,
+            )
+
+        assert captured.get('startup_grace_secs') == 33.0, (
+            f'startup_grace_secs not forwarded to _run_subprocess; captured={captured!r}'
+        )
+
 
 def _make_gate(
     *,
@@ -2793,3 +2823,292 @@ class TestReadTranscriptRecords:
             config_dir=tmp_path, session_id=sid
         )
         assert result is None
+
+
+# ── Two-regime liveness watchdog tests ──────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestRunSubprocessWatchdog:
+    """Two-regime liveness watchdog tests for _run_subprocess.
+
+    These tests verify that the new watchdog param ``startup_grace_secs``
+    enables a fast pre-turn-1 kill when a zero-turn startup wedge is detected,
+    distinct from the per-role post-turn-1 ceiling.
+
+    The key fake communicate pattern used throughout:
+      - First call: hangs via ``asyncio.Event().wait()`` until cancelled by the
+        watchdog kill path (raises CancelledError on cancellation).
+      - Second call (post-SIGTERM): raises TimeoutError immediately to trigger
+        the SIGKILL branch so ``terminate_process_group`` is called.
+    """
+
+    @staticmethod
+    def _make_hanging_proc():
+        """Return (proc, call_count_ref) where communicate hangs on call 1, raises TimeoutError on call 2."""
+        call_count = [0]
+
+        async def communicate_side_effect(input=None):  # noqa: A002
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Hang until the watchdog cancels comm_task — CancelledError is raised here.
+                await asyncio.Event().wait()
+            # Second call (inside SIGTERM grace window): raise immediately → SIGKILL path.
+            raise TimeoutError
+
+        proc = MagicMock()
+        proc.communicate = communicate_side_effect
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = None
+        proc.pid = 12345
+        return proc, call_count
+
+    async def test_startup_wedge_killed_at_grace_not_ceiling(self, tmp_path):
+        """Startup wedge (0 turns) is killed at startup_grace_secs, not the 5s ceiling.
+
+        With startup_grace_secs=0.05 and timeout_seconds=5.0, the watchdog
+        should detect 0 turns after ~0.05s and kill fast.  Wall-clock must be
+        well under the 5s ceiling, proving the kill happened at the grace bound.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=0),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=5.0, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
+        terminate_pg_mock.assert_called_once()
+        # Upper bound is generous (2s) to avoid CI flakiness under scheduler pressure;
+        # the key assertion is that terminate_process_group fired (not just a ceiling kill).
+        assert wall < 2.0, f'Expected fast kill (<2s), got {wall:.3f}s — wedge not killed at grace bound'
+
+    async def test_none_transcript_degrades_to_ceiling_not_grace(self, tmp_path):
+        """B7 conservative degrade: unreadable/absent transcript (None) must NOT trigger
+        the startup-grace fast kill.
+
+        When count_transcript_turns returns None, the watchdog cannot prove a wedge.
+        The run must survive past startup_grace_secs and be killed only at the ceiling
+        (timeout_seconds).  Wall-clock must be >= ~0.25s (past the 0.05s grace).
+
+        This is the step-5 RED case: the step-4 first-cut guard `not seen_turn` is
+        too broad — it also early-kills on None (unreadable transcript), which is
+        wrong.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=None),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.3, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is True
+        assert result.transcript_turns is None
+        # Must NOT have been killed at the 0.05s grace bound — must reach the 0.3s ceiling.
+        assert wall >= 0.2, (
+            f'Expected kill at ceiling (~0.3s), but killed early at {wall:.3f}s '
+            f'— None transcript should degrade to ceiling, not trigger fast kill'
+        )
+
+    async def test_working_regime_survives_grace_killed_at_ceiling(self, tmp_path):
+        """B6 long-synchronous-tool survival: ≥1 turn seen → no fast kill at grace, only ceiling.
+
+        A proc that has made progress (count_transcript_turns=5) must NOT be killed
+        at the startup_grace_secs bound.  Liveness is proven (seen_turn=True); the
+        working regime applies and only the absolute ceiling triggers the kill.
+        Wall-clock must be >= ~0.25s (past the 0.05s grace) and result.transcript_turns==5.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=5),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.3, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is True
+        assert result.transcript_turns == 5
+        # Must NOT have been killed at the 0.05s grace bound — must reach the 0.3s ceiling.
+        assert wall >= 0.2, (
+            f'Expected kill at ceiling (~0.3s), but killed early at {wall:.3f}s '
+            f'— seen_turn=True (5 turns) should prevent startup-grace fast kill'
+        )
+
+    async def test_none_transcript_post_grace_does_not_busy_loop(self, tmp_path):
+        """Regression: post-grace tight-spin when transcript is unreadable (None).
+
+        After startup_grace_secs expires with live_turns=None (unreadable transcript),
+        the poll must NOT degenerate to 0.0 (causing a tight-spin that hammers
+        count_transcript_turns hundreds/thousands of times).
+
+        Asserts that count_transcript_turns is called at most 20 times across the
+        full 0.4s window (~8 calls expected at the 0.05s poll cadence).
+
+        Fails before step-8: once elapsed >= startup_grace_secs with live_turns=None,
+        time_to_grace = max(0.0, grace - elapsed) = 0.0, so
+        poll = min(_WATCHDOG_POLL_SECS=0.05, 0.0, time_to_ceiling) = 0.0;
+        asyncio.wait(timeout=0.0) returns immediately and the loop tight-spins,
+        calling count_transcript_turns hundreds/thousands of times in the 0.4s window.
+        """
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        call_counter = [0]
+
+        def counting_count_turns(config_dir, session_id):
+            call_counter[0] += 1
+            return None
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=counting_count_turns),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.4, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is True, 'Expected timed_out=True (killed at ceiling)'
+        assert call_counter[0] <= 20, (
+            f'count_transcript_turns called {call_counter[0]} times — '
+            f'busy-loop detected; expected ≤20 (bounded by ~0.05s poll cadence)'
+        )
+
+    async def test_cancelled_error_cancels_comm_task_and_kills_group(self, tmp_path):
+        """When the outer task is cancelled (orchestrator shutdown), comm_task is
+        cancelled and terminate_process_group is called.
+
+        Exercises the ``except asyncio.CancelledError`` path added in step-4:
+          • comm_task.cancel() is called so the communicate coroutine doesn't dangle
+          • terminate_process_group is awaited to reap the process group
+          • CancelledError is re-raised (tested by catching it on task await)
+        """
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=None),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
+        ):
+            task = asyncio.ensure_future(_run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                # Large ceiling so the watchdog doesn't fire before the cancel
+                timeout_seconds=5.0, startup_grace_secs=2.0,
+                session_id=sid, config_dir=cfg_dir,
+            ))
+            # Yield to let _run_subprocess start and enter asyncio.wait in the
+            # watchdog poll loop.  A single sleep(0) is sufficient because
+            # fake_exec is an awaitable that returns without yielding, so the
+            # task runs straight through to the first asyncio.wait suspension.
+            await asyncio.sleep(0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        # The CancelledError path must have called terminate_process_group.
+        terminate_pg_mock.assert_called_once()
+
+
+# ── invoke_with_cap_retry kwarg-forwarding tests ─────────────────────────────
+
+@pytest.mark.asyncio
+class TestInvokeWithCapRetryForwardsStartupGraceSecs:
+    """invoke_with_cap_retry must forward startup_grace_secs via **invoke_kwargs."""
+
+    async def test_startup_grace_secs_forwarded_to_invoke_fn(self):
+        """invoke_with_cap_retry passes startup_grace_secs to the invoke_fn.
+
+        startup_grace_secs travels through invoke_with_cap_retry's **invoke_kwargs
+        to the invoke_fn.  This is structurally guaranteed by the passthrough, but
+        an explicit test guards against an accidental pop() or filter in the future.
+        """
+        captured: dict = {}
+
+        async def fake_invoke_fn(**kwargs):
+            captured.update(kwargs)
+            return AgentResult(success=True, output='ok')
+
+        await invoke_with_cap_retry(
+            None,  # no gate → fast path
+            'test-label',
+            invoke_fn=fake_invoke_fn,
+            prompt='hi',
+            startup_grace_secs=77.0,
+        )
+
+        assert captured.get('startup_grace_secs') == 77.0, (
+            f'startup_grace_secs not forwarded to invoke_fn; captured kwargs: {captured}'
+        )

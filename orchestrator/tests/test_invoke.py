@@ -21,6 +21,7 @@ from orchestrator.agents.invoke import (
     _parse_gemini_output,
     _run_subprocess_local,
     _SubprocessResult,
+    invoke_agent,
     invoke_with_cap_retry,
 )
 
@@ -482,6 +483,93 @@ class TestSandboxPathForwardsSessionConfig:
         )
         assert captured_kwargs.get('config_dir') == cfg_dir, (
             f'Expected config_dir={cfg_dir!r} forwarded to _run_subprocess; got {captured_kwargs!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestStartupGraceSecsForwarding:
+    """invoke_agent and _invoke_claude_with_sandbox must forward startup_grace_secs.
+
+    Step-11 RED: fails until invoke.py is updated to thread startup_grace_secs
+    through both the non-sandbox (invoke_claude_agent) and sandbox (_run_subprocess)
+    paths.
+    """
+
+    async def test_non_sandbox_path_forwards_startup_grace_secs(self, tmp_path):
+        """Non-sandbox claude path: startup_grace_secs reaches invoke_claude_agent.
+
+        invoke_agent(backend='claude', sandbox_modules=None) falls through to
+        invoke_claude_agent().  We patch that and assert startup_grace_secs=33.0 is
+        forwarded.
+
+        Fails today: invoke_agent has no startup_grace_secs param → TypeError.
+        """
+        captured_kwargs: dict = {}
+
+        async def capturing_invoke_claude_agent(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return AgentResult(success=True, output='')
+
+        with patch(
+            'orchestrator.agents.invoke.invoke_claude_agent',
+            side_effect=capturing_invoke_claude_agent,
+        ):
+            await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend='claude', sandbox_modules=None,
+                startup_grace_secs=33.0,
+            )
+
+        assert captured_kwargs.get('startup_grace_secs') == 33.0, (
+            f'startup_grace_secs not forwarded to invoke_claude_agent; captured={captured_kwargs!r}'
+        )
+
+    async def test_sandbox_path_forwards_startup_grace_secs(self, tmp_path):
+        """Sandbox-active branch: startup_grace_secs reaches _run_subprocess.
+
+        Mirrors TestSandboxPathForwardsSessionConfig: patches resolve_active_backend
+        → 'bwrap' and wrap_command → identity so the sandbox branch is taken.
+        Captures kwargs on the _run_subprocess mock and asserts startup_grace_secs
+        is forwarded.
+
+        Fails today: _invoke_claude_with_sandbox has no startup_grace_secs param →
+        TypeError.
+        """
+        captured_kwargs: dict = {}
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            captured_kwargs.update(kwargs)
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        with (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods: cmd,
+            ),
+            patch(
+                'orchestrator.agents.invoke._run_subprocess',
+                side_effect=mock_run_subprocess,
+            ),
+        ):
+            await _invoke_claude_with_sandbox(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+                startup_grace_secs=33.0,
+            )
+
+        assert captured_kwargs.get('startup_grace_secs') == 33.0, (
+            f'startup_grace_secs not forwarded to _run_subprocess; captured={captured_kwargs!r}'
         )
 
 

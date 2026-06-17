@@ -459,3 +459,60 @@ class TestRealPromptPassedToCliInvokeOnResume:
         assert call_kwargs.get('resume_session_id') == 'sid-1', (
             f"Expected resume_session_id='sid-1' but got {call_kwargs.get('resume_session_id')!r}."
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression: config.timeouts.startup_grace_secs reaches the watchdog
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStartupGraceSecsReachesWatchdog:
+    """config.timeouts.startup_grace_secs must be forwarded to invoke_with_cap_retry.
+
+    Step-13 RED: _invoke does not yet pass startup_grace_secs, so the config
+    field is a dead knob — editing config.yaml has no effect on the watchdog.
+    After step-14 it is threaded end-to-end:
+    config.yaml → TimeoutsConfig.startup_grace_secs → _invoke →
+    invoke_with_cap_retry → invoke_agent → _invoke_claude_with_sandbox →
+    {sandbox _run_subprocess | invoke_claude_agent → _invoke_claude → _run_subprocess}
+    """
+
+    async def test_config_startup_grace_secs_reaches_invoke_with_cap_retry(
+        self, config, git_ops, task_assignment,
+    ):
+        """_invoke forwards config.timeouts.startup_grace_secs to invoke_with_cap_retry.
+
+        Fails today: _invoke does not pass startup_grace_secs, so the captured
+        kwarg is absent/None != 77.0.
+        """
+        config.timeouts.startup_grace_secs = 77.0
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        cwd = wt_info.path
+
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=None,
+        )
+        workflow.artifacts = None
+
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ) as mock_cap_retry:
+            await workflow._invoke(IMPLEMENTER, 'PROMPT', cwd)
+
+        assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
+        assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'
+        call_kwargs = mock_cap_retry.await_args.kwargs
+        assert call_kwargs.get('startup_grace_secs') == 77.0, (
+            f'Expected startup_grace_secs=77.0 forwarded to invoke_with_cap_retry; '
+            f'got {call_kwargs.get("startup_grace_secs")!r}. '
+            'workflow._invoke must thread config.timeouts.startup_grace_secs end-to-end.'
+        )
