@@ -22,18 +22,24 @@ class TestTopLevelImports:
             UsageGate,
             classify_agent_failure,
             connect_daemon,
+            count_transcript_turns,
             files_to_modules,
             invoke_claude_agent,
             invoke_with_cap_retry,
+            is_timed_out_with_progress,
             is_zero_output_timeout,
             modules_conflict,
             normalize_lock,
+            read_transcript_records,
         )
 
         assert AgentResult is not None
         assert invoke_claude_agent is not None
         assert invoke_with_cap_retry is not None
         assert is_zero_output_timeout is not None
+        assert is_timed_out_with_progress is not None
+        assert count_transcript_turns is not None
+        assert read_transcript_records is not None
         assert UsageGate is not None
         assert AccountState is not None
         assert SessionBudgetExhausted is not None
@@ -66,9 +72,12 @@ class TestModuleLevelAll:
             'AllAccountsCappedException',
             'build_failure_message',
             'classify_agent_failure',
+            'count_transcript_turns',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
+            'is_timed_out_with_progress',
             'is_zero_output_timeout',
+            'read_transcript_records',
         }
 
     def test_usage_gate_all(self):

@@ -16,9 +16,12 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     build_failure_message,
     classify_agent_failure,
+    count_transcript_turns,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    is_timed_out_with_progress,
     is_zero_output_timeout,
+    read_transcript_records,
 )
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
@@ -43,9 +46,12 @@ __all__ = [
     'AllAccountsCappedException',
     'build_failure_message',
     'classify_agent_failure',
+    'count_transcript_turns',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    'is_timed_out_with_progress',
     'is_zero_output_timeout',
+    'read_transcript_records',
     'AccountConfig',
     'UsageCapConfig',
     'CostStore',
