@@ -426,6 +426,65 @@ class TestSandboxCallerPropagatesTimedOut:
         assert agent.timed_out is True
 
 
+@pytest.mark.asyncio
+class TestSandboxPathForwardsSessionConfig:
+    """_invoke_claude_with_sandbox sandbox path must forward session_id + config_dir to _run_subprocess.
+
+    Step-15 RED: fails until invoke.py line 212 is updated to thread session_id and config_dir.
+    """
+
+    async def test_sandbox_path_passes_session_id_and_config_dir(self, tmp_path):
+        """The sandbox-active branch passes session_id and config_dir to _run_subprocess.
+
+        Patches resolve_active_backend → 'bwrap' and wrap_command → identity so the
+        sandbox branch is taken.  Captures kwargs on the _run_subprocess mock and
+        asserts that session_id and config_dir are forwarded.
+        """
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        captured_kwargs: dict = {}
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            captured_kwargs.update(kwargs)
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        with (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods: cmd,
+            ),
+            patch(
+                'orchestrator.agents.invoke._run_subprocess',
+                side_effect=mock_run_subprocess,
+            ),
+        ):
+            await _invoke_claude_with_sandbox(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+                session_id='sid-xyz',
+                config_dir=cfg_dir,
+            )
+
+        assert captured_kwargs.get('session_id') == 'sid-xyz', (
+            f'Expected session_id="sid-xyz" forwarded to _run_subprocess; got {captured_kwargs!r}'
+        )
+        assert captured_kwargs.get('config_dir') == cfg_dir, (
+            f'Expected config_dir={cfg_dir!r} forwarded to _run_subprocess; got {captured_kwargs!r}'
+        )
+
+
 # ===================================================================
 # TestReleaseProbeSlotOnException (orchestrator invoke_with_cap_retry)
 # ===================================================================
