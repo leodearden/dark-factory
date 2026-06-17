@@ -30,6 +30,7 @@ from shared.cli_invoke import (
     classify_agent_failure,
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    read_transcript_records,
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
@@ -665,6 +666,10 @@ class TaskWorkflow:
         if resume_session_id:
             self._pending_resume_session_id = resume_session_id.get('session_id')
             self._pending_resume_role = resume_session_id.get('role')
+        # Session id stash for zero-output evidence enrichment.  Set in _invoke
+        # right after session_id_val is determined; read by _capture_zero_output_evidence
+        # so it can locate the transcript even when result.session_id is '' (hard SIGKILL).
+        self._last_invoke_session_id: str | None = None
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -3958,7 +3963,35 @@ class TaskWorkflow:
                 'proc_tree': result.proc_tree,
                 'config_dir': config_dir_str,
                 'config_dir_listing': config_dir_listing,
+                'transcript_turns': result.transcript_turns,
             }
+
+            # Enrich with transcript data when we have a session id stash and
+            # a config_dir to search.  Best-effort: any failure leaves the keys absent.
+            if self._config_dir is not None and self._last_invoke_session_id:
+                try:
+                    records = read_transcript_records(
+                        self._config_dir.path,
+                        self.worktree,
+                        self._last_invoke_session_id,
+                    )
+                    if records is not None:
+                        evidence['last_records'] = records[-5:]
+                        # Find the last tool_use block name across all records
+                        last_tool: str | None = None
+                        for rec in records:
+                            content = rec.get('content')
+                            if isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, dict) and block.get('type') == 'tool_use':
+                                        last_tool = block.get('name')
+                        evidence['last_tool'] = last_tool
+                except Exception as exc:
+                    logger.warning(
+                        'Task %s: failed to enrich zero-output evidence with transcript data: %s',
+                        self.task_id, exc,
+                    )
+
             evidence_path = self.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
             evidence_path.write_text(json.dumps(evidence, indent=2))
             logger.info(
@@ -6205,6 +6238,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
         else:
             session_id_val = str(uuid.uuid4())
+
+        # Stash for _capture_zero_output_evidence — result.session_id is '' on
+        # hard SIGKILL, so we capture the effective id here before the invocation.
+        self._last_invoke_session_id = session_id_val
 
         if self.artifacts is not None:
             self.artifacts.write_agent_session(
