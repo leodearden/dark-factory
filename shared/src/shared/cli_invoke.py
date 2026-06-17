@@ -374,6 +374,26 @@ def is_zero_output_timeout(result: AgentResult) -> bool:
     return result.turns == 0 and result.cost_usd == 0.0
 
 
+def is_timed_out_with_progress(result: AgentResult) -> bool:
+    """Return True when *result* is a timed-out run that did real agentic work.
+
+    Specifically: ``timed_out=True`` and ``transcript_turns > 0``.  This is the
+    complement of ``is_zero_output_timeout`` when ``transcript_turns is not
+    None``.
+
+    Mutual-exclusivity invariant: when ``result.timed_out`` is True and
+    ``result.transcript_turns is not None``, exactly one of
+    {``is_zero_output_timeout``, ``is_timed_out_with_progress``} returns True.
+
+    Callers:
+    - ``steward._is_empty_output``: guards against misclassifying a productive
+      SIGTERM-killed run (subtype=error_empty_output) as "no real work done".
+    - ``workflow._capture_zero_output_evidence``: enriches the evidence JSON.
+    - task γ: decides whether to resume a killed productive run.
+    """
+    return result.timed_out and (result.transcript_turns or 0) > 0
+
+
 class AgentFailureKind(enum.StrEnum):
     """Classification of an AgentResult.  SUCCESS is the non-failure case."""
 
