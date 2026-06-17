@@ -48,6 +48,10 @@ _MAX_CAP_COOLDOWN_SECS = 300.0
 # actual sleep per tick is min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling)
 # so grace and ceiling are never overshot by a full poll interval.
 _WATCHDOG_POLL_SECS = 5.0
+# Minimum poll duration — prevents the poll from degenerating to 0.0 when both
+# time_to_grace and time_to_ceiling have already elapsed (would otherwise cause an
+# asyncio.wait(timeout=0) tight-spin hammering count_transcript_turns).
+_WATCHDOG_MIN_POLL_SECS = 0.01
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -1316,17 +1320,39 @@ async def _run_subprocess(
             while True:
                 elapsed = time.monotonic() - watchdog_start
                 # How long until the next mandatory check-point?
+                #
+                # time_to_grace: collapse to inf once the startup-grace kill can
+                # no longer fire — avoids a 0.0-poll tight-spin after grace expires.
+                # The kill is permanently non-actionable when:
+                #   • seen_turn: ≥1 assistant turn seen → working regime, never kills
+                #   • elapsed >= startup_grace_secs: grace already passed; the kill
+                #     check at the bottom of the loop fires on the first read that
+                #     returns live_turns==0, no early wake-up needed
+                #   • not (config_dir and session_id): transcript cannot be read →
+                #     live_turns stays None → startup-kill requires live_turns==0 →
+                #     can never trigger
+                _grace_spent = (
+                    seen_turn
+                    or elapsed >= startup_grace_secs
+                    or not (config_dir and session_id)
+                )
                 time_to_grace = (
-                    max(0.0, startup_grace_secs - elapsed)
-                    if not seen_turn
-                    else float('inf')
+                    float('inf') if _grace_spent
+                    else max(0.0, startup_grace_secs - elapsed)
                 )
                 time_to_ceiling = (
                     max(0.0, timeout_seconds - elapsed)
                     if timeout_seconds is not None
                     else float('inf')
                 )
-                poll = min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling)
+                # Floor at _WATCHDOG_MIN_POLL_SECS so the poll never degenerates
+                # to 0.0 (which would make asyncio.wait return immediately and
+                # tight-spin, hammering count_transcript_turns and starving the
+                # event loop).
+                poll = max(
+                    min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling),
+                    _WATCHDOG_MIN_POLL_SECS,
+                )
 
                 done, _ = await asyncio.wait({comm_task}, timeout=poll)
 
