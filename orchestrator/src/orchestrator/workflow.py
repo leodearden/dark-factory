@@ -3968,11 +3968,16 @@ class TaskWorkflow:
 
             # Enrich with transcript data when we have a session id stash and
             # a config_dir to search.  Best-effort: any failure leaves the keys absent.
+            # NOTE: this calls read_transcript_records a second time on the same file;
+            # _run_subprocess already called count_transcript_turns (which delegates to
+            # read_transcript_records internally) to stamp transcript_turns.  The
+            # double-read is intentional: caching the records would require expanding
+            # the shared _SubprocessResult contract beyond the single transcript_turns
+            # field, and this code path is rare (only reached on timeout/kill).
             if self._config_dir is not None and self._last_invoke_session_id:
                 try:
                     records = read_transcript_records(
                         self._config_dir.path,
-                        self.worktree,
                         self._last_invoke_session_id,
                     )
                     if records is not None:

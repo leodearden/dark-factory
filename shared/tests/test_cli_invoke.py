@@ -2674,7 +2674,7 @@ class TestRunSubprocessCpuPriorityPrefix:
 
 
 class TestCountTranscriptTurns:
-    """Unit tests for count_transcript_turns(config_dir, cwd, session_id).
+    """Unit tests for count_transcript_turns(config_dir, session_id).
 
     The function reads a JSONL transcript file named <session_id>.jsonl under
     <config_dir>/projects/*/ and counts records with type=='assistant'.
@@ -2704,7 +2704,7 @@ class TestCountTranscriptTurns:
         ]
         self._write_transcript(tmp_path, sid, lines)
         result = count_transcript_turns(
-            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+            config_dir=tmp_path, session_id=sid
         )
         assert result == 3
 
@@ -2719,7 +2719,7 @@ class TestCountTranscriptTurns:
         ]
         self._write_transcript(tmp_path, sid, lines)
         result = count_transcript_turns(
-            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+            config_dir=tmp_path, session_id=sid
         )
         assert result == 2
 
@@ -2729,13 +2729,13 @@ class TestCountTranscriptTurns:
         # Create projects dir but no matching file
         (tmp_path / 'projects' / 'myproject').mkdir(parents=True, exist_ok=True)
         result = count_transcript_turns(
-            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+            config_dir=tmp_path, session_id=sid
         )
         assert result is None
 
 
 class TestReadTranscriptRecords:
-    """Unit tests for read_transcript_records(config_dir, cwd, session_id).
+    """Unit tests for read_transcript_records(config_dir, session_id).
 
     The function reads a JSONL transcript file and returns ALL parsed records as
     a list of dicts, preserving order.  Tolerant: unparseable lines are skipped,
@@ -2762,7 +2762,7 @@ class TestReadTranscriptRecords:
         lines = [json.dumps(r) for r in records_in]
         self._write_transcript(tmp_path, sid, lines)
         result = read_transcript_records(
-            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+            config_dir=tmp_path, session_id=sid
         )
         assert isinstance(result, list)
         assert len(result) == 4
@@ -2781,7 +2781,7 @@ class TestReadTranscriptRecords:
         lines.append('{"type": "assistant", "content": "trunc')  # truncated
         self._write_transcript(tmp_path, sid, lines)
         result = read_transcript_records(
-            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+            config_dir=tmp_path, session_id=sid
         )
         assert result == complete
 
@@ -2790,6 +2790,6 @@ class TestReadTranscriptRecords:
         sid = 'sess-absent-xyz'
         (tmp_path / 'projects' / 'proj').mkdir(parents=True, exist_ok=True)
         result = read_transcript_records(
-            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+            config_dir=tmp_path, session_id=sid
         )
         assert result is None

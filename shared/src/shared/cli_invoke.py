@@ -274,7 +274,6 @@ def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
 
 def read_transcript_records(
     config_dir: Path,
-    cwd: Path | None,  # noqa: ARG001 — forward-compat/diagnostics only
     session_id: str,
 ) -> list[dict] | None:
     """Read and return all parsed records from the transcript for *session_id*.
@@ -317,7 +316,6 @@ def read_transcript_records(
 
 def count_transcript_turns(
     config_dir: Path,
-    cwd: Path | None,
     session_id: str,
 ) -> int | None:
     """Count assistant turns in the on-disk JSONL transcript for *session_id*.
@@ -331,7 +329,7 @@ def count_transcript_turns(
     - ``None`` — transcript file could not be located, or the whole read raised
       a catastrophic error.  Never raises; logs at debug/warning on failure.
     """
-    records = read_transcript_records(config_dir, cwd, session_id)
+    records = read_transcript_records(config_dir, session_id)
     if records is None:
         return None
     return sum(1 for r in records if r.get('type') == 'assistant')
@@ -1322,7 +1320,7 @@ async def _run_subprocess(
                 )
             duration_ms = int(time.monotonic() * 1000) - start_ms
             tt = (
-                count_transcript_turns(config_dir, cwd, session_id)
+                count_transcript_turns(config_dir, session_id)
                 if (config_dir and session_id)
                 else None
             )
