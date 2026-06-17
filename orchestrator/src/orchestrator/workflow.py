@@ -3977,10 +3977,18 @@ class TaskWorkflow:
                     )
                     if records is not None:
                         evidence['last_records'] = records[-5:]
-                        # Find the last tool_use block name across all records
+                        # Find the last tool_use block name across all records.
+                        # Real Claude CLI transcript schema: content blocks live at
+                        # rec['message']['content'] (nested), NOT rec['content'].
+                        # The top-level rec.get('content') branch is retained as a
+                        # defensive fallback for synthetic/flattened record shapes.
                         last_tool: str | None = None
                         for rec in records:
-                            content = rec.get('content')
+                            msg = rec.get('message')
+                            if isinstance(msg, dict):
+                                content = msg.get('content')
+                            else:
+                                content = rec.get('content')
                             if isinstance(content, list):
                                 for block in content:
                                     if isinstance(block, dict) and block.get('type') == 'tool_use':
