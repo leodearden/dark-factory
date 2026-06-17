@@ -73,6 +73,13 @@ def _write_transcript(
     - ``n_assistant`` assistant records.  When ``last_tool`` is set, the **last**
       assistant record carries a ``{"type":"tool_use","name":last_tool}`` block in
       its ``message.content`` list; all others carry a plain text block.
+
+    .. warning::
+        This helper is duplicated verbatim in
+        ``shared/tests/test_liveness_boundary_gate.py``.  Both copies MUST stay
+        byte-identical — divergence would silently weaken one half of the
+        cli_invoke ↔ orchestrator seam contract.  Extraction into a shared fixture
+        module was deferred (cross-package conftest complexity; see review comment).
     """
     transcript_dir = config_dir / 'projects' / cwd_slug
     transcript_dir.mkdir(parents=True, exist_ok=True)
