@@ -265,19 +265,20 @@ def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
         return None
 
 
-def count_transcript_turns(
+def read_transcript_records(
     config_dir: Path,
     cwd: Path,  # noqa: ARG001 — forward-compat/diagnostics only
     session_id: str,
-) -> int | None:
-    """Count assistant turns in the on-disk JSONL transcript for *session_id*.
+) -> list[dict] | None:
+    """Read and return all parsed records from the transcript for *session_id*.
 
-    Locates ``<config_dir>/projects/*/<session_id>.jsonl`` via glob and counts
-    records with ``type == "assistant"``.  Parsing is TOLERANT: unparseable
-    lines (e.g. a truncated final line left by SIGKILL) are silently skipped.
+    Locates ``<config_dir>/projects/*/<session_id>.jsonl`` via glob and parses
+    each line as JSON, returning a list of dicts in order.  Parsing is TOLERANT:
+    unparseable lines (e.g. a truncated final line left by SIGKILL) are silently
+    skipped.
 
     Returns:
-    - ``int`` — number of assistant records found (may be 0).
+    - ``list[dict]`` — all successfully-parsed records (may be empty).
     - ``None`` — transcript file could not be located, or the whole read raised
       a catastrophic error.  Never raises; logs at debug/warning on failure.
     """
@@ -285,7 +286,7 @@ def count_transcript_turns(
         path = _resolve_transcript_path(config_dir, session_id)
         if path is None:
             return None
-        count = 0
+        records: list[dict] = []
         with path.open(encoding='utf-8') as fh:
             for line in fh:
                 line = line.strip()
@@ -293,18 +294,40 @@ def count_transcript_turns(
                     continue
                 try:
                     record = json.loads(line)
-                    if isinstance(record, dict) and record.get('type') == 'assistant':
-                        count += 1
+                    if isinstance(record, dict):
+                        records.append(record)
                 except json.JSONDecodeError:
                     logger.debug(
-                        f'count_transcript_turns: skipping unparseable line in {path}'
+                        f'read_transcript_records: skipping unparseable line in {path}'
                     )
-        return count
+        return records
     except Exception:
         logger.warning(
-            f'count_transcript_turns: failed to read transcript for session {session_id}'
+            f'read_transcript_records: failed to read transcript for session {session_id}'
         )
         return None
+
+
+def count_transcript_turns(
+    config_dir: Path,
+    cwd: Path,
+    session_id: str,
+) -> int | None:
+    """Count assistant turns in the on-disk JSONL transcript for *session_id*.
+
+    Delegates to ``read_transcript_records`` and counts records with
+    ``type == "assistant"``.  Inherits the same TOLERANT parsing semantics
+    (truncated lines skipped, None on file-not-found or catastrophic error).
+
+    Returns:
+    - ``int`` — number of assistant records found (may be 0).
+    - ``None`` — transcript file could not be located, or the whole read raised
+      a catastrophic error.  Never raises; logs at debug/warning on failure.
+    """
+    records = read_transcript_records(config_dir, cwd, session_id)
+    if records is None:
+        return None
+    return sum(1 for r in records if r.get('type') == 'assistant')
 
 
 def is_zero_output_timeout(result: AgentResult) -> bool:
