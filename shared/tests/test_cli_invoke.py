@@ -32,6 +32,7 @@ from shared.cli_invoke import (
     invoke_claude_agent,
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    read_transcript_records,
 )
 from shared.testing import make_gate_mock
 
@@ -2490,6 +2491,67 @@ class TestCountTranscriptTurns:
         # Create projects dir but no matching file
         (tmp_path / 'projects' / 'myproject').mkdir(parents=True, exist_ok=True)
         result = count_transcript_turns(
+            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+        )
+        assert result is None
+
+
+class TestReadTranscriptRecords:
+    """Unit tests for read_transcript_records(config_dir, cwd, session_id).
+
+    The function reads a JSONL transcript file and returns ALL parsed records as
+    a list of dicts, preserving order.  Tolerant: unparseable lines are skipped,
+    not None.  None is returned only when the file cannot be located or the
+    whole read raises.
+    """
+
+    def _write_transcript(self, base: Path, session_id: str, lines: list[str]) -> Path:
+        slug_dir = base / 'projects' / 'myproject'
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        transcript = slug_dir / f'{session_id}.jsonl'
+        transcript.write_text('\n'.join(lines) + '\n')
+        return transcript
+
+    def test_returns_all_records_in_order(self, tmp_path):
+        """4 well-formed records (mixed types) → list of 4 dicts in order."""
+        sid = 'sess-read-001'
+        records_in = [
+            {'type': 'system', 'content': 'init'},
+            {'type': 'user', 'content': 'prompt'},
+            {'type': 'assistant', 'content': [{'type': 'tool_use', 'name': 'Bash', 'input': {}}]},
+            {'type': 'tool', 'content': 'result'},
+        ]
+        lines = [json.dumps(r) for r in records_in]
+        self._write_transcript(tmp_path, sid, lines)
+        result = read_transcript_records(
+            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+        )
+        assert isinstance(result, list)
+        assert len(result) == 4
+        # Verify order and content
+        for i, rec in enumerate(records_in):
+            assert result[i] == rec
+
+    def test_truncated_final_line_skipped(self, tmp_path):
+        """Truncated final line skipped; complete records returned."""
+        sid = 'sess-read-002'
+        complete = [
+            {'type': 'user', 'content': 'hi'},
+            {'type': 'assistant', 'content': 'hello'},
+        ]
+        lines = [json.dumps(r) for r in complete]
+        lines.append('{"type": "assistant", "content": "trunc')  # truncated
+        self._write_transcript(tmp_path, sid, lines)
+        result = read_transcript_records(
+            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+        )
+        assert result == complete
+
+    def test_absent_file_returns_none(self, tmp_path):
+        """No matching transcript file → None."""
+        sid = 'sess-absent-xyz'
+        (tmp_path / 'projects' / 'proj').mkdir(parents=True, exist_ok=True)
+        result = read_transcript_records(
             config_dir=tmp_path, cwd=tmp_path, session_id=sid
         )
         assert result is None
