@@ -8,6 +8,7 @@ import enum
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 import uuid
@@ -6190,6 +6191,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         - DF_AGENT_CPU_NICE (CPU nice de-prioritization env) so cli_invoke prepends
           ``nice -n N`` to the Claude CLI spawn, causing agents to yield CPU to
           reify's negatively-niced merge/task verifies.
+        - DF_AGENT_CPU_GOVERN (cgroup placement env) so cli_invoke._cpu_govern_prefix
+          prepends cpu-governed-exec.sh to the Claude CLI argv, placing the agent
+          and its inherited cargo/rustc subtree into a cpu.weight-weighted cgroup
+          scope (DF-1).
+        - scripts/agent-bin prepended to PATH so the agent's ad-hoc ``cargo …``
+          (Bash tool) hits the PSI shim instead of the system cargo (DF-2).
+          PATH propagates to the agent and its cargo children (not popped).
         Other roles (merger, judge, reviewer) receive None.
         """
         if role.name not in ('architect', 'implementer', 'debugger'):
@@ -6201,6 +6209,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 merged['REIFY_DEBUG_PORT'] = str(self._reify_debug_port)
         merged.update(self.config.jobserver.agent_env())
         merged.update(self.config.cpu_priority.agent_env())
+        merged.update(self.config.cpu_governance.agent_env(self.worktree, os.environ.get('PATH', '')))
         return merged or None
 
     async def _invoke(
