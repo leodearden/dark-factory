@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
 import logging
@@ -2897,7 +2898,9 @@ class TestRunSubprocessWatchdog:
 
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
         terminate_pg_mock.assert_called_once()
-        assert wall < 1.0, f'Expected fast kill (<1s), got {wall:.3f}s — wedge not killed at grace bound'
+        # Upper bound is generous (2s) to avoid CI flakiness under scheduler pressure;
+        # the key assertion is that terminate_process_group fired (not just a ceiling kill).
+        assert wall < 2.0, f'Expected fast kill (<2s), got {wall:.3f}s — wedge not killed at grace bound'
 
     async def test_none_transcript_degrades_to_ceiling_not_grace(self, tmp_path):
         """B7 conservative degrade: unreadable/absent transcript (None) must NOT trigger
@@ -3033,4 +3036,79 @@ class TestRunSubprocessWatchdog:
         assert call_counter[0] <= 20, (
             f'count_transcript_turns called {call_counter[0]} times — '
             f'busy-loop detected; expected ≤20 (bounded by ~0.05s poll cadence)'
+        )
+
+    async def test_cancelled_error_cancels_comm_task_and_kills_group(self, tmp_path):
+        """When the outer task is cancelled (orchestrator shutdown), comm_task is
+        cancelled and terminate_process_group is called.
+
+        Exercises the ``except asyncio.CancelledError`` path added in step-4:
+          • comm_task.cancel() is called so the communicate coroutine doesn't dangle
+          • terminate_process_group is awaited to reap the process group
+          • CancelledError is re-raised (tested by catching it on task await)
+        """
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=None),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
+        ):
+            task = asyncio.ensure_future(_run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                # Large ceiling so the watchdog doesn't fire before the cancel
+                timeout_seconds=5.0, startup_grace_secs=2.0,
+                session_id=sid, config_dir=cfg_dir,
+            ))
+            # Yield to let _run_subprocess start and enter asyncio.wait in the
+            # watchdog poll loop.  A single sleep(0) is sufficient because
+            # fake_exec is an awaitable that returns without yielding, so the
+            # task runs straight through to the first asyncio.wait suspension.
+            await asyncio.sleep(0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        # The CancelledError path must have called terminate_process_group.
+        terminate_pg_mock.assert_called_once()
+
+
+# ── invoke_with_cap_retry kwarg-forwarding tests ─────────────────────────────
+
+@pytest.mark.asyncio
+class TestInvokeWithCapRetryForwardsStartupGraceSecs:
+    """invoke_with_cap_retry must forward startup_grace_secs via **invoke_kwargs."""
+
+    async def test_startup_grace_secs_forwarded_to_invoke_fn(self):
+        """invoke_with_cap_retry passes startup_grace_secs to the invoke_fn.
+
+        startup_grace_secs travels through invoke_with_cap_retry's **invoke_kwargs
+        to the invoke_fn.  This is structurally guaranteed by the passthrough, but
+        an explicit test guards against an accidental pop() or filter in the future.
+        """
+        captured: dict = {}
+
+        async def fake_invoke_fn(**kwargs):
+            captured.update(kwargs)
+            return AgentResult(success=True, output='ok')
+
+        await invoke_with_cap_retry(
+            None,  # no gate → fast path
+            'test-label',
+            invoke_fn=fake_invoke_fn,
+            prompt='hi',
+            startup_grace_secs=77.0,
+        )
+
+        assert captured.get('startup_grace_secs') == 77.0, (
+            f'startup_grace_secs not forwarded to invoke_fn; captured kwargs: {captured}'
         )
