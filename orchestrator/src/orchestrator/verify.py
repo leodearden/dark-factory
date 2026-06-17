@@ -1921,6 +1921,7 @@ async def run_verification(
         # unchanged when governance is disabled or the path is non-executable,
         # so a misconfig never makes a verify spawn fail.
         cmd = _maybe_govern_merge_cmd(cmd, config, worktree, role)
+        assert cmd is not None  # _maybe_govern_merge_cmd returns None only when cmd is None; guarded above
         started_at = datetime.now(UTC).isoformat()
         t0 = time.monotonic()
         # Pass use_cgroup_scope only when enabled so the default-off call

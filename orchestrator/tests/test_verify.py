@@ -5594,6 +5594,7 @@ class TestMaybeGovernMergeCmd:
     async def test_merge_role_enabled_exec_wraps_cmd(self, tmp_path):
         """role='merge' + enabled + executable -> cmd wrapped in govern invocation."""
         import shlex
+
         from orchestrator.verify import _maybe_govern_merge_cmd
         config, exec_file = self._make_govern_config(tmp_path)
         cmd = 'cargo test --workspace'
@@ -5620,8 +5621,8 @@ class TestMaybeGovernMergeCmd:
 
     async def test_non_executable_exec_returns_cmd_unchanged(self, tmp_path):
         """enabled + non-executable exec -> cmd unchanged (fail-open)."""
-        from orchestrator.verify import _maybe_govern_merge_cmd
         from orchestrator.config import CpuGovernConfig
+        from orchestrator.verify import _maybe_govern_merge_cmd
         scripts = tmp_path / 'scripts'
         scripts.mkdir()
         exec_file = scripts / 'cpu-governed-exec.sh'
@@ -5646,6 +5647,7 @@ class TestMaybeGovernMergeCmd:
     async def test_shell_operators_in_cmd_survive(self, tmp_path):
         """Commands with shell operators are quoted so they run intact inside the govern scope."""
         import shlex
+
         from orchestrator.verify import _maybe_govern_merge_cmd
         config, exec_file = self._make_govern_config(tmp_path)
         cmd = 'cargo test && cargo clippy --all -- -D warnings'

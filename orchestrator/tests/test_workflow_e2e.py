@@ -279,6 +279,7 @@ class AgentStub:
         timeout_seconds: float | None = None,
         config_dir: Path | None = None,
         env_overrides: dict[str, str] | None = None,
+        startup_grace_secs: float = 120.0,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
