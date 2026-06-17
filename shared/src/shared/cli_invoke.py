@@ -246,6 +246,10 @@ class AgentResult:
     schema_tool_denied: bool = False
     api_error_status: int | None = None
     proc_tree: str = ''
+    transcript_turns: int | None = None
+    """Number of assistant turns found in the on-disk JSONL transcript, or None
+    when the transcript was not read (non-timeout paths) or could not be located.
+    Stamped only on the SIGTERM/SIGKILL timeout path via count_transcript_turns."""
 
 
 def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
@@ -524,6 +528,7 @@ class _SubprocessResult:
     duration_ms: int
     timed_out: bool = False
     proc_tree: str = ''
+    transcript_turns: int | None = None
 
 
 async def invoke_claude_agent(
@@ -1044,7 +1049,8 @@ async def _invoke_claude(
 def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     """Parse Claude Code JSON output into AgentResult.
 
-    timed_out is propagated directly from result.timed_out on every return path.
+    timed_out and transcript_turns are propagated directly from result on every
+    return path.
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -1055,6 +1061,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             timed_out=result.timed_out,
             duration_ms=result.duration_ms,
             proc_tree=result.proc_tree,
+            transcript_turns=result.transcript_turns,
         )
 
     try:
@@ -1067,6 +1074,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             stderr=result.stderr,
             timed_out=result.timed_out,
             proc_tree=result.proc_tree,
+            transcript_turns=result.transcript_turns,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -1144,6 +1152,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         schema_tool_denied=schema_tool_denied,
         api_error_status=api_error_status,
         proc_tree=result.proc_tree,
+        transcript_turns=result.transcript_turns,
     )
 
 
