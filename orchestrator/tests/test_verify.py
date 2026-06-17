@@ -5569,3 +5569,87 @@ class TestMergeGuardModuleConfigs:
         assert result.passed
         assert calls == [], f'No commands should run when guard absent; got: {calls}'
         assert 'No source files' in result.summary
+
+
+@pytest.mark.asyncio
+class TestMaybeGovernMergeCmd:
+    """Unit tests for _maybe_govern_merge_cmd and its integration into merge-verify path."""
+
+    def _make_govern_config(self, tmp_path, enabled=True, create_exec=True):
+        """Build an OrchestratorConfig with cpu_governance wired to a tmp executable."""
+        from orchestrator.config import CpuGovernConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir(exist_ok=True)
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        if create_exec:
+            exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+            exec_file.chmod(0o755)
+        config = OrchestratorConfig()
+        config.cpu_governance = CpuGovernConfig(
+            enabled=enabled,
+            exec_path='scripts/cpu-governed-exec.sh',
+        )
+        return config, exec_file
+
+    async def test_merge_role_enabled_exec_wraps_cmd(self, tmp_path):
+        """role='merge' + enabled + executable -> cmd wrapped in govern invocation."""
+        import shlex
+        from orchestrator.verify import _maybe_govern_merge_cmd
+        config, exec_file = self._make_govern_config(tmp_path)
+        cmd = 'cargo test --workspace'
+        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
+        abs_exec = str(exec_file.resolve())
+        expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
+        assert result == expected
+
+    async def test_task_role_returns_cmd_unchanged(self, tmp_path):
+        """role='task' -> cmd unchanged (only merge-verify uses governance)."""
+        from orchestrator.verify import _maybe_govern_merge_cmd
+        config, _ = self._make_govern_config(tmp_path)
+        cmd = 'cargo test --workspace'
+        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='task')
+        assert result == cmd
+
+    async def test_disabled_governance_returns_cmd_unchanged(self, tmp_path):
+        """cpu_governance disabled -> cmd unchanged (fail-open)."""
+        from orchestrator.verify import _maybe_govern_merge_cmd
+        config, _ = self._make_govern_config(tmp_path, enabled=False)
+        cmd = 'cargo test --workspace'
+        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
+        assert result == cmd
+
+    async def test_non_executable_exec_returns_cmd_unchanged(self, tmp_path):
+        """enabled + non-executable exec -> cmd unchanged (fail-open)."""
+        from orchestrator.verify import _maybe_govern_merge_cmd
+        from orchestrator.config import CpuGovernConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\n')
+        exec_file.chmod(0o644)  # not executable
+        config = OrchestratorConfig()
+        config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+        )
+        cmd = 'cargo test --workspace'
+        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
+        assert result == cmd
+
+    async def test_none_cmd_returned_unchanged(self, tmp_path):
+        """cmd=None is returned as None (skip-guard)."""
+        from orchestrator.verify import _maybe_govern_merge_cmd
+        config, _ = self._make_govern_config(tmp_path)
+        result = _maybe_govern_merge_cmd(None, config, tmp_path, role='merge')
+        assert result is None
+
+    async def test_shell_operators_in_cmd_survive(self, tmp_path):
+        """Commands with shell operators are quoted so they run intact inside the govern scope."""
+        import shlex
+        from orchestrator.verify import _maybe_govern_merge_cmd
+        config, exec_file = self._make_govern_config(tmp_path)
+        cmd = 'cargo test && cargo clippy --all -- -D warnings'
+        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
+        abs_exec = str(exec_file.resolve())
+        expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
+        assert result == expected
