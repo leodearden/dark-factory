@@ -28,6 +28,7 @@ from shared.cli_invoke import (
     _to_token_count,
     build_failure_message,
     classify_agent_failure,
+    count_transcript_turns,
     invoke_claude_agent,
     invoke_with_cap_retry,
     is_zero_output_timeout,
@@ -2428,3 +2429,67 @@ class TestRunSubprocessCpuPriorityPrefix:
             )
 
         assert captured_args == ['claude', '--x'], f'Expected bare argv; got {captured_args}'
+
+
+# ── Transcript readers ────────────────────────────────────────────────────────
+
+
+class TestCountTranscriptTurns:
+    """Unit tests for count_transcript_turns(config_dir, cwd, session_id).
+
+    The function reads a JSONL transcript file named <session_id>.jsonl under
+    <config_dir>/projects/*/ and counts records with type=='assistant'.
+    It is tolerant: truncated/unparseable lines are skipped (not None).
+    None is returned only when the file cannot be located or the whole read
+    raises catastrophically.
+    """
+
+    def _write_transcript(self, base: Path, session_id: str, lines: list[str]) -> Path:
+        """Write a JSONL transcript under base/projects/<slug>/<session_id>.jsonl."""
+        slug_dir = base / 'projects' / 'myproject'
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        transcript = slug_dir / f'{session_id}.jsonl'
+        transcript.write_text('\n'.join(lines) + '\n')
+        return transcript
+
+    def test_counts_assistant_records(self, tmp_path):
+        """3 assistant records interleaved with user/system → returns 3."""
+        sid = 'session-abc-001'
+        lines = [
+            json.dumps({'type': 'system', 'content': 'hello'}),
+            json.dumps({'type': 'assistant', 'content': 'turn 1'}),
+            json.dumps({'type': 'user', 'content': 'prompt 2'}),
+            json.dumps({'type': 'assistant', 'content': 'turn 2'}),
+            json.dumps({'type': 'user', 'content': 'prompt 3'}),
+            json.dumps({'type': 'assistant', 'content': 'turn 3'}),
+        ]
+        self._write_transcript(tmp_path, sid, lines)
+        result = count_transcript_turns(
+            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+        )
+        assert result == 3
+
+    def test_truncated_final_line_skipped_tolerantly(self, tmp_path):
+        """2 complete assistant records + truncated final line → returns 2 (not None)."""
+        sid = 'session-abc-002'
+        lines = [
+            json.dumps({'type': 'assistant', 'content': 'turn 1'}),
+            json.dumps({'type': 'user', 'content': 'prompt'}),
+            json.dumps({'type': 'assistant', 'content': 'turn 2'}),
+            '{"type": "assistant", "content": "trunc',  # truncated / unparseable
+        ]
+        self._write_transcript(tmp_path, sid, lines)
+        result = count_transcript_turns(
+            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+        )
+        assert result == 2
+
+    def test_absent_session_returns_none(self, tmp_path):
+        """No matching transcript file for the session id → None."""
+        sid = 'session-does-not-exist'
+        # Create projects dir but no matching file
+        (tmp_path / 'projects' / 'myproject').mkdir(parents=True, exist_ok=True)
+        result = count_transcript_turns(
+            config_dir=tmp_path, cwd=tmp_path, session_id=sid
+        )
+        assert result is None
