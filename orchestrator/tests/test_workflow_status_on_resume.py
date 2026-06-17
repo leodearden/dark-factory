@@ -509,6 +509,7 @@ class TestStartupGraceSecsReachesWatchdog:
             await workflow._invoke(IMPLEMENTER, 'PROMPT', cwd)
 
         assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
+        assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'
         call_kwargs = mock_cap_retry.await_args.kwargs
         assert call_kwargs.get('startup_grace_secs') == 77.0, (
             f'Expected startup_grace_secs=77.0 forwarded to invoke_with_cap_retry; '
