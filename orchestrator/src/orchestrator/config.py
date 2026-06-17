@@ -558,6 +558,133 @@ class CpuPriorityConfig(BaseModel):
         return {'DF_AGENT_CPU_NICE': str(self.nice)}
 
 
+class CpuGovernConfig(BaseModel):
+    """CPU cgroup governance for agent inner-loop subprocesses.
+
+    When enabled, resolves ``exec_path`` and ``shim_dir`` against the task
+    worktree and injects:
+
+    * ``DF_AGENT_CPU_GOVERN`` — absolute path to reify's ``cpu-governed-exec.sh``,
+      consumed by ``cli_invoke._cpu_govern_prefix`` (DF-1), which pops the key
+      (keeping the child env clean) and prepends
+      ``[<exec>, '--role', 'task', '--']`` to the Claude CLI argv so the agent
+      and all cargo/rustc children run inside a ``cpu.weight``-weighted cgroup
+      scope.
+
+    * ``PATH`` prepend — ``scripts/agent-bin`` put first so the agent's ad-hoc
+      ``cargo …`` (Bash tool) hits the PSI shim instead of the system cargo
+      (DF-2).  Unlike ``DF_AGENT_CPU_GOVERN``, PATH is **not** popped — it must
+      propagate to the agent and its cargo children.
+
+    **Must default to ``enabled=False``** (fail-open) — unlike default-on
+    ``CpuPriorityConfig`` — because governance needs reify-provided paths
+    (``cpu-governed-exec.sh``, ``scripts/agent-bin``) that dark-factory cannot
+    assume exist at any fixed location.  Reify opts in via its own
+    ``orchestrator.yaml`` (sibling task δ, **not** a dependency of ζ), exactly
+    like ``JobserverConfig``.
+
+    ``OrchestratorConfig`` uses ``extra='ignore'``, so a ``cpu_governance:``
+    block in ``orchestrator.yaml`` would be silently dropped unless this field
+    exists.  ``default_factory`` keeps the default instance inert (no
+    ``defaults.yaml`` edit required, no reify-file edits — clean
+    reciprocal-ownership seam).
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description='Enable CPU cgroup governance for agent subprocesses.',
+    )
+    exec_path: str = Field(
+        default='',
+        description=(
+            'Worktree-relative (or absolute) path to reify\'s '
+            'cpu-governed-exec.sh.  Resolved against the task worktree; '
+            'must be executable, else governance is skipped (fail-open).'
+        ),
+    )
+    shim_dir: str = Field(
+        default='',
+        description=(
+            'Worktree-relative (or absolute) path to reify\'s '
+            'scripts/agent-bin directory.  Prepended to PATH when resolved.'
+        ),
+    )
+
+    @staticmethod
+    def _resolve(p: str, worktree: 'Path | None') -> 'Path | None':
+        """Resolve *p* to an absolute Path, or None if it cannot be resolved.
+
+        * empty string → None
+        * absolute → as-is (ignore worktree)
+        * relative + worktree None → None (cannot resolve)
+        * relative + worktree → worktree / p
+        """
+        if not p:
+            return None
+        path = Path(p)
+        if path.is_absolute():
+            return path
+        if worktree is None:
+            return None
+        return worktree / p
+
+    def resolved_exec_path(self, worktree: 'Path | None') -> 'str | None':
+        """Return the resolved, executable exec_path as a string, or None.
+
+        Returns ``None`` when disabled, path is missing, or path is not
+        executable — so a bad/missing path always fails open (never breaks a
+        spawn).
+        """
+        if not self.enabled:
+            return None
+        path = self._resolve(self.exec_path, worktree)
+        if path is None:
+            return None
+        if not os.access(path, os.X_OK):
+            return None
+        return str(path)
+
+    def resolved_shim_dir(self, worktree: 'Path | None') -> 'str | None':
+        """Return the resolved shim_dir as a string if it is a directory, else None."""
+        if not self.enabled:
+            return None
+        path = self._resolve(self.shim_dir, worktree)
+        if path is None:
+            return None
+        if not path.is_dir():
+            return None
+        return str(path)
+
+    def agent_env(self, worktree: 'Path | None', base_path: str) -> 'dict[str, str]':
+        """Return governance env dict when enabled and paths resolve, else {}.
+
+        Mirrors ``JobserverConfig.agent_env``'s FS-checking pattern.
+
+        Returns:
+            ``{}`` when disabled or when ``exec_path`` does not resolve to an
+            executable.  When resolved:
+
+            * ``DF_AGENT_CPU_GOVERN`` is always included (consumed and popped
+              by ``cli_invoke._cpu_govern_prefix``).
+            * ``PATH`` is included when ``shim_dir`` resolves to a directory,
+              prepending it to *base_path* (pass ``os.environ.get('PATH', '')``
+              from the call site so the agent inherits the full system PATH
+              with only the shim prepended).
+        """
+        if not self.enabled:
+            return {}
+        exec_abs = self.resolved_exec_path(worktree)
+        if exec_abs is None:
+            return {}
+        result: dict[str, str] = {'DF_AGENT_CPU_GOVERN': exec_abs}
+        shim_abs = self.resolved_shim_dir(worktree)
+        if shim_abs is not None:
+            result['PATH'] = (
+                f'{shim_abs}{os.pathsep}{base_path}' if base_path else shim_abs
+            )
+        return result
+
+
 class GitConfig(BaseModel):
     """Git operations configuration."""
 
@@ -1505,6 +1632,13 @@ class OrchestratorConfig(BaseSettings):
     # An absent stanza in orchestrator.yaml yields the enabled-by-default instance;
     # no extra orchestrator.yaml edit is required — the reify restart alone activates it.
     cpu_priority: CpuPriorityConfig = Field(default_factory=CpuPriorityConfig)
+
+    # CPU cgroup governance for agent inner-loop subprocesses (DF_AGENT_CPU_GOVERN +
+    # scripts/agent-bin PATH prepend).  An absent stanza yields the disabled default
+    # (fail-open — governance needs reify-provided paths that dark-factory cannot
+    # assume exist).  Reify opts in via its own orchestrator.yaml (task δ, NOT a
+    # dependency of ζ), exactly like jobserver.
+    cpu_governance: CpuGovernConfig = Field(default_factory=CpuGovernConfig)
 
     # Lever C: remote verify runner pool configuration.
     # Adding this field makes a verify_runners: block in orchestrator.yaml live;
