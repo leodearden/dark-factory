@@ -30,7 +30,6 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
-
 # ---------------------------------------------------------------------------
 # Shared harness (mirrors test_workflow_zero_output_hang.py)
 # ---------------------------------------------------------------------------
