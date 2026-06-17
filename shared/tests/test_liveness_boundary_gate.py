@@ -26,14 +26,11 @@ import pytest
 
 from shared.cli_invoke import (
     AgentResult,
-    _reset_for_fresh_retry,
     count_transcript_turns,
     invoke_with_cap_retry,
     is_timed_out_with_progress,
     is_zero_output_timeout,
-    read_transcript_records,
 )
-
 
 # ---------------------------------------------------------------------------
 # Module-level helpers

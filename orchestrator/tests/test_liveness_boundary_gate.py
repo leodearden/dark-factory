@@ -31,12 +31,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
-
-from orchestrator.agents.invoke import AgentResult
-from orchestrator.agents.roles import IMPLEMENTER
-from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig
-from orchestrator.workflow import ZERO_OUTPUT_HANG_REASON, TaskWorkflow, WorkflowOutcome
 from shared.cli_invoke import (
     _run_subprocess,
     count_transcript_turns,
@@ -45,6 +39,11 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 
+from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import IMPLEMENTER
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import OrchestratorConfig
+from orchestrator.workflow import ZERO_OUTPUT_HANG_REASON, TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Transcript helper (matches shared/tests/test_liveness_boundary_gate.py)
@@ -466,6 +465,7 @@ class TestB3ResumeAcrossWall:
         # The sidecar is written before the subprocess starts and cleared in the finally block,
         # so read_agent_session() after _invoke returns always returns None.
         sidecar_calls: list[dict] = []
+        assert wf.artifacts is not None
         original_write = wf.artifacts.write_agent_session
 
         def spy_write(session_id: str, role: str, started_at: str) -> None:
