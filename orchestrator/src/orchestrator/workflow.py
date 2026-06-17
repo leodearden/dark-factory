@@ -3835,6 +3835,11 @@ class TaskWorkflow:
                 # of being discarded.  The existing _invoke resume lifecycle
                 # (workflow.py:6240-6253) picks these up because
                 # _pending_resume_role == role.name == 'implementer'.
+                #
+                # Progress is proof-of-life: reset the consecutive zero-output counter
+                # so this iteration does not count toward the wedge circuit breaker.
+                # (Preserves the reset the old `else` branch provided before γ.)
+                consecutive_zero_output = 0
                 self._pending_resume_session_id = self._last_invoke_session_id
                 self._pending_resume_role = IMPLEMENTER.name
                 logger.info(
