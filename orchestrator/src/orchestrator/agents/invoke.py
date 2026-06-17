@@ -209,7 +209,12 @@ async def _invoke_claude_with_sandbox(
                 env['CLAUDE_CONFIG_DIR'] = str(config_dir)
 
             try:
-                result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
+                result = await _run_subprocess(
+                    cmd, cwd, env, model, timeout_seconds,
+                    stdin_data=stdin_data,
+                    session_id=(resume_session_id or session_id),
+                    config_dir=config_dir,
+                )
                 return _parse_claude_output(result)
             finally:
                 for path in temp_files:
