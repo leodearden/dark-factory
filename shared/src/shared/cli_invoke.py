@@ -248,6 +248,65 @@ class AgentResult:
     proc_tree: str = ''
 
 
+def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
+    """Locate the transcript file for *session_id* under *config_dir*.
+
+    Globs ``<config_dir>/projects/*/<session_id>.jsonl`` and returns the first
+    match, or None if nothing is found or an error occurs.  Uses session_id
+    (a unique UUID) as the glob anchor — version-robust per PRD decision #2.
+    """
+    try:
+        matches = list(config_dir.glob(f'projects/*/{session_id}.jsonl'))
+        return matches[0] if matches else None
+    except Exception:
+        logger.debug(
+            f'_resolve_transcript_path: failed to glob for session {session_id} under {config_dir}'
+        )
+        return None
+
+
+def count_transcript_turns(
+    config_dir: Path,
+    cwd: Path,  # noqa: ARG001 — forward-compat/diagnostics only
+    session_id: str,
+) -> int | None:
+    """Count assistant turns in the on-disk JSONL transcript for *session_id*.
+
+    Locates ``<config_dir>/projects/*/<session_id>.jsonl`` via glob and counts
+    records with ``type == "assistant"``.  Parsing is TOLERANT: unparseable
+    lines (e.g. a truncated final line left by SIGKILL) are silently skipped.
+
+    Returns:
+    - ``int`` — number of assistant records found (may be 0).
+    - ``None`` — transcript file could not be located, or the whole read raised
+      a catastrophic error.  Never raises; logs at debug/warning on failure.
+    """
+    try:
+        path = _resolve_transcript_path(config_dir, session_id)
+        if path is None:
+            return None
+        count = 0
+        with path.open(encoding='utf-8') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    if isinstance(record, dict) and record.get('type') == 'assistant':
+                        count += 1
+                except json.JSONDecodeError:
+                    logger.debug(
+                        f'count_transcript_turns: skipping unparseable line in {path}'
+                    )
+        return count
+    except Exception:
+        logger.warning(
+            f'count_transcript_turns: failed to read transcript for session {session_id}'
+        )
+        return None
+
+
 def is_zero_output_timeout(result: AgentResult) -> bool:
     """Return True when *result* is a fresh-invocation zero-output CLI wedge.
 
