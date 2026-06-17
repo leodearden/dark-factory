@@ -312,3 +312,103 @@ class TestProgressResetsZeroOutputCounter:
             f'Expected 4 _invoke calls (counter resets after progress), '
             f'got {mock_invoke.call_count}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Amendment: test that _invoke actually consumes the pending-resume fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInvokeResumesConsumesFields:
+    """_invoke consumes _pending_resume_session_id/_pending_resume_role on match.
+
+    The γ comment states: '_invoke resume lifecycle picks these up because
+    _pending_resume_role == role.name == implementer'.  These tests call _invoke
+    directly (not through _execute_iterations), patching only the subprocess
+    layer (invoke_with_cap_retry) so the real resume-selection block
+    (workflow.py:6262-6273) runs.
+
+    A refactor that broke the role-name match or the field-clear would be
+    caught here; the existing _execute_iterations tests cannot catch it because
+    they mock _invoke entirely.
+    """
+
+    async def test_invoke_resume_lifecycle_consumes_pending_fields(self, tmp_path: Path):
+        """_invoke passes resume_session_id='killed-sid' to invoke_with_cap_retry
+        and clears both pending fields afterwards.
+
+        Pre-sets _pending_resume_session_id='killed-sid' / _pending_resume_role='implementer'
+        exactly as γ's elif branch does after a wall-killed progress-timeout, then calls
+        _invoke(IMPLEMENTER, ...) with only the subprocess layer patched.
+
+        Assertions:
+        - invoke_with_cap_retry receives resume_session_id='killed-sid'
+        - _pending_resume_session_id is None after the call
+        - _pending_resume_role is None after the call
+        """
+        from unittest.mock import patch
+
+        from orchestrator.agents.roles import IMPLEMENTER
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        # Exactly what γ's elif branch sets after a progress-timeout
+        wf._pending_resume_session_id = 'killed-sid'  # type: ignore[attr-defined]
+        wf._pending_resume_role = 'implementer'  # type: ignore[attr-defined]
+
+        resume_result = AgentResult(
+            success=True, output='resumed ok', timed_out=False, turns=2, cost_usd=0.0,
+        )
+
+        with patch('orchestrator.workflow.invoke_with_cap_retry', new_callable=AsyncMock) as mock_iwcr:
+            mock_iwcr.return_value = resume_result
+            # Stub _build_agent_env to avoid traversing config.env_overrides/jobserver
+            # (both are MagicMock under the spec_set config, but dict.update semantics
+            # on non-dict mocks are undefined — bypass to keep the test focused).
+            with patch.object(wf, '_build_agent_env', return_value=None):
+                await wf._invoke(IMPLEMENTER, 'test-prompt', tmp_path)
+
+        # The resume-selection block must have passed the stashed session id
+        call_kwargs = mock_iwcr.call_args.kwargs
+        assert call_kwargs.get('resume_session_id') == 'killed-sid', (
+            f"Expected resume_session_id='killed-sid' in invoke_with_cap_retry call, "
+            f"got {call_kwargs.get('resume_session_id')!r}"
+        )
+
+        # Pending fields must be cleared so the next _invoke starts a fresh session
+        assert wf._pending_resume_session_id is None, (
+            f'Expected _pending_resume_session_id=None after _invoke, '
+            f'got {wf._pending_resume_session_id!r}'
+        )
+        assert wf._pending_resume_role is None, (
+            f'Expected _pending_resume_role=None after _invoke, '
+            f'got {wf._pending_resume_role!r}'
+        )
+
+    async def test_invoke_without_pending_fields_does_not_resume(self, tmp_path: Path):
+        """When no pending-resume fields are set, _invoke passes resume_session_id=None.
+
+        Guard: verifies the resume-selection block's 'else' path allocates a fresh
+        UUID session without passing resume_session_id.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.agents.roles import IMPLEMENTER
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        # No pending fields set — the 'else' path in the resume-selection block fires
+
+        resume_result = AgentResult(
+            success=True, output='fresh start', timed_out=False, turns=1, cost_usd=0.0,
+        )
+
+        with patch('orchestrator.workflow.invoke_with_cap_retry', new_callable=AsyncMock) as mock_iwcr:
+            mock_iwcr.return_value = resume_result
+            with patch.object(wf, '_build_agent_env', return_value=None):
+                await wf._invoke(IMPLEMENTER, 'test-prompt', tmp_path)
+
+        call_kwargs = mock_iwcr.call_args.kwargs
+        assert call_kwargs.get('resume_session_id') is None, (
+            f'Expected resume_session_id=None (fresh session), '
+            f'got {call_kwargs.get("resume_session_id")!r}'
+        )

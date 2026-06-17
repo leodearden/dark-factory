@@ -3662,6 +3662,12 @@ class TaskWorkflow:
         # resets it.  Threshold: config.max_consecutive_zero_output_timeouts.
         consecutive_zero_output = 0
         self._zero_output_hang_info = None
+        # Counts CONSECUTIVE progress-timeouts (is_timed_out_with_progress);
+        # reset by any successful (non-timeout) result.  No separate cap —
+        # max_execute_iterations is the only bound (PRD §9 Q4 design decision).
+        # Surfaced in logs at the iteration cap so exhausted-via-resume tasks
+        # are diagnosable without a new instance variable or escalation path.
+        consecutive_progress_timeouts = 0
         self._preserve_config_dir = False
         while self.artifacts.get_pending_steps():
             if self.metrics.execute_iterations >= self.config.max_execute_iterations:
@@ -3682,6 +3688,20 @@ class TaskWorkflow:
                             f'evidence: .task/zero_output_evidence-iter*.json'
                         ),
                     }
+                elif consecutive_progress_timeouts > 0:
+                    # Diagnosable signal: the task exhausted its iteration budget
+                    # while resuming a progress-killed session.  The only cap on
+                    # progress-resume loops is max_execute_iterations (PRD §9 Q4).
+                    # Log so ops can distinguish 'stuck-resuming-slow-session'
+                    # from a genuine task complexity exhaustion.
+                    logger.warning(
+                        'Task %s: exhausted max_execute_iterations with '
+                        'consecutive_progress_timeouts=%s — session may be slow '
+                        'or looping; each resume consumed one iteration. '
+                        'Bound: max_execute_iterations=%s (PRD §9 Q4).',
+                        self.task_id, consecutive_progress_timeouts,
+                        self.config.max_execute_iterations,
+                    )
                 return WorkflowOutcome.BLOCKED
 
             # Inter-iteration rebase: keep the task branch close to main
@@ -3840,6 +3860,7 @@ class TaskWorkflow:
                 # so this iteration does not count toward the wedge circuit breaker.
                 # (Preserves the reset the old `else` branch provided before γ.)
                 consecutive_zero_output = 0
+                consecutive_progress_timeouts += 1
                 self._pending_resume_session_id = self._last_invoke_session_id
                 self._pending_resume_role = IMPLEMENTER.name
                 logger.info(
@@ -3850,8 +3871,9 @@ class TaskWorkflow:
                 )
                 continue  # re-dispatch with --resume; skip judge this iteration
             else:
-                # Non-zero-output result: reset the consecutive counter.
+                # Non-timeout result: reset both consecutive counters.
                 consecutive_zero_output = 0
+                consecutive_progress_timeouts = 0
 
             # --- Judge: decide whether to exit early (ζ) ---
             # Opt-in via config.judge_after_each_iteration (default False).
