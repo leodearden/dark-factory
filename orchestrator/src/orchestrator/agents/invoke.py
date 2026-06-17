@@ -70,6 +70,7 @@ async def invoke_agent(
     timeout_seconds: float | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
+    startup_grace_secs: float = 120.0,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
@@ -95,6 +96,7 @@ async def invoke_agent(
             timeout_seconds=timeout_seconds,
             config_dir=config_dir,
             env_overrides=env_overrides,
+            startup_grace_secs=startup_grace_secs,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -138,6 +140,7 @@ async def _invoke_claude_with_sandbox(
     timeout_seconds: float | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
+    startup_grace_secs: float = 120.0,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
@@ -214,6 +217,7 @@ async def _invoke_claude_with_sandbox(
                     stdin_data=stdin_data,
                     session_id=(resume_session_id or session_id),
                     config_dir=config_dir,
+                    startup_grace_secs=startup_grace_secs,
                 )
                 return _parse_claude_output(result)
             finally:
@@ -231,6 +235,7 @@ async def _invoke_claude_with_sandbox(
         session_id=session_id,
         timeout_seconds=timeout_seconds, config_dir=config_dir,
         env_overrides=env_overrides,
+        startup_grace_secs=startup_grace_secs,
     )
 
 
