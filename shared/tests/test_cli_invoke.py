@@ -2793,3 +2793,79 @@ class TestReadTranscriptRecords:
             config_dir=tmp_path, session_id=sid
         )
         assert result is None
+
+
+# ── Two-regime liveness watchdog tests ──────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestRunSubprocessWatchdog:
+    """Two-regime liveness watchdog tests for _run_subprocess.
+
+    These tests verify that the new watchdog param ``startup_grace_secs``
+    enables a fast pre-turn-1 kill when a zero-turn startup wedge is detected,
+    distinct from the per-role post-turn-1 ceiling.
+
+    The key fake communicate pattern used throughout:
+      - First call: hangs via ``asyncio.Event().wait()`` until cancelled by the
+        watchdog kill path (raises CancelledError on cancellation).
+      - Second call (post-SIGTERM): raises TimeoutError immediately to trigger
+        the SIGKILL branch so ``terminate_process_group`` is called.
+    """
+
+    @staticmethod
+    def _make_hanging_proc():
+        """Return (proc, call_count_ref) where communicate hangs on call 1, raises TimeoutError on call 2."""
+        call_count = [0]
+
+        async def communicate_side_effect(input=None):  # noqa: A002
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Hang until the watchdog cancels comm_task — CancelledError is raised here.
+                await asyncio.Event().wait()
+            # Second call (inside SIGTERM grace window): raise immediately → SIGKILL path.
+            raise TimeoutError
+
+        proc = MagicMock()
+        proc.communicate = communicate_side_effect
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = None
+        proc.pid = 12345
+        return proc, call_count
+
+    async def test_startup_wedge_killed_at_grace_not_ceiling(self, tmp_path):
+        """Startup wedge (0 turns) is killed at startup_grace_secs, not the 5s ceiling.
+
+        With startup_grace_secs=0.05 and timeout_seconds=5.0, the watchdog
+        should detect 0 turns after ~0.05s and kill fast.  Wall-clock must be
+        well under the 5s ceiling, proving the kill happened at the grace bound.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=0),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=5.0, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
+        terminate_pg_mock.assert_called_once()
+        assert wall < 1.0, f'Expected fast kill (<1s), got {wall:.3f}s — wedge not killed at grace bound'
