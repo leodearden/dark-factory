@@ -2869,3 +2869,89 @@ class TestRunSubprocessWatchdog:
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
         terminate_pg_mock.assert_called_once()
         assert wall < 1.0, f'Expected fast kill (<1s), got {wall:.3f}s — wedge not killed at grace bound'
+
+    async def test_none_transcript_degrades_to_ceiling_not_grace(self, tmp_path):
+        """B7 conservative degrade: unreadable/absent transcript (None) must NOT trigger
+        the startup-grace fast kill.
+
+        When count_transcript_turns returns None, the watchdog cannot prove a wedge.
+        The run must survive past startup_grace_secs and be killed only at the ceiling
+        (timeout_seconds).  Wall-clock must be >= ~0.25s (past the 0.05s grace).
+
+        This is the step-5 RED case: the step-4 first-cut guard `not seen_turn` is
+        too broad — it also early-kills on None (unreadable transcript), which is
+        wrong.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=None),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.3, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is True
+        assert result.transcript_turns is None
+        # Must NOT have been killed at the 0.05s grace bound — must reach the 0.3s ceiling.
+        assert wall >= 0.2, (
+            f'Expected kill at ceiling (~0.3s), but killed early at {wall:.3f}s '
+            f'— None transcript should degrade to ceiling, not trigger fast kill'
+        )
+
+    async def test_working_regime_survives_grace_killed_at_ceiling(self, tmp_path):
+        """B6 long-synchronous-tool survival: ≥1 turn seen → no fast kill at grace, only ceiling.
+
+        A proc that has made progress (count_transcript_turns=5) must NOT be killed
+        at the startup_grace_secs bound.  Liveness is proven (seen_turn=True); the
+        working regime applies and only the absolute ceiling triggers the kill.
+        Wall-clock must be >= ~0.25s (past the 0.05s grace) and result.transcript_turns==5.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=5),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.3, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is True
+        assert result.transcript_turns == 5
+        # Must NOT have been killed at the 0.05s grace bound — must reach the 0.3s ceiling.
+        assert wall >= 0.2, (
+            f'Expected kill at ceiling (~0.3s), but killed early at {wall:.3f}s '
+            f'— seen_turn=True (5 turns) should prevent startup-grace fast kill'
+        )
