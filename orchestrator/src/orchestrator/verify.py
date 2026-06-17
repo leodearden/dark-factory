@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import time
 import uuid
@@ -1744,6 +1745,45 @@ def _resolve_verify_env(
     return merged
 
 
+def _maybe_govern_merge_cmd(
+    cmd: 'str | None',
+    config: OrchestratorConfig,
+    worktree: 'Path | None',
+    role: str,
+) -> 'str | None':
+    """Wrap *cmd* in a cpu-governed-exec.sh invocation when role=='merge' and governance is enabled.
+
+    Returns *cmd* unchanged when:
+
+    * *cmd* is ``None`` (skip-guard — caller's ``if cmd is None: return`` fires first)
+    * *role* is not ``'merge'`` (only merge-verify uses the merge-weighted cgroup scope)
+    * ``config.cpu_governance`` is disabled (default; fail-open)
+    * ``config.cpu_governance.resolved_exec_path(worktree)`` returns ``None``
+      (non-executable, missing, or worktree=None; fail-open)
+
+    Otherwise wraps as::
+
+        <shlex.quote(exec_abs)> --role merge -- /bin/bash -c <shlex.quote(cmd)>
+
+    so that shell operators (``&&``, ``|``, leading env assignments) in *cmd*
+    survive intact inside the merge-weighted cgroup scope.  The inner
+    ``/bin/bash -c <quoted>`` makes the whole original command a single argv
+    payload for ``cpu-governed-exec.sh``.
+
+    Does NOT alter ``_run_cmd``'s signature, the ``use_cgroup_scope`` path, or
+    any merge PSI/semaphore bypass.
+    """
+    if cmd is None or role != 'merge':
+        return cmd
+    gov = getattr(config, 'cpu_governance', None)
+    if gov is None or not gov.enabled:
+        return cmd
+    exec_abs = gov.resolved_exec_path(worktree)
+    if not exec_abs:
+        return cmd
+    return f'{shlex.quote(exec_abs)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
+
+
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -1876,6 +1916,11 @@ async def run_verification(
         """
         if cmd is None:
             return 0, '', False, None, 0.0
+        # Wrap the command in cpu-governed-exec.sh when role=='merge' and
+        # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
+        # unchanged when governance is disabled or the path is non-executable,
+        # so a misconfig never makes a verify spawn fail.
+        cmd = _maybe_govern_merge_cmd(cmd, config, worktree, role)
         started_at = datetime.now(UTC).isoformat()
         t0 = time.monotonic()
         # Pass use_cgroup_scope only when enabled so the default-off call
