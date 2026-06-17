@@ -274,7 +274,7 @@ def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
 
 def read_transcript_records(
     config_dir: Path,
-    cwd: Path,  # noqa: ARG001 — forward-compat/diagnostics only
+    cwd: Path | None,  # noqa: ARG001 — forward-compat/diagnostics only
     session_id: str,
 ) -> list[dict] | None:
     """Read and return all parsed records from the transcript for *session_id*.
@@ -317,7 +317,7 @@ def read_transcript_records(
 
 def count_transcript_turns(
     config_dir: Path,
-    cwd: Path,
+    cwd: Path | None,
     session_id: str,
 ) -> int | None:
     """Count assistant turns in the on-disk JSONL transcript for *session_id*.

@@ -189,7 +189,11 @@ class TestTranscriptClassifierPublicSurface:
 
     def test_symbols_importable_from_cli_invoke(self):
         """Each symbol must be directly importable from shared.cli_invoke."""
-        from shared.cli_invoke import count_transcript_turns, read_transcript_records, is_timed_out_with_progress
+        from shared.cli_invoke import (
+            count_transcript_turns,
+            is_timed_out_with_progress,
+            read_transcript_records,
+        )
         assert callable(count_transcript_turns)
         assert callable(read_transcript_records)
         assert callable(is_timed_out_with_progress)
@@ -205,7 +209,11 @@ class TestTranscriptClassifierPublicSurface:
 
     def test_symbols_importable_from_shared(self):
         """Each symbol must be importable from the top-level shared namespace."""
-        from shared import count_transcript_turns, read_transcript_records, is_timed_out_with_progress
+        from shared import (
+            count_transcript_turns,
+            is_timed_out_with_progress,
+            read_transcript_records,
+        )
         assert callable(count_transcript_turns)
         assert callable(read_transcript_records)
         assert callable(is_timed_out_with_progress)
