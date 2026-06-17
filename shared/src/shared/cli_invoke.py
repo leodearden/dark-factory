@@ -1218,6 +1218,49 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     )
 
 
+def _cpu_govern_prefix(env: dict[str, str]) -> list[str]:
+    """Return a cgroup-governance prefix list if DF_AGENT_CPU_GOVERN is set to an executable.
+
+    Pops ``DF_AGENT_CPU_GOVERN`` from *env* (mutates the dict in place) so the
+    variable does not leak into the child process environment and a nested
+    invocation cannot double-wrap in a second cgroup scope.
+
+    Returns ``[<path>, '--role', 'task', '--']`` when the popped value is a
+    non-empty string AND ``shutil.which(<value>)`` confirms it is executable,
+    else ``[]``.
+
+    The value is the absolute path to reify's ``cpu-governed-exec.sh`` script.
+    ``'--role' 'task' '--'`` is the dark-factory-side CLI contract for
+    agent-launch invocations (merge-verify uses ``--role merge`` via a
+    separate DF-3 path in ``verify.py``).
+
+    Fail-safe: absent key, empty string, or non-executable/missing path all
+    return ``[]`` so no spawn ever fails due to a bad or missing govern script.
+
+    ``cpu-governed-exec.sh`` execs in place on both its governed
+    (``exec systemd-run --user --scope``) and fail-open (``exec nice/exec cmd``)
+    paths, so ``start_new_session=True`` / ``pgid=proc.pid`` and the
+    process-group kill logic in ``_run_subprocess`` are unaffected.  Cargo and
+    rustc children inherit the cgroup scope via fork, which is the intended
+    effect for DF-1.
+    """
+    raw = env.pop('DF_AGENT_CPU_GOVERN', None)
+    if not raw:
+        return []
+    # Belt-and-suspenders executability check: DF_AGENT_CPU_GOVERN is always
+    # populated from CpuGovernConfig.resolved_exec_path(), which already
+    # validated the path with os.access(path, os.X_OK).  shutil.which() is a
+    # second layer of defence for the edge case where the path was constructed
+    # outside that gate (e.g. injected directly in tests or a future caller).
+    # The two predicates differ subtly (os.access honours real-UID/ACL
+    # semantics; shutil.which uses the effective UID) — this is intentional
+    # belt-and-suspenders redundancy, not an attempt at equivalence.  Both
+    # always fail-open: a rejected path returns [] and never breaks the spawn.
+    if not shutil.which(raw):
+        return []
+    return [raw, '--role', 'task', '--']
+
+
 def _cpu_priority_prefix(env: dict[str, str]) -> list[str]:
     """Return a ``nice`` prefix list if DF_AGENT_CPU_NICE is set to a valid value.
 
@@ -1273,12 +1316,17 @@ async def _run_subprocess(
 
     start_ms = int(time.monotonic() * 1000)
 
-    # Prepend `nice -n N` when DF_AGENT_CPU_NICE is set.  This de-prioritizes
-    # the Claude CLI and its inherited cargo/rustc subtree so they yield CPU to
-    # reify's negatively-niced merge/task verifies.  _cpu_priority_prefix pops
-    # the signal from env so it does not leak to the child.  nice execvp's in
-    # place, so start_new_session/pgid logic below is unaffected.
-    spawn_cmd = _cpu_priority_prefix(env) + cmd
+    # Compose the spawn prefix (govern OUTERMOST, then nice, then cmd):
+    #   _cpu_govern_prefix  — places the agent and its inherited cargo/rustc/test
+    #     subtree into a reify cpu.weight-weighted cgroup scope via
+    #     cpu-governed-exec.sh (reify-owned).  Pops DF_AGENT_CPU_GOVERN so it
+    #     does not leak to the child and cannot re-wrap.  cpu-governed-exec.sh
+    #     execs in place, so start_new_session/pgid kill logic below is unaffected.
+    #   _cpu_priority_prefix — prepends `nice -n N` to de-prioritize the agent.
+    #     Pops DF_AGENT_CPU_NICE.  nice also execvp's in place.
+    # Govern is outermost so the cgroup scope wraps nice wraps the Claude CLI
+    # (PRD C-G1).
+    spawn_cmd = _cpu_govern_prefix(env) + _cpu_priority_prefix(env) + cmd
 
     proc = await asyncio.create_subprocess_exec(
         *spawn_cmd,

@@ -1384,3 +1384,116 @@ class TestCpuPriorityConfig:
         assert isinstance(cfg.cpu_priority, CpuPriorityConfig)
         assert cfg.cpu_priority.enabled is True
         assert cfg.cpu_priority.nice == 10
+
+
+class TestCpuGovernConfig:
+    """Unit tests for CpuGovernConfig schema and agent_env()."""
+
+    def test_defaults_are_disabled_and_empty_paths(self):
+        """CpuGovernConfig() defaults: enabled=False, exec_path='', shim_dir=''."""
+        from orchestrator.config import CpuGovernConfig
+        cfg = CpuGovernConfig()
+        assert cfg.enabled is False
+        assert cfg.exec_path == ''
+        assert cfg.shim_dir == ''
+
+    def test_disabled_agent_env_returns_empty(self, tmp_path):
+        """disabled -> agent_env() == {} (and resolved paths are None)."""
+        from orchestrator.config import CpuGovernConfig
+        cfg = CpuGovernConfig()
+        assert cfg.agent_env(tmp_path, '/usr/bin') == {}
+        assert cfg.resolved_exec_path(tmp_path) is None
+        assert cfg.resolved_shim_dir(tmp_path) is None
+
+    def test_enabled_with_valid_paths(self, tmp_path):
+        """enabled=True with tmp executable + dir: resolved paths correct, agent_env correct."""
+        from orchestrator.config import CpuGovernConfig
+        # Create the executable
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o755)
+        # Create the shim dir
+        agent_bin = scripts / 'agent-bin'
+        agent_bin.mkdir()
+
+        cfg = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+            shim_dir='scripts/agent-bin',
+        )
+        abs_exec = str(exec_file.resolve())
+        abs_shim = str(agent_bin.resolve())
+
+        assert cfg.resolved_exec_path(tmp_path) == abs_exec
+        assert cfg.resolved_shim_dir(tmp_path) == abs_shim
+
+        env = cfg.agent_env(tmp_path, '/usr/bin')
+        assert env.get('DF_AGENT_CPU_GOVERN') == abs_exec
+        assert env.get('PATH') == f'{abs_shim}{os.pathsep}/usr/bin'
+
+    def test_enabled_with_non_executable_exec_path_fails_open(self, tmp_path):
+        """enabled + non-executable exec_path -> resolved_exec_path is None, DF_AGENT_CPU_GOVERN absent."""
+        from orchestrator.config import CpuGovernConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\nexec "$@"\n')
+        exec_file.chmod(0o644)  # not executable
+
+        cfg = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+            shim_dir='scripts/agent-bin',
+        )
+        assert cfg.resolved_exec_path(tmp_path) is None
+        env = cfg.agent_env(tmp_path, '/usr/bin')
+        assert 'DF_AGENT_CPU_GOVERN' not in env
+
+    def test_enabled_with_missing_exec_path_fails_open(self, tmp_path):
+        """enabled + missing exec_path -> resolved_exec_path is None, fail-open."""
+        from orchestrator.config import CpuGovernConfig
+        cfg = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/nonexistent.sh',
+            shim_dir='scripts/agent-bin',
+        )
+        assert cfg.resolved_exec_path(tmp_path) is None
+        env = cfg.agent_env(tmp_path, '/usr/bin')
+        assert 'DF_AGENT_CPU_GOVERN' not in env
+
+    def test_enabled_with_relative_path_and_worktree_none_returns_none(self):
+        """enabled + relative path + worktree=None -> resolved_exec_path is None."""
+        from orchestrator.config import CpuGovernConfig
+        cfg = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+            shim_dir='scripts/agent-bin',
+        )
+        assert cfg.resolved_exec_path(None) is None
+        assert cfg.resolved_shim_dir(None) is None
+
+    def test_enabled_with_absolute_exec_path_used_as_is(self, tmp_path):
+        """An absolute exec_path is used as-is (not joined to worktree)."""
+        from orchestrator.config import CpuGovernConfig
+        exec_file = tmp_path / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\n')
+        exec_file.chmod(0o755)
+        agent_bin = tmp_path / 'agent-bin'
+        agent_bin.mkdir()
+
+        cfg = CpuGovernConfig(
+            enabled=True,
+            exec_path=str(exec_file),
+            shim_dir=str(agent_bin),
+        )
+        assert cfg.resolved_exec_path(tmp_path) == str(exec_file)
+        assert cfg.resolved_shim_dir(tmp_path) == str(agent_bin)
+
+    def test_orchestrator_config_has_cpu_governance_field(self):
+        """OrchestratorConfig exposes a cpu_governance field defaulting to enabled=False."""
+        from orchestrator.config import CpuGovernConfig
+        cfg = OrchestratorConfig()
+        assert isinstance(cfg.cpu_governance, CpuGovernConfig)
+        assert cfg.cpu_governance.enabled is False
