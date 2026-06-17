@@ -1218,6 +1218,40 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     )
 
 
+def _cpu_govern_prefix(env: dict[str, str]) -> list[str]:
+    """Return a cgroup-governance prefix list if DF_AGENT_CPU_GOVERN is set to an executable.
+
+    Pops ``DF_AGENT_CPU_GOVERN`` from *env* (mutates the dict in place) so the
+    variable does not leak into the child process environment and a nested
+    invocation cannot double-wrap in a second cgroup scope.
+
+    Returns ``[<path>, '--role', 'task', '--']`` when the popped value is a
+    non-empty string AND ``shutil.which(<value>)`` confirms it is executable,
+    else ``[]``.
+
+    The value is the absolute path to reify's ``cpu-governed-exec.sh`` script.
+    ``'--role' 'task' '--'`` is the dark-factory-side CLI contract for
+    agent-launch invocations (merge-verify uses ``--role merge`` via a
+    separate DF-3 path in ``verify.py``).
+
+    Fail-safe: absent key, empty string, or non-executable/missing path all
+    return ``[]`` so no spawn ever fails due to a bad or missing govern script.
+
+    ``cpu-governed-exec.sh`` execs in place on both its governed
+    (``exec systemd-run --user --scope``) and fail-open (``exec nice/exec cmd``)
+    paths, so ``start_new_session=True`` / ``pgid=proc.pid`` and the
+    process-group kill logic in ``_run_subprocess`` are unaffected.  Cargo and
+    rustc children inherit the cgroup scope via fork, which is the intended
+    effect for DF-1.
+    """
+    raw = env.pop('DF_AGENT_CPU_GOVERN', None)
+    if not raw:
+        return []
+    if not shutil.which(raw):
+        return []
+    return [raw, '--role', 'task', '--']
+
+
 def _cpu_priority_prefix(env: dict[str, str]) -> list[str]:
     """Return a ``nice`` prefix list if DF_AGENT_CPU_NICE is set to a valid value.
 
