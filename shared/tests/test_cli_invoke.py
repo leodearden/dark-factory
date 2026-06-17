@@ -2367,6 +2367,60 @@ class TestIsZeroOutputTimeout:
         )
         assert is_zero_output_timeout(result) is False
 
+    # ── transcript_turns-driven cases (task 1778) ─────────────────────────────
+
+    def test_transcript_turns_zero_is_true(self):
+        """timed_out=True, transcript_turns=0 → True (transcript says no work)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=0, cost_usd=0.0, transcript_turns=0,
+        )
+        assert is_zero_output_timeout(result) is True
+
+    def test_transcript_turns_nonzero_beats_legacy_zero_defaults(self):
+        """timed_out=True, transcript_turns=5, turns=0, cost_usd=0.0 → False.
+
+        transcript_turns authoritative: work was done even though legacy
+        fields show zero (reify-4415 case: 43 assistant turns, 0 JSON output).
+        """
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=0, cost_usd=0.0, transcript_turns=5,
+        )
+        assert is_zero_output_timeout(result) is False
+
+    def test_transcript_turns_none_legacy_fallback_zero(self):
+        """timed_out=True, transcript_turns=None, turns=0, cost_usd=0.0 → True (legacy fallback)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=0, cost_usd=0.0, transcript_turns=None,
+        )
+        assert is_zero_output_timeout(result) is True
+
+    def test_transcript_turns_none_legacy_fallback_nonzero_turns(self):
+        """timed_out=True, transcript_turns=None, turns=3 → False (legacy: turns>0)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=3, cost_usd=0.0, transcript_turns=None,
+        )
+        assert is_zero_output_timeout(result) is False
+
+    def test_transcript_turns_none_legacy_fallback_nonzero_cost(self):
+        """timed_out=True, transcript_turns=None, cost_usd=0.01 → False (legacy: cost>0)."""
+        result = AgentResult(
+            success=False, output='', timed_out=True,
+            turns=0, cost_usd=0.01, transcript_turns=None,
+        )
+        assert is_zero_output_timeout(result) is False
+
+    def test_not_timed_out_transcript_zero(self):
+        """timed_out=False, transcript_turns=0 → False (not a timeout at all)."""
+        result = AgentResult(
+            success=True, output='done', timed_out=False,
+            turns=0, cost_usd=0.0, transcript_turns=0,
+        )
+        assert is_zero_output_timeout(result) is False
+
 
 # ── _cpu_priority_prefix helper ───────────────────────────────────────────────
 
