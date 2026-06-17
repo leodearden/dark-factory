@@ -213,6 +213,18 @@ class TimeoutsConfig(BaseModel):
     module_tagger: float = Field(default=300.0)
     deep_reviewer: float = Field(default=2400.0)
     judge: float = Field(default=300.0)
+    startup_grace_secs: float = Field(
+        default=120.0,
+        description=(
+            "Pre-turn-1 STARTUP grace window (seconds). "
+            "If no assistant turn appears within this period, _run_subprocess "
+            "kills the subprocess fast — this catches genuine from-source-build / "
+            "uv / MCP-startup wedges. "
+            "Distinct from the per-role post-turn-1 ceiling (e.g. implementer=1200s): "
+            "once ≥1 assistant turn is observed, liveness is proven and the full "
+            "per-role ceiling applies."
+        ),
+    )
 
 
 class BackendsConfig(BaseModel):
