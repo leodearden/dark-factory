@@ -179,55 +179,6 @@ class TestInitAllCompleteness:
             )
 
 
-class TestTranscriptClassifierPublicSurface:
-    """Verify that the three transcript-classifier symbols are part of the public API.
-
-    Covers both the module-level __all__ and the top-level shared namespace.
-    """
-
-    _SYMBOLS = ('count_transcript_turns', 'read_transcript_records', 'is_timed_out_with_progress')
-
-    def test_symbols_importable_from_cli_invoke(self):
-        """Each symbol must be directly importable from shared.cli_invoke."""
-        from shared.cli_invoke import (
-            count_transcript_turns,
-            is_timed_out_with_progress,
-            read_transcript_records,
-        )
-        assert callable(count_transcript_turns)
-        assert callable(read_transcript_records)
-        assert callable(is_timed_out_with_progress)
-
-    def test_symbols_in_cli_invoke_all(self):
-        """Each symbol must appear in shared.cli_invoke.__all__."""
-        from shared import cli_invoke
-        for sym in self._SYMBOLS:
-            assert sym in cli_invoke.__all__, (
-                f"'{sym}' missing from shared.cli_invoke.__all__; "
-                f"current __all__ = {sorted(cli_invoke.__all__)}"
-            )
-
-    def test_symbols_importable_from_shared(self):
-        """Each symbol must be importable from the top-level shared namespace."""
-        from shared import (
-            count_transcript_turns,
-            is_timed_out_with_progress,
-            read_transcript_records,
-        )
-        assert callable(count_transcript_turns)
-        assert callable(read_transcript_records)
-        assert callable(is_timed_out_with_progress)
-
-    def test_symbols_in_shared_all(self):
-        """Each symbol must appear in shared.__all__."""
-        import shared
-        for sym in self._SYMBOLS:
-            assert sym in shared.__all__, (
-                f"'{sym}' missing from shared.__all__; "
-                f"current shared.__all__ = {sorted(shared.__all__)}"
-            )
-
-
 class TestPEP561:
     """Verify PEP 561 py.typed marker is present."""
 

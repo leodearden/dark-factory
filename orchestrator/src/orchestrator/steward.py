@@ -826,4 +826,11 @@ def _is_empty_output(result) -> bool:
     transcript_turns) distinguishes that case — those runs DID do real work and
     must NOT be treated as instant empty-output failures.
     """
+    if result.timed_out and result.transcript_turns is None and result.subtype == 'error_empty_output':
+        logger.debug(
+            '_is_empty_output: timed_out=True but transcript_turns=None '
+            '(transcript could not be located for session %r) — '
+            'conservative empty-output classification may misidentify a productive run',
+            getattr(result, 'session_id', ''),
+        )
     return result.subtype == 'error_empty_output' and not is_timed_out_with_progress(result)

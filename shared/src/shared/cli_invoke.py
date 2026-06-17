@@ -372,6 +372,14 @@ def is_zero_output_timeout(result: AgentResult) -> bool:
     if result.transcript_turns is not None:
         return result.transcript_turns == 0
     # Legacy fallback: transcript not available — use JSON-output fields.
+    # Log so that 'transcript not located for a possibly-productive run' is
+    # diagnosable rather than silently degrading to the conservative wedge path.
+    logger.debug(
+        'is_zero_output_timeout: timed_out=True but transcript_turns=None '
+        '(transcript could not be located for session %r) — '
+        'falling back to legacy turns==0 and cost_usd==0.0 heuristic',
+        result.session_id,
+    )
     return result.turns == 0 and result.cost_usd == 0.0
 
 
