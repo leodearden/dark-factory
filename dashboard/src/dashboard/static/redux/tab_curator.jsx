@@ -117,16 +117,23 @@ function QueueRow({ ticket, onCancel }) {
       <td style={{ maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis' }} title={title}>{title || '—'}</td>
       <td>
         {files && files.length > 0 ? (
-          <ChipList
-            items={files}
-            renderChip={(f, i) => (
-              <span key={i} className="chip" title={f} style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>
-                {f.split('/').pop()}
-              </span>
-            )}
-            maxInline={2}
-            persistKey={`df.curator.files.${ticket_id}`}
-          />
+          (() => {
+            const labelMap = (window.DF_SCHED_UTILS || {}).disambiguateLabels
+              ? window.DF_SCHED_UTILS.disambiguateLabels(files)
+              : null;
+            return (
+              <ChipList
+                items={files}
+                renderChip={(f, i) => (
+                  <span key={i} className="chip" title={f} style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>
+                    {labelMap ? labelMap.get(f) : f}
+                  </span>
+                )}
+                maxInline={2}
+                persistKey={`df.curator.files.${ticket_id}`}
+              />
+            );
+          })()
         ) : (
           <span style={{ color: 'var(--fg-3)' }}>—</span>
         )}
