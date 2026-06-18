@@ -112,6 +112,12 @@ class StaleServiceRestartCoordinator:
         Human-readable service identifier injected into log strings and event
         data (``data['service']``, ``data['reason']``).  Default: ``'fused-memory'``
         so the existing fused-memory instance renders byte-identical text.
+    require_idle:
+        When True (default), ``maybe_restart`` only fires when ``agents_idle``
+        is True — the orchestrator's idle quiet-window.  When False (leaf
+        services such as the dashboard), the gate becomes
+        ``(agents_idle or not require_idle)`` so the restart fires even while
+        agents are dispatching.
     """
 
     def __init__(
@@ -127,6 +133,7 @@ class StaleServiceRestartCoordinator:
         restart_executor: Callable[[], Awaitable[object]] | None = None,
         clock: Callable[[], float] = time.monotonic,
         service_name: str = 'fused-memory',
+        require_idle: bool = True,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -140,6 +147,10 @@ class StaleServiceRestartCoordinator:
         self._restart_executor = restart_executor
         self._clock = clock
         self._service_name = service_name
+        # When False (leaf services), the restart fires even while agents are
+        # dispatching — agents_idle is not required in the gate.  Default True
+        # preserves the existing fused-memory behaviour (idle-only).
+        self._require_idle = require_idle
 
         # State
         self._pending: bool = False
@@ -214,7 +225,7 @@ class StaleServiceRestartCoordinator:
         if not (
             self._enabled
             and self._pending
-            and agents_idle
+            and (agents_idle or not self._require_idle)
             and (self._clock() - self._last_request_monotonic >= self._debounce_secs)
         ):
             return False
