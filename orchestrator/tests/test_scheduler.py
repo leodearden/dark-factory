@@ -3776,10 +3776,13 @@ class TestBlastRadiusRefinement:
         )
         ev = set_to_plan_events[0]
         assert ev[1]['task_id'] == '936'
+        # This is a shift (lib.rs → conformance.rs): additional=['conformance.rs'],
+        # stale=['lib.rs'].  The acquired field carries what was actually acquired
+        # (additional), which for a shift is non-empty.
         assert ev[1]['data'] == {
             'files': ['crates/reify-compiler/src/conformance.rs'],
             'released': ['crates/reify-compiler/src/lib.rs'],
-            'acquired': [],
+            'acquired': ['crates/reify-compiler/src/conformance.rs'],
             'persisted': True,
         }, f'set_to_plan event payload mismatch; got {ev[1]["data"]}'
 

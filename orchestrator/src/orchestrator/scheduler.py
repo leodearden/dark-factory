@@ -3463,6 +3463,21 @@ class Scheduler:
                         'in-memory modules already narrowed; reconcile/next-plan will retry).',
                         task_id,
                     )
+                # Emit set_to_plan to signal the DURABLE persist (lock_released
+                # above signals the in-memory release; this signals durability).
+                # persisted=False lets the reify ζ gate distinguish a failed
+                # write from a successful one without a separate metadata read.
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.set_to_plan,
+                        task_id=task_id,
+                        data={
+                            'files': needed,
+                            'released': released,
+                            'acquired': additional,
+                            'persisted': bool(updated),
+                        },
+                    )
             logger.info(f'Task {task_id} expanded to modules: {needed}')
             return True
 
