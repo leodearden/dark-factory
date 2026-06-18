@@ -1034,6 +1034,54 @@ class GitOps:
             )
             return False
 
+    async def refresh_warm_base(self) -> bool:
+        """Advance the rolling warm base by running the refresh script.
+
+        Invokes ``<_merge-verify>/scripts/refresh-warm-base.sh <advancing> <base>``
+        where:
+        - *advancing* = ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
+          (the _merge-verify lane's target — the warm build of the just-landed commit)
+        - *base* = ``warm_lane_base_target_path`` (the configured rolling base)
+
+        **inv.9 promote-provenance** is enforced STRUCTURALLY: the advancing dir
+        is hardcoded to the _merge-verify target and no caller-supplied advancing
+        parameter is exposed, so DF can never source a task lane (un-landed WIP).
+
+        Returns:
+            True  — script ran and exited 0 (base refreshed).
+            False — any guard triggered or the script absent/failed (fail-soft;
+                    never raises — a base-refresh hiccup cannot block merges).
+        """
+        try:
+            script = self.persistent_merge_worktree_path / 'scripts' / 'refresh-warm-base.sh'
+            if not script.exists():
+                logger.debug(
+                    'refresh_warm_base: script absent at %s — no-op', script,
+                )
+                return False
+
+            artifact_dir = (
+                self.config.reap_build_artifact_dirs[0]
+                if self.config.reap_build_artifact_dirs
+                else 'target'
+            )
+            advancing = self.persistent_merge_worktree_path / artifact_dir
+            base = self.warm_lane_base_target_path
+
+            rc, _, err = await _run(
+                [str(script), str(advancing), str(base)],
+                cwd=self.persistent_merge_worktree_path,
+            )
+            if rc != 0:
+                logger.warning(
+                    'refresh_warm_base: script exited %d (stderr=%r)', rc, err,
+                )
+                return False
+            return True
+        except Exception:
+            logger.warning('refresh_warm_base: unexpected error', exc_info=True)
+            return False
+
     async def acquire_warm_lane(
         self,
         branch_name: str,
