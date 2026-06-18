@@ -1334,3 +1334,208 @@ class TestAlarmVerifyHostUnreachable:
         # Must not raise even though event_store=None
         self._call(eq, 'host1', 'err', streak=3, duration_s=60.0, event_store=None)
         assert len(eq.submitted) == 1  # escalation still submitted
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-9 RED: RU branch of _finalize_inflight wired to tracker + alarm
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeInflightRunnerUnavailableEscalation:
+    """_finalize_inflight RUNNER_UNAVAILABLE branch wires tracker + alarm (task 1795 step-9).
+
+    RED until step-10 GREEN adds the tracker/alarm calls in the RU branch.
+    """
+
+    def _make_worker(self, *, escalate_after_n=2):
+        """Build a minimal SpeculativeMergeWorker with fake allocator + escalation queue."""
+        import asyncio
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        git_ops = _make_git_ops_mock()
+        git_ops.project_root = None  # no real git needed for this test
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        worker._unreachable_escalate_after_n = escalate_after_n
+
+        # Fake escalation queue
+        eq = _FakeEscalationQueue(open_l1=False)
+        worker._escalation_queue = eq
+
+        # Fake host allocator with async quarantine_and_release
+        fake_alloc = MagicMock()
+        fake_alloc.quarantine_and_release = AsyncMock()
+        fake_alloc.release = AsyncMock()
+        fake_alloc.cancel_and_release = AsyncMock()
+        worker._host_allocator = fake_alloc
+
+        return worker, eq, fake_alloc
+
+    def _make_ru_entry(self, worker, host_name, reason='ssh timeout'):
+        """Build an InflightEntry whose verify_task yields RUNNER_UNAVAILABLE."""
+        import asyncio
+        from orchestrator.merge_queue import (
+            InflightEntry, InflightVerifyResult,
+            MergeOutcome, MergeRequest, SpeculativeItem,
+        )
+        from orchestrator.verify_runner import HostLease
+
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id='task-ru',
+            branch='task/ru',
+            worktree=MagicMock(),
+            pre_rebased=False,
+            task_files=[],
+            module_configs=[],
+            config=_make_config(),
+            result=loop.create_future(),
+        )
+
+        fake_runner = MagicMock()
+        fake_runner.name = host_name
+        fake_runner.is_local = False
+        lease = HostLease(name=host_name, runner=fake_runner, is_local=False)
+
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'deadbeefdeadbeef1234'
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=MagicMock(),
+            base_sha='base123',
+            speculative=False,
+            skip_verify=False,
+        )
+
+        async def _fake_ru_verify():
+            return InflightVerifyResult(
+                outcome=None,
+                merge_wt=item.merge_wt,
+                status='RUNNER_UNAVAILABLE',
+                reason=reason,
+            )
+
+        verify_task = asyncio.ensure_future(_fake_ru_verify())
+        return InflightEntry(
+            item=item,
+            lease=lease,
+            verify_task=verify_task,
+            merge_wt=item.merge_wt,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+    async def test_quarantine_and_release_still_runs(self):
+        """RUNNER_UNAVAILABLE → quarantine_and_release called (existing behavior preserved)."""
+        from unittest.mock import patch
+        from orchestrator.merge_queue import SpeculativeItem
+
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=3)
+        entry = self._make_ru_entry(worker, 'laptop')
+
+        # Patch _remerge so we don't need a real git repo
+        remerged = MagicMock(spec=SpeculativeItem)
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            result = await worker._finalize_inflight(entry)
+
+        fake_alloc.quarantine_and_release.assert_awaited_once()
+        assert result is False  # RU path always returns False
+
+    async def test_host_in_runner_quarantine_after_ru(self):
+        """After RUNNER_UNAVAILABLE the lease host is in worker._runner_quarantine."""
+        from unittest.mock import patch
+        from orchestrator.merge_queue import SpeculativeItem
+
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=3)
+        entry = self._make_ru_entry(worker, 'laptop')
+
+        # Simulate quarantine_and_release adding to the shared set
+        async def _fake_qar(lease):
+            worker._runner_quarantine.add(lease.name)
+
+        fake_alloc.quarantine_and_release = AsyncMock(side_effect=_fake_qar)
+
+        remerged = MagicMock(spec=SpeculativeItem)
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            await worker._finalize_inflight(entry)
+
+        assert 'laptop' in worker._runner_quarantine
+
+    async def test_nth_ru_submits_exactly_one_escalation(self):
+        """After N RU events for same host exactly ONE escalation is submitted."""
+        from unittest.mock import patch
+        from orchestrator.merge_queue import SpeculativeItem
+
+        n = 2
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
+        remerged = MagicMock(spec=SpeculativeItem)
+
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for _ in range(n):
+                entry = self._make_ru_entry(worker, 'laptop', reason='ssh: connect failed')
+                await worker._finalize_inflight(entry)
+
+        # RED: no escalation submitted until step-10 wires the tracker
+        assert len(eq.submitted) == 1, (
+            f'Expected 1 escalation after N={n} RU events; got {len(eq.submitted)}'
+        )
+
+    async def test_nth_escalation_names_host_and_reason(self):
+        """The submitted escalation names the host and captured reason."""
+        from unittest.mock import patch
+        from orchestrator.merge_queue import SpeculativeItem
+
+        n = 2
+        reason = 'ssh: Could not resolve hostname laptop'
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
+        remerged = MagicMock(spec=SpeculativeItem)
+
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for _ in range(n):
+                entry = self._make_ru_entry(worker, 'laptop', reason=reason)
+                await worker._finalize_inflight(entry)
+
+        assert len(eq.submitted) == 1
+        esc = eq.submitted[0]
+        assert 'laptop' in esc.summary or 'laptop' in esc.task_id
+        assert reason in esc.summary or reason in esc.detail
+
+    async def test_further_ru_events_do_not_submit_second_escalation(self):
+        """Additional RU events after threshold are dedup'd (has_open_l1 guard)."""
+        from unittest.mock import patch
+        from orchestrator.merge_queue import SpeculativeItem
+
+        n = 2
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
+        remerged = MagicMock(spec=SpeculativeItem)
+
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for i in range(n + 3):  # 5 total (n=2 threshold + 3 extra)
+                entry = self._make_ru_entry(worker, 'laptop', reason='timeout')
+                await worker._finalize_inflight(entry)
+                if i == n - 1:
+                    # After the Nth call, fake the alarm as now-open so dedup fires
+                    eq.open_it()
+
+        assert len(eq.submitted) == 1  # no duplicate
+
+    async def test_n_failed_stays_false_on_ru(self):
+        """RUNNER_UNAVAILABLE does not set _n_failed (item should be re-dispatched)."""
+        from unittest.mock import patch
+        from orchestrator.merge_queue import SpeculativeItem
+
+        n = 2
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
+        remerged = MagicMock(spec=SpeculativeItem)
+
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for _ in range(n):
+                entry = self._make_ru_entry(worker, 'laptop')
+                await worker._finalize_inflight(entry)
+
+        # _n_failed is written from _n_failed_val inside finalize; read back
+        # via the worker's attribute — it must stay False after RU.
+        assert worker._n_failed is False
