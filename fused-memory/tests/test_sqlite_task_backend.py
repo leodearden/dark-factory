@@ -2000,21 +2000,19 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
     'metadata_mode, append, expected',
     [
         # (a) explicit metadata_mode returned verbatim regardless of append
-        ('merge',     None,  'merge'),
-        ('additive',  None,  'additive'),
-        ('replace',   None,  'replace'),
-        ('merge',     True,  'merge'),
-        ('additive',  False, 'additive'),
-        ('replace',   True,  'replace'),
+        ('merge',    None,  'merge'),
+        ('additive', None,  'additive'),
+        ('replace',  None,  'replace'),
         # (b) metadata_mode=None + append=True -> 'additive'
         (None, True,  'additive'),
         # (c) metadata_mode=None + append=False -> 'replace'
         (None, False, 'replace'),
         # (d) metadata_mode=None + append=None -> 'merge' (new default)
         (None, None,  'merge'),
-        # (f) explicit metadata_mode wins over conflicting append
+        # (f) explicit metadata_mode wins over conflicting append (distinct combos)
         ('merge',    True,  'merge'),
         ('additive', False, 'additive'),
+        ('replace',  True,  'replace'),
     ],
 )
 def test_resolve_metadata_mode_mapping(metadata_mode, append, expected):
@@ -2232,3 +2230,33 @@ async def test_update_task_default_corrupt_blob_refused(backend, project_root, c
     assert row['metadata'] == _CORRUPT_BLOB, (
         f'corrupt blob must be byte-for-byte unchanged; got: {row["metadata"]!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_update_task_invalid_metadata_mode_always_raises(
+    backend, project_root,
+):
+    """Invalid metadata_mode must raise immediately regardless of whether
+    ``metadata`` is supplied (regression guard for the unconditional validation
+    introduced in the amendment pass — previously the check only fired inside
+    the ``if metadata is not None:`` block)."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    # Without metadata — the original bug: bad mode was silently ignored.
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata_mode='bogus',
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+
+    # With metadata — should also raise (sanity check, same code path).
+    with pytest.raises(TaskmasterError) as exc2:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'k': 'v'}),
+            metadata_mode='bogus',
+        )
+    assert exc2.value.code == 'TASKMASTER_TOOL_ERROR'

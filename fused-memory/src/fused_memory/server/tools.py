@@ -2746,7 +2746,10 @@ def create_mcp_server(
                 - ``'replace'`` — whole-blob overwrite. Bypasses the corrupt-blob
                   guard; the sanctioned repair path.
             append: DEPRECATED shim. ``True`` → ``'additive'``, ``False`` →
-                ``'replace'``. Also governs ``details`` append. Omit in favour of
+                ``'replace'``. **Also the only knob that governs ``details``/
+                ``prompt`` append** — ``metadata_mode`` does NOT affect the
+                details path, so callers that need details-append must still
+                pass ``append=True`` even after migrating metadata writes to
                 ``metadata_mode``. Resolution is single-sourced in the backend.
             tag: Tag context (optional)
             title: New title (overwrites)

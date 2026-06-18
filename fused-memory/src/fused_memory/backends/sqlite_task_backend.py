@@ -814,6 +814,12 @@ class SqliteTaskBackend:
         # ``details`` is passed it feeds the details path (replace, or append
         # when ``append=True``). ``metadata`` retains the merge-or-replace
         # semantics keyed off ``append``.
+        # Validate metadata_mode unconditionally — a bad value should always
+        # raise immediately, even if no metadata is supplied in this call.
+        # Resolution is stored so the metadata block can reuse it without a
+        # second call (and to keep the single call-site clear).
+        resolved_mode = _resolve_metadata_mode(metadata_mode, append)
+
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
@@ -872,7 +878,7 @@ class SqliteTaskBackend:
                 # metadata_mode='replace' (bypasses the guard intentionally).
                 new_metadata = _merge_metadata(
                     row['metadata'], metadata,
-                    mode=_resolve_metadata_mode(metadata_mode, append),
+                    mode=resolved_mode,
                     project_root=project_root, tag=tag, task_id=tid,
                 )
                 set_columns.append('metadata = ?')
