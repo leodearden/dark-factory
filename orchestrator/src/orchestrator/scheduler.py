@@ -837,6 +837,12 @@ class Scheduler:
         # Process-local — same rationale as _external_unresolved_counts.
         # GC'd alongside _external_unresolved_counts in the per-tick stale-id sweep.
         self._external_hold_streak: dict[str, int] = {}
+        # Tracks the most-recent cause for _external_hold_streak[task_id].
+        # Reset alongside the streak.  When the cause changes tick-over-tick
+        # (e.g. resolver degraded → dep live) the streak resets to zero so the
+        # emitted external_dep_gate_held.cause always reflects the dominant
+        # (consecutive-run) reason, not a mixed accumulation.
+        self._external_hold_cause: dict[str, str] = {}
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -1616,6 +1622,11 @@ class Scheduler:
         Does NOT touch ``_external_unresolved_counts`` (sentinel-counter)
         — that counter is owned by the sentinel-escalation path.
         """
+        # Reset when the cause changes so emitted events always reflect a
+        # single consecutive-run cause, not a mixed accumulation.
+        if self._external_hold_cause.get(task_id) != cause:
+            self._external_hold_streak[task_id] = 0
+        self._external_hold_cause[task_id] = cause
         streak = self._external_hold_streak.get(task_id, 0) + 1
         self._external_hold_streak[task_id] = streak
         if streak >= threshold and streak % threshold == 0:
@@ -1701,6 +1712,10 @@ class Scheduler:
             # non-sentinel) status this tick — used to drive hold-streak
             # visibility after the dep loop.
             held_live = False
+            # Set True in the cancelled / threshold-crossing-sentinel branches
+            # so the post-loop hold-streak code knows not to emit a spurious
+            # 'deps_live' gate-held event for a task being terminally blocked.
+            blocked_this_tick = False
             for dep in external_deps:
                 status = external_cache.get(dep)
 
@@ -1734,6 +1749,7 @@ class Scheduler:
                             dep,
                             task_id,
                         )
+                    blocked_this_tick = True
 
                 elif status in self._EXTERNAL_SENTINEL_STATUSES:
                     # Unknown/malformed — grace-then-escalate counter.
@@ -1774,6 +1790,7 @@ class Scheduler:
                                 count,
                                 task_id,
                             )
+                        blocked_this_tick = True
                     else:
                         logger.debug(
                             'Task %s: external dep %r status=%r (%d/%d ticks) — '
@@ -1794,10 +1811,12 @@ class Scheduler:
                     held_live = True
 
             # After the dep loop: drive the hold-streak for live-status holds.
-            # - If any dep kept the task held (held_live): bump+emit streak.
-            # - Otherwise (all deps done or task was blocked via cancelled/sentinel):
-            #   pop the streak so recovery is visible (streak resets cleanly).
-            if held_live:
+            # - If any dep held the task live AND no terminal action fired this
+            #   tick: bump+emit streak (genuinely waiting).
+            # - Otherwise (all deps done, OR task was blocked via
+            #   cancelled/threshold-sentinel): pop the streak.  A blocked task
+            #   is not "still waiting" so gate_held must not fire for it.
+            if held_live and not blocked_this_tick:
                 self._note_external_hold(
                     task_id,
                     cause='deps_live',
@@ -1805,6 +1824,7 @@ class Scheduler:
                 )
             else:
                 self._external_hold_streak.pop(task_id, None)
+                self._external_hold_cause.pop(task_id, None)
 
     async def update_task(
         self,
@@ -2688,11 +2708,12 @@ class Scheduler:
             ]
             for k in _stale_ext_keys:
                 del self._external_unresolved_counts[k]
-        # _external_hold_streak is keyed by task_id (str); GC alongside
-        # _external_unresolved_counts so the dict stays bounded.
-        if _stale_ids and self._external_hold_streak:
+        # _external_hold_streak and _external_hold_cause are keyed by task_id
+        # (str); GC alongside _external_unresolved_counts so they stay bounded.
+        if _stale_ids and (self._external_hold_streak or self._external_hold_cause):
             for tid in _stale_ids:
                 self._external_hold_streak.pop(tid, None)
+                self._external_hold_cause.pop(tid, None)
 
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before

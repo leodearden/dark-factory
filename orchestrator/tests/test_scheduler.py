@@ -7,6 +7,7 @@ from datetime import UTC
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import (
     TIER_BASE,
@@ -3006,23 +3007,6 @@ def _pending_task(
         'dependencies': [{'id': d} for d in (deps or [])],
         'metadata': {'files': files or [f'mod{task_id}']},
     }
-
-
-class _RecordingEventStore:
-    """Minimal EventStore stand-in capturing emit() calls in-memory."""
-
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    def emit(self, event_type, *, task_id=None, phase=None, role=None,
-             data=None, cost_usd=None, duration_ms=None):
-        self.events.append((
-            str(event_type),
-            {
-                'task_id': task_id,
-                'data': dict(data or {}),
-            },
-        ))
 
 
 class TestPriorityInheritance:

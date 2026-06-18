@@ -31,6 +31,7 @@ import json
 from pathlib import Path
 
 import pytest
+from _recording_event_store import _RecordingEventStore
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
@@ -680,24 +681,6 @@ class TestTransientResolverError:
             f'After clearing transient error: upstream done → T must dispatch; '
             f'got {tick_b_result!r}'
         )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# _RecordingEventStore — minimal stand-in for scheduler event capture
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _RecordingEventStore:
-    """Minimal in-memory event store for asserting scheduler event emission."""
-
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    def emit(self, event_type, *, task_id=None, phase=None, role=None,
-             data=None, cost_usd=None, duration_ms=None):
-        self.events.append((
-            str(event_type),
-            {'task_id': task_id, 'data': dict(data or {})},
-        ))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
