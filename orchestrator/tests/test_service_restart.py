@@ -672,3 +672,55 @@ async def test_require_idle_true_defers_when_agents_not_idle() -> None:
     assert result is False
     assert coord.is_pending is True
     executor.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# script_args / default executor spawn tests (step-7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_executor_with_empty_script_args_omits_drain() -> None:
+    """Default executor with script_args=[] spawns script with NO --drain flag."""
+    from unittest.mock import MagicMock as MM
+    from unittest.mock import patch
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=['dashboard/src/app.py'])
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['dashboard/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        project_root='/fake/project',
+        script_path='scripts/restart-dashboard.sh',
+        clock=lambda: current_time[0],
+        service_name='dashboard',
+        require_idle=False,
+        script_args=[],
+    )
+
+    await coord.note_merge('task-leaf', 'base1', 'head1')
+
+    fake_proc = MM()
+    with patch(
+        'orchestrator.service_restart.asyncio.create_subprocess_exec',
+        new_callable=AsyncMock,
+        return_value=fake_proc,
+    ) as mock_exec:
+        r = await coord.maybe_restart(agents_idle=False)
+
+    assert r is True
+    mock_exec.assert_awaited_once()
+    call_args = mock_exec.call_args
+    pos_args = call_args.args if call_args.args else call_args[0]
+    # Only the script path — no '--drain'
+    assert str(pos_args[0]).endswith('scripts/restart-dashboard.sh')
+    assert len(pos_args) == 1  # script path only, no extra args
+    assert call_args.kwargs.get('start_new_session') is True
+    fake_proc.wait.assert_not_called()
+    fake_proc.communicate.assert_not_called()
