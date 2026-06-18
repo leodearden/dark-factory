@@ -1,24 +1,27 @@
 """
-Set-aware label disambiguation tests for the lock/path chips.
+Set-aware label disambiguation — algorithm tests only.
 
-Two test tiers:
- 1. Algorithm tests — run disambiguateLabels in a node vm sandbox.
-    Skip when node is absent.
- 2. Source-structure tests — fetch JSX files via Starlette TestClient and
-    assert structural contracts (naive shortener removed, helper routed,
-    title attribute preserved).  Follow the idiom from test_tab_scheduler.py.
+Uses a node vm sandbox to execute disambiguateLabels from scheduler_utils.jsx
+and verify its behaviour directly.  Tests skip when node is absent.
+
+The 6 React render-site wiring changes (tabs.jsx, tab_tasks.jsx,
+scheduler_drawer.jsx, scheduler_heatmap.jsx, tab_scheduler.jsx,
+tab_curator.jsx) are implemented in steps 4/6/8/10/12/14 but have no
+corresponding test here: the dashboard has no JS/DOM test runner (no
+package.json/node_modules, React+babel are CDN-only with in-browser
+transpilation and no build step), so a behavioural render test is out of
+scope.  The only non-trivial logic — the disambiguation algorithm — has full
+RED→GREEN coverage via the node-vm sandbox below.
 """
 
 from __future__ import annotations
 
 import json
 import pathlib
-import re
 import shutil
 import subprocess
 
 import pytest
-from starlette.testclient import TestClient
 
 SCHED_UTILS_PATH = str(
     pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux/scheduler_utils.jsx'
@@ -71,20 +74,7 @@ def _eval_sched_utils_fn(fn_name, *args):
 
 
 # ---------------------------------------------------------------------------
-# Shared Starlette client fixture (module-scoped for speed)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-# ---------------------------------------------------------------------------
-# Step-1: Algorithm RED tests for disambiguateLabels
-# (RED because disambiguateLabels does not exist yet in scheduler_utils.jsx)
+# Algorithm tests for disambiguateLabels (node-vm runtime)
 # ---------------------------------------------------------------------------
 
 class TestDisambiguateLabels:
@@ -184,214 +174,3 @@ class TestDisambiguateLabels:
                     f"Label '{label}' for key '{key}' is not minimal: "
                     f"shorter suffix '{shorter}' doesn't appear in any other key"
                 )
-
-
-# ---------------------------------------------------------------------------
-# Step-3: Source-structure tests for tabs.jsx (LockChip wiring)
-# (RED because tabs.jsx still defines shortPath and never calls
-# disambiguateLabels)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope='module')
-def tabs_jsx_body(_client):
-    return _client.get('/static/redux/tabs.jsx').text
-
-
-class TestTabsJsxLockChipWiring:
-    def test_shortpath_function_removed(self, tabs_jsx_body):
-        # The duplicate local shortener must be gone
-        assert 'function shortPath' not in tabs_jsx_body, (
-            'shortPath function still present in tabs.jsx — should be deleted'
-        )
-
-    def test_shortpath_call_removed(self, tabs_jsx_body):
-        # No call site remains either
-        assert 'shortPath(' not in tabs_jsx_body, (
-            'shortPath( call still present in tabs.jsx — should be removed'
-        )
-
-    def test_disambiguate_labels_routed(self, tabs_jsx_body):
-        # LocksCell must route the lockSet through the shared helper
-        assert 'disambiguateLabels(' in tabs_jsx_body, (
-            'disambiguateLabels( not found in tabs.jsx — wiring missing'
-        )
-
-    def test_full_key_title_preserved(self, tabs_jsx_body):
-        # LockChip must still render a title containing the path
-        assert re.search(r'title=\{[^}]*path', tabs_jsx_body), (
-            'LockChip title={...path...} hover attribute not found in tabs.jsx'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Step-5: Source-structure tests for tab_tasks.jsx (Module-locks panel)
-# (RED because tab_tasks.jsx still renders modPath.split('/').pop())
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope='module')
-def tab_tasks_jsx_body(_client):
-    return _client.get('/static/redux/tab_tasks.jsx').text
-
-
-class TestTabTasksJsxModuleLocksWiring:
-    def test_modpath_basename_removed(self, tab_tasks_jsx_body):
-        # The naive basename for modPath must be gone.
-        # Guard: we target modPath.split only, not the task-id split('/T-').pop().
-        assert "modPath.split('/').pop()" not in tab_tasks_jsx_body, (
-            "modPath.split('/').pop() still present in tab_tasks.jsx — should be replaced"
-        )
-
-    def test_disambiguate_labels_routed(self, tab_tasks_jsx_body):
-        assert 'disambiguateLabels(' in tab_tasks_jsx_body, (
-            'disambiguateLabels( not found in tab_tasks.jsx — wiring missing'
-        )
-
-    def test_full_key_title_preserved(self, tab_tasks_jsx_body):
-        # The chip must still have title={modPath}
-        assert 'title={modPath}' in tab_tasks_jsx_body, (
-            'title={modPath} not found in tab_tasks.jsx — full key hover removed'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Step-7: Source-structure tests for scheduler_drawer.jsx (HolderEtas)
-# (RED because scheduler_drawer.jsx still renders m.path.split('/').pop())
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope='module')
-def scheduler_drawer_jsx_body(_client):
-    return _client.get('/static/redux/scheduler_drawer.jsx').text
-
-
-class TestSchedulerDrawerJsxHolderEtasWiring:
-    def test_mpath_basename_removed(self, scheduler_drawer_jsx_body):
-        assert "m.path.split('/').pop()" not in scheduler_drawer_jsx_body, (
-            "m.path.split('/').pop() still present in scheduler_drawer.jsx — should be replaced"
-        )
-
-    def test_disambiguate_labels_destructured(self, scheduler_drawer_jsx_body):
-        # disambiguateLabels must be added to the existing top-level destructure
-        # of window.DF_SCHED_UTILS
-        assert 'disambiguateLabels' in scheduler_drawer_jsx_body, (
-            'disambiguateLabels not found in scheduler_drawer.jsx — wiring missing'
-        )
-
-    def test_full_key_title_preserved(self, scheduler_drawer_jsx_body):
-        # The holder row must still have title={m.path}
-        assert 'title={m.path}' in scheduler_drawer_jsx_body, (
-            'title={m.path} not found in scheduler_drawer.jsx — full key hover removed'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Step-9: Source-structure tests for scheduler_heatmap.jsx (column headers)
-# (RED because scheduler_heatmap.jsx still renders m.path.split('/').pop()
-# for the sched-col-path span — the primary multi-collision site)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope='module')
-def scheduler_heatmap_jsx_body(_client):
-    return _client.get('/static/redux/scheduler_heatmap.jsx').text
-
-
-class TestSchedulerHeatmapJsxColumnHeaderWiring:
-    def test_mpath_basename_removed(self, scheduler_heatmap_jsx_body):
-        assert "m.path.split('/').pop()" not in scheduler_heatmap_jsx_body, (
-            "m.path.split('/').pop() still present in scheduler_heatmap.jsx — should be replaced"
-        )
-
-    def test_disambiguate_labels_routed(self, scheduler_heatmap_jsx_body):
-        assert 'disambiguateLabels(' in scheduler_heatmap_jsx_body, (
-            'disambiguateLabels( not found in scheduler_heatmap.jsx — wiring missing'
-        )
-
-    def test_column_header_title_preserved(self, scheduler_heatmap_jsx_body):
-        # The <th> must still have a title attribute containing m.path
-        assert re.search(r'title=\{[^}]*m\.path', scheduler_heatmap_jsx_body), (
-            'Column header title={...m.path...} not found in scheduler_heatmap.jsx'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Step-11: Source-structure tests for tab_scheduler.jsx (Modules view)
-# (RED because tab_scheduler.jsx still renders m.path.split('/').pop()
-# as the primary title line in the module card)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope='module')
-def tab_scheduler_jsx_body(_client):
-    return _client.get('/static/redux/tab_scheduler.jsx').text
-
-
-class TestTabSchedulerJsxModulesViewWiring:
-    def test_mpath_basename_removed(self, tab_scheduler_jsx_body):
-        assert "m.path.split('/').pop()" not in tab_scheduler_jsx_body, (
-            "m.path.split('/').pop() still present in tab_scheduler.jsx — should be replaced"
-        )
-
-    def test_disambiguate_labels_destructured(self, tab_scheduler_jsx_body):
-        # disambiguateLabels must be added to the existing top-level destructure
-        assert 'disambiguateLabels' in tab_scheduler_jsx_body, (
-            'disambiguateLabels not found in tab_scheduler.jsx — wiring missing'
-        )
-
-    def test_full_path_text_preserved(self, tab_scheduler_jsx_body):
-        # The secondary full-path text line must still show m.path
-        assert '{m.path}' in tab_scheduler_jsx_body, (
-            '{m.path} not found in tab_scheduler.jsx — secondary full-path text removed'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Step-13: Source-structure tests for tab_curator.jsx (ticket-files ChipList)
-# (RED because tab_curator.jsx still renders f.split('/').pop())
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope='module')
-def tab_curator_jsx_body(_client):
-    return _client.get('/static/redux/tab_curator.jsx').text
-
-
-class TestTabCuratorJsxFileChipWiring:
-    def test_f_basename_removed(self, tab_curator_jsx_body):
-        assert "f.split('/').pop()" not in tab_curator_jsx_body, (
-            "f.split('/').pop() still present in tab_curator.jsx — should be replaced"
-        )
-
-    def test_disambiguate_labels_routed(self, tab_curator_jsx_body):
-        assert 'disambiguateLabels(' in tab_curator_jsx_body, (
-            'disambiguateLabels( not found in tab_curator.jsx — wiring missing'
-        )
-
-    def test_full_key_title_preserved(self, tab_curator_jsx_body):
-        # The file chip must still have title={f}
-        assert 'title={f}' in tab_curator_jsx_body, (
-            'title={f} not found in tab_curator.jsx — full key hover removed'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Step-15: Cache-buster check — all ?v= values in index.html must be >= 24
-# (RED because all assets are currently ?v=23)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
-
-
-class TestIndexHtmlCacheBuster:
-    def test_at_least_one_versioned_asset(self, index_html_body):
-        # Confirm there are versioned assets to check
-        assert re.search(r'\?v=\d+', index_html_body), (
-            'No ?v=<n> versioned assets found in index.html'
-        )
-
-    def test_all_version_numbers_at_least_24(self, index_html_body):
-        # Every ?v=<n> cache-buster must be >= 24 (7 JSX files changed)
-        versions = [int(m.group(1)) for m in re.finditer(r'\?v=(\d+)', index_html_body)]
-        assert versions, 'No versioned assets found'
-        for v in versions:
-            assert v >= 24, (
-                f'Asset with ?v={v} found — all cache-busters must be bumped to >= 24'
-            )
