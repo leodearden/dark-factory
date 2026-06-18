@@ -2781,9 +2781,8 @@ async def run_main_tip_sweep(
     guarantee: a broad prune would deregister concurrently-active sibling
     probe/merge worktrees).
     """
-    import uuid
-
-    from orchestrator.git_ops import _run  # noqa: PLC0415, I001 — lazy, mirrors verify_failure_is_preexisting_on_main
+    import uuid  # noqa: PLC0415, I001
+    from orchestrator.git_ops import _run  # noqa: PLC0415 — lazy, mirrors verify_failure_is_preexisting_on_main
 
     # git worktree add CREATES tmp_path; do NOT pre-create or strict git rejects it.
     tmp_path: Path | None = None
