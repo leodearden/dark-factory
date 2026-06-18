@@ -1214,10 +1214,35 @@ class TaskInterceptor:
         verdict = self._path_guard_check(candidate, kwargs, project_id)
         if not verdict.is_rejection:
             return None
-        # Stage-1 heuristic hit — fire Stage-2 LLM adjudicator when wired.
-        # (No adjudicator → skip directly to escalate+reject, identical to before.)
-        # Stage-2 is added in step-12; this step only converts the method to async
-        # and extracts the escalation tail.
+        # Stage-1 heuristic hit — run Stage-2 LLM adjudicator when wired.
+        if self._path_scope_adjudicator is not None:
+            title = (candidate.title if candidate else '') or str(
+                kwargs.get('title') or kwargs.get('prompt') or '',
+            )
+            description = str(kwargs.get('description') or '')
+            adj = await self._path_scope_adjudicator.adjudicate(
+                title=title,
+                description=description,
+                matched_paths=verdict.matched_paths,
+                project_id=project_id,
+                suggested_project=verdict.suggested_project or '',
+                project_root=project_root,
+            )
+            if adj.should_allow_creation:
+                logger.debug(
+                    'path-guard: LLM adjudicator downgraded heuristic hit to allow '
+                    'for %r (matched=%s)',
+                    title,
+                    verdict.matched_paths,
+                )
+                return None
+            # Reject / uncertain / fail-safe: escalate carrying the LLM reason.
+            self._emit_scope_violation_escalation(
+                verdict, candidate, kwargs, project_root, project_id,
+                llm_reason=adj.reason or None,
+            )
+            return verdict.to_error_dict()
+        # No adjudicator wired → identical to pre-task-1822 behavior.
         self._emit_scope_violation_escalation(
             verdict, candidate, kwargs, project_root, project_id, llm_reason=None,
         )
