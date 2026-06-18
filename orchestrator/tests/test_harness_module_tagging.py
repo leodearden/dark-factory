@@ -12,6 +12,7 @@ from shared.cli_invoke import AllAccountsCappedException
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from orchestrator.scheduler import Scheduler
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
@@ -243,4 +244,59 @@ async def test_tag_task_modules_fetches_active_only(harness, config):
     )
     assert set(call_kwargs['statuses']) == ACTIVE_TASK_STATUSES, (
         f'Expected statuses {ACTIVE_TASK_STATUSES}, got {set(call_kwargs["statuses"])}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_tag_task_modules_forwards_merge_mode_on_wire(harness, monkeypatch):
+    """_tag_task_modules update_task wire call must carry metadata_mode='merge' (#4271 fix).
+
+    A module re-tag writes only {'files': [...]}, a partial key.  Under merge
+    (shallow last-write-wins) sibling keys like _causation_id and memory_hints
+    are preserved; under replace they are silently deleted.
+
+    RED today: the wrapper forwards nothing instead of metadata_mode='merge'.
+    GREEN after step-5 impl (scheduler.py update_task gains metadata_mode).
+    """
+    tasks_with_one_untagged = [
+        {'id': '1', 'title': 'Task A', 'status': 'pending', 'metadata': {}, 'dependencies': []},
+    ]
+
+    captured_args: list[dict] = []
+
+    async def mock_mcp_call(url, method, payload, **kwargs):
+        captured_args.append(payload)
+        return {}
+
+    # Wire harness to a real Scheduler so the full update_task wire logic runs.
+    real_scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+    real_scheduler.get_tasks = AsyncMock(return_value=tasks_with_one_untagged)
+    harness.scheduler = real_scheduler
+
+    monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+    agent_response = {'tasks': [{'id': '1', 'files': ['src/server/app.py']}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules()
+
+    # The wire call for update_task (payload['name']=='update_task') should carry
+    # metadata_mode='merge' so sibling keys survive the partial-key re-tag.
+    update_calls = [p for p in captured_args if p.get('name') == 'update_task']
+    assert len(update_calls) == 1, (
+        f'Expected exactly 1 update_task wire call; got {len(update_calls)} '
+        f'(all calls: {[p.get("name") for p in captured_args]})'
+    )
+    arguments = update_calls[0]['arguments']
+    assert arguments.get('metadata_mode') == 'merge', (
+        f"module-tagger must forward metadata_mode='merge' on the wire; got: {arguments}"
+    )
+    assert 'append' not in arguments, (
+        f"'append' key must not appear on the wire; got: {arguments}"
     )
