@@ -84,8 +84,26 @@ def load_json_or_warn(
     try:
         parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError) as exc:
-        # Corrupt branch: warn once per path, then return (default, False).
+        # Corrupt branch: dispatch on on_corrupt.
+        #
+        # fail_closed: the exception IS the loud channel — re-raise BEFORE
+        # any WARNING to avoid double-signalling.
+        if on_corrupt == 'fail_closed':
+            raise
+
+        # Validate mode early so an unknown value raises rather than silently
+        # behaving like 'warn'.
+        if on_corrupt not in ('warn', 'quarantine'):
+            raise ValueError(f'unknown on_corrupt={on_corrupt!r}')
+
+        # warn / quarantine both emit the deduped WARNING.
         logger.warning('safe_io: corrupt JSON at %s: %s', p, exc)
-        return (default, False)
+
+        if on_corrupt == 'warn':
+            return (default, False)
+
+        # quarantine: not yet implemented; fall through raises ValueError above
+        # for now (step-08 will add it).
+        raise ValueError(f'unknown on_corrupt={on_corrupt!r}')  # unreachable after step-08
 
     return (parsed, True)
