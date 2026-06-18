@@ -30,6 +30,7 @@ class TestTopLevelImports:
             invoke_with_cap_retry,
             is_timed_out_with_progress,
             is_zero_output_timeout,
+            load_json_or_warn,
             modules_conflict,
             normalize_lock,
             read_transcript_records,
@@ -58,6 +59,7 @@ class TestTopLevelImports:
         assert connect_daemon is not None
         assert AgentVerdict is not None
         assert extract_agent_verdict is not None
+        assert load_json_or_warn is not None
 
 
 class TestModuleLevelAll:
@@ -130,6 +132,12 @@ class TestModuleLevelAll:
         assert hasattr(agent_result, '__all__'), 'agent_result must define __all__'
         assert set(agent_result.__all__) == {'AgentVerdict', 'extract_agent_verdict'}
 
+    def test_safe_io_all(self):
+        from shared import safe_io
+
+        assert hasattr(safe_io, '__all__'), 'safe_io must define __all__'
+        assert set(safe_io.__all__) == {'load_json_or_warn'}
+
 
 class TestInitAllCompleteness:
     """Verify that shared.__all__ covers the union of all module __all__ entries."""
@@ -143,6 +151,7 @@ class TestInitAllCompleteness:
             config_models,
             cost_store,
             locking,
+            safe_io,
             sqlite_sync_base,
             usage_gate,
         )
@@ -155,6 +164,7 @@ class TestInitAllCompleteness:
             | set(cost_store.__all__)
             | set(async_sqlite_base.__all__)
             | set(locking.__all__)
+            | set(safe_io.__all__)
             | set(sqlite_sync_base.__all__)
         )
         assert set(shared.__all__) == union, (
@@ -172,6 +182,7 @@ class TestInitAllCompleteness:
             config_models,
             cost_store,
             locking,
+            safe_io,
             sqlite_sync_base,
             usage_gate,
         )
@@ -185,6 +196,7 @@ class TestInitAllCompleteness:
             (cost_store, 'cost_store'),
             (async_sqlite_base, 'async_sqlite_base'),
             (locking, 'locking'),
+            (safe_io, 'safe_io'),
             (sqlite_sync_base, 'sqlite_sync_base'),
         ]:
             private = [s for s in module.__all__ if s.startswith('_')]
