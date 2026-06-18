@@ -6,6 +6,7 @@ Steps covered in this file:
   step-5  RED  — quarantine_and_release
   step-7  RED  — cancel_and_release happy path
   step-9  RED  — cancel_and_release cancel-FAIL + PARK + probe
+  1795/step-1  RED  — clear_quarantine + quarantined_remote_runners
 """
 
 from __future__ import annotations
@@ -498,3 +499,126 @@ class TestHostAllocatorCancelFail:
         assert result is False
         # Slot still held (PARKED) — not freed
         assert alloc.is_busy('remoteA') is True
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-1 RED: clear_quarantine + quarantined_remote_runners
+# ---------------------------------------------------------------------------
+
+
+class TestHostAllocatorClearQuarantine:
+    """HostAllocator.clear_quarantine and quarantined_remote_runners sync tests (task 1795)."""
+
+    def _make_allocator(self, *, shared_quarantine=None):
+        from orchestrator.verify_runner import HostAllocator
+        remote_a = _FakeRemoteRunner('remoteA')
+        remote_b = _FakeRemoteRunner('remoteB')
+        q = shared_quarantine if shared_quarantine is not None else set()
+        return HostAllocator([remote_a, remote_b], quarantine=q)
+
+    # --- clear_quarantine ---
+
+    def test_clear_quarantine_removes_name_from_shared_set(self):
+        """clear_quarantine(name) discards the name from the shared quarantine set."""
+        shared_q: set[str] = {'remoteA'}
+        alloc = self._make_allocator(shared_quarantine=shared_q)
+        alloc.clear_quarantine('remoteA')
+        assert 'remoteA' not in shared_q
+
+    def test_clear_quarantine_is_idempotent_absent_name(self):
+        """clear_quarantine on a name not in quarantine is a no-op (no error)."""
+        shared_q: set[str] = set()
+        alloc = self._make_allocator(shared_quarantine=shared_q)
+        # Should not raise
+        alloc.clear_quarantine('remoteA')
+        alloc.clear_quarantine('remoteA')  # second call — still no error
+        assert shared_q == set()
+
+    def test_clear_quarantine_is_idempotent_after_clearing(self):
+        """clear_quarantine twice on the same name is safe."""
+        shared_q: set[str] = {'remoteA'}
+        alloc = self._make_allocator(shared_quarantine=shared_q)
+        alloc.clear_quarantine('remoteA')
+        alloc.clear_quarantine('remoteA')  # second call — idempotent
+        assert 'remoteA' not in shared_q
+
+    # --- quarantined_remote_runners ---
+
+    def test_quarantined_remote_runners_empty_when_none_quarantined(self):
+        """quarantined_remote_runners() returns [] when nothing is quarantined."""
+        alloc = self._make_allocator()
+        result = alloc.quarantined_remote_runners()
+        assert result == []
+
+    def test_quarantined_remote_runners_returns_quarantined_remotes(self):
+        """quarantined_remote_runners() returns (name, runner) for each quarantined remote."""
+        shared_q: set[str] = {'remoteA'}
+        alloc = self._make_allocator(shared_quarantine=shared_q)
+        result = alloc.quarantined_remote_runners()
+        assert len(result) == 1
+        name, runner = result[0]
+        assert name == 'remoteA'
+        assert runner.name == 'remoteA'  # the actual runner object
+
+    def test_quarantined_remote_runners_excludes_non_quarantined(self):
+        """quarantined_remote_runners() does not include non-quarantined remotes."""
+        shared_q: set[str] = {'remoteA'}
+        alloc = self._make_allocator(shared_quarantine=shared_q)
+        result = alloc.quarantined_remote_runners()
+        names = [n for n, _ in result]
+        assert 'remoteB' not in names
+
+    def test_quarantined_remote_runners_excludes_local(self):
+        """quarantined_remote_runners() never includes the local host even if named in the set."""
+        # The local host is not in _remote_runners so it should never appear
+        shared_q: set[str] = {'local', 'remoteA'}
+        alloc = self._make_allocator(shared_quarantine=shared_q)
+        result = alloc.quarantined_remote_runners()
+        names = [n for n, _ in result]
+        assert 'local' not in names
+        assert 'remoteA' in names
+
+    def test_quarantined_remote_runners_returns_all_quarantined_when_multiple(self):
+        """All quarantined remotes appear in the result when multiple are quarantined."""
+        shared_q: set[str] = {'remoteA', 'remoteB'}
+        alloc = self._make_allocator(shared_quarantine=shared_q)
+        result = alloc.quarantined_remote_runners()
+        names = sorted(n for n, _ in result)
+        assert names == ['remoteA', 'remoteB']
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorClearQuarantineAsync:
+    """HostAllocator.clear_quarantine async tests (task 1795)."""
+
+    def _make_allocator(self, *, shared_quarantine=None):
+        from orchestrator.verify_runner import HostAllocator
+        remote_a = _FakeRemoteRunner('remoteA')
+        remote_b = _FakeRemoteRunner('remoteB')
+        q = shared_quarantine if shared_quarantine is not None else set()
+        return HostAllocator([remote_a, remote_b], quarantine=q)
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    async def test_clear_quarantine_re_enables_host_for_acquire_remote(self):
+        """After quarantine_and_release then clear_quarantine, acquire_remote returns the host."""
+        shared_q: set[str] = set()
+        alloc = self._make_allocator(shared_quarantine=shared_q)
+        # Fill local so overflow goes to remote
+        await alloc.acquire(self._local_factory)       # local busy
+        remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        assert remote_lease is not None and remote_lease.name == 'remoteA'
+
+        await alloc.quarantine_and_release(remote_lease)
+        assert 'remoteA' in shared_q
+        # remoteA is quarantined — slot is FREE but blocked
+        assert alloc.is_busy('remoteA') is False
+
+        alloc.clear_quarantine('remoteA')
+        assert 'remoteA' not in shared_q
+
+        # acquire_remote should now return remoteA (its slot is FREE + not quarantined)
+        re_acquired = alloc.acquire_remote()
+        assert re_acquired is not None
+        assert re_acquired.name == 'remoteA'
