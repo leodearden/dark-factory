@@ -496,49 +496,161 @@ class TestGetTasksNormalizesMetadata:
             assert task['metadata'] == expected, f'failed for input: {task}'
 
 
-class TestParseToolTextResultWarning:
-    """_parse_tool_text_result must emit a WARNING when JSON parsing fails.
+# ---------------------------------------------------------------------------
+# TestGetTasksAndGetStatusFailsLoud (task 1807 — step-3 RED / step-4 GREEN)
+#
+# Replaces TestParseToolTextResultWarning: resolver-level loud tests that
+# drive get_tasks / get_status directly and assert WARNINGs emitted by the
+# shared.mcp_envelope primitive (not from orchestrator.scheduler directly).
+# ---------------------------------------------------------------------------
 
-    A malformed text block should still return None (preserving existing
-    contract) but must log a WARNING containing a ≤200-char prefix of the
-    offending text so operators can identify the source of bad output.
+class TestGetTasksAndGetStatusFailsLoud:
+    """``get_tasks`` and ``get_status`` must emit loud WARNINGs on malformed envelopes.
+
+    After migrating to ``parse_tool_result``, the WARNING logger is
+    ``shared.mcp_envelope``, not ``orchestrator.scheduler``.
+
+    Fails today:
+    - ``get_tasks`` non-list 'tasks' branch returns ``[]`` silently (no WARNING).
+    - ``get_tasks`` unparseable-JSON WARNING comes from ``orchestrator.scheduler``
+      not ``shared.mcp_envelope``.
+    - ``get_status`` non-str 'status' branch returns ``None`` silently (no WARNING).
     """
 
-    def test_invalid_json_returns_none_and_logs_warning(self, caplog):
-        import logging as _logging
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
 
-        # Build a long invalid-JSON payload so we can validate truncation.
-        bad_text = 'not valid json payload ' * 30  # 23*30 = 690 chars
-        result_envelope = {
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
             'result': {
-                'content': [
-                    {'type': 'text', 'text': bad_text},
-                ]
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
             }
         }
 
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
-            value = Scheduler._parse_tool_text_result(result_envelope, 'tasks')
+    @staticmethod
+    def _bad_json_envelope(text: str) -> dict:
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': text}]
+            }
+        }
 
-        # (1) Return contract is preserved.
-        assert value is None
+    # --- get_tasks ---
 
-        # (2) A WARNING is emitted.
-        warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
-        assert warnings, f'Expected a WARNING log. Records: {[r.message for r in caplog.records]}'
+    @pytest.mark.asyncio
+    async def test_get_tasks_non_list_emits_warning_from_shared_envelope(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """get_tasks fed a non-list 'tasks' value emits a WARNING from shared.mcp_envelope.
 
-        warning_text = ' '.join(r.getMessage() for r in warnings)
+        Fails today: the non-list branch is silent (no WARNING, just returns []).
+        """
+        import logging
 
-        # (3) The log contains a truncated prefix of the offending text.
-        truncated_prefix = bad_text[:200]
-        assert truncated_prefix in warning_text, (
-            f'Expected log to contain truncated text prefix. Got: {warning_text}'
+        # 'tasks' is a dict, not a list.
+        response = self._envelope({'tasks': {'id': '1'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
         )
 
-        # (4) The full original text is NOT present in the log (validates truncation).
-        assert bad_text not in warning_text, (
-            'Full (690-char) text must NOT appear in log — only the truncated ≤200-char prefix.'
+        with caplog.at_level(logging.WARNING):
+            result = await scheduler.get_tasks()
+
+        assert result == [], f'Expected [] on non-list; got {result!r}'
+        mcp_envelope_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'shared.mcp_envelope'
+        ]
+        assert mcp_envelope_warnings, (
+            f'Expected a WARNING from shared.mcp_envelope; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_unparseable_json_emits_warning_from_shared_envelope(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """get_tasks fed unparseable JSON emits a WARNING from shared.mcp_envelope.
+
+        Fails today: the WARNING comes from orchestrator.scheduler (via
+        _parse_tool_text_result), not from shared.mcp_envelope.
+        """
+        import logging
+
+        bad_text = 'not valid json payload ' * 30  # 690 chars
+        response = self._bad_json_envelope(bad_text)
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await scheduler.get_tasks()
+
+        assert result == [], f'Expected [] on unparseable JSON; got {result!r}'
+        mcp_envelope_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'shared.mcp_envelope'
+        ]
+        assert mcp_envelope_warnings, (
+            f'Expected a WARNING from shared.mcp_envelope; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+
+    # --- get_status ---
+
+    @pytest.mark.asyncio
+    async def test_get_status_non_str_emits_warning(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """get_status fed a non-str 'status' value emits a WARNING and returns None.
+
+        Fails today: the non-str branch is silent (no WARNING).
+        """
+        import logging
+
+        # 'status' is a dict, not a str.
+        response = self._envelope({'status': {'value': 'pending'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await scheduler.get_status('42')
+
+        assert result is None, f'Expected None on non-str; got {result!r}'
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'Expected a WARNING; got {caplog.records!r}'
+
+    @pytest.mark.asyncio
+    async def test_get_status_absent_key_emits_warning(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """get_status fed a response with no 'status' key emits a WARNING and returns None.
+
+        Fails today: the absent-key branch is silent (no WARNING).
+        """
+        import logging
+
+        # No 'status' key.
+        response = self._envelope({'task': {'id': '42'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await scheduler.get_status('42')
+
+        assert result is None
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
 class TestAcquireNextNoDuplicates:
