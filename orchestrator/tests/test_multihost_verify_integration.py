@@ -1163,6 +1163,10 @@ def _make_minimal_escalation_queue():
 
         def resolve(self, esc_id: str, resolution: str, **kw) -> None:
             self.resolved.append((esc_id, resolution))
+
+        def seed_open_l1(self, task_id: str) -> None:
+            """Mark task_id as having an open L1 alarm (simulates streak-path alarm having fired)."""
+            self._by_task[task_id] = True
     return _FakeEQ()
 
 
@@ -1358,7 +1362,7 @@ class TestUnreachableHostCapstone:
         The reprobe loop (step-16) will wire this to run automatically.
         """
         from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import _HostUnavailability
+        from orchestrator.merge_queue import _HostUnavailability, _verify_host_unreachable_sentinel
 
         worker = _make_minimal_worker()
         es = _RecordingEventStore()
@@ -1381,6 +1385,9 @@ class TestUnreachableHostCapstone:
         worker._runner_unavailable['good-host'] = _HostUnavailability(
             streak=3, first_unavailable_at=now - 300.0, reason='ssh timeout',
         )
+        # Simulate the open L1 alarm that would have been filed by the streak-based
+        # path in _finalize_inflight (streak=3 >= default threshold=3).
+        eq.seed_open_l1(_verify_host_unreachable_sentinel('good-host'))
 
         await worker._reprobe_quarantined_hosts(now)
 
@@ -1396,7 +1403,7 @@ class TestUnreachableHostCapstone:
         RED until step-16 wires _reprobe_loop into run() with a small interval.
         """
         from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import _HostUnavailability
+        from orchestrator.merge_queue import _HostUnavailability, _verify_host_unreachable_sentinel
 
         worker = _make_minimal_worker()
         worker._reprobe_interval_s = 0.01  # fire almost immediately
@@ -1423,6 +1430,9 @@ class TestUnreachableHostCapstone:
         worker._runner_unavailable['loop-host'] = _HostUnavailability(
             streak=5, first_unavailable_at=now_base - 60.0, reason='unreachable',
         )
+        # Simulate the open L1 that would have been filed by the streak path
+        # (streak=5 >= default threshold=3) so recovery path emits the event.
+        eq.seed_open_l1(_verify_host_unreachable_sentinel('loop-host'))
 
         # Start the worker
         worker_task = asyncio.create_task(worker.run())

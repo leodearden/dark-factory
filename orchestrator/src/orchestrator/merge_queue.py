@@ -5287,17 +5287,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         **both** in the allocator's quarantine set **and** tracked as
         RunnerUnavailable (``self._runner_unavailable``):
 
-        1. If ``self._unreachable_escalate_after_secs > 0`` **and**
+        1. Probes the host via ``runner.health()`` (cheap SSH reachability check).
+        2. **On success** (host recovered): clears quarantine, resets the tracker,
+           and calls :func:`_clear_verify_host_unreachable` to resolve the open
+           L1 and emit a recovery event.
+        3. **On failure** (host still unreachable): if
+           ``self._unreachable_escalate_after_secs > 0`` **and**
            ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
            fires the time-based variant of the unreachability alarm (dedup'd via
            ``has_open_l1``).  When *escalate_after_secs* is **0** the time-based
            trip is disabled (streak-only mode); see
            ``OrchestratorConfig.verify_host_unreachable_escalate_after_secs``.
-        2. Probes the host via ``runner.health()`` (cheap SSH reachability check).
-        3. On success: clears quarantine, resets the tracker, and calls
-           :func:`_clear_verify_host_unreachable` to resolve the open L1 and
-           emit a recovery event.
-        4. On failure: leaves the host quarantined; the alarm stays open.
+           Probing before alarming avoids a spurious open→immediate-resolve L1
+           churn for a host that recovers in the same cycle it would have tripped
+           the time-based threshold.
 
         **Correctness invariant**: hosts quarantined by :class:`DriftDetector`
         for verdict divergence are intentionally skipped — they are in the
@@ -5320,18 +5323,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             try:
                 downtime_s = now - entry.first_unavailable_at
 
-                # Fire the time-based alarm path (dedup'd — no-op if already open).
-                # `> 0` guard: secs=0 disables the time-based trip (streak-only).
-                if self._unreachable_escalate_after_secs > 0 and downtime_s >= self._unreachable_escalate_after_secs:
-                    _alarm_verify_host_unreachable(
-                        self._escalation_queue,
-                        name,
-                        entry.reason,
-                        streak=entry.streak,
-                        duration_s=downtime_s,
-                        event_store=self._event_store,
-                    )
-
+                # Probe health first so a host that recovers in the same cycle
+                # it would have tripped the time-based threshold goes directly
+                # to the recovery path, avoiding a spurious open→immediate-
+                # resolve L1 notification.
                 if await runner.health():
                     self._host_allocator.clear_quarantine(name)
                     self._record_runner_recovered(name)
@@ -5341,6 +5336,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         name,
                         downtime_s=downtime_s,
                     )
+                else:
+                    # Host still unreachable: fire the time-based alarm path
+                    # (dedup'd — no-op if already open).
+                    # `> 0` guard: secs=0 disables the time-based trip
+                    # (streak-only).
+                    if self._unreachable_escalate_after_secs > 0 and downtime_s >= self._unreachable_escalate_after_secs:
+                        _alarm_verify_host_unreachable(
+                            self._escalation_queue,
+                            name,
+                            entry.reason,
+                            streak=entry.streak,
+                            duration_s=downtime_s,
+                            event_store=self._event_store,
+                        )
             except Exception:
                 logger.exception(
                     'reprobe_quarantined_hosts: unexpected error probing %r; skipping',
@@ -8013,8 +8022,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if entry.lease is not None:
                     _ru_host = entry.lease.name
                     _ru_reason = vr.reason or '<unknown>'
+                    _ru_now = time.time()  # capture once for consistent timestamps
                     _should_escalate = self._record_runner_unavailable(
-                        _ru_host, _ru_reason, time.time()
+                        _ru_host, _ru_reason, _ru_now
                     )
                     if _should_escalate:
                         _ru_entry = self._runner_unavailable.get(_ru_host)
@@ -8024,7 +8034,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             _ru_reason,
                             streak=_ru_entry.streak if _ru_entry is not None else 1,
                             duration_s=(
-                                time.time() - _ru_entry.first_unavailable_at
+                                _ru_now - _ru_entry.first_unavailable_at
                                 if _ru_entry is not None else 0.0
                             ),
                             event_store=self._event_store,
@@ -9277,6 +9287,13 @@ _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL = '__warm_cold_shadow_unparseable__'
 # unreachability alarms (RunnerUnavailable) in separate dedup namespaces.
 _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX = '__verify_host_unreachable__'
 
+# Distinct prefix for recovery info sentinels — kept separate from the
+# unreachable-alarm prefix so a host literally named ``'recovered__X'``
+# cannot alias the unreachable sentinel for host ``'X'``
+# (``'__verify_host_unreachable__recovered__X'`` vs
+#  ``'__verify_host_recovered__X'`` — no collision).
+_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX = '__verify_host_recovered__'
+
 
 def _verify_host_unreachable_sentinel(host: str) -> str:
     """Return the per-host dedup sentinel task_id for unreachability alarms."""
@@ -9396,11 +9413,18 @@ def _clear_verify_host_unreachable(
     1. **Resolve open L1**: looks up all pending escalations for the per-host
        sentinel (via ``get_by_task(sentinel, status='pending')``) and resolves
        each one with a recovery message.
-    2. **Emit recovery event**: emits ``EventType.verify_host_recovered`` when an
-       event store is provided.
-    3. **Submit info escalation**: submits a ``severity='info'``, ``level=0``
-       informational escalation naming the host and the downtime duration so the
-       audit trail captures the recovery.
+    2. **Emit recovery event** *(conditional)*: emits
+       ``EventType.verify_host_recovered`` when an event store is provided,
+       **only if an alarm was actually open for this host**.
+    3. **Submit info escalation** *(conditional)*: submits a ``severity='info'``,
+       ``level=0`` informational escalation naming the host and the downtime
+       duration, **only if an alarm was actually open for this host**.
+
+    Steps 2 and 3 are gated on whether the escalation queue reports an open L1
+    for the per-host sentinel (checked via ``has_open_l1`` before resolving).
+    This suppresses spurious recovery noise for sub-threshold blips — a host
+    that flapped briefly without ever crossing *escalate_after_n* or
+    *escalate_after_secs* never filed an alarm, so no recovery record is needed.
 
     None-safe: returns immediately when *escalation_queue* is None.
 
@@ -9416,6 +9440,10 @@ def _clear_verify_host_unreachable(
 
     sentinel = _verify_host_unreachable_sentinel(host)
 
+    # Check whether an alarm was actually open before resolving — we read this
+    # BEFORE calling resolve(), which clears the open-L1 flag in many impls.
+    alarm_was_open = escalation_queue.has_open_l1(sentinel)
+
     # Resolve any pending L1 escalations for this host.
     pending = escalation_queue.get_by_task(sentinel, status='pending')
     for esc in pending:
@@ -9424,6 +9452,13 @@ def _clear_verify_host_unreachable(
             f'{downtime_s / 60.0:.1f} min of unavailability.'
         )
         escalation_queue.resolve(esc.id, resolution, resolved_by='orchestrator-verify-host-monitor')
+
+    # Only emit recovery signal when an alarm was actually open for this host.
+    # Sub-threshold blips (host flapped briefly without crossing either
+    # escalate_after_n or escalate_after_secs) never filed an alarm, so no
+    # recovery record is needed — emitting one would be spurious audit noise.
+    if not alarm_was_open:
+        return
 
     # Emit recovery event.
     if event_store is not None:
@@ -9450,7 +9485,7 @@ def _clear_verify_host_unreachable(
         'unreachability alarm resolved.  No restart required.'
     )
 
-    recovery_sentinel = f'{_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX}recovered__{host}'
+    recovery_sentinel = f'{_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX}{host}'
     esc = Escalation(
         id=escalation_queue.make_id(recovery_sentinel),
         task_id=recovery_sentinel,

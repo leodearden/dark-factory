@@ -1627,9 +1627,11 @@ class TestClearVerifyHostUnreachable:
         assert len(still_pending) == 0, 'L1 should no longer be pending after recovery'
 
     def test_emits_verify_host_recovered_event(self):
-        """When event_store is provided a verify_host_recovered event is emitted."""
+        """When event_store is provided and an alarm was open, a recovered event is emitted."""
         from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('recover-host'))
         es = _FakeEventStore()
         self._call(eq, es, 'recover-host', downtime_s=180.0)
         types = [e['event_type'] for e in es.emitted]
@@ -1638,7 +1640,9 @@ class TestClearVerifyHostUnreachable:
     def test_recovery_event_names_the_host(self):
         """The emitted verify_host_recovered event data includes the host name."""
         from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('my-box'))
         es = _FakeEventStore()
         self._call(eq, es, 'my-box', downtime_s=120.0)
         events = [e for e in es.emitted if e['event_type'] == EventType.verify_host_recovered]
@@ -1646,8 +1650,10 @@ class TestClearVerifyHostUnreachable:
         assert any('my-box' in str(e) for e in events)
 
     def test_submits_info_severity_recovery_escalation(self):
-        """An info-severity (severity='info') recovery escalation is submitted."""
+        """An info-severity recovery escalation is submitted when an alarm was open."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('recovered-host'))
         self._call(eq, None, 'recovered-host', downtime_s=60.0)
         assert len(eq.submitted) >= 1
         info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
@@ -1655,7 +1661,9 @@ class TestClearVerifyHostUnreachable:
 
     def test_recovery_escalation_has_level_0(self):
         """The recovery escalation is level=0 (informational, not L1 blocking)."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('recovered-host'))
         self._call(eq, None, 'recovered-host', downtime_s=60.0)
         info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
         assert info_escs
@@ -1663,7 +1671,9 @@ class TestClearVerifyHostUnreachable:
 
     def test_recovery_escalation_names_the_host(self):
         """Recovery escalation summary, detail, or task_id includes the host name."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('worker-node'))
         self._call(eq, None, 'worker-node', downtime_s=90.0)
         info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
         assert info_escs
@@ -1676,15 +1686,18 @@ class TestClearVerifyHostUnreachable:
         assert host_present, f'Host not found in recovery escalation: {esc}'
 
     def test_safe_when_no_open_l1(self):
-        """No L1 pre-seeded → resolve() is never called, function exits cleanly."""
+        """No L1 pre-seeded → resolve() is never called; no recovery noise emitted."""
         eq = _FakeEscalationQueueWithResolution()
         # Must not raise even when there is no pending L1 to resolve
         self._call(eq, None, 'fresh-host')
         assert len(eq.resolved) == 0
+        assert len(eq.submitted) == 0, 'no recovery noise when no alarm was open'
 
     def test_no_event_when_event_store_none(self):
-        """No raise and no event when event_store is None."""
+        """No event store → no event emitted; info escalation still submitted when alarm was open."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('host1'))
         self._call(eq, None, 'host1', downtime_s=60.0)
         # Recovery escalation is still submitted even without an event store
         assert len(eq.submitted) >= 1
@@ -1843,7 +1856,8 @@ class TestReprobeQuarantinedHosts:
         assert 'good-host' not in worker._runner_unavailable, 'tracker entry should be cleared'
 
     async def test_healthy_host_recovery_escalation_submitted(self):
-        """health()=True → _clear_verify_host_unreachable submits an info escalation."""
+        """health()=True with an open alarm → _clear_verify_host_unreachable submits info escalation."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
         worker, eq = self._make_worker_with_reprobe()
 
         fake_runner = MagicMock()
@@ -1853,11 +1867,15 @@ class TestReprobeQuarantinedHosts:
 
         now = 1000.0
         self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
+        # Pre-seed an open L1 alarm so _clear_verify_host_unreachable emits the
+        # recovery signal (mirrors the realistic path where _finalize_inflight
+        # already fired the alarm via the streak-based path).
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('good-host'))
 
         await worker._reprobe_quarantined_hosts(now)
 
         info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
-        assert info_escs, 'expected recovery info escalation after healthy reprobe'
+        assert info_escs, 'expected recovery info escalation after healthy reprobe with open alarm'
 
     async def test_divergence_quarantined_host_is_skipped(self):
         """CRITICAL: host in allocator quarantine but NOT in RU tracker is never touched."""
