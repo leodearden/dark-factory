@@ -242,6 +242,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     h.scheduler.get_status = AsyncMock(return_value='in-progress')
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.release = MagicMock()
+    h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
 
     assignment = TaskAssignment(  # type: ignore[reportMissingImports]
         task_id=tid,

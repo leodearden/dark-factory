@@ -142,6 +142,7 @@ def harness_for_registry_run_slot() -> Harness:
     h.review_checkpoint = None
     h.scheduler = MagicMock()
     h.scheduler.release = MagicMock()
+    h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
     return h
 
 
