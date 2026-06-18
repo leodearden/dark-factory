@@ -384,7 +384,12 @@ class AgentLoop:
             try:
                 structured = json.loads(structured)
             except json.JSONDecodeError:
-                structured = {'thinking': structured, 'tool_calls': []}
+                logger.warning(
+                    'cli_output_unparseable: Claude CLI reported success but structured_output'
+                    ' was unparseable JSON; treating as empty tool-call turn. Raw prefix: %s',
+                    structured[:200],
+                )
+                structured = {'thinking': structured, 'tool_calls': [], 'warning': 'cli_output_unparseable'}
         if not structured:
             structured = {'thinking': '', 'tool_calls': []}
 
@@ -419,7 +424,7 @@ class _CLIResponseAdapter:
     Exposes both the legacy ``.content`` list (for drop-in compatibility with
     the anthropic/openai branches) and direct attribute access (for
     delegation-level tests and future callers that don't need the block list):
-    ``.thinking``, ``.tool_calls``, ``.session_id``.
+    ``.thinking``, ``.tool_calls``, ``.session_id``, ``.warning``.
     """
 
     def __init__(self, structured_output: dict, session_id: str = ''):
@@ -430,6 +435,7 @@ class _CLIResponseAdapter:
         self.thinking: str = structured_output.get('thinking', '')
         self.tool_calls: list = structured_output.get('tool_calls', [])
         self.session_id: str = session_id
+        self.warning: str = structured_output.get('warning', '')
 
         if self.thinking:
             self.content.append(_TextBlock(self.thinking))
