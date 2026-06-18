@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -22,6 +23,10 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from shared.safe_io import load_json_or_warn
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -62,20 +67,44 @@ def _state_path(project_root: str | Path) -> Path:
 # State I/O
 # ---------------------------------------------------------------------------
 
-def _load_state(path: Path) -> dict[str, Any]:
-    """Load b3 state from *path*; return empty state on any error."""
-    try:
-        text = path.read_text(encoding='utf-8')
-        if not text.strip():
-            return {'launches': [], 'charges': []}
-        data = json.loads(text)
-        # Ensure both keys present
-        return {
+def _load_state_checked(path: Path) -> tuple[dict[str, Any], bool]:
+    """Load b3 state from *path*; return (state, ok).
+
+    ok=True  — file was absent (benign fresh) or valid JSON.
+    ok=False — file was corrupt/empty; a deduped WARNING has been emitted
+               by load_json_or_warn (one per path per process).
+
+    Non-FileNotFoundError OSErrors propagate (unexpected environment failure).
+    """
+    data, ok = load_json_or_warn(path, default={}, on_corrupt='warn')
+    if not ok:
+        # Corrupt/empty: return empty (fail-closed signal is the ok=False flag).
+        return ({'launches': [], 'charges': []}, False)
+    if not isinstance(data, dict):
+        # Valid JSON but not an object — treat as corrupt.
+        logger.warning(
+            'b3_gate: state file %s is not a JSON object (got %s);'
+            ' treating as corrupt',
+            path, type(data).__name__,
+        )
+        return ({'launches': [], 'charges': []}, False)
+    return (
+        {
             'launches': data.get('launches', []),
             'charges': data.get('charges', []),
-        }
-    except (OSError, json.JSONDecodeError, ValueError):
-        return {'launches': [], 'charges': []}
+        },
+        True,
+    )
+
+
+def _load_state(path: Path) -> dict[str, Any]:
+    """Load b3 state from *path*; return empty state on any error.
+
+    Thin wrapper around _load_state_checked that discards the ok flag.
+    Used by state-inspection callers (tests, _already_attempted, _cap_remaining)
+    that don't make cap-bearing decisions — keeping those ~18 call sites unchanged.
+    """
+    return _load_state_checked(path)[0]
 
 
 def _save_state(path: Path, state: dict[str, Any]) -> None:
@@ -135,7 +164,10 @@ def record_launch(
     """
     retention_cutoff = now - timedelta(days=_LAUNCH_RETENTION_DAYS)
     with _locked_state(state_path):
-        state = _load_state(state_path)
+        state, ok = _load_state_checked(state_path)
+        if not ok:
+            # Corrupt state — refuse without writing to preserve forensic bytes.
+            return {'recorded': False, 'already_attempted': False}
         # Prune stale launch entries to bound file growth
         state['launches'] = [
             e for e in state['launches']
@@ -195,7 +227,14 @@ def charge(
     Over-cap calls return ``{'charged': False, 'remaining': 0, 'reason': 'cap exceeded'}``.
     """
     with _locked_state(state_path):
-        state = _load_state(state_path)
+        state, ok = _load_state_checked(state_path)
+        if not ok:
+            # Corrupt state — treat cap as fully exhausted without writing.
+            return {
+                'charged': False,
+                'remaining': 0,
+                'reason': 'corrupt state — cap treated as exhausted',
+            }
         cutoff = now - timedelta(hours=24)
         in_window = [c for c in state.get('charges', [])
                      if _ts_in_window(c.get('charged_at', ''), cutoff)]
@@ -397,7 +436,12 @@ def _resolve_cap(config_path: str | None) -> int:
     try:
         from orchestrator.config import load_config
         return load_config(Path(config_path)).unblock_auto.b3_merge_cap_per_24h
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            'b3_gate: failed to load merge cap from config %s'
+            ' — falling back to DEFAULT_CAP=%d: %s',
+            config_path, DEFAULT_CAP, exc,
+        )
         return DEFAULT_CAP
 
 
@@ -432,7 +476,7 @@ def run_check(args: argparse.Namespace) -> None:
     now = _parse_now(args.now)
     cap = _resolve_cap(args.config)
     sp = _state_path(args.project_root)
-    state = _load_state(sp)
+    state, state_ok = _load_state_checked(sp)
 
     tag = getattr(args, 'tag', DEFAULT_TAG)
     entry = _read_latest_proposal(args.task_id, args.project_root, tag=tag)
@@ -445,13 +489,17 @@ def run_check(args: argparse.Namespace) -> None:
         now=now,
     )
 
-    # Add state-derived fields
-    result['cap_remaining'] = _cap_remaining(state, cap, now)
-    head_sha = entry.get('head_sha') if entry else None
-    investigated_at = entry.get('investigated_at') if entry else None
-    result['already_attempted'] = _already_attempted(
-        state, str(args.task_id), head_sha, investigated_at,
-    )
+    # Add state-derived fields — fail CLOSED on corrupt state
+    if state_ok:
+        result['cap_remaining'] = _cap_remaining(state, cap, now)
+        head_sha = entry.get('head_sha') if entry else None
+        investigated_at = entry.get('investigated_at') if entry else None
+        result['already_attempted'] = _already_attempted(
+            state, str(args.task_id), head_sha, investigated_at,
+        )
+    else:
+        result['cap_remaining'] = 0
+        result['already_attempted'] = False
 
     print(json.dumps(result))
 
