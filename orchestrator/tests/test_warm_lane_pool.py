@@ -1,8 +1,10 @@
 """Tests for WarmLanePool — pure state-machine tests (no git I/O)
-+ GitOps-wiring tests (step-3).
++ GitOps-wiring tests (step-3)
++ _seed_warm_lane tests (step-5).
 
 Step-1: RED — WarmLanePool and LaneState are absent; import fails.
 Step-3: RED — GitOps pool-wiring / warm_lane_base_target_path absent.
+Step-5: RED — GitOps._seed_warm_lane absent.
 """
 
 import asyncio
@@ -369,3 +371,102 @@ class TestWarmLaneBaseTargetPath:
         git_ops = GitOps(config, wl_git_repo, warm_lane_pool_size=2)
         expected = git_ops.persistent_merge_worktree_path / 'target'
         assert git_ops.warm_lane_base_target_path == expected
+
+
+# ===========================================================================
+# Step-5: RED — GitOps._seed_warm_lane
+# ===========================================================================
+
+
+async def _make_lane_dir(repo: Path, lane_name: str = '_lane-0') -> Path:
+    """Create a real worktree at <repo>/.worktrees/<lane_name> for seeding tests."""
+    worktree_base = repo / '.worktrees'
+    worktree_base.mkdir(parents=True, exist_ok=True)
+    lane = worktree_base / lane_name
+    # Use git worktree add to create the lane as a real registered worktree
+    await _run(
+        ['git', 'worktree', 'add', '-b', f'task/{lane_name}', str(lane), 'HEAD'],
+        cwd=repo,
+    )
+    return lane
+
+
+@pytest.mark.asyncio
+class TestSeedWarmLane:
+    async def test_seed_calls_script_with_correct_args(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """_seed_warm_lane invokes seed-warm-lane.sh with <base_target> <lane> <mode>."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # Create a real lane worktree so the script can live inside it
+        lane = await _make_lane_dir(wl_git_repo, '_lane-0')
+
+        # Write a stub seed-warm-lane.sh into the lane's scripts dir.
+        # The stub appends its argv (space-joined) to a marker file.
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        marker = lane / 'seed_args.txt'
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            f'#!/usr/bin/env bash\necho "$@" >> {marker}\n'
+        )
+        script.chmod(0o755)
+
+        result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+
+        assert result is True
+        assert marker.exists(), 'seed-warm-lane.sh was not called (marker missing)'
+        recorded = marker.read_text().strip()
+        base_target = str(git_ops.warm_lane_base_target_path)
+        expected = f'{base_target} {lane} --fresh-checkout'
+        assert recorded == expected, (
+            f'Wrong args: got {recorded!r}, expected {expected!r}'
+        )
+
+    async def test_seed_absent_script_returns_false(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Absent seed-warm-lane.sh → returns False (no warm capability), never raises."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        lane = await _make_lane_dir(wl_git_repo, '_lane-abs')
+        # No script installed in lane/scripts/
+        result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        assert result is False
+
+    async def test_seed_nonzero_exit_returns_false(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Script that exits non-zero → returns False (fail-soft), never raises."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        lane = await _make_lane_dir(wl_git_repo, '_lane-fail')
+
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text('#!/usr/bin/env bash\necho "failure" >&2\nexit 1\n')
+        script.chmod(0o755)
+
+        result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        assert result is False
+
+    async def test_seed_reset_in_place_mode_passes_correct_flag(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """_seed_warm_lane with '--reset-in-place' passes the correct mode flag."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        lane = await _make_lane_dir(wl_git_repo, '_lane-rip')
+
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        marker = lane / 'seed_args_rip.txt'
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            f'#!/usr/bin/env bash\necho "$@" >> {marker}\n'
+        )
+        script.chmod(0o755)
+
+        result = await git_ops._seed_warm_lane(lane, '--reset-in-place')
+        assert result is True
+        recorded = marker.read_text().strip()
+        assert recorded.endswith('--reset-in-place')
