@@ -1455,6 +1455,17 @@ class OrchestratorConfig(BaseSettings):
     stranded_reconcile_enabled: bool = Field(default=True)
     stranded_reconcile_interval_secs: float = Field(default=900.0)
 
+    # Periodic full-suite + lint + typecheck sweep of the current main tip in
+    # a throwaway detached worktree, completely off the merge hot-path so
+    # per-merge latency is untouched.  When main has advanced since the last
+    # sweep, runs run_full_verification (all subprojects in parallel) against a
+    # _mainsweep-<hex> worktree pinned at that SHA and escalates (L1,
+    # infra_issue) on drift.  Catches test-suite drift that scoped per-merge
+    # verify misses (tasks 1829 / esc-1749-16).  SHA dedup avoids redundant
+    # full builds when main hasn't advanced within the interval.
+    main_tip_sweep_enabled: bool = Field(default=True)
+    main_tip_sweep_interval_secs: float = Field(default=1800.0)
+
     # Backstop for the stranded-`blocked` gap: a task left `blocked` with no
     # open escalation AND no active workflow is an orphaned recovery (its
     # blocking escalation was resolved directly with no live workflow to
