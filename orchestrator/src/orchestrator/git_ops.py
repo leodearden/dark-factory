@@ -2129,7 +2129,7 @@ class GitOps:
         consumer logs and proceeds rather than blocking the merge on
         a transient diff error.
         """
-        rc, output, _ = await _run(
+        rc, output, stderr = await _run(
             [
                 'git', 'log', '--name-only', '--no-renames',
                 '--pretty=format:', f'{base_sha}..{branch_head}',
@@ -2138,6 +2138,10 @@ class GitOps:
             cwd=self.project_root,
         )
         if rc != 0:
+            logger.warning(
+                'get_files_touched_in_branch: git log %s..%s failed (rc=%s): %s',
+                base_sha, branch_head, rc, (stderr or '').strip()[:200],
+            )
             return []
         seen: set[str] = set()
         for ln in output.splitlines():
