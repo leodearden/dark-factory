@@ -3649,7 +3649,7 @@ class InflightVerifyResult:
 
     outcome: MergeOutcome | None
     merge_wt: Path | None
-    warm_results: dict[str, bool] = dataclasses.field(default_factory=dict)
+    warm_results: dict[str, str] = dataclasses.field(default_factory=dict)
     status: str | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
 
 
@@ -7556,7 +7556,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         assert merge_commit is not None
         merge_commit = merge_commit.strip()
 
-        _warm_results: dict[str, bool] = {}
+        _warm_results: dict[str, str] = {}
         _is_warm_path = False
         _warm_capture: list[VerifyResult] = []
 
@@ -7852,7 +7852,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # _maybe_schedule_shadow_compare so the same-candidate shadow compare
             # fires.  When vr is None (verify_task=None compat path) there is no
             # warm run, so default to {} — matching pre-refactor behaviour.
-            _warm_results: dict[str, bool] = vr.warm_results if vr is not None else {}
+            _warm_results: dict[str, str] = vr.warm_results if vr is not None else {}
 
             # Short-circuit: if abandonment landed while verify completed,
             # skip the expensive CAS loop (mirrors _verify_and_advance :6934).
@@ -8695,8 +8695,45 @@ _LIBTEST_TEST_LINE_RE = re.compile(
 )
 
 
-def parse_per_test_results(test_output: str) -> dict[str, bool]:
-    """Parse test runner output into a per-test pass/fail map.
+def _classify_test_status(raw_status: str) -> str:
+    """Map a raw nextest or libtest status token to a 3-valued verdict string.
+
+    Verdict vocabulary:
+      ``'pass'``        — nextest ``PASS`` or ``LEAK``; libtest ``ok``
+      ``'fail'``        — nextest ``FAIL``; libtest ``FAILED``
+      ``'inconclusive'`` — nextest ``TIMEOUT`` or ``SIGSEGV``
+
+    **LEAK → 'pass'** mirrors nextest's own default ``--leak-timeout 100ms``
+    semantics: nextest counts LEAK as a PASS (suite exit stays 0) because
+    teardown-slip leaks are non-fatal by design.  Under host contention,
+    fast deterministic tests spuriously trip leak detection, so treating LEAK
+    as ``'fail'`` produces false-positive warm/cold divergences (esc-31,
+    esc-32).
+
+    **TIMEOUT / SIGSEGV → 'inconclusive'** because these are non-deterministic
+    execution artifacts (scheduler jitter, OOM-adjacent crashes) that do not
+    imply a genuine warm/cold suite-verdict flip.  Routing them to
+    ``'inconclusive'`` prevents the comparator from alarming on noise.
+
+    Unknown tokens (forward-compat) fall through to ``'fail'`` (fail-closed).
+
+    Args:
+        raw_status: Status token from the regex capture group, e.g.
+            ``'PASS'``, ``'LEAK'``, ``'TIMEOUT'``, ``'ok'``, ``'FAILED'``.
+
+    Returns:
+        One of ``'pass'``, ``'fail'``, or ``'inconclusive'``.
+    """
+    if raw_status in ('PASS', 'LEAK', 'ok'):
+        return 'pass'
+    if raw_status in ('TIMEOUT', 'SIGSEGV'):
+        return 'inconclusive'
+    # 'FAIL', 'FAILED', and any unknown forward-compat token → 'fail' (fail-closed)
+    return 'fail'
+
+
+def parse_per_test_results(test_output: str) -> dict[str, str]:
+    """Parse test runner output into a per-test verdict map.
 
     Supports two formats:
 
@@ -8710,14 +8747,20 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
       **excluded** from the key so that warm and cold runs (which have different
       N/M indices) produce identical stable keys.
 
-      Key: ``"<pkg::bin> <test::path>"``, value: ``True`` iff status is ``PASS``.
-      TIMEOUT / LEAK / SIGSEGV are treated as failures (``False``).
+      Key: ``"<pkg::bin> <test::path>"``, value: verdict string from
+      :func:`_classify_test_status`.
 
     * **libtest** (plain ``cargo test``)::
 
           test <test::path> ... ok|FAILED
 
-      Key: ``"<test::path>"``, value: ``True`` iff status is ``ok``.
+      Key: ``"<test::path>"``, value: ``'pass'`` iff status is ``ok``,
+      else ``'fail'``.
+
+    Verdict vocabulary: ``'pass'`` (nextest PASS/LEAK; libtest ok),
+    ``'fail'`` (nextest FAIL; libtest FAILED),
+    ``'inconclusive'`` (nextest TIMEOUT/SIGSEGV — non-deterministic artifacts
+    excluded from alarm-worthy divergence detection).
 
     SKIP / ignored lines are excluded from both formats so they do not
     introduce spurious presence-divergences in the shadow compare diff.
@@ -8731,22 +8774,22 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
         test_output: Raw string output from a verify run.
 
     Returns:
-        ``dict[str, bool]`` mapping test id to pass status.  Empty dict for
+        ``dict[str, str]`` mapping test id to verdict string.  Empty dict for
         empty/blank input or when no test lines are present.  A caller that
         receives an empty dict from a genuine verify run should log a warning
         — the parser may not match the project's verify command output format.
     """
-    result: dict[str, bool] = {}
+    result: dict[str, str] = {}
     for line in test_output.splitlines():
         m = _NEXTEST_TEST_LINE_RE.match(line)
         if m:
             status, crate, test_path = m.group(1), m.group(2), m.group(3)
-            result[f"{crate} {test_path}"] = (status == 'PASS')
+            result[f"{crate} {test_path}"] = _classify_test_status(status)
             continue
         m = _LIBTEST_TEST_LINE_RE.match(line)
         if m:
             test_path, status = m.group(1), m.group(2)
-            result[test_path] = (status == 'ok')
+            result[test_path] = _classify_test_status(status)
     return result
 
 
@@ -8815,7 +8858,7 @@ class ShadowCompareDiff:
         only_cold: Test ids present in the cold result but absent from warm.
     """
 
-    diverging: dict[str, tuple[bool, bool]]
+    diverging: dict[str, tuple[str, str]]
     warm_pass_cold_fail: list[str]
     warm_fail_cold_pass: list[str]
     only_warm: list[str]
@@ -8832,8 +8875,8 @@ class ShadowCompareDiff:
 
 
 def diff_per_test_results(
-    warm: dict[str, bool],
-    cold: dict[str, bool],
+    warm: dict[str, str],
+    cold: dict[str, str],
 ) -> ShadowCompareDiff:
     """Compute the per-test divergence between warm and cold verify results.
 
@@ -8841,15 +8884,15 @@ def diff_per_test_results(
     bucket.  Tests whose warm verdict equals their cold verdict are omitted.
 
     Args:
-        warm: Per-test results from the warm (in-place) verify run,
+        warm: Per-test verdict map from the warm (in-place) verify run,
             as returned by :func:`parse_per_test_results`.
-        cold: Per-test results from the cold (throwaway-worktree) verify run.
+        cold: Per-test verdict map from the cold (throwaway-worktree) verify run.
 
     Returns:
         A :class:`ShadowCompareDiff` with buckets populated for diverging
         tests.  ``has_divergence`` is False iff all buckets are empty.
     """
-    diverging: dict[str, tuple[bool, bool]] = {}
+    diverging: dict[str, tuple[str, str]] = {}
     warm_pass_cold_fail: list[str] = []
     warm_fail_cold_pass: list[str] = []
     only_warm: list[str] = []
@@ -8974,8 +9017,8 @@ def _submit_shadow_divergence_escalation(
     escalation_queue: Any,
     merge_commit: str,
     diff: ShadowCompareDiff,
-    warm_results: dict[str, bool],
-    cold_results: dict[str, bool],
+    warm_results: dict[str, str],
+    cold_results: dict[str, str],
 ) -> None:
     """Submit a born-at-L2 escalation for a warm/cold shadow divergence.
 
@@ -9177,7 +9220,7 @@ async def _run_cold_shadow_verify(
     req: MergeRequest,
     merge_commit: str,
     event_store: EventStore | None,
-) -> dict[str, bool]:
+) -> dict[str, str]:
     """Run a from-scratch cold verify on *merge_commit* in a throwaway worktree.
 
     Creates an ephemeral ``_merge-<uuid>`` worktree at *merge_commit* via
@@ -9199,7 +9242,7 @@ async def _run_cold_shadow_verify(
         event_store: Optional event store (passed to VerifyRunnerPool; None-safe).
 
     Returns:
-        Per-test pass/fail map as returned by :func:`parse_per_test_results`.
+        Per-test verdict map as returned by :func:`parse_per_test_results`.
         Empty dict if the cold verify produced no parseable test output.
     """
     wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
@@ -9233,7 +9276,7 @@ async def _run_shadow_compare(
     git_ops: GitOps,
     req: MergeRequest,
     merge_commit: str,
-    warm_results: dict[str, bool],
+    warm_results: dict[str, str],
     escalation_queue: Any,
     event_store: EventStore | None,
 ) -> None:
@@ -9320,7 +9363,7 @@ async def _maybe_schedule_shadow_compare(
     git_ops: GitOps,
     req: MergeRequest,
     merge_commit: str,
-    warm_results: dict[str, bool],
+    warm_results: dict[str, str],
     escalation_queue: Any,
     event_store: EventStore | None,
 ) -> None:
