@@ -86,16 +86,20 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
     parked_by: parkedByModule[`${m.project || ''}/${m.path}`] || null,
   }));
 
-  // Memoised against `enriched` to avoid the O(n^2 * segments) scan on every
-  // re-render not triggered by a change in module data (e.g. row selection).
+  // Memoised against `modules` (the stable prop reference) to avoid the
+  // O(n^2 * segments) scan on every re-render not triggered by a change in
+  // module data (e.g. row selection).  Keying on `enriched` would not work
+  // because `enriched` is a new array reference on every render — the memo
+  // would never hit.  The path list is identical: `enriched` only adds
+  // `parked_by` metadata, which doesn't affect the labels.
   // Hook MUST run on every render path, so it precedes the early-return guard
   // below — `rows` legitimately toggles empty/non-empty on a live dashboard,
   // and a conditionally-called hook would change the hook count and crash.
   const labelMap = useMemo(
     () => (window.DF_SCHED_UTILS || {}).disambiguateLabels
-      ? window.DF_SCHED_UTILS.disambiguateLabels(enriched.map(m => m.path))
+      ? window.DF_SCHED_UTILS.disambiguateLabels((modules || []).map(m => m.path))
       : null,
-    [enriched]
+    [modules]
   );
 
   if (!rows || rows.length === 0) {
@@ -119,7 +123,7 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
                 className="sched-col-label"
                 title={m.project ? `${m.path} · ${m.project}` : m.path}
               >
-                <span className="sched-col-path">{labelMap ? labelMap.get(m.path) : m.path}</span>
+                <span className="sched-col-path">{labelMap ? labelMap.get(m.path) : m.path.split('/').pop()}</span>
                 {m.contention > 1 && (
                   <span className="sched-col-count">{m.contention}</span>
                 )}

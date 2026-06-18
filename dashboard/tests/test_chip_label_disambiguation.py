@@ -177,3 +177,16 @@ class TestDisambiguateLabels:
                     f"Label '{label}' for key '{key}' is not minimal: "
                     f"shorter suffix '{shorter}' doesn't appear in any other key"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Null-guard tests for labelFor (node-vm runtime)
+# ---------------------------------------------------------------------------
+
+class TestLabelFor:
+    def test_null_input_returns_empty(self):
+        # labelFor(null) should return {} via the null-guard `paths || []`.
+        # disambiguateLabels(undefined) would throw on [...new Set(undefined)];
+        # labelFor exists precisely to absorb that case.
+        result = _eval_sched_utils_fn('labelFor', None)
+        assert result == {}
