@@ -24,7 +24,6 @@ This file covers:
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -33,7 +32,6 @@ from _orch_helpers import _init_harness_state_for_test
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.verify import VerifyResult
-
 
 # ---------------------------------------------------------------------------
 # step-1: Config field presence and defaults
@@ -112,8 +110,8 @@ class TestRunMainTipSweepHarness:
         ):
             await h._run_main_tip_sweep()
 
-        h._escalation_queue.submit.assert_called_once()
-        submitted_esc = h._escalation_queue.submit.call_args[0][0]
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        submitted_esc = h._escalation_queue.submit.call_args[0][0]  # type: ignore[union-attr, attr-defined]
         assert submitted_esc.level == 1
         assert submitted_esc.category == 'infra_issue'
         assert submitted_esc.severity == 'blocking'
@@ -140,7 +138,7 @@ class TestRunMainTipSweepHarness:
         ):
             await h._run_main_tip_sweep()
 
-        h._escalation_queue.submit.assert_not_called()
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
         assert h._last_swept_main_sha == MAIN_SHA, (
             f'Expected _last_swept_main_sha={MAIN_SHA!r}, got {h._last_swept_main_sha!r}'
         )
@@ -159,7 +157,7 @@ class TestRunMainTipSweepHarness:
             await h._run_main_tip_sweep()
 
         mock_sweep.assert_not_called()
-        h._escalation_queue.submit.assert_not_called()
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
 
     @pytest.mark.asyncio
     async def test_run_main_tip_sweep_no_queue_noop(self) -> None:

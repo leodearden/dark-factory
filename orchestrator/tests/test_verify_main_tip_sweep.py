@@ -22,13 +22,10 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
-
-import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.verify import VerifyResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers / constants
