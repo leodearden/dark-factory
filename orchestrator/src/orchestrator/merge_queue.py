@@ -5269,6 +5269,69 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         self._runner_unavailable.pop(host, None)
 
+    async def _reprobe_quarantined_hosts(self, now: float) -> None:
+        """Probe each RU-quarantined remote host and clear on recovery.
+
+        Called periodically by :meth:`_reprobe_loop`.  For each host that is
+        **both** in the allocator's quarantine set **and** tracked as
+        RunnerUnavailable (``self._runner_unavailable``):
+
+        1. If ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
+           fires the time-based variant of the unreachability alarm (dedup'd via
+           ``has_open_l1``).
+        2. Probes the host via ``runner.health()`` (cheap SSH reachability check).
+        3. On success: clears quarantine, resets the tracker, and calls
+           :func:`_clear_verify_host_unreachable` to resolve the open L1 and
+           emit a recovery event.
+        4. On failure: leaves the host quarantined; the alarm stays open.
+
+        **Correctness invariant**: hosts quarantined by :class:`DriftDetector`
+        for verdict divergence are intentionally skipped — they are in the
+        allocator quarantine but absent from ``self._runner_unavailable``.
+        Clearing them on mere SSH reachability would bypass the drift parity
+        gate (Invariant 5).
+
+        Per-host exceptions are caught so one host's failure cannot abort the
+        sweep for the remaining hosts.
+        """
+        if self._host_allocator is None:
+            return
+
+        for name, runner in self._host_allocator.quarantined_remote_runners():
+            # Skip divergence-quarantined hosts — not tracked as RunnerUnavailable.
+            entry = self._runner_unavailable.get(name)
+            if entry is None:
+                continue
+
+            try:
+                downtime_s = now - entry.first_unavailable_at
+
+                # Fire the time-based alarm path (dedup'd — no-op if already open).
+                if downtime_s >= self._unreachable_escalate_after_secs:
+                    _alarm_verify_host_unreachable(
+                        self._escalation_queue,
+                        name,
+                        entry.reason,
+                        streak=entry.streak,
+                        duration_s=downtime_s,
+                        event_store=self._event_store,
+                    )
+
+                if await runner.health():
+                    self._host_allocator.clear_quarantine(name)
+                    self._record_runner_recovered(name)
+                    _clear_verify_host_unreachable(
+                        self._escalation_queue,
+                        self._event_store,
+                        name,
+                        downtime_s=downtime_s,
+                    )
+            except Exception:
+                logger.exception(
+                    'reprobe_quarantined_hosts: unexpected error probing %r; skipping',
+                    name,
+                )
+
     # ── owned-worktree liveness ledger ───────────────────────────────────
 
     def _register_owned_merge_worktree(self, wt: Path | None) -> None:
