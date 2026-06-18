@@ -710,7 +710,16 @@ class ReconciliationHarness:
             return {}
         try:
             statuses = await self.taskmaster.get_statuses(project_root=project_root)
-            return statuses if isinstance(statuses, dict) else {}
+            if isinstance(statuses, dict):
+                return statuses
+            logger.warning(
+                '_fetch_task_count_census: get_statuses returned a non-dict'
+                ' (type=%s, repr=%s) for %r; census cross-check will be skipped',
+                type(statuses).__name__,
+                repr(statuses)[:200],
+                project_root,
+            )
+            return {}
         except Exception as exc:
             logger.warning(
                 f'_fetch_task_count_census failed for {project_root!r}: {exc}'
