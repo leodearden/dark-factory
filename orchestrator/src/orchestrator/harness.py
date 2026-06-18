@@ -1452,7 +1452,14 @@ Output JSON matching the schema. Every task must appear in the output.
             # name (e.g. '_lane-0') never equals the real task_id by design —
             # the lane dir is named after the pool slot, not the task.
             # Cold path: recovery_id == task_id (entry.name) — byte-identical.
-            recovery_id = plan.get('task_id') if is_lane else task_id
+            # Normalize to str: plan.json could store task_id as int; dispatch
+            # and restore_assignment key off str (mirroring the str() coercion
+            # in the orphan-reaper live_ids set).
+            recovery_id = (
+                str(plan.get('task_id'))
+                if (is_lane and plan.get('task_id') is not None)
+                else task_id
+            )
 
             # For lanes: if plan.json has no task_id there is no recoverable
             # identity — release the lane back to the pool.
@@ -1572,7 +1579,13 @@ Output JSON matching the schema. Every task must appear in the output.
                     f'Recovery: worktree {task_id} has unstamped plan with no '
                     f'completed steps — cleaning up'
                 )
-                await self.git_ops.cleanup_worktree(entry, task_id)
+                # For lanes, pass recovery_id (the real task branch name) so
+                # release_warm_lane deletes the actual task branch (e.g.
+                # 'task/42') rather than the nonexistent 'task/_lane-0'.
+                # Cold path: recovery_id == task_id, so behavior is unchanged.
+                await self.git_ops.cleanup_worktree(
+                    entry, recovery_id if is_lane else task_id
+                )
                 cleaned += 1
                 continue
 
