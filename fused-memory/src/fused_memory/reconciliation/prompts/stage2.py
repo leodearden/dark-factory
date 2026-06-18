@@ -326,7 +326,13 @@ carry-forward finding — never a truncated short/8-character prefix. \
 Never construct IDs from truncated sources: a prefix will miss the written memory \
 and cause the count to return 0, falsely triggering re-carry-forward. \
 If the count is now > 0, the write succeeded — emit the finding as RESOLVED (or omit it). \
-Only propagate (carry forward) the finding as unresolved if the count is STILL 0 after the write. \
+If the count is STILL 0, treat the reconstruction write as FAILED: retry the \
+reconstruction `add_memory` once, this time PREPENDING a fresh `retry_nonce` token as a \
+new first line of the content (metadata unchanged) to defeat Mem0's ~0.92 \
+cosine-similarity dedup — retrying with identical content re-triggers dedup (the same \
+mechanism that silently lost write 74b902f8); the `retry_nonce` extends the existing \
+`summary_nonce` dedup-defeat pattern. Re-run the count check after the nonce retry. \
+Only propagate (carry forward) the finding as unresolved if the count is STILL 0 after the nonce retry. \
 \
 Failure mode: drafting the carry-forward finding from the pre-write count (0 by definition, \
 since that is why you are reconstructing) re-emits an already-resolved finding as unresolved \
