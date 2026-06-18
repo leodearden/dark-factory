@@ -4,6 +4,8 @@ import asyncio
 import logging
 from pathlib import Path
 
+from shared.agent_result import extract_agent_verdict
+
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationResult
 from fused_memory.reconciliation.agent_loop import AgentLoop, ToolDefinition
@@ -279,10 +281,16 @@ Investigate this claim against the codebase and call `verification_complete` wit
 
         result, _ = await agent.run(prompt)
 
+        verdict = extract_agent_verdict(
+            result,
+            default_verdict='inconclusive',
+            error_summary='verify_failed',
+        )
+        raw = verdict.raw or {}
         return VerificationResult(
-            verdict=result.get('verdict', 'inconclusive'),
-            confidence=result.get('confidence', 0.0),
-            evidence=result.get('evidence', []),
-            summary=result.get('summary', ''),
-            git_context=result.get('git_context'),
+            verdict=verdict.verdict,
+            confidence=raw.get('confidence', 0.0),
+            evidence=raw.get('evidence', []),
+            summary=verdict.summary,
+            git_context=raw.get('git_context'),
         )
