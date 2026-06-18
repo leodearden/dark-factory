@@ -1648,3 +1648,56 @@ async def test_call_claude_cli_legitimate_empty_calls_no_warning(caplog):
         f'Expected adapter.warning == "", got {adapter.warning!r}'
     )
     assert adapter.tool_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'structured_output',
+    [None, {}, 'null'],
+    ids=['none', 'empty_dict', 'json_null'],
+)
+async def test_call_claude_cli_empty_structured_output_emits_warning(
+    structured_output, caplog
+):
+    """When structured_output is None, {}, or JSON 'null', _call_claude_cli must:
+
+    - emit a WARNING record whose message contains 'cli_output_empty'
+    - return an adapter with .warning == 'cli_output_empty'
+    - return an adapter with .tool_calls == []
+
+    RED in step-5: the `if not structured:` branch currently swallows silently.
+    'null' parses to Python None via json.loads, then hits `if not structured`.
+    """
+    config = _make_cli_config()
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test system prompt',
+        tools={},
+        usage_gate=make_gate_mock(),
+    )
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='s',
+        structured_output=structured_output,
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        with caplog.at_level(logging.WARNING):
+            adapter = await agent._call_claude_cli(prompt='p', tools=[])
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning_records, 'Expected at least one WARNING record, got none'
+    assert any('cli_output_empty' in r.message for r in warning_records), (
+        f'Expected a WARNING containing cli_output_empty, '
+        f'got: {[r.message for r in warning_records]}'
+    )
+    assert adapter.warning == 'cli_output_empty', (
+        f'Expected adapter.warning == "cli_output_empty", got {adapter.warning!r}'
+    )
+    assert adapter.tool_calls == []
