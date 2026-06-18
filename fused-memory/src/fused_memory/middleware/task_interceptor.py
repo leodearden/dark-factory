@@ -3787,15 +3787,17 @@ def interceptor_write_succeeded(resp: object) -> bool:
     that does not include an explicit ``success`` field still classifies correctly.
     Non-dict responses (``None``, strings, lists) are always treated as failures.
 
-    .. warning::
-        An empty dict ``{}`` is treated as success (both ``success`` and ``error`` are
-        absent, so both default to their "no problem" values). This is intentional for
-        fixture compatibility, but it means a future upstream bug that returns ``{}``
-        instead of ``{'success': True, 'id': …}`` would be silently classified as a
-        successful write. Production Taskmaster responses always include at least one
-        of ``success`` or ``id``; if you see a ``{}`` in logs, investigate the caller.
+    An empty dict ``{}`` carries no positive write signal and is therefore treated as
+    **failure** (``bool({})`` is ``False``). Production Taskmaster responses always
+    include at least one of ``success`` or ``id``; if you see ``{}`` in logs,
+    investigate the caller.
     """
-    return isinstance(resp, dict) and bool(resp.get('success', True)) and not resp.get('error')
+    return (
+        isinstance(resp, dict)
+        and bool(resp)
+        and bool(resp.get('success', True))
+        and not resp.get('error')
+    )
 
 
 def _done_provenance_missing_error(task_id: str) -> dict:
