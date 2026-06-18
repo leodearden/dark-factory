@@ -6,7 +6,7 @@
 const { useState: sdUseState, useCallback: sdUseCallback, useRef: sdUseRef, useEffect: sdUseEffect } = React;
 const { timeago, fmtDateTime } = window.DF_SHELL;
 // Shared helpers loaded by scheduler_utils.jsx (must come before this script).
-const { fmtAge, totalEvents, avgWaitSeconds } = window.DF_SCHED_UTILS;
+const { fmtAge, totalEvents, avgWaitSeconds, labelFor } = window.DF_SCHED_UTILS;
 
 // Derive which modules are currently blocking this task.
 // A module blocks this task when: it is in the task's lock_set AND it has a
@@ -35,6 +35,8 @@ function HolderEtas({ task, modules, spark }) {
   const elapsed = fmtAge(task.age_seconds);
   const n = totalEvents(spark);
   const p50 = n >= 10 ? avgWaitSeconds(spark) : null;
+  // labelFor always returns a Map (scheduler_utils.jsx hard-loads before this script).
+  const labelMap = labelFor(blocked.map(m => m.path));
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -42,7 +44,7 @@ function HolderEtas({ task, modules, spark }) {
         <div key={`${m.project || ''}/${m.path}`} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11 }}>
           <div style={{ flex: 1, overflow: 'hidden' }}>
             <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)', overflow: 'hidden', textOverflow: 'ellipsis' }} title={m.path}>
-              {m.path.split('/').pop()}
+              {labelMap.get(m.path)}
             </div>
             <div style={{ color: 'var(--fg-2)' }}>
               held by <span className="mono" style={{ color: 'var(--accent)' }}>T-{m.holder}</span>

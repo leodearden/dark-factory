@@ -111,6 +111,14 @@ function QueueRow({ ticket, onCancel }) {
   const age = age_seconds != null
     ? (age_seconds < 60 ? `${age_seconds}s` : age_seconds < 3600 ? `${Math.round(age_seconds / 60)}m` : `${Math.round(age_seconds / 3600)}h`)
     : timeago(created_at);
+  // Lifted out of the render body: compute once per files-identity change, not per render.
+  // React.useMemo avoids the O(n^2 * segments) scan on re-renders unrelated to file changes.
+  const labelMap = React.useMemo(
+    () => (window.DF_SCHED_UTILS || {}).disambiguateLabels
+      ? window.DF_SCHED_UTILS.disambiguateLabels(files || [])
+      : null,
+    [files]
+  );
   return (
     <tr>
       <td className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>{shortTicketId(ticket_id)}</td>
@@ -121,7 +129,7 @@ function QueueRow({ ticket, onCancel }) {
             items={files}
             renderChip={(f, i) => (
               <span key={i} className="chip" title={f} style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>
-                {f.split('/').pop()}
+                {labelMap ? labelMap.get(f) : f}
               </span>
             )}
             maxInline={2}
