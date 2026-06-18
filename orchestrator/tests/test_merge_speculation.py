@@ -53,6 +53,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run  # noqa: F401
 from orchestrator.merge_queue import (  # noqa: F401
     SpeculativeMergeWorker,
+    _acquire_warm_verify_worktree,
     _maybe_schedule_shadow_compare,
     _submit_shadow_divergence_escalation,
 )
@@ -496,3 +497,115 @@ class TestReleaseSpecLane:
             pytest.fail(
                 f'release_spec_lane raised {type(exc).__name__} on FREE lane: {exc}'
             )
+
+
+# ===========================================================================
+# Step-13: RED — _acquire_warm_verify_worktree speculative routing
+# ===========================================================================
+
+
+def _make_spec_req(tmp_path: Path, *, spec_knob: bool, persistent: bool = False) -> MagicMock:
+    """Build a minimal MergeRequest stub for spec-routing tests."""
+    req = MagicMock()
+    req.task_id = 'task-spec-1'
+    req.config = OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            persistent_merge_worktree=persistent,
+            merge_spec_warm_lane_pool=spec_knob,
+        ),
+    )
+    return req
+
+
+def _make_spec_git_ops_spy(
+    *,
+    lane_path: Path | None = None,
+    warm_path: Path | None = None,
+) -> MagicMock:
+    """Build a GitOps MagicMock with async spies for routing assertions."""
+    git_ops = MagicMock()
+    _lane = lane_path or Path('/fake/_spec-0')
+    _warm = warm_path or Path('/fake/_merge-verify')
+    git_ops.acquire_spec_lane = AsyncMock(return_value=(_lane, True))
+    git_ops.reset_persistent_merge_worktree = AsyncMock(return_value=_warm)
+    git_ops.release_spec_lane = AsyncMock()
+    git_ops.cleanup_merge_worktree = AsyncMock()
+    return git_ops
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmVerifyWorktreeSpecRouting:
+    """_acquire_warm_verify_worktree routes speculative LOCAL items to acquire_spec_lane."""
+
+    async def test_speculative_routes_to_acquire_spec_lane(self, tmp_path: Path):
+        """speculative=True + merge_spec_warm_lane_pool → acquire_spec_lane called."""
+        req = _make_spec_req(tmp_path, spec_knob=True, persistent=True)
+        git_ops = _make_spec_git_ops_spy()
+        merge_wt = tmp_path / '_merge-abc'
+
+        await _acquire_warm_verify_worktree(
+            git_ops, req, merge_wt, 'deadbeef' * 5,
+            safety_valve_due=False, speculative=True,
+        )
+
+        git_ops.acquire_spec_lane.assert_called_once()
+        git_ops.reset_persistent_merge_worktree.assert_not_called()
+
+    async def test_non_speculative_routes_to_reset_persistent(self, tmp_path: Path):
+        """speculative=False → reset_persistent_merge_worktree (serial head), not acquire_spec_lane."""
+        req = _make_spec_req(tmp_path, spec_knob=True, persistent=True)
+        git_ops = _make_spec_git_ops_spy()
+        merge_wt = tmp_path / '_merge-abc'
+
+        await _acquire_warm_verify_worktree(
+            git_ops, req, merge_wt, 'deadbeef' * 5,
+            safety_valve_due=False, speculative=False,
+        )
+
+        git_ops.reset_persistent_merge_worktree.assert_called_once()
+        git_ops.acquire_spec_lane.assert_not_called()
+
+    async def test_spec_knob_off_ignores_speculative_flag(self, tmp_path: Path):
+        """merge_spec_warm_lane_pool=False → spec branch not taken even with speculative=True."""
+        req = _make_spec_req(tmp_path, spec_knob=False, persistent=False)
+        git_ops = _make_spec_git_ops_spy()
+        merge_wt = tmp_path / '_merge-abc'
+
+        await _acquire_warm_verify_worktree(
+            git_ops, req, merge_wt, 'deadbeef' * 5,
+            safety_valve_due=False, speculative=True,
+        )
+
+        git_ops.acquire_spec_lane.assert_not_called()
+
+    async def test_safety_valve_due_bypasses_spec_pool(self, tmp_path: Path):
+        """safety_valve_due=True → spec pool bypassed even with speculative=True + knob on."""
+        req = _make_spec_req(tmp_path, spec_knob=True, persistent=True)
+        git_ops = _make_spec_git_ops_spy()
+        merge_wt = tmp_path / '_merge-abc'
+
+        await _acquire_warm_verify_worktree(
+            git_ops, req, merge_wt, 'deadbeef' * 5,
+            safety_valve_due=True, speculative=True,
+        )
+
+        git_ops.acquire_spec_lane.assert_not_called()
+
+    async def test_speculative_warm_result_threads_back(self, tmp_path: Path):
+        """Spec acquire returns (lane_path, warm=True); function threads warm signal to caller."""
+        req = _make_spec_req(tmp_path, spec_knob=True, persistent=True)
+        lane_path = Path('/fake/_spec-0')
+        git_ops = _make_spec_git_ops_spy(lane_path=lane_path)
+        merge_wt = tmp_path / '_merge-abc'
+
+        result = await _acquire_warm_verify_worktree(
+            git_ops, req, merge_wt, 'deadbeef' * 5,
+            safety_valve_due=False, speculative=True,
+        )
+
+        # Result must be (path, warm) so the caller can route release correctly:
+        # warm=True → release_spec_lane; warm=False → cleanup_merge_worktree.
+        path, warm = result
+        assert path == lane_path
+        assert warm is True
