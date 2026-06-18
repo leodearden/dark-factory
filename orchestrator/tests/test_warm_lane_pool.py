@@ -875,3 +875,115 @@ class TestAcquireWarmLaneResetInPlace:
             if line.startswith('worktree ') and '_lane-0' in line
         ]
         assert len(lane_registrations) == 1
+
+
+# ===========================================================================
+# Step-11: RED — GitOps.release_warm_lane
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestReleaseWarmLane:
+    """release_warm_lane: FREE pool, delete branch, retain worktree + target/."""
+
+    async def _acquire_lane_a(
+        self, repo: Path, config: GitConfig,
+    ) -> tuple['GitOps', 'WorktreeInfo']:
+        """Acquire _lane-0 for task-A; return (git_ops, info)."""
+        from orchestrator.git_ops import WorktreeInfo
+        scripts_dir = repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(
+            '#!/usr/bin/env bash\nmkdir -p "$2/target"\necho seeded > "$2/target/seeded.bin"\n'
+        )
+        seed_script.chmod(0o755)
+        debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+        debug_script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        debug_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=repo)
+        await _run(['git', 'commit', '-m', 'add scripts'], cwd=repo)
+
+        git_ops = GitOps(config, repo, warm_lane_pool_size=1)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info is not None
+        return git_ops, info
+
+    async def test_release_marks_pool_free(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """After release_warm_lane, pool state for _lane-0 is FREE."""
+        from orchestrator.warm_lane_pool import LaneState
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
+
+        await git_ops.release_warm_lane(info.path, 'task-A')
+
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE
+
+    async def test_release_deletes_task_branch(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Branch task/task-A is deleted after release."""
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
+
+        await git_ops.release_warm_lane(info.path, 'task-A')
+
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/task-A'], cwd=wl_git_repo,
+        )
+        assert rc != 0, 'Branch task/task-A should be deleted after release'
+
+    async def test_release_lane_remains_registered(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """_lane-0 is still a registered git worktree after release."""
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
+        lane = info.path
+
+        await git_ops.release_warm_lane(lane, 'task-A')
+
+        assert await git_ops._is_registered_worktree(lane), (
+            '_lane-0 must remain registered after release (not removed)'
+        )
+
+    async def test_release_retains_target_dir(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """target/ (including seeded.bin) is retained after release."""
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
+        target_file = info.path / 'target' / 'seeded.bin'
+        assert target_file.exists(), 'prerequisite: seed.bin should exist after acquire'
+
+        await git_ops.release_warm_lane(info.path, 'task-A')
+
+        assert (info.path / 'target').exists(), 'target/ must be retained after release'
+        assert target_file.exists(), 'target/seeded.bin must be retained'
+
+    async def test_release_makes_lane_reacquirable(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """After release, _lane-0 can be acquired again."""
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
+        lane = info.path
+
+        await git_ops.release_warm_lane(lane, 'task-A')
+
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        info2 = await git_ops.acquire_warm_lane('task-C', start_ref.strip())
+        assert info2 is not None
+        assert info2.path == lane
+
+    async def test_release_idempotent_when_already_free(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Calling release_warm_lane on a FREE lane does not raise."""
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
+        lane = info.path
+
+        await git_ops.release_warm_lane(lane, 'task-A')
+        # Second call — pool thinks it's FREE, method must not raise
+        await git_ops.release_warm_lane(lane, 'task-A')  # must not raise
