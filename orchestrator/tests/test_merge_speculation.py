@@ -1302,3 +1302,143 @@ class TestB9CapstoneIntegration:
             f'_maybe_schedule_shadow_compare must receive non-empty warm_results; '
             f'got warm_results={call_kwargs.get("warm_results")!r}'
         )
+
+
+# ===========================================================================
+# Step-21: RED — abort paths in _run_inflight_verify must RELEASE spec lanes
+# ===========================================================================
+
+
+def _make_abort_test_worker(
+    tmp_path: Path,
+) -> tuple[SpeculativeMergeWorker, MagicMock]:
+    """Build a SpeculativeMergeWorker with async release/cleanup spies for abort tests.
+
+    Sets VERIFY_ABANDON_POLL_SECS=0.01 so the abort-poll loop ticks fast and
+    the test can trigger abort conditions after a short asyncio.sleep.
+    """
+    mock_git_ops = MagicMock()
+    mock_git_ops.project_root = tmp_path
+    mock_git_ops.release_spec_lane = AsyncMock()
+    mock_git_ops.cleanup_merge_worktree = AsyncMock()
+    worker = SpeculativeMergeWorker(mock_git_ops, asyncio.Queue())
+    worker.VERIFY_ABANDON_POLL_SECS = 0.01
+    return worker, mock_git_ops
+
+
+@pytest.mark.asyncio
+class TestSpecLaneAbortPathRelease:
+    """_run_inflight_verify abort paths (DROPPED / REQUEUED) must release spec lanes.
+
+    RED: both abort branches at merge_queue.py:7838 (DROPPED) and 7857 (REQUEUED)
+    call ``_cleanup_owned_merge_worktree(merge_wt)`` unconditionally.  When
+    ``merge_wt`` is a warm _spec- lane (``_spec_warm=True``), this removes the
+    lane from disk via ``git worktree remove``, leaving WarmLanePool ASSIGNED
+    forever — a permanent pool leak.
+
+    GREEN (step-22): both branches call
+    ``_release_or_cleanup(merge_wt, spec_warm=_spec_warm)`` which routes to
+    ``release_spec_lane(lane, warm=True)`` for the warm spec-lane path.
+    """
+
+    async def test_dropped_abort_releases_spec_lane(self, tmp_path: Path):
+        """DROPPED abort (sole-waiter cancelled) must release_spec_lane, not cleanup.
+
+        Setup: verify hangs; req.result cancelled → _request_abandoned → DROPPED.
+        Assert: release_spec_lane(fake_lane, warm=True) awaited;
+                cleanup_merge_worktree NOT called on the spec lane.
+
+        RED: _cleanup_owned_merge_worktree called unconditionally → spec lane removed.
+        GREEN (step-22): _release_or_cleanup routes spec lane to release_spec_lane.
+        """
+        cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
+        worker, mock_git_ops = _make_abort_test_worker(tmp_path)
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        lease = _make_local_lease()
+
+        async def _hang_verify(*args, **kwargs):  # noqa: ARG001
+            await asyncio.sleep(100)
+            return None
+
+        with patch(
+            'orchestrator.merge_queue._acquire_warm_verify_worktree',
+            new=AsyncMock(return_value=(fake_lane, True)),
+        ), patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            new=_hang_verify,
+        ):
+            inflight_task = asyncio.ensure_future(
+                worker._run_inflight_verify(item, lease)
+            )
+            # Let the poll loop spin (>= 5 ticks at VERIFY_ABANDON_POLL_SECS=0.01)
+            await asyncio.sleep(0.08)
+            # Cancel result future → triggers _request_abandoned → DROPPED path
+            item.request.result.cancel()
+            result = await inflight_task
+
+        assert result.status == 'DROPPED', (
+            f'Expected DROPPED, got status={result.status!r}'
+        )
+        # GREEN: warm spec lane must be RELEASED, not git-worktree-removed
+        mock_git_ops.release_spec_lane.assert_called_once_with(fake_lane, warm=True)
+        # cleanup_merge_worktree must NOT be called on the spec lane path
+        cleaned = [c.args[0] for c in mock_git_ops.cleanup_merge_worktree.call_args_list]
+        assert fake_lane not in cleaned, (
+            f'cleanup_merge_worktree was called on spec lane {fake_lane!r} — '
+            'DROPPED abort path must route warm _spec- lanes to release_spec_lane '
+            '(permanent pool leak otherwise)'
+        )
+
+    async def test_requeued_abort_releases_spec_lane(self, tmp_path: Path):
+        """REQUEUED abort (operator halt) must release_spec_lane, not cleanup.
+
+        Setup: verify hangs; worker._operator_halt set → REQUEUED (req re-queued).
+        Assert: release_spec_lane(fake_lane, warm=True) awaited;
+                cleanup_merge_worktree NOT called on the spec lane.
+
+        RED: _cleanup_owned_merge_worktree called unconditionally → spec lane removed.
+        GREEN (step-22): _release_or_cleanup routes spec lane to release_spec_lane.
+        """
+        cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
+        worker, mock_git_ops = _make_abort_test_worker(tmp_path)
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        lease = _make_local_lease()
+
+        async def _hang_verify(*args, **kwargs):  # noqa: ARG001
+            await asyncio.sleep(100)
+            return None
+
+        with patch(
+            'orchestrator.merge_queue._acquire_warm_verify_worktree',
+            new=AsyncMock(return_value=(fake_lane, True)),
+        ), patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            new=_hang_verify,
+        ):
+            inflight_task = asyncio.ensure_future(
+                worker._run_inflight_verify(item, lease)
+            )
+            # Let the poll loop spin
+            await asyncio.sleep(0.08)
+            # Set operator halt → triggers REQUEUED path
+            worker._operator_halt.set()
+            result = await inflight_task
+
+        assert result.status == 'REQUEUED', (
+            f'Expected REQUEUED, got status={result.status!r}'
+        )
+        # GREEN: warm spec lane must be RELEASED, not git-worktree-removed
+        mock_git_ops.release_spec_lane.assert_called_once_with(fake_lane, warm=True)
+        # cleanup_merge_worktree must NOT be called on the spec lane path
+        cleaned = [c.args[0] for c in mock_git_ops.cleanup_merge_worktree.call_args_list]
+        assert fake_lane not in cleaned, (
+            f'cleanup_merge_worktree was called on spec lane {fake_lane!r} — '
+            'REQUEUED abort path must route warm _spec- lanes to release_spec_lane '
+            '(permanent pool leak otherwise)'
+        )

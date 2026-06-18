@@ -5397,6 +5397,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if wt is not None:
             await self._git_ops.cleanup_merge_worktree(wt)
 
+    async def _release_or_cleanup(
+        self, merge_wt: Path | None, *, spec_warm: bool
+    ) -> None:
+        """Route worktree cleanup: release a warm _spec- lane or run cold cleanup.
+
+        A single shared helper for every cleanup site that may hold a warm
+        spec lane, preventing drift.
+
+        When ``spec_warm=True`` and ``merge_wt`` is not None, the lane is a
+        member of ``spec_warm_lane_pool`` and must be RELEASED back to FREE
+        (retaining target/ for the next assignment) rather than removed from
+        disk.  Cold/ephemeral fallback paths (``spec_warm=False``) delegate to
+        ``_cleanup_owned_merge_worktree`` which deregisters the ledger entry
+        and calls ``git worktree remove``.
+        """
+        if spec_warm and merge_wt is not None:
+            await self._git_ops.release_spec_lane(merge_wt, warm=True)
+        else:
+            await self._cleanup_owned_merge_worktree(merge_wt)
+
     def _touch_owned_merge_worktrees(self) -> int:
         """Touch (os.utime) every ledger path to refresh its mtime.
 
@@ -7835,7 +7855,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     verify_task.cancel()
                     with contextlib.suppress(BaseException):
                         await verify_task
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -7854,7 +7874,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     verify_task.cancel()
                     with contextlib.suppress(BaseException):
                         await verify_task
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                     self._queue.put_nowait(req)
                     return InflightVerifyResult(
                         outcome=None,
@@ -7882,10 +7902,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: verify end '
                 f'(merge={merge_commit[:8]}, error)'
             )
-            if _spec_warm and merge_wt is not None:
-                await self._git_ops.release_spec_lane(merge_wt, warm=True)
-            else:
-                await self._cleanup_owned_merge_worktree(merge_wt)
+            await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
             err_outcome = MergeOutcome('blocked', reason=f'Verification error: {exc}')
             if not req.result.done():
                 req.result.set_result(err_outcome)
