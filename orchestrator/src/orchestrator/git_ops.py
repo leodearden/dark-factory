@@ -762,9 +762,7 @@ class GitOps:
             and (train is None or train.get('order', 0) == 0)
             and not await self._is_registered_worktree(worktree_path)
         ):
-            pool_info = await self.acquire_warm_lane(
-                branch_name, start_ref, expected_title=expected_title,
-            )
+            pool_info = await self.acquire_warm_lane(branch_name, start_ref)
             if pool_info is not None:
                 # Carry stale_commits from the freshen result onto the pool info
                 return WorktreeInfo(
@@ -1038,8 +1036,6 @@ class GitOps:
         self,
         branch_name: str,
         start_ref: str,
-        *,
-        expected_title: str | None = None,
     ) -> 'WorktreeInfo | None':
         """Allocate a FREE warm lane, seed/reset it, and return a WorktreeInfo.
 
@@ -1052,6 +1048,13 @@ class GitOps:
         **Reset-in-place path** (lane already registered — added in step-10):
             Handled by :meth:`_reset_warm_lane`; skips re-seed (target/ already
             warm from the previous assignment).
+
+        Identity guarding (``expected_title``) is intentionally N/A here:
+        the pool gate in :meth:`create_worktree` only enters this method for
+        *fresh* dispatches (``not _is_registered_worktree(worktree_path)``),
+        so there is no stored title in the lane to compare against.  The
+        identity guard for reuse-by-name dispatches is handled entirely on
+        the cold path below the pool-acquisition block.
 
         Returns:
             WorktreeInfo on success; None on pool exhaustion, absent seed
