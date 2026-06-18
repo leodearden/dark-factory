@@ -7,7 +7,7 @@ from pathlib import Path
 from shared.agent_result import extract_agent_verdict
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import VerificationResult
+from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.reconciliation.agent_loop import AgentLoop, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -288,7 +288,7 @@ Investigate this claim against the codebase and call `verification_complete` wit
         )
         raw = verdict.raw or {}
         return VerificationResult(
-            verdict=verdict.verdict,
+            verdict=VerificationVerdict(verdict.verdict),
             confidence=raw.get('confidence', 0.0),
             evidence=raw.get('evidence', []),
             summary=verdict.summary,
