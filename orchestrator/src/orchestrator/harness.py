@@ -1924,6 +1924,30 @@ Output JSON matching the schema. Every task must appear in the output.
                 return assigned
         return self.git_ops.worktree_base / tid
 
+    async def _branch_is_degenerate(
+        self, branch: str, metadata: dict[str, Any],
+    ) -> bool:
+        """Return True iff the branch is a provisioning-only degenerate branch.
+
+        A branch is degenerate when its live tip SHA equals the recorded
+        branch_base_sha (#1226), meaning zero commits were ever pushed beyond
+        the creation point.  Called from the Guard-2 citation-miss path and the
+        Guard-3 citation-hit path in _reconcile_one_stranded to share the same
+        degeneracy signal without duplicating the three-step check.
+
+        Returns False when:
+        - branch_base_sha is absent or not a valid 40-hex SHA (backward compat
+          for pre-#1226 tasks or tasks whose metadata write failed transiently);
+        - resolve_branch_sha returns None (branch ref vanished mid-sweep —
+          treat as non-degenerate so the caller falls through to escalate); or
+        - the live tip has advanced past the recorded base SHA.
+        """
+        branch_base_sha = metadata.get('branch_base_sha')
+        if not _is_valid_sha_40(branch_base_sha):
+            return False
+        branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
+        return branch_tip_sha is not None and branch_tip_sha == branch_base_sha
+
     async def _reconcile_one_stranded(
         self, tid: str, status: str, *, mid_run: bool,
     ) -> str | None:
@@ -2000,6 +2024,33 @@ Output JSON matching the schema. Every task must appear in the output.
                 pattern_template=self.git_ops.config.commit_citation_pattern,
             )
             if citation_sha is None:
+                # -------------------------------------------------------
+                # #1823 degenerate-provisioning-branch guard.
+                #
+                # Guard 3 (below) recognises the degenerate shape on the
+                # citation-HIT path but is unreachable here — this Guard-2
+                # block bails before Guard 3 ever runs.  Each bail
+                # increments the skip counter, so after MAX_RECONCILE_FAILURES
+                # sweeps the reconciler incorrectly escalates
+                # reconcile_citation_missing for a branch that is simply
+                # provisioning-only (no work ever pushed).
+                # Repro: esc-4598-6 cluster (tasks in-progress, tip ==
+                # branch_base_sha, zero commits).
+                # _branch_is_degenerate implements the precise degeneracy
+                # test (tip == branch_base_sha, NOT rev-list==0 — see its
+                # docstring) and is shared with Guard 3 below.
+                if await self._branch_is_degenerate(branch, metadata):
+                    logger.info(
+                        'Reconcile: task %s branch is degenerate '
+                        '(zero commits beyond main; tip == branch_base_sha %s); '
+                        'skipping citation-missing escalation '
+                        '(provisioning-only branch)',
+                        tid, metadata.get('branch_base_sha'),
+                    )
+                    self._reconcile_skip_counts.pop(tid, None)
+                    return None
+                # -------------------------------------------------------
+
                 count = self._reconcile_skip_counts.get(tid, 0) + 1
                 self._reconcile_skip_counts[tid] = count
                 logger.info(
@@ -2015,29 +2066,22 @@ Output JSON matching the schema. Every task must appear in the output.
                     self._escalate_reconcile_skip(tid, status, count)
                 return None
 
-            # Guard 3 — branch-advanced structural check.
+            # Guard 3 — branch-advanced structural check (#1226).
             # Guards 1 (open L1) and 2 (citation grep) are content
             # heuristics.  This guard is structural: it rejects the
             # false-positive shape where a zero-commit branch sits on a
             # main ancestor (is_ancestor returns True trivially) even
-            # though no real implementation work was pushed.  We compare
-            # the live branch tip against the recorded branch_base_sha
-            # written by workflow._setup_worktree_and_artifacts at
-            # branch-creation time.
-            #
-            # Missing / malformed branch_base_sha → fall through (backward
-            # compat for tasks created before this guard was deployed, or
-            # if the metadata write failed transiently at creation time).
-            branch_base_sha = metadata.get('branch_base_sha')
-            if _is_valid_sha_40(branch_base_sha):
-                branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
-                if branch_tip_sha == branch_base_sha:
-                    logger.info(
-                        'Reconcile: task %s branch tip == branch_base_sha (%s); '
-                        'branch never advanced past creation — vetoing auto-flip',
-                        tid, branch_base_sha,
-                    )
-                    return None
+            # though no real implementation work was pushed.
+            # _branch_is_degenerate encapsulates the tip==branch_base_sha
+            # check (missing / malformed base SHA → returns False →
+            # fall through to flip, preserving backward compat).
+            if await self._branch_is_degenerate(branch, metadata):
+                logger.info(
+                    'Reconcile: task %s branch tip == branch_base_sha (%s); '
+                    'branch never advanced past creation — vetoing auto-flip',
+                    tid, metadata.get('branch_base_sha'),
+                )
+                return None
 
             # All guards passed — clear the skip counter and flip.
             self._reconcile_skip_counts.pop(tid, None)
