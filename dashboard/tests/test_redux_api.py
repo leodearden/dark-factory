@@ -82,6 +82,32 @@ def test_shape_orchestrators_last_update_none_when_absent():
     assert orch['last_update'] is None
 
 
+def test_shape_orchestrators_propagates_offline_marker():
+    """shape_orchestrators must copy offline=True / error from the raw entry to the wire dict.
+
+    Fails today because the out_orchs.append() block does not include offline/error keys.
+    """
+    raw = [{
+        'pids': [7777],
+        'prd': '/home/leo/src/dark-factory/prd.md',
+        'label': 'dark-factory/main',
+        'project_root': '/home/leo/src/dark-factory',
+        'running': True,
+        'started': 'Mar18',
+        'last_update': None,
+        'tasks': [],
+        'worktrees': {},
+        'summary': {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0},
+        'offline': True,
+        'error': 'boom',
+    }]
+
+    body = redux_api.shape_orchestrators(raw)
+    [orch] = body['ORCHESTRATORS']
+    assert orch.get('offline') is True, f'expected offline=True in ORCHESTRATORS entry, got: {orch}'
+    assert orch.get('error') == 'boom', f'expected error=boom in ORCHESTRATORS entry, got: {orch}'
+
+
 # ---------------------------------------------------------------------------
 # shape_memory
 # ---------------------------------------------------------------------------

@@ -1118,3 +1118,37 @@ class TestDiscoverOrchestratorsPerProject:
 
         assert len(result) == 1
         assert result[0]['last_update'] == '2026-06-14T20:00:00'
+
+
+class TestDiscoverOrchestratorsOfflineMarker:
+    """Tests for discover_orchestrators propagating the MCP offline marker."""
+
+    async def test_offline_marker_preserved_not_discarded(self, tmp_path, monkeypatch, dummy_client):
+        """When fetch_tasks returns the offline marker, the project entry must still appear
+        with offline=True and error from the marker, not be silently discarded.
+
+        Fails today because `fetched if isinstance(fetched, list) else []` discards the marker.
+        """
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+        prd_path = str(tmp_path / 'prd.md')
+        mock_procs = [{'pid': 9999, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar18'}]
+
+        async def offline_fetch(client, cfg, project_root):
+            return {'offline': True, 'error': 'boom'}
+
+        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', offline_fetch)
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = await discover_orchestrators(client=dummy_client, config=config)
+
+        assert len(result) == 1, 'offline-marker entry must NOT be dropped from the result'
+        entry = result[0]
+        assert entry.get('offline') is True, f'expected offline=True, got: {entry}'
+        assert entry.get('error') == 'boom', f'expected error=boom, got: {entry}'
+        # Summary should be all-zero (no tasks)
+        s = entry.get('summary', {})
+        assert s.get('total', -1) == 0
