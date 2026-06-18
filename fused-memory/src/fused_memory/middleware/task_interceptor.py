@@ -221,6 +221,7 @@ class TaskInterceptor:
         bulk_reset_guard: 'BulkResetGuard | None' = None,
         prefix_registry: ProjectPrefixRegistry | None = None,
         scope_violation_escalator: ScopeViolationEscalator | None = None,
+        path_scope_adjudicator: 'PathScopeAdjudicator | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -323,6 +324,10 @@ class TaskInterceptor:
         # and fires a scope_violation escalation alongside any rejection.
         self._prefix_registry = prefix_registry
         self._scope_violation_escalator = scope_violation_escalator
+        # Stage-2 LLM adjudicator (task 1822): runs only on Stage-1 heuristic hit
+        # to distinguish real misroutes from incidental-mention false positives.
+        # None (default) → exact current behavior (guard not weakened).
+        self._path_scope_adjudicator = path_scope_adjudicator
 
         # Task write-journal (Commit 7): mirrors MemoryService's
         # ``set_write_journal`` pattern. When wired by the bootstrap, every
@@ -1103,7 +1108,57 @@ class TaskInterceptor:
         v = self._path_guard_check(candidate, kwargs, project_id)
         return v.to_error_dict() if v.is_rejection else None
 
-    def _path_guard_or_skip(
+    def _emit_scope_violation_escalation(
+        self,
+        verdict: PathGuardVerdict,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_root: str,
+        project_id: str,
+        *,
+        llm_reason: str | None = None,
+    ) -> None:
+        """Fire the scope_violation escalation on a rejection verdict.
+
+        Pure side-effect helper: resolves the suggested root, builds the
+        candidate title, and delegates to :attr:`_scope_violation_escalator`.
+        Errors are logged and swallowed so a queue failure can never convert
+        a rejection into an exception (matches the never-raise convention).
+        No-ops when no escalator is configured.
+
+        The optional *llm_reason* is forwarded to ``report_rejection``
+        (task 1822) so genuine-misroute / fail-safe cases carry the LLM
+        adjudicator's reason in the escalation detail.
+        """
+        if self._scope_violation_escalator is None:
+            return
+        registry = self._prefix_registry
+        suggested_root: str | None = None
+        if verdict.suggested_project and registry is not None:
+            suggested_root = registry.root_for_project(verdict.suggested_project)
+        candidate_title = (candidate.title if candidate else '') or str(
+            kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
+        )[:200]
+        try:
+            self._scope_violation_escalator.report_rejection(
+                project_root=project_root,
+                project_id=project_id,
+                candidate_title=candidate_title,
+                matched_paths=verdict.matched_paths,
+                suggested_project=verdict.suggested_project,
+                suggested_root=suggested_root,
+                llm_reason=llm_reason,
+            )
+        except Exception:  # pragma: no cover — defensive only
+            # Escalator is built to never raise (queue failures are
+            # logged), but if a future change regresses we must not
+            # turn a rejection into an exception.
+            logger.exception(
+                'task_interceptor: scope_violation_escalator raised; '
+                'continuing with rejection error',
+            )
+
+    async def _path_guard_or_skip(
         self,
         kwargs: dict[str, Any],
         project_root: str,
@@ -1139,8 +1194,16 @@ class TaskInterceptor:
         that skips the build entirely for dark_factory still applies in
         back-compat mode.
 
+        Stage-2 LLM adjudication (task 1822): when
+        :attr:`_path_scope_adjudicator` is wired and the heuristic fires,
+        the adjudicator runs inline.  A confident ``allow`` verdict permits
+        the submission without escalation; all other outcomes (reject /
+        uncertain / fail-safe) preserve the existing reject+escalate
+        behaviour.  When no adjudicator is wired the method behaves exactly
+        as before (guard not weakened).
+
         Call-site pattern:
-            ``if err := self._path_guard_or_skip(kwargs, project_root, project_id): return err``
+            ``if err := await self._path_guard_or_skip(kwargs, project_root, project_id): return err``
         """
         registry = self._prefix_registry
         # Back-compat fast path: no registry + dark_factory → guard is a no-op.
@@ -1151,31 +1214,13 @@ class TaskInterceptor:
         verdict = self._path_guard_check(candidate, kwargs, project_id)
         if not verdict.is_rejection:
             return None
-        # Fire the scope_violation escalation alongside the rejection.
-        if self._scope_violation_escalator is not None:
-            suggested_root: str | None = None
-            if verdict.suggested_project and registry is not None:
-                suggested_root = registry.root_for_project(verdict.suggested_project)
-            candidate_title = (candidate.title if candidate else '') or str(
-                kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
-            )[:200]
-            try:
-                self._scope_violation_escalator.report_rejection(
-                    project_root=project_root,
-                    project_id=project_id,
-                    candidate_title=candidate_title,
-                    matched_paths=verdict.matched_paths,
-                    suggested_project=verdict.suggested_project,
-                    suggested_root=suggested_root,
-                )
-            except Exception:  # pragma: no cover — defensive only
-                # Escalator is built to never raise (queue failures are
-                # logged), but if a future change regresses we must not
-                # turn a rejection into an exception.
-                logger.exception(
-                    'task_interceptor: scope_violation_escalator raised; '
-                    'continuing with rejection error',
-                )
+        # Stage-1 heuristic hit — fire Stage-2 LLM adjudicator when wired.
+        # (No adjudicator → skip directly to escalate+reject, identical to before.)
+        # Stage-2 is added in step-12; this step only converts the method to async
+        # and extracts the escalation tail.
+        self._emit_scope_violation_escalation(
+            verdict, candidate, kwargs, project_root, project_id, llm_reason=None,
+        )
         return verdict.to_error_dict()
 
     async def _execute_combine(
@@ -1458,7 +1503,7 @@ class TaskInterceptor:
         # _build_candidate is skipped on the hot path.  Rejections also fire a
         # scope_violation escalation when the escalator is configured.
         # Must run before kwargs.pop('metadata') below so the helper can read metadata.
-        if err := self._path_guard_or_skip(kwargs, project_root, project_id):
+        if err := await self._path_guard_or_skip(kwargs, project_root, project_id):
             return err
 
         metadata = kwargs.pop('metadata', None)
