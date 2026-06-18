@@ -1818,7 +1818,12 @@ class Scheduler:
             memory_hints instead of silently clobbering them.
             ``'additive'``: recursive list-union, dict-recursive, scalar
             OLD-wins.  Use for list-growth writes (e.g. dry_run_proposals).
-            ``'replace'``: whole-blob overwrite, delete-by-omission.
+            ``'replace'``: whole-blob overwrite, delete-by-omission.  Also
+            the sanctioned repair path if a task's persisted metadata is
+            corrupt (non-dict): under ``'merge'`` or ``'additive'``, the
+            backend will raise the corrupt-blob guard rather than silently
+            overwriting, so a corrupted blob requires an explicit
+            ``metadata_mode='replace'`` call to repair.
         append:
             Legacy shorthand kept for back-compat.  Resolved to
             ``'additive'`` when ``True``.  Ignored when ``metadata_mode``

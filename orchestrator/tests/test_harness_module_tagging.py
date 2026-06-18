@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _orch_helpers import assert_update_wire_mode
 from shared.cli_invoke import AllAccountsCappedException
 
 from orchestrator.agents.invoke import AgentResult
@@ -288,15 +289,4 @@ async def test_tag_task_modules_forwards_merge_mode_on_wire(harness, monkeypatch
 
     # The wire call for update_task (payload['name']=='update_task') should carry
     # metadata_mode='merge' so sibling keys survive the partial-key re-tag.
-    update_calls = [p for p in captured_args if p.get('name') == 'update_task']
-    assert len(update_calls) == 1, (
-        f'Expected exactly 1 update_task wire call; got {len(update_calls)} '
-        f'(all calls: {[p.get("name") for p in captured_args]})'
-    )
-    arguments = update_calls[0]['arguments']
-    assert arguments.get('metadata_mode') == 'merge', (
-        f"module-tagger must forward metadata_mode='merge' on the wire; got: {arguments}"
-    )
-    assert 'append' not in arguments, (
-        f"'append' key must not appear on the wire; got: {arguments}"
-    )
+    assert_update_wire_mode(captured_args, 'merge')

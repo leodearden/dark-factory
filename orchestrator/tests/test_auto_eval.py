@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import _init_harness_state_for_test, pydantic_spec
+from _orch_helpers import assert_update_wire_mode, _init_harness_state_for_test, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
@@ -350,20 +350,7 @@ async def test_auto_eval_back_link_forwards_merge_mode(tmp_path: Path, monkeypat
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
 
     # update_task must have been called exactly once (the back-link write).
-    update_wire_calls = [
-        p for p in captured_update_payloads if p.get('name') == 'update_task'
-    ]
-    assert len(update_wire_calls) == 1, (
-        f'Expected 1 update_task wire call; got {len(update_wire_calls)} '
-        f'(all: {[p.get("name") for p in captured_update_payloads]})'
-    )
-    arguments = update_wire_calls[0]['arguments']
-    assert arguments.get('metadata_mode') == 'merge', (
-        f"auto-eval back-link must forward metadata_mode='merge'; got: {arguments}"
-    )
-    assert 'append' not in arguments, (
-        f"'append' key must not appear on the wire; got: {arguments}"
-    )
+    arguments = assert_update_wire_mode(captured_update_payloads, 'merge')
 
     # Full-blob assertions: auto_eval_pair and seeded sibling memory_hints both present.
     blob = _json.loads(arguments['metadata'])

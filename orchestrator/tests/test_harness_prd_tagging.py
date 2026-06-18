@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _orch_helpers import assert_update_wire_mode
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
@@ -253,15 +254,4 @@ async def test_tag_prd_metadata_forwards_merge_mode_on_wire(harness, tmp_path, m
     await harness._tag_prd_metadata(prd, pre_ids)
 
     # The wire call for update_task must carry metadata_mode='merge' so siblings survive.
-    update_calls = [p for p in captured_args if p.get('name') == 'update_task']
-    assert len(update_calls) == 1, (
-        f'Expected exactly 1 update_task wire call; got {len(update_calls)} '
-        f'(all calls: {[p.get("name") for p in captured_args]})'
-    )
-    arguments = update_calls[0]['arguments']
-    assert arguments.get('metadata_mode') == 'merge', (
-        f"prd-tagger must forward metadata_mode='merge' on the wire; got: {arguments}"
-    )
-    assert 'append' not in arguments, (
-        f"'append' key must not appear on the wire; got: {arguments}"
-    )
+    assert_update_wire_mode(captured_args, 'merge')

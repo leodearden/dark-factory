@@ -25,6 +25,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.models import Escalation
 
+from _orch_helpers import assert_update_wire_mode
+
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.scheduler import Scheduler
@@ -943,19 +945,4 @@ class TestReblockGuardWireMode:
 
         assert result is True, 'Guard should allow the flip (count=2 < threshold=3)'
 
-        update_wire_calls = [
-            p for p in captured_payloads if p.get('name') == 'update_task'
-        ]
-        assert len(update_wire_calls) == 1, (
-            f'Expected 1 update_task wire call; got {len(update_wire_calls)} '
-            f'(all: {[p.get("name") for p in captured_payloads]})'
-        )
-        arguments = update_wire_calls[0]['arguments']
-        assert arguments.get('metadata_mode') == 'merge', (
-            f"_check_reblock_guard must forward metadata_mode='merge' so the "
-            f"whole reblock_guard sub-dict is overwritten wholesale (new count "
-            f"wins) and sibling keys are preserved; got: {arguments}"
-        )
-        assert 'append' not in arguments, (
-            f"'append' key must not appear on the wire; got: {arguments}"
-        )
+        assert_update_wire_mode(captured_payloads, 'merge')

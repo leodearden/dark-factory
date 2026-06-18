@@ -688,10 +688,15 @@ class TestDryRunWireMode:
     """
 
     @pytest.mark.asyncio
-    async def test_proposal_persist_forwards_additive_and_trim_forwards_merge(
+    async def test_proposal_persist_and_trim_wire_modes(
         self, tmp_path, monkeypatch
     ):
-        """proposal persist → metadata_mode='additive'; trim write → metadata_mode='merge'."""
+        """Wire-mode assertions only: proposal persist → 'additive'; trim → 'merge'.
+
+        Verifies the flags forwarded on the wire; behavioral verification
+        (additive actually appends, merge actually trims) lives in the
+        separate _RecordingScheduler / TestKeepLastNTrim suite.
+        """
         from orchestrator.dry_run_unblock import run_dry_run_unblock
 
         repo_dir = tmp_path / 'repo'
