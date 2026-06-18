@@ -410,6 +410,7 @@ class TestTrainIntegrationB2:
     a regression in the former's post-merge verify→block path.
     """
 
+    @pytest.mark.exercise_merge_verify
     async def test_lower_member_break_blocks_train(
         self,
         cargo_or_skip,  # noqa: ARG002

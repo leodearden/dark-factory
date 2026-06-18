@@ -731,6 +731,7 @@ class TestScenario5GroupMergeVerify:
             f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
         )
 
+    @pytest.mark.exercise_merge_verify
     async def test_group_merge_workspace_verify_red(
         self,
         cargo_or_skip,  # noqa: ARG002
