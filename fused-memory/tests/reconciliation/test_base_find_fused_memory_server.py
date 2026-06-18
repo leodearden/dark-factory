@@ -11,8 +11,6 @@ from __future__ import annotations
 import json
 import logging
 
-import pytest
-
 from fused_memory.reconciliation.stages.base import _find_fused_memory_server
 
 _DEFAULT_UV_STDIO = {

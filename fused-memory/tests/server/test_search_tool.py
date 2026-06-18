@@ -11,7 +11,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
-import pytest_asyncio
 
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import SearchResults

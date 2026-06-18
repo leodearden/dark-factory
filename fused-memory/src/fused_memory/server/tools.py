@@ -787,7 +787,7 @@ def create_mcp_server(
                 session_id=session_id,
                 include_planned=include_planned,
             )
-            response = {'results': [r.model_dump() for r in results]}
+            response: dict[str, Any] = {'results': [r.model_dump() for r in results]}
             # Fault-only loudness: surface degraded/failed_stores only when the
             # search was degraded (a selected store timed out or raised).  Uses
             # getattr so a plain list return (back-compat callers) is harmless.
