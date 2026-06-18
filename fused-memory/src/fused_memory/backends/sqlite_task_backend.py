@@ -866,6 +866,7 @@ class SqliteTaskBackend:
             if metadata is not None:
                 new_metadata = _merge_metadata(
                     row['metadata'], metadata, append=append,
+                    project_root=project_root, tag=tag, task_id=tid,
                 )
                 set_columns.append('metadata = ?')
                 set_values.append(new_metadata)
