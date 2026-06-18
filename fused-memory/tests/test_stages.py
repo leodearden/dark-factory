@@ -11300,3 +11300,40 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
         stage.record_task_dump_spot_check(report)
         assert 'task_dump_spot_check' not in report.stats
 
+
+class TestStage2RetroactiveSummaryWriteReliability:
+    """Minimal existence checks for Stage 2 retroactive-summary write reliability fixes.
+
+    Task 1796: three root causes behind the f1f09b5a / write 74b902f8 silent loss
+    (one of two near-duplicate RETROACTIVE writes deduped by Mem0 during run 1e72763a).
+
+    Follows the task-1570 norm (documented in TestStage2PromptNonceMechanism):
+    single-token mechanism-existence checks against build_stage2_system_prompt and
+    STAGE2_SYSTEM_PROMPT — NOT prose-phrase pins (brittle/no behavioral value).
+
+    One negative assertion ('with the same content and metadata' not in STAGE2_SYSTEM_PROMPT)
+    is a root-cause regression guard: the dedup-trap retry instruction is exactly what
+    re-triggered Mem0 cosine-similarity dedup and silently lost write 74b902f8. Mirrors
+    the sanctioned 'update_task(status=' not in STAGE2_SYSTEM_PROMPT precedent at line 1216.
+    """
+
+    def test_triple_filter_mandates_full_run_id_uuid(self):
+        """build_stage2_system_prompt('dark_factory') must include 'full run_id UUID'.
+
+        The count_memories_by_metadata({'kind':'cycle_summary','run_id':<run_id>,
+        'stage':'task_knowledge_sync'}) triple-filter post-write confirmation must use
+        the COMPLETE run_id UUID — never a truncated short/8-char prefix (e.g. the
+        recon-xxxxxxxx display id from harness.py). Using a truncated prefix can cause
+        the count check to silently miss the written memory, incorrectly triggering the
+        retry path (the f1f09b5a / write 74b902f8 incident).
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        result = build_stage2_system_prompt('dark_factory')
+        assert 'full run_id UUID' in result, (
+            "build_stage2_system_prompt('dark_factory') must instruct the Stage 2 agent "
+            "to use the 'full run_id UUID' in the triple-filter post-write confirmation "
+            "(count_memories_by_metadata on kind/run_id/stage) — never a truncated "
+            "short/8-char prefix (cf. harness.py recon-{run_id[:8]} display ids; "
+            "stage1.py:80 'Never construct IDs from truncated sources')."
+        )
