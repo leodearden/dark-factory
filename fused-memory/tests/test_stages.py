@@ -11350,7 +11350,10 @@ class TestStage2RetroactiveSummaryWriteReliability:
         STAGE2_SYSTEM_PROMPT — retrying with identical content is the exact mechanism
         that silently lost write 74b902f8 (root cause of the f1f09b5a incident).
         """
-        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt, STAGE2_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage2 import (
+            STAGE2_SYSTEM_PROMPT,
+            build_stage2_system_prompt,
+        )
 
         result = build_stage2_system_prompt('dark_factory')
         assert 'retry_nonce' in result, (
