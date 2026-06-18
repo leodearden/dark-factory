@@ -413,6 +413,11 @@ class Harness:
             warm_lane_pool_size=(
                 config.max_concurrent_tasks if config.git.warm_lane_pool else 0
             ),
+            # Spec-pool size: K (same as speculation_depth) when knob on, else 0.
+            # self._speculation_k is safe here — self.config is already set above.
+            merge_spec_warm_lane_pool_size=(
+                self._speculation_k if config.git.merge_spec_warm_lane_pool else 0
+            ),
         )
         self.scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
         # Wire the park-stop trip callback: Scheduler trips → Harness.pause_scheduler.
@@ -604,6 +609,19 @@ class Harness:
 
         # Singleton lock — held for the duration of run()
         self._lock_file: IO | None = None
+
+    @property
+    def _speculation_k(self) -> int:
+        """Single shared K source: 1 + len(enabled_verify_runners).
+
+        Used by BOTH GitOps spec-pool sizing (harness.__init__) and
+        _start_merge_worker (speculation_depth + enforce_persistent_worktree_serial_lane)
+        so the spec pool size and the worker cap cannot drift as verify_runners grows.
+
+        Mirrors the invariant comment at _start_merge_worker: all three Lever-C knobs
+        derive from ONE expression.
+        """
+        return 1 + len(self.config.enabled_verify_runners)
 
     def _init_digest_state(self) -> None:
         """Initialise task-1327 AFK-hardening digest counters.
@@ -3814,7 +3832,9 @@ Output JSON matching the schema. Every task must appear in the output.
         # config.verify_runners by task 1716 (Lever C operator-enable path).
         # DO NOT flip reify's orchestrator.yaml verify_runners on until the
         # verdict-parity report is green (PRD D6 gate; see task 1716 analysis).
-        _k: int = 1 + len(self.config.enabled_verify_runners)
+        # NOTE: use self._speculation_k — single shared source so GitOps spec-pool
+        # size (set at __init__) and speculation_depth here cannot drift apart.
+        _k: int = self._speculation_k
 
         # Fail-CLOSED on an over-budget liveness verdict: refuse to start the merge
         # worker and propagate MergeLivenessConfigError to the caller.
