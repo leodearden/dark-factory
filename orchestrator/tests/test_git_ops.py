@@ -5840,3 +5840,375 @@ class TestRecoverRedMain:
             f'No dirty-tree warning found in records; all warnings: '
             f'{[r.getMessage() for r in warnings]}'
         )
+
+
+# ===========================================================================
+# Step-13: RED — create_worktree routes through warm-lane pool (B8 + B10)
+# ===========================================================================
+
+
+async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
+    """Commit stub seed-warm-lane.sh + setup-worktree-debug-port.sh into repo."""
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    seed_script = scripts_dir / 'seed-warm-lane.sh'
+    seed_script.write_text(
+        '#!/usr/bin/env bash\nmkdir -p "$2/target"\necho "seeded" > "$2/target/seeded.bin"\n'
+    )
+    seed_script.chmod(0o755)
+    debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+    debug_script.write_text(f'#!/usr/bin/env bash\necho {port}\n')
+    debug_script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeWarmLaneRouting:
+    """create_worktree uses the pool when enabled, falls back to cold on exhaustion."""
+
+    async def test_warm_path_returns_lane_not_branch_named_dir(
+        self, git_repo: Path,
+    ):
+        """With pool enabled, create_worktree returns _lane-0 not <worktree_base>/A."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        info = await git_ops.create_worktree('A')
+
+        expected_lane = git_ops.worktree_base / '_lane-0'
+        assert info.path == expected_lane, (
+            f'Expected _lane-0 ({expected_lane}), got {info.path}'
+        )
+
+    async def test_warm_path_lane_registered_on_task_branch(
+        self, git_repo: Path,
+    ):
+        """The returned lane is a registered worktree on branch task/A."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        assert await git_ops._is_registered_worktree(info.path)
+        _, branch, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=info.path,
+        )
+        assert branch.strip() == 'task/A'
+
+    async def test_warm_path_landlock_confined_to_lane(
+        self, git_repo: Path,
+    ):
+        """build_landlock_command with lane path produces --writable paths within the lane."""
+        from orchestrator.agents.landlock import build_landlock_command
+
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        # Simulate landlock wrapping with the returned path
+        cmd = build_landlock_command(['cargo', 'test'], info.path, ['src'])
+
+        # All --writable paths must be under the lane, not some other dir
+        writable_paths = [
+            cmd[i + 1] for i, arg in enumerate(cmd) if arg == '--writable'
+        ]
+        lane_resolved = str(info.path.resolve())
+        for wp in writable_paths:
+            assert wp.startswith(lane_resolved), (
+                f'--writable {wp!r} is not under lane {lane_resolved!r}'
+            )
+
+    async def test_cold_fallback_on_pool_exhaustion(
+        self, git_repo: Path,
+    ):
+        """Pool exhausted: create_worktree returns a cold branch-named worktree."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        # Exhaust the pool
+        info_A = await git_ops.create_worktree('A')
+        assert info_A.path == git_ops.worktree_base / '_lane-0'
+
+        # Pool exhausted — should fall back to cold (branch-named dir)
+        info_B = await git_ops.create_worktree('B')
+        expected_cold = git_ops.worktree_base / 'B'
+        assert info_B.path == expected_cold, (
+            f'Expected cold path {expected_cold}, got {info_B.path}'
+        )
+        assert info_B.path.exists()
+        assert await git_ops._is_registered_worktree(info_B.path)
+
+    async def test_knob_off_cold_path_unchanged(
+        self, git_ops: GitOps,
+    ):
+        """With warm_lane_pool=False (default fixture), create_worktree is byte-identical to today."""
+        # Default git_ops fixture has warm_lane_pool=False, no warm_lane_pool_size
+        assert git_ops.warm_lane_pool is None
+        info = await git_ops.create_worktree('C')
+        expected = git_ops.worktree_base / 'C'
+        assert info.path == expected
+        assert info.path.exists()
+
+
+# ===========================================================================
+# Step-15: RED — cleanup_worktree is pool-aware (releases lane, not removes)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestCleanupWorktreePoolAware:
+    """cleanup_worktree routes to release_warm_lane for lanes; cold path unchanged."""
+
+    async def test_cleanup_lane_not_removed(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a lane retains the registered worktree (not removed)."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        # Cleanup the lane
+        await git_ops.cleanup_worktree(info.path, 'A')
+
+        # The lane dir must still exist as a registered worktree
+        assert await git_ops._is_registered_worktree(info.path), (
+            '_lane-0 must remain registered after cleanup (pool-aware)'
+        )
+
+    async def test_cleanup_lane_target_retained(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a lane retains target/ warmth."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        assert (info.path / 'target' / 'seeded.bin').exists(), 'prereq: seed ran'
+        await git_ops.cleanup_worktree(info.path, 'A')
+
+        assert (info.path / 'target').exists(), 'target/ must be retained after cleanup'
+
+    async def test_cleanup_lane_pool_freed(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a lane flips the pool state back to FREE."""
+        from orchestrator.warm_lane_pool import LaneState
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
+
+        await git_ops.cleanup_worktree(info.path, 'A')
+
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE
+
+    async def test_cleanup_lane_branch_deleted(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a lane deletes branch task/A."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        await git_ops.cleanup_worktree(info.path, 'A')
+
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc != 0, 'task/A branch must be deleted after cleanup'
+
+    async def test_cleanup_cold_worktree_removed(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a cold (non-lane) path removes the worktree as before."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        # Exhaust the pool so Z goes to cold path
+        _info_A = await git_ops.create_worktree('A')  # -> _lane-0
+        info_Z = await git_ops.create_worktree('Z')  # -> cold <base>/Z
+        cold_path = git_ops.worktree_base / 'Z'
+        assert info_Z.path == cold_path
+
+        # Cleanup the cold worktree — must be removed
+        await git_ops.cleanup_worktree(info_Z.path, 'Z')
+        assert not cold_path.exists(), 'Cold worktree must be removed by cleanup'
+
+    async def test_cleanup_knob_off_cold_path(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """With pool disabled (default fixture), cleanup_worktree removes the worktree."""
+        info = await git_ops.create_worktree('D')
+        assert info.path.exists()
+
+        await git_ops.cleanup_worktree(info.path, 'D')
+
+        assert not info.path.exists(), 'Cold worktree must be removed when pool disabled'
+
+
+# ===========================================================================
+# Step-25: RED — create_worktree requeue-of-a-warm-task end-to-end
+#   + recycled-id identity guard
+#
+# Part (a): Requeue regression guard — same process requeue of a warm task
+#   should reuse _lane-0, preserve .task/plan.json, commit WIP, retain target/.
+#   This works today (steps 22-24 implemented live-requeue).
+#
+# Part (b): Recycled-id guard — after cleanup + re-dispatch with a DIFFERENT
+#   expected_title, the disk backstop should NOT inherit the stale plan.json.
+#   Today (step-24, no step-26): disk backstop detects task_id match → REUSE
+#   → stale plan.json IS inherited → test FAILS → RED.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeRequeueAndRecycledId:
+    """create_worktree requeue regression guard + recycled-id identity guard."""
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_requeue_same_lane_plan_preserved(self, git_repo: Path):
+        """(a) Requeue: same task returns _lane-0 with .task/plan.json preserved."""
+        import json as _json
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.create_worktree('A')
+        lane = info1.path
+
+        # Simulate agent work
+        (lane / '.task').mkdir(exist_ok=True)
+        plan_file = lane / '.task' / 'plan.json'
+        plan_file.write_text('{"task_id": "A", "title": "Task A"}')
+        (lane / 'README.md').write_text('WIP changes\n')
+
+        # Requeue (no cleanup)
+        info2 = await git_ops.create_worktree('A')
+
+        assert info2.path == lane, f'Expected same _lane-0 ({lane}), got {info2.path}'
+        assert plan_file.exists(), '.task/plan.json must be preserved on requeue'
+        data = _json.loads(plan_file.read_text())
+        assert data['task_id'] == 'A', f'plan.json was overwritten: {data}'
+
+    async def test_requeue_wip_committed(self, git_repo: Path):
+        """(a) Requeue: a WIP-save commit is created for uncommitted tracked changes."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.create_worktree('A')
+        lane = info1.path
+        (lane / '.task').mkdir(exist_ok=True)
+        (lane / '.task' / 'plan.json').write_text('{"task_id": "A"}')
+        (lane / 'README.md').write_text('WIP changes\n')
+
+        info2 = await git_ops.create_worktree('A')
+        assert info2.path == lane
+
+        _, log_out, _ = await _run(['git', 'log', '--oneline'], cwd=lane)
+        wip_commits = [
+            line for line in log_out.splitlines()
+            if 'save wip' in line.lower() or 'save WIP' in line
+        ]
+        assert wip_commits, f'No WIP-save commit found in log:\n{log_out}'
+
+    async def test_requeue_target_retained(self, git_repo: Path):
+        """(a) Requeue: target/cache.bin is retained (warmth preserved)."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.create_worktree('A')
+        lane = info1.path
+        (lane / '.task').mkdir(exist_ok=True)
+        (lane / '.task' / 'plan.json').write_text('{"task_id": "A"}')
+        (lane / 'README.md').write_text('WIP\n')
+        cache_file = lane / 'target' / 'cache.bin'
+        cache_file.write_bytes(b'\xca\xfe' * 32)
+
+        info2 = await git_ops.create_worktree('A')
+        assert info2.path == lane
+
+        assert cache_file.exists(), 'target/cache.bin must be retained on requeue'
+
+    async def test_recycled_id_stale_plan_not_inherited(self, git_repo: Path):
+        """(b) Recycled-id guard: new task with different expected_title should NOT
+        inherit the stale .task/plan.json from the prior deleted task.
+
+        Today (step-24, no step-26): disk backstop sees task_id 'A' == 'A'
+        → REUSE → plan.json IS inherited → this assertion FAILS → RED.
+        After step-26: identity guard checks read_worktree_title vs
+        expected_title → 'Old Task' != 'New Task' → MISMATCH → FRESH reset
+        → plan.json cleared → this assertion PASSES.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # First task 'A' runs on _lane-0 and writes plan.json with 'Old Task'
+        info1 = await git_ops.create_worktree('A')
+        lane = info1.path
+        (lane / '.task').mkdir(exist_ok=True)
+        plan_file = lane / '.task' / 'plan.json'
+        plan_file.write_text('{"task_id": "A", "title": "Old Task"}')
+
+        # Cleanup: lane returns to FREE; plan.json stays on disk
+        await git_ops.cleanup_worktree(lane, 'A')
+        assert plan_file.exists(), 'prereq: plan.json must still exist after cleanup'
+
+        # NEW task with recycled id 'A' but DIFFERENT title — should NOT inherit plan
+        info2 = await git_ops.create_worktree('A', expected_title='New Task')
+        assert info2.path == lane  # same pool lane
+
+        # TODAY: disk backstop reuses (task_id 'A' == 'A') → plan.json inherited → FAIL
+        # AFTER step-26: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
+        assert not plan_file.exists(), (
+            'Recycled-id task MUST NOT inherit the prior task\'s plan.json '
+            '(identity guard should route to fresh reset)'
+        )

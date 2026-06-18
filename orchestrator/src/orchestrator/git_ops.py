@@ -475,10 +475,22 @@ def parse_diff_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
 class GitOps:
     """Git worktree and merge operations."""
 
-    def __init__(self, config: GitConfig, project_root: Path):
+    def __init__(self, config: GitConfig, project_root: Path, *, warm_lane_pool_size: int = 0):
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
+        # Warm-lane pool — None when knob off or size=0 (default-off, trivially
+        # revertible, mirrors persistent_merge_worktree).  Size is passed from
+        # OrchestratorConfig.max_concurrent_tasks by Harness at startup (D9).
+        self._warm_lane_pool_size = warm_lane_pool_size
+        if warm_lane_pool_size > 0 and config.warm_lane_pool:
+            from orchestrator.warm_lane_pool import WarmLanePool
+            self.warm_lane_pool: WarmLanePool | None = WarmLanePool(
+                worktree_base=self.worktree_base,
+                size=warm_lane_pool_size,
+            )
+        else:
+            self.warm_lane_pool = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -738,6 +750,35 @@ class GitOps:
                     f'create_worktree: rev-parse of local {start_ref} also failed (rc={rc})'
                 )
 
+        # ── Warm-lane pool (ζ): try to allocate a pre-seeded lane ──────────
+        # Only for non-train, non-reuse-by-name fresh dispatches.  Train-
+        # stacked members (predecessor-tip branching) and identity-guard
+        # reuse-by-name have bespoke logic below; pooling them is out of ζ's
+        # scope and the cold path stays correct.
+        # Pool exhaustion / absent seed script / seed failure all fall through
+        # to the unchanged cold path below (inv.6: never block/deadlock).
+        if (
+            self.warm_lane_pool is not None
+            and (train is None or train.get('order', 0) == 0)
+            and not await self._is_registered_worktree(worktree_path)
+        ):
+            pool_info = await self.acquire_warm_lane(
+                branch_name, start_ref, expected_title=expected_title,
+            )
+            if pool_info is not None:
+                # Carry stale_commits from the freshen result onto the pool info
+                return WorktreeInfo(
+                    path=pool_info.path,
+                    base_commit=pool_info.base_commit,
+                    stale_commits=stale_commits,
+                    reify_debug_port=pool_info.reify_debug_port,
+                )
+            # Fall through to cold path (exhaustion / seed failure)
+            logger.info(
+                'create_worktree: pool acquire failed for %s — falling back to cold path',
+                branch_name,
+            )
+
         # If worktree already exists, reuse it (common after requeue) —
         # but ONLY if it is a real registered git worktree.  A stale
         # directory (e.g. containing only .task/ state files from a previous
@@ -954,6 +995,355 @@ class GitOps:
             stale_commits=stale_commits,
             reify_debug_port=port,
         )
+
+    async def _seed_warm_lane(self, lane_dir: Path, mode: str) -> bool:
+        """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
+
+        Invokes ``<lane_dir>/scripts/seed-warm-lane.sh <base_target> <lane_dir> <mode>``
+        where *base_target* is :attr:`warm_lane_base_target_path` and *mode* is
+        either ``'--fresh-checkout'`` or ``'--reset-in-place'``.
+
+        The script lives in the LANE's own scripts dir (the lane's checked-out
+        tree provides it, consistent with the debug-port script pattern).
+
+        Returns:
+            True  — script ran and exited 0 (seed succeeded, lane is warm).
+            False — script absent, exited non-zero, or any exception (fail-soft;
+                    never blocks dispatch — caller falls back to cold path).
+        """
+        try:
+            script = lane_dir / 'scripts' / 'seed-warm-lane.sh'
+            if not script.exists():
+                logger.debug('_seed_warm_lane: seed script absent at %s', script)
+                return False
+            base_target = str(self.warm_lane_base_target_path)
+            rc, _, err = await _run(
+                [str(script), base_target, str(lane_dir), mode],
+                cwd=lane_dir,
+            )
+            if rc != 0:
+                logger.warning(
+                    '_seed_warm_lane: script exited %d for %s (stderr=%r)',
+                    rc, lane_dir, err,
+                )
+                return False
+            return True
+        except Exception:
+            logger.warning(
+                '_seed_warm_lane: unexpected error for %s', lane_dir, exc_info=True,
+            )
+            return False
+
+    async def acquire_warm_lane(
+        self,
+        branch_name: str,
+        start_ref: str,
+        *,
+        expected_title: str | None = None,
+    ) -> 'WorktreeInfo | None':
+        """Allocate a FREE warm lane, seed/reset it, and return a WorktreeInfo.
+
+        **Create-once path** (lane not yet a registered worktree):
+            ``git worktree add -b task/<branch_name> <lane> <start_ref>``,
+            then seed via :meth:`_seed_warm_lane(lane, '--fresh-checkout')`.
+            If seed fails, the just-created worktree is removed and None is
+            returned (caller falls through to the cold path — inv.6).
+
+        **Reset-in-place path** (lane already registered — added in step-10):
+            Handled by :meth:`_reset_warm_lane`; skips re-seed (target/ already
+            warm from the previous assignment).
+
+        **Identity guard** (``expected_title``, step-26):
+            When *expected_title* is supplied, any reuse candidate (in-memory
+            map hit *or* on-disk plan.json match) has its stored title checked
+            via :func:`identities_match`.  On mismatch the stale assignment is
+            dropped from the pool and the lane is reset in-place (fresh path) —
+            so a recycled-id task never inherits the prior task's ``.task/``
+            state.  ``expected_title=None`` (default) disables the guard and
+            all existing callers/tests are unaffected.
+
+        Returns:
+            WorktreeInfo on success; None on pool exhaustion, absent seed
+            script, or seed failure (never raises — cold-fallback signal).
+        """
+        if self.warm_lane_pool is None:
+            return None
+
+        acq = await self.warm_lane_pool.acquire_for(branch_name)
+        if acq is None:
+            return None  # Pool exhausted → caller cold-fallback (inv.6)
+        lane, reused = acq
+
+        full_branch = f'{self.config.branch_prefix}{branch_name}'
+
+        try:
+            if reused:
+                # ── Reuse path: live requeue of same task on same lane ────
+                # Identity guard: if expected_title is set, verify the stored
+                # title matches before reusing .task/plan.json + WIP.
+                # Fail-open: identities_match returns True when either side is
+                # empty, so a title-less lane always reuses as before.
+                _ident_ok = (
+                    expected_title is None
+                    or identities_match(read_worktree_title(lane), expected_title)
+                )
+                if _ident_ok:
+                    # .task/plan.json is preserved; WIP is committed + rebased.
+                    return await self._reuse_warm_lane(lane, full_branch)
+                # Mismatch: stale assignment from a recycled id — drop it and
+                # reset in-place so the new task starts clean.
+                logger.warning(
+                    'acquire_warm_lane: in-memory reuse identity MISMATCH for '
+                    '%s — expected %r; running fresh reset',
+                    lane, expected_title,
+                )
+                self.warm_lane_pool.drop_assignment(branch_name)
+                await self._reset_warm_lane(lane, full_branch, start_ref)
+                # Falls through to shared tail
+
+            elif not await self._is_registered_worktree(lane):
+                # ── Create-once branch ────────────────────────────────────
+                # Self-heal: remove a stale unregistered directory so
+                # git worktree add doesn't refuse a non-empty dir.
+                if lane.exists():
+                    logger.warning(
+                        'acquire_warm_lane: lane %s exists but is not registered; '
+                        'removing stale directory (self-heal)', lane,
+                    )
+                    shutil.rmtree(lane)
+                lane.parent.mkdir(parents=True, exist_ok=True)
+
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'add', '-b', full_branch, str(lane), start_ref],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    logger.warning(
+                        'acquire_warm_lane: git worktree add failed for %s: %s', lane, err,
+                    )
+                    await self.warm_lane_pool.release(lane)
+                    return None
+
+                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if not ok:
+                    # Seed failed — remove the just-created worktree and release
+                    logger.warning(
+                        'acquire_warm_lane: seed failed for %s; removing and cold-falling back',
+                        lane,
+                    )
+                    await _run(
+                        ['git', 'worktree', 'remove', str(lane), '--force'],
+                        cwd=self.project_root,
+                    )
+                    await self.warm_lane_pool.release(lane)
+                    return None
+            else:
+                # ── Already-registered lane — check on-disk backstop first ─
+                # If the lane still carries THIS task's plan.json (e.g. after a
+                # process restart that cleared the in-memory _assignments map),
+                # treat it as a REUSE: restore the assignment and route to
+                # _reuse_warm_lane so .task/plan.json + WIP are preserved.
+                # Identity guard: if expected_title is set and the stored title
+                # does not match, treat as fresh (recycled-id guard).
+                # Any read/parse error falls safe toward the fresh reset path.
+                disk_reuse = False
+                try:
+                    plan_path = lane / '.task' / 'plan.json'
+                    if plan_path.exists():
+                        import json as _json
+                        data = _json.loads(plan_path.read_text())
+                        if data.get('task_id') == branch_name:
+                            # Check identity guard before declaring reuse
+                            _disk_ident_ok = (
+                                expected_title is None
+                                or identities_match(
+                                    read_worktree_title(lane), expected_title,
+                                )
+                            )
+                            if _disk_ident_ok:
+                                # Record the mapping and route to reuse
+                                self.warm_lane_pool.note_assignment(branch_name, lane)
+                                disk_reuse = True
+                            else:
+                                logger.warning(
+                                    'acquire_warm_lane: disk backstop identity '
+                                    'MISMATCH for %s — expected %r; fresh reset',
+                                    lane, expected_title,
+                                )
+                except Exception:
+                    # Fail safe: unreadable or non-JSON plan → treat fresh
+                    pass
+
+                if disk_reuse:
+                    return await self._reuse_warm_lane(lane, full_branch)
+
+                # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
+                await self._reset_warm_lane(lane, full_branch, start_ref)
+
+            # ── Shared tail: gitignore, scrub, base, debug-port ──────────
+            _ensure_task_gitignore(lane)
+            await scrub_task_dir_from_tree(lane, 'warm-lane-acquire', amend=False)
+
+            _, mb_out, _ = await _run(
+                ['git', 'merge-base', start_ref, 'HEAD'],
+                cwd=lane,
+            )
+            _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+            base_commit = mb_out.strip() or head_sha.strip()
+
+            port = await self._provision_reify_debug_port(lane)
+            logger.info(
+                'acquire_warm_lane: acquired %s on branch %s (base=%s, port=%s)',
+                lane, full_branch, base_commit[:8] if base_commit else '?', port,
+            )
+            return WorktreeInfo(path=lane, base_commit=base_commit, reify_debug_port=port)
+
+        except Exception:
+            logger.warning(
+                'acquire_warm_lane: unexpected error for %s; releasing', lane, exc_info=True,
+            )
+            await self.warm_lane_pool.release(lane)
+            return None
+
+    async def _reuse_warm_lane(
+        self, lane_dir: Path, full_branch: str,
+    ) -> 'WorktreeInfo':
+        """Handle a live-requeue: same task on the same lane (in-memory map hit).
+
+        Mirrors the cold-requeue reuse block (git_ops.py ~806-858):
+        1. Commit any uncommitted WIP so it is preserved across the rebase.
+        2. Rebase onto main (best-effort; log failure and continue on old base).
+        3. Re-ensure the task .gitignore.
+        4. Recompute ``base_commit`` as ``merge-base main HEAD``.
+        5. Re-provision the debug port (inv.7).
+
+        ``.task/plan.json`` is NOT committed by ``commit()`` (the
+        ``:!.task`` pathspec excludes it) and survives the rebase intact
+        because git rebase only touches tracked files.
+
+        Returns:
+            WorktreeInfo for the reused lane.  Never raises — exceptions
+            propagate to the caller's try/except-release wrapper.
+        """
+        # 1. Commit WIP (returns None if nothing to commit — that's fine)
+        await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
+
+        # 2. Rebase onto main (best-effort; failure leaves the branch on old base)
+        rebased = await self.rebase_onto_main(lane_dir)
+        if not rebased:
+            logger.info(
+                '_reuse_warm_lane: rebase failed for %s; continuing on old base', lane_dir,
+            )
+
+        # 3. Re-ensure task .gitignore (idempotent)
+        _ensure_task_gitignore(lane_dir)
+
+        # 4. Recompute base: merge-base between main_branch and HEAD
+        _, mb_out, _ = await _run(
+            ['git', 'merge-base', self.config.main_branch, 'HEAD'],
+            cwd=lane_dir,
+        )
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane_dir)
+        base_commit = mb_out.strip() or head_sha.strip()
+
+        # 5. Re-provision debug port (inv.7)
+        port = await self._provision_reify_debug_port(lane_dir)
+
+        logger.info(
+            '_reuse_warm_lane: reused %s on branch %s (base=%s, port=%s)',
+            lane_dir, full_branch, base_commit[:8] if base_commit else '?', port,
+        )
+        return WorktreeInfo(path=lane_dir, base_commit=base_commit, reify_debug_port=port)
+
+    async def _reset_warm_lane(
+        self, lane_dir: Path, full_branch: str, target_commit: str,
+    ) -> None:
+        """Reset an already-registered lane to *target_commit* on *full_branch*.
+
+        Implements reset-determinism (inv.1) + warmth retention:
+        ``git checkout -B <full_branch> <target_commit>`` establishes the new
+        task branch and updates the tracked tree; then a SINGLE
+        ``git clean -xfd -e <dir>`` (one -e per reap_build_artifact_dirs)
+        removes stray untracked files while retaining all artifact dirs —
+        mirroring reset_persistent_merge_worktree's single-pass clean so
+        >1 artifact dir all survive (per-dir-loop bug from κ, step-19).
+
+        Added as a stub here (step-8); fully exercised by step-10 tests.
+        """
+        # -f (force) discards local modifications to tracked files before the
+        # branch switch — required when the lane is being reused from a prior
+        # task that left uncommitted work.  -B creates or resets the branch.
+        rc, _, err = await _run(
+            ['git', 'checkout', '-f', '-B', full_branch, target_commit],
+            cwd=lane_dir,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f'_reset_warm_lane: checkout -f -B {full_branch} {target_commit} '
+                f'failed for {lane_dir}: {err}'
+            )
+        # Single invocation excluding ALL artifact dirs at once — every
+        # configured build-output dir survives in one pass.  A per-dir loop
+        # would leave NONE surviving with >1 dir (κ step-19 regression).
+        clean_cmd = ['git', 'clean', '-xfd']
+        for artifact_dir in self.config.reap_build_artifact_dirs:
+            clean_cmd += ['-e', artifact_dir]
+        rc, _, err = await _run(clean_cmd, cwd=lane_dir)
+        if rc != 0:
+            raise RuntimeError(
+                f'_reset_warm_lane: git clean failed for {lane_dir}: {err}'
+            )
+
+    async def release_warm_lane(self, lane_dir: Path, branch_name: str) -> None:
+        """Release a warm lane back to the FREE pool, retaining warmth.
+
+        Steps:
+        1. ``git -C <lane> checkout --detach`` — detach HEAD so the just-used
+           branch is deletable while the lane stays checked-out warm.
+        2. ``git branch -D task/<branch_name>`` — best-effort; logs on failure.
+        3. ``await self.warm_lane_pool.release(lane_dir)`` — flip ASSIGNED→FREE.
+
+        Never removes the worktree; ``target/`` is retained for the next
+        assignment.  Fully best-effort / never-raise (mirrors
+        ``cleanup_merge_worktree`` contract) so a hiccup cannot strand the
+        scheduler.
+        """
+        if self.warm_lane_pool is None:
+            return
+
+        full_branch = f'{self.config.branch_prefix}{branch_name}'
+        try:
+            # Detach HEAD so the task branch can be deleted while the lane
+            # remains checked out warm (target/ survives).
+            rc, _, err = await _run(
+                ['git', 'checkout', '--detach'],
+                cwd=lane_dir,
+            )
+            if rc != 0:
+                logger.warning(
+                    'release_warm_lane: checkout --detach failed for %s: %s', lane_dir, err,
+                )
+        except Exception:
+            logger.warning(
+                'release_warm_lane: checkout --detach error for %s', lane_dir, exc_info=True,
+            )
+
+        try:
+            rc, _, err = await _run(
+                ['git', 'branch', '-D', full_branch],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                logger.warning(
+                    'release_warm_lane: branch -D %s failed: %s', full_branch, err,
+                )
+        except Exception:
+            logger.warning(
+                'release_warm_lane: branch -D error for %s', full_branch, exc_info=True,
+            )
+
+        await self.warm_lane_pool.release(lane_dir)
+        logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
 
     async def _provision_reify_debug_port(self, worktree_path: Path) -> int | None:
         """Run setup-worktree-debug-port.sh in the worktree and return the allocated port.
@@ -1855,6 +2245,25 @@ class GitOps:
         when the feature is off.
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+    @property
+    def warm_lane_base_target_path(self) -> Path:
+        """Absolute path of the warm BASE target/ to CoW-seed lane target/ from.
+
+        Resolution order:
+        1. ``config.warm_lane_base_target_dir`` when explicitly set (override).
+        2. ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
+           (derived default: ``<worktree_base>/_merge-verify/target``).
+        3. Fallback to ``'target'`` when ``reap_build_artifact_dirs`` is empty.
+        """
+        if self.config.warm_lane_base_target_dir is not None:
+            return Path(self.config.warm_lane_base_target_dir)
+        artifact_dir = (
+            self.config.reap_build_artifact_dirs[0]
+            if self.config.reap_build_artifact_dirs
+            else 'target'
+        )
+        return self.persistent_merge_worktree_path / artifact_dir
 
     #: Name of the counter file used to persist the verify attempt count across
     #: stateless CLI invocations.  Scope is **per-project-worktree** — the file
@@ -3025,7 +3434,18 @@ class GitOps:
         )
 
     async def cleanup_worktree(self, worktree: Path, branch: str) -> None:
-        """Remove worktree and delete branch."""
+        """Remove worktree and delete branch.
+
+        **Pool-aware**: if *worktree* is a warm lane, routes to
+        :meth:`release_warm_lane` (retain worktree + ``target/``, flip FREE)
+        instead of removing.  Mirrors :meth:`cleanup_merge_worktree`'s
+        persistent-path no-op pattern.  Covers the workflow done-gate and all
+        harness reconcile call sites without touching each individually.
+        """
+        if self.warm_lane_pool is not None and self.warm_lane_pool.is_lane(worktree):
+            await self.release_warm_lane(worktree, branch)
+            return
+
         full_branch = f'{self.config.branch_prefix}{branch}'
 
         # Remove worktree

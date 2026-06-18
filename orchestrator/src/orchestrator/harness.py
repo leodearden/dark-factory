@@ -401,7 +401,17 @@ class Harness:
         from orchestrator.agents.sandbox_dispatch import set_backend
         set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
-        self.git_ops = GitOps(config.git, config.project_root)
+        # Size the warm-lane pool from max_concurrent_tasks (D9: read once at startup,
+        # single source of truth). Pass 0 when the knob is off so GitOps leaves
+        # warm_lane_pool=None — non-dispatch call sites (cli.py verify-merge,
+        # recover_main.py, evals/runner.py) default to size=0 and stay on cold path.
+        self.git_ops = GitOps(
+            config.git,
+            config.project_root,
+            warm_lane_pool_size=(
+                config.max_concurrent_tasks if config.git.warm_lane_pool else 0
+            ),
+        )
         self.scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
         # Wire the park-stop trip callback: Scheduler trips → Harness.pause_scheduler.
         # This connects in-memory trip detection to the full pause bundle
