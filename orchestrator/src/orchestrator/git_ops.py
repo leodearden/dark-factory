@@ -475,10 +475,13 @@ def parse_diff_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
 class GitOps:
     """Git worktree and merge operations."""
 
-    def __init__(self, config: GitConfig, project_root: Path):
+    def __init__(self, config: GitConfig, project_root: Path, *, warm_lane_pool_size: int = 0):
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
+        # Warm-lane pool — wired in step-4; None until then.
+        self._warm_lane_pool_size = warm_lane_pool_size
+        self.warm_lane_pool = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).

@@ -814,6 +814,29 @@ class GitConfig(BaseModel):
             'lane and never blocks a warm land.'
         ),
     )
+    warm_lane_pool: bool = Field(
+        default=False,
+        description=(
+            'When True, task-dispatch worktree provisioning allocates from a '
+            'per-host pool of pre-seeded warm lanes (_lane-0 .. _lane-{N-1}) '
+            'instead of creating a cold ephemeral git worktree for each task. '
+            'Pool size N = max_concurrent_tasks (passed to GitOps at startup). '
+            'On pool exhaustion, absent seed script, or seed failure, '
+            'create_worktree falls back to the cold path — never blocks the '
+            'scheduler (inv.6).  Default False → byte-identical to today '
+            '(trivially revertible, mirrors persistent_merge_worktree knob).'
+        ),
+    )
+    warm_lane_base_target_dir: str | None = Field(
+        default=None,
+        description=(
+            'Absolute path of the warm BASE target/ directory to CoW-seed lane '
+            'target/ from (passed as first positional arg to seed-warm-lane.sh). '
+            'None (default) → derive from persistent_merge_worktree_path / '
+            'reap_build_artifact_dirs[0] (i.e. <worktree_base>/_merge-verify/target). '
+            'Set only when the seed base lives at a non-default location.'
+        ),
+    )
 
 
 class VerifyRunnerConfig(BaseModel):
