@@ -1838,3 +1838,49 @@ async def test_update_task_refuses_to_clobber_corrupt_metadata(
     assert 'dark_factory:42' in row['metadata'], (
         f'Expected external_deps substring in preserved metadata; got: {row["metadata"]!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_qualified_refuses_corrupt_metadata(
+    backend, project_root, caplog,
+):
+    """add_dependency raises TaskmasterError and emits exactly one deduped
+    malformed-metadata WARNING when the stored metadata blob is corrupt,
+    leaving the blob byte-for-byte unchanged (the new dep was NOT added).
+
+    RED after step-4: _merge_metadata raises (raises+bytes-preserved pass)
+    but add_dependency's qualified path passes no context kwargs to
+    _merge_metadata → zero WARNINGs → warn-count assertion fails.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        with pytest.raises(TaskmasterError):
+            await backend.add_dependency(
+                '1', 'dark_factory:13', project_root=project_root,
+            )
+
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly one malformed-metadata WARNING; got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
+
+    # The new external dep must NOT have been added; original blob unchanged.
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute('SELECT metadata FROM tasks WHERE id = 1')
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'Expected metadata unchanged; got: {row["metadata"]!r}'
+    )
