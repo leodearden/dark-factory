@@ -1491,6 +1491,7 @@ class TestAcquireFor:
 
         lane = asyncio.run(pool.try_acquire())
         assert lane == base / '_lane-0'
+        assert lane is not None
         assert pool.state(lane) == LaneState.ASSIGNED
         # assignment_for is not touched by try_acquire
         assert pool.assignment_for('anything') is None

@@ -95,7 +95,7 @@ class WarmLanePool:
             if matched is not None:
                 to_drop = [
                     br for br, assigned in self._assignments.items()
-                    if assigned == matched or assigned == lane
+                    if assigned in (matched, lane)
                 ]
                 for br in to_drop:
                     del self._assignments[br]
