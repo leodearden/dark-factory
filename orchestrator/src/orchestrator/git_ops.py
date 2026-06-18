@@ -750,6 +750,35 @@ class GitOps:
                     f'create_worktree: rev-parse of local {start_ref} also failed (rc={rc})'
                 )
 
+        # ── Warm-lane pool (ζ): try to allocate a pre-seeded lane ──────────
+        # Only for non-train, non-reuse-by-name fresh dispatches.  Train-
+        # stacked members (predecessor-tip branching) and identity-guard
+        # reuse-by-name have bespoke logic below; pooling them is out of ζ's
+        # scope and the cold path stays correct.
+        # Pool exhaustion / absent seed script / seed failure all fall through
+        # to the unchanged cold path below (inv.6: never block/deadlock).
+        if (
+            self.warm_lane_pool is not None
+            and (train is None or train.get('order', 0) == 0)
+            and not await self._is_registered_worktree(worktree_path)
+        ):
+            pool_info = await self.acquire_warm_lane(
+                branch_name, start_ref, expected_title=expected_title,
+            )
+            if pool_info is not None:
+                # Carry stale_commits from the freshen result onto the pool info
+                return WorktreeInfo(
+                    path=pool_info.path,
+                    base_commit=pool_info.base_commit,
+                    stale_commits=stale_commits,
+                    reify_debug_port=pool_info.reify_debug_port,
+                )
+            # Fall through to cold path (exhaustion / seed failure)
+            logger.info(
+                'create_worktree: pool acquire failed for %s — falling back to cold path',
+                branch_name,
+            )
+
         # If worktree already exists, reuse it (common after requeue) —
         # but ONLY if it is a real registered git worktree.  A stale
         # directory (e.g. containing only .task/ state files from a previous
