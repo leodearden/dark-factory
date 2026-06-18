@@ -823,3 +823,154 @@ def _make_local_lease() -> MagicMock:
     lease = MagicMock()
     lease.is_local = True
     return lease
+
+
+# ===========================================================================
+# Step-17: RED — per-spec-lane DIVERGENCE → HARD ALARM; unparseable → alarm
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestSpecLaneDivergenceAlarm:
+    """Per-spec-lane divergence → born-at-L2 alarm; unparseable → fail-closed alarm.
+
+    Reuses _submit_shadow_divergence_escalation semantics (severity=critical,
+    orchestrator-prefixed agent_role, category=risk_identified).
+
+    RED conditions (pre-step-16 / pre-step-18 context):
+    - Divergence: warm_results empty → shadow no-ops → no alarm.
+    - Unparseable: _alarm_warm_shadow_unparseable not called (no warm capture).
+    GREEN after steps-16 + 18: both paths produce an alarm.
+    """
+
+    async def test_divergence_fires_born_at_l2_alarm(self, tmp_path: Path):
+        """Injected warm-pass/cold-fail divergence on a spec lane → escalation.submit."""
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            git=_make_spec_git_config(
+                on=True,
+                warm_verify_shadow_compare=True,
+                warm_verify_shadow_compare_every_n_merges=1,
+            ),
+        )
+        escalation_spy = _make_escalation_queue()
+        worker = _make_minimal_worker(tmp_path)
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+
+        # Warm: test passes
+        fake_vr = VerifyResult(
+            passed=True,
+            test_output='        PASS [0.05s] reify-spec test_diverge\n',
+            lint_output='', type_output='', summary='',
+        )
+
+        async def _mock_verify(*args, **kwargs):
+            on_result = kwargs.get('on_result')
+            if on_result is not None:
+                on_result(fake_vr)
+            return None
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        # Cold: test FAILS on both first run AND re-confirmation (Option B)
+        cold_call_count = 0
+
+        async def _divergent_cold(*args, **kwargs):
+            nonlocal cold_call_count
+            cold_call_count += 1
+            return {'reify-spec test_diverge': 'fail'}  # diverges from warm pass
+
+        with patch(
+            'orchestrator.merge_queue._acquire_warm_verify_worktree',
+            new=AsyncMock(return_value=(fake_lane, True)),
+        ), patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            new=_mock_verify,
+        ), patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify',
+            new=_divergent_cold,
+        ):
+            vr = await worker._run_inflight_verify(item, _make_local_lease())
+
+            await _maybe_schedule_shadow_compare(
+                worker,
+                worker._git_ops,
+                item.request,
+                'deadbeef01234567890a',
+                warm_results=vr.warm_results,
+                escalation_queue=escalation_spy,
+                event_store=None,
+            )
+            # Drain shadow tasks (re-confirmation cold run is also backgrounded)
+            if worker._shadow_compare_tasks:
+                await asyncio.gather(*list(worker._shadow_compare_tasks))
+
+        # Option B re-confirmation requires two cold runs
+        assert cold_call_count == 2, (
+            f'Expected 2 cold runs (first + re-confirmation); got {cold_call_count}'
+        )
+        # Born-at-L2 alarm must be submitted for persistent divergence
+        escalation_spy.submit.assert_called_once()
+        esc = escalation_spy.submit.call_args[0][0]
+        assert esc.severity == 'critical', (
+            f'Divergence escalation must be critical; got {esc.severity!r}'
+        )
+        assert esc.agent_role.startswith('orchestrator-'), (
+            f'Born-at-L2 requires orchestrator- prefix; got {esc.agent_role!r}'
+        )
+        assert esc.category == 'risk_identified', (
+            f'Expected risk_identified; got {esc.category!r}'
+        )
+
+    async def test_unparseable_warm_verify_alarms(self, tmp_path: Path):
+        """Unparseable warm output on a spec lane → _alarm_warm_shadow_unparseable fires.
+
+        The fail-closed guard must never allow a silent pass (κ invariant 6).
+        """
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            git=_make_spec_git_config(
+                on=True,
+                warm_verify_shadow_compare=True,
+            ),
+        )
+        # Worker WITH escalation_queue spy so _alarm_warm_shadow_unparseable submits
+        escalation_spy = _make_escalation_queue()
+        mock_git_ops = MagicMock()
+        mock_git_ops.project_root = tmp_path
+        worker = SpeculativeMergeWorker(
+            mock_git_ops, asyncio.Queue(), escalation_queue=escalation_spy,
+        )
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+
+        # Unparseable: test_output contains no recognizable test lines
+        unparseable_vr = VerifyResult(
+            passed=True,
+            test_output='Build succeeded\nNo test output\n',
+            lint_output='', type_output='', summary='',
+        )
+
+        async def _mock_verify_unparseable(*args, **kwargs):
+            on_result = kwargs.get('on_result')
+            if on_result is not None:
+                on_result(unparseable_vr)
+            return None
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        with patch(
+            'orchestrator.merge_queue._acquire_warm_verify_worktree',
+            new=AsyncMock(return_value=(fake_lane, True)),
+        ), patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            new=_mock_verify_unparseable,
+        ):
+            await worker._run_inflight_verify(item, _make_local_lease())
+
+        # Unparseable warm output must trigger the fail-closed alarm
+        # (κ invariant 6: never a silent pass)
+        escalation_spy.submit.assert_called_once()
