@@ -6252,3 +6252,44 @@ class TestGetMergeDiffFilesWarning:
             'get_merge_diff_files' in t.lower() or 'diff' in t.lower()
             for t in warning_texts
         ), f'Expected WARNING to mention diff failure; got: {warning_texts}'
+
+
+# ---------------------------------------------------------------------------
+# Task 1825 step-1: get_files_touched_in_branch emits WARNING on rc!=0
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGetFilesTouchedInBranchWarning:
+    """Step-1 (RED): get_files_touched_in_branch must emit a WARNING when
+    git log exits non-zero (e.g. non-existent base SHA), while still
+    returning [].
+
+    Before step-2 impl: rc!=0 path is silent → RED (no WARNING).
+    After step-2 impl: WARNING captured at 'orchestrator.git_ops'.
+    """
+
+    async def test_nonexistent_sha_returns_empty_and_warns(
+        self, git_repo: Path, git_config: GitConfig, caplog,
+    ) -> None:
+        import logging
+
+        ops = GitOps(git_config, git_repo)
+        non_existent = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await ops.get_files_touched_in_branch(non_existent, 'HEAD')
+
+        assert result == [], (
+            f'Expected [] on git error; got {result!r}'
+        )
+
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_texts, (
+            'Expected a WARNING at orchestrator.git_ops when git log fails; '
+            'got no warnings'
+        )
+        assert any(
+            'get_files_touched_in_branch' in t.lower() or 'git log' in t.lower()
+            for t in warning_texts
+        ), f'Expected WARNING to mention get_files_touched_in_branch or git log; got: {warning_texts}'
