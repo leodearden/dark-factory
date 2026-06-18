@@ -18,6 +18,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
+from shared.mcp_envelope import resolver_failed
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -1637,7 +1638,7 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         statuses, err = await self.scheduler.get_statuses()
-        if err is not None or not statuses:
+        if resolver_failed(statuses, err):
             logger.warning(
                 'Orphan reaper: get_statuses() returned %s — aborting sweep '
                 '(fail-safe against transient DB failure or empty task tree)',
@@ -1821,10 +1822,17 @@ Output JSON matching the schema. Every task must appear in the output.
         ``cleanup_worktree`` (swallow errors), call
         ``set_task_status('done', done_provenance={'commit': marker_sha, ...})``.
         """
-        statuses, _ = await self.scheduler.get_statuses()
+        statuses, err = await self.scheduler.get_statuses()
         reverted = 0
         marked_done = 0
         log_prefix = 'Reconcile (mid-run)' if mid_run else 'Reconcile'
+        if resolver_failed(statuses, err):
+            logger.warning(
+                '%s: get_statuses() returned %s — aborting sweep (fail-safe)',
+                log_prefix,
+                'error' if err is not None else 'empty',
+            )
+            return 0
 
         # R4: sweep both 'in-progress' AND 'blocked' so out-of-band-merged
         # blocked tasks (manual `git merge` while task was blocked) get
