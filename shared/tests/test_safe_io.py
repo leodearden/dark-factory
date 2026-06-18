@@ -56,3 +56,22 @@ class TestBenignPaths:
         assert ok is True
         assert result is SENTINEL
         assert len(caplog.records) == 0, f'Expected silent return, got: {caplog.records}'
+
+
+class TestCorruptWarnMode:
+    """Default on_corrupt='warn': return (default, False) + one WARNING."""
+
+    def test_corrupt_file_returns_default_false_and_warns(self, tmp_path, caplog):
+        """Corrupt JSON returns (SENTINEL, False) with exactly one WARNING naming the path."""
+        from shared.safe_io import load_json_or_warn
+
+        p = tmp_path / 'state.json'
+        p.write_bytes(b'{not json')
+
+        with caplog.at_level(logging.WARNING):
+            result, ok = load_json_or_warn(p, default=SENTINEL)
+
+        assert ok is False
+        assert result is SENTINEL
+        assert len(caplog.records) == 1, f'Expected exactly one WARNING, got: {caplog.records}'
+        assert str(p) in caplog.records[0].message
