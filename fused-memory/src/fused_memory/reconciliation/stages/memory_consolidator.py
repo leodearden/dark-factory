@@ -318,8 +318,13 @@ class MemoryConsolidator(BaseStage):
         # 3. Store stats
         try:
             status = await self.memory.get_status(project_id=self.project_id)
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                'reconciliation.stage1_status_fetch_failed',
+                extra={'project_id': self.project_id, 'error': str(e)},
+            )
             status = {}
+            self._fetch_degraded_sources.append('status')
 
         # 4. Events summary
         event_summary = _format_events(events)
