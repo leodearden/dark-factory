@@ -3362,9 +3362,13 @@ def _extract_status(task_data: dict) -> str:
 def _extract_metadata_files(task_data: Any) -> list[str]:
     """Return ``metadata.files`` as a list[str] from a Taskmaster task dict.
 
-    Silently returns ``[]`` when the field is absent, empty, or malformed —
-    the phantom-done gate only fires when files is a non-empty list of
-    strings, so defensive behaviour here means "do not gate".
+    Silently returns ``[]`` when the field is absent, empty, or the task_data /
+    metadata are not dicts — these are benign-absent paths and the phantom-done
+    gate simply does not fire.
+
+    Emits a WARNING when ``metadata.files`` is *present* but not a list (the gate
+    would silently self-exempt), and when a non-empty files list yields dropped
+    non-str / empty entries (partial data loss is observable).
     """
     if not isinstance(task_data, dict):
         return []
@@ -3372,9 +3376,28 @@ def _extract_metadata_files(task_data: Any) -> list[str]:
     if not isinstance(metadata, dict):
         return []
     files = metadata.get('files')
-    if not isinstance(files, list):
+    if files is None:
+        # Benign absent — phantom-done gate simply does not fire.
         return []
-    return [f for f in files if isinstance(f, str) and f]
+    if not isinstance(files, list):
+        logger.warning(
+            "_extract_metadata_files: metadata.files is present but not a list "
+            "(type=%s); treating as empty. got: %s",
+            type(files).__name__,
+            repr(files)[:200],
+        )
+        return []
+    filtered = [f for f in files if isinstance(f, str) and f]
+    if files and len(filtered) < len(files):
+        dropped = len(files) - len(filtered)
+        logger.warning(
+            "_extract_metadata_files: dropped %d non-str/empty entr%s from metadata.files. "
+            "got: %s",
+            dropped,
+            'y' if dropped == 1 else 'ies',
+            repr(files)[:200],
+        )
+    return filtered
 
 
 def _missing_files(project_root: str, declared: list[str]) -> list[str]:
