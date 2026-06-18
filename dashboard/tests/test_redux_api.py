@@ -279,6 +279,89 @@ def test_shape_memory_wal_red_on_stale_ts():
     assert 'stale' in (wal['reason'] or '')
 
 
+def test_shape_wal_status_red_on_corrupt_ts(caplog):
+    """A corrupt ts string causes row status='red' with reason 'corrupt ts',
+    panel status escalates to 'red', and a WARNING is emitted (via parse_timestamp_or_warn).
+
+    Fails today because the except-ValueError path sets ts_dt=None -> age_s=None ->
+    stale guard skipped, so row stays 'ok' and no WARNING is emitted.
+    """
+    import logging
+
+    status, queue = _basic_status_and_queue()
+    with caplog.at_level(logging.WARNING):
+        body = redux_api.shape_memory(status, queue, wal={
+            'stores': {'http://srv': {
+                'task_backend': {
+                    'ts': 'not-a-date',
+                    'busy': 0,
+                    'log': 5,
+                    'checkpointed': 5,
+                    'detail': None,
+                },
+            }},
+        })
+    wal = body['MEMORY_STATUS']['wal']
+    # Row must be red with a 'corrupt ts' reason.
+    assert len(wal['rows']) == 1
+    row = wal['rows'][0]
+    assert row['status'] == 'red', (
+        f"expected row status='red' for corrupt ts, got {row['status']!r}; "
+        f"row reason: {row.get('reason')!r}"
+    )
+    assert 'corrupt' in (row['reason'] or '').lower(), (
+        f"expected 'corrupt' in row reason, got {row.get('reason')!r}"
+    )
+    # Panel-level status must escalate.
+    assert wal['status'] == 'red', (
+        f"expected panel status='red', got {wal['status']!r}"
+    )
+    # A WARNING must have been emitted (from shared.timestamps.parse_timestamp_or_warn).
+    warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warning_records, (
+        'expected at least one WARNING for corrupt ts, but no warnings were emitted'
+    )
+
+
+def test_shape_wal_status_ok_on_valid_recent_ts():
+    """A store with a valid recent ts stays 'ok' — no regression from the fix."""
+    from datetime import UTC, datetime
+    now_iso = datetime.now(UTC).isoformat()
+    status, queue = _basic_status_and_queue()
+    body = redux_api.shape_memory(status, queue, wal={
+        'stores': {'http://srv': {
+            'task_backend': {'ts': now_iso, 'busy': 0, 'log': 0, 'checkpointed': 0,
+                             'detail': None},
+        }},
+    })
+    wal = body['MEMORY_STATUS']['wal']
+    assert wal['status'] == 'ok'
+    assert wal['rows'][0]['status'] == 'ok'
+
+
+def test_shape_wal_status_benign_on_missing_ts(caplog):
+    """A store where ts is None stays benign — missing ts is not an error."""
+    import logging
+
+    status, queue = _basic_status_and_queue()
+    with caplog.at_level(logging.WARNING):
+        body = redux_api.shape_memory(status, queue, wal={
+            'stores': {'http://srv': {
+                'task_backend': {'ts': None, 'busy': 0, 'log': 0, 'checkpointed': 0,
+                                 'detail': None},
+            }},
+        })
+    wal = body['MEMORY_STATUS']['wal']
+    row = wal['rows'][0]
+    assert row['status'] == 'ok', (
+        f"expected row status='ok' for missing ts (benign), got {row['status']!r}"
+    )
+    warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warning_records, (
+        f'expected no WARNINGs for missing ts, got: {[r.message for r in warning_records]}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # shape_memory_graphs
 # ---------------------------------------------------------------------------
