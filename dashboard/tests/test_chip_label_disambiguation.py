@@ -252,3 +252,33 @@ class TestTabTasksJsxModuleLocksWiring:
         assert 'title={modPath}' in tab_tasks_jsx_body, (
             'title={modPath} not found in tab_tasks.jsx — full key hover removed'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-7: Source-structure tests for scheduler_drawer.jsx (HolderEtas)
+# (RED because scheduler_drawer.jsx still renders m.path.split('/').pop())
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def scheduler_drawer_jsx_body(_client):
+    return _client.get('/static/redux/scheduler_drawer.jsx').text
+
+
+class TestSchedulerDrawerJsxHolderEtasWiring:
+    def test_mpath_basename_removed(self, scheduler_drawer_jsx_body):
+        assert "m.path.split('/').pop()" not in scheduler_drawer_jsx_body, (
+            "m.path.split('/').pop() still present in scheduler_drawer.jsx — should be replaced"
+        )
+
+    def test_disambiguate_labels_destructured(self, scheduler_drawer_jsx_body):
+        # disambiguateLabels must be added to the existing top-level destructure
+        # of window.DF_SCHED_UTILS
+        assert 'disambiguateLabels' in scheduler_drawer_jsx_body, (
+            'disambiguateLabels not found in scheduler_drawer.jsx — wiring missing'
+        )
+
+    def test_full_key_title_preserved(self, scheduler_drawer_jsx_body):
+        # The holder row must still have title={m.path}
+        assert 'title={m.path}' in scheduler_drawer_jsx_body, (
+            'title={m.path} not found in scheduler_drawer.jsx — full key hover removed'
+        )
