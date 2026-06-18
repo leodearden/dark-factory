@@ -1823,6 +1823,10 @@ class HostAllocator:
     The quarantine set is passed by reference so HostAllocator-driven
     (RunnerUnavailable) and DriftDetector-driven quarantines share one
     source of truth with the worker's _runner_quarantine set.
+    ``clear_quarantine(name)`` discards from this same set; because it is
+    shared by reference the host immediately becomes acquire_remote()-eligible
+    again without an orchestrator restart.  This is the re-engagement
+    mechanism used by the auto-reprobe path (task 1795).
     """
 
     def __init__(
@@ -1903,6 +1907,37 @@ class HostAllocator:
         if not lease.is_local:
             self._quarantine.add(lease.name)
         await self.release(lease)
+
+    def clear_quarantine(self, name: str) -> None:
+        """Remove a host from the shared quarantine set (idempotent).
+
+        Mirrors :meth:`VerifyRunnerPool.clear_quarantine`.  Because the
+        quarantine set is shared by reference with the worker's
+        ``_runner_quarantine``, discarding *name* here immediately makes the
+        host eligible for :meth:`acquire_remote` again — no restart required.
+
+        Clearing a name that is not in the quarantine (including names that
+        were never quarantined) is a safe no-op.
+        """
+        self._quarantine.discard(name)
+
+    def quarantined_remote_runners(self) -> list[tuple[str, Any]]:
+        """Return (name, runner) pairs for remote runners currently in quarantine.
+
+        Only remotes present in ``_remote_runners`` are checked — the local
+        host is never included.  The result is in the same declaration order
+        as the original ``remote_runners`` list.  Returns ``[]`` when nothing
+        is quarantined.
+
+        Used by the auto-reprobe path (task 1795) to identify candidates for
+        health probing: only RU-quarantined hosts (those also in the worker's
+        ``_runner_unavailable`` tracker) are ultimately probed and cleared.
+        """
+        return [
+            (name, runner)
+            for name, runner in self._remote_runners.items()
+            if name in self._quarantine
+        ]
 
     async def cancel_and_release(
         self,
