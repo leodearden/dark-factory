@@ -35,6 +35,22 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
     return BriefingAssembler(config)
 
 
+@pytest.fixture
+def anti_anchor_task() -> dict:
+    """Shared task fixture with metadata.files for anti-anchor tests.
+
+    Used by both TestFormatTaskIncludeFiles (unit) and
+    TestAntiAnchorFirstDerivation (integration) to keep the sample task
+    definition in one place.
+    """
+    return {
+        'id': '1835',
+        'title': 'Anti-anchor title',
+        'description': 'Derive files independently',
+        'metadata': {'files': ['orchestrator', 'shared']},
+    }
+
+
 class TestFormatTaskMetadataInvariant:
     def test_dict_metadata_with_files(self, briefing: BriefingAssembler):
         task = {
@@ -82,34 +98,26 @@ class TestFormatTaskIncludeFiles:
     derivation cannot rubber-stamp the queue-time metadata.files guess.
     """
 
-    def _task_with_files(self) -> dict:
-        return {
-            'id': '1835',
-            'title': 'Anti-anchor task',
-            'description': 'Derive files independently',
-            'metadata': {'files': ['orchestrator', 'shared']},
-        }
-
     def test_include_files_false_omits_files_line(
-        self, briefing: BriefingAssembler,
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
     ):
         """include_files=False must hide the Files line."""
-        out = briefing._format_task(self._task_with_files(), include_files=False)
+        out = briefing._format_task(anti_anchor_task, include_files=False)
         assert '**Files:**' not in out
 
     def test_include_files_false_keeps_description(
-        self, briefing: BriefingAssembler,
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
     ):
         """include_files=False must not suppress Description or other fields."""
-        out = briefing._format_task(self._task_with_files(), include_files=False)
+        out = briefing._format_task(anti_anchor_task, include_files=False)
         assert '**Description:**' in out
         assert '**Title:**' in out
 
     def test_include_files_default_still_shows_files(
-        self, briefing: BriefingAssembler,
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
     ):
         """Default call (no flag) must still render the Files line."""
-        out = briefing._format_task(self._task_with_files())
+        out = briefing._format_task(anti_anchor_task)
         assert '**Files:** orchestrator, shared' in out
 
 
@@ -240,42 +248,34 @@ class TestAntiAnchorFirstDerivation:
           the **Files:** label — the revalidation path is explicitly exempt.
     """
 
-    def _task(self) -> dict:
-        return {
-            'id': '1835',
-            'title': 'Anti-anchor title',
-            'description': 'Derive files independently',
-            'metadata': {'files': ['orchestrator', 'shared']},
-        }
-
     async def test_architect_prompt_excludes_files(
-        self, briefing: BriefingAssembler,
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
     ):
         """C-A1: build_architect_prompt must not expose metadata.files."""
         prompt = await briefing.build_architect_prompt(
-            self._task(), worktree=None, context='',
+            anti_anchor_task, worktree=None, context='',
         )
         assert '**Files:**' not in prompt
 
     async def test_architect_prompt_keeps_description(
-        self, briefing: BriefingAssembler,
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
     ):
         """C-A1: description and title must survive the files suppression."""
         prompt = await briefing.build_architect_prompt(
-            self._task(), worktree=None, context='',
+            anti_anchor_task, worktree=None, context='',
         )
         assert 'Derive files independently' in prompt
         assert 'Anti-anchor title' in prompt
 
     async def test_revalidation_prompt_includes_files(
-        self, briefing: BriefingAssembler,
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
     ):
         """C-A2 exemption: build_revalidation_prompt must still show Files."""
         prompt = await briefing.build_revalidation_prompt(
-            self._task(),
+            anti_anchor_task,
             existing_plan={'files': ['orchestrator'], 'steps': []},
             changed_files=[],
             worktree=None,
             context='',
         )
-        assert '**Files:**' in prompt
+        assert '**Files:** orchestrator, shared' in prompt
