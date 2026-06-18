@@ -5287,9 +5287,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         **both** in the allocator's quarantine set **and** tracked as
         RunnerUnavailable (``self._runner_unavailable``):
 
-        1. If ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
+        1. If ``self._unreachable_escalate_after_secs > 0`` **and**
+           ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
            fires the time-based variant of the unreachability alarm (dedup'd via
-           ``has_open_l1``).
+           ``has_open_l1``).  When *escalate_after_secs* is **0** the time-based
+           trip is disabled (streak-only mode); see
+           ``OrchestratorConfig.verify_host_unreachable_escalate_after_secs``.
         2. Probes the host via ``runner.health()`` (cheap SSH reachability check).
         3. On success: clears quarantine, resets the tracker, and calls
            :func:`_clear_verify_host_unreachable` to resolve the open L1 and
@@ -5318,7 +5321,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 downtime_s = now - entry.first_unavailable_at
 
                 # Fire the time-based alarm path (dedup'd — no-op if already open).
-                if downtime_s >= self._unreachable_escalate_after_secs:
+                # `> 0` guard: secs=0 disables the time-based trip (streak-only).
+                if self._unreachable_escalate_after_secs > 0 and downtime_s >= self._unreachable_escalate_after_secs:
                     _alarm_verify_host_unreachable(
                         self._escalation_queue,
                         name,
