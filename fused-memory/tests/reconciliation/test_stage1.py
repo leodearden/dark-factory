@@ -23,6 +23,7 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from datetime import UTC, datetime
@@ -1079,4 +1080,289 @@ class TestMemoryConsolidatorRunWiring:
             "genuinely absent tasks). "
             f"got items_flagged={report.items_flagged!r}. "
             "RED: current impl's except handler drops ALL raises as inconclusive."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-11 (RED) / step-12 (GREEN): task_count_verification stat wiring
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorTaskCountVerificationWiring:
+    """MemoryConsolidator.run() must surface task_count_verification in report.stats.
+
+    step-11 (RED): task_count_verification attribute and stat-wiring don't exist yet.
+    step-12 (GREEN): add class attribute + stat block in run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_task_count_verification_stat_set_when_inconsistent(self):
+        """When task_count_verification has consistent=False, report.stats is set and WARNING logged."""
+        import logging
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+
+        verification_record = {
+            'available': True,
+            'consistent': False,
+            'done_mismatch': True,
+            'total_mismatch': False,
+            'authoritative': {'done': 608, 'total': 635},
+            'tree': {'done': 600, 'total': 635},
+        }
+        stage.task_count_verification = verification_record
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        import pytest
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+            pytest.raises(Exception, match='.') if False else contextlib.nullcontext(),
+        ):
+            pass
+
+        # Use caplog-style approach: check via a separate caplog test
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step11-tcv',
+            )
+
+        assert 'task_count_verification' in report.stats, (
+            "run() must set report.stats['task_count_verification'] when "
+            "stage.task_count_verification is set; "
+            f"got stats={report.stats!r}"
+        )
+        assert report.stats['task_count_verification'] == verification_record
+
+    @pytest.mark.asyncio
+    async def test_task_count_verification_warning_when_inconsistent(self, caplog):
+        """run() logs a WARNING when task_count_verification.consistent is False."""
+        import logging
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        stage.task_count_verification = {
+            'available': True,
+            'consistent': False,
+            'done_mismatch': True,
+            'total_mismatch': False,
+            'authoritative': {'done': 608, 'total': 635},
+            'tree': {'done': 600, 'total': 635},
+        }
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step11-tcv-warn',
+            )
+
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), 'Expected at least one WARNING when task_count_verification.consistent=False'
+
+    @pytest.mark.asyncio
+    async def test_task_count_verification_absent_when_none(self):
+        """When stage.task_count_verification is None, the key must be absent from report.stats."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        # Explicitly leave task_count_verification at the default (None)
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step11-tcv-none',
+            )
+
+        assert 'task_count_verification' not in report.stats, (
+            "When stage.task_count_verification is None, the key must be absent from "
+            f"report.stats; got stats={report.stats!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-13 (RED) / step-14 (GREEN): graphiti_queue_health stat wiring
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorGraphitiQueueHealthWiring:
+    """MemoryConsolidator.run() must surface graphiti_queue_health in report.stats.
+
+    step-13 (RED): graphiti_queue_health attribute and stat-wiring don't exist yet.
+    step-14 (GREEN): add class attribute + stat block in run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_graphiti_queue_health_stat_set_when_unhealthy(self):
+        """When graphiti_queue_health.healthy=False, report.stats is set."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+
+        health_record = {
+            'dead_count': 2,
+            'pending_count': 0,
+            'retry_count': 0,
+            'oldest_pending_age_seconds': None,
+            'healthy': False,
+        }
+        stage.graphiti_queue_health = health_record
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step13-gqh',
+            )
+
+        assert 'graphiti_queue_health' in report.stats, (
+            "run() must set report.stats['graphiti_queue_health'] when "
+            "stage.graphiti_queue_health is set; "
+            f"got stats={report.stats!r}"
+        )
+        assert report.stats['graphiti_queue_health'] == health_record
+
+    @pytest.mark.asyncio
+    async def test_graphiti_queue_health_warning_when_unhealthy(self, caplog):
+        """run() logs a WARNING when graphiti_queue_health.healthy=False."""
+        import logging
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        stage.graphiti_queue_health = {
+            'dead_count': 2, 'pending_count': 0, 'retry_count': 0,
+            'oldest_pending_age_seconds': None, 'healthy': False,
+        }
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step13-gqh-warn',
+            )
+
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), 'Expected at least one WARNING when graphiti_queue_health.healthy=False'
+
+    @pytest.mark.asyncio
+    async def test_graphiti_queue_health_absent_when_none(self):
+        """When stage.graphiti_queue_health is None, the key must be absent from report.stats."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        # Explicitly leave graphiti_queue_health at the default (None)
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step13-gqh-none',
+            )
+
+        assert 'graphiti_queue_health' not in report.stats, (
+            "When stage.graphiti_queue_health is None, the key must be absent from "
+            f"report.stats; got stats={report.stats!r}"
         )
