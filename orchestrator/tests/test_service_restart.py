@@ -605,3 +605,70 @@ async def test_service_name_default_fused_memory_byte_identical(
     assert data['service'] == 'fused-memory'
     assert data['reason'] == 'post_merge_fused_memory_code_change'
     assert any('Restarting fused-memory' in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# require_idle gate tests (step-5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_require_idle_false_fires_when_agents_not_idle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(a) require_idle=False: fires (returns True, clears pending) even when agents_idle=False."""
+    import logging
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=['dashboard/src/app.py'])
+    event_store = MagicMock()
+    executor = AsyncMock()
+    current_time: list[float] = [0.0]
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['dashboard/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+        service_name='dashboard',
+        require_idle=False,
+    )
+
+    await coord.note_merge('task-leaf', 'base_sha', 'head_sha')
+    assert coord.is_pending is True
+
+    # Advance time past debounce (debounce=0, so anything works)
+    current_time[0] = 1.0
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result = await coord.maybe_restart(agents_idle=False)
+
+    assert result is True
+    assert coord.is_pending is False
+    executor.assert_awaited_once()
+
+    # Event emitted
+    event_store.emit.assert_called_once()
+
+    # Log fired
+    assert any('Restarting dashboard' in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_require_idle_true_defers_when_agents_not_idle() -> None:
+    """(b) Default require_idle=True: defers (returns False, stays pending) when agents_idle=False — regression guard."""
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'], debounce_secs=0.0
+    )
+    current_time[0] = 1000.0
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # Advance well past debounce; agents_idle=False should still defer
+    current_time[0] = 2000.0
+    result = await coord.maybe_restart(agents_idle=False)
+
+    assert result is False
+    assert coord.is_pending is True
+    executor.assert_not_awaited()
