@@ -185,9 +185,13 @@ def _mock_merge_queue_verification(monkeypatch, request):
     (skip the monkeypatch), restoring the real binding.
 
     An Explore audit (task 1829) confirmed that only two tests are in this at-risk
-    category:
+    category — tests whose correctness assertion requires the blocked outcome and
+    which use the marker as the SOLE restore mechanism (no in-body patch):
       - test_train_integration.py::TestTrainIntegrationB2::test_lower_member_break_blocks_train
       - test_atomic_train_merge.py::TestScenario5GroupMergeVerify::test_group_merge_workspace_verify_red
+    Do NOT add a redundant in-body ``patch('orchestrator.merge_queue.run_scoped_verification',
+    ...)`` to these tests — the marker is sufficient and is the authoritative mechanism
+    (pinned by test_merge_verify_mock_autouse.py).
     Every other test that drives the real merge path either overrides
     run_scoped_verification itself, injects verify via a different seam
     (run_scoped= param / workflow-layer patch), tests a failure that occurs BEFORE
