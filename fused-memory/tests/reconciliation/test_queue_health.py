@@ -6,7 +6,13 @@ Step-6 (GREEN): create queue_health.py with the function.
 
 from __future__ import annotations
 
+import logging
+
+import pytest
+
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
+
+_LOGGER = "fused_memory.reconciliation.queue_health"
 
 
 class TestSummarizeGraphitiQueueHealth:
@@ -81,4 +87,90 @@ class TestSummarizeGraphitiQueueHealth:
         result = summarize_graphiti_queue_health(stats_pending)
         assert result['healthy'] is True, (
             'pending+retry without dead must still be healthy'
+        )
+
+    # --- Step-1 (task 1810): malformed-stats WARNING tests ---
+
+    @pytest.mark.parametrize("bad_stats", [None, "oops", [1, 2, 3]])
+    def test_non_dict_stats_yields_unhealthy_and_warning(self, bad_stats, caplog):
+        """stats that is not a dict => healthy=False AND a WARNING on the module logger.
+
+        Currently RED: non-dict stats yields healthy=True and no logger exists.
+        """
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health(bad_stats)
+
+        assert result['healthy'] is False, (
+            f"non-dict stats {bad_stats!r} must yield healthy=False"
+        )
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            f"expected a WARNING on {_LOGGER!r} for non-dict stats, got none"
+        )
+
+    def test_counts_present_but_non_dict_yields_unhealthy_and_warning(self, caplog):
+        """stats with 'counts' present but not a dict => healthy=False + WARNING.
+
+        Currently RED: the 'corrupt' string falls through to counts={} => healthy=True.
+        """
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health({'counts': 'corrupt'})
+
+        assert result['healthy'] is False, (
+            "counts='corrupt' (present-but-not-dict) must yield healthy=False"
+        )
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            f"expected a WARNING on {_LOGGER!r} for present-but-non-dict counts"
+        )
+
+    def test_absent_counts_key_is_benign_no_warning(self, caplog):
+        """Missing 'counts' key is benign: healthy=True with ZERO warnings.
+
+        Regression: the benign-absent path must stay silent.
+        """
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health({'oldest_pending_age_seconds': None})
+
+        assert result['healthy'] is True
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f"absent 'counts' key must not emit any WARNING; got {warns!r}"
+        )
+
+    def test_healthy_case_no_warning(self, caplog):
+        """REGRESSION: healthy stats emit ZERO warnings."""
+        stats = {'counts': {'completed': 10}, 'oldest_pending_age_seconds': 0.5}
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health(stats)
+
+        assert result['healthy'] is True
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"healthy stats must not emit WARNINGs; got {warns!r}"
+
+    def test_unhealthy_case_no_extra_warning(self, caplog):
+        """REGRESSION: dead-letter unhealthy case emits ZERO warnings (only failure branch warns)."""
+        stats = {'counts': {'dead': 1, 'completed': 5}}
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health(stats)
+
+        assert result['healthy'] is False
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f"dead-letter unhealthy case must not emit WARNINGs; got {warns!r}"
         )
