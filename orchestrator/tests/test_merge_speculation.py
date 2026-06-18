@@ -701,7 +701,7 @@ class TestSpecLaneWarmPathShadowParity:
         # Fake VerifyResult with parseable per-test output
         fake_vr = VerifyResult(
             passed=True,
-            test_output='        PASS [0.05s] spec::test_warm_shadow\n',
+            test_output='        PASS [0.05s] reify-spec test_warm_shadow\n',
             lint_output='',
             type_output='',
             summary='',
@@ -758,7 +758,7 @@ class TestSpecLaneWarmPathShadowParity:
 
         fake_vr = VerifyResult(
             passed=True,
-            test_output='        PASS [0.05s] spec::test_warm_shadow\n',
+            test_output='        PASS [0.05s] reify-spec test_warm_shadow\n',
             lint_output='',
             type_output='',
             summary='',
@@ -778,7 +778,7 @@ class TestSpecLaneWarmPathShadowParity:
         # Cold verify returns SAME results as warm (parity case)
         async def _mock_cold_shadow_verify(*args, **kwargs):
             cold_verify_calls.append(args)
-            return {'spec::test_warm_shadow': 'pass'}  # parity with warm
+            return {'reify-spec test_warm_shadow': 'pass'}  # parity with warm
 
         escalation_queue = _make_escalation_queue()
 

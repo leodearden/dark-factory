@@ -7787,8 +7787,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if merge_wt is not item.merge_wt:
                     self._deregister_owned_merge_worktree(item.merge_wt)
                 _is_warm_path = (
-                    req.config.git.persistent_merge_worktree
-                    and not _due
+                    (req.config.git.persistent_merge_worktree and not _due)
+                    or (req.config.git.merge_spec_warm_lane_pool and _spec_warm)
                 )
 
             # NOTE: _verify_item/_verify_phase/_verify_started_at are vestigial
