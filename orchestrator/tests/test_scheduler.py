@@ -7863,6 +7863,140 @@ class TestAcquireNextLocalBackfillFailsSafe:
             f'Expected _local_backfill_unresolved_counts[(B, A)] >= 1; got {count}'
         )
 
+    @pytest.mark.asyncio
+    async def test_counter_resets_on_success_after_failure(
+        self, scheduler: Scheduler, caplog
+    ):
+        """Counter must be RESET (popped) when backfill succeeds after a prior failure.
+
+        Amendment 1 (suggestion 1 from reviewer): _local_backfill_unresolved_counts
+        claims consecutive-tick semantics in its comment and warning message, but
+        without a reset-on-success the count accumulates across the gap.  The fix
+        mirrors _external_unresolved_counts.pop(...) on 'done' in
+        _apply_external_dep_policy.
+
+        Step 1: fail → counter bumped for (B, A).
+        Step 2: success → counter popped for (B, A).
+        """
+        import logging
+
+        task_b = {
+            'id': 'B',
+            'title': 'Task B — depends on A',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['backend/module_b']},
+        }
+
+        call_count = {'n': 0}
+
+        async def _dispatch_fail_then_succeed(tool_name, arguments, **kwargs):
+            if tool_name == 'get_tasks':
+                return self._envelope({'tasks': [task_b]})
+            if tool_name == 'get_statuses':
+                call_count['n'] += 1
+                if call_count['n'] == 1:
+                    # First call: malformed → EnvelopeParseError
+                    return self._envelope({'statuses': ['not', 'a', 'dict']})
+                else:
+                    # Second call: A now resolves as done
+                    return self._envelope({'statuses': {'A': 'done'}})
+            return {}
+
+        scheduler.dispatch_tool = AsyncMock(side_effect=_dispatch_fail_then_succeed)
+
+        # Tick 1: backfill fails → counter bumped
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler.acquire_next()
+
+        assert scheduler._local_backfill_unresolved_counts.get(('B', 'A'), 0) >= 1, (
+            'Counter should be > 0 after first (failed) tick'
+        )
+
+        # Tick 2: backfill succeeds → counter must be reset (popped)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler.acquire_next()
+
+        remaining = scheduler._local_backfill_unresolved_counts.get(('B', 'A'), 0)
+        assert remaining == 0, (
+            f'Expected counter reset to 0 after successful backfill; got {remaining}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_backfill_warns_for_missing_ids(
+        self, scheduler: Scheduler, caplog
+    ):
+        """Partial backfill (valid dict but missing some requested ids) → WARNING + counter.
+
+        Amendment 2 (suggestion 2 from reviewer): get_statuses returns a non-empty
+        dict that omits some of the requested dep ids.  resolver_failed() returns
+        False (no error, non-empty), so the old code updated status_map and held
+        the still-missing dep silently.  The fix mirrors the missing-key guard in
+        get_external_statuses: compute still_missing and treat it as degraded.
+
+        Setup:
+        - B depends on both A and C.
+        - get_tasks returns [B] (active only; A and C are done, absent from active).
+        - get_statuses returns {'C': 'done'} — C resolved but A is missing from
+          the response (partial).
+
+        Expected:
+        - orchestrator.scheduler WARNING naming A as the missing dep.
+        - _local_backfill_unresolved_counts[('B', 'A')] bumped.
+        - _local_backfill_unresolved_counts[('B', 'C')] NOT bumped (resolved).
+        - B NOT dispatched (A still absent from status_map → deps not satisfied).
+        """
+        import logging
+
+        task_b = {
+            'id': 'B',
+            'title': 'Task B — depends on A and C',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}, {'id': 'C'}],
+            'metadata': {'files': ['backend/module_b']},
+        }
+
+        async def _dispatch(tool_name, arguments, **kwargs):
+            if tool_name == 'get_tasks':
+                return self._envelope({'tasks': [task_b]})
+            if tool_name == 'get_statuses':
+                # Partial: C resolved, A absent (partial response)
+                return self._envelope({'statuses': {'C': 'done'}})
+            return {}
+
+        scheduler.dispatch_tool = AsyncMock(side_effect=_dispatch)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler.acquire_next()
+
+        # B must NOT be dispatched (A is still unknown)
+        assert result is None, (
+            f'Expected None (fail-safe-wait for missing A) but got {result!r}'
+        )
+
+        # WARNING must be emitted naming the partial result
+        partial_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and r.name == 'orchestrator.scheduler'
+            and 'partial' in r.getMessage().lower()
+        ]
+        assert partial_warnings, (
+            'Expected a WARNING about partial backfill result; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+
+        # Counter bumped for still-missing A, not for resolved C
+        count_a = scheduler._local_backfill_unresolved_counts.get(('B', 'A'), 0)
+        assert count_a >= 1, (
+            f'Expected counter bumped for (B, A); got {count_a}'
+        )
+        count_c = scheduler._local_backfill_unresolved_counts.get(('B', 'C'), 0)
+        assert count_c == 0, (
+            f'Expected counter 0 for resolved (B, C); got {count_c}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-7 RED: bookkeeping purged for tasks absent from active fetch (not only terminal)
