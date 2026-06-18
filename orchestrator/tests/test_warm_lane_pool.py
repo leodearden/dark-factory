@@ -382,6 +382,15 @@ class TestGitConfigDefaults:
         config = GitConfig()
         assert config.warm_lane_base_target_dir is None
 
+    def test_merge_spec_warm_lane_pool_default_false(self):
+        """merge_spec_warm_lane_pool defaults to False (feature gated off).
+
+        Step-1 RED: field absent → AttributeError.
+        Step-2 GREEN: field present and default False.
+        """
+        config = GitConfig()
+        assert config.merge_spec_warm_lane_pool is False
+
 
 class TestWarmLaneBaseTargetPath:
     def test_derived_default_from_persistent_merge_worktree(
