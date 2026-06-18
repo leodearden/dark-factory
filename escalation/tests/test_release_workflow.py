@@ -242,6 +242,8 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     h.scheduler.get_status = AsyncMock(return_value='in-progress')
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.release = MagicMock()
+    # carries_substrate_probe must return False so _run_slot skips _run_substrate_gate
+    # (which needs git_ops.worktree_base — left None since TaskWorkflow is patched).
     h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
 
     assignment = TaskAssignment(  # type: ignore[reportMissingImports]

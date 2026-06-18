@@ -582,7 +582,7 @@ class TestExceptionLogging:
         assert result == []
 
     async def test_operational_error_logs_debug(self, tmp_path, caplog):
-        """with_db emits a DEBUG log on OperationalError (no-table DB)."""
+        """with_db emits a WARNING log on OperationalError (no-table DB)."""
         from dashboard.data.reconciliation import get_watermarks
 
         # Create a valid SQLite file but with no tables — causes OperationalError
@@ -592,14 +592,14 @@ class TestExceptionLogging:
 
         async with aiosqlite.connect(str(db_path)) as db:
             db.row_factory = aiosqlite.Row
-            with caplog.at_level(logging.DEBUG, logger='dashboard.data.db'):
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
                 result = await get_watermarks(db)
 
         assert result == []
         assert any(
-            r.levelno == logging.DEBUG and 'dashboard.data.db' in r.name
+            r.levelno >= logging.WARNING and 'dashboard.data.db' in r.name
             for r in caplog.records
-        ), f'Expected DEBUG log from dashboard.data.db, got: {caplog.records}'
+        ), f'Expected WARNING log from dashboard.data.db, got: {caplog.records}'
 
 
 class TestGetJournalEntries:
@@ -965,7 +965,7 @@ class TestWithDb:
         assert not db_records, f'Expected no logs for None path, got: {db_records}'
 
     async def test_emits_debug_log_on_operational_error(self, tmp_path, caplog):
-        """Helper emits a DEBUG log on OperationalError."""
+        """Helper emits a WARNING log on OperationalError."""
         import sqlite3 as _sqlite3
 
         from dashboard.data.db import with_db
@@ -979,14 +979,14 @@ class TestWithDb:
 
         async with aiosqlite.connect(str(db_path)) as db:
             db.row_factory = aiosqlite.Row
-            with caplog.at_level(logging.DEBUG, logger='dashboard.data.db'):
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
                 await with_db(db, _fn, default=None)
 
-        debug_records = [
+        warning_records = [
             r for r in caplog.records
-            if r.levelno == logging.DEBUG and 'dashboard.data.db' in r.name
+            if r.levelno >= logging.WARNING and 'dashboard.data.db' in r.name
         ]
-        assert debug_records, f'Expected DEBUG log, got: {caplog.records}'
+        assert warning_records, f'Expected WARNING log, got: {caplog.records}'
 
 
 class TestMakeReconDb:

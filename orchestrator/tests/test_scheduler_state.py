@@ -866,6 +866,17 @@ class TestSnapshotWriteThrottle:
         scheduler._write_state_snapshot_raw = MagicMock()
         scheduler._build_snapshot_payload = MagicMock(side_effect=[f'p{i}' for i in range(N)])
 
+        # Defeat content-dedup via _build_snapshot_payload: acquire_next() cleans
+        # up _skip_count entries for task IDs absent from tasks_by_id, so injecting
+        # fake _skip_count keys no longer works.  Instead, replace _build_snapshot_payload
+        # with a counter that always returns a unique string, making the time-throttle
+        # gate the SOLE mechanism bounding writes.
+        _dedup_counter = [0]
+        def _unique_payload(state=None):  # noqa: E301
+            _dedup_counter[0] += 1
+            return str(_dedup_counter[0])
+        scheduler._build_snapshot_payload = _unique_payload
+
         for i in range(N):
             clock['t'] = (i + 1) * tick_interval  # multiplicative: no accumulation drift
             await scheduler.acquire_next()

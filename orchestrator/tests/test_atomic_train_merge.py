@@ -1109,6 +1109,13 @@ class TestScenario6ParkPrefixDerail:
         # α/β are live (in get_statuses) with merge-deferred status.
         harness.scheduler = MagicMock()
         harness.scheduler._dispatched = set()
+        harness.scheduler.get_tasks = AsyncMock(return_value=[
+            {"id": "alpha6", "status": "merge-deferred"},
+            {"id": "beta6", "status": "merge-deferred"},
+            {"id": "gamma6", "status": "blocked"},
+        ])
+        # _reap_orphan_worktrees now uses get_statuses() (async) to build live_ids.
+        # Provide a non-empty dict so resolver_failed() does not abort the sweep.
         harness.scheduler.get_statuses = AsyncMock(return_value=(
             {"alpha6": "merge-deferred", "beta6": "merge-deferred", "gamma6": "blocked"},
             None,

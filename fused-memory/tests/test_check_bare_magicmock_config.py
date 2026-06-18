@@ -594,17 +594,24 @@ class TestHooksIntegration:
 
     def test_hook_invokes_check_with_python3_not_uv_run(self):
         """The bare-magicmock check invocation must use a python3 token, not uv run,
-        and target the five test directories.
+        and the gate must target the five test directories.
 
         Word-boundary regex r'\\bpython3(?:\\.\\d+)?\\b' accepts plain `python3`,
         versioned `python3.11`, and absolute paths, while rejecting `mypython3`.
 
-        The filter checks `'check_bare_magicmock_config.py' in line.split('#')[0]`
-        so that the script name must appear in the non-comment portion of the line.
-        This excludes both full-line bash comments and inline comments.
+        The invocation filter checks
+        `'check_bare_magicmock_config.py' in line.split('#')[0]` so that the script
+        name must appear in the non-comment portion of the line. This excludes both
+        full-line bash comments and inline comments.
 
-        The scan-target assertions check each line's non-comment portion
-        (`line.split('#')[0]`) so that comment-only occurrences don't satisfy them.
+        Scan-dir coverage: commit 2a527c12c9 ("scope pre-commit to staged diff")
+        moved the five scan directories off the script-invocation line and onto the
+        `git diff --cached ... -- <dirs>` selection line (the `staged_mm=`
+        assignment); matching staged files are then piped to the script via xargs.
+        The directories therefore live on the selection line, not the invocation
+        line, so the coverage assertion scans the whole gate (selection +
+        invocation lines), each via its non-comment portion (`line.split('#')[0]`)
+        so comment-only occurrences don't satisfy it.
         """
         import re as _re  # noqa: PLC0415 — avoid polluting module namespace
 
@@ -625,10 +632,34 @@ class TestHooksIntegration:
             assert 'uv run' not in line, (
                 f'Found uv run in bare-magicmock check invocation (should use plain python3): {line!r}'
             )
-        # Assert ALL five configured scan directories appear in the invocation line(s).
-        # Asserting against invocation_lines (already filtered to lines that contain
-        # check_bare_magicmock_config.py in non-comment code) is more precise than
-        # scanning all_non_comment — a drop of any single directory is immediately caught.
+        # Assert ALL five configured scan directories appear in the bare-magicmock
+        # gate. The gate is the contiguous block that begins at the staged-file
+        # selection (`staged_mm=` — a multi-line `git diff --cached ... -- <dirs>`
+        # whose `-- <dirs>` pathspec carries the five directories on a backslash
+        # continuation line) and ends at the script-invocation line. Scanning the
+        # whole block (each line's non-comment portion) keeps a drop of any single
+        # directory immediately catchable regardless of which continuation line
+        # carries the pathspec.
+        all_lines = content.splitlines()
+        start_idx = next(
+            (i for i, line in enumerate(all_lines) if 'staged_mm=' in line.split('#')[0]),
+            None,
+        )
+        end_idx = next(
+            (
+                i
+                for i, line in enumerate(all_lines)
+                if 'check_bare_magicmock_config.py' in line.split('#')[0]
+            ),
+            None,
+        )
+        assert start_idx is not None and end_idx is not None and start_idx <= end_idx, (
+            'Could not locate the bare-magicmock gate block (staged_mm selection '
+            'through check_bare_magicmock_config.py invocation) in hooks/project-checks'
+        )
+        gate_code = '\n'.join(
+            line.split('#')[0] for line in all_lines[start_idx : end_idx + 1]
+        )
         _EXPECTED_SCAN_DIRS = [
             'shared/tests',
             'escalation/tests',
@@ -636,11 +667,11 @@ class TestHooksIntegration:
             'orchestrator/tests',
             'dashboard/tests',
         ]
-        invocation_code = '\n'.join(invocation_lines)
         for expected_dir in _EXPECTED_SCAN_DIRS:
-            assert expected_dir in invocation_code, (
-                f'Expected scan target {expected_dir!r} in check_bare_magicmock_config.py '
-                f'invocation line(s) in hooks/project-checks, got: {invocation_code!r}'
+            assert expected_dir in gate_code, (
+                f'Expected scan target {expected_dir!r} in the bare-magicmock gate '
+                f'(staged_mm selection + check_bare_magicmock_config.py invocation) '
+                f'in hooks/project-checks, got: {gate_code!r}'
             )
 
 

@@ -14,7 +14,7 @@ import subprocess
 import textwrap
 import time
 
-import pytest
+import pytest  # pyright: ignore[reportMissingImports]
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
@@ -221,19 +221,26 @@ def test_window_close_yields_129_not_hang(
     # Send SIGHUP to the entire process group of the session leader.
     os.killpg(leader_pid, signal.SIGHUP)
 
-    # spawn-claude.sh must complete within 10 s and return 129.
+    # Must-not-hang guard — NOT a latency SLA.
+    # 10s flaked under full-suite CPU contention: SIGHUP->exit-129 can exceed 10s
+    # because spawn-claude.sh's await_sentinel polls at 2s granularity (line 68).
+    # 30s gives load headroom while staying below the global 60s pytest-timeout
+    # (shared/pyproject.toml, timeout_method=signal), so this descriptive
+    # pytest.fail still fires before the blunt signal-kill on a genuine hang.
+    # De-flake precedent: task 1335, commit 36cd05094b.
     try:
-        rc = proc.wait(timeout=10)
+        rc = proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
             f"[{terminal_name}] spawn-claude.sh hung after window-close "
             f"(await_sentinel never unblocked — SIGHUP sentinel gap not fixed)"
         )
-    assert rc == 129, (
-        f"[{terminal_name}] Expected exit 129 (window closed while alive), "
-        f"got {rc}\nstderr: {proc.stderr.read().decode()}"  # type: ignore[union-attr]
-    )
+    else:
+        assert rc == 129, (
+            f"[{terminal_name}] Expected exit 129 (window closed while alive), "
+            f"got {rc}\nstderr: {proc.stderr.read().decode()}"  # type: ignore[union-attr]
+        )
 
 
 # ===========================================================================

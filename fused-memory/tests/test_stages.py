@@ -884,7 +884,10 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
         assert result.items_flagged == []
-        assert result.stats == {'entity_summary_snapshot_lines_stripped': 0}
+        assert result.stats == {
+            'entity_summary_snapshot_lines_stripped': 0,
+            'stage1_fetch_degraded': [],
+        }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
 
@@ -972,7 +975,10 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
         assert result.items_flagged == []
-        assert result.stats == {'entity_summary_snapshot_lines_stripped': 0}
+        assert result.stats == {
+            'entity_summary_snapshot_lines_stripped': 0,
+            'stage1_fetch_degraded': [],
+        }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
         assert any(
