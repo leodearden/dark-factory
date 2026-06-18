@@ -1189,3 +1189,148 @@ class TestRunnerUnavailableTracker:
         assert 'host1' not in worker._runner_unavailable
         assert 'host2' in worker._runner_unavailable
         assert worker._runner_unavailable['host2'].streak == 1
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-7 RED: _alarm_verify_host_unreachable module-level helper
+# ---------------------------------------------------------------------------
+
+
+class _FakeEscalationQueue:
+    """Minimal fake escalation queue for testing _alarm_verify_host_unreachable."""
+
+    def __init__(self, *, open_l1: bool = False):
+        self._open_l1 = open_l1
+        self._seq = 0
+        self.submitted: list = []
+
+    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+        return self._open_l1
+
+    def make_id(self, task_id: str) -> str:
+        self._seq += 1
+        return f'esc-{self._seq}'
+
+    def submit(self, esc) -> None:
+        self.submitted.append(esc)
+
+    def open_it(self):
+        """Simulate a prior open L1 (for dedup tests)."""
+        self._open_l1 = True
+
+
+class _FakeEventStore:
+    """Minimal fake event store for testing event emission."""
+
+    def __init__(self):
+        self.emitted: list = []
+
+    def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
+        self.emitted.append({'event_type': event_type, 'task_id': task_id, 'data': data or {}})
+
+
+class TestAlarmVerifyHostUnreachable:
+    """_alarm_verify_host_unreachable module-level helper (task 1795 step-7).
+
+    RED until step-8 GREEN adds the function and sentinel to merge_queue.py.
+    """
+
+    def _call(self, eq, host, reason, *, streak=3, duration_s=120.0, event_store=None):
+        from orchestrator.merge_queue import _alarm_verify_host_unreachable
+        _alarm_verify_host_unreachable(
+            eq, host, reason,
+            streak=streak,
+            duration_s=duration_s,
+            event_store=event_store,
+        )
+
+    def test_none_queue_is_noop(self):
+        """None escalation_queue → returns silently, no raise."""
+        self._call(None, 'host1', 'ssh timeout', streak=3, duration_s=60.0)
+        # No assertion needed — must not raise
+
+    def test_first_call_submits_exactly_one_escalation(self):
+        """First call submits exactly one Escalation."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'host1', 'ssh timeout', streak=3, duration_s=120.0)
+        assert len(eq.submitted) == 1
+
+    def test_escalation_has_level_1(self):
+        """Submitted Escalation has level==1 (L1 blocking, not L2 critical)."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'host1', 'ssh timeout', streak=3, duration_s=120.0)
+        esc = eq.submitted[0]
+        assert esc.level == 1
+
+    def test_escalation_has_verify_host_unreachable_category(self):
+        """Submitted Escalation has category=='verify_host_unreachable'."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'host1', 'ssh timeout', streak=3, duration_s=120.0)
+        esc = eq.submitted[0]
+        assert esc.category == 'verify_host_unreachable'
+
+    def test_category_is_not_halting(self):
+        """category is NOT in {wip_conflict, unmerged_state} (non-halting invariant)."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'host1', 'err', streak=3, duration_s=120.0)
+        esc = eq.submitted[0]
+        assert esc.category not in {'wip_conflict', 'unmerged_state'}
+
+    def test_escalation_task_id_is_per_host_sentinel(self):
+        """task_id is the per-host sentinel __verify_host_unreachable__<host>."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'my-laptop', 'err', streak=3, duration_s=120.0)
+        esc = eq.submitted[0]
+        assert esc.task_id == '__verify_host_unreachable__my-laptop'
+
+    def test_escalation_summary_names_host_and_reason(self):
+        """summary includes both the host name and the reason string."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        reason = 'ssh: Could not resolve hostname leo-laptop'
+        self._call(eq, 'leo-laptop', reason, streak=5, duration_s=300.0)
+        esc = eq.submitted[0]
+        assert 'leo-laptop' in esc.summary
+        assert reason in esc.summary or 'Could not resolve hostname' in esc.summary
+
+    def test_escalation_detail_names_host_reason_duration(self):
+        """detail includes host, reason, and a human-readable duration."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        reason = 'Connection refused'
+        self._call(eq, 'build-box', reason, streak=4, duration_s=900.0)
+        esc = eq.submitted[0]
+        assert 'build-box' in esc.detail
+        assert reason in esc.detail
+
+    def test_second_call_with_open_l1_is_deduped(self):
+        """When has_open_l1 returns True the function submits nothing (dedup)."""
+        eq = _FakeEscalationQueue(open_l1=True)  # alarm already open
+        self._call(eq, 'host1', 'ssh timeout', streak=5, duration_s=200.0)
+        assert len(eq.submitted) == 0
+
+    def test_event_store_emits_verify_host_unreachable_event(self):
+        """When event_store is provided, a verify_host_unreachable event is emitted."""
+        from orchestrator.event_store import EventType
+        eq = _FakeEscalationQueue(open_l1=False)
+        es = _FakeEventStore()
+        self._call(eq, 'host1', 'ssh error', streak=3, duration_s=60.0, event_store=es)
+        assert len(es.emitted) >= 1
+        types = [e['event_type'] for e in es.emitted]
+        assert EventType.verify_host_unreachable in types
+
+    def test_event_names_the_host(self):
+        """The emitted verify_host_unreachable event includes the host name in data."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        es = _FakeEventStore()
+        self._call(eq, 'build-machine', 'err', streak=3, duration_s=90.0, event_store=es)
+        from orchestrator.event_store import EventType
+        events = [e for e in es.emitted if e['event_type'] == EventType.verify_host_unreachable]
+        assert events, 'no verify_host_unreachable event emitted'
+        host_in_data = any('build-machine' in str(e['data']) for e in events)
+        assert host_in_data
+
+    def test_no_event_when_event_store_none(self):
+        """When event_store is None no exception is raised and no event is emitted."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        # Must not raise even though event_store=None
+        self._call(eq, 'host1', 'err', streak=3, duration_s=60.0, event_store=None)
+        assert len(eq.submitted) == 1  # escalation still submitted
