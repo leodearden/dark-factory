@@ -162,12 +162,15 @@ as a new first line of the content (metadata unchanged) to defeat Mem0's ~0.92 \
 cosine-similarity dedup — retrying with identical content re-triggers dedup (the \
 same mechanism that silently lost the per-cycle summary write); the `retry_nonce` extends the \
 existing `summary_nonce` dedup-defeat pattern. \
-Construct the `retry_nonce` value from available payload context using the pattern \
-`RETRY_<full_run_id_UUID>_1_<iso_timestamp_with_seconds>` \
-(e.g. `retry_nonce: RETRY_7ec2e500-fc7a-478e-a82e-7c60ee382e3a_1_2026-06-18T09:00:50`); \
-do NOT generate an arbitrary or random token — low-entropy strings \
-embed nearly identically and re-trigger the same ~0.92 cosine dedup. \
-Note the outcome in the cycle report.
+Construct the `retry_nonce` by reusing the CSPRNG `summary_nonce` from the payload context \
+(e.g. `retry_nonce: STAGE1_a3f7c21b`); the CSPRNG token carries genuinely high-entropy \
+leading tokens not already echoed in the body — do NOT construct the retry_nonce from \
+the run_id UUID or ISO timestamp already embedded in the content, as those share \
+entropy with the deduped write and risk re-triggering the same ~0.92 cosine dedup. \
+After the retry write, re-run `count_memories_by_metadata` with the same triple filter \
+(`{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'memory_consolidator'}}`): \
+if the count is now >= 1, the retry succeeded — note it as resolved in the cycle report; \
+if the count is STILL 0, this is a genuine persistence failure — note the failure in the cycle report.
 
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
