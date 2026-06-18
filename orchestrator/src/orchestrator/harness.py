@@ -1030,6 +1030,13 @@ class Harness:
                         timeout=15,
                     )
                     self._collect_done_reports(done, task_reports)
+                    # Leaf services (dashboard, require_idle=False) restart
+                    # promptly after their diff lands even while agents are
+                    # dispatching.  fused-memory (require_idle=True) no-ops here
+                    # and is reserved for the idle branch above — the two
+                    # branches are mutually exclusive per tick and maybe_restart
+                    # clears pending on fire, so there is no double-fire.
+                    await self._maybe_restart_stale_service(agents_idle=False)
                     continue
 
                 await sem.acquire()
