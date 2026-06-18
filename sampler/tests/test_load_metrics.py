@@ -291,3 +291,25 @@ class TestSumVerifyRss:
         proc = FakeProc(1, 'bash', ['verify.sh'], rss=4096)
         result = sum_verify_rss([proc])
         assert result == 4096
+
+
+# ---------------------------------------------------------------------------
+# Step-1 (plan) tests: collect_process_metrics propagation on total failure
+# ---------------------------------------------------------------------------
+
+
+class TestCollectProcessMetricsDegrade:
+    def test_total_proc_iter_failure_propagates(self):
+        """A total proc_iter failure must propagate, not be swallowed into 0.0.
+
+        Current code wraps proc_iter in `except Exception: procs = []` which
+        converts a RuntimeError scan failure into a fabricated healthy-zero dict.
+        This test confirms the RED premise: the exception is NOT raised.
+        """
+        from sampler.metrics import collect_process_metrics
+
+        def raising(*_a, **_kw):
+            raise RuntimeError('psutil scan down')
+
+        with pytest.raises(RuntimeError):
+            collect_process_metrics(proc_iter=raising, fd9_exists=lambda _pid: False)
