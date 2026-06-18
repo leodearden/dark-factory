@@ -127,3 +127,110 @@ class TestRunMainTipSweepHappyPath:
         assert remove_calls, 'Expected a git worktree remove --force call (cleanup)'
         remove_cmd = remove_calls[0]
         assert '--force' in remove_cmd, f'Expected --force in worktree remove cmd: {remove_cmd}'
+
+
+# ---------------------------------------------------------------------------
+# step-5: fail-safe paths + drift passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestRunMainTipSweepFailSafes:
+    """step-5: None sentinel returned on infra failures; drift passed through."""
+
+    def test_run_main_tip_sweep_failsafe_empty_sha(self, tmp_path: Path) -> None:
+        """When get_main_sha returns '', run_main_tip_sweep returns None and
+        neither run_full_verification nor git worktree add is called."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path, main_sha='')
+
+        full_verify_called = []
+
+        async def _fake_run(cmd, **kwargs):
+            full_verify_called.append(('_run', cmd))
+            return (0, '', '')
+
+        async def _fake_full_verify(*args, **kwargs):
+            full_verify_called.append(('full_verify',))
+            return PASSING_RESULT
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is None, f'Expected None on empty SHA, got {result!r}'
+        worktree_adds = [x for x in full_verify_called if x[0] == '_run' and 'add' in x[1]]
+        assert not worktree_adds, 'git worktree add should NOT be called when sha is empty'
+        full_verifies = [x for x in full_verify_called if x[0] == 'full_verify']
+        assert not full_verifies, 'run_full_verification should NOT be called when sha is empty'
+
+    def test_run_main_tip_sweep_failsafe_worktree_add_fails(self, tmp_path: Path) -> None:
+        """When git worktree add fails for every retry, returns None and
+        run_full_verification is NOT called."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        full_verify_called = []
+
+        async def _fake_run(cmd, **kwargs):
+            # Always fail worktree add; succeed on remove (shouldn't be called but guard)
+            if 'add' in cmd:
+                return (1, '', 'lock contention')
+            return (0, '', '')
+
+        async def _fake_full_verify(*args, **kwargs):
+            full_verify_called.append(True)
+            return PASSING_RESULT
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is None, f'Expected None when worktree add fails, got {result!r}'
+        assert not full_verify_called, 'run_full_verification should NOT be called on add failure'
+
+    def test_run_main_tip_sweep_drift_passthrough(self, tmp_path: Path) -> None:
+        """When run_full_verification returns a failing result, run_main_tip_sweep
+        returns (main_sha, failing_result) AND git worktree remove still ran (cleanup-on-failure)."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return (0, '', '')
+
+        async def _fake_full_verify(*args, **kwargs):
+            return FAILING_RESULT
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None, 'Expected (sha, VerifyResult) even on drift, got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is False
+        assert vr.category == 'test_failure'
+
+        # Cleanup must run even when verify fails
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, 'git worktree remove should run even when verify fails (cleanup-on-failure)'
