@@ -8,8 +8,10 @@ Design highlights
 * Only ``MergeRequest`` (not ``GroupMergeRequest``) is journaled — train merges
   carry live scheduler callbacks that cannot be serialized.
 * Atomic file I/O (tmp + os.replace) mirrors b3_gate.py ``_save_state``.
-* Fail-open reads: missing / empty / corrupt file → empty list; startup never
-  crashes because of a damaged journal.
+* Fail-open reads: missing file → empty list (benign, silent); empty / corrupt
+  file → empty list **plus** ``journal_corrupt=True`` and a deduped WARNING
+  (empty files are treated as corrupt because _save_raw never writes an empty
+  string, so an empty file is an anomaly, not a legitimate fresh state).
 * Keyed by ``request_id`` so ``record()`` is idempotent on redispatch (updates
   in place) and ``remove()`` is O(1) on terminal.
 """
@@ -23,6 +25,8 @@ import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from shared.safe_io import load_json_or_warn
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -73,6 +77,9 @@ class MergeQueueStore:
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        # Set journal_corrupt BEFORE _load_raw so the attribute always exists
+        # even if _load_raw raises unexpectedly (it shouldn't, but defensive).
+        self.journal_corrupt: bool = False
         # In-memory mirror of the on-disk journal, warmed at construction time.
         # All mutations go through this dict so record()/remove() never re-read
         # the file — they just update the cache and write it out atomically.
@@ -143,14 +150,27 @@ class MergeQueueStore:
     # ------------------------------------------------------------------
 
     def _load_raw(self) -> dict[str, Any]:
-        """Load the JSON map from disk; return {} on any error (fail-open)."""
-        try:
-            text = self._path.read_text(encoding='utf-8')
-            if not text.strip():
-                return {}
-            return json.loads(text)
-        except (OSError, json.JSONDecodeError, ValueError):
+        """Load the JSON map from disk; return {} on any error.
+
+        Missing file → {} (benign, silent, journal_corrupt stays False).
+        Empty / corrupt file → {} + journal_corrupt=True + deduped WARNING.
+        Non-dict but valid JSON → {} + journal_corrupt=True + WARNING.
+        Non-FileNotFoundError OSErrors propagate (unexpected environment failure).
+        """
+        data, ok = load_json_or_warn(self._path, default={}, on_corrupt='warn')
+        if not ok:
+            self.journal_corrupt = True
             return {}
+        if not isinstance(data, dict):
+            self.journal_corrupt = True
+            logger.warning(
+                'merge_queue_store: journal at %s is not a JSON object (got %s);'
+                ' treating as corrupt',
+                self._path,
+                type(data).__name__,
+            )
+            return {}
+        return data
 
     def _save_raw(self, state: dict[str, Any]) -> None:
         """Atomically write *state* to disk (tmp + os.replace)."""
