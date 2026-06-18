@@ -1238,6 +1238,43 @@ class GitOps:
 
         return lane, True
 
+    async def release_spec_lane(self, lane: Path, *, warm: bool) -> None:
+        """Release a ``_spec-`` lane after a speculative merge verify.
+
+        **Warm path** (``warm=True`` — pool lane):
+            ``await self.spec_warm_lane_pool.release(lane)`` — flips
+            ASSIGNED→FREE retaining the worktree and ``target/`` on disk so
+            the next :meth:`acquire_spec_lane` can re-seed from a warm base
+            (CoW-cheap, harmless to retain).  The worktree is never removed.
+
+        **Cold path** (``warm=False`` — ephemeral fallback worktree):
+            ``await self.cleanup_merge_worktree(lane)`` — removes the
+            throwaway ``_merge-<uuid>`` worktree created by
+            :meth:`create_throwaway_verify_worktree`.
+
+        **Idempotent**: releasing a FREE lane, an already-cleaned path, or an
+        unknown path is a no-op (never raises).  Mirrors the
+        ``release_warm_lane`` best-effort / never-raise contract so a hiccup
+        cannot strand the scheduler.
+
+        Args:
+            lane: Path returned by :meth:`acquire_spec_lane`.
+            warm: True when *lane* is a warm ``_spec-`` pool lane; False when
+                it is a cold ephemeral fallback worktree.
+        """
+        try:
+            if warm and self.spec_warm_lane_pool is not None:
+                await self.spec_warm_lane_pool.release(lane)
+                logger.debug('release_spec_lane: released warm lane %s', lane)
+            else:
+                await self.cleanup_merge_worktree(lane)
+                logger.debug('release_spec_lane: cleaned up cold lane %s', lane)
+        except Exception:
+            logger.warning(
+                'release_spec_lane: error releasing %s (warm=%s)',
+                lane, warm, exc_info=True,
+            )
+
     async def acquire_warm_lane(
         self,
         branch_name: str,
