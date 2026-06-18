@@ -134,6 +134,7 @@ class StaleServiceRestartCoordinator:
         clock: Callable[[], float] = time.monotonic,
         service_name: str = 'fused-memory',
         require_idle: bool = True,
+        script_args: list[str] | None = None,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -151,6 +152,10 @@ class StaleServiceRestartCoordinator:
         # dispatching — agents_idle is not required in the gate.  Default True
         # preserves the existing fused-memory behaviour (idle-only).
         self._require_idle = require_idle
+        # script_args are unpacked as positional args after the script path in
+        # _default_restart_executor.  None → ['--drain'] to preserve the
+        # existing fused-memory spawn signature exactly.
+        self._script_args: list[str] = script_args if script_args is not None else ['--drain']
 
         # State
         self._pending: bool = False
@@ -281,12 +286,16 @@ class StaleServiceRestartCoordinator:
         return True
 
     async def _default_restart_executor(self) -> None:
-        """Fire-and-forget: spawn the restart script detached."""
+        """Fire-and-forget: spawn the restart script detached.
+
+        Positional args after the script path are taken from ``self._script_args``
+        (e.g. ``['--drain']`` for fused-memory, ``[]`` for the dashboard).
+        """
         script = self._project_root / self._script_path
         await asyncio.create_subprocess_exec(
             str(script),
-            '--drain',
+            *self._script_args,
             start_new_session=True,
         )
-        # Intentionally NOT awaiting the process exit — the ~150 s
-        # drain+health must not block the orchestrator event loop.
+        # Intentionally NOT awaiting the process exit — the script runs
+        # detached so its health-poll never blocks the orchestrator event loop.
