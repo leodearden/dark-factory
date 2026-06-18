@@ -1046,20 +1046,24 @@ class GitOps:
         **inv.9 promote-provenance** is enforced STRUCTURALLY: the advancing dir
         is hardcoded to the _merge-verify target and no caller-supplied advancing
         parameter is exposed, so DF can never source a task lane (un-landed WIP).
+        The reify B12 guard inside refresh-warm-base.sh is defense-in-depth.
+
+        Self-guards (all return False, never raise):
+        - ``warm_lane_pool is None`` — pool knob off; refresh has no meaning.
+        - ``advancing == base`` — no separate rolling base configured; degenerate
+          self-copy skipped (default config has ``warm_lane_base_target_dir=None``
+          so base == ``_merge-verify/target`` == advancing).
+        - Script absent or non-zero exit — fail-soft.
 
         Returns:
             True  — script ran and exited 0 (base refreshed).
             False — any guard triggered or the script absent/failed (fail-soft;
                     never raises — a base-refresh hiccup cannot block merges).
         """
-        try:
-            script = self.persistent_merge_worktree_path / 'scripts' / 'refresh-warm-base.sh'
-            if not script.exists():
-                logger.debug(
-                    'refresh_warm_base: script absent at %s — no-op', script,
-                )
-                return False
+        if self.warm_lane_pool is None:
+            return False
 
+        try:
             artifact_dir = (
                 self.config.reap_build_artifact_dirs[0]
                 if self.config.reap_build_artifact_dirs
@@ -1067,6 +1071,20 @@ class GitOps:
             )
             advancing = self.persistent_merge_worktree_path / artifact_dir
             base = self.warm_lane_base_target_path
+
+            if advancing == base:
+                logger.debug(
+                    'refresh_warm_base: advancing == base (%s) — no separate rolling '
+                    'base configured, skipping degenerate self-copy', advancing,
+                )
+                return False
+
+            script = self.persistent_merge_worktree_path / 'scripts' / 'refresh-warm-base.sh'
+            if not script.exists():
+                logger.debug(
+                    'refresh_warm_base: script absent at %s — no-op', script,
+                )
+                return False
 
             rc, _, err = await _run(
                 [str(script), str(advancing), str(base)],
