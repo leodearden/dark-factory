@@ -282,3 +282,32 @@ class TestSchedulerDrawerJsxHolderEtasWiring:
         assert 'title={m.path}' in scheduler_drawer_jsx_body, (
             'title={m.path} not found in scheduler_drawer.jsx — full key hover removed'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-9: Source-structure tests for scheduler_heatmap.jsx (column headers)
+# (RED because scheduler_heatmap.jsx still renders m.path.split('/').pop()
+# for the sched-col-path span — the primary multi-collision site)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def scheduler_heatmap_jsx_body(_client):
+    return _client.get('/static/redux/scheduler_heatmap.jsx').text
+
+
+class TestSchedulerHeatmapJsxColumnHeaderWiring:
+    def test_mpath_basename_removed(self, scheduler_heatmap_jsx_body):
+        assert "m.path.split('/').pop()" not in scheduler_heatmap_jsx_body, (
+            "m.path.split('/').pop() still present in scheduler_heatmap.jsx — should be replaced"
+        )
+
+    def test_disambiguate_labels_routed(self, scheduler_heatmap_jsx_body):
+        assert 'disambiguateLabels(' in scheduler_heatmap_jsx_body, (
+            'disambiguateLabels( not found in scheduler_heatmap.jsx — wiring missing'
+        )
+
+    def test_column_header_title_preserved(self, scheduler_heatmap_jsx_body):
+        # The <th> must still have a title attribute containing m.path
+        assert re.search(r'title=\{[^}]*m\.path', scheduler_heatmap_jsx_body), (
+            'Column header title={...m.path...} not found in scheduler_heatmap.jsx'
+        )
