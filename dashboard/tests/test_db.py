@@ -498,3 +498,49 @@ class TestWithDb:
 
             result = await with_db(db, raises_os_error, 'default')
             assert result == 'default'
+
+    async def test_with_db_warns_on_operational_error(self, tmp_path, caplog):
+        """with_db must emit a WARNING when fn raises sqlite3.OperationalError.
+
+        The return contract is unchanged: the supplied default is returned.
+        Fails today because with_db logs at DEBUG, not WARNING.
+        """
+        import logging
+
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+
+            async def bad_query(conn):
+                raise sqlite3.OperationalError('no such table: nonexistent')
+
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
+                result = await with_db(db, bad_query, 'fallback')
+
+        assert result == 'fallback'
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'dashboard.data.db']
+        assert warnings, 'expected a WARNING from dashboard.data.db on query failure, got none'
+
+    async def test_with_db_warns_on_os_error(self, tmp_path, caplog):
+        """with_db must emit a WARNING when fn raises OSError.
+
+        The return contract is unchanged: the supplied default is returned.
+        Fails today because with_db logs at DEBUG, not WARNING.
+        """
+        import logging
+
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+
+            async def raises_os_error(conn):
+                raise OSError('disk I/O error')
+
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
+                result = await with_db(db, raises_os_error, 42)
+
+        assert result == 42
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'dashboard.data.db']
+        assert warnings, 'expected a WARNING from dashboard.data.db on OSError, got none'
