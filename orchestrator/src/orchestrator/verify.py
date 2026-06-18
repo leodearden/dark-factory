@@ -1319,6 +1319,21 @@ def _build_fallback_config(
     )
 
 
+def _verify_duration_secs(runs: list[dict]) -> float:
+    """Sum per-command ``duration_secs`` values from a verification runs list.
+
+    Each entry is expected to have a ``duration_secs`` key (float); entries
+    that are missing the key contribute 0.0.  Returns 0.0 for an empty list.
+
+    This is the correct wall-clock measure when commands were run **serially**
+    (sum of sequential durations).  For the **concurrent** branch (asyncio.gather
+    of test/lint/type) the caller should use ``max(...)`` of the individual
+    durations — mirroring the multi-module logic in ``_aggregate_results`` — to
+    avoid overstating wall-clock by ~3×.
+    """
+    return sum(r.get('duration_secs', 0.0) for r in runs)
+
+
 @dataclass
 class VerifyResult:
     passed: bool
@@ -1331,6 +1346,19 @@ class VerifyResult:
     category: str = ''
     worktree_log_paths: list[str] = field(default_factory=list)
     archive_log_paths: list[str] = field(default_factory=list)
+    # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
+    # when the three commands ran concurrently (asyncio.gather), or their sum
+    # when run serially.  For a multi-module run: max across child
+    # VerifyResults (set by _aggregate_results — modules run concurrently via
+    # asyncio.gather so max approximates wall-time).  Defaults to 0.0 for
+    # _trivial_pass and mocked results.
+    #
+    # compare=False: wall-clock duration differs between two independent runs of
+    # the same logical verification, so it must NOT participate in __eq__ (else
+    # cli_result == local can never hold — see test_cli
+    # test_verify_merge_cli_wrapper_transparency). Folded in here to clear a
+    # preexisting main red introduced by task 1802.
+    duration_secs: float = field(default=0.0, compare=False)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -2133,6 +2161,14 @@ async def run_verification(
         except Exception as exc:  # noqa: BLE001
             logger.warning('run_verification: persistence error (non-fatal): %s', exc)
 
+    # When the three verify commands ran concurrently (asyncio.gather) the
+    # true wall-clock cost is the longest single command, not their sum.
+    # Serial mode is rare (legacy / explicit opt-out) and sums correctly.
+    if concurrent:
+        _wall_secs = max(test_duration, lint_duration, type_duration)
+    else:
+        _wall_secs = _verify_duration_secs(runs)
+
     result = VerifyResult(
         passed=passed,
         test_output=test_out,
@@ -2144,6 +2180,7 @@ async def run_verification(
         category=category,
         worktree_log_paths=worktree_log_paths,
         archive_log_paths=archive_log_paths,
+        duration_secs=_wall_secs,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -2239,6 +2276,10 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         category=category,
         worktree_log_paths=worktree_log_paths,
         archive_log_paths=archive_log_paths,
+        # Wall-clock approximation: modules run concurrently via asyncio.gather
+        # so the slowest module dominates the total elapsed time.  Single-module
+        # tasks hit the len==1 fast path above and carry the exact value.
+        duration_secs=max((r.duration_secs for r in results), default=0.0),
     )
 
 

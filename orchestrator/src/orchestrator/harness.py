@@ -5320,14 +5320,15 @@ Output JSON matching the schema. Every task must appear in the output.
         new_count = prev_count + 1 if same_sig else 1
 
         # Persist BEFORE the flip (crash-safe: over-count, never under-count — C5).
-        # append=True → recursive-merge: only the 'reblock_guard' key is written;
-        # sibling metadata keys (files, memory_hints, …) are preserved, and the
-        # flip's own set_task_status reopen_reason audit-merge cannot clobber the
-        # counter (C3.4 hazard).
+        # metadata_mode='merge': shallow last-write-wins — the whole reblock_guard
+        # key is overwritten wholesale (new count/signature win), while sibling
+        # metadata keys (files, memory_hints, …) are preserved.  'additive' would
+        # use scalar OLD-wins under #1827's _merge_values, freezing the counter
+        # across incarnations when the guard key already exists.
         await self.scheduler.update_task(
             task_id,
             {'reblock_guard': {'count': new_count, 'signature': new_sig}},
-            append=True,
+            metadata_mode='merge',
         )
 
         return True

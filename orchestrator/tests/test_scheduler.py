@@ -1284,10 +1284,16 @@ class TestUpdateTaskMetadataSerialization:
         assert parsed == {'prd': '/abs/path/to/feature.prd'}
 
     @pytest.mark.asyncio
-    async def test_update_task_forwards_append_kwarg(
+    async def test_update_task_append_true_forwards_additive_mode(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """update_task(append=True) must forward append=True in MCP arguments."""
+        """update_task(append=True) must forward metadata_mode='additive', not 'append'.
+
+        append=True is the legacy additive-mode shorthand.  The wrapper resolves it
+        to metadata_mode='additive' and forwards that on the wire; it must NOT
+        forward 'append' (which the #1827 backend still accepts as a shim but which
+        the wrapper no longer relies on).
+        """
         captured_args: list[dict] = []
 
         async def mock_mcp_call(url, method, payload, **kwargs):
@@ -1300,22 +1306,23 @@ class TestUpdateTaskMetadataSerialization:
 
         assert len(captured_args) == 1
         arguments = captured_args[0]['arguments']
-        # append=True must be forwarded to the fused-memory MCP tool so it
-        # uses recursive-merge semantics instead of full-replacement.
-        assert arguments.get('append') is True, (
-            f'Expected append=True in MCP arguments, got: {arguments}'
+        assert arguments.get('metadata_mode') == 'additive', (
+            f"Expected metadata_mode='additive' in MCP arguments, got: {arguments}"
+        )
+        assert 'append' not in arguments, (
+            f"'append' key must not be forwarded on the wire; got: {arguments}"
         )
 
     @pytest.mark.asyncio
-    async def test_update_task_default_omits_append_key(
+    async def test_update_task_default_forwards_merge_mode(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """Default update_task call must NOT include 'append' in MCP arguments.
+        """Default update_task call must forward metadata_mode='merge' (the #4271 fix).
 
-        Existing callers omit the append kwarg and rely on full-replacement
-        semantics (append=False default).  A regression that always sets
-        append=True would silently flip every caller to merge-mode without
-        test failure — this test locks in the default replace-semantics.
+        No-append callers (prd-tagger, module-tagger, auto-eval back-link, …) rely
+        on merge — shallow last-write-wins that preserves sibling keys — NOT
+        full-replacement.  This test locks in the new default-merge contract and
+        ensures 'append' is absent from the wire call.
         """
         captured_args: list[dict] = []
 
@@ -1329,9 +1336,85 @@ class TestUpdateTaskMetadataSerialization:
 
         assert len(captured_args) == 1
         arguments = captured_args[0]['arguments']
-        assert 'append' not in arguments, (
-            f"Default call must not include 'append' key; got: {arguments}"
+        assert arguments.get('metadata_mode') == 'merge', (
+            f"Default call must forward metadata_mode='merge'; got: {arguments}"
         )
+        assert 'append' not in arguments, (
+            f"'append' key must not appear in the wire call; got: {arguments}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_task_explicit_replace_mode(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """update_task(metadata_mode='replace') forwards metadata_mode='replace'."""
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('1', {'files': ['backend']}, metadata_mode='replace')
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        assert arguments.get('metadata_mode') == 'replace', (
+            f"Expected metadata_mode='replace', got: {arguments}"
+        )
+        assert 'append' not in arguments
+
+    @pytest.mark.asyncio
+    async def test_update_task_explicit_additive_mode_passthrough(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """update_task(metadata_mode='additive') forwards 'additive' directly."""
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('1', {'files': ['backend']}, metadata_mode='additive')
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        assert arguments.get('metadata_mode') == 'additive', (
+            f"Expected metadata_mode='additive', got: {arguments}"
+        )
+        assert 'append' not in arguments
+
+    @pytest.mark.asyncio
+    async def test_update_task_metadata_mode_wins_over_append(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Explicit metadata_mode beats append=True (metadata_mode > append precedence).
+
+        If both append=True and metadata_mode='merge' are supplied, the explicit
+        metadata_mode='merge' must win — mirroring the backend _resolve_metadata_mode
+        precedence: metadata_mode > append > default.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task(
+            '1', {'files': ['backend']}, append=True, metadata_mode='merge'
+        )
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        assert arguments.get('metadata_mode') == 'merge', (
+            f"Explicit metadata_mode='merge' must win over append=True; got: {arguments}"
+        )
+        assert 'append' not in arguments
 
 
 class TestRequeueCooldown:

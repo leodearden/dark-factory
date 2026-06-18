@@ -1,8 +1,11 @@
 """Autonomous dry-run unblock — fire-and-forget investigation at block time.
 
 Invoked by workflow._mark_blocked when a task transitions to blocked.
-Runs the unblock-auto skill read-only, then appends a proposal entry to
-metadata.dry_run_proposals[] via scheduler.update_task(append=True).
+Runs the unblock-auto skill read-only, then persists a proposal entry to
+metadata.dry_run_proposals[] via scheduler.update_task(metadata_mode='additive')
+(list-union — preserves prior entries) and trims the list to keep_last entries
+via a separate update_task(default merge — overwrites dry_run_proposals wholesale
+while preserving sibling keys like memory_hints/files).
 Never mutates task state; all writes go through the parent process.
 """
 
@@ -247,17 +250,20 @@ async def run_dry_run_unblock(
         logger.error('dry_run_unblock: failed to persist proposal for task %s: %s', task_id, exc)
 
     # Best-effort keep-last-N trim: read the full metadata blob, slice
-    # dry_run_proposals to the most recent keep_last entries, rewrite the
-    # whole blob (append=False preserves sibling keys like memory_hints/files).
+    # dry_run_proposals to the most recent keep_last entries, and rewrite the
+    # whole blob via the default merge mode (shallow last-write-wins).  Merge
+    # overwrites the dry_run_proposals list wholesale (achieving the trim) while
+    # preserving sibling keys like memory_hints/files — strictly safer than
+    # replace (which would delete-by-omission any sibling written concurrently).
     # Wrapped in its own try/except — a trim failure never crashes the hook.
     # keep_last <= 0 disables trimming.
     # Note: existing MagicMock-scheduler tests stay green because their
     # scheduler.get_task is non-awaitable — raises TypeError, is caught here,
-    # and only the single append=True call persists.
+    # and only the single additive call persists.
     #
     # Concurrency note: this read-modify-write is not atomic. If another writer
-    # mutates the task metadata between get_task and update_task(append=False),
-    # that concurrent change is clobbered (stale-plus-trimmed blob wins).
+    # mutates the task metadata between get_task and the trim update_task, that
+    # concurrent change is clobbered (stale-plus-trimmed blob wins).
     # Concurrent dry-runs on the same blocked task are extremely unlikely — the
     # scheduler dispatches at most one hook per task — so this is acceptable as
     # a best-effort trim. A missed trim cycle is preferable to coordination
@@ -271,7 +277,7 @@ async def run_dry_run_unblock(
                 proposals = metadata.get('dry_run_proposals') or []
                 if len(proposals) > keep_last:
                     metadata['dry_run_proposals'] = proposals[-keep_last:]
-                    await scheduler.update_task(task_id, metadata, append=False)
+                    await scheduler.update_task(task_id, metadata)
     except Exception as exc:
         logger.warning(
             'dry_run_unblock: trim failed for task %s (best-effort, continuing): %s',

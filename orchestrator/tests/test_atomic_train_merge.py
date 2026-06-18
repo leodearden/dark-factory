@@ -788,6 +788,10 @@ class TestScenario5GroupMergeVerify:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue)
+
+        # The @pytest.mark.exercise_merge_verify marker (above) makes the autouse
+        # fixture skip the passed=True stub; the real run_scoped_verification runs
+        # here automatically — no in-body patch needed or added.
         outcome = await worker._do_merge(req)
 
         # (i) Outcome is blocked (not done).
@@ -1102,7 +1106,7 @@ class TestScenario6ParkPrefixDerail:
         harness.git_ops.prune_worktrees = AsyncMock()
         harness.config.worktree_orphan_reaper_enabled = True
 
-        # α/β are live (in get_tasks) with merge-deferred status.
+        # α/β are live (in get_statuses) with merge-deferred status.
         harness.scheduler = MagicMock()
         harness.scheduler._dispatched = set()
         harness.scheduler.get_tasks = AsyncMock(return_value=[

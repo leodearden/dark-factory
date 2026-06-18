@@ -93,6 +93,32 @@ def _serialize_temporal(
     }
 
 
+class SearchResults(list):
+    """list subclass returned by MemoryService.search carrying in-band degrade metadata.
+
+    All ~11 internal list-consuming callers (context_assembler, targeted, flag_dedup,
+    mem0_dedup, task_knowledge_sync) keep working unchanged — only tools.py reads the
+    extra attributes (task 1812).
+
+    Attributes:
+        degraded: True when one or more selected stores raised or timed out.
+        failed_stores: List of store name strings (SourceStore.value) that failed.
+
+    .. warning::
+        The `degraded` and `failed_stores` metadata do **not** survive list-returning
+        operations (slicing, sorted(), concatenation, list comprehensions).  Those
+        operations return a plain ``list``, silently dropping the degrade metadata.
+        Callers that need the metadata after a transform should read the attributes
+        *before* the transform, or pass the SearchResults object directly without
+        intermediate list operations.
+    """
+
+    def __init__(self, iterable=(), *, degraded: bool = False, failed_stores=None):
+        super().__init__(iterable)
+        self.degraded = degraded
+        self.failed_stores: list[str] = failed_stores if failed_stores is not None else []
+
+
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
@@ -896,6 +922,7 @@ class MemoryService:
             ))
 
         results: list[MemoryResult] = []
+        failed_stores: list[SourceStore] = []
         if task_list:
             done, pending = await asyncio.wait(
                 task_list, timeout=search_timeout, return_when=asyncio.ALL_COMPLETED
@@ -910,13 +937,20 @@ class MemoryService:
                 logger.warning(
                     f'Search timed out for stores: {[s.value for s in timed_out_stores]}'
                 )
+            failed_stores.extend(timed_out_stores)
 
-            for t in done:
+            for i, t in enumerate(task_list):
+                if t not in done:
+                    continue
                 try:
                     store_results = t.result()
                     results.extend(store_results)
                 except Exception as e:
-                    logger.error(f'Search store failed: {e}')
+                    logger.warning(
+                        'search.store_failed',
+                        extra={'store': store_list[i].value, 'error': str(e)},
+                    )
+                    failed_stores.append(store_list[i])
 
         # Sort: primary store results first, then by relevance score
         def sort_key(r: MemoryResult) -> tuple[int, float]:
@@ -948,6 +982,7 @@ class MemoryService:
                     if r.source_store == SourceStore.graphiti and r.category is None:
                         r.category = inferred
 
+        degraded = bool(failed_stores)
         final = results[:limit]
 
         # Log search when causation_id is present (recon paths)
@@ -962,11 +997,18 @@ class MemoryService:
                 session_id=session_id,
                 kind='read',
                 params={'query': query[:200], 'limit': limit},
-                result_summary={'count': len(final)},
-                success=True,
+                result_summary={
+                    'count': len(final),
+                    'failed_stores': [s.value for s in failed_stores],
+                },
+                success=not degraded,
             )
 
-        return final
+        return SearchResults(
+            final,
+            degraded=degraded,
+            failed_stores=[s.value for s in failed_stores],
+        )
 
     async def _search_graphiti(
         self, query: str, scope: Scope, limit: int, include_planned: bool = False

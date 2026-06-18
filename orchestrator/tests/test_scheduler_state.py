@@ -832,11 +832,12 @@ class TestSnapshotWriteThrottle:
         throttle_interval=0.25 s.  The acceptance bound is
         ceil(20 * 0.05 / 0.25) = ceil(4.0) = 4.
 
-        Content-dedup is defeated by mutating a unique _skip_count key per
-        tick so every payload differs — making the time-throttle gate the
-        SOLE mechanism bounding writes.  The exact-equality assertion guards
-        against future time-gate off-by-one regressions that the former
-        1 ≤ count ≤ upper_bound assertion would have missed.
+        Content-dedup is defeated by mocking _build_snapshot_payload with a
+        unique string per call so every post-time-gate payload differs —
+        making the time-throttle gate the SOLE mechanism bounding writes.
+        The exact-equality assertion guards against future time-gate
+        off-by-one regressions that the former 1 ≤ count ≤ upper_bound
+        assertion would have missed.
 
         The clock is computed as ``(i+1) * tick_interval`` (not accumulated
         via ``+=``) to eliminate IEEE-754 accumulation drift: repeated
@@ -863,6 +864,7 @@ class TestSnapshotWriteThrottle:
         task_a = _pending_task('A', files=['mod_a'])
         scheduler.get_tasks = AsyncMock(return_value=[task_a])
         scheduler._write_state_snapshot_raw = MagicMock()
+        scheduler._build_snapshot_payload = MagicMock(side_effect=[f'p{i}' for i in range(N)])
 
         # Defeat content-dedup via _build_snapshot_payload: acquire_next() cleans
         # up _skip_count entries for task IDs absent from tasks_by_id, so injecting

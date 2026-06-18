@@ -462,6 +462,9 @@ class TestTrainIntegrationB2:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue, event_store=spy)
 
+        # The @pytest.mark.exercise_merge_verify marker (above) makes the autouse
+        # fixture skip the passed=True stub; the real run_scoped_verification runs
+        # here automatically — no in-body patch needed or added.
         outcome = await worker._do_merge(req)
 
         # (1) Outcome is NOT done — compile break blocked the train.

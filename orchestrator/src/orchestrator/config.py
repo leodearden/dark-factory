@@ -1106,6 +1106,15 @@ class OrchestratorConfig(BaseSettings):
     # not advanced; default True closes the demonstrated bug, ops can opt
     # out if it surprises us.
     rebase_before_verify: bool = Field(default=True)
+    # Cohort-labelling boundary for post-rebase cost instrumentation.
+    # Commits in old_base..new_base below this threshold are labelled
+    # 'continuous' (normal orchestrator cadence); at-or-above with
+    # is_first_rebase=True → 'post-unblock', otherwise → 'big-jump'.
+    # LABELLING ONLY — does NOT trigger any re-seed behaviour ("wear the
+    # cost for now").  25 cleanly separates the continuous single-/low-
+    # double-digit orchestrator rebases from the 100s-of-commits
+    # accumulated drift the /unblock path pays on resume.
+    rebase_reseed_distance_threshold: int = Field(default=25, ge=1)
     # Fix 2 — thrash threshold for repeated infra-issue resumes on the
     # same root cause.  Counter increments when an L0 (category=
     # infra_issue) is resolved without iteration-log growth, resets to 1
