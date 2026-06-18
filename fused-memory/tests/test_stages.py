@@ -11337,3 +11337,32 @@ class TestStage2RetroactiveSummaryWriteReliability:
             "short/8-char prefix (cf. harness.py recon-{run_id[:8]} display ids; "
             "stage1.py:80 'Never construct IDs from truncated sources')."
         )
+
+    def test_count_zero_retry_prepends_nonce_not_same_content(self):
+        """count=0 retry must prepend a retry_nonce; the dedup-trap phrase must be gone.
+
+        Positive: build_stage2_system_prompt('dark_factory') must include 'retry_nonce'
+        — on count=0 the retry must prepend a fresh nonce token to defeat Mem0's ~0.92
+        cosine-similarity dedup, extending the established summary_nonce pattern.
+
+        Negative regression (mirrors 'update_task(status=' not in STAGE2_SYSTEM_PROMPT
+        at line 1216): 'with the same content and metadata' must NOT appear in
+        STAGE2_SYSTEM_PROMPT — retrying with identical content is the exact mechanism
+        that silently lost write 74b902f8 (root cause of the f1f09b5a incident).
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt, STAGE2_SYSTEM_PROMPT
+
+        result = build_stage2_system_prompt('dark_factory')
+        assert 'retry_nonce' in result, (
+            "build_stage2_system_prompt('dark_factory') must include 'retry_nonce': "
+            "on count=0 the add_memory retry must prepend a fresh retry_nonce token "
+            "as a new first content line to defeat Mem0's ~0.92 cosine-similarity dedup "
+            "(task 1796; extends the existing summary_nonce dedup-defeat pattern)."
+        )
+        # Negative regression guard: the dedup-trap 'retry with same content and metadata'
+        # instruction must be removed — it re-triggers dedup and silently loses the write.
+        assert 'with the same content and metadata' not in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must not retain 'with the same content and metadata': "
+            "retrying identical content re-triggers Mem0 ~0.92 cosine dedup — the exact "
+            "mechanism that silently lost write 74b902f8 (task 1796 root cause)."
+        )
