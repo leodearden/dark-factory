@@ -131,7 +131,7 @@ async def test_fetch_external_statuses_returns_bare_status_map(dummy_config):
 
 @pytest.mark.asyncio
 async def test_fetch_external_statuses_returns_empty_on_connect_error(dummy_config):
-    """fetch_external_statuses returns {} (fail-safe) on ConnectError."""
+    """fetch_external_statuses returns the offline marker on ConnectError (all URLs exhausted)."""
     from dashboard.data.tasks import fetch_external_statuses
 
     async def _raise_connect(*args, **kwargs):
@@ -141,12 +141,13 @@ async def test_fetch_external_statuses_returns_empty_on_connect_error(dummy_conf
         async with httpx.AsyncClient() as client:
             result = await fetch_external_statuses(client, dummy_config, ['dark_factory:13'])
 
-    assert result == {}
+    assert result.get('offline') is True
+    assert result.get('error')
 
 
 @pytest.mark.asyncio
 async def test_fetch_external_statuses_returns_empty_on_non_dict_result(dummy_config):
-    """fetch_external_statuses returns {} if MCP returns a non-dict (guards shape drift)."""
+    """fetch_external_statuses returns the offline marker if MCP returns a non-dict (all URLs exhausted)."""
     from dashboard.data.tasks import fetch_external_statuses
 
     async def _bad_result(*args, **kwargs):
@@ -156,7 +157,8 @@ async def test_fetch_external_statuses_returns_empty_on_non_dict_result(dummy_co
         async with httpx.AsyncClient() as client:
             result = await fetch_external_statuses(client, dummy_config, ['dark_factory:13'])
 
-    assert result == {}
+    assert result.get('offline') is True
+    assert result.get('error')
 
 
 @pytest.mark.asyncio

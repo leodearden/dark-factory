@@ -191,6 +191,7 @@ async def fetch_external_statuses(
     if not deps:
         return {}
 
+    errors: list[str] = []
     for url in config.fused_memory_urls:
         try:
             result = await mcp_tool_call(
@@ -199,22 +200,24 @@ async def fetch_external_statuses(
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
             logger.debug('fetch_external_statuses failed for %s: %s', url, e)
+            errors.append(f'{url}: {e}')
             _sessions.pop(url.rstrip('/'), None)
             continue
 
         if not isinstance(result, dict):
             logger.debug('fetch_external_statuses: unexpected result type %s from %s', type(result), url)
+            errors.append(f'{url}: unexpected result type {type(result).__name__}')
             continue
 
         if 'error' in result or not result:
             # Structured error dict or empty result (e.g. parse failure) — try next URL.
-            # The fail-safe {} is returned below if all URLs exhaust.
             logger.debug('fetch_external_statuses: soft failure from %s: %s', url, result)
+            errors.append(f'{url}: {result.get("error", "empty result") if isinstance(result, dict) else "empty result"}')
             continue
 
         return result  # bare {dep: status} map
 
-    return {}
+    return {'offline': True, 'error': '; '.join(errors)}
 
 
 async def fetch_statuses(
