@@ -118,6 +118,58 @@ class TestGetRebaseDistance:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# step-05 RED: VerifyResult.duration_secs field + _verify_duration_secs helper
+# ---------------------------------------------------------------------------
+
+
+def test_verify_result_has_duration_secs_default_zero():
+    """VerifyResult must accept a duration_secs field defaulting to 0.0."""
+    from orchestrator.verify import VerifyResult
+    r = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+    assert hasattr(r, 'duration_secs'), 'VerifyResult must have duration_secs field'
+    assert r.duration_secs == 0.0, f'Expected 0.0 default, got {r.duration_secs}'
+
+
+def test_verify_result_duration_secs_settable():
+    """duration_secs can be set explicitly on construction."""
+    from orchestrator.verify import VerifyResult
+    r = VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='',
+        summary='ok', duration_secs=3.14,
+    )
+    assert r.duration_secs == pytest.approx(3.14)
+
+
+@pytest.mark.parametrize('runs,expected', [
+    # Three runs with mixed durations
+    (
+        [{'duration_secs': 1.5}, {'duration_secs': 2.0}, {'duration_secs': 0.0}],
+        3.5,
+    ),
+    # Single run
+    ([{'duration_secs': 4.2}], 4.2),
+    # Empty list → 0.0
+    ([], 0.0),
+    # Runs without duration_secs key → treated as 0.0 per entry
+    ([{'rc': 0}, {'rc': 0}], 0.0),
+    # Missing key in some entries
+    ([{'duration_secs': 1.0}, {'rc': 0}], 1.0),
+])
+def test_verify_duration_secs(runs, expected):
+    """_verify_duration_secs sums per-command duration_secs (default 0.0 per entry)."""
+    from orchestrator.verify import _verify_duration_secs
+    result = _verify_duration_secs(runs)
+    assert result == pytest.approx(expected), (
+        f'_verify_duration_secs({runs}) => {result}, expected {expected}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-03 RED: classify_rebase_cohort pure function
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize('distance,is_first,threshold,expected', [
     # distance < 0 → 'unknown'
     (-1, True, 25, 'unknown'),
