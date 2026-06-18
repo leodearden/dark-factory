@@ -17,7 +17,12 @@ from orchestrator.config import (
 )
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import ExternalResolverError, ModuleLockTable, Scheduler, files_to_modules
+from orchestrator.scheduler import (
+    ExternalResolverError,
+    ModuleLockTable,
+    Scheduler,
+    files_to_modules,
+)
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
@@ -6119,6 +6124,7 @@ class TestGetExternalStatusesFailsLoud:
         A WARNING must be logged so the failure is visible in journalctl / caplog.
         """
         import logging
+
         import orchestrator.scheduler as _sched_module
 
         # Response whose JSON has NO 'statuses' key → _parse_tool_text_result returns None.
@@ -6148,7 +6154,6 @@ class TestGetExternalStatusesFailsLoud:
         self, scheduler: Scheduler, monkeypatch
     ):
         """Non-dict error leaves no persistent state; next call still works correctly."""
-        import json
         import orchestrator.scheduler as _sched_module
 
         # First call: non-dict response.
@@ -6207,6 +6212,7 @@ class TestGetExternalStatusesPartialResult:
     ):
         """Response missing 'upstream_proj:2' → (partial, ExternalResolverError) + WARNING."""
         import logging
+
         import orchestrator.scheduler as _sched_module
 
         # Request 2 deps; response only has 1.
@@ -6811,7 +6817,7 @@ class TestExternalDepGateHeld_ResolverDegraded:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config, event_store=_RecordingEventStore())
+        return Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
 
     def _pending_task_with_ext(self, task_id: str = 'T') -> dict:
         return {
@@ -6836,9 +6842,11 @@ class TestExternalDepGateHeld_ResolverDegraded:
                 ExternalResolverError('simulated degraded resolver'),
             )
 
+        _event_store = scheduler.event_store
+        assert _event_store is not None
         gate_held_events = [
             (evt, data)
-            for evt, data in scheduler.event_store.events
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
             if evt == str(EventType.external_dep_gate_held)
         ]
         assert len(gate_held_events) == 1, (
@@ -6918,7 +6926,7 @@ class TestExternalDepGateHeld_DepsLive:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config, event_store=_RecordingEventStore())
+        return Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
 
     def _pending_task_with_ext(self, task_id: str = 'T') -> dict:
         return {
@@ -6944,9 +6952,11 @@ class TestExternalDepGateHeld_DepsLive:
                 None,
             )
 
+        _event_store = scheduler.event_store
+        assert _event_store is not None
         gate_held_events = [
             (evt, data)
-            for evt, data in scheduler.event_store.events
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
             if evt == str(EventType.external_dep_gate_held)
         ]
         assert len(gate_held_events) == 1, (
@@ -7001,8 +7011,10 @@ class TestExternalDepGateHeld_DepsLive:
             )
 
         # Count events so far.
+        _event_store = scheduler.event_store
+        assert _event_store is not None
         events_before = [
-            e for e in scheduler.event_store.events
+            e for e in _event_store.events  # type: ignore[attr-defined]
             if e[0] == str(EventType.external_dep_gate_held)
         ]
         assert len(events_before) == 1, 'Setup: expected 1 gate_held event after threshold ticks'
@@ -7016,7 +7028,7 @@ class TestExternalDepGateHeld_DepsLive:
 
         # No additional event.
         events_after = [
-            e for e in scheduler.event_store.events
+            e for e in _event_store.events  # type: ignore[attr-defined]
             if e[0] == str(EventType.external_dep_gate_held)
         ]
         assert len(events_after) == 1, (
