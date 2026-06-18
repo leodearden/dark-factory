@@ -5915,6 +5915,52 @@ class TestFilterStaleCountSnapshotCorrections:
             f'but filter returned {result!r}'
         )
 
+    def test_keep_reversed_order_phrasing(self):
+        """(KEEP) Corrected-value-first phrasing — proposed comes before current in text.
+
+        When the text reads 'should be 635/608 ... currently 634/607', groups[0] is the
+        proposed value and groups[1] is the current value, so the delta computation
+        (proposed - current) yields negative values.  The monotonic check rejects this
+        and keeps the flag (fail-open).  This test pins the positional contract so any
+        future re-ordering of group selection is caught.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='should be 635/608 but currently snapshot reads 634/607 — off by 1',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Reversed-order phrasing (proposed before current) yields negative deltas '
+            'and must be KEPT (fail-open); '
+            f'filter returned {result!r}'
+        )
+
+    def test_keep_more_than_two_count_groups(self):
+        """(KEEP) Three or more arity-≥2 count-groups → bail to KEEP (ambiguous text).
+
+        A text with three or more count-pairs cannot be safely resolved via positional
+        current/proposed assignment — groups[0]/groups[1] might be an incidental near-
+        equal pair while the real discrepancy appears later.  The filter must KEEP the
+        flag rather than risk a false DROP.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        # Three count-groups: 634/607 (near-equal to 635/608) then 700/500 (large gap).
+        # Positional logic would compare 634/607 vs 635/608 (delta=1, would drop),
+        # but the 700/500 group hints at a real discrepancy — flag must be KEPT.
+        flag = self._make_flag(
+            description=(
+                'snapshot edge reports 634/607; should be 635/608; '
+                'however the authoritative tree actually shows 700/500 — investigate'
+            ),
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Three arity-≥2 count-groups must cause a KEEP (bail-to-KEEP for ambiguous text); '
+            f'filter returned {result!r}'
+        )
+
     def test_non_matching_flags_pass_through_unchanged(self):
         """Unrelated flags (not count_snapshot_mismatch) are returned unchanged."""
         from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections

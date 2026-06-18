@@ -1146,9 +1146,13 @@ _CORRECTION_LANGUAGE_SUBSTRINGS: tuple[str, ...] = (
     'actual count',
 )
 
-#: Word-boundary regex for 'incorrect' — matches the word 'incorrect' but NOT when
-#: preceded by 'not ' (which would give 'not incorrect' = positive) and critically
-#: NOT matching 'is correct' (which shares the 'correct' substring).
+#: Word-boundary regex for 'incorrect' — matches the word 'incorrect' at a word
+#: boundary, case-insensitively.  NOTE: this WILL match 'incorrect' inside the
+#: phrase 'not incorrect' (the regex has no lookbehind exclusion for 'not').
+#: That phrasing is vanishingly rare in LLM finding text, so the practical impact
+#: is negligible; but the comment here is intentionally accurate about the behaviour.
+#: The regex critically does NOT fire on bare 'is correct' because 'correct' alone
+#: lacks the 'in' prefix — the \b boundary is anchored on the full word 'incorrect'.
 _INCORRECT_WORD_RE: re.Pattern[str] = re.compile(r'\bincorrect\b', re.IGNORECASE)
 
 #: Count-group regex: matches ≥2 integers joined by separators that appear in
@@ -1169,7 +1173,11 @@ _COUNT_GROUP_RE: re.Pattern[str] = re.compile(
     r'(?:'                                           # separator group (non-capturing)
     r'[\s,/]+'                                       # plain separator: space, comma, slash
     r'(?:'                                           # optional status-word interleave
-    r'(?:done|cancelled|pending|in[-\s]?progress|blocked|deferred|review|total|merge-deferred)'
+    # Status-word alternation kept aligned with task_filter.COUNT_SNAPSHOT_RE:
+    #   cancell?ed  — matches both 'canceled' (US) and 'cancelled' (UK)
+    #   in[-_ ]?progress — matches 'in-progress', 'in_progress', 'in progress'
+    #   merge[-_ ]?deferred — matches 'merge-deferred', 'merge_deferred', 'merge deferred'
+    r'(?:done|cancell?ed|pending|in[-_ ]?progress|blocked|deferred|review|total|merge[-_ ]?deferred)'
     r'[\s,/]+'
     r')?'
     r'\d+'                                           # subsequent integer
@@ -1220,13 +1228,26 @@ def filter_stale_count_snapshot_corrections(
           text (paired snapshots like '634/607' or '634 done / 607 total').
           Requiring arity ≥ 2 structurally excludes stray digits like the '1' in
           'off by 1' from becoming a comparison operand.
-      (c) The first two groups (treated as current and proposed) have equal arity,
-          proposed ≥ current componentwise (monotonic drift), and the maximum
-          componentwise delta ≤ :data:`STALE_SNAPSHOT_CADENCE_DELTA`.
+      (c) After order-preserving deduplication, the combined text yields **exactly
+          two distinct** arity-≥2 count-groups (if three or more distinct groups are
+          found the flag is KEPT — a clean stale-drift correction references exactly
+          two distinct numeric snapshots, though the proposed value may appear more
+          than once across ``description`` and ``suggested_action``).  The two
+          groups (treated as current and proposed) have equal arity, proposed ≥
+          current componentwise (monotonic drift), and the maximum componentwise
+          delta ≤ :data:`STALE_SNAPSHOT_CADENCE_DELTA`.
+
+    The "exactly two distinct groups" constraint in condition (c) is intentional:
+    if a flag's text contains three or more *distinct* arity-≥2 count-groups, the
+    positional current/proposed identification (unique_groups[0] and unique_groups[1])
+    could be confused by an incidental near-equal pair appearing before a genuine
+    large-discrepancy pair.  Bailing to KEEP for these ambiguous texts avoids that
+    failure mode while accommodating the common pattern where the proposed value is
+    restated in both the description and the suggested_action.
 
     Otherwise the flag is KEPT (fail-open).  This conservative posture ensures that
-    large discrepancies, count DECREASES, arity mismatches, and flags without
-    extractable snapshot pairs are never silently discarded.
+    large discrepancies, count DECREASES, arity mismatches, reversed-order phrasings,
+    and flags without extractable snapshot pairs are never silently discarded.
 
     This is the third (finding-side) layer of the snapshot-discipline defense:
     - Layer 1 (input-side): ``strip_snapshot_lines`` / ``is_count_snapshot`` in
@@ -1267,7 +1288,26 @@ def filter_stale_count_snapshot_corrections(
             kept.append(flag)
             continue
 
-        current, proposed = groups[0], groups[1]
+        # Condition (b, cont.): deduplicate groups (order-preserving) then require
+        # exactly two DISTINCT groups.  The same proposed value often appears in both
+        # description ("should be 635/608") and suggested_action ("correct to 635/608"),
+        # so naive len(groups) can be 3 for a clean stale-drift correction.  After
+        # deduplication, a clean correction always has exactly 2 distinct groups.
+        # Three or more DISTINCT groups mean the text is ambiguous — a positional
+        # current/proposed assignment could pair an incidental near-equal prefix with
+        # a real large-discrepancy mention later, causing a false DROP.  Bail to
+        # KEEP (fail-open) for any such complex text.
+        seen: set[tuple[int, ...]] = set()
+        unique_groups: list[tuple[int, ...]] = []
+        for g in groups:
+            if g not in seen:
+                seen.add(g)
+                unique_groups.append(g)
+        if len(unique_groups) > 2:
+            kept.append(flag)
+            continue
+
+        current, proposed = unique_groups[0], unique_groups[1]
 
         # Condition (c): equal arity, monotonic, delta ≤ STALE_SNAPSHOT_CADENCE_DELTA?
         if len(current) != len(proposed):
