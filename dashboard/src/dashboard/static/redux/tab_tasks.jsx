@@ -321,11 +321,12 @@ function TaskDetail({ task, allTasks }) {
       })()}
 
       {(() => {
-        const { buildSchedLockInfo } = window.DF_SCHED_UTILS || {};
+        const { buildSchedLockInfo, disambiguateLabels } = window.DF_SCHED_UTILS || {};
         const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
           ? buildSchedLockInfo(task, DF_T.SCHEDULER)
           : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
         if (!lockSet.length) return null;
+        const labelMap = disambiguateLabels ? disambiguateLabels(lockSet) : null;
         return (<>
           <div className="section-lbl">Module locks ({lockSet.length})</div>
           <div className="chips column">
@@ -337,7 +338,7 @@ function TaskDetail({ task, allTasks }) {
               const cls = !holder ? 'lock-free' : isMine ? 'lock-mine' : 'lock-taken';
               return (
                 <span key={modPath} className={`chip ${cls}`} title={modPath}>
-                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{modPath.split('/').pop()}</span>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelMap ? labelMap.get(modPath) : modPath}</span>
                   {cls === 'lock-taken' && <span className="holder">⊘ T-{holder}</span>}
                 </span>
               );
