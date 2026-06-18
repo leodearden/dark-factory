@@ -540,6 +540,7 @@ async def run_server():
         scope_violation_escalator: ScopeViolationEscalator | None = (
             ScopeViolationEscalator()
         )
+        _multi_project_mode = True
         logger.info(
             '  Path-scope guard: multi-project mode (%d projects)',
             len(_known_projects_map),
@@ -547,6 +548,7 @@ async def run_server():
     else:
         prefix_registry = None
         scope_violation_escalator = None
+        _multi_project_mode = False
         logger.info(
             '  Path-scope guard: dark-factory-only back-compat mode '
             '(set DASHBOARD_KNOWN_PROJECT_ROOTS to enable multi-project)',
@@ -559,6 +561,23 @@ async def run_server():
     # open aiosqlite connection never leaks even though this runs before the
     # try/finally that wraps transport.serve().
     curator_cost_store, curator_usage_gate = await _setup_curator_usage_gate(config)
+
+    # Stage-2 LLM adjudicator for path-scope guard (task 1822): wired only in
+    # multi-project mode when config.path_scope_adjudicator.enabled is True.
+    # In single-project/back-compat mode the adjudicator is None and the guard
+    # behaves exactly as before (heuristic-only, not weakened).
+    path_scope_adjudicator = None
+    if _multi_project_mode and config.path_scope_adjudicator.enabled:
+        from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
+
+        path_scope_adjudicator = PathScopeAdjudicator(
+            config.path_scope_adjudicator,
+            usage_gate=curator_usage_gate,
+            cwd=Path(_primary_root) if _primary_root else None,
+        )
+        logger.info('  Path-scope adjudicator: enabled (model=%s)', config.path_scope_adjudicator.model)
+    else:
+        logger.debug('  Path-scope adjudicator: disabled')
 
     event_queue = None
     sqlite_watchdog = None
@@ -708,6 +727,7 @@ async def run_server():
             bulk_reset_guard=bulk_reset_guard,
             prefix_registry=prefix_registry,
             scope_violation_escalator=scope_violation_escalator,
+            path_scope_adjudicator=path_scope_adjudicator,
         )
         await task_interceptor.start()
         # Wire interceptor back into targeted so reconciler-initiated metadata writes
@@ -772,6 +792,7 @@ async def run_server():
             ticket_store=ticket_store,
             prefix_registry=prefix_registry,
             scope_violation_escalator=scope_violation_escalator,
+            path_scope_adjudicator=path_scope_adjudicator,
         )
         await task_interceptor.start()
         task_interceptor.set_write_journal(write_journal)
