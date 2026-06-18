@@ -461,7 +461,16 @@ class TestTrainIntegrationB2:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue, event_store=spy)
 
-        outcome = await worker._do_merge(req)
+        # Override the autouse _mock_merge_queue_verification fixture (which
+        # forces passed=True) so the post-merge union verify runs REAL cargo
+        # against the assembled tip — the anchor's compile break must drive a
+        # blocked outcome.  Mirrors the green sibling
+        # (test_two_member_train_lands_via_one_union_verify) at :326.
+        async def _spy_verify(*args, **kwargs):
+            return await run_scoped_verification(*args, **kwargs)
+
+        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
+            outcome = await worker._do_merge(req)
 
         # (1) Outcome is NOT done — compile break blocked the train.
         assert outcome is not None

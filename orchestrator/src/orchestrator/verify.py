@@ -1352,7 +1352,13 @@ class VerifyResult:
     # VerifyResults (set by _aggregate_results — modules run concurrently via
     # asyncio.gather so max approximates wall-time).  Defaults to 0.0 for
     # _trivial_pass and mocked results.
-    duration_secs: float = 0.0
+    #
+    # compare=False: wall-clock duration differs between two independent runs of
+    # the same logical verification, so it must NOT participate in __eq__ (else
+    # cli_result == local can never hold — see test_cli
+    # test_verify_merge_cli_wrapper_transparency). Folded in here to clear a
+    # preexisting main red introduced by task 1802.
+    duration_secs: float = field(default=0.0, compare=False)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
