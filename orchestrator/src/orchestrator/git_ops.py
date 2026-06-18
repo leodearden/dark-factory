@@ -967,6 +967,44 @@ class GitOps:
             reify_debug_port=port,
         )
 
+    async def _seed_warm_lane(self, lane_dir: Path, mode: str) -> bool:
+        """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
+
+        Invokes ``<lane_dir>/scripts/seed-warm-lane.sh <base_target> <lane_dir> <mode>``
+        where *base_target* is :attr:`warm_lane_base_target_path` and *mode* is
+        either ``'--fresh-checkout'`` or ``'--reset-in-place'``.
+
+        The script lives in the LANE's own scripts dir (the lane's checked-out
+        tree provides it, consistent with the debug-port script pattern).
+
+        Returns:
+            True  — script ran and exited 0 (seed succeeded, lane is warm).
+            False — script absent, exited non-zero, or any exception (fail-soft;
+                    never blocks dispatch — caller falls back to cold path).
+        """
+        try:
+            script = lane_dir / 'scripts' / 'seed-warm-lane.sh'
+            if not script.exists():
+                logger.debug('_seed_warm_lane: seed script absent at %s', script)
+                return False
+            base_target = str(self.warm_lane_base_target_path)
+            rc, _, err = await _run(
+                [str(script), base_target, str(lane_dir), mode],
+                cwd=lane_dir,
+            )
+            if rc != 0:
+                logger.warning(
+                    '_seed_warm_lane: script exited %d for %s (stderr=%r)',
+                    rc, lane_dir, err,
+                )
+                return False
+            return True
+        except Exception:
+            logger.warning(
+                '_seed_warm_lane: unexpected error for %s', lane_dir, exc_info=True,
+            )
+            return False
+
     async def _provision_reify_debug_port(self, worktree_path: Path) -> int | None:
         """Run setup-worktree-debug-port.sh in the worktree and return the allocated port.
 
