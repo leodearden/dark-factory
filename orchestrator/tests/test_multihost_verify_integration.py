@@ -38,10 +38,13 @@ Headline λ gate (queueing-model + provenance): test_queueing_model_direction_an
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -49,6 +52,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.merge_queue import (
     PersistentWorktreeConfigError,
+    SpeculativeMergeWorker,
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
@@ -1113,3 +1117,334 @@ class TestQueueingModelAndProvenance:
         assert len(parity_events) >= 1, (
             f'expected ≥1 verdict_parity_ok event; got {len(parity_events)}'
         )
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-15 RED: _reprobe_loop lifecycle + capstone USER-OBSERVABLE SIGNAL
+# ---------------------------------------------------------------------------
+
+
+def _make_minimal_worker() -> SpeculativeMergeWorker:
+    """Build a bare SpeculativeMergeWorker with no real git ops needed."""
+    git_ops = MagicMock()
+    git_ops.project_root = None
+    q: asyncio.Queue = asyncio.Queue()
+    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+    worker._shutdown_timeout = 2.0
+    return worker
+
+
+def _make_minimal_escalation_queue():
+    """Minimal fake escalation queue used in capstone tests."""
+    class _FakeEQ:
+        def __init__(self):
+            self._seq = 0
+            self._open_l1 = False
+            self._by_task: dict = {}
+            self.submitted: list = []
+            self.resolved: list = []
+
+        def has_open_l1(self, task_id: str) -> bool:
+            return self._by_task.get(task_id, False)
+
+        def make_id(self, task_id: str) -> str:
+            self._seq += 1
+            return f'esc-{self._seq}'
+
+        def submit(self, esc) -> None:
+            self.submitted.append(esc)
+            # track open L1s by task_id
+            if getattr(esc, 'level', 0) == 1:
+                self._by_task[esc.task_id] = True
+
+        def get_by_task(self, task_id: str, status: str | None = None) -> list:
+            return []
+
+        def resolve(self, esc_id: str, resolution: str, **kw) -> None:
+            self.resolved.append((esc_id, resolution))
+    return _FakeEQ()
+
+
+@pytest.mark.asyncio
+class TestReprobeLoopLifecycle:
+    """_reprobe_loop task lifecycle in SpeculativeMergeWorker.run()/stop() (task 1795 step-15).
+
+    RED until step-16 GREEN adds _reprobe_task and _reprobe_loop to run()/stop().
+    """
+
+    async def test_reprobe_task_initially_none(self):
+        """_reprobe_task is None before run() is called."""
+        worker = _make_minimal_worker()
+        # step-16 will set this to None in __init__; until then AttributeError is
+        # also an acceptable RED signal
+        val = getattr(worker, '_reprobe_task', 'MISSING')
+        assert val is None, (
+            f'_reprobe_task must be None before run(); got {val!r}'
+        )
+
+    async def test_reprobe_task_created_by_run(self):
+        """run() creates _reprobe_task as a live asyncio.Task."""
+        worker = _make_minimal_worker()
+        worker._reprobe_interval_s = 9999.0  # never fires during test
+
+        worker_task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0)  # yield control so run() can create its tasks
+
+        try:
+            # RED: _reprobe_task not created by run() yet
+            assert hasattr(worker, '_reprobe_task'), (
+                '_reprobe_task attribute must exist after run() starts'
+            )
+            assert worker._reprobe_task is not None, (
+                '_reprobe_task must not be None after run() starts'
+            )
+            assert not worker._reprobe_task.done(), (
+                '_reprobe_task must not be done immediately after run() starts'
+            )
+        finally:
+            await worker.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+    async def test_reprobe_task_cancelled_by_stop(self):
+        """stop() cancels and awaits _reprobe_task so it is done after stop() returns."""
+        worker = _make_minimal_worker()
+        worker._reprobe_interval_s = 9999.0
+
+        worker_task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0)
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        # RED: _reprobe_task not managed by stop() yet
+        assert hasattr(worker, '_reprobe_task'), (
+            '_reprobe_task attribute must exist'
+        )
+        assert worker._reprobe_task is not None and worker._reprobe_task.done(), (
+            '_reprobe_task must be done after stop()'
+        )
+
+    async def test_reprobe_loop_survives_health_exception(self):
+        """_reprobe_loop catches exceptions from health() so it never crashes the worker."""
+        worker = _make_minimal_worker()
+        worker._reprobe_interval_s = 0.01  # fire quickly
+
+        # Inject a fake allocator with a host whose health() always raises
+        crashing_runner = MagicMock()
+        crashing_runner.health = AsyncMock(side_effect=RuntimeError('ssh exploded'))
+
+        from orchestrator.merge_queue import _HostUnavailability
+        worker._runner_unavailable['bad-host'] = _HostUnavailability(
+            streak=5, first_unavailable_at=0.0, reason='test crash',
+        )
+
+        fake_alloc = MagicMock()
+        fake_alloc.quarantined_remote_runners = MagicMock(
+            return_value=[('bad-host', crashing_runner)]
+        )
+        fake_alloc.clear_quarantine = MagicMock()
+        worker._host_allocator = fake_alloc
+
+        worker_task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0)
+
+        # Let the reprobe loop fire at least once (tiny interval)
+        await asyncio.sleep(0.05)
+
+        # Worker must still be running (loop survived the exception)
+        assert not worker_task.done(), (
+            '_reprobe_loop exception must not crash the worker task'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+@pytest.mark.asyncio
+class TestUnreachableHostCapstone:
+    """End-to-end user-observable signal for unreachable-host escalation + auto-recovery.
+
+    Tests the full flow: remote unreachable → dedup'd L1 escalation →
+    reprobe clears quarantine + recovery event → host re-enters pool.
+
+    RED: recovery assertions fail until step-16 wires _reprobe_loop into run().
+    """
+
+    async def test_n_ru_events_produce_exactly_one_escalation(self):
+        """N consecutive RunnerUnavailable finalize events → exactly one L1 escalation."""
+        import asyncio
+        from orchestrator.merge_queue import (
+            InflightEntry, InflightVerifyResult,
+            MergeOutcome, MergeRequest, SpeculativeItem,
+        )
+        from orchestrator.verify_runner import HostLease
+        from unittest.mock import patch
+
+        n = 2
+        worker = _make_minimal_worker()
+        worker._unreachable_escalate_after_n = n
+        eq = _make_minimal_escalation_queue()
+        worker._escalation_queue = eq
+
+        fake_alloc = MagicMock()
+        fake_alloc.quarantine_and_release = AsyncMock()
+        fake_alloc.release = AsyncMock()
+        fake_alloc.cancel_and_release = AsyncMock()
+        worker._host_allocator = fake_alloc
+
+        def _make_entry(host_name: str, reason: str):
+            loop = asyncio.get_event_loop()
+            config = OrchestratorConfig(
+                git=GitConfig(project_root='/tmp/fake'),
+                enable_speculative_merge=False,
+            )
+            req = MergeRequest(
+                task_id='task-cap',
+                branch='task/cap',
+                worktree=MagicMock(),
+                pre_rebased=False,
+                task_files=[],
+                module_configs=[],
+                config=config,
+                result=loop.create_future(),
+            )
+            fake_runner = MagicMock()
+            fake_runner.name = host_name
+            fake_runner.is_local = False
+            lease = HostLease(name=host_name, runner=fake_runner, is_local=False)
+            item = SpeculativeItem(
+                request=req,
+                merge_result=MagicMock(merge_commit='abc123'),
+                merge_wt=MagicMock(),
+                base_sha='base',
+                speculative=False,
+                skip_verify=False,
+            )
+
+            async def _ru_verify():
+                return InflightVerifyResult(
+                    outcome=None, merge_wt=item.merge_wt,
+                    status='RUNNER_UNAVAILABLE', reason=reason,
+                )
+
+            vt = asyncio.ensure_future(_ru_verify())
+            return InflightEntry(
+                item=item, lease=lease, verify_task=vt, merge_wt=item.merge_wt,
+                was_speculative=False, phase='verifying',
+            )
+
+        remerged = MagicMock(spec=SpeculativeItem)
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for _ in range(n):
+                entry = _make_entry('remote-host', 'ssh: connect refused')
+                await worker._finalize_inflight(entry)
+
+        l1_escs = [e for e in eq.submitted if getattr(e, 'level', 0) == 1]
+        assert len(l1_escs) == 1, (
+            f'Expected exactly 1 L1 escalation after {n} RU events; got {len(l1_escs)}'
+        )
+        assert 'remote-host' in l1_escs[0].task_id or 'remote-host' in l1_escs[0].summary
+
+    async def test_reprobe_clears_quarantine_on_recovery(self):
+        """After health() returns True, clear_quarantine is called and recovery event emitted.
+
+        This exercises _reprobe_quarantined_hosts directly (already implemented in step-14).
+        The reprobe loop (step-16) will wire this to run automatically.
+        """
+        from orchestrator.merge_queue import _HostUnavailability
+        from orchestrator.event_store import EventType
+
+        worker = _make_minimal_worker()
+        es = _RecordingEventStore()
+        worker._event_store = es
+
+        eq = _make_minimal_escalation_queue()
+        worker._escalation_queue = eq
+
+        recovering_runner = MagicMock()
+        recovering_runner.health = AsyncMock(return_value=True)
+
+        fake_alloc = MagicMock()
+        fake_alloc.quarantined_remote_runners = MagicMock(
+            return_value=[('good-host', recovering_runner)]
+        )
+        fake_alloc.clear_quarantine = MagicMock()
+        worker._host_allocator = fake_alloc
+
+        now = 1000.0
+        worker._runner_unavailable['good-host'] = _HostUnavailability(
+            streak=3, first_unavailable_at=now - 300.0, reason='ssh timeout',
+        )
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        fake_alloc.clear_quarantine.assert_called_once_with('good-host')
+        assert 'good-host' not in worker._runner_unavailable
+
+        recovered_events = es.events_of(EventType.verify_host_recovered)
+        assert recovered_events, 'expected verify_host_recovered event after reprobe'
+
+    async def test_reprobe_loop_runs_automatically_and_clears_quarantine(self):
+        """USER-OBSERVABLE SIGNAL: _reprobe_loop started by run() fires automatically.
+
+        RED until step-16 wires _reprobe_loop into run() with a small interval.
+        """
+        from orchestrator.merge_queue import _HostUnavailability
+        from orchestrator.event_store import EventType
+
+        worker = _make_minimal_worker()
+        worker._reprobe_interval_s = 0.01  # fire almost immediately
+        worker._unreachable_escalate_after_secs = 9999.0  # only check via n-streak path
+
+        es = _RecordingEventStore()
+        worker._event_store = es
+
+        eq = _make_minimal_escalation_queue()
+        worker._escalation_queue = eq
+
+        # Remote runner that starts unhealthy then becomes healthy
+        remote_runner = MagicMock()
+        remote_runner.health = AsyncMock(return_value=False)
+
+        fake_alloc = MagicMock()
+        fake_alloc.quarantined_remote_runners = MagicMock(
+            return_value=[('loop-host', remote_runner)]
+        )
+        fake_alloc.clear_quarantine = MagicMock()
+        worker._host_allocator = fake_alloc
+
+        now_base = 1000.0
+        worker._runner_unavailable['loop-host'] = _HostUnavailability(
+            streak=5, first_unavailable_at=now_base - 60.0, reason='unreachable',
+        )
+
+        # Start the worker
+        worker_task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0)
+
+        # RED: _reprobe_task doesn't exist yet — this assertion will be checked below
+        # For now let the worker start and give the loop time to fire at least once
+        await asyncio.sleep(0.05)
+
+        # Flip the runner healthy
+        remote_runner.health = AsyncMock(return_value=True)
+
+        # Give the reprobe loop time to detect recovery
+        await asyncio.sleep(0.05)
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        # RED: these assertions fail until _reprobe_loop is wired into run()
+        assert hasattr(worker, '_reprobe_task') and worker._reprobe_task is not None, (
+            '_reprobe_task must be created by run() (step-16)'
+        )
+        assert fake_alloc.clear_quarantine.called, (
+            'reprobe loop must have called clear_quarantine on recovery'
+        )
+        recovered = es.events_of(EventType.verify_host_recovered)
+        assert recovered, 'reprobe loop must have emitted verify_host_recovered'
