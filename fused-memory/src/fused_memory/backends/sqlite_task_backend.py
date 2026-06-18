@@ -1131,7 +1131,21 @@ class SqliteTaskBackend:
                     try:
                         meta = json.loads(row['metadata'] or '{}')
                     except (TypeError, ValueError):
-                        meta = {}
+                        # Corrupt stored blob: warn once via the shared gate and
+                        # return an accurate message — do NOT claim removal, do
+                        # NOT write (blob left intact).
+                        _warn_malformed_metadata_once(
+                            project_root, tag, tid, row['metadata'] or '',
+                            resolution='remove_dependency skipped — corrupt blob left intact',
+                        )
+                        return {
+                            'id': str(tid),
+                            'dependency_id': canonical,
+                            'message': (
+                                f'Could not remove external dependency {canonical} from task {tid}:'
+                                f' metadata blob is corrupt and was left intact.'
+                            ),
+                        }
                     existing = meta.get('external_deps', [])
                     if canonical in existing:
                         updated = [e for e in existing if e != canonical]
