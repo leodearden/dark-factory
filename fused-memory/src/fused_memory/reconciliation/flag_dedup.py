@@ -1289,21 +1289,24 @@ def filter_stale_count_snapshot_corrections(
             continue
 
         # Condition (b, cont.): deduplicate groups (order-preserving) then require
-        # exactly two DISTINCT groups.  The same proposed value often appears in both
+        # EXACTLY two DISTINCT groups.  The same proposed value often appears in both
         # description ("should be 635/608") and suggested_action ("correct to 635/608"),
         # so naive len(groups) can be 3 for a clean stale-drift correction.  After
         # deduplication, a clean correction always has exactly 2 distinct groups.
-        # Three or more DISTINCT groups mean the text is ambiguous — a positional
-        # current/proposed assignment could pair an incidental near-equal prefix with
-        # a real large-discrepancy mention later, causing a false DROP.  Bail to
-        # KEEP (fail-open) for any such complex text.
+        # Any other count (0, 1, or ≥3 distinct groups) means the text is degenerate
+        # or ambiguous — bail to KEEP (fail-open).  Only when len==2 is a well-defined
+        # positional current/proposed pair guaranteed; any other count risks:
+        #   len==1: proposed restated identically in both fields → only one group, no
+        #           "current" to compare against (was IndexError pre-fix)
+        #   len≥3:  ambiguous text where positional groups[0]/groups[1] might pair an
+        #           incidental near-equal prefix with a later large-discrepancy mention
         seen: set[tuple[int, ...]] = set()
         unique_groups: list[tuple[int, ...]] = []
         for g in groups:
             if g not in seen:
                 seen.add(g)
                 unique_groups.append(g)
-        if len(unique_groups) > 2:
+        if len(unique_groups) != 2:
             kept.append(flag)
             continue
 
