@@ -8840,22 +8840,29 @@ class ShadowCompareDiff:
     """Per-test divergence between a warm and a cold verify run.
 
     Produced by :func:`diff_per_test_results` for PRD §10 invariant 6(b).
-    The ``diverging`` dict contains every test whose warm/cold verdicts differ;
-    the list buckets partition diverging tests by direction for easy alarming.
 
-    Presence divergences (a test in only one result set) are also recorded
-    because they indicate structural differences between the two runs.
+    Verdict model: each test verdict is one of ``'pass'``, ``'fail'``, or
+    ``'inconclusive'``.  A divergence is **alarm-worthy** only when it is a
+    genuine ``'pass'``↔``'fail'`` flip (or a presence divergence); any
+    difference involving ``'inconclusive'`` is routed to the non-alarming
+    :attr:`inconclusive` bucket and excluded from :attr:`has_divergence`.
 
     Attributes:
-        diverging: Maps test_id → (warm_passed, cold_passed) for every
-            diverging test.
-        warm_pass_cold_fail: Test ids that passed warm but failed cold
-            (the dangerous class: warm landed OK, cold reveals a real fail).
-        warm_fail_cold_pass: Test ids that failed warm but passed cold
-            (less dangerous; warm was conservative).
+        diverging: Maps test_id → (warm_verdict, cold_verdict) for every
+            alarm-worthy diverging test (genuine ``'pass'``↔``'fail'`` flip).
+        warm_pass_cold_fail: Test ids that yielded ``'pass'`` warm but
+            ``'fail'`` cold (the dangerous class: warm landed OK, cold reveals
+            a real fail).
+        warm_fail_cold_pass: Test ids that yielded ``'fail'`` warm but
+            ``'pass'`` cold (less dangerous; warm was conservative).
         only_warm: Test ids present in the warm result but absent from cold
-            (structural difference; may indicate a cold build failure).
+            (structural presence divergence → alarm-worthy).
         only_cold: Test ids present in the cold result but absent from warm.
+        inconclusive: Maps test_id → (warm_verdict, cold_verdict) for tests
+            where EITHER side is ``'inconclusive'``
+            (TIMEOUT/SIGSEGV — non-deterministic execution artifacts).
+            These differences are logged but NOT alarmed.
+            Excluded from :attr:`has_divergence` by design.
     """
 
     diverging: dict[str, tuple[str, str]]
@@ -8863,10 +8870,15 @@ class ShadowCompareDiff:
     warm_fail_cold_pass: list[str]
     only_warm: list[str]
     only_cold: list[str]
+    inconclusive: dict[str, tuple[str, str]] = dataclasses.field(default_factory=dict)
 
     @property
     def has_divergence(self) -> bool:
-        """True iff any divergence bucket is non-empty."""
+        """True iff any alarm-worthy divergence bucket is non-empty.
+
+        Deliberately excludes :attr:`inconclusive` — a pair differing by
+        TIMEOUT/SIGSEGV is not alarm-worthy.
+        """
         return bool(
             self.diverging
             or self.only_warm
@@ -8881,7 +8893,18 @@ def diff_per_test_results(
     """Compute the per-test divergence between warm and cold verify results.
 
     Classifies every test in the union of both result sets into a divergence
-    bucket.  Tests whose warm verdict equals their cold verdict are omitted.
+    bucket using the 3-valued verdict model (``'pass'``/``'fail'``/
+    ``'inconclusive'``):
+
+    * Tests with **identical** verdicts in both legs are omitted.
+    * Tests present in **only one** leg (presence divergences) go to
+      :attr:`~ShadowCompareDiff.only_warm` / :attr:`~ShadowCompareDiff.only_cold`
+      — alarm-worthy (structural difference).
+    * Tests where **either** verdict is ``'inconclusive'`` (TIMEOUT/SIGSEGV)
+      go to :attr:`~ShadowCompareDiff.inconclusive` — non-alarming.
+    * Tests with a genuine ``'pass'``↔``'fail'`` flip go to
+      :attr:`~ShadowCompareDiff.diverging` and one of the direction buckets
+      — alarm-worthy.
 
     Args:
         warm: Per-test verdict map from the warm (in-place) verify run,
@@ -8890,13 +8913,15 @@ def diff_per_test_results(
 
     Returns:
         A :class:`ShadowCompareDiff` with buckets populated for diverging
-        tests.  ``has_divergence`` is False iff all buckets are empty.
+        tests.  :attr:`~ShadowCompareDiff.has_divergence` is False iff all
+        alarm-worthy buckets are empty (``inconclusive`` is excluded by design).
     """
     diverging: dict[str, tuple[str, str]] = {}
     warm_pass_cold_fail: list[str] = []
     warm_fail_cold_pass: list[str] = []
     only_warm: list[str] = []
     only_cold: list[str] = []
+    inconclusive: dict[str, tuple[str, str]] = {}
 
     all_tests = warm.keys() | cold.keys()
     for test_id in sorted(all_tests):
@@ -8905,11 +8930,16 @@ def diff_per_test_results(
         if in_warm and in_cold:
             w, c = warm[test_id], cold[test_id]
             if w != c:
-                diverging[test_id] = (w, c)
-                if w and not c:
-                    warm_pass_cold_fail.append(test_id)
+                if w == 'inconclusive' or c == 'inconclusive':
+                    # Non-deterministic execution artifact — not alarm-worthy
+                    inconclusive[test_id] = (w, c)
                 else:
-                    warm_fail_cold_pass.append(test_id)
+                    # Genuine 'pass'↔'fail' flip — alarm-worthy
+                    diverging[test_id] = (w, c)
+                    if w == 'pass' and c == 'fail':
+                        warm_pass_cold_fail.append(test_id)
+                    else:
+                        warm_fail_cold_pass.append(test_id)
         elif in_warm:
             only_warm.append(test_id)
         else:
@@ -8921,6 +8951,7 @@ def diff_per_test_results(
         warm_fail_cold_pass=warm_fail_cold_pass,
         only_warm=only_warm,
         only_cold=only_cold,
+        inconclusive=inconclusive,
     )
 
 
