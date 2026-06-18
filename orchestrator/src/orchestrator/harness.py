@@ -4948,6 +4948,11 @@ Output JSON matching the schema. Every task must appear in the output.
         if not main_sha:
             return
 
+        # SHA dedup: skip the expensive full verify when main has not advanced.
+        # This is the batching gate — N merges within one interval cost one sweep.
+        if main_sha == self._last_swept_main_sha:
+            return
+
         outcome = await verify_mod.run_main_tip_sweep(self.config, self.git_ops)
         if outcome is None:
             # Infra failure in the sweep itself — retry next tick, don't mark swept.
@@ -4960,6 +4965,14 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         # Drift detected: file one L1 escalation per distinct bad SHA.
+        if not self._escalation_queue:
+            logger.warning(
+                'Main-tip integrity sweep: drift detected at %s (%s) but no escalation '
+                'queue attached — skipping L1 file',
+                swept_sha[:12], vr.category,
+            )
+            return
+
         from escalation.models import Escalation  # noqa: PLC0415
 
         task_id = f'main-sweep-{swept_sha[:12]}'
