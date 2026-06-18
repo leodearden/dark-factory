@@ -10465,6 +10465,132 @@ class TestApplyPostFlightGuardsLiveWorkflow:
         )
 
 
+# ── Tests for task 1810 step-7: _apply_post_flight_guards status_cache build warnings ──────────
+
+
+_TKS_LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+
+class TestApplyPostFlightGuardsStatusCacheBuildWarns:
+    """_apply_post_flight_guards emits WARNINGs when get_task returns non-dict or unknown-status.
+
+    Step-7 (RED): both branches `continue` silently — no WARNING is emitted.
+    Step-8 (GREEN): add WARNING on both branches naming task_id.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_dict_get_task_result_emits_warning(
+        self, stage2_guard_mock_deps, caplog
+    ):
+        """get_task returning a non-dict => WARNING naming task_id.
+
+        Currently RED: non-dict result continues silently.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/project'
+
+        op = _make_sts_op(op_id='op-non-dict', task_id='9901')
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [op]
+        # get_task returns a non-dict (plain string)
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = 'not-a-dict'
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result([], stats={})),
+            ),
+            caplog.at_level(logging.WARNING, logger=_TKS_LOGGER),
+        ):
+            from fused_memory.models.reconciliation import Watermark
+            wm = Watermark(project_id='dark_factory')
+            await stage.run([], wm, [], 'test-run-non-dict')
+
+        warns = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('9901' in r.message for r in warns), (
+            f"expected a WARNING mentioning task_id='9901' for non-dict get_task result; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_status_get_task_result_emits_warning(
+        self, stage2_guard_mock_deps, caplog
+    ):
+        """get_task returning a dict that resolves to 'unknown' status => WARNING naming task_id.
+
+        Currently RED: 'unknown' status continues silently.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/project'
+
+        op = _make_sts_op(op_id='op-unknown', task_id='9902')
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [op]
+        # get_task returns a dict with no 'status' key => _extract_status => 'unknown'
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'id': '9902', 'title': 'x'}
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result([], stats={})),
+            ),
+            caplog.at_level(logging.WARNING, logger=_TKS_LOGGER),
+        ):
+            from fused_memory.models.reconciliation import Watermark
+            wm = Watermark(project_id='dark_factory')
+            await stage.run([], wm, [], 'test-run-unknown')
+
+        warns = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('9902' in r.message for r in warns), (
+            f"expected a WARNING mentioning task_id='9902' for unknown-status result; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_healthy_get_task_no_warning(self, stage2_guard_mock_deps, caplog):
+        """REGRESSION: healthy get_task with resolvable status => cache populated, ZERO new warnings."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/project'
+
+        op = _make_sts_op(op_id='op-healthy', task_id='9903')
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [op]
+        # get_task returns a healthy dict with a known status
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {
+            'id': '9903', 'status': 'in-progress',
+        }
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result([], stats={})),
+            ),
+            caplog.at_level(logging.WARNING, logger=_TKS_LOGGER),
+        ):
+            from fused_memory.models.reconciliation import Watermark
+            wm = Watermark(project_id='dark_factory')
+            await stage.run([], wm, [], 'test-run-healthy')
+
+        warns = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+            # exclude the already-loud BaseException branch (it can warn on other task_ids)
+            and '9903' in r.message
+        ]
+        assert not warns, (
+            f"healthy get_task must not emit WARNINGs for task_id='9903'; got {warns!r}"
+        )
+
+
 # ── Tests for Task 1655 step-9: assemble_payload renders '### Live-Workflow Signals' ──────────
 
 
