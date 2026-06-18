@@ -102,8 +102,10 @@ def load_json_or_warn(
         if on_corrupt == 'warn':
             return (default, False)
 
-        # quarantine: not yet implemented; fall through raises ValueError above
-        # for now (step-08 will add it).
-        raise ValueError(f'unknown on_corrupt={on_corrupt!r}')  # unreachable after step-08
+        # quarantine: atomic rename to <name>.corrupt (os.replace overwrites any
+        # prior quarantine slot, keeping disk growth bounded to one file per path).
+        dest = p.with_name(p.name + '.corrupt')
+        os.replace(p, dest)
+        return (default, False)
 
     return (parsed, True)
