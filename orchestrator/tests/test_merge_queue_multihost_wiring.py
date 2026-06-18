@@ -1049,3 +1049,143 @@ class TestRunInflightVerifyRunnerUnavailableReason:
             'add `except RunnerUnavailable as exc:` and reason=str(exc)'
         )
         assert 'Could not resolve hostname' in result.reason
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-5 RED: per-host unavailability tracker on the worker
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerUnavailableTracker:
+    """Per-host streak tracker _record_runner_unavailable / _record_runner_recovered.
+
+    RED until step-6 GREEN adds _HostUnavailability, _runner_unavailable dict,
+    and the two methods to SpeculativeMergeWorker.
+    """
+
+    def _make_worker(self, *, escalate_after_n=2):
+        from unittest.mock import MagicMock
+        import asyncio
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        git_ops = MagicMock()
+        git_ops.project_root = None
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        # Override threshold to a small value (test-overridable attr)
+        worker._unreachable_escalate_after_n = escalate_after_n
+        return worker
+
+    def test_first_call_sets_streak_one_and_returns_false_below_threshold(self):
+        """First _record_runner_unavailable call: streak=1, returns False when N=2."""
+        import time
+        worker = self._make_worker(escalate_after_n=2)
+        now = time.time()
+        # RED: AttributeError until the method is added
+        result = worker._record_runner_unavailable('host1', 'ssh timeout', now)
+        assert result is False  # streak=1 < N=2
+
+    def test_first_call_stores_first_unavailable_at(self):
+        """first_unavailable_at is set to `now` on the first call."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        now = time.time()
+        worker._record_runner_unavailable('host1', 'ssh error', now)
+        entry = worker._runner_unavailable['host1']
+        assert entry.first_unavailable_at == now
+
+    def test_first_call_stores_reason(self):
+        """reason is stored in the tracker entry on first call."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        now = time.time()
+        worker._record_runner_unavailable('host1', 'Connection refused', now)
+        entry = worker._runner_unavailable['host1']
+        assert entry.reason == 'Connection refused'
+
+    def test_repeated_calls_increment_streak_keep_first_at_fixed(self):
+        """Repeated calls increment streak; first_unavailable_at is NOT updated."""
+        import time
+        worker = self._make_worker(escalate_after_n=5)
+        t0 = time.time()
+        worker._record_runner_unavailable('host1', 'err', t0)
+        t1 = t0 + 30.0
+        worker._record_runner_unavailable('host1', 'err2', t1)
+        t2 = t0 + 60.0
+        worker._record_runner_unavailable('host1', 'err3', t2)
+        entry = worker._runner_unavailable['host1']
+        assert entry.streak == 3
+        assert entry.first_unavailable_at == t0  # unchanged
+
+    def test_returns_true_exactly_when_streak_reaches_n(self):
+        """Returns True (should-escalate) on the call that reaches streak==N."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        t = time.time()
+        r1 = worker._record_runner_unavailable('host1', 'e', t)
+        r2 = worker._record_runner_unavailable('host1', 'e', t + 1)
+        r3 = worker._record_runner_unavailable('host1', 'e', t + 2)  # streak=3 == N
+        assert r1 is False
+        assert r2 is False
+        assert r3 is True
+
+    def test_returns_true_again_beyond_n(self):
+        """Returns True for every call once streak >= N (persistent alarm condition)."""
+        import time
+        worker = self._make_worker(escalate_after_n=2)
+        t = time.time()
+        worker._record_runner_unavailable('host1', 'e', t)      # streak=1 False
+        r2 = worker._record_runner_unavailable('host1', 'e', t + 1)  # streak=2 True
+        r3 = worker._record_runner_unavailable('host1', 'e', t + 2)  # streak=3 True
+        assert r2 is True
+        assert r3 is True
+
+    def test_recovered_clears_tracker_state(self):
+        """_record_runner_recovered removes the host entry; next call starts fresh."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        t = time.time()
+        worker._record_runner_unavailable('host1', 'err', t)
+        worker._record_runner_unavailable('host1', 'err', t + 1)
+
+        worker._record_runner_recovered('host1')
+
+        assert 'host1' not in worker._runner_unavailable
+
+    def test_recovered_idempotent_on_absent_host(self):
+        """_record_runner_recovered on a host that was never tracked is a no-op."""
+        worker = self._make_worker()
+        # Should not raise
+        worker._record_runner_recovered('ghost-host')
+
+    def test_recovered_allows_fresh_episode(self):
+        """After recovery, a new failure starts a fresh streak (first_unavailable_at resets)."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        t0 = time.time()
+        worker._record_runner_unavailable('host1', 'err', t0)
+        worker._record_runner_unavailable('host1', 'err', t0 + 1)
+
+        worker._record_runner_recovered('host1')
+
+        t1 = t0 + 100.0
+        r = worker._record_runner_unavailable('host1', 'new err', t1)
+        assert r is False  # streak=1 < N=3
+        entry = worker._runner_unavailable['host1']
+        assert entry.streak == 1
+        assert entry.first_unavailable_at == t1  # fresh episode
+
+    def test_independent_hosts_tracked_separately(self):
+        """Two different hosts maintain independent streak counters."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        t = time.time()
+        worker._record_runner_unavailable('host1', 'e', t)
+        worker._record_runner_unavailable('host1', 'e', t + 1)  # host1 streak=2
+        worker._record_runner_unavailable('host2', 'e', t)      # host2 streak=1
+
+        worker._record_runner_recovered('host1')
+
+        assert 'host1' not in worker._runner_unavailable
+        assert 'host2' in worker._runner_unavailable
+        assert worker._runner_unavailable['host2'].streak == 1
