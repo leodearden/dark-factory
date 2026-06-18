@@ -1386,7 +1386,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         )
         from orchestrator.verify_runner import HostLease
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id='task-ru',
             branch='task/ru',

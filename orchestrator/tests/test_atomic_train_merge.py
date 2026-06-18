@@ -787,7 +787,16 @@ class TestScenario5GroupMergeVerify:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue)
-        outcome = await worker._do_merge(req)
+
+        # Override the autouse _mock_merge_queue_verification fixture (which
+        # forces passed=True) so the post-merge gate runs REAL cargo against the
+        # assembled tip — γ's broken edit must drive a blocked outcome.  Mirrors
+        # the GREEN sibling's spy (test_group_merge_workspace_verify_green).
+        async def _spy_verify(*args, **kwargs):
+            return await run_scoped_verification(*args, **kwargs)
+
+        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
+            outcome = await worker._do_merge(req)
 
         # (i) Outcome is blocked (not done).
         assert outcome is not None
@@ -1101,14 +1110,13 @@ class TestScenario6ParkPrefixDerail:
         harness.git_ops.prune_worktrees = AsyncMock()
         harness.config.worktree_orphan_reaper_enabled = True
 
-        # α/β are live (in get_tasks) with merge-deferred status.
+        # α/β are live (in get_statuses) with merge-deferred status.
         harness.scheduler = MagicMock()
         harness.scheduler._dispatched = set()
-        harness.scheduler.get_tasks = AsyncMock(return_value=[
-            {"id": "alpha6", "status": "merge-deferred"},
-            {"id": "beta6", "status": "merge-deferred"},
-            {"id": "gamma6", "status": "blocked"},
-        ])
+        harness.scheduler.get_statuses = AsyncMock(return_value=(
+            {"alpha6": "merge-deferred", "beta6": "merge-deferred", "gamma6": "blocked"},
+            None,
+        ))
         harness._recovered_plans = {}
         harness._preserved_worktrees = set()
         harness._recovered_sessions = {}

@@ -19103,8 +19103,8 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         task = asyncio.create_task(worker._heartbeat_loop())
         try:
             # Poll up to 1 s for mtime to advance
-            deadline = asyncio.get_event_loop().time() + 1.0
-            while asyncio.get_event_loop().time() < deadline:
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while asyncio.get_running_loop().time() < deadline:
                 if merge_wt.stat().st_mtime > time.time() - 5:
                     break
                 await asyncio.sleep(0.05)

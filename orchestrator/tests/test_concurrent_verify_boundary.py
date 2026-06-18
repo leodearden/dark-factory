@@ -167,7 +167,7 @@ class TestHarnessSmokeTest:
         fake_remote = _make_fake_remote('laptop')
         _inject_two_host_allocator(worker, fake_remote)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id='smoke-a', branch='task/smoke-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -237,7 +237,7 @@ class TestB1OverlapOrderedAdvance:
         worker = SpeculativeMergeWorker(git_ops, q, on_merge_landed=_on_landed)
         _inject_two_host_allocator(worker, spanning_remote)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='b1-a', branch='task/b1-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -350,7 +350,7 @@ class TestB2ChainInvalidationUnderOverlap:
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='b2-a', branch='task/b2-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -472,7 +472,7 @@ class TestB3HostDownMidOverlap:
         worker = SpeculativeMergeWorker(git_ops, q)
         _inject_two_host_allocator(worker, dead_remote)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='b3-a', branch='task/b3-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -579,7 +579,7 @@ class TestB4CancelBehavior:
         allocator = _inject_two_host_allocator(worker, gated_remote)
         remote_name = gated_remote.name
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='b4a-a', branch='task/b4a-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -690,7 +690,7 @@ class TestB4CancelBehavior:
 
         gated_remote.probe_clean = AsyncMock(side_effect=_checking_probe)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='b4b-a', branch='task/b4b-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -799,7 +799,7 @@ class TestB5OperatorHalt:
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='b5-a', branch='task/b5-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -954,7 +954,7 @@ class TestB7SingleHostNewPath:
 
         worker._on_merge_landed = _on_landed
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='b7-a', branch='task/b7-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
