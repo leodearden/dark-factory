@@ -302,3 +302,105 @@ class TestAcquireSpecLane:
         assert await git_ops._is_registered_worktree(lane_path), (
             f'Lane {lane_path} is not a registered git worktree'
         )
+
+
+# ===========================================================================
+# Step-9: RED — acquire_spec_lane cold fallback (pool exhausted + seed fail)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireSpecLaneFallback:
+    """acquire_spec_lane falls back to cold ephemeral worktree on exhaustion or seed fail."""
+
+    async def test_pool_exhausted_returns_cold_false(self, spec_git_repo: Path):
+        """When all _spec- lanes are ASSIGNED, returns (cold_wt, False) — never None."""
+        await _add_recording_seed_to_repo(spec_git_repo)
+        cfg = _make_spec_git_config(on=True)
+        # Pool size=1 so acquiring once exhausts it
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        # First acquire: consumes the only lane
+        lane1, warm1 = await git_ops.acquire_spec_lane(merge_commit)
+        assert warm1 is True, 'First acquire should be warm'
+
+        # Second acquire: pool exhausted → cold fallback
+        lane2, warm2 = await git_ops.acquire_spec_lane(merge_commit)
+
+        assert warm2 is False, f'Expected warm=False on exhaustion, got {warm2!r}'
+        assert lane2 is not None, 'acquire_spec_lane must never return None'
+        # The cold fallback must be a DIFFERENT path from the warm lane
+        assert lane2 != lane1, (
+            f'Cold fallback path {lane2} must differ from warm lane {lane1}'
+        )
+        # Cold fallback is a registered worktree (ephemeral _merge-<uuid>)
+        assert await git_ops._is_registered_worktree(lane2), (
+            f'Cold fallback {lane2} is not a registered git worktree'
+        )
+        # The warm lane is still ASSIGNED (not released)
+        assert git_ops.spec_warm_lane_pool is not None
+        assert git_ops.spec_warm_lane_pool._lanes[lane1] == LaneState.ASSIGNED
+
+    async def test_seed_failure_returns_cold_false(self, spec_git_repo: Path):
+        """When seed fails (no seed script), falls back to cold — lane released to FREE."""
+        # Do NOT add seed script — so _seed_warm_lane returns False
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        lane_path, warm = await git_ops.acquire_spec_lane(merge_commit)
+
+        assert warm is False, f'Expected warm=False on seed failure, got {warm!r}'
+        assert lane_path is not None, 'acquire_spec_lane must never return None'
+
+    async def test_seed_failure_releases_lane_back_to_free(self, spec_git_repo: Path):
+        """On seed failure the partially-acquired _spec- lane is released back to FREE."""
+        # No seed script → _seed_warm_lane returns False → lane must be released
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        await git_ops.acquire_spec_lane(merge_commit)
+
+        # After seed-failure fallback the pool's only lane should be FREE again
+        assert git_ops.spec_warm_lane_pool is not None
+        lane0 = git_ops.worktree_base / '_spec-0'
+        assert git_ops.spec_warm_lane_pool._lanes[lane0] == LaneState.FREE, (
+            'Lane must be released back to FREE after seed failure'
+        )
+
+    async def test_exhausted_never_raises(self, spec_git_repo: Path):
+        """Pool exhaustion never raises — returns a usable cold worktree."""
+        await _add_recording_seed_to_repo(spec_git_repo)
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        # Exhaust the pool
+        await git_ops.acquire_spec_lane(merge_commit)
+
+        # Must not raise on exhaustion
+        try:
+            result = await git_ops.acquire_spec_lane(merge_commit)
+        except Exception as exc:
+            pytest.fail(
+                f'acquire_spec_lane raised {type(exc).__name__} on exhaustion: {exc}'
+            )
+        assert result is not None
