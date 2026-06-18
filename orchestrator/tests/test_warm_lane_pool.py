@@ -373,6 +373,46 @@ class TestGitOpsPoolWiring:
         assert git_ops.warm_lane_pool is None
 
 
+class TestGitOpsSpecPoolWiring:
+    """Step-3 RED / Step-4 GREEN — GitOps.spec_warm_lane_pool wiring.
+
+    Mirrors TestGitOpsPoolWiring but for the _spec- pool.
+    """
+
+    def test_spec_pool_constructed_when_enabled_with_size(
+        self, wl_git_repo: Path,
+    ):
+        """GitOps(config(merge_spec_warm_lane_pool=True), repo, merge_spec_warm_lane_pool_size=K)
+        exposes spec_warm_lane_pool: a WarmLanePool with name_prefix='_spec-' and size K."""
+        config = GitConfig(merge_spec_warm_lane_pool=True)
+        git_ops = GitOps(config, wl_git_repo, merge_spec_warm_lane_pool_size=3)
+        assert git_ops.spec_warm_lane_pool is not None
+        assert isinstance(git_ops.spec_warm_lane_pool, WarmLanePool)
+        assert git_ops.spec_warm_lane_pool.size == 3
+        # Lanes live under worktree_base with _spec- prefix
+        worktree_base = (wl_git_repo / '.worktrees').resolve()
+        for k in range(3):
+            assert git_ops.spec_warm_lane_pool.is_lane(worktree_base / f'_spec-{k}')
+
+    def test_spec_pool_none_when_size_zero(self, wl_git_repo: Path):
+        """spec_warm_lane_pool is None when merge_spec_warm_lane_pool_size=0."""
+        config = GitConfig(merge_spec_warm_lane_pool=True)
+        git_ops = GitOps(config, wl_git_repo, merge_spec_warm_lane_pool_size=0)
+        assert git_ops.spec_warm_lane_pool is None
+
+    def test_spec_pool_none_when_knob_off(self, wl_git_repo: Path):
+        """spec_warm_lane_pool is None when merge_spec_warm_lane_pool=False even with size>0."""
+        config = GitConfig(merge_spec_warm_lane_pool=False)
+        git_ops = GitOps(config, wl_git_repo, merge_spec_warm_lane_pool_size=3)
+        assert git_ops.spec_warm_lane_pool is None
+
+    def test_spec_pool_none_by_default(self, wl_git_repo: Path):
+        """GitOps without merge_spec_warm_lane_pool_size → spec_warm_lane_pool is None."""
+        config = GitConfig(merge_spec_warm_lane_pool=True)
+        git_ops = GitOps(config, wl_git_repo)
+        assert git_ops.spec_warm_lane_pool is None
+
+
 class TestGitConfigDefaults:
     def test_warm_lane_pool_default_false(self):
         config = GitConfig()
