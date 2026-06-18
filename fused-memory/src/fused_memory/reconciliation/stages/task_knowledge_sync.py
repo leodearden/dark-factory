@@ -1626,6 +1626,11 @@ class TaskKnowledgeSync(BaseStage):
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
+        # --- trim-then-write: pre-trim pool to cap-1 BEFORE agent writes (task 1831) ---
+        # Runs unconditionally (full + remediation) so the pool is bounded every cycle.
+        # Trim target is cap-1, reserving one slot for the imminent agent write so a
+        # newly-written summary can never be the "oldest" trim candidate.  Best-effort.
+        pretrimmed = await _pretrim_stage2_summary_pool(self.memory, self.project_id, run_id)
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
 
         # --- stale fixc marker sweep stat (task 1224) ---
@@ -1675,13 +1680,13 @@ class TaskKnowledgeSync(BaseStage):
         # --- post-flight guards (task 1137) ---
         await self._apply_post_flight_guards(report, prior_reports, run_id)
 
-        # --- stage2 cycle-summary pool cap enforcement (task 1657) ---
-        # Runs unconditionally (NOT gated by remediation_mode) so both full-cycle
-        # and remediation runs trim the pool.  Best-effort: helper never raises.
-        trimmed = await _enforce_stage2_summary_pool_cap(
-            self.memory, self.project_id, run_id
+        # --- cycle-summary stats (task 1831 trim-then-write) ---
+        # pre-trim count was captured before super().run(); record it now alongside
+        # the post-write verification count so both land in the same report.stats.
+        report.stats['stage2_cycle_summary_pool_trimmed'] = pretrimmed
+        report.stats['stage2_cycle_summary_verified_count'] = (
+            await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
         )
-        report.stats['stage2_cycle_summary_pool_trimmed'] = trimmed
 
         return report
 
