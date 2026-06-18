@@ -73,7 +73,8 @@ def _get_merge_worker(harness: Any | None) -> Any | None:
 
 # C1 action enum for resolve_issue — five valid values, two disposition buckets.
 RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'close_only')
-_DISMISS_ACTIONS: frozenset[str] = frozenset({'park', 'abandon', 'close_only'})
+# park is no longer dismissed — it keeps the record open at L2 (version-a).
+_DISMISS_ACTIONS: frozenset[str] = frozenset({'abandon', 'close_only'})
 
 CATEGORIES = [
     'scope_violation',
@@ -462,8 +463,9 @@ def create_server(
         +--------------+------------+----------------------------+------------------------+
         | restart      | resolved   | restart task from scratch  | reset to pending       |
         +--------------+------------+----------------------------+------------------------+
-        | park         | dismissed  | task left paused; no       | stays blocked/deferred |
-        |              |            | immediate workflow action  |                        |
+        | park         | kept OPEN  | workflow killed; task      | → blocked (held under  |
+        |              | at L2      | blocked-on-human; no re-   | open L2 escalation)    |
+        |              |            | dispatch while open        |                        |
         +--------------+------------+----------------------------+------------------------+
         | abandon      | dismissed  | task cancelled outright    | cancelled              |
         +--------------+------------+----------------------------+------------------------+
@@ -497,6 +499,19 @@ def create_server(
             }
         if action not in RESOLVE_ACTIONS:
             return {'error': f'invalid action {action!r}; expected one of {list(RESOLVE_ACTIONS)}'}
+        if action == 'park':
+            # Version-a: park keeps the escalation open at L2.
+            # queue.park() handles all stamping (level=2, resolution_action='park',
+            # resolution text) and fires the resolve callback for teardown WITHOUT
+            # archiving the record.  No pre-stamp needed — park() owns the full write.
+            esc = queue.park(
+                escalation_id, resolution,
+                resolved_by=resolved_by, resolution_turns=resolution_turns,
+            )
+            if esc is None:
+                return {'error': f'Escalation {escalation_id} not found'}
+            return esc.to_dict()
+
         # Pre-stamp resolution_action on the pending record so resolve()'s
         # read-modify-write carries it into the archived JSON (C1 persistence).
         # Guard: only rewrite pending records — archived records must not be resurrected.
