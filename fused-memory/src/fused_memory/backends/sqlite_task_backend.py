@@ -784,9 +784,10 @@ class SqliteTaskBackend:
         project_root: str,
         prompt: str | None = None,
         metadata: str | None = None,
-        append: bool = False,
+        append: bool | None = None,
         tag: str | None = None,
         *,
+        metadata_mode: str | None = None,
         title: str | None = None,
         description: str | None = None,
         details: str | None = None,
@@ -871,7 +872,7 @@ class SqliteTaskBackend:
                 # metadata_mode='replace' (bypasses the guard intentionally).
                 new_metadata = _merge_metadata(
                     row['metadata'], metadata,
-                    mode=_resolve_metadata_mode(None, append),
+                    mode=_resolve_metadata_mode(metadata_mode, append),
                     project_root=project_root, tag=tag, task_id=tid,
                 )
                 set_columns.append('metadata = ?')

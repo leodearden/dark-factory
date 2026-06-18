@@ -318,9 +318,11 @@ async def test_update_task_overwrites_metadata_without_append(backend, project_r
         project_root=project_root, title='x',
         metadata=json.dumps({'prd': 'old.md'}),
     )
+    # Default is now shallow-merge; use explicit replace to overwrite wholesale.
     await backend.update_task(
         '1', project_root=project_root,
         metadata=json.dumps({'prd': 'new.md'}),
+        metadata_mode='replace',
     )
     one = await backend.get_task('1', project_root=project_root)
     assert one['metadata'] == {'prd': 'new.md'}
@@ -2088,3 +2090,145 @@ def test_merge_metadata_mode_merge_existing_none_returns_incoming():
     """mode='merge' with existing_raw=None returns incoming (no existing data)."""
     incoming = json.dumps({'k': 'v'})
     assert _merge_metadata(None, incoming, mode='merge') == incoming
+
+
+# ── update_task end-to-end: default-merge + metadata_mode (step-5 RED / step-6 GREEN) ──
+
+
+@pytest.mark.asyncio
+async def test_update_task_default_merge_regression_4271(backend, project_root):
+    """Regression #4271: default update_task merge preserves _causation_id+memory_hints
+    while adding files — no metadata_mode or append arg passed."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({
+            '_causation_id': 'caus-abc',
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['src/a.py']}),
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert meta.get('_causation_id') == 'caus-abc', f'_causation_id clobbered: {meta}'
+    assert meta.get('memory_hints') == {'entities': ['E1'], 'queries': ['q1']}, (
+        f'memory_hints clobbered: {meta}'
+    )
+    assert meta.get('files') == ['src/a.py'], f'files not written: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_default_merge_updates_existing_scalar(backend, project_root):
+    """Default merge updates an existing scalar key (not OLD-wins)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'branch_base_sha': 'aaa', '_causation_id': 'caus'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'branch_base_sha': 'bbb'}),
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert meta.get('branch_base_sha') == 'bbb', f'scalar not updated: {meta}'
+    assert meta.get('_causation_id') == 'caus', f'sibling clobbered: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_metadata_mode_additive_unions_list(backend, project_root):
+    """metadata_mode='additive' unions a list (dry_run_proposals-style append)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'dry_run_proposals': ['prop-1']}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'dry_run_proposals': ['prop-2']}),
+        metadata_mode='additive',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['dry_run_proposals'] == ['prop-1', 'prop-2'], (
+        f'additive union failed: {task["metadata"]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_metadata_mode_replace_overwrites(backend, project_root):
+    """metadata_mode='replace' overwrites the whole blob (siblings dropped)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'_causation_id': 'keep', 'extra': 'sibling'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['f.py']}),
+        metadata_mode='replace',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert list(meta.keys()) == ['files'], f'replace should drop siblings: {meta}'
+    assert meta['files'] == ['f.py']
+
+
+@pytest.mark.asyncio
+async def test_update_task_legacy_append_true_additive(backend, project_root):
+    """Legacy append=True -> additive union (shim end-to-end)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'items': [1]}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'items': [2]}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['items'] == [1, 2], (
+        f'legacy append=True should additive-union: {task["metadata"]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_legacy_append_false_replace(backend, project_root):
+    """Legacy append=False -> replace overwrite (shim end-to-end)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'_causation_id': 'keep', 'extra': 'gone'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['f.py']}),
+        append=False,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert 'extra' not in meta, f'legacy append=False should replace: {meta}'
+    assert meta['files'] == ['f.py']
+
+
+@pytest.mark.asyncio
+async def test_update_task_default_corrupt_blob_refused(backend, project_root, caplog):
+    """Default (no-arg) merge refuses a corrupt existing blob — raises TaskmasterError
+    and leaves stored bytes unchanged."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    conn = await backend._get_connection(project_root)
+    await conn.execute('UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,))
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ), pytest.raises(TaskmasterError):
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'note': 'x'}),
+        )
+
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute('SELECT metadata FROM tasks WHERE id = 1')
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'corrupt blob must be byte-for-byte unchanged; got: {row["metadata"]!r}'
+    )
