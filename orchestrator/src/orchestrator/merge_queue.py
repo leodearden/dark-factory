@@ -9138,6 +9138,114 @@ _WARM_COLD_SHADOW_SENTINEL = '__warm_cold_shadow__'
 # unparseable-format alarm dedup independently.
 _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL = '__warm_cold_shadow_unparseable__'
 
+# Prefix for per-host verify-unreachable escalation sentinels (task 1795).
+# Each host gets its own sentinel: ``__verify_host_unreachable__<host>``.
+# This keeps divergence-quarantine alarms (DriftDetector) and
+# unreachability alarms (RunnerUnavailable) in separate dedup namespaces.
+_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX = '__verify_host_unreachable__'
+
+
+def _verify_host_unreachable_sentinel(host: str) -> str:
+    """Return the per-host dedup sentinel task_id for unreachability alarms."""
+    return f'{_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX}{host}'
+
+
+def _alarm_verify_host_unreachable(
+    escalation_queue: Any,
+    host: str,
+    reason: str,
+    *,
+    streak: int,
+    duration_s: float,
+    event_store: Any = None,
+) -> None:
+    """Submit a dedup'd L1 escalation when a remote verify host is persistently unreachable.
+
+    Fires at most ONCE per downtime episode per host (dedup'd via
+    ``has_open_l1(sentinel)``).  Recovery clears the open L1 via
+    :func:`_clear_verify_host_unreachable`.
+
+    The escalation is:
+
+    * ``level=1`` (L1 blocking) — loud (steward→auto-watcher→human ladder)
+      but NON-halting: the merge-halt gate fires only for categories
+      ``wip_conflict`` / ``unmerged_state``; ``verify_host_unreachable`` is
+      intentionally excluded so the serial-local fallback keeps flowing.
+    * ``category='verify_host_unreachable'``
+    * ``task_id=_verify_host_unreachable_sentinel(host)``
+
+    None-safe: returns immediately when *escalation_queue* is None.
+    Dedup: returns immediately when an open L1 already exists for the sentinel.
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        host: Remote runner name (e.g. ``'leo-laptop'``).
+        reason: ``str(exc)`` from the most-recent ``RunnerUnavailable`` exception.
+        streak: Consecutive RunnerUnavailable failure count for this episode.
+        duration_s: Seconds since the first failure in this episode.
+        event_store: Optional event store; when provided a
+            ``EventType.verify_host_unreachable`` event is emitted.
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = _verify_host_unreachable_sentinel(host)
+
+    # Dedup: don't re-alarm while an open L1 already exists for this host.
+    if escalation_queue.has_open_l1(sentinel):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    minutes = duration_s / 60.0
+    duration_str = f'{minutes:.1f} min' if duration_s < 3600 else f'{duration_s / 3600:.1f} h'
+    summary = (
+        f'Remote verify host {host!r} unreachable for {duration_str} '
+        f'({streak} consecutive RunnerUnavailable failures): {reason}'
+    )
+    detail = (
+        f'Host: {host}\n'
+        f'Reason: {reason}\n'
+        f'Consecutive failures: {streak}\n'
+        f'Duration since first failure: {duration_str}\n'
+        '\n'
+        f'The remote verify runner {host!r} has been quarantined after '
+        f'{streak} consecutive RunnerUnavailable failures.  '
+        'The orchestrator is falling back to serial-local verification; '
+        'throughput is degraded but correctness is preserved.\n'
+        '\n'
+        'Auto-reprobe is active: when the host becomes reachable again '
+        '(ssh health check passes) the quarantine is cleared automatically '
+        'and this alarm is resolved without a restart.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-verify-host-monitor',
+        severity='blocking',
+        level=1,
+        category='verify_host_unreachable',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            f'Check SSH connectivity to {host!r}.  '
+            'The auto-reprobe loop will clear the quarantine and resolve this '
+            'alarm once the host responds to `ssh -o BatchMode=yes -o '
+            'ConnectTimeout=10 <host> true`.  '
+            'To manually re-engage: fix SSH access and the orchestrator will '
+            'recover automatically on the next reprobe cycle.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+        event_store.emit(
+            EventType.verify_host_unreachable,
+            data={'host': host, 'reason': reason, 'streak': streak, 'duration_s': duration_s},
+        )
+
 
 def _submit_shadow_divergence_escalation(
     escalation_queue: Any,
