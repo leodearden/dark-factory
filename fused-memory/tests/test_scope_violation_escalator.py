@@ -101,6 +101,44 @@ class TestEscalationEnabled:
         assert result is None  # no exception propagates
 
 
+    def test_llm_reason_appended_to_detail(self, tmp_path):
+        """report_rejection with llm_reason= includes the reason in the escalation detail."""
+        esc = ScopeViolationEscalator()
+        llm_reason = 'LLM: genuine misroute — task edits orchestrator/harness.py'
+        esc_id = esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            candidate_title='Fix orchestrator bug',
+            matched_paths=('orchestrator/',),
+            suggested_project='orchestrator',
+            llm_reason=llm_reason,
+        )
+        assert esc_id is not None
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('*.json'))
+        assert len(files) == 1
+        import json
+        payload = json.loads(files[0].read_text())
+        assert 'llm_adjudicator_reason' in payload['detail']
+        assert llm_reason in payload['detail']
+
+    def test_no_llm_reason_keeps_detail_clean(self, tmp_path):
+        """Back-compat: without llm_reason the detail does NOT contain llm_adjudicator_reason."""
+        esc = ScopeViolationEscalator()
+        esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            candidate_title='Fix orchestrator bug',
+            matched_paths=('orchestrator/',),
+            suggested_project='orchestrator',
+        )
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('*.json'))
+        import json
+        payload = json.loads(files[0].read_text())
+        assert 'llm_adjudicator_reason' not in payload['detail']
+
+
 class TestEscalationDisabled:
     def test_no_op_when_escalation_pkg_unavailable(self, tmp_path, monkeypatch):
         """When HAS_ESCALATION is False the escalator silently no-ops."""
