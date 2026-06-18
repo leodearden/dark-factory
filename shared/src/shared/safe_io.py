@@ -5,8 +5,9 @@ JSON state file" pattern into two clearly-separated branches:
 
 * **FileNotFoundError** — first-run / file absent; silently returns the
   caller-supplied ``default``.
-* **JSONDecodeError / ValueError** — file present but corrupt; emits a
-  deduped WARNING and dispatches on *on_corrupt*.
+* **JSONDecodeError / ValueError** — file present but corrupt (includes
+  non-UTF-8 / binary garbage); emits a deduped WARNING and dispatches on
+  *on_corrupt*.
 
 Other OSErrors (PermissionError, IsADirectoryError, …) propagate uncaught
 so the caller sees genuinely unexpected environmental failures.
@@ -84,18 +85,20 @@ def load_json_or_warn(
     p = Path(path)
 
     # --- read phase ---
+    # Read raw bytes — no decode here (only FileNotFoundError is benign;
+    # other OSErrors such as PermissionError/IsADirectoryError propagate).
     try:
-        text = p.read_text(encoding='utf-8')
+        raw = p.read_bytes()
     except FileNotFoundError:
         # Benign first-run absence — caller's default, no log.
         return (default, True)
-    # Other OSErrors propagate uncaught (PermissionError, IsADirectoryError, …).
 
     # --- parse phase ---
-    # json.JSONDecodeError is a ValueError subclass, so `except ValueError`
-    # covers both malformed JSON and non-UTF-8 content detected post-read.
+    # json.loads accepts bytes (since 3.6) and auto-detects the encoding.
+    # Both malformed JSON and non-UTF-8/binary garbage surface here as a
+    # ValueError (JSONDecodeError/UnicodeDecodeError respectively).
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(raw)
     except ValueError as exc:
         # Corrupt branch: dispatch on on_corrupt.
         #
