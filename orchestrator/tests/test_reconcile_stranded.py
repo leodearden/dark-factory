@@ -2383,6 +2383,98 @@ async def test_degenerate_zero_commit_branch_suppresses_citation_missing(
 
 
 @pytest.mark.asyncio
+async def test_citation_missing_still_escalates_when_branch_advanced(
+    harness: Harness,
+):
+    """Precision lock: the #1823 guard suppresses ONLY the degenerate case.
+
+    Case A — branch advanced (tip != branch_base_sha): legitimate citation-
+    miss escalation must still fire after MAX_RECONCILE_FAILURES sweeps.
+
+    Case B — backward-compat, missing branch_base_sha: the guard's
+    ``_is_valid_sha_40`` gate falls through cleanly and escalation fires.
+
+    Both cases prove the new guard does not over-suppress.
+    This test is GREEN both before and after the #1823 fix.
+    """
+    from orchestrator.harness import MAX_RECONCILE_FAILURES
+
+    class _StubEscalationQueue:
+        def __init__(self):
+            self.submissions = []
+
+        def make_id(self, task_id):
+            return f'esc-{task_id}-{len(self.submissions)}'
+
+        def submit(self, esc):
+            self.submissions.append(esc)
+
+        def has_open_l1(self, task_id):  # noqa: ARG002
+            return False
+
+    tid = '4598'
+
+    # ------------------------------------------------------------------
+    # Case A: branch advanced (tip != branch_base_sha) — escalation fires.
+    # ------------------------------------------------------------------
+    q_a = _StubEscalationQueue()
+    harness._escalation_queue = q_a  # type: ignore[assignment]
+
+    branch_base = 'aaaa' * 10  # 40 hex, valid
+    branch_tip = 'deadbeef' + 'a' * 32  # different SHA → branch advanced
+
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.git_ops.find_task_citation_commit = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)  # type: ignore[attr-defined]
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}},
+    )
+    harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(q_a.submissions) == 1, (
+        f'branch-advanced + citation-miss must still escalate after '
+        f'{MAX_RECONCILE_FAILURES} sweeps; got {len(q_a.submissions)}'
+    )
+    esc_a = q_a.submissions[0]
+    assert esc_a.task_id == tid
+    assert esc_a.category == 'reconcile_citation_missing'
+    assert esc_a.level == 1
+    assert esc_a.severity == 'blocking'
+    # Counter reset by _escalate_reconcile_skip.
+    assert tid not in harness._reconcile_skip_counts
+
+    # ------------------------------------------------------------------
+    # Case B: missing branch_base_sha — _is_valid_sha_40 falls through,
+    # escalation fires (backward-compat for pre-#1226 tasks).
+    # ------------------------------------------------------------------
+    q_b = _StubEscalationQueue()
+    harness._escalation_queue = q_b  # type: ignore[assignment]
+    harness._reconcile_skip_counts.pop(tid, None)  # reset counter
+
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {}},  # no branch_base_sha
+    )
+    harness.scheduler.mark_done.reset_mock()  # type: ignore[attr-defined]
+    harness.scheduler.set_task_status.reset_mock()  # type: ignore[attr-defined]
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(q_b.submissions) == 1, (
+        f'missing branch_base_sha + citation-miss must still escalate; '
+        f'got {len(q_b.submissions)}'
+    )
+    esc_b = q_b.submissions[0]
+    assert esc_b.task_id == tid
+    assert esc_b.category == 'reconcile_citation_missing'
+    assert esc_b.level == 1
+    assert tid not in harness._reconcile_skip_counts
+
+
+@pytest.mark.asyncio
 async def test_failure_counter_resets_on_success(harness: Harness):
     """A successful mark_done clears the per-tid failure counter."""
     from orchestrator.scheduler import DoneGateRejection
