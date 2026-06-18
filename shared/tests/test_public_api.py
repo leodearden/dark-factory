@@ -15,6 +15,7 @@ class TestTopLevelImports:
             AgentFailureClass,
             AgentFailureKind,
             AgentResult,
+            AgentVerdict,
             AllAccountsCappedException,
             CostStore,
             SessionBudgetExhausted,
@@ -23,6 +24,7 @@ class TestTopLevelImports:
             classify_agent_failure,
             connect_daemon,
             count_transcript_turns,
+            extract_agent_verdict,
             files_to_modules,
             invoke_claude_agent,
             invoke_with_cap_retry,
@@ -54,6 +56,8 @@ class TestTopLevelImports:
         assert AgentFailureKind is not None
         assert classify_agent_failure is not None
         assert connect_daemon is not None
+        assert AgentVerdict is not None
+        assert extract_agent_verdict is not None
 
 
 class TestModuleLevelAll:
@@ -120,6 +124,12 @@ class TestModuleLevelAll:
         assert hasattr(locking, '__all__'), 'locking must define __all__'
         assert set(locking.__all__) == {'normalize_lock', 'files_to_modules', 'modules_conflict'}
 
+    def test_agent_result_all(self):
+        from shared import agent_result
+
+        assert hasattr(agent_result, '__all__'), 'agent_result must define __all__'
+        assert set(agent_result.__all__) == {'AgentVerdict', 'extract_agent_verdict'}
+
 
 class TestInitAllCompleteness:
     """Verify that shared.__all__ covers the union of all module __all__ entries."""
@@ -127,6 +137,7 @@ class TestInitAllCompleteness:
     def test_init_all_covers_all_module_symbols(self):
         import shared
         from shared import (
+            agent_result,
             async_sqlite_base,
             cli_invoke,
             config_models,
@@ -137,7 +148,8 @@ class TestInitAllCompleteness:
         )
 
         union = (
-            set(cli_invoke.__all__)
+            set(agent_result.__all__)
+            | set(cli_invoke.__all__)
             | set(usage_gate.__all__)
             | set(config_models.__all__)
             | set(cost_store.__all__)
@@ -154,6 +166,7 @@ class TestInitAllCompleteness:
     def test_no_private_symbols_in_any_all(self):
         import shared
         from shared import (
+            agent_result,
             async_sqlite_base,
             cli_invoke,
             config_models,
@@ -165,6 +178,7 @@ class TestInitAllCompleteness:
 
         for module, name in [
             (shared, 'shared'),
+            (agent_result, 'agent_result'),
             (cli_invoke, 'cli_invoke'),
             (usage_gate, 'usage_gate'),
             (config_models, 'config_models'),
