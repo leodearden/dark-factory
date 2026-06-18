@@ -579,3 +579,91 @@ class TestVerifyDebugfixLoopEmit:
         assert rows == [], (
             f'Expected no rebase_verify_cost events when main unchanged; got {rows}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-15 RED: summarize_rebase_verify_cost pure readout function
+# ---------------------------------------------------------------------------
+
+
+def _make_row(distance: int, verify_secs: float, cohort: str) -> dict:
+    """Construct a synthetic fetch_events_by_type-style row."""
+    return {
+        'data': {
+            'distance_commits': distance,
+            'next_verify_wall_secs': verify_secs,
+            'cohort': cohort,
+        }
+    }
+
+
+def test_summarize_rebase_verify_cost_groups_by_cohort():
+    """summarize_rebase_verify_cost groups by cohort with n, distance_p50, verify_secs_p50."""
+    from orchestrator.rebase_cost_readout import summarize_rebase_verify_cost
+
+    rows = [
+        # continuous cohort: 3 rows
+        _make_row(1, 10.0, 'continuous'),
+        _make_row(3, 20.0, 'continuous'),
+        _make_row(5, 30.0, 'continuous'),
+        # post-unblock cohort: 2 rows
+        _make_row(100, 120.0, 'post-unblock'),
+        _make_row(200, 240.0, 'post-unblock'),
+    ]
+
+    summary = summarize_rebase_verify_cost(rows)
+
+    assert 'continuous' in summary, f'Expected continuous key; got {summary.keys()}'
+    assert 'post-unblock' in summary, f'Expected post-unblock key; got {summary.keys()}'
+
+    cont = summary['continuous']
+    assert cont['n'] == 3, f'Expected n=3 for continuous; got {cont}'
+    assert cont['distance_p50'] == pytest.approx(3.0), (
+        f'Expected distance_p50=3.0; got {cont["distance_p50"]}'
+    )
+    assert cont['verify_secs_p50'] == pytest.approx(20.0), (
+        f'Expected verify_secs_p50=20.0; got {cont["verify_secs_p50"]}'
+    )
+
+    pu = summary['post-unblock']
+    assert pu['n'] == 2, f'Expected n=2 for post-unblock; got {pu}'
+    # median of [100, 200] = 150.0
+    assert pu['distance_p50'] == pytest.approx(150.0), (
+        f'Expected distance_p50=150.0; got {pu["distance_p50"]}'
+    )
+    assert pu['verify_secs_p50'] == pytest.approx(180.0), (
+        f'Expected verify_secs_p50=180.0; got {pu["verify_secs_p50"]}'
+    )
+
+
+def test_summarize_rebase_verify_cost_empty_input():
+    """summarize_rebase_verify_cost returns {} for empty input (no crash)."""
+    from orchestrator.rebase_cost_readout import summarize_rebase_verify_cost
+    result = summarize_rebase_verify_cost([])
+    assert result == {}, f'Expected empty dict; got {result}'
+
+
+def test_summarize_rebase_verify_cost_single_cohort_single_row():
+    """Single row: n=1, median == the value itself."""
+    from orchestrator.rebase_cost_readout import summarize_rebase_verify_cost
+    rows = [_make_row(7, 3.5, 'big-jump')]
+    summary = summarize_rebase_verify_cost(rows)
+    assert 'big-jump' in summary
+    bj = summary['big-jump']
+    assert bj['n'] == 1
+    assert bj['distance_p50'] == pytest.approx(7.0)
+    assert bj['verify_secs_p50'] == pytest.approx(3.5)
+
+
+def test_summarize_rebase_verify_cost_flat_rows_without_data_wrapper():
+    """Rows without a 'data' key (flat dict) should also be handled."""
+    from orchestrator.rebase_cost_readout import summarize_rebase_verify_cost
+    # Flat dict: no 'data' wrapper — the impl reads from row directly if 'data' absent.
+    flat_rows = [
+        {'distance_commits': 2, 'next_verify_wall_secs': 5.0, 'cohort': 'continuous'},
+        {'distance_commits': 4, 'next_verify_wall_secs': 7.0, 'cohort': 'continuous'},
+    ]
+    summary = summarize_rebase_verify_cost(flat_rows)
+    assert 'continuous' in summary
+    assert summary['continuous']['n'] == 2
+    assert summary['continuous']['distance_p50'] == pytest.approx(3.0)
