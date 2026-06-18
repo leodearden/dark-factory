@@ -1642,6 +1642,15 @@ Output JSON matching the schema. Every task must appear in the output.
             # Skip reserved (merge / auto-eval skip-attempt) worktrees.
             if name.startswith('_merge-') or name.endswith('-skip-attempt'):
                 continue
+            # Skip warm pool lanes.  quarantine_worktree is NOT pool-aware
+            # (it moves the dir), so moving a lane would leave the pool's
+            # registered path dangling.  Crash-recovery already handles
+            # lanes; the reaper must not undo a just-recovered lane.
+            if (
+                self.git_ops.warm_lane_pool is not None
+                and self.git_ops.warm_lane_pool.is_lane(entry)
+            ):
+                continue
             # Skip live, recovered, preserved, and in-flight worktrees.
             if (
                 name in live_ids
