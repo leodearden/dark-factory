@@ -6173,6 +6173,122 @@ class TestGetExternalStatusesFailsLoud:
 
 
 # ---------------------------------------------------------------------------
+# TestGetExternalStatusesPartialResult (task 1799 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetExternalStatusesPartialResult:
+    """Partial-result guard: missing dep keys in response → resolver-degraded error.
+
+    (a) Response dict present but missing one or more requested dep keys →
+        ``(partial_statuses, ExternalResolverError)`` — partial dict PRESERVED
+        (not discarded), error slot set, WARNING logged.
+    (b) Negative / no-false-positive: all requested keys present (including
+        sentinel values like 'unknown_task') → ``(statuses, None)`` — sentinels
+        are valid values, not missing keys.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_partial_result_returns_partial_dict_plus_error(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """Response missing 'upstream_proj:2' → (partial, ExternalResolverError) + WARNING."""
+        import logging
+        import orchestrator.scheduler as _sched_module
+
+        # Request 2 deps; response only has 1.
+        response = self._envelope({'statuses': {'upstream_proj:1': 'done'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            statuses, err = await scheduler.get_external_statuses(
+                ['upstream_proj:1', 'upstream_proj:2']
+            )
+
+        # Partial dict preserved (not discarded to {}).
+        assert statuses == {'upstream_proj:1': 'done'}, (
+            f'Expected partial dict to be preserved; got {statuses!r}'
+        )
+        assert err is not None, (
+            'Expected ExternalResolverError for partial result; got None '
+            '(partial-result guard not yet implemented)'
+        )
+        assert isinstance(err, _sched_module.ExternalResolverError), (
+            f'Expected ExternalResolverError; got {type(err).__name__}'
+        )
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            f'Expected a WARNING log for partial result; got {caplog.records!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_keys_present_with_sentinel_values_is_success(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """All requested keys present (including sentinels) → (statuses, None).
+
+        Sentinels ('unknown_task', 'unknown_project', 'malformed') are PRESENT
+        values — only MISSING keys trigger the partial-result guard.
+        """
+        # Both requested dep keys present; one is a real status, one is a sentinel.
+        response = self._envelope({
+            'statuses': {
+                'upstream_proj:1': 'done',
+                'upstream_proj:2': 'unknown_task',  # sentinel, but key IS present
+            }
+        })
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        statuses, err = await scheduler.get_external_statuses(
+            ['upstream_proj:1', 'upstream_proj:2']
+        )
+
+        assert err is None, (
+            f'Sentinel value should NOT trigger partial-result guard; got err={err!r}'
+        )
+        assert statuses == {
+            'upstream_proj:1': 'done',
+            'upstream_proj:2': 'unknown_task',
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_deps_no_false_positive(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Empty deps list → no 'missing' keys → (empty_dict, None) success."""
+        response = self._envelope({'statuses': {}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        statuses, err = await scheduler.get_external_statuses([])
+
+        assert err is None, (
+            f'Empty deps should not trigger partial-result guard; got err={err!r}'
+        )
+        assert statuses == {}
+
+
+# ---------------------------------------------------------------------------
 # TestDepsSatisfiedExternalGate (task 1580 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
