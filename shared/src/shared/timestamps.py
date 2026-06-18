@@ -47,11 +47,13 @@ def parse_timestamp_or_warn(
         that "oldest-first" folds always include malformed records rather than
         silently dropping them.
     """
+    sentinel = fallback if fallback is not None else datetime.min.replace(tzinfo=UTC)
+    ctx_tag = f' [{context}]' if context else ''
+
     if not isinstance(raw, str):
-        sentinel = fallback if fallback is not None else datetime.min.replace(tzinfo=UTC)
         logger.warning(
             'parse_timestamp_or_warn: non-string/None timestamp%s; got %r — using fallback',
-            f' [{context}]' if context else '',
+            ctx_tag,
             raw,
         )
         return (sentinel, False)
@@ -59,10 +61,9 @@ def parse_timestamp_or_warn(
     try:
         dt = datetime.fromisoformat(raw)
     except ValueError:
-        sentinel = fallback if fallback is not None else datetime.min.replace(tzinfo=UTC)
         logger.warning(
             'parse_timestamp_or_warn: unparseable timestamp%s; got %r — using fallback',
-            f' [{context}]' if context else '',
+            ctx_tag,
             raw,
         )
         return (sentinel, False)
