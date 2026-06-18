@@ -369,3 +369,30 @@ class TestTabCuratorJsxFileChipWiring:
         assert 'title={f}' in tab_curator_jsx_body, (
             'title={f} not found in tab_curator.jsx — full key hover removed'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-15: Cache-buster check — all ?v= values in index.html must be >= 24
+# (RED because all assets are currently ?v=23)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def index_html_body(_client):
+    return _client.get('/static/redux/index.html').text
+
+
+class TestIndexHtmlCacheBuster:
+    def test_at_least_one_versioned_asset(self, index_html_body):
+        # Confirm there are versioned assets to check
+        assert re.search(r'\?v=\d+', index_html_body), (
+            'No ?v=<n> versioned assets found in index.html'
+        )
+
+    def test_all_version_numbers_at_least_24(self, index_html_body):
+        # Every ?v=<n> cache-buster must be >= 24 (7 JSX files changed)
+        versions = [int(m.group(1)) for m in re.finditer(r'\?v=(\d+)', index_html_body)]
+        assert versions, 'No versioned assets found'
+        for v in versions:
+            assert v >= 24, (
+                f'Asset with ?v={v} found — all cache-busters must be bumped to >= 24'
+            )
