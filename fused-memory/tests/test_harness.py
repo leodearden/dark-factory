@@ -7232,3 +7232,195 @@ def test_dead_owner_storm_alarm_folds_to_single_pending_escalation(
     assert pending_with_fp[0].severity == 'blocking', (
         f'Storm alarm must be blocking; got {pending_with_fp[0].severity!r}'
     )
+
+
+# ── Tests for task 1785: harness._fetch_task_count_census ──────────────────────
+
+
+class TestHarnessFetchTaskCountCensus:
+    """ReconciliationHarness._fetch_task_count_census fetches authoritative {id:status} map.
+
+    step-7 (RED): _fetch_task_count_census does not exist yet.
+    step-8 (GREEN): add it to harness.py.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fetches_statuses_from_taskmaster(self, journal, event_buffer, mock_memory_service):
+        """_fetch_task_count_census calls taskmaster.get_statuses and returns the map."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_statuses = AsyncMock(return_value={'1': 'done', '2': 'pending'})
+
+        result = await harness._fetch_task_count_census('/abs/project')
+
+        assert result == {'1': 'done', '2': 'pending'}
+        harness.taskmaster.get_statuses.assert_called_once_with(project_root='/abs/project')
+
+    @pytest.mark.asyncio
+    async def test_degrades_when_taskmaster_is_none(self, journal, event_buffer, mock_memory_service):
+        """_fetch_task_count_census returns {} when taskmaster is None — no exception."""
+        from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+
+        config = FusedMemoryConfig(
+            reconciliation=ReconciliationConfig(
+                enabled=True,
+                explore_codebase_root='/tmp/test',
+                agent_llm_provider='anthropic',
+                agent_llm_model='claude-sonnet-4-20250514',
+            )
+        )
+        harness = ReconciliationHarness(
+            memory_service=mock_memory_service,
+            taskmaster=None,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=config,
+        )
+
+        result = await harness._fetch_task_count_census('/abs/project')
+
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_degrades_on_get_statuses_exception(self, journal, event_buffer, mock_memory_service):
+        """_fetch_task_count_census returns {} when get_statuses raises — no exception propagated."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('connection refused'))
+
+        result = await harness._fetch_task_count_census('/abs/project')
+
+        assert result == {}
+
+
+# ── Tests for task 1785: harness._check_graphiti_queue_health ──────────────────
+
+
+class TestHarnessCheckGraphitiQueueHealth:
+    """ReconciliationHarness._check_graphiti_queue_health surfaces dead-letter count.
+
+    step-9 (RED): _check_graphiti_queue_health does not exist yet.
+    step-10 (GREEN): add it to harness.py.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_health_record_from_durable_queue(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """_check_graphiti_queue_health reads durable_queue.get_stats and classifies result."""
+        import logging
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        durable_queue_mock = AsyncMock()
+        durable_queue_mock.get_stats = AsyncMock(
+            return_value={'counts': {'dead': 3, 'completed': 10}, 'oldest_pending_age_seconds': 5.0}
+        )
+        harness.memory.durable_queue = durable_queue_mock
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._check_graphiti_queue_health('test_project')
+
+        assert result is not None
+        assert result['dead_count'] == 3
+        assert result['healthy'] is False
+
+        # A WARNING must be emitted when dead > 0
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_records, (
+            'Expected a WARNING log when dead_count=3 (silent-drop signal)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_durable_queue_is_none(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_check_graphiti_queue_health returns None when durable_queue is None — no exception."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.durable_queue = None
+
+        result = await harness._check_graphiti_queue_health('test_project')
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_get_stats_exception(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_check_graphiti_queue_health returns None when get_stats raises — no exception propagated."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        durable_queue_mock = AsyncMock()
+        durable_queue_mock.get_stats = AsyncMock(side_effect=RuntimeError('db error'))
+        harness.memory.durable_queue = durable_queue_mock
+
+        result = await harness._check_graphiti_queue_health('test_project')
+
+        assert result is None
+
+
+# ── Tests for task 1785: harness._configure_consolidator new kwargs ─────────────
+
+
+class TestConfigureConsolidatorNewKwargs:
+    """_configure_consolidator accepts and sets task_count_verification + graphiti_queue_health.
+
+    step-17 (RED): _configure_consolidator does not accept the new kwargs yet.
+    step-18 (GREEN): extend _configure_consolidator.
+    """
+
+    def test_sets_task_count_verification_on_stage(self):
+        """_configure_consolidator sets stage.task_count_verification from kwarg."""
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        config = ReconciliationConfig()
+        stage = MagicMock(spec=MemoryConsolidator)
+        tier = MagicMock()
+        tier.episode_limit = 5
+        tier.memory_limit = 10
+
+        verification_record = {
+            'available': True, 'consistent': False, 'done_mismatch': True,
+            'total_mismatch': False, 'authoritative': {'done': 608, 'total': 635},
+        }
+
+        ReconciliationHarness._configure_consolidator(
+            stage, tier,
+            task_count_verification=verification_record,
+        )
+
+        assert stage.task_count_verification == verification_record
+
+    def test_sets_graphiti_queue_health_on_stage(self):
+        """_configure_consolidator sets stage.graphiti_queue_health from kwarg."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MagicMock(spec=MemoryConsolidator)
+        tier = MagicMock()
+        tier.episode_limit = 5
+        tier.memory_limit = 10
+
+        health_record = {'dead_count': 2, 'healthy': False}
+
+        ReconciliationHarness._configure_consolidator(
+            stage, tier,
+            graphiti_queue_health=health_record,
+        )
+
+        assert stage.graphiti_queue_health == health_record
+
+    def test_defaults_both_new_kwargs_to_none(self):
+        """_configure_consolidator defaults task_count_verification and graphiti_queue_health to None."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MagicMock(spec=MemoryConsolidator)
+        tier = MagicMock()
+        tier.episode_limit = 5
+        tier.memory_limit = 10
+
+        ReconciliationHarness._configure_consolidator(stage, tier)
+
+        assert stage.task_count_verification is None
+        assert stage.graphiti_queue_health is None
