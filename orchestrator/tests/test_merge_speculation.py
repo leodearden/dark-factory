@@ -946,10 +946,18 @@ class TestSpecLaneDivergenceAlarm:
 
         item = _make_spec_item(tmp_path, cfg, speculative=True)
 
-        # Unparseable: test_output contains no recognizable test lines
+        # Unparseable: output has a nextest Summary footer (N=1 test ran) but no
+        # per-test lines that parse_per_test_results can match.  This triggers
+        # _alarm_warm_shadow_unparseable: _nextest_reported_test_count returns 1
+        # (not None/0) → format-mismatch alarm fires (κ inv.6 fail-closed).
+        # Using 'Build succeeded' + Summary but no PASS/FAIL lines ensures
+        # parse_per_test_results returns {} while the discriminator sees N>0.
         unparseable_vr = VerifyResult(
             passed=True,
-            test_output='Build succeeded\nNo test output\n',
+            test_output=(
+                'Build succeeded\n'
+                '        Summary [   0.01s] 1 test run: 1 passed, 0 failed, 0 skipped\n'
+            ),
             lint_output='', type_output='', summary='',
         )
 
