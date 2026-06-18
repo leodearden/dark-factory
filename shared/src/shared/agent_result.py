@@ -51,7 +51,26 @@ def extract_agent_verdict(
     the ``failed`` flag — never in the ``verdict`` field alone, which equals the
     caller-supplied ``default_verdict`` and may coincide with a legitimate value.
     """
+    # ── GUARD: 2-tuple misuse ───────────────────────────────────────────────────
+    # AgentLoop.run() returns (result_dict, journal_entries).  A caller who
+    # passes the whole tuple instead of unpacking it gets isinstance(result,
+    # dict)==False and silently falls to the failure sentinel with an unhelpful
+    # token.  Detect this early and emit a distinct warning so the misuse is
+    # loud rather than indistinguishable from a real agent failure.
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], dict):
+        logger.warning(
+            'extract_agent_verdict received a 2-tuple; did you forget to unpack'
+            ' AgentLoop.run()? Pass result[0] directly. Treating as failure.'
+        )
+        # Intentionally do NOT recover — the caller must fix the call site.
+        # Fall through to the failure branch below (the tuple is not a dict).
+
     # ── SUCCESS branch ──────────────────────────────────────────────────────────
+    # NOTE: a truthy 'verdict' key takes precedence over any 'warning' key that
+    # may also be present in the payload.  When both keys coexist the payload is
+    # treated as a successful (though possibly partial) result and returned
+    # without a log.  Callers that need to inspect the warning in this case can
+    # read it from result.raw after the call.
     if isinstance(result, dict) and result.get('verdict'):
         return AgentVerdict(
             verdict=result['verdict'],
