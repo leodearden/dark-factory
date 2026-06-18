@@ -762,7 +762,9 @@ class GitOps:
             and (train is None or train.get('order', 0) == 0)
             and not await self._is_registered_worktree(worktree_path)
         ):
-            pool_info = await self.acquire_warm_lane(branch_name, start_ref)
+            pool_info = await self.acquire_warm_lane(
+                branch_name, start_ref, expected_title=expected_title,
+            )
             if pool_info is not None:
                 # Carry stale_commits from the freshen result onto the pool info
                 return WorktreeInfo(
@@ -1036,6 +1038,8 @@ class GitOps:
         self,
         branch_name: str,
         start_ref: str,
+        *,
+        expected_title: str | None = None,
     ) -> 'WorktreeInfo | None':
         """Allocate a FREE warm lane, seed/reset it, and return a WorktreeInfo.
 
@@ -1049,12 +1053,14 @@ class GitOps:
             Handled by :meth:`_reset_warm_lane`; skips re-seed (target/ already
             warm from the previous assignment).
 
-        Identity guarding (``expected_title``) is intentionally N/A here:
-        the pool gate in :meth:`create_worktree` only enters this method for
-        *fresh* dispatches (``not _is_registered_worktree(worktree_path)``),
-        so there is no stored title in the lane to compare against.  The
-        identity guard for reuse-by-name dispatches is handled entirely on
-        the cold path below the pool-acquisition block.
+        **Identity guard** (``expected_title``, step-26):
+            When *expected_title* is supplied, any reuse candidate (in-memory
+            map hit *or* on-disk plan.json match) has its stored title checked
+            via :func:`identities_match`.  On mismatch the stale assignment is
+            dropped from the pool and the lane is reset in-place (fresh path) —
+            so a recycled-id task never inherits the prior task's ``.task/``
+            state.  ``expected_title=None`` (default) disables the guard and
+            all existing callers/tests are unaffected.
 
         Returns:
             WorktreeInfo on success; None on pool exhaustion, absent seed
@@ -1073,10 +1079,29 @@ class GitOps:
         try:
             if reused:
                 # ── Reuse path: live requeue of same task on same lane ────
-                # .task/plan.json is preserved; WIP is committed + rebased.
-                return await self._reuse_warm_lane(lane, full_branch)
+                # Identity guard: if expected_title is set, verify the stored
+                # title matches before reusing .task/plan.json + WIP.
+                # Fail-open: identities_match returns True when either side is
+                # empty, so a title-less lane always reuses as before.
+                _ident_ok = (
+                    expected_title is None
+                    or identities_match(read_worktree_title(lane), expected_title)
+                )
+                if _ident_ok:
+                    # .task/plan.json is preserved; WIP is committed + rebased.
+                    return await self._reuse_warm_lane(lane, full_branch)
+                # Mismatch: stale assignment from a recycled id — drop it and
+                # reset in-place so the new task starts clean.
+                logger.warning(
+                    'acquire_warm_lane: in-memory reuse identity MISMATCH for '
+                    '%s — expected %r; running fresh reset',
+                    lane, expected_title,
+                )
+                self.warm_lane_pool.drop_assignment(branch_name)
+                await self._reset_warm_lane(lane, full_branch, start_ref)
+                # Falls through to shared tail
 
-            if not await self._is_registered_worktree(lane):
+            elif not await self._is_registered_worktree(lane):
                 # ── Create-once branch ────────────────────────────────────
                 # Self-heal: remove a stale unregistered directory so
                 # git worktree add doesn't refuse a non-empty dir.
@@ -1118,6 +1143,8 @@ class GitOps:
                 # process restart that cleared the in-memory _assignments map),
                 # treat it as a REUSE: restore the assignment and route to
                 # _reuse_warm_lane so .task/plan.json + WIP are preserved.
+                # Identity guard: if expected_title is set and the stored title
+                # does not match, treat as fresh (recycled-id guard).
                 # Any read/parse error falls safe toward the fresh reset path.
                 disk_reuse = False
                 try:
@@ -1126,9 +1153,23 @@ class GitOps:
                         import json as _json
                         data = _json.loads(plan_path.read_text())
                         if data.get('task_id') == branch_name:
-                            # Record the mapping and route to reuse
-                            self.warm_lane_pool.note_assignment(branch_name, lane)
-                            disk_reuse = True
+                            # Check identity guard before declaring reuse
+                            _disk_ident_ok = (
+                                expected_title is None
+                                or identities_match(
+                                    read_worktree_title(lane), expected_title,
+                                )
+                            )
+                            if _disk_ident_ok:
+                                # Record the mapping and route to reuse
+                                self.warm_lane_pool.note_assignment(branch_name, lane)
+                                disk_reuse = True
+                            else:
+                                logger.warning(
+                                    'acquire_warm_lane: disk backstop identity '
+                                    'MISMATCH for %s — expected %r; fresh reset',
+                                    lane, expected_title,
+                                )
                 except Exception:
                     # Fail safe: unreadable or non-JSON plan → treat fresh
                     pass

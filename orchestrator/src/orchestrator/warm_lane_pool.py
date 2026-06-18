@@ -177,3 +177,13 @@ class WarmLanePool:
         the caller must ensure the lane is ASSIGNED before calling.
         """
         self._assignments[branch_name] = lane
+
+    def drop_assignment(self, branch_name: str) -> None:
+        """Remove the *branch_name* assignment without changing lane state.
+
+        Used when an identity guard rejects a reuse candidate: the lane stays
+        ASSIGNED (the caller resets it in-place), but the stale assignment is
+        cleared so the pool no longer considers this branch mapped to the lane.
+        Idempotent: silently ignored if *branch_name* has no assignment.
+        """
+        self._assignments.pop(branch_name, None)
