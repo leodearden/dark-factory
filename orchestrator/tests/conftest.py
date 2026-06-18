@@ -166,7 +166,7 @@ def _clear_probe_cache():
 
 
 @pytest.fixture(autouse=True)
-def _mock_merge_queue_verification(monkeypatch):
+def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
     MergeWorker hardcodes orchestrator.merge_queue.run_scoped_verification in its
@@ -174,7 +174,15 @@ def _mock_merge_queue_verification(monkeypatch):
     pytest/ruff/pyright (not in PATH in test environments) cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
+
+    **Opt-out via ``exercise_merge_verify`` marker**:
+    Tests whose purpose is to assert that a compile-broken member is caught by the
+    post-merge verify gate must run the REAL ``run_scoped_verification`` (e.g. real
+    cargo). Marking such a test with ``@pytest.mark.exercise_merge_verify`` causes
+    this fixture to return early (skip the monkeypatch), restoring the real binding.
     """
+    if request.node.get_closest_marker('exercise_merge_verify'):
+        return
     from orchestrator.verify import VerifyResult
     monkeypatch.setattr(
         'orchestrator.merge_queue.run_scoped_verification',
