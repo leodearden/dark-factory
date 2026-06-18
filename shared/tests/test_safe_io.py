@@ -75,3 +75,33 @@ class TestCorruptWarnMode:
         assert result is SENTINEL
         assert len(caplog.records) == 1, f'Expected exactly one WARNING, got: {caplog.records}'
         assert str(p) in caplog.records[0].message
+
+
+class TestOnCorruptDispatch:
+    """on_corrupt dispatch: fail_closed raises, unknown mode raises ValueError."""
+
+    def test_fail_closed_raises_and_emits_no_warning(self, tmp_path, caplog):
+        """on_corrupt='fail_closed' raises ValueError (JSONDecodeError subclass) with NO WARNING."""
+        from shared.safe_io import load_json_or_warn
+
+        p = tmp_path / 'state.json'
+        p.write_bytes(b'{not json')
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ValueError):
+                load_json_or_warn(p, default=SENTINEL, on_corrupt='fail_closed')
+
+        assert len(caplog.records) == 0, (
+            f'fail_closed must emit NO WARNING (exception is the loud channel), '
+            f'got: {caplog.records}'
+        )
+
+    def test_unknown_on_corrupt_raises_value_error(self, tmp_path, caplog):
+        """Unknown on_corrupt value raises ValueError (unknown-mode guard)."""
+        from shared.safe_io import load_json_or_warn
+
+        p = tmp_path / 'state.json'
+        p.write_bytes(b'{not json')
+
+        with pytest.raises(ValueError, match='unknown on_corrupt'):
+            load_json_or_warn(p, default=SENTINEL, on_corrupt='bogus')
