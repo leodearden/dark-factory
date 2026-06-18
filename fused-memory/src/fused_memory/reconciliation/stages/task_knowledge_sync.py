@@ -1178,6 +1178,95 @@ async def _enforce_stage2_summary_pool_cap(
     return success_count
 
 
+async def _pretrim_stage2_summary_pool(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    cap: int = STAGE2_CYCLE_SUMMARY_POOL_CAP,
+) -> int:
+    """Pre-trim the stage2_cycle_summary pool to cap-1, reserving one slot.
+
+    Delegates to ``_enforce_stage2_summary_pool_cap`` with
+    ``cap=max(cap - 1, 0)`` so the imminent agent write lands as the cap-th
+    member and can never be a trim candidate (trim-then-write ordering, task
+    1831).
+
+    Must be called BEFORE ``super().run()`` (the agent write).  Post-write
+    pool size transiently reaches cap; it is bounded back to cap on the next
+    cycle's pre-trim — no post-write trim is needed.
+
+    Args:
+        memory_service: Forwarded to ``_enforce_stage2_summary_pool_cap``.
+        project_id: Project scope.
+        run_id: Current reconciliation run identifier (audit journal).
+        cap: Logical pool cap (default ``STAGE2_CYCLE_SUMMARY_POOL_CAP``).
+            Actual trim target is ``max(cap - 1, 0)``.
+
+    Returns:
+        Number of memories successfully deleted (0 if pool is already at
+        or below cap-1, or on enumeration failure).
+    """
+    return await _enforce_stage2_summary_pool_cap(
+        memory_service, project_id, run_id, cap=max(cap - 1, 0)
+    )
+
+
+async def _verify_stage2_summary_written(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> int:
+    """Best-effort post-write check: count this run's cycle_summary in Mem0.
+
+    Counts memories matching the triple filter
+    ``{'kind':'cycle_summary','stage':'task_knowledge_sync','run_id':run_id}``
+    via ``count_memories_by_metadata`` (deterministic Qdrant count, NOT semantic
+    search).  Logs a WARNING when count==0 or when the count call raises.
+
+    The Stage 2 prompt mandates the cycle_summary write unconditionally on every
+    cycle path (full and remediation); there is no legitimate skip path.
+    count==0 is always unexpected and indicates a genuine agent failure or
+    write loss — the WARNING is intentional and not a false-positive alarm.
+
+    Best-effort: never raises, never retries.  The LLM agent owns its own
+    count-verify-and-retry path; Python's verify is a redundant observability
+    signal surfaced via ``report.stats['stage2_cycle_summary_verified_count']``.
+
+    Args:
+        memory_service: Service with ``count_memories_by_metadata``.
+        project_id: Project scope for the count call.
+        run_id: Current reconciliation run identifier (used as filter key).
+
+    Returns:
+        Count returned by ``count_memories_by_metadata``, or 0 on failure.
+    """
+    try:
+        count = await memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters={
+                'kind': 'cycle_summary',
+                'stage': 'task_knowledge_sync',
+                'run_id': run_id,
+            },
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._verify_stage2_summary_written: '
+            'count_memories_by_metadata failed for run_id=%s; treating as 0',
+            run_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
+    if not count:
+        logger.warning(
+            'reconciliation._verify_stage2_summary_written: '
+            'no cycle_summary found for run_id=%s after agent write',
+            run_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+    return count
+
+
 async def _track_flag_persistence(
     memory_service,
     project_id: str,
@@ -1541,6 +1630,11 @@ class TaskKnowledgeSync(BaseStage):
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
+        # --- trim-then-write: pre-trim pool to cap-1 BEFORE agent writes (task 1831) ---
+        # Runs unconditionally (full + remediation) so the pool is bounded every cycle.
+        # Trim target is cap-1, reserving one slot for the imminent agent write so a
+        # newly-written summary can never be the "oldest" trim candidate.  Best-effort.
+        pretrimmed = await _pretrim_stage2_summary_pool(self.memory, self.project_id, run_id)
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
 
         # --- stale fixc marker sweep stat (task 1224) ---
@@ -1590,13 +1684,13 @@ class TaskKnowledgeSync(BaseStage):
         # --- post-flight guards (task 1137) ---
         await self._apply_post_flight_guards(report, prior_reports, run_id)
 
-        # --- stage2 cycle-summary pool cap enforcement (task 1657) ---
-        # Runs unconditionally (NOT gated by remediation_mode) so both full-cycle
-        # and remediation runs trim the pool.  Best-effort: helper never raises.
-        trimmed = await _enforce_stage2_summary_pool_cap(
-            self.memory, self.project_id, run_id
+        # --- cycle-summary stats (task 1831 trim-then-write) ---
+        # pre-trim count was captured before super().run(); record it now alongside
+        # the post-write verification count so both land in the same report.stats.
+        report.stats['stage2_cycle_summary_pool_trimmed'] = pretrimmed
+        report.stats['stage2_cycle_summary_verified_count'] = (
+            await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
         )
-        report.stats['stage2_cycle_summary_pool_trimmed'] = trimmed
 
         return report
 
