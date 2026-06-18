@@ -115,7 +115,7 @@ class DbPool:
                 self._conns[resolved] = conn
                 return conn
             except (FileNotFoundError, sqlite3.OperationalError, OSError):
-                logger.debug('DbPool: cannot open %s', resolved, exc_info=True)
+                logger.warning('DbPool: cannot open %s', resolved, exc_info=True)
                 return None
 
     @property
