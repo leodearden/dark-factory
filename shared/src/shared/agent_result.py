@@ -51,11 +51,19 @@ def extract_agent_verdict(
     the ``failed`` flag — never in the ``verdict`` field alone, which equals the
     caller-supplied ``default_verdict`` and may coincide with a legitimate value.
     """
+    # ── SUCCESS branch ──────────────────────────────────────────────────────────
+    if isinstance(result, dict) and result.get('verdict'):
+        return AgentVerdict(
+            verdict=result['verdict'],
+            summary=result.get('summary', ''),
+            failed=False,
+            raw=result,
+        )
+
     # ── FAILURE branch ──────────────────────────────────────────────────────────
     # Determine the token: use the 'warning' key when present (matches the shapes
     # emitted by AgentLoop.run(): {'warning': 'no_tool_calls'} / {'warning':
     # 'max_steps_reached'}), otherwise fall back to the caller-supplied error_summary.
-    # (SUCCESS branch added in step-4.)
     if isinstance(result, dict) and 'warning' in result:
         token = result['warning']
     else:
