@@ -96,8 +96,13 @@ def load_json_or_warn(
         if on_corrupt not in ('warn', 'quarantine'):
             raise ValueError(f'unknown on_corrupt={on_corrupt!r}')
 
-        # warn / quarantine both emit the deduped WARNING.
-        logger.warning('safe_io: corrupt JSON at %s: %s', p, exc)
+        # warn / quarantine both emit the deduped WARNING — once per path per
+        # process (mirrors sqlite_task_backend._warned_malformed_task_ids:51).
+        # The corrective action (return / quarantine rename) always runs.
+        key = str(p)
+        if key not in _warned_corrupt_paths:
+            _warned_corrupt_paths.add(key)
+            logger.warning('safe_io: corrupt JSON at %s: %s', p, exc)
 
         if on_corrupt == 'warn':
             return (default, False)
