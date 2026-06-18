@@ -17,10 +17,13 @@ panel changes before we build the rest of the trial.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from collections import Counter, defaultdict
 from itertools import combinations
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 REPO = Path('/home/leo/src/dark-factory')
 SEARCH_ROOTS = [REPO / '.worktrees', REPO / '.eval-worktrees']
@@ -55,7 +58,8 @@ def task_label(reviews_dir: Path) -> str:
 def load_review(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning('skipping unreadable review file %s: %s', path, exc)
         return None
 
 
@@ -288,4 +292,5 @@ def main() -> int:
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.WARNING)
     sys.exit(main())
