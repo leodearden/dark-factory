@@ -3649,7 +3649,7 @@ class InflightVerifyResult:
 
     outcome: MergeOutcome | None
     merge_wt: Path | None
-    warm_results: dict[str, bool] = dataclasses.field(default_factory=dict)
+    warm_results: dict[str, str] = dataclasses.field(default_factory=dict)
     status: str | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
 
 
@@ -7556,7 +7556,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         assert merge_commit is not None
         merge_commit = merge_commit.strip()
 
-        _warm_results: dict[str, bool] = {}
+        _warm_results: dict[str, str] = {}
         _is_warm_path = False
         _warm_capture: list[VerifyResult] = []
 
@@ -7852,7 +7852,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # _maybe_schedule_shadow_compare so the same-candidate shadow compare
             # fires.  When vr is None (verify_task=None compat path) there is no
             # warm run, so default to {} — matching pre-refactor behaviour.
-            _warm_results: dict[str, bool] = vr.warm_results if vr is not None else {}
+            _warm_results: dict[str, str] = vr.warm_results if vr is not None else {}
 
             # Short-circuit: if abandonment landed while verify completed,
             # skip the expensive CAS loop (mirrors _verify_and_advance :6934).
@@ -8695,8 +8695,45 @@ _LIBTEST_TEST_LINE_RE = re.compile(
 )
 
 
-def parse_per_test_results(test_output: str) -> dict[str, bool]:
-    """Parse test runner output into a per-test pass/fail map.
+def _classify_test_status(raw_status: str) -> str:
+    """Map a raw nextest or libtest status token to a 3-valued verdict string.
+
+    Verdict vocabulary:
+      ``'pass'``        — nextest ``PASS`` or ``LEAK``; libtest ``ok``
+      ``'fail'``        — nextest ``FAIL``; libtest ``FAILED``
+      ``'inconclusive'`` — nextest ``TIMEOUT`` or ``SIGSEGV``
+
+    **LEAK → 'pass'** mirrors nextest's own default ``--leak-timeout 100ms``
+    semantics: nextest counts LEAK as a PASS (suite exit stays 0) because
+    teardown-slip leaks are non-fatal by design.  Under host contention,
+    fast deterministic tests spuriously trip leak detection, so treating LEAK
+    as ``'fail'`` produces false-positive warm/cold divergences (esc-31,
+    esc-32).
+
+    **TIMEOUT / SIGSEGV → 'inconclusive'** because these are non-deterministic
+    execution artifacts (scheduler jitter, OOM-adjacent crashes) that do not
+    imply a genuine warm/cold suite-verdict flip.  Routing them to
+    ``'inconclusive'`` prevents the comparator from alarming on noise.
+
+    Unknown tokens (forward-compat) fall through to ``'fail'`` (fail-closed).
+
+    Args:
+        raw_status: Status token from the regex capture group, e.g.
+            ``'PASS'``, ``'LEAK'``, ``'TIMEOUT'``, ``'ok'``, ``'FAILED'``.
+
+    Returns:
+        One of ``'pass'``, ``'fail'``, or ``'inconclusive'``.
+    """
+    if raw_status in ('PASS', 'LEAK', 'ok'):
+        return 'pass'
+    if raw_status in ('TIMEOUT', 'SIGSEGV'):
+        return 'inconclusive'
+    # 'FAIL', 'FAILED', and any unknown forward-compat token → 'fail' (fail-closed)
+    return 'fail'
+
+
+def parse_per_test_results(test_output: str) -> dict[str, str]:
+    """Parse test runner output into a per-test verdict map.
 
     Supports two formats:
 
@@ -8710,14 +8747,20 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
       **excluded** from the key so that warm and cold runs (which have different
       N/M indices) produce identical stable keys.
 
-      Key: ``"<pkg::bin> <test::path>"``, value: ``True`` iff status is ``PASS``.
-      TIMEOUT / LEAK / SIGSEGV are treated as failures (``False``).
+      Key: ``"<pkg::bin> <test::path>"``, value: verdict string from
+      :func:`_classify_test_status`.
 
     * **libtest** (plain ``cargo test``)::
 
           test <test::path> ... ok|FAILED
 
-      Key: ``"<test::path>"``, value: ``True`` iff status is ``ok``.
+      Key: ``"<test::path>"``, value: ``'pass'`` iff status is ``ok``,
+      else ``'fail'``.
+
+    Verdict vocabulary: ``'pass'`` (nextest PASS/LEAK; libtest ok),
+    ``'fail'`` (nextest FAIL; libtest FAILED),
+    ``'inconclusive'`` (nextest TIMEOUT/SIGSEGV — non-deterministic artifacts
+    excluded from alarm-worthy divergence detection).
 
     SKIP / ignored lines are excluded from both formats so they do not
     introduce spurious presence-divergences in the shadow compare diff.
@@ -8731,22 +8774,22 @@ def parse_per_test_results(test_output: str) -> dict[str, bool]:
         test_output: Raw string output from a verify run.
 
     Returns:
-        ``dict[str, bool]`` mapping test id to pass status.  Empty dict for
+        ``dict[str, str]`` mapping test id to verdict string.  Empty dict for
         empty/blank input or when no test lines are present.  A caller that
         receives an empty dict from a genuine verify run should log a warning
         — the parser may not match the project's verify command output format.
     """
-    result: dict[str, bool] = {}
+    result: dict[str, str] = {}
     for line in test_output.splitlines():
         m = _NEXTEST_TEST_LINE_RE.match(line)
         if m:
             status, crate, test_path = m.group(1), m.group(2), m.group(3)
-            result[f"{crate} {test_path}"] = (status == 'PASS')
+            result[f"{crate} {test_path}"] = _classify_test_status(status)
             continue
         m = _LIBTEST_TEST_LINE_RE.match(line)
         if m:
             test_path, status = m.group(1), m.group(2)
-            result[test_path] = (status == 'ok')
+            result[test_path] = _classify_test_status(status)
     return result
 
 
@@ -8797,33 +8840,45 @@ class ShadowCompareDiff:
     """Per-test divergence between a warm and a cold verify run.
 
     Produced by :func:`diff_per_test_results` for PRD §10 invariant 6(b).
-    The ``diverging`` dict contains every test whose warm/cold verdicts differ;
-    the list buckets partition diverging tests by direction for easy alarming.
 
-    Presence divergences (a test in only one result set) are also recorded
-    because they indicate structural differences between the two runs.
+    Verdict model: each test verdict is one of ``'pass'``, ``'fail'``, or
+    ``'inconclusive'``.  A divergence is **alarm-worthy** only when it is a
+    genuine ``'pass'``↔``'fail'`` flip (or a presence divergence); any
+    difference involving ``'inconclusive'`` is routed to the non-alarming
+    :attr:`inconclusive` bucket and excluded from :attr:`has_divergence`.
 
     Attributes:
-        diverging: Maps test_id → (warm_passed, cold_passed) for every
-            diverging test.
-        warm_pass_cold_fail: Test ids that passed warm but failed cold
-            (the dangerous class: warm landed OK, cold reveals a real fail).
-        warm_fail_cold_pass: Test ids that failed warm but passed cold
-            (less dangerous; warm was conservative).
+        diverging: Maps test_id → (warm_verdict, cold_verdict) for every
+            alarm-worthy diverging test (genuine ``'pass'``↔``'fail'`` flip).
+        warm_pass_cold_fail: Test ids that yielded ``'pass'`` warm but
+            ``'fail'`` cold (the dangerous class: warm landed OK, cold reveals
+            a real fail).
+        warm_fail_cold_pass: Test ids that yielded ``'fail'`` warm but
+            ``'pass'`` cold (less dangerous; warm was conservative).
         only_warm: Test ids present in the warm result but absent from cold
-            (structural difference; may indicate a cold build failure).
+            (structural presence divergence → alarm-worthy).
         only_cold: Test ids present in the cold result but absent from warm.
+        inconclusive: Maps test_id → (warm_verdict, cold_verdict) for tests
+            where EITHER side is ``'inconclusive'``
+            (TIMEOUT/SIGSEGV — non-deterministic execution artifacts).
+            These differences are logged but NOT alarmed.
+            Excluded from :attr:`has_divergence` by design.
     """
 
-    diverging: dict[str, tuple[bool, bool]]
+    diverging: dict[str, tuple[str, str]]
     warm_pass_cold_fail: list[str]
     warm_fail_cold_pass: list[str]
     only_warm: list[str]
     only_cold: list[str]
+    inconclusive: dict[str, tuple[str, str]] = dataclasses.field(default_factory=dict)
 
     @property
     def has_divergence(self) -> bool:
-        """True iff any divergence bucket is non-empty."""
+        """True iff any alarm-worthy divergence bucket is non-empty.
+
+        Deliberately excludes :attr:`inconclusive` — a pair differing by
+        TIMEOUT/SIGSEGV is not alarm-worthy.
+        """
         return bool(
             self.diverging
             or self.only_warm
@@ -8832,28 +8887,48 @@ class ShadowCompareDiff:
 
 
 def diff_per_test_results(
-    warm: dict[str, bool],
-    cold: dict[str, bool],
+    warm: dict[str, str],
+    cold: dict[str, str],
 ) -> ShadowCompareDiff:
     """Compute the per-test divergence between warm and cold verify results.
 
     Classifies every test in the union of both result sets into a divergence
-    bucket.  Tests whose warm verdict equals their cold verdict are omitted.
+    bucket using the 3-valued verdict model (``'pass'``/``'fail'``/
+    ``'inconclusive'``):
+
+    * Tests with **identical** verdicts in both legs are omitted.
+    * Tests present in **only one** leg with a ``'pass'`` or ``'fail'`` verdict
+      go to :attr:`~ShadowCompareDiff.only_warm` /
+      :attr:`~ShadowCompareDiff.only_cold` — alarm-worthy (structural
+      difference).
+    * Tests present in **only one** leg whose sole verdict is
+      ``'inconclusive'`` (TIMEOUT/SIGSEGV) go to
+      :attr:`~ShadowCompareDiff.inconclusive` — non-alarming.  A TIMEOUT in
+      one leg that the other leg simply never ran is a non-deterministic
+      execution artifact, not a suite-verdict-changing flip.
+    * Tests where **either** verdict in both legs is ``'inconclusive'``
+      (TIMEOUT/SIGSEGV) go to :attr:`~ShadowCompareDiff.inconclusive`
+      — non-alarming.
+    * Tests with a genuine ``'pass'``↔``'fail'`` flip go to
+      :attr:`~ShadowCompareDiff.diverging` and one of the direction buckets
+      — alarm-worthy.
 
     Args:
-        warm: Per-test results from the warm (in-place) verify run,
+        warm: Per-test verdict map from the warm (in-place) verify run,
             as returned by :func:`parse_per_test_results`.
-        cold: Per-test results from the cold (throwaway-worktree) verify run.
+        cold: Per-test verdict map from the cold (throwaway-worktree) verify run.
 
     Returns:
         A :class:`ShadowCompareDiff` with buckets populated for diverging
-        tests.  ``has_divergence`` is False iff all buckets are empty.
+        tests.  :attr:`~ShadowCompareDiff.has_divergence` is False iff all
+        alarm-worthy buckets are empty (``inconclusive`` is excluded by design).
     """
-    diverging: dict[str, tuple[bool, bool]] = {}
+    diverging: dict[str, tuple[str, str]] = {}
     warm_pass_cold_fail: list[str] = []
     warm_fail_cold_pass: list[str] = []
     only_warm: list[str] = []
     only_cold: list[str] = []
+    inconclusive: dict[str, tuple[str, str]] = {}
 
     all_tests = warm.keys() | cold.keys()
     for test_id in sorted(all_tests):
@@ -8862,15 +8937,32 @@ def diff_per_test_results(
         if in_warm and in_cold:
             w, c = warm[test_id], cold[test_id]
             if w != c:
-                diverging[test_id] = (w, c)
-                if w and not c:
-                    warm_pass_cold_fail.append(test_id)
+                if w == 'inconclusive' or c == 'inconclusive':
+                    # Non-deterministic execution artifact — not alarm-worthy
+                    inconclusive[test_id] = (w, c)
                 else:
-                    warm_fail_cold_pass.append(test_id)
+                    # Genuine 'pass'↔'fail' flip — alarm-worthy
+                    diverging[test_id] = (w, c)
+                    if w == 'pass' and c == 'fail':
+                        warm_pass_cold_fail.append(test_id)
+                    else:
+                        warm_fail_cold_pass.append(test_id)
         elif in_warm:
-            only_warm.append(test_id)
+            v = warm[test_id]
+            if v == 'inconclusive':
+                # TIMEOUT/SIGSEGV in warm with no cold result — non-deterministic
+                # artifact, not alarm-worthy.  Store as ('inconclusive', 'absent')
+                # for diagnostics.
+                inconclusive[test_id] = ('inconclusive', 'absent')
+            else:
+                only_warm.append(test_id)
         else:
-            only_cold.append(test_id)
+            v = cold[test_id]
+            if v == 'inconclusive':
+                # TIMEOUT/SIGSEGV in cold with no warm result — same reasoning.
+                inconclusive[test_id] = ('absent', 'inconclusive')
+            else:
+                only_cold.append(test_id)
 
     return ShadowCompareDiff(
         diverging=diverging,
@@ -8878,6 +8970,7 @@ def diff_per_test_results(
         warm_fail_cold_pass=warm_fail_cold_pass,
         only_warm=only_warm,
         only_cold=only_cold,
+        inconclusive=inconclusive,
     )
 
 
@@ -8974,8 +9067,8 @@ def _submit_shadow_divergence_escalation(
     escalation_queue: Any,
     merge_commit: str,
     diff: ShadowCompareDiff,
-    warm_results: dict[str, bool],
-    cold_results: dict[str, bool],
+    warm_results: dict[str, str],
+    cold_results: dict[str, str],
 ) -> None:
     """Submit a born-at-L2 escalation for a warm/cold shadow divergence.
 
@@ -9177,7 +9270,7 @@ async def _run_cold_shadow_verify(
     req: MergeRequest,
     merge_commit: str,
     event_store: EventStore | None,
-) -> dict[str, bool]:
+) -> dict[str, str]:
     """Run a from-scratch cold verify on *merge_commit* in a throwaway worktree.
 
     Creates an ephemeral ``_merge-<uuid>`` worktree at *merge_commit* via
@@ -9199,7 +9292,7 @@ async def _run_cold_shadow_verify(
         event_store: Optional event store (passed to VerifyRunnerPool; None-safe).
 
     Returns:
-        Per-test pass/fail map as returned by :func:`parse_per_test_results`.
+        Per-test verdict map as returned by :func:`parse_per_test_results`.
         Empty dict if the cold verify produced no parseable test output.
     """
     wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
@@ -9229,11 +9322,40 @@ async def _run_cold_shadow_verify(
         await git_ops.cleanup_merge_worktree(wt)
 
 
+def _persistent_alarm_tests(
+    diff1: ShadowCompareDiff,
+    diff2: ShadowCompareDiff,
+) -> set[str]:
+    """Return the alarm-worthy test ids that diverge in BOTH cold runs.
+
+    Used by the Option-B re-confirmation logic: only a test that is
+    alarm-worthy in *diff1* (first cold run) AND in *diff2* (second cold run)
+    is considered a genuine persistent divergence worthy of a born-at-L2 alarm.
+    Tests that appear alarm-worthy only in one run are treated as execution
+    flakiness and silently discarded.
+
+    An alarm-worthy test is one present in any of the three alarm-worthy
+    buckets: :attr:`~ShadowCompareDiff.diverging`,
+    :attr:`~ShadowCompareDiff.only_warm`, or
+    :attr:`~ShadowCompareDiff.only_cold`.
+
+    Args:
+        diff1: Diff between warm results and the first cold run.
+        diff2: Diff between warm results and the second (re-confirmation) cold run.
+
+    Returns:
+        The intersection of alarm-worthy test ids across both diffs.
+    """
+    alarm1: set[str] = set(diff1.diverging) | set(diff1.only_warm) | set(diff1.only_cold)
+    alarm2: set[str] = set(diff2.diverging) | set(diff2.only_warm) | set(diff2.only_cold)
+    return alarm1 & alarm2
+
+
 async def _run_shadow_compare(
     git_ops: GitOps,
     req: MergeRequest,
     merge_commit: str,
-    warm_results: dict[str, bool],
+    warm_results: dict[str, str],
     escalation_queue: Any,
     event_store: EventStore | None,
 ) -> None:
@@ -9244,13 +9366,18 @@ async def _run_shadow_compare(
     1. Runs a cold verify on *merge_commit* via :func:`_run_cold_shadow_verify`
        in a throwaway ``_merge-<uuid>`` worktree (off the serial lane).
     2. Diffs the cold results against *warm_results* via :func:`diff_per_test_results`.
-    3. On per-test divergence: submits a born-at-L2 critical escalation via
-       :func:`_submit_shadow_divergence_escalation` naming the diverging tests
-       and explicitly stating the warm merge has ALREADY LANDED.
-    4. On agreement (no divergence): emits an :attr:`~orchestrator.event_store.EventType.verdict_parity_ok`
-       event (mirrors :class:`~orchestrator.verify_runner.DriftDetector`).
+    3. **On alarm-worthy divergence (Option B re-confirmation)**: re-runs the cold
+       leg once and escalates via :func:`_submit_shadow_divergence_escalation` ONLY
+       when the same alarm-worthy tests persist across both cold runs.  A divergence
+       that clears on the second run is logged at WARNING as transient/flaky with no
+       alarm and no parity-ok event.  If the re-confirmation cold run itself returns
+       empty results (build/infra hiccup), the result is treated as inconclusive.
+    4. On agreement (no alarm-worthy divergence after the first run): emits an
+       :attr:`~orchestrator.event_store.EventType.verdict_parity_ok` event
+       (mirrors :class:`~orchestrator.verify_runner.DriftDetector`).  This path
+       also covers inconclusive-only diffs (``has_divergence`` is False by design).
 
-    **Exception handling**: any exception from the cold leg is logged at WARNING
+    **Exception handling**: any exception from either cold leg is logged at WARNING
     level and swallowed.  A shadow/detective control must never crash or stall
     the merge worker — it runs off the critical serial lane via
     ``asyncio.create_task`` (see :func:`_maybe_schedule_shadow_compare`).
@@ -9260,7 +9387,7 @@ async def _run_shadow_compare(
         req: The :class:`MergeRequest` that warm-landed (provides config +
              module_configs for the cold verify spec).
         merge_commit: The just-landed merge commit SHA.
-        warm_results: Per-test pass/fail map captured from the warm verify run.
+        warm_results: Per-test verdict map captured from the warm verify run.
         escalation_queue: Live escalation queue, or ``None`` (None-safe).
         event_store: Optional event store for parity-ok event emission.
     """
@@ -9294,12 +9421,75 @@ async def _run_shadow_compare(
         )
         return
 
-    diff = diff_per_test_results(warm_results, cold_results)
+    diff1 = diff_per_test_results(warm_results, cold_results)
 
-    if diff.has_divergence:
-        _submit_shadow_divergence_escalation(
-            escalation_queue, merge_commit, diff, warm_results, cold_results
+    if diff1.has_divergence:
+        # Option B: Re-confirm the divergence with a second independent cold run.
+        # Escalate only on the intersection of alarm-worthy tests that persist
+        # across both runs; a transient flip that clears on re-run is not alarmed.
+        n_alarm_worthy = (
+            len(diff1.diverging) + len(diff1.only_warm) + len(diff1.only_cold)
         )
+        logger.info(
+            'Shadow compare first-run divergence on %s: %d alarm-worthy test(s); '
+            'starting re-confirmation cold run (Option B) — this doubles the cold '
+            'verify cost for this commit',
+            merge_commit[:8],
+            n_alarm_worthy,
+        )
+        try:
+            cold2 = await _run_cold_shadow_verify(
+                git_ops, req, merge_commit, event_store
+            )
+        except Exception:
+            logger.warning(
+                'Shadow compare re-confirmation cold leg failed for %s — '
+                'swallowing exception; treating divergence as inconclusive',
+                merge_commit[:8],
+                exc_info=True,
+            )
+            return
+
+        # Empty-cold inconclusive guard for the re-confirmation run
+        if not cold2 and warm_results:
+            logger.warning(
+                'Shadow compare re-confirmation inconclusive for %s: second cold '
+                'leg produced no parseable test results; not alarming',
+                merge_commit[:8],
+            )
+            return
+
+        diff2 = diff_per_test_results(warm_results, cold2)
+        persistent = _persistent_alarm_tests(diff1, diff2)
+
+        if persistent:
+            # Build a ShadowCompareDiff restricted to the persistently-diverging
+            # tests only; pass cold2 as the definitive cold result.
+            restricted_diff = ShadowCompareDiff(
+                diverging={t: v for t, v in diff2.diverging.items() if t in persistent},
+                warm_pass_cold_fail=[t for t in diff2.warm_pass_cold_fail if t in persistent],
+                warm_fail_cold_pass=[t for t in diff2.warm_fail_cold_pass if t in persistent],
+                only_warm=[t for t in diff2.only_warm if t in persistent],
+                only_cold=[t for t in diff2.only_cold if t in persistent],
+            )
+            _submit_shadow_divergence_escalation(
+                escalation_queue, merge_commit, restricted_diff, warm_results, cold2
+            )
+        else:
+            # Divergence cleared on re-confirmation — transient/flaky, not a real issue.
+            logger.warning(
+                'Shadow compare divergence on %s was transient/flaky (did not '
+                'persist across re-confirmation run); not alarming',
+                merge_commit[:8],
+            )
+        # No parity-ok event in either sub-case (persistent or transient divergence).
+        # Design intent: the result is genuinely uncertain (either a real flip that
+        # triggered an alarm, or a flaky flip that was cleared); emitting parity_ok
+        # would be misleading for the persistent case and premature for the transient
+        # case.  Downstream metric accounting that needs a per-compare outcome can
+        # observe the presence/absence of the born-at-L2 alarm instead.  A new
+        # 'verdict_parity_inconclusive' EventType was explicitly ruled out of scope
+        # for this task to avoid expanding into event_store.py.
     else:
         # Parity OK — emit event (mirrors DriftDetector.check verdict_parity_ok)
         if event_store is not None:
@@ -9320,7 +9510,7 @@ async def _maybe_schedule_shadow_compare(
     git_ops: GitOps,
     req: MergeRequest,
     merge_commit: str,
-    warm_results: dict[str, bool],
+    warm_results: dict[str, str],
     escalation_queue: Any,
     event_store: EventStore | None,
 ) -> None:
