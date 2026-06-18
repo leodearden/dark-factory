@@ -58,6 +58,7 @@ __all__ = [
     'TerminalExitRejection',
     'DoneGateRejection',
     'ProvenanceValidationRejection',
+    'ExternalResolverError',
     'extract_rejection',
     'extract_structured_rejection',
     'is_transient_rejection',
@@ -157,6 +158,26 @@ class ProvenanceValidationRejection(SetTaskStatusRejected):
                 f'{error_code} — {raw}'
             ),
         )
+
+class ExternalResolverError(RuntimeError):
+    """Synthesised error: ``get_external_statuses`` returned an unusable result.
+
+    Raised (into the error slot of the ``(statuses, error)`` tuple) in two cases:
+
+    1. **Non-dict / unparseable result** — ``_parse_tool_text_result`` returned
+       ``None`` (missing 'statuses' key, wrong type, or JSON parse failure).
+       The returned statuses dict is ``{}``.
+
+    2. **Partial-result (missing keys)** — the 'statuses' dict was present but did
+       not contain a key for every requested dep string.  The returned statuses dict
+       is the partial dict (not ``{}``) so callers can log what was received, but
+       the error flag forces a fail-safe wait (do not silently treat missing keys
+       as non-done statuses).
+
+    In both cases ``_external_resolver_failed`` becomes ``True`` via the existing
+    ``external_err is not None`` plumbing — no gate-logic changes needed.
+    """
+
 
 # Error-type names that indicate a transient backend failure (taskmaster
 # child reconnecting, fused-memory crashed mid-call, network blip).  Matches
@@ -810,6 +831,18 @@ class Scheduler:
         # Process-local — a scheduler restart is an acceptable implicit reset,
         # matching _requeue_counts/_skip_count idioms above.
         self._external_unresolved_counts: dict[tuple[str, str], int] = {}
+        # Per-task_id count of consecutive ticks where the external-dep gate
+        # held dispatch (either because the resolver was degraded, or because
+        # all deps returned live non-done statuses).  Keyed by task_id (str).
+        # Process-local — same rationale as _external_unresolved_counts.
+        # GC'd alongside _external_unresolved_counts in the per-tick stale-id sweep.
+        self._external_hold_streak: dict[str, int] = {}
+        # Tracks the most-recent cause for _external_hold_streak[task_id].
+        # Reset alongside the streak.  When the cause changes tick-over-tick
+        # (e.g. resolver degraded → dep live) the streak resets to zero so the
+        # emitted external_dep_gate_held.cause always reflects the dominant
+        # (consecutive-run) reason, not a mixed accumulation.
+        self._external_hold_cause: dict[str, str] = {}
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -1520,9 +1553,15 @@ class Scheduler:
         ``malformed``) are surfaced as-is — the caller decides policy.
 
         Returns:
-            ``({dep: status}, None)`` on success.
-            ``({}, exception)`` on any failure — transient raises are swallowed
-            into the error slot (fail-safe; caller should skip policy effects).
+            ``({dep: status}, None)`` on success (all requested dep keys present).
+            ``(partial_dict, ExternalResolverError)`` when the response dict is
+            missing one or more requested dep keys (resolver-degraded; partial
+            dict preserved for logging but error slot forces fail-safe wait).
+            ``({}, ExternalResolverError)`` when ``_parse_tool_text_result``
+            returns a non-dict/None (unparseable JSON or missing 'statuses' key).
+            ``({}, exception)`` on any raised exception — transient raises are
+            swallowed into the error slot (fail-safe; caller should skip policy
+            effects).
         """
         try:
             arguments: dict = {'deps': list(deps)}
@@ -1531,6 +1570,20 @@ class Scheduler:
             )
             statuses = self._parse_tool_text_result(result, 'statuses')
             if isinstance(statuses, dict):
+                # Guard: the real tool always keys its response by the verbatim
+                # dep string and always sets a value (real status or a sentinel).
+                # A missing dep key is a genuine contract violation, not normal
+                # operation, so treat it as resolver-degraded (fail-safe wait).
+                missing = [d for d in deps if d not in statuses]
+                if missing:
+                    msg = (
+                        f'get_external_statuses: response missing {len(missing)}'
+                        f' of {len(deps)} requested dep keys '
+                        f'(sample: {missing[:3]!r}) — resolver-degraded; '
+                        'fail-safe wait this tick'
+                    )
+                    logger.warning(msg)
+                    return statuses, ExternalResolverError(msg)
                 return statuses, None
         except Exception as e:
             logger.exception(
@@ -1539,11 +1592,58 @@ class Scheduler:
                 e,
             )
             return {}, e
-        return {}, None
+        # Non-dict / unparseable result — _parse_tool_text_result returned None.
+        msg = (
+            f'get_external_statuses: response was non-dict/unparseable for '
+            f'{len(deps)} dep(s) — failing LOUD into error slot (fail-safe wait)'
+        )
+        logger.warning(msg)
+        return {}, ExternalResolverError(msg)
 
     _EXTERNAL_SENTINEL_STATUSES: frozenset[str] = frozenset(
         {'unknown_project', 'unknown_task', 'malformed'}
     )
+
+    def _note_external_hold(
+        self,
+        task_id: str,
+        *,
+        cause: str,
+        threshold: int,
+        detail: str | None = None,
+    ) -> None:
+        """Bump the hold-streak for ``task_id`` and emit an event at the threshold.
+
+        Called once per held tick (either ``'resolver_degraded'`` or
+        ``'deps_live'``).  Emits ``EventType.external_dep_gate_held`` the
+        first time the streak reaches ``threshold`` and on each subsequent
+        ``threshold``-multiple tick, so the event is durable and bounded.
+
+        Does NOT touch ``_external_unresolved_counts`` (sentinel-counter)
+        — that counter is owned by the sentinel-escalation path.
+        """
+        # Reset when the cause changes so emitted events always reflect a
+        # single consecutive-run cause, not a mixed accumulation.
+        if self._external_hold_cause.get(task_id) != cause:
+            self._external_hold_streak[task_id] = 0
+        self._external_hold_cause[task_id] = cause
+        streak = self._external_hold_streak.get(task_id, 0) + 1
+        self._external_hold_streak[task_id] = streak
+        if streak >= threshold and streak % threshold == 0:
+            logger.warning(
+                'Task %s: external-dep gate has held dispatch for %d consecutive '
+                'ticks (cause=%r, threshold=%d)',
+                task_id,
+                streak,
+                cause,
+                threshold,
+            )
+            if self.event_store is not None:
+                self.event_store.emit(
+                    EventType.external_dep_gate_held,
+                    task_id=task_id,
+                    data={'cause': cause, 'ticks': streak, 'detail': detail},
+                )
 
     async def _apply_external_dep_policy(
         self,
@@ -1581,16 +1681,41 @@ class Scheduler:
         ``_eligible_for_dispatch``.  Those are pure predicates called per-candidate;
         side effects here would N-fire per tick.
         """
-        if external_err is not None:
-            return  # transient resolver failure — fail-safe wait
-
         threshold = self.config.max_external_dep_unresolved_cycles
+
+        if external_err is not None:
+            # Resolver-degraded tick: fail-safe wait with visibility at threshold.
+            # - NO sentinel-counter bumps (fail-safe invariant from task 1580).
+            # - NO escalation (may recover next tick).
+            # - Bump hold streak for every pending task with external deps so the
+            #   hold becomes dashboard-visible once it persists too long.
+            for task in pending_tasks:
+                task_id = str(task.get('id', '?'))
+                external_deps: list = (
+                    (task.get('metadata') or {}).get('external_deps') or []
+                )
+                if external_deps:
+                    self._note_external_hold(
+                        task_id,
+                        cause='resolver_degraded',
+                        threshold=threshold,
+                        detail=str(external_err),
+                    )
+            return
 
         for task in pending_tasks:
             task_id = str(task.get('id', '?'))
             external_deps: list = (
                 (task.get('metadata') or {}).get('external_deps') or []
             )
+            # Track whether any dep left this task held in a live (non-done,
+            # non-sentinel) status this tick — used to drive hold-streak
+            # visibility after the dep loop.
+            held_live = False
+            # Set True in the cancelled / threshold-crossing-sentinel branches
+            # so the post-loop hold-streak code knows not to emit a spurious
+            # 'deps_live' gate-held event for a task being terminally blocked.
+            blocked_this_tick = False
             for dep in external_deps:
                 status = external_cache.get(dep)
 
@@ -1624,6 +1749,7 @@ class Scheduler:
                             dep,
                             task_id,
                         )
+                    blocked_this_tick = True
 
                 elif status in self._EXTERNAL_SENTINEL_STATUSES:
                     # Unknown/malformed — grace-then-escalate counter.
@@ -1664,6 +1790,7 @@ class Scheduler:
                                 count,
                                 task_id,
                             )
+                        blocked_this_tick = True
                     else:
                         logger.debug(
                             'Task %s: external dep %r status=%r (%d/%d ticks) — '
@@ -1678,8 +1805,26 @@ class Scheduler:
                 else:
                     # Any other live status (pending, in-progress, blocked, …):
                     # wait silently and reset the sentinel counter so transient
-                    # blips don't accumulate.
+                    # blips don't accumulate.  Mark this task as held by a live
+                    # dep so we can emit a visibility event if this persists.
                     self._external_unresolved_counts.pop((task_id, dep), None)
+                    held_live = True
+
+            # After the dep loop: drive the hold-streak for live-status holds.
+            # - If any dep held the task live AND no terminal action fired this
+            #   tick: bump+emit streak (genuinely waiting).
+            # - Otherwise (all deps done, OR task was blocked via
+            #   cancelled/threshold-sentinel): pop the streak.  A blocked task
+            #   is not "still waiting" so gate_held must not fire for it.
+            if held_live and not blocked_this_tick:
+                self._note_external_hold(
+                    task_id,
+                    cause='deps_live',
+                    threshold=threshold,
+                )
+            else:
+                self._external_hold_streak.pop(task_id, None)
+                self._external_hold_cause.pop(task_id, None)
 
     async def update_task(
         self,
@@ -2563,6 +2708,12 @@ class Scheduler:
             ]
             for k in _stale_ext_keys:
                 del self._external_unresolved_counts[k]
+        # _external_hold_streak and _external_hold_cause are keyed by task_id
+        # (str); GC alongside _external_unresolved_counts so they stay bounded.
+        if _stale_ids and (self._external_hold_streak or self._external_hold_cause):
+            for tid in _stale_ids:
+                self._external_hold_streak.pop(tid, None)
+                self._external_hold_cause.pop(tid, None)
 
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before

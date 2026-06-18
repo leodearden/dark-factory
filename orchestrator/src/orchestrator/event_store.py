@@ -209,6 +209,15 @@ class EventType(StrEnum):
     # whose landed diff touched fused-memory/src/).
     service_restart = 'service_restart'
 
+    # Cross-project external-dep gate held — emitted when a pending task's
+    # external deps have been holding dispatch for ``threshold`` consecutive
+    # ticks.  Makes the hold DASHBOARD-VISIBLE (telemetry) without escalating
+    # (which would be premature for a legitimately-slow upstream).
+    # cause values: 'resolver_degraded' (MCP resolver returned an unusable
+    #   result) or 'deps_live' (deps returned a live non-done status).
+    # data keys: {cause, ticks, detail}.
+    external_dep_gate_held = 'external_dep_gate_held'
+
 
 class EventStore:
     """Append-only SQLite event store.

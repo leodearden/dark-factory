@@ -7,6 +7,7 @@ from datetime import UTC
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import (
     TIER_BASE,
@@ -17,7 +18,12 @@ from orchestrator.config import (
 )
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
+from orchestrator.scheduler import (
+    ExternalResolverError,
+    ModuleLockTable,
+    Scheduler,
+    files_to_modules,
+)
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
@@ -3001,23 +3007,6 @@ def _pending_task(
         'dependencies': [{'id': d} for d in (deps or [])],
         'metadata': {'files': files or [f'mod{task_id}']},
     }
-
-
-class _RecordingEventStore:
-    """Minimal EventStore stand-in capturing emit() calls in-memory."""
-
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    def emit(self, event_type, *, task_id=None, phase=None, role=None,
-             data=None, cost_usd=None, duration_ms=None):
-        self.events.append((
-            str(event_type),
-            {
-                'task_id': task_id,
-                'data': dict(data or {}),
-            },
-        ))
 
 
 class TestPriorityInheritance:
@@ -6080,6 +6069,216 @@ class TestGetExternalStatuses:
 
 
 # ---------------------------------------------------------------------------
+# TestGetExternalStatusesFailsLoud (task 1799 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetExternalStatusesFailsLoud:
+    """``Scheduler.get_external_statuses`` must fail LOUD on non-dict/unparseable results.
+
+    Today the non-dict branch falls through to ``return {}, None`` (err is None),
+    silently stranding tasks.  After the fix:
+    - Non-dict / missing-'statuses'-key → ``({}, ExternalResolverError(...))``
+    - A WARNING is logged naming the failure.
+    - The existing exception-raised path (``({}, exception)``) is unchanged.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        """Return a JSON-RPC envelope with a single text block."""
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_dict_statuses_returns_error(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """Non-dict 'statuses' value (e.g. missing key) → ({}, ExternalResolverError).
+
+        When ``_parse_tool_text_result(result, 'statuses')`` returns None (missing key
+        or unparseable JSON), the method must return an error, NOT ``({}, None)``.
+        A WARNING must be logged so the failure is visible in journalctl / caplog.
+        """
+        import logging
+
+        import orchestrator.scheduler as _sched_module
+
+        # Response whose JSON has NO 'statuses' key → _parse_tool_text_result returns None.
+        response = self._envelope({'data': 'not-a-statuses-dict'})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            statuses, err = await scheduler.get_external_statuses(['upstream_proj:1'])
+
+        assert statuses == {}, f'Expected empty dict; got {statuses!r}'
+        assert err is not None, (
+            'Expected ExternalResolverError in error slot; got None '
+            '(non-dict branch fell through to return {}, None)'
+        )
+        assert isinstance(err, _sched_module.ExternalResolverError), (
+            f'Expected ExternalResolverError; got {type(err).__name__}'
+        )
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'Expected a WARNING log; got records={caplog.records!r}'
+
+    @pytest.mark.asyncio
+    async def test_non_dict_result_no_state_leak(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Non-dict error leaves no persistent state; next call still works correctly."""
+        import orchestrator.scheduler as _sched_module
+
+        # First call: non-dict response.
+        response_bad = self._envelope({'no_statuses_here': True})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response_bad),
+        )
+        _stat_bad, err_bad = await scheduler.get_external_statuses(['upstream_proj:1'])
+        assert err_bad is not None
+        assert isinstance(err_bad, _sched_module.ExternalResolverError)
+
+        # Second call: correct response.
+        response_ok = self._envelope({'statuses': {'upstream_proj:1': 'done'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response_ok),
+        )
+        stat_ok, err_ok = await scheduler.get_external_statuses(['upstream_proj:1'])
+        assert err_ok is None
+        assert stat_ok == {'upstream_proj:1': 'done'}
+
+
+# ---------------------------------------------------------------------------
+# TestGetExternalStatusesPartialResult (task 1799 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetExternalStatusesPartialResult:
+    """Partial-result guard: missing dep keys in response → resolver-degraded error.
+
+    (a) Response dict present but missing one or more requested dep keys →
+        ``(partial_statuses, ExternalResolverError)`` — partial dict PRESERVED
+        (not discarded), error slot set, WARNING logged.
+    (b) Negative / no-false-positive: all requested keys present (including
+        sentinel values like 'unknown_task') → ``(statuses, None)`` — sentinels
+        are valid values, not missing keys.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_partial_result_returns_partial_dict_plus_error(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """Response missing 'upstream_proj:2' → (partial, ExternalResolverError) + WARNING."""
+        import logging
+
+        import orchestrator.scheduler as _sched_module
+
+        # Request 2 deps; response only has 1.
+        response = self._envelope({'statuses': {'upstream_proj:1': 'done'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            statuses, err = await scheduler.get_external_statuses(
+                ['upstream_proj:1', 'upstream_proj:2']
+            )
+
+        # Partial dict preserved (not discarded to {}).
+        assert statuses == {'upstream_proj:1': 'done'}, (
+            f'Expected partial dict to be preserved; got {statuses!r}'
+        )
+        assert err is not None, (
+            'Expected ExternalResolverError for partial result; got None '
+            '(partial-result guard not yet implemented)'
+        )
+        assert isinstance(err, _sched_module.ExternalResolverError), (
+            f'Expected ExternalResolverError; got {type(err).__name__}'
+        )
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            f'Expected a WARNING log for partial result; got {caplog.records!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_keys_present_with_sentinel_values_is_success(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """All requested keys present (including sentinels) → (statuses, None).
+
+        Sentinels ('unknown_task', 'unknown_project', 'malformed') are PRESENT
+        values — only MISSING keys trigger the partial-result guard.
+        """
+        # Both requested dep keys present; one is a real status, one is a sentinel.
+        response = self._envelope({
+            'statuses': {
+                'upstream_proj:1': 'done',
+                'upstream_proj:2': 'unknown_task',  # sentinel, but key IS present
+            }
+        })
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        statuses, err = await scheduler.get_external_statuses(
+            ['upstream_proj:1', 'upstream_proj:2']
+        )
+
+        assert err is None, (
+            f'Sentinel value should NOT trigger partial-result guard; got err={err!r}'
+        )
+        assert statuses == {
+            'upstream_proj:1': 'done',
+            'upstream_proj:2': 'unknown_task',
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_deps_no_false_positive(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Empty deps list → no 'missing' keys → (empty_dict, None) success."""
+        response = self._envelope({'statuses': {}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        statuses, err = await scheduler.get_external_statuses([])
+
+        assert err is None, (
+            f'Empty deps should not trigger partial-result guard; got err={err!r}'
+        )
+        assert statuses == {}
+
+
+# ---------------------------------------------------------------------------
 # TestDepsSatisfiedExternalGate (task 1580 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -6576,6 +6775,255 @@ class TestApplyExternalDepPolicyTransientErr:
         )
         assert result is False, (
             'external_resolver_failed=True must block dispatch regardless of cache'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestExternalDepGateHeld_ResolverDegraded (task 1799 — step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestExternalDepGateHeld_ResolverDegraded:
+    """_apply_external_dep_policy emits external_dep_gate_held when resolver is degraded.
+
+    When ``external_err is not None`` (degraded resolver tick):
+    - After ``threshold`` consecutive degraded ticks, exactly ONE
+      ``EventType.external_dep_gate_held`` event must be recorded with
+      ``cause='resolver_degraded'``, ``task_id='T'``, and ``ticks==threshold``.
+    - ``_external_unresolved_counts`` must NOT have any entry — degraded ticks
+      must NOT bump the sentinel counter (fail-safe invariant from task 1580).
+    - No exception must be raised even when ``_on_external_dep_block`` is None
+      (no escalation on a degraded tick — only an event).
+
+    This fails today because ``EventType.external_dep_gate_held`` does not exist
+    and the degraded branch simply returns without emitting anything.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+
+    def _pending_task_with_ext(self, task_id: str = 'T') -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['upstream_proj:1']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_degraded_resolver_emits_gate_held_at_threshold(
+        self, scheduler: Scheduler
+    ):
+        """After threshold degraded ticks → one external_dep_gate_held(cause='resolver_degraded')."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {},  # empty cache — resolver degraded
+                ExternalResolverError('simulated degraded resolver'),
+            )
+
+        _event_store = scheduler.event_store
+        assert _event_store is not None
+        gate_held_events = [
+            (evt, data)
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
+            if evt == str(EventType.external_dep_gate_held)
+        ]
+        assert len(gate_held_events) == 1, (
+            f'Expected exactly 1 external_dep_gate_held event after {threshold} degraded ticks; '
+            f'got {len(gate_held_events)}: {gate_held_events!r}'
+        )
+        _evt_type, evt_data = gate_held_events[0]
+        assert evt_data['task_id'] == 'T', (
+            f'Expected task_id="T"; got {evt_data["task_id"]!r}'
+        )
+        assert evt_data['data'].get('cause') == 'resolver_degraded', (
+            f'Expected cause="resolver_degraded"; got {evt_data["data"]!r}'
+        )
+        assert evt_data['data'].get('ticks') == threshold, (
+            f'Expected ticks={threshold}; got {evt_data["data"].get("ticks")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_degraded_resolver_does_not_bump_sentinel_counter(
+        self, scheduler: Scheduler
+    ):
+        """Degraded ticks must NOT touch _external_unresolved_counts (fail-safe invariant)."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {'upstream_proj:1': 'unknown_task'},  # cache has a sentinel
+                ExternalResolverError('degraded'),
+            )
+
+        assert scheduler._external_unresolved_counts == {}, (
+            f'Degraded ticks must NOT bump sentinel counter; '
+            f'got {scheduler._external_unresolved_counts!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_degraded_resolver_no_escalation_without_callback(
+        self, scheduler: Scheduler
+    ):
+        """No exception raised when _on_external_dep_block is None (degraded → event only)."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+        # _on_external_dep_block is None by default — must not raise.
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {},
+                ExternalResolverError('degraded'),
+            )
+        # No assertion needed — the test passes if no exception was raised.
+
+
+# ---------------------------------------------------------------------------
+# TestExternalDepGateHeld_DepsLive (task 1799 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestExternalDepGateHeld_DepsLive:
+    """_apply_external_dep_policy emits external_dep_gate_held when deps are live (not done).
+
+    When the resolver is OK (``external_err is None``) but a dep's status is a live
+    status (e.g. 'pending', 'in-progress') — NOT a sentinel — the task stays held.
+
+    After ``threshold`` consecutive held ticks:
+    - Exactly ONE ``EventType.external_dep_gate_held`` event must be recorded with
+      ``cause='deps_live'``, ``task_id='T'``, ``ticks==threshold``.
+    - ``_external_unresolved_counts`` must NOT have a ``('T','upstream_proj:1')`` entry
+      (live statuses are NOT sentinels; the sentinel counter stays clean).
+    - After the hold resolves (dep becomes 'done') the hold streak is reset:
+      NO additional gate_held event; ``_external_hold_streak`` has no 'T' entry.
+
+    Fails today because the live-status else-branch does not set any ``held_live``
+    flag, so ``_note_external_hold`` is never called for live-status holds.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+
+    def _pending_task_with_ext(self, task_id: str = 'T') -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['upstream_proj:1']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_live_deps_emits_gate_held_at_threshold(
+        self, scheduler: Scheduler
+    ):
+        """After threshold live-dep ticks → one external_dep_gate_held(cause='deps_live')."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        # Resolver OK; dep is live (pending) — not done, not a sentinel.
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {'upstream_proj:1': 'pending'},
+                None,
+            )
+
+        _event_store = scheduler.event_store
+        assert _event_store is not None
+        gate_held_events = [
+            (evt, data)
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
+            if evt == str(EventType.external_dep_gate_held)
+        ]
+        assert len(gate_held_events) == 1, (
+            f'Expected exactly 1 external_dep_gate_held event after {threshold} '
+            f'live-dep ticks; got {len(gate_held_events)}: {gate_held_events!r}'
+        )
+        _evt_type, evt_data = gate_held_events[0]
+        assert evt_data['task_id'] == 'T', (
+            f'Expected task_id="T"; got {evt_data["task_id"]!r}'
+        )
+        assert evt_data['data'].get('cause') == 'deps_live', (
+            f'Expected cause="deps_live"; got {evt_data["data"]!r}'
+        )
+        assert evt_data['data'].get('ticks') == threshold, (
+            f'Expected ticks={threshold}; got {evt_data["data"].get("ticks")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_deps_does_not_bump_sentinel_counter(
+        self, scheduler: Scheduler
+    ):
+        """Live-dep ticks must NOT touch _external_unresolved_counts (live ≠ sentinel)."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {'upstream_proj:1': 'in-progress'},
+                None,
+            )
+
+        assert scheduler._external_unresolved_counts == {}, (
+            f'Live-dep ticks must NOT bump sentinel counter; '
+            f'got {scheduler._external_unresolved_counts!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_hold_streak_resets_on_resolution(
+        self, scheduler: Scheduler
+    ):
+        """When dep becomes 'done', streak is cleared and no additional event is emitted."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        # Build up a streak of threshold ticks.
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {'upstream_proj:1': 'pending'},
+                None,
+            )
+
+        # Count events so far.
+        _event_store = scheduler.event_store
+        assert _event_store is not None
+        events_before = [
+            e for e in _event_store.events  # type: ignore[attr-defined]
+            if e[0] == str(EventType.external_dep_gate_held)
+        ]
+        assert len(events_before) == 1, 'Setup: expected 1 gate_held event after threshold ticks'
+
+        # Now dep resolves to 'done'.
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'upstream_proj:1': 'done'},
+            None,
+        )
+
+        # No additional event.
+        events_after = [
+            e for e in _event_store.events  # type: ignore[attr-defined]
+            if e[0] == str(EventType.external_dep_gate_held)
+        ]
+        assert len(events_after) == 1, (
+            f'After resolution: no additional gate_held event expected; '
+            f'got {events_after!r}'
+        )
+
+        # Streak cleared.
+        assert 'T' not in scheduler._external_hold_streak, (
+            f'After dep done: _external_hold_streak must have no "T" entry; '
+            f'got {scheduler._external_hold_streak!r}'
         )
 
 

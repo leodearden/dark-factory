@@ -31,9 +31,11 @@ import json
 from pathlib import Path
 
 import pytest
+from _recording_event_store import _RecordingEventStore
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +69,7 @@ class TwoProjectMcpSession:
         self.known_projects: set[str] = known_projects
         self.ext_call_count: int = 0
         self.raise_on_external: bool = False
+        self.malformed_external_result: bool = False
         self._request_id: int = 0
         # Payload of the most-recent get_external_statuses call (for assertion).
         self.last_ext_call_deps: list[str] | None = None
@@ -137,6 +140,12 @@ class TwoProjectMcpSession:
             raise RuntimeError(
                 'TwoProjectMcpSession: simulated transient resolver error'
             )
+
+        if self.malformed_external_result:
+            # Return an envelope whose payload is NOT a usable 'statuses' dict.
+            # This simulates the non-dict/unparseable path in get_external_statuses
+            # (the silent-empty-cache fall-through bug this task fixes).
+            return self._envelope(json.dumps({'data': 'not-a-dict'}))
 
         deps: list[str] = arguments.get('deps', [])
         # Record the deps payload so tests can assert the full batched set.
@@ -671,4 +680,109 @@ class TestTransientResolverError:
         assert tick_b_result == 'T', (
             f'After clearing transient error: upstream done → T must dispatch; '
             f'got {tick_b_result!r}'
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestMalformedExternalResult (task 1799 — step-9 regression)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMalformedExternalResult:
+    """Regression: non-dict/malformed resolver result → fail-safe wait, NOT silent strand.
+
+    Proves the combined fix (task 1799):
+    - When the resolver returns a non-dict payload, the scheduler fails LOUD
+      (WARNING logged, ExternalResolverError raised internally) and fails SAFE
+      (task NOT dispatched even though upstream dep is actually 'done').
+    - No sentinel counter entry, no escalation — degraded resolver ≠ policy decision.
+    - Gate_held event emitted after threshold consecutive malformed ticks.
+    - Once the resolver answers correctly, the task dispatches immediately.
+
+    This is the exact failure mode that stranded reify task 4635 for hours — the
+    old code fell through to ``return {}, None`` and the task was silently stranded
+    with zero events/escalations/logs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_malformed_resolver_fails_safe_and_recovers(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Non-dict resolver: fail-safe wait + visible WARNING + recovery dispatch."""
+        import logging
+
+        harness, session = build_harness(tmp_path)
+        # Inject a recording event store so we can assert gate_held events.
+        rec = _RecordingEventStore()
+        harness.scheduler.event_store = rec  # type: ignore[assignment]
+
+        upstream_task_id = '42'
+        dep_string = f'{_UPSTREAM_PROJECT}:{upstream_task_id}'
+
+        register_pending_dependent_task(session, 'T', external_deps=[dep_string])
+        # Upstream is actually done — only the malformed resolver blocks dispatch.
+        set_upstream_status(session, upstream_task_id, 'done')
+
+        threshold = harness.scheduler.config.max_external_dep_unresolved_cycles
+
+        # ── Tick A: malformed resolver result ────────────────────────────────
+        session.malformed_external_result = True
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            tick_a_result = await run_tick(harness)
+
+        # (a) Task T must NOT be dispatched — fail-safe wait, not silent strand.
+        assert tick_a_result is None, (
+            f'Malformed resolver: T must NOT be dispatched on Tick A (fail-safe wait); '
+            f'got {tick_a_result!r}'
+        )
+
+        # (b) A WARNING must have been emitted from get_external_statuses.
+        scheduler_warnings = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert scheduler_warnings, (
+            'Malformed resolver: at least one WARNING must be logged on Tick A; '
+            f'got records: {[r.message for r in caplog.records]!r}'
+        )
+
+        # (c) Sentinel counter must NOT be bumped — degraded ticks are fail-safe.
+        count_key = ('T', dep_string)
+        assert count_key not in harness.scheduler._external_unresolved_counts, (
+            f'Malformed resolver: _external_unresolved_counts must NOT have entry '
+            f'{count_key!r}; got {harness.scheduler._external_unresolved_counts!r}'
+        )
+
+        # (d) No escalation filed — a degraded resolver is not a policy escalation.
+        assert escalations_for(harness, 'T') == [], (
+            'Malformed resolver: must NOT file any escalation on Tick A'
+        )
+
+        # ── Ticks B…(threshold): accumulate hold streak → gate_held event ───
+        for _ in range(threshold - 1):
+            tick_result = await run_tick(harness)
+            assert tick_result is None, (
+                'Malformed resolver: T must remain un-dispatched during degraded ticks'
+            )
+
+        gate_held_events = [
+            e for e in rec.events
+            if e[0] == str(EventType.external_dep_gate_held)
+        ]
+        assert len(gate_held_events) >= 1, (
+            f'After {threshold} malformed ticks: expected at least one '
+            f'external_dep_gate_held event; got {gate_held_events!r}'
+        )
+        _evt_type, evt_data = gate_held_events[0]
+        assert evt_data['data'].get('cause') == 'resolver_degraded', (
+            f'Expected cause="resolver_degraded"; got {evt_data["data"]!r}'
+        )
+
+        # ── Recovery tick: resolver answers, upstream done → T dispatches ────
+        session.malformed_external_result = False
+
+        tick_recovery = await run_tick(harness)
+        assert tick_recovery == 'T', (
+            f'After resolver recovery: upstream done → T must dispatch; '
+            f'got {tick_recovery!r}'
         )
