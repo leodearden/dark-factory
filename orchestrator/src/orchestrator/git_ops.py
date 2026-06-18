@@ -1117,6 +1117,102 @@ class GitOps:
             logger.warning('refresh_warm_base: unexpected error', exc_info=True)
             return False
 
+    async def acquire_spec_lane(
+        self,
+        merge_commit: str,
+    ) -> tuple[Path, bool]:
+        """Acquire a warm ``_spec-`` lane for a speculative merge verify (inv.8).
+
+        **Create-once path** (lane not yet a registered worktree):
+            ``git worktree add --detach <lane> <merge_commit>``, then seed via
+            :meth:`_seed_warm_lane(lane, '--reset-in-place')`.
+
+        **Reset-in-place path** (lane already registered):
+            ``git reset --hard <merge_commit>`` + ONE ``git clean -xfd -e <dir>``
+            invocation (one -e per :attr:`~GitConfig.reap_build_artifact_dirs`
+            entry) mirroring :meth:`reset_persistent_merge_worktree`'s pattern,
+            then always re-seeded via :meth:`_seed_warm_lane(lane, '--reset-in-place')`.
+
+        **inv.8 always-re-seed-at-acquire**: target/ is re-CoW-seeded from the
+        current warm base on every acquire, so each speculative verify starts
+        from the latest base regardless of which lane it lands on.
+
+        **Cold-fallback path** (pool exhausted or seed failure — inv.6):
+            Implemented in step-10.  The current implementation returns the
+            warm path only; callers must not rely on a non-None guarantee until
+            step-10 is complete.
+
+        Args:
+            merge_commit: The merge commit SHA to check out in the spec lane.
+
+        Returns:
+            ``(lane_path, True)`` when the warm spec lane is ready;
+            ``(cold_path, False)`` on pool exhaustion or seed failure (step-10).
+        """
+        if self.spec_warm_lane_pool is None:
+            # Knob off or size=0 — always cold (byte-identical to default).
+            wt = await self.create_throwaway_verify_worktree(merge_commit)
+            return wt, False
+
+        lane = await self.spec_warm_lane_pool.try_acquire()
+        if lane is None:
+            # Pool exhausted — cold fallback (full release-on-fallback in step-10).
+            wt = await self.create_throwaway_verify_worktree(merge_commit)
+            return wt, False
+
+        # ── Create-once or reset-in-place ────────────────────────────────────
+        if not await self._is_registered_worktree(lane):
+            # Create-once: self-heal a stale unregistered directory first
+            # (mirrors reset_persistent_merge_worktree's self-heal pattern).
+            if lane.exists():
+                import shutil as _shutil
+                _shutil.rmtree(lane)
+            lane.parent.mkdir(parents=True, exist_ok=True)
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                await self.spec_warm_lane_pool.release(lane)
+                wt = await self.create_throwaway_verify_worktree(merge_commit)
+                return wt, False
+            logger.info(
+                'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
+            )
+        else:
+            # Reset-in-place: mirror reset_persistent_merge_worktree's exact sequence
+            # (git reset --hard + ONE git clean with all -e flags in a single pass).
+            rc, _, err = await _run(
+                ['git', 'reset', '--hard', merge_commit],
+                cwd=lane,
+            )
+            if rc != 0:
+                await self.spec_warm_lane_pool.release(lane)
+                wt = await self.create_throwaway_verify_worktree(merge_commit)
+                return wt, False
+            clean_cmd = ['git', 'clean', '-xfd']
+            for artifact_dir in self.config.reap_build_artifact_dirs:
+                clean_cmd += ['-e', artifact_dir]
+            rc, _, err = await _run(clean_cmd, cwd=lane)
+            if rc != 0:
+                await self.spec_warm_lane_pool.release(lane)
+                wt = await self.create_throwaway_verify_worktree(merge_commit)
+                return wt, False
+            logger.info(
+                'acquire_spec_lane: reset %s to HEAD=%s', lane, merge_commit[:8],
+            )
+
+        # ── inv.8: ALWAYS re-seed target/ from the current warm base ─────────
+        ok = await self._seed_warm_lane(lane, '--reset-in-place')
+        if not ok:
+            # Seed failed — release the partially-acquired lane (step-10 covers
+            # the test for this path; the release here is the correct behaviour).
+            await self.spec_warm_lane_pool.release(lane)
+            wt = await self.create_throwaway_verify_worktree(merge_commit)
+            return wt, False
+
+        return lane, True
+
     async def acquire_warm_lane(
         self,
         branch_name: str,
