@@ -1121,40 +1121,6 @@ class Scheduler:
         from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
         return extract_probe_set(task) is not None
 
-    @staticmethod
-    def _parse_tool_text_result(result: dict, key: str) -> Any:
-        """Parse a text-content MCP result block and return ``inner[key]``.
-
-        Handles the ``{data: {...}}`` envelope that taskmaster sometimes wraps
-        responses in.  Returns ``None`` if no text block is found, JSON cannot
-        be parsed, or the key is absent.
-
-        Args:
-            result: Raw response from ``dispatch_tool``.
-            key: The key to retrieve from the (optionally unwrapped) payload.
-        """
-        content = result.get('result', {}).get('content', [])
-        for block in content:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                try:
-                    data = json.loads(block['text'])
-                except (ValueError, TypeError):
-                    logger.warning(
-                        'Failed to parse MCP tool text block as JSON '
-                        '(key=%r, text_prefix=%r)',
-                        key,
-                        block.get('text', '')[:200],
-                    )
-                    return None
-                # Unwrap taskmaster's {data: {...}} envelope when present.
-                inner = (
-                    data.get('data')
-                    if isinstance(data.get('data'), dict)
-                    else data
-                )
-                return inner.get(key) if isinstance(inner, dict) else None
-        return None
-
     async def tasks_by_train(self, train_id: str) -> list[dict]:
         """Return tasks belonging to ``train_id``, sorted ascending by train.order (root→tip).
 
@@ -1565,23 +1531,25 @@ class Scheduler:
             result = await self.dispatch_tool(
                 'get_external_statuses', arguments, timeout=15
             )
-            statuses = self._parse_tool_text_result(result, 'statuses')
-            if isinstance(statuses, dict):
-                # Guard: the real tool always keys its response by the verbatim
-                # dep string and always sets a value (real status or a sentinel).
-                # A missing dep key is a genuine contract violation, not normal
-                # operation, so treat it as resolver-degraded (fail-safe wait).
-                missing = [d for d in deps if d not in statuses]
-                if missing:
-                    msg = (
-                        f'get_external_statuses: response missing {len(missing)}'
-                        f' of {len(deps)} requested dep keys '
-                        f'(sample: {missing[:3]!r}) — resolver-degraded; '
-                        'fail-safe wait this tick'
-                    )
-                    logger.warning(msg)
-                    return statuses, ExternalResolverError(msg)
-                return statuses, None
+            statuses, parse_err = parse_tool_result(result, 'statuses', dict)
+            if parse_err is not None:
+                # primitive already emitted the WARNING; preserve ExternalResolverError type.
+                return {}, ExternalResolverError(str(parse_err))
+            # Guard: the real tool always keys its response by the verbatim
+            # dep string and always sets a value (real status or a sentinel).
+            # A missing dep key is a genuine contract violation, not normal
+            # operation, so treat it as resolver-degraded (fail-safe wait).
+            missing = [d for d in deps if d not in statuses]
+            if missing:
+                msg = (
+                    f'get_external_statuses: response missing {len(missing)}'
+                    f' of {len(deps)} requested dep keys '
+                    f'(sample: {missing[:3]!r}) — resolver-degraded; '
+                    'fail-safe wait this tick'
+                )
+                logger.warning(msg)
+                return statuses, ExternalResolverError(msg)
+            return statuses, None
         except Exception as e:
             logger.exception(
                 'Failed to fetch external dep statuses: %s: %s',
@@ -1589,13 +1557,6 @@ class Scheduler:
                 e,
             )
             return {}, e
-        # Non-dict / unparseable result — parse_tool_result returned an error.
-        msg = (
-            f'get_external_statuses: response was non-dict/unparseable for '
-            f'{len(deps)} dep(s) — failing LOUD into error slot (fail-safe wait)'
-        )
-        logger.warning(msg)
-        return {}, ExternalResolverError(msg)
 
     _EXTERNAL_SENTINEL_STATUSES: frozenset[str] = frozenset(
         {'unknown_project', 'unknown_task', 'malformed'}
