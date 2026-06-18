@@ -1878,6 +1878,23 @@ Output JSON matching the schema. Every task must appear in the output.
             )
         return reverted + marked_done
 
+    def _resolve_task_worktree(self, tid: str) -> Path:
+        """Return the on-disk worktree path for *tid*.
+
+        When a WarmLanePool is active and has an assignment for *tid*, returns
+        the assigned lane path (e.g. ``worktree_base/_lane-0``).  Otherwise
+        falls back to the cold convention ``worktree_base/<tid>``.
+
+        Pool-absent or unmapped tid → identical cold behaviour (byte-compatible
+        with pre-pool code).
+        """
+        pool = self.git_ops.warm_lane_pool
+        if pool is not None:
+            assigned = pool.assignment_for(tid)
+            if assigned is not None:
+                return assigned
+        return self.git_ops.worktree_base / tid
+
     async def _reconcile_one_stranded(
         self, tid: str, status: str, *, mid_run: bool,
     ) -> str | None:
@@ -2162,7 +2179,9 @@ Output JSON matching the schema. Every task must appear in the output.
             return None
 
         # 'in-progress' and not on main: classify by lock state.
-        worktree_path = self.git_ops.worktree_base / tid
+        # For warm tasks the real worktree is the assigned pool lane, not
+        # worktree_base/<tid>.  _resolve_task_worktree handles both cases.
+        worktree_path = self._resolve_task_worktree(tid)
         lock_path = worktree_path / '.task' / 'plan.lock'
 
         if not lock_path.exists():
@@ -2274,7 +2293,10 @@ Output JSON matching the schema. Every task must appear in the output.
                 tid, reason,
             )
             return
-        worktree_path = self.git_ops.worktree_base / tid
+        # For warm tasks the real worktree is the assigned pool lane.
+        # _resolve_task_worktree falls back to the cold worktree_base/tid
+        # convention when the pool is absent or has no assignment for tid.
+        worktree_path = self._resolve_task_worktree(tid)
         self._recovered_plans.pop(tid, None)
         self._recovered_sessions.pop(tid, None)
         if worktree_path.exists():
