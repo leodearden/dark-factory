@@ -1178,6 +1178,39 @@ async def _enforce_stage2_summary_pool_cap(
     return success_count
 
 
+async def _pretrim_stage2_summary_pool(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    cap: int = STAGE2_CYCLE_SUMMARY_POOL_CAP,
+) -> int:
+    """Pre-trim the stage2_cycle_summary pool to cap-1, reserving one slot.
+
+    Delegates to ``_enforce_stage2_summary_pool_cap`` with
+    ``cap=max(cap - 1, 0)`` so the imminent agent write lands as the cap-th
+    member and can never be a trim candidate (trim-then-write ordering, task
+    1831).
+
+    Must be called BEFORE ``super().run()`` (the agent write).  Post-write
+    pool size transiently reaches cap; it is bounded back to cap on the next
+    cycle's pre-trim — no post-write trim is needed.
+
+    Args:
+        memory_service: Forwarded to ``_enforce_stage2_summary_pool_cap``.
+        project_id: Project scope.
+        run_id: Current reconciliation run identifier (audit journal).
+        cap: Logical pool cap (default ``STAGE2_CYCLE_SUMMARY_POOL_CAP``).
+            Actual trim target is ``max(cap - 1, 0)``.
+
+    Returns:
+        Number of memories successfully deleted (0 if pool is already at
+        or below cap-1, or on enumeration failure).
+    """
+    return await _enforce_stage2_summary_pool_cap(
+        memory_service, project_id, run_id, cap=max(cap - 1, 0)
+    )
+
+
 async def _verify_stage2_summary_written(
     memory_service,
     project_id: str,

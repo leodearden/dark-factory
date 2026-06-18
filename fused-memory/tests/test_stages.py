@@ -11608,3 +11608,87 @@ class TestVerifyStage2SummaryWritten:
 
         assert result == 0
         assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestPretrimStage2SummaryPool:
+    """_pretrim_stage2_summary_pool delegates to _enforce_stage2_summary_pool_cap
+    with cap=max(STAGE2_CYCLE_SUMMARY_POOL_CAP-1, 0) == 1, reserving one slot
+    for the imminent agent write."""
+
+    def _pool_members(self, count: int) -> list:
+        return [
+            {
+                'id': f'summary-{i}',
+                'created_at': f'2026-0{i+1}-01T00:00:00+00:00',
+                'metadata': {'recon_pool': 'stage2_cycle_summary'},
+            }
+            for i in range(count)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_two_members_deletes_one_oldest_returns_one(self):
+        """2 pool members → trim to cap-1=1 → delete 1 oldest, returns 1."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _pretrim_stage2_summary_pool,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(2))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-pre')
+
+        assert result == 1
+        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
+        assert deleted_ids == {'summary-0'}
+
+    @pytest.mark.asyncio
+    async def test_three_members_deletes_two_oldest_returns_two(self):
+        """3 pool members → trim to cap-1=1 → delete 2 oldest, returns 2."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _pretrim_stage2_summary_pool,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(3))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-pre')
+
+        assert result == 2
+        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
+        assert deleted_ids == {'summary-0', 'summary-1'}
+
+    @pytest.mark.asyncio
+    async def test_one_member_deletes_nothing_returns_zero(self):
+        """1 pool member (already at cap-1=1) → deletes nothing, returns 0."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _pretrim_stage2_summary_pool,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(1))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-pre')
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_called_with_correct_audit_kwargs(self):
+        """delete_memory called with store='mem0', causation_id=run_id, _source='stage2_cycle_summary_trim'."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _pretrim_stage2_summary_pool,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(2))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-check')
+
+        call_kwargs = memory_service.delete_memory.call_args.kwargs
+        assert call_kwargs['store'] == 'mem0'
+        assert call_kwargs['causation_id'] == 'run-check'
+        assert call_kwargs['_source'] == 'stage2_cycle_summary_trim'
