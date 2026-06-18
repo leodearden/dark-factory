@@ -64,6 +64,23 @@ class TestParsePressureFile:
         assert result['some_avg10'] == pytest.approx(99.99)
         assert result['full_avg10'] == 0.0
 
+    def test_total_parse_miss_returns_none(self):
+        """A total parse miss (no some/full avg10 line) must return None sentinel.
+
+        Current code pre-seeds {some_avg10:0.0, full_avg10:0.0} and always
+        returns that dict — these assertions FAIL (RED) until step-4 implements
+        the sentinel.  The partial-miss boundary pin (PSI_MEM_TEXT has only
+        'some') is included to verify None is NOT triggered for partial misses.
+        """
+        from sampler.metrics import parse_pressure_file
+
+        # Total miss — garbage text with no recognisable avg10 fields
+        assert parse_pressure_file('garbage line with no avg fields\n') is None
+        # Empty string — also a total miss
+        assert parse_pressure_file('') is None
+        # Partial miss (some present, full absent) — NOT a total miss, must not be None
+        assert parse_pressure_file(PSI_MEM_TEXT) is not None
+
 
 class TestCollectPsi:
     def _fake_read(self, mapping: dict[str, str]):
