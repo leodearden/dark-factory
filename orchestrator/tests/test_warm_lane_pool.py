@@ -1860,3 +1860,108 @@ class TestRefreshWarmBase:
         assert '_lane-' not in advancing_arg, (
             f'Advancing arg must NOT be a task-lane path, got: {advancing_arg!r}'
         )
+
+
+# ===========================================================================
+# Step-8: RED — refresh_warm_base guards + fail-soft
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRefreshWarmBaseGuards:
+    """refresh_warm_base guards and fail-soft behavior.
+
+    Tests (a) and (b) fail against the step-7 happy-only impl (no guards).
+    Tests (c) and (d) verify fail-soft behavior already present in step-7
+    (regression guards).
+    """
+
+    async def test_no_op_when_pool_is_none(
+        self, wl_git_repo: Path, wl_git_config_rolling_base: GitConfig, tmp_path: Path,
+    ):
+        """(a) refresh_warm_base returns False and does NOT invoke the script when
+        warm_lane_pool is None (knob off / size-0).
+
+        Fails against step-7 (no pool-None guard — would invoke the script).
+        """
+        recorder = tmp_path / 'refresh_args.txt'
+        # Set up the _merge-verify dir and recorder script
+        merge_verify = wl_git_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        _install_refresh_recorder(merge_verify / 'scripts', recorder)
+
+        # warm_lane_pool_size=0 → warm_lane_pool is None
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=0)
+        assert git_ops.warm_lane_pool is None, 'prerequisite: pool must be None'
+
+        result = await git_ops.refresh_warm_base()
+
+        assert result is False, 'refresh_warm_base must return False when pool is None'
+        assert not recorder.exists(), (
+            'refresh-warm-base.sh must NOT be invoked when pool is None'
+        )
+
+    async def test_no_op_when_advancing_equals_base(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, tmp_path: Path,
+    ):
+        """(b) refresh_warm_base returns False / script NOT invoked when advancing == base.
+
+        When warm_lane_base_target_dir is unset, warm_lane_base_target_path defaults
+        to persistent_merge_worktree_path/target — same as the advancing dir.  Refreshing
+        would be a degenerate self-copy, so it is skipped.
+
+        Fails against step-7 (no advancing==base guard — would invoke the script).
+        """
+        recorder = tmp_path / 'refresh_args.txt'
+        merge_verify = wl_git_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        _install_refresh_recorder(merge_verify / 'scripts', recorder)
+
+        # wl_git_config_on has NO warm_lane_base_target_dir → advancing == base
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        advancing = git_ops.persistent_merge_worktree_path / 'target'
+        base = git_ops.warm_lane_base_target_path
+        assert advancing == base, 'prerequisite: advancing and base must be the same path'
+
+        result = await git_ops.refresh_warm_base()
+
+        assert result is False, (
+            'refresh_warm_base must return False (no-op) when advancing == base'
+        )
+        assert not recorder.exists(), (
+            'refresh-warm-base.sh must NOT be invoked when advancing == base'
+        )
+
+    async def test_absent_script_returns_false(
+        self, wl_git_repo: Path, wl_git_config_rolling_base: GitConfig,
+    ):
+        """(c) Absent script returns False without raising (fail-soft).
+
+        Regression guard: already passes in step-7 (existence guard present).
+        """
+        merge_verify = wl_git_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        # Do NOT install any script
+
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
+        result = await git_ops.refresh_warm_base()
+        assert result is False, 'Absent script must return False (fail-soft)'
+
+    async def test_failing_script_returns_false(
+        self, wl_git_repo: Path, wl_git_config_rolling_base: GitConfig,
+    ):
+        """(d) Non-zero-exit script returns False without raising (fail-soft).
+
+        Regression guard: already passes in step-7 (rc!=0 → return False).
+        """
+        merge_verify = wl_git_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        _install_refresh_failing(merge_verify / 'scripts')
+
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
+        result = await git_ops.refresh_warm_base()
+        assert result is False, 'Non-zero script exit must return False (fail-soft)'
