@@ -3959,10 +3959,14 @@ Output JSON matching the schema. Every task must appear in the output.
         that an error in one coordinator cannot prevent the remaining coordinators
         from being armed.  Errors are logged at WARNING level and execution
         continues (fail-open).
+
+        A non-zero git diff exit code is surfaced via the error slot and skips
+        all coordinators with a WARNING (fail-open); a legitimately empty diff
+        (revert merges, ``.task/``-only merges) calls all coordinators with an
+        empty file list — no restart is armed, but no coordinators are skipped.
         """
-        try:
-            prefetched_diff = await self.git_ops.get_merge_diff_files(base_sha, head_sha)
-        except Exception:  # noqa: BLE001
+        prefetched_diff, err = await self.git_ops.get_merge_diff_files(base_sha, head_sha)
+        if err is not None:
             logger.warning(
                 '_note_merge_all: git diff fetch failed for %s..%s; skipping all coordinators',
                 base_sha[:12],

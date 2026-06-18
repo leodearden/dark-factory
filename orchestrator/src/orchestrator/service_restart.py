@@ -206,11 +206,12 @@ class StaleServiceRestartCoordinator:
         if not self._enabled:
             return False
 
-        changed = (
-            prefetched_diff
-            if prefetched_diff is not None
-            else await self._git_ops.get_merge_diff_files(base_sha, head_sha)
-        )
+        if prefetched_diff is not None:
+            changed = prefetched_diff
+        else:
+            changed, err = await self._git_ops.get_merge_diff_files(base_sha, head_sha)
+            if err is not None:
+                return False
         # Compute the matched subset once — used for both the gate decision and
         # the log count, avoiding a redundant O(files × prefixes) re-scan.
         watched_changed = [

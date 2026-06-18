@@ -45,7 +45,7 @@ def _make_workflow(
     )
 
     git_ops = MagicMock()
-    get_merge_diff_files = AsyncMock(return_value=[])
+    get_merge_diff_files = AsyncMock(return_value=([], None))
     git_ops.get_merge_diff_files = get_merge_diff_files
 
     wf = TaskWorkflow(
@@ -77,9 +77,9 @@ async def test_writes_merge_diff_files_when_merge_sha_and_base_commit_set(
     # plan.files names what the architect said it would touch — but the
     # merge actually landed a different set of paths.
     wf.plan = {'files': ['old/path.py'], 'steps': []}
-    get_merge_diff_files.return_value = [
-        'src/landed_a.py', 'src/landed_b.py',
-    ]
+    get_merge_diff_files.return_value = (
+        ['src/landed_a.py', 'src/landed_b.py'], None,
+    )
 
     await wf._reconcile_metadata_files_for_done()
 
@@ -129,7 +129,7 @@ async def test_writes_empty_list_when_diff_returns_empty(tmp_path: Path):
     wf, update_task, get_merge_diff_files = _make_workflow(project_root=tmp_path)
     wf._base_commit = 'a' * 40
     wf._merge_sha = 'b' * 40
-    get_merge_diff_files.return_value = []
+    get_merge_diff_files.return_value = ([], None)
 
     await wf._reconcile_metadata_files_for_done()
 
@@ -154,7 +154,7 @@ async def test_reconcile_preserves_memory_hints_from_backend(tmp_path: Path):
     )
     wf._base_commit = 'a' * 40
     wf._merge_sha = 'b' * 40
-    get_merge_diff_files.return_value = ['src/landed.py']
+    get_merge_diff_files.return_value = (['src/landed.py'], None)
 
     await wf._reconcile_metadata_files_for_done()
 
@@ -182,7 +182,7 @@ async def test_reconcile_explicit_files_override_backend_files(tmp_path: Path):
     )
     wf._base_commit = 'a' * 40
     wf._merge_sha = 'b' * 40
-    get_merge_diff_files.return_value = ['src/new.py']
+    get_merge_diff_files.return_value = (['src/new.py'], None)
 
     await wf._reconcile_metadata_files_for_done()
 
@@ -192,4 +192,32 @@ async def test_reconcile_explicit_files_override_backend_files(tmp_path: Path):
     )
     assert payload.get('memory_hints') == {'entities': ['E1'], 'queries': ['q1']}, (
         f"memory_hints must survive when files key is overridden; got {payload!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_writes_empty_files_on_git_error_fail_open(tmp_path: Path):
+    """When get_merge_diff_files returns ([], error), files=[] is written (fail-open).
+
+    Sibling keys from the backend are still preserved — the read-modify-write
+    structure is unchanged even on the error path.
+    """
+    wf, update_task, get_merge_diff_files = _make_workflow(
+        project_root=tmp_path,
+        backend_metadata={
+            'memory_hints': {'entities': ['E2'], 'queries': ['q2']},
+        },
+    )
+    wf._base_commit = 'a' * 40
+    wf._merge_sha = 'b' * 40
+    get_merge_diff_files.return_value = ([], OSError('diff failed'))
+
+    await wf._reconcile_metadata_files_for_done()
+
+    payload = _persisted_payload(update_task)
+    assert payload.get('files') == [], (
+        f'files must be [] (fail-open) on git error; got {payload.get("files")!r}'
+    )
+    assert payload.get('memory_hints') == {'entities': ['E2'], 'queries': ['q2']}, (
+        f'memory_hints must survive even on git error path; got {payload!r}'
     )

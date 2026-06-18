@@ -119,7 +119,7 @@ def _make_coordinator(
 ) -> tuple[StaleServiceRestartCoordinator, AsyncMock]:
     """Build a coordinator with a mock git_ops and controllable clock."""
     git_ops = MagicMock()
-    git_ops.get_merge_diff_files = AsyncMock(return_value=diff_files)
+    git_ops.get_merge_diff_files = AsyncMock(return_value=(diff_files, None))
     event_store = MagicMock()
     # Simple counter-based clock
     _clock_vals = list(clock_values or [0.0])
@@ -271,7 +271,7 @@ def _make_coordinator_with_mutable_clock(
 ) -> tuple[StaleServiceRestartCoordinator, list[float], AsyncMock, MagicMock]:
     """Build a coordinator with a mutable-list clock and injectable executor."""
     git_ops = MagicMock()
-    git_ops.get_merge_diff_files = AsyncMock(return_value=diff_files)
+    git_ops.get_merge_diff_files = AsyncMock(return_value=(diff_files, None))
     event_store = MagicMock()
     # Mutable current time — tests advance by writing current_time[0]
     current_time: list[float] = [0.0]
@@ -466,7 +466,7 @@ async def test_burst_coalescing_fires_exactly_once_after_last_merge() -> None:
     - t=240 (120s after last): maybe_restart → fires exactly once
     """
     git_ops = MagicMock()
-    git_ops.get_merge_diff_files = AsyncMock(return_value=['fused-memory/src/server/main.py'])
+    git_ops.get_merge_diff_files = AsyncMock(return_value=(['fused-memory/src/server/main.py'], None))
     event_store = MagicMock()
     executor = AsyncMock()
     current_time: list[float] = [0.0]
@@ -531,7 +531,7 @@ async def test_default_executor_spawns_script_detached() -> None:
     from unittest.mock import patch
 
     git_ops = MagicMock()
-    git_ops.get_merge_diff_files = AsyncMock(return_value=['fused-memory/src/server/main.py'])
+    git_ops.get_merge_diff_files = AsyncMock(return_value=(['fused-memory/src/server/main.py'], None))
     event_store = MagicMock()
     current_time: list[float] = [0.0]
 
@@ -590,7 +590,7 @@ async def test_service_name_dashboard_emits_correct_event_data(
     )
     # Rebuild with dashboard prefixes and service_name
     git_ops = MagicMock()
-    git_ops.get_merge_diff_files = AsyncMock(return_value=['dashboard/src/app.py'])
+    git_ops.get_merge_diff_files = AsyncMock(return_value=(['dashboard/src/app.py'], None))
     event_store = MagicMock()
     current_time2: list[float] = [0.0]
     exec2 = AsyncMock()
@@ -663,7 +663,7 @@ async def test_require_idle_false_fires_when_agents_not_idle(
     import logging
 
     git_ops = MagicMock()
-    git_ops.get_merge_diff_files = AsyncMock(return_value=['dashboard/src/app.py'])
+    git_ops.get_merge_diff_files = AsyncMock(return_value=(['dashboard/src/app.py'], None))
     event_store = MagicMock()
     executor = AsyncMock()
     current_time: list[float] = [0.0]
@@ -729,7 +729,7 @@ async def test_default_executor_with_empty_script_args_omits_drain() -> None:
     from unittest.mock import patch
 
     git_ops = MagicMock()
-    git_ops.get_merge_diff_files = AsyncMock(return_value=['dashboard/src/app.py'])
+    git_ops.get_merge_diff_files = AsyncMock(return_value=(['dashboard/src/app.py'], None))
     event_store = MagicMock()
     current_time: list[float] = [0.0]
 
@@ -767,3 +767,58 @@ async def test_default_executor_with_empty_script_args_omits_drain() -> None:
     assert call_args.kwargs.get('start_new_session') is True
     fake_proc.wait.assert_not_called()
     fake_proc.communicate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 1826: (value, error) tuple contract for get_merge_diff_files call sites
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_note_merge_git_error_returns_false_fail_open() -> None:
+    """When get_merge_diff_files returns ([], error), note_merge returns False (fail-open).
+
+    Reproduces the prior [] on-error outcome: no watched files → False, is_pending stays False.
+    """
+    coord, mock_diff = _make_coordinator(
+        [],  # overridden below
+        watch_prefixes=['fused-memory/src/'],
+        clock_values=[1000.0],
+    )
+    # Override the mock to simulate a git error
+    coord._git_ops.get_merge_diff_files = AsyncMock(
+        return_value=([], RuntimeError('git boom'))
+    )
+
+    result = await coord.note_merge('task-99', 'base_sha', 'head_sha')
+
+    assert result is False, (
+        'note_merge must return False (fail-open) when get_merge_diff_files returns an error'
+    )
+    assert coord.is_pending is False, (
+        'is_pending must NOT be armed when get_merge_diff_files returns an error'
+    )
+
+
+@pytest.mark.asyncio
+async def test_note_merge_empty_success_returns_false_not_error() -> None:
+    """When get_merge_diff_files returns ([], None), note_merge returns False without error treatment.
+
+    Empty diff is a legitimate outcome (revert / .task-only merges) and must NOT
+    be treated as an error — it simply means no watched paths changed.
+    """
+    coord, mock_diff = _make_coordinator(
+        [],  # empty diff (success, no watched files)
+        watch_prefixes=['fused-memory/src/'],
+        clock_values=[1000.0],
+    )
+
+    result = await coord.note_merge('task-99', 'base_sha', 'head_sha')
+
+    assert result is False, (
+        'note_merge must return False for ([], None) — empty diff is not an error'
+    )
+    assert coord.is_pending is False, (
+        'is_pending must NOT be armed for an empty-success diff'
+    )
+    mock_diff.assert_awaited_once_with('base_sha', 'head_sha')
