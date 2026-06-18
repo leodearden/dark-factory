@@ -6594,3 +6594,127 @@ class TestExtractMetadataFilesWarns:
             if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
         ]
         assert not warns, f"valid files list must not emit WARNINGs; got {warns!r}"
+
+
+# ── task-1810 step-15/16: _check_escalation_idempotency tuple sentinel ──
+
+
+class TestCheckEscalationIdempotencyTuple:
+    """_check_escalation_idempotency returns (hit, check_failed) tuple.
+
+    Step-15 (RED): function returns dict|None (no tuple) and logs DEBUG on get_tasks raise.
+    Step-16 (GREEN): return type changed to tuple[dict|None, bool]; get_tasks raise =>
+      WARNING + (None, True); happy paths => (result, False).
+    """
+
+    def _make_interceptor(self, taskmaster_mock, reconciler_mock=None, event_buffer_mock=None):
+        """Build a minimal TaskInterceptor for direct method testing."""
+        from fused_memory.reconciliation.event_buffer import EventBuffer
+        if reconciler_mock is None:
+            reconciler_mock = AsyncMock()
+        if event_buffer_mock is None:
+            event_buffer_mock = AsyncMock(spec=EventBuffer)
+        return TaskInterceptor(taskmaster_mock, reconciler_mock, event_buffer_mock)
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_raise_returns_tuple_none_true_and_warns(self, caplog):
+        """taskmaster.get_tasks raises => (None, True) AND a WARNING.
+
+        Currently RED: returns bare None (not tuple) and logs DEBUG.
+        """
+        import logging
+        tm = AsyncMock()
+        tm.get_tasks = AsyncMock(side_effect=RuntimeError('db unavailable'))
+        interceptor = self._make_interceptor(tm)
+
+        metadata = {
+            'escalation_id': 'esc-r4-test',
+            'suggestion_hash': 'abc123abc123',
+        }
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = await interceptor._check_escalation_idempotency(
+                project_root='/project',
+                metadata=metadata,
+            )
+
+        # Must return a 2-tuple
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"expected (None, True) tuple; got {result!r}"
+        )
+        hit, check_failed = result
+        assert hit is None, f"expected hit=None; got {hit!r}"
+        assert check_failed is True, f"expected check_failed=True; got {check_failed!r}"
+
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING on get_tasks raise; "
+            f"got records={[(r.levelno, r.message) for r in caplog.records]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_happy_no_match_returns_none_false(self):
+        """No match in task list => (None, False).
+
+        Currently RED: returns bare None (not tuple).
+        """
+        tm = AsyncMock()
+        tm.get_tasks = AsyncMock(return_value={'tasks': []})
+        interceptor = self._make_interceptor(tm)
+
+        metadata = {
+            'escalation_id': 'esc-nomatch',
+            'suggestion_hash': 'nomatch_hash',
+        }
+        result = await interceptor._check_escalation_idempotency(
+            project_root='/project',
+            metadata=metadata,
+        )
+
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"expected (None, False) tuple; got {result!r}"
+        )
+        hit, check_failed = result
+        assert hit is None, f"expected hit=None; got {hit!r}"
+        assert check_failed is False, f"expected check_failed=False; got {check_failed!r}"
+
+    @pytest.mark.asyncio
+    async def test_happy_match_returns_dict_false(self):
+        """Match on non-cancelled task => (dict_with_id, False).
+
+        Currently RED: returns bare dict (not tuple).
+        """
+        tm = AsyncMock()
+        tm.get_tasks = AsyncMock(return_value={
+            'tasks': [{
+                'id': '42',
+                'title': 'Existing escalation task',
+                'status': 'in-progress',
+                'metadata': {
+                    'escalation_id': 'esc-r4-match',
+                    'suggestion_hash': 'match_hash_xyz',
+                },
+            }],
+        })
+        interceptor = self._make_interceptor(tm)
+
+        metadata = {
+            'escalation_id': 'esc-r4-match',
+            'suggestion_hash': 'match_hash_xyz',
+        }
+        result = await interceptor._check_escalation_idempotency(
+            project_root='/project',
+            metadata=metadata,
+        )
+
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"expected (dict, False) tuple; got {result!r}"
+        )
+        hit, check_failed = result
+        assert hit is not None and isinstance(hit, dict), (
+            f"expected hit dict; got {hit!r}"
+        )
+        assert hit.get('id') == '42', f"expected hit id='42'; got {hit!r}"
+        assert check_failed is False, f"expected check_failed=False; got {check_failed!r}"
