@@ -4800,10 +4800,11 @@ class MergeWorker(_WipHaltMixin):
             self._verify_attempt_count,
             req.config.git.persistent_merge_worktree_safety_valve_every_n,
         )
-        merge_wt = await _acquire_warm_verify_worktree(
+        merge_wt, _ = await _acquire_warm_verify_worktree(
             self._git_ops, req, merge_wt,
             merge_result.merge_commit,  # non-None; assert at 4044 above
             safety_valve_due=_due,
+            speculative=False,  # MergeWorker always handles non-speculative items
         )
         assert merge_wt is not None  # input was non-None; warm or unchanged
         out = await _run_post_merge_verify(
@@ -7777,9 +7778,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._verify_attempt_count,
                     req.config.git.persistent_merge_worktree_safety_valve_every_n,
                 )
-                merge_wt = await _acquire_warm_verify_worktree(
+                merge_wt, _spec_warm = await _acquire_warm_verify_worktree(
                     self._git_ops, req, merge_wt, merge_commit,
                     safety_valve_due=_due,
+                    speculative=item.speculative,
                 )
                 assert merge_wt is not None
                 if merge_wt is not item.merge_wt:
@@ -10251,7 +10253,8 @@ async def _acquire_warm_verify_worktree(
     merge_commit: str,
     *,
     safety_valve_due: bool,
-) -> Path | None:
+    speculative: bool = False,
+) -> tuple[Path | None, bool]:
     """Swap the ephemeral merge worktree for the persistent warm worktree.
 
     Called at the top of ``_verify_and_advance`` (and ``MergeWorker._process``)
@@ -10274,20 +10277,56 @@ async def _acquire_warm_verify_worktree(
         safety_valve_due: ``True`` on the Nth verifying attempt (PRD §10
             invariant 6): bypass the swap and run a cold verify in the
             throwaway ephemeral worktree instead.
+        speculative: ``True`` when the item being verified is a speculative
+            merge (merged against a pending SHA, not the current main HEAD).
+            When ``True`` and ``merge_spec_warm_lane_pool`` is enabled, routes
+            to a ``_spec-`` warm lane instead of the serial ``_merge-verify``
+            lane (reify §9.5 B9, task η/1789).
 
     Returns:
-        The warm ``_merge-verify`` path when the swap is performed, or the
-        original *merge_wt* when the knob is off / safety valve is due.
-    """
-    if not req.config.git.persistent_merge_worktree or safety_valve_due:
-        return merge_wt
+        A ``(path, warm)`` tuple:
+        - *path*: the warm or ephemeral worktree to use for the verify;
+          ``None`` only if *merge_wt* was ``None`` and no swap occurred.
+        - *warm*: ``True`` when the path is a warm-seeded worktree (the
+          shadow safety valve uses this to decide whether to run a cold
+          shadow compare); ``False`` for cold/ephemeral paths.
 
-    warm = await git_ops.reset_persistent_merge_worktree(merge_commit)
+        Callers route worktree release based on *warm*:
+        ``warm=True`` → ``release_spec_lane`` (retains target/) for spec lanes
+        or ``reset_persistent_merge_worktree`` already handled the swap;
+        ``warm=False`` → ``cleanup_merge_worktree`` (ephemeral).
+    """
+    # ── Speculative branch: route LOCAL spec items to the _spec- warm pool ──
+    # Preconditions (all must hold to use the spec pool):
+    #   1. merge_spec_warm_lane_pool knob on
+    #   2. item is a speculative merge (speculative=True)
+    #   3. safety valve not due (inv.6: cold from-scratch on every Nth attempt)
+    # On pool exhaustion or seed failure, acquire_spec_lane falls back to a
+    # cold ephemeral worktree and returns warm=False (inv.6 preserved).
+    if (
+        req.config.git.merge_spec_warm_lane_pool
+        and speculative
+        and not safety_valve_due
+    ):
+        lane_path, warm = await git_ops.acquire_spec_lane(merge_commit)
+        # Drop the ephemeral merge_wt now that the spec lane holds the commit.
+        # If acquire_spec_lane returned the same path (should not happen in
+        # practice) skip the cleanup to avoid removing the lane itself.
+        if merge_wt is not None and merge_wt.resolve() != lane_path.resolve():
+            await git_ops.cleanup_merge_worktree(merge_wt)
+        return lane_path, warm
+
+    # ── Existing serial-head path (persistent _merge-verify worktree) ──
+    # Serial-head path and knob-off path remain byte-identical to pre-η.
+    if not req.config.git.persistent_merge_worktree or safety_valve_due:
+        return merge_wt, False
+
+    warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
     # The merge commit is already a reachable git object; the ephemeral worktree
     # is no longer needed — drop it immediately to free the worktree slot.
-    if merge_wt is not None and merge_wt.resolve() != warm.resolve():
+    if merge_wt is not None and merge_wt.resolve() != warm_path.resolve():
         await git_ops.cleanup_merge_worktree(merge_wt)
-    return warm
+    return warm_path, True
 
 
 def enforce_persistent_worktree_serial_lane(
