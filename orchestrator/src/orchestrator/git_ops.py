@@ -2009,7 +2009,7 @@ class GitOps:
         "no scope to record" (the gate-skip in fused-memory's
         task_interceptor.py covers the missing-paths case anyway).
         """
-        rc, output, _ = await _run(
+        rc, output, stderr = await _run(
             [
                 'git', 'diff', '--name-only', '--no-renames',
                 base_sha, head_sha, '--', ':!.task/',
@@ -2017,6 +2017,10 @@ class GitOps:
             cwd=self.project_root,
         )
         if rc != 0:
+            logger.warning(
+                'get_merge_diff_files: git diff %s..%s failed (rc=%s): %s',
+                base_sha, head_sha, rc, (stderr or '').strip()[:200],
+            )
             return []
         return [f for f in output.strip().splitlines() if f.strip()]
 
