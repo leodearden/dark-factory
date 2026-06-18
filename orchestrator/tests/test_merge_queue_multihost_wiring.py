@@ -10,6 +10,8 @@ Covers:
     (step-13 RED / step-14 GREEN)
   - Drift-task stop() cancellation + worktree cleanup
     (step-15 RED / step-16 GREEN)
+  - InflightVerifyResult.reason field + RUNNER_UNAVAILABLE reason capture
+    (1795/step-3 RED / 1795/step-4 GREEN)
 """
 
 import asyncio
@@ -951,3 +953,99 @@ class TestDriftCheckTaskStopCleanup:
             if not t.done():
                 t.cancel()
             await asyncio.gather(t, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-3 RED: InflightVerifyResult.reason field + RUNNER_UNAVAILABLE capture
+# ---------------------------------------------------------------------------
+
+
+class TestInflightVerifyResultReasonField:
+    """InflightVerifyResult has a reason: str | None = None field (task 1795 step-3).
+
+    RED until step-4 GREEN adds the field to the dataclass.
+    """
+
+    def test_reason_field_defaults_to_none(self):
+        """InflightVerifyResult() has reason attribute defaulting to None."""
+        from orchestrator.merge_queue import InflightVerifyResult
+        ivr = InflightVerifyResult(outcome=None, merge_wt=None)
+        # RED: AttributeError until the field is added
+        assert ivr.reason is None
+
+    def test_reason_field_accepts_string(self):
+        """InflightVerifyResult(reason='...') stores the value."""
+        from orchestrator.merge_queue import InflightVerifyResult
+        ivr = InflightVerifyResult(outcome=None, merge_wt=None, reason='ssh timeout')
+        assert ivr.reason == 'ssh timeout'
+
+    def test_reason_field_in_runner_unavailable_sentinel(self):
+        """InflightVerifyResult with status='RUNNER_UNAVAILABLE' can carry reason."""
+        from orchestrator.merge_queue import InflightVerifyResult
+        ivr = InflightVerifyResult(
+            outcome=None,
+            merge_wt=None,
+            status='RUNNER_UNAVAILABLE',
+            reason='ssh: Could not resolve hostname leo-laptop',
+        )
+        assert ivr.status == 'RUNNER_UNAVAILABLE'
+        assert ivr.reason is not None
+        assert 'Could not resolve hostname' in ivr.reason
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyRunnerUnavailableReason:
+    """_run_inflight_verify captures RunnerUnavailable message into reason (task 1795 step-3).
+
+    RED until step-4 GREEN changes `except RunnerUnavailable:` to
+    `except RunnerUnavailable as exc:` and sets reason=str(exc).
+    """
+
+    async def test_reason_captured_from_exception_message(self, tmp_path):
+        """REMOTE lease RunnerUnavailable → reason field holds the exception message."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker, SpeculativeItem
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        error_msg = 'ssh: Could not resolve hostname leo-laptop'
+
+        git_ops = _make_git_ops_mock()
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+
+        # Minimal SpeculativeItem: only the fields asserted in _run_inflight_verify
+        merge_wt_path = tmp_path / 'merge-wt'
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=[], worktree=tmp_path)
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt_path,
+            base_sha='base123',
+            speculative=False,
+            skip_verify=False,
+        )
+
+        # REMOTE lease — bypasses local warm-swap path
+        fake_runner = MagicMock()
+        fake_runner.name = 'leo-laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+
+        # Patch _run_post_merge_verify to raise RunnerUnavailable immediately
+        async def _raise_unavailable(*args, **kwargs):
+            raise RunnerUnavailable(error_msg)
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable):
+            result = await worker._run_inflight_verify(item, lease)
+
+        assert result.status == 'RUNNER_UNAVAILABLE'
+        # RED: reason is None until step-4 adds `except RunnerUnavailable as exc:` + reason=str(exc)
+        assert result.reason is not None, (
+            'reason must be captured from RunnerUnavailable exception — '
+            'add `except RunnerUnavailable as exc:` and reason=str(exc)'
+        )
+        assert 'Could not resolve hostname' in result.reason
