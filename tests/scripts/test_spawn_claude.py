@@ -236,10 +236,11 @@ def test_window_close_yields_129_not_hang(
             f"[{terminal_name}] spawn-claude.sh hung after window-close "
             f"(await_sentinel never unblocked — SIGHUP sentinel gap not fixed)"
         )
-    assert rc == 129, (
-        f"[{terminal_name}] Expected exit 129 (window closed while alive), "
-        f"got {rc}\nstderr: {proc.stderr.read().decode()}"  # type: ignore[union-attr]
-    )
+    else:
+        assert rc == 129, (
+            f"[{terminal_name}] Expected exit 129 (window closed while alive), "
+            f"got {rc}\nstderr: {proc.stderr.read().decode()}"  # type: ignore[union-attr]
+        )
 
 
 # ===========================================================================
