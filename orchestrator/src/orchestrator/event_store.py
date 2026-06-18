@@ -62,6 +62,12 @@ class EventType(StrEnum):
     cap_hit = 'cap_hit'
     lock_acquired = 'lock_acquired'
     lock_released = 'lock_released'
+    # Durable persist of the plan-tightened lock set on the success branch of
+    # handle_blast_radius_expansion. Payload: {files, released, acquired,
+    # persisted: bool}. Complements lock_released (reason='plan_refinement')
+    # by evidencing the DURABLE write; persisted=False means the in-memory
+    # narrowing applied but the metadata write failed (non-critical).
+    set_to_plan = 'set_to_plan'
     merge_attempt = 'merge_attempt'
     merge_verify = 'merge_verify'
     verdict_parity_ok = 'verdict_parity_ok'

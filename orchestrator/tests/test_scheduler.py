@@ -3532,6 +3532,12 @@ class TestBlastRadiusRefinement:
         """Plan scope narrows to a sibling file — the initial lock is freed."""
         lt = scheduler.lock_table
         assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        # The success branch now persists metadata.files when stale is non-empty.
+        # Mock get_task/update_task so the test remains hermetic (no network I/O).
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
         ok = await scheduler.handle_blast_radius_expansion(
             '936',
             current=['crates/reify-compiler/src/lib.rs'],
@@ -3561,6 +3567,12 @@ class TestBlastRadiusRefinement:
         """Plan refines to a mixed set: acquire new, release stale."""
         lt = scheduler.lock_table
         assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        # The success branch persists metadata.files when stale is non-empty.
+        # Mock get_task/update_task so the test remains hermetic (no network I/O).
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
         ok = await scheduler.handle_blast_radius_expansion(
             '936',
             current=['crates/reify-compiler/src/lib.rs'],
@@ -3675,6 +3687,175 @@ class TestBlastRadiusRefinement:
             '_causation_id': 'C1',
             'files': ['crates/reify-compiler/src/conformance.rs'],
         }, f'Sibling keys from backend must survive blast-radius files write; got {persisted}'
+
+    @pytest.mark.asyncio
+    async def test_narrowing_persists_metadata_files(self, scheduler: Scheduler):
+        """Plan narrowing on the SUCCESS branch must persist metadata.files (set-to-plan).
+
+        Sibling keys (memory_hints, _causation_id) must survive the write so
+        Stage-2 reconciliation data is not clobbered — mirrors the requeue-branch
+        read-modify-write pattern (scheduler.py handle_blast_radius_expansion failure
+        branch) on the success path.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        backend_md = {
+            'memory_hints': {'entities': ['E1']},
+            '_causation_id': 'C1',
+        }
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': backend_md}
+        )
+        update_task = AsyncMock(return_value=True)
+        scheduler.update_task = update_task  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+        )
+
+        assert ok is True
+        assert update_task.await_args is not None, (
+            'update_task must be called to make the narrowed set durable'
+        )
+        persisted = update_task.await_args.args[1]
+        assert persisted == {
+            'memory_hints': {'entities': ['E1']},
+            '_causation_id': 'C1',
+            'files': ['crates/reify-compiler/src/conformance.rs'],
+        }, f'Sibling keys must survive; files narrowed to needed; got {persisted}'
+
+    @pytest.mark.asyncio
+    async def test_pure_expansion_does_not_persist(self, scheduler: Scheduler):
+        """Pure widening (needed ⊃ current) must NOT call update_task.
+
+        Widening self-heals on restart: the scheduler re-reads the smaller
+        metadata.files, re-acquires, then re-expands. Gating the persist on
+        stale being non-empty avoids unnecessary MCP round-trips on the
+        widening path and leaves test_pure_expansion_keeps_current green.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('T', ['a/lib.rs'])
+        update_task = AsyncMock()
+        scheduler.update_task = update_task  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            'T',
+            current=['a/lib.rs'],
+            needed=['a/lib.rs', 'a/other.rs'],
+        )
+
+        assert ok is True
+        update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_narrowing_emits_set_to_plan_event(self, scheduler: Scheduler):
+        """A shift (lib.rs → conformance.rs) must emit exactly one set_to_plan
+        event after the persist.
+
+        Payload must carry:
+          - files: the needed (narrowed) set
+          - released: the stale modules that were released (lib.rs)
+          - acquired: the additional modules acquired (non-empty for a shift —
+            here, conformance.rs is newly acquired in the same call)
+          - persisted: True when update_task succeeds
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        backend_md = {
+            'memory_hints': {'entities': ['E1']},
+            '_causation_id': 'C1',
+        }
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': backend_md}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+        )
+
+        assert ok is True
+        event_store = scheduler.event_store
+        assert event_store is not None
+        set_to_plan_events = [
+            e for e in event_store.events  # type: ignore[attr-defined]
+            if e[0] == 'set_to_plan'
+        ]
+        assert len(set_to_plan_events) == 1, (
+            f'Expected exactly one set_to_plan event; got {set_to_plan_events}'
+        )
+        ev = set_to_plan_events[0]
+        assert ev[1]['task_id'] == '936'
+        # This is a shift (lib.rs → conformance.rs): additional=['conformance.rs'],
+        # stale=['lib.rs'].  The acquired field carries what was actually acquired
+        # (additional), which for a shift is non-empty.
+        assert ev[1]['data'] == {
+            'files': ['crates/reify-compiler/src/conformance.rs'],
+            'released': ['crates/reify-compiler/src/lib.rs'],
+            'acquired': ['crates/reify-compiler/src/conformance.rs'],
+            'persisted': True,
+        }, f'set_to_plan event payload mismatch; got {ev[1]["data"]}'
+
+    @pytest.mark.asyncio
+    async def test_persist_failure_marks_event_not_persisted(self, scheduler: Scheduler):
+        """When update_task returns False, handle_blast_radius_expansion must still
+        return True (in-memory narrowing applied) and emit set_to_plan with persisted=False.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+        )
+
+        assert ok is True
+        # In-memory narrowing applied: lib.rs released, conformance.rs held
+        assert lt.try_acquire('2035', ['crates/reify-compiler/src/lib.rs'])
+        assert not lt.try_acquire('9999', ['crates/reify-compiler/src/conformance.rs'])
+
+        event_store = scheduler.event_store
+        assert event_store is not None
+        set_to_plan_events = [
+            e for e in event_store.events  # type: ignore[attr-defined]
+            if e[0] == 'set_to_plan'
+        ]
+        assert len(set_to_plan_events) == 1
+        assert set_to_plan_events[0][1]['data']['persisted'] is False, (
+            'persisted must be False when update_task returns False'
+        )
+
+    @pytest.mark.asyncio
+    async def test_pure_expansion_does_not_emit_set_to_plan(self, scheduler: Scheduler):
+        """Pure widening must NOT emit a set_to_plan event (no stale release)."""
+        lt = scheduler.lock_table
+        assert lt.try_acquire('T', ['a/lib.rs'])
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            'T',
+            current=['a/lib.rs'],
+            needed=['a/lib.rs', 'a/other.rs'],
+        )
+
+        assert ok is True
+        event_store = scheduler.event_store
+        assert event_store is not None
+        set_to_plan_events = [
+            e for e in event_store.events  # type: ignore[attr-defined]
+            if e[0] == 'set_to_plan'
+        ]
+        assert set_to_plan_events == [], (
+            f'Widening must not emit set_to_plan; got {set_to_plan_events}'
+        )
 
 
 class TestSchedulerMcpSessionDI:
