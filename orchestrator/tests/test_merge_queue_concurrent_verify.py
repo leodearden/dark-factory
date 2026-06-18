@@ -2941,7 +2941,7 @@ class TestFinalizeInflightWarmResultsThreading:
         # Build a real asyncio.Task (not just a Future) wrapping a coroutine that
         # immediately returns a passing InflightVerifyResult with a non-empty
         # warm_results map — the data the shadow compare needs.
-        warm_map = {'crate::test_x': True, 'crate::test_y': False}
+        warm_map: dict[str, str] = {'crate::test_x': 'pass', 'crate::test_y': 'fail'}
         merge_wt_cap = item.merge_wt  # capture for closure
 
         async def _immediate_vr() -> InflightVerifyResult:

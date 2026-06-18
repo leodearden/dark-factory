@@ -411,12 +411,18 @@ class TestParsePerTestResults:
 
 
 class TestDiffPerTestResults:
-    """Unit tests for diff_per_test_results and ShadowCompareDiff."""
+    """Unit tests for diff_per_test_results and ShadowCompareDiff.
+
+    Verdict model: 'pass' / 'fail' / 'inconclusive'.
+    Alarm-worthy divergence: genuine 'pass'↔'fail' flip or presence divergence.
+    Non-alarming: any difference where EITHER side is 'inconclusive' → routed
+    to ShadowCompareDiff.inconclusive, excluded from has_divergence.
+    """
 
     # (c) Identical maps → has_divergence is False, all buckets empty
     def test_identical_maps_no_divergence(self) -> None:
-        warm = {"t1": True, "t2": False, "t3": True}
-        cold = {"t1": True, "t2": False, "t3": True}
+        warm = {"t1": 'pass', "t2": 'fail', "t3": 'pass'}
+        cold = {"t1": 'pass', "t2": 'fail', "t3": 'pass'}
         diff = diff_per_test_results(warm, cold)
         assert diff.has_divergence is False
         assert diff.diverging == {}
@@ -425,46 +431,46 @@ class TestDiffPerTestResults:
         assert diff.only_warm == []
         assert diff.only_cold == []
 
-    # (d) warm=pass/cold=fail → appears in warm_pass_cold_fail + diverging
+    # (d) warm=pass/cold=fail → genuine flip → warm_pass_cold_fail + diverging
     def test_warm_pass_cold_fail_named(self) -> None:
-        warm = {"reify-core bad::test": True}
-        cold = {"reify-core bad::test": False}
+        warm = {"reify-core bad::test": 'pass'}
+        cold = {"reify-core bad::test": 'fail'}
         diff = diff_per_test_results(warm, cold)
         assert diff.has_divergence is True
         assert "reify-core bad::test" in diff.warm_pass_cold_fail
         assert "reify-core bad::test" in diff.diverging
-        assert diff.diverging["reify-core bad::test"] == (True, False)
+        assert diff.diverging["reify-core bad::test"] == ('pass', 'fail')
 
     def test_warm_fail_cold_pass(self) -> None:
-        warm = {"reify-core flaky::test": False}
-        cold = {"reify-core flaky::test": True}
+        warm = {"reify-core flaky::test": 'fail'}
+        cold = {"reify-core flaky::test": 'pass'}
         diff = diff_per_test_results(warm, cold)
         assert diff.has_divergence is True
         assert "reify-core flaky::test" in diff.warm_fail_cold_pass
-        assert diff.diverging["reify-core flaky::test"] == (False, True)
+        assert diff.diverging["reify-core flaky::test"] == ('fail', 'pass')
 
-    # Test only present in warm → only_warm (divergence)
+    # Test only present in warm → only_warm (presence divergence → alarm-worthy)
     def test_only_warm(self) -> None:
-        warm = {"t-warm": True}
-        cold: dict[str, bool] = {}
+        warm = {"t-warm": 'pass'}
+        cold: dict[str, str] = {}
         diff = diff_per_test_results(warm, cold)
         assert diff.has_divergence is True
         assert "t-warm" in diff.only_warm
         assert diff.warm_pass_cold_fail == []
         assert diff.warm_fail_cold_pass == []
 
-    # Test only in cold → only_cold (divergence)
+    # Test only in cold → only_cold (presence divergence → alarm-worthy)
     def test_only_cold(self) -> None:
-        warm: dict[str, bool] = {}
-        cold = {"t-cold": False}
+        warm: dict[str, str] = {}
+        cold = {"t-cold": 'fail'}
         diff = diff_per_test_results(warm, cold)
         assert diff.has_divergence is True
         assert "t-cold" in diff.only_cold
 
-    # Test passing in both → NOT a divergence
+    # Test with same verdict in both → NOT a divergence
     def test_both_pass_no_divergence(self) -> None:
-        warm = {"t1": True}
-        cold = {"t1": True}
+        warm = {"t1": 'pass'}
+        cold = {"t1": 'pass'}
         diff = diff_per_test_results(warm, cold)
         assert diff.has_divergence is False
         assert "t1" not in diff.diverging
@@ -472,8 +478,8 @@ class TestDiffPerTestResults:
 
     # Multiple divergences in one call
     def test_multiple_divergences(self) -> None:
-        warm = {"t_flip": True, "t_agree": True, "t_only_warm": False}
-        cold = {"t_flip": False, "t_agree": True, "t_only_cold": True}
+        warm = {"t_flip": 'pass', "t_agree": 'pass', "t_only_warm": 'fail'}
+        cold = {"t_flip": 'fail', "t_agree": 'pass', "t_only_cold": 'pass'}
         diff = diff_per_test_results(warm, cold)
         assert diff.has_divergence is True
         assert "t_flip" in diff.warm_pass_cold_fail
@@ -495,7 +501,7 @@ class TestDiffPerTestResults:
     def test_has_divergence_true_if_any_bucket_nonempty(self) -> None:
         # diverging nonempty
         diff = ShadowCompareDiff(
-            diverging={"t": (True, False)}, warm_pass_cold_fail=["t"],
+            diverging={"t": ('pass', 'fail')}, warm_pass_cold_fail=["t"],
             warm_fail_cold_pass=[], only_warm=[], only_cold=[]
         )
         assert diff.has_divergence is True
@@ -505,6 +511,120 @@ class TestDiffPerTestResults:
             only_warm=[], only_cold=["t_extra"]
         )
         assert diff2.has_divergence is True
+
+    # --- New: inconclusive bucket (RED until step-4 adds the field and routing) ---
+
+    def test_inconclusive_warm_does_not_set_has_divergence(self) -> None:
+        """A 'pass' vs 'inconclusive' pair must NOT set has_divergence.
+
+        RED: current diff has no inconclusive bucket; 'pass'≠'inconclusive' routes to
+        diverging, making has_divergence True.  After step-4, this routes to inconclusive.
+        """
+        warm = {"t": 'pass'}
+        cold = {"t": 'inconclusive'}
+        diff = diff_per_test_results(warm, cold)
+        # inconclusive difference → NOT alarm-worthy
+        assert diff.has_divergence is False
+        assert "t" not in diff.diverging
+        # Must land in the inconclusive bucket
+        assert "t" in diff.inconclusive
+        assert diff.inconclusive["t"] == ('pass', 'inconclusive')
+
+    def test_inconclusive_cold_does_not_set_has_divergence(self) -> None:
+        """An 'inconclusive' vs 'fail' pair must NOT set has_divergence."""
+        warm = {"t": 'inconclusive'}
+        cold = {"t": 'fail'}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is False
+        assert "t" not in diff.diverging
+        assert "t" in diff.inconclusive
+        assert diff.inconclusive["t"] == ('inconclusive', 'fail')
+
+    def test_inconclusive_both_sides_not_has_divergence(self) -> None:
+        """Two 'inconclusive' results → identical verdicts → no entry anywhere."""
+        warm = {"t": 'inconclusive'}
+        cold = {"t": 'inconclusive'}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is False
+        assert "t" not in diff.diverging
+
+    def test_inconclusive_excluded_from_has_divergence_property(self) -> None:
+        """ShadowCompareDiff.has_divergence must not count inconclusive entries."""
+        diff = ShadowCompareDiff(
+            diverging={}, warm_pass_cold_fail=[], warm_fail_cold_pass=[],
+            only_warm=[], only_cold=[],
+            inconclusive={"t": ('pass', 'inconclusive')},
+        )
+        # inconclusive entries must not make has_divergence True
+        assert diff.has_divergence is False
+
+    def test_mixed_genuine_and_inconclusive(self) -> None:
+        """A genuine 'pass'↔'fail' flip plus an inconclusive pair in the same diff.
+
+        The genuine flip sets has_divergence; the inconclusive pair is filtered.
+        """
+        warm = {"t_real": 'pass', "t_noisy": 'pass'}
+        cold = {"t_real": 'fail', "t_noisy": 'inconclusive'}
+        diff = diff_per_test_results(warm, cold)
+        # Real flip → alarm-worthy
+        assert diff.has_divergence is True
+        assert "t_real" in diff.warm_pass_cold_fail
+        # Noisy pair → inconclusive bucket, NOT diverging
+        assert "t_noisy" in diff.inconclusive
+        assert "t_noisy" not in diff.diverging
+
+    # --- G2 integration tests: parse raw nextest output then diff ---
+
+    def test_g2_leak_vs_pass_no_divergence(self) -> None:
+        """G2 clause 1: a warm/cold pair differing only by LEAK vs PASS yields no divergence.
+
+        nextest counts LEAK as PASS (suite exit 0), so both legs → 'pass',
+        and the comparator must NOT alarm.
+        """
+        warm_out = "        PASS [   0.050s] my-crate my::test::fast\n"
+        cold_out = "        LEAK [   0.050s] my-crate my::test::fast\n"
+        warm_map = parse_per_test_results(warm_out)
+        cold_map = parse_per_test_results(cold_out)
+        # Both map to 'pass'
+        assert warm_map == {"my-crate my::test::fast": 'pass'}
+        assert cold_map == {"my-crate my::test::fast": 'pass'}
+        # No divergence → no alarm
+        diff = diff_per_test_results(warm_map, cold_map)
+        assert diff.has_divergence is False
+        assert diff.diverging == {}
+
+    def test_g2_timeout_vs_pass_is_inconclusive(self) -> None:
+        """G2 clause 1: a TIMEOUT-vs-PASS warm/cold pair yields non-alarming inconclusive.
+
+        RED: diff has no inconclusive field; 'pass'≠'inconclusive' sets has_divergence=True.
+        After step-4: routes to inconclusive bucket, has_divergence=False.
+        """
+        warm_out = "        PASS [   0.050s] my-crate my::slow::test\n"
+        cold_out = "        TIMEOUT [  10.000s] my-crate my::slow::test\n"
+        warm_map = parse_per_test_results(warm_out)
+        cold_map = parse_per_test_results(cold_out)
+        assert warm_map == {"my-crate my::slow::test": 'pass'}
+        assert cold_map == {"my-crate my::slow::test": 'inconclusive'}
+        diff = diff_per_test_results(warm_map, cold_map)
+        # Not alarm-worthy: has_divergence must be False
+        assert diff.has_divergence is False
+        # The pair must appear in the inconclusive bucket
+        assert "my-crate my::slow::test" in diff.inconclusive
+
+    def test_g2_sigsegv_vs_pass_is_inconclusive(self) -> None:
+        """G2 clause 1: a SIGSEGV-vs-PASS warm/cold pair yields non-alarming inconclusive.
+
+        RED: same structure as TIMEOUT test above.
+        """
+        warm_out = "        PASS [   0.010s] my-crate crash::prone::test\n"
+        cold_out = "        SIGSEGV [   0.010s] my-crate crash::prone::test\n"
+        warm_map = parse_per_test_results(warm_out)
+        cold_map = parse_per_test_results(cold_out)
+        assert warm_map == {"my-crate crash::prone::test": 'pass'}
+        assert cold_map == {"my-crate crash::prone::test": 'inconclusive'}
+        diff = diff_per_test_results(warm_map, cold_map)
+        assert diff.has_divergence is False
+        assert "my-crate crash::prone::test" in diff.inconclusive
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +643,7 @@ def _make_escalation_queue(*, has_open: bool = False) -> MagicMock:
 
 def _make_diverging_diff() -> ShadowCompareDiff:
     return ShadowCompareDiff(
-        diverging={"reify-core bad::test": (True, False)},
+        diverging={"reify-core bad::test": ('pass', 'fail')},
         warm_pass_cold_fail=["reify-core bad::test"],
         warm_fail_cold_pass=[],
         only_warm=[],
@@ -539,7 +659,7 @@ class TestSubmitShadowDivergenceEscalation:
         diff = _make_diverging_diff()
         _submit_shadow_divergence_escalation(
             None, "abc1234567", diff,
-            {"t": True}, {"t": False}
+            {"t": 'pass'}, {"t": 'fail'}
         )
 
     def test_submits_escalation_on_divergence(self) -> None:
@@ -547,8 +667,8 @@ class TestSubmitShadowDivergenceEscalation:
         diff = _make_diverging_diff()
         _submit_shadow_divergence_escalation(
             q, "deadbeef1234", diff,
-            {"reify-core bad::test": True},
-            {"reify-core bad::test": False},
+            {"reify-core bad::test": 'pass'},
+            {"reify-core bad::test": 'fail'},
         )
         q.submit.assert_called_once()
 
@@ -606,11 +726,14 @@ class TestSubmitShadowDivergenceEscalation:
         _submit_shadow_divergence_escalation(
             q, "sha123",
             diff,
-            {"reify-core bad::test": True},
-            {"reify-core bad::test": False},
+            {"reify-core bad::test": 'pass'},
+            {"reify-core bad::test": 'fail'},
         )
         esc = q.submit.call_args[0][0]
         assert "reify-core bad::test" in esc.detail
+        # Verdict strings must appear in the per-test detail line
+        assert 'warm=pass' in esc.detail
+        assert 'cold=fail' in esc.detail
 
     def test_detail_mentions_warm_already_landed(self) -> None:
         q = _make_escalation_queue()
@@ -772,8 +895,8 @@ class TestRunShadowCompare:
 
     @pytest.mark.asyncio
     async def test_matching_warm_cold_no_escalation(self, tmp_path: Path) -> None:
-        warm = {'reify-core ok::test': True, 'reify-eval other::test': False}
-        cold = {'reify-core ok::test': True, 'reify-eval other::test': False}
+        warm = {'reify-core ok::test': 'pass', 'reify-eval other::test': 'fail'}
+        cold = {'reify-core ok::test': 'pass', 'reify-eval other::test': 'fail'}
         q = _make_escalation_queue()
         event_store = MagicMock()
         req = _make_mock_req(tmp_path)
@@ -794,8 +917,8 @@ class TestRunShadowCompare:
     async def test_matching_warm_cold_emits_parity_ok_event(
         self, tmp_path: Path
     ) -> None:
-        warm = {'t1': True}
-        cold = {'t1': True}
+        warm = {'t1': 'pass'}
+        cold = {'t1': 'pass'}
         event_store = MagicMock()
         req = _make_mock_req(tmp_path)
 
@@ -817,8 +940,8 @@ class TestRunShadowCompare:
         self, tmp_path: Path
     ) -> None:
         # (d) warm=pass/cold=fail → escalation submitted
-        warm = {'reify-core bad::test': True}
-        cold = {'reify-core bad::test': False}
+        warm = {'reify-core bad::test': 'pass'}
+        cold = {'reify-core bad::test': 'fail'}
         q = _make_escalation_queue()
         event_store = MagicMock()
         req = _make_mock_req(tmp_path)
@@ -837,8 +960,8 @@ class TestRunShadowCompare:
     async def test_diverging_escalation_names_diverging_test(
         self, tmp_path: Path
     ) -> None:
-        warm = {'reify-core bad::test': True}
-        cold = {'reify-core bad::test': False}
+        warm = {'reify-core bad::test': 'pass'}
+        cold = {'reify-core bad::test': 'fail'}
         q = _make_escalation_queue()
         req = _make_mock_req(tmp_path)
 
@@ -856,8 +979,8 @@ class TestRunShadowCompare:
     @pytest.mark.asyncio
     async def test_diverging_no_parity_ok_event(self, tmp_path: Path) -> None:
         # On divergence we submit escalation; no parity-ok event
-        warm = {'t': True}
-        cold = {'t': False}
+        warm = {'t': 'pass'}
+        cold = {'t': 'fail'}
         event_store = MagicMock()
         req = _make_mock_req(tmp_path)
 
@@ -875,8 +998,8 @@ class TestRunShadowCompare:
     async def test_cold_leg_called_with_merge_commit(self, tmp_path: Path) -> None:
         # The cold leg must be invoked with the exact merge_commit (→ throwaway
         # worktree WOULD be created at that commit)
-        warm = {'t1': True}
-        cold = {'t1': True}
+        warm = {'t1': 'pass'}
+        cold = {'t1': 'pass'}
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(return_value=cold)
 
@@ -909,8 +1032,8 @@ class TestRunShadowCompare:
         The correct behaviour: log a WARNING, emit no alarm, emit no parity-ok
         event (result is indeterminate, not "OK").
         """
-        warm = {'reify-core test::a': True, 'reify-core test::b': False}
-        cold: dict[str, bool] = {}  # simulates build failure / infra hiccup
+        warm = {'reify-core test::a': 'pass', 'reify-core test::b': 'fail'}
+        cold: dict[str, str] = {}  # simulates build failure / infra hiccup
         q = _make_escalation_queue()
         event_store = MagicMock()
         req = _make_mock_req(tmp_path)
@@ -932,8 +1055,8 @@ class TestRunShadowCompare:
     async def test_both_empty_is_parity_ok(self, tmp_path: Path) -> None:
         """Both warm and cold empty → no inconclusive guard (no warm tests to compare),
         falls through to diff which finds no divergence → parity-ok event."""
-        warm: dict[str, bool] = {}
-        cold: dict[str, bool] = {}
+        warm: dict[str, str] = {}
+        cold: dict[str, str] = {}
         q = _make_escalation_queue()
         event_store = MagicMock()
         req = _make_mock_req(tmp_path)
@@ -997,7 +1120,7 @@ class TestMaybeScheduleShadowCompare:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, shadow_compare_on=False)
-        warm = {'t1': True}
+        warm = {'t1': 'pass'}
 
         # Should be a sync or async function; call synchronously via asyncio.run
         asyncio.run(
@@ -1044,7 +1167,7 @@ class TestMaybeScheduleShadowCompare:
 
         asyncio.run(
             _maybe_schedule_shadow_compare(
-                worker, MagicMock(), req, 'sha', {'t1': True}, None, None
+                worker, MagicMock(), req, 'sha', {'t1': 'pass'}, None, None
             )
         )
 
@@ -1056,7 +1179,7 @@ class TestMaybeScheduleShadowCompare:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
-        warm = {'t1': True}
+        warm = {'t1': 'pass'}
 
         # Pre-set state: count=5, last_run recent enough that nightly won't fire
         state = ShadowCompareState(merges_since_last_shadow=5, last_shadow_run_at=1e10)
@@ -1089,7 +1212,7 @@ class TestMaybeScheduleShadowCompare:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
-        warm = {'t1': True}
+        warm = {'t1': 'pass'}
 
         # Seed state at threshold
         state = ShadowCompareState(merges_since_last_shadow=9, last_shadow_run_at=0.0)
@@ -1122,7 +1245,7 @@ class TestMaybeScheduleShadowCompare:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
-        warm = {'t1': True}
+        warm = {'t1': 'pass'}
 
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
         _save_shadow_compare_state(worker._shadow_state_path, state)
@@ -1152,7 +1275,7 @@ class TestMaybeScheduleShadowCompare:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
-        warm = {'t1': True}
+        warm = {'t1': 'pass'}
 
         # Both calls see state with count=10 (due)
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
@@ -1205,7 +1328,7 @@ class TestMaybeScheduleShadowCompare:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
         req.config = _make_shadow_config(tmp_path, every_n=10, nightly_interval=86400.0)
-        warm = {'t1': True}
+        warm = {'t1': 'pass'}
 
         # First call: state at threshold (10 = due), spawns the in-flight task
         state = ShadowCompareState(merges_since_last_shadow=10, last_shadow_run_at=0.0)
