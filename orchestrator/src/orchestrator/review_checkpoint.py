@@ -37,6 +37,7 @@ class ReviewReport:
     escalated_findings: int = 0
     cost_usd: float = 0.0
     duration_ms: int = 0
+    parse_failed: bool = False
 
 
 class ReviewCheckpoint:
@@ -238,6 +239,7 @@ class ReviewCheckpoint:
         tasks_created: list[str] = []
         findings_count = 0
         escalated = 0
+        parse_failed = False
 
         parsed = result.structured_output or self._try_parse_json(result.output)
 
@@ -250,6 +252,12 @@ class ReviewCheckpoint:
             ]
             escalated = sum(
                 1 for f in findings if f.get('triage') == 'escalate'
+            )
+        else:
+            parse_failed = True
+            logger.warning(
+                'Review [%s]: reviewer produced unparseable output (success=%s): %s',
+                review_id, result.success, (result.output or '')[:200],
             )
 
         # Promote any L0 escalations emitted by the reviewer to L1.  The
@@ -269,6 +277,7 @@ class ReviewCheckpoint:
             escalated_findings=escalated,
             cost_usd=result.cost_usd,
             duration_ms=elapsed_ms,
+            parse_failed=parse_failed,
         )
 
         self._save_report(report, result.output)
