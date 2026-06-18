@@ -311,3 +311,33 @@ class TestSchedulerHeatmapJsxColumnHeaderWiring:
         assert re.search(r'title=\{[^}]*m\.path', scheduler_heatmap_jsx_body), (
             'Column header title={...m.path...} not found in scheduler_heatmap.jsx'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-11: Source-structure tests for tab_scheduler.jsx (Modules view)
+# (RED because tab_scheduler.jsx still renders m.path.split('/').pop()
+# as the primary title line in the module card)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def tab_scheduler_jsx_body(_client):
+    return _client.get('/static/redux/tab_scheduler.jsx').text
+
+
+class TestTabSchedulerJsxModulesViewWiring:
+    def test_mpath_basename_removed(self, tab_scheduler_jsx_body):
+        assert "m.path.split('/').pop()" not in tab_scheduler_jsx_body, (
+            "m.path.split('/').pop() still present in tab_scheduler.jsx — should be replaced"
+        )
+
+    def test_disambiguate_labels_destructured(self, tab_scheduler_jsx_body):
+        # disambiguateLabels must be added to the existing top-level destructure
+        assert 'disambiguateLabels' in tab_scheduler_jsx_body, (
+            'disambiguateLabels not found in tab_scheduler.jsx — wiring missing'
+        )
+
+    def test_full_path_text_preserved(self, tab_scheduler_jsx_body):
+        # The secondary full-path text line must still show m.path
+        assert '{m.path}' in tab_scheduler_jsx_body, (
+            '{m.path} not found in tab_scheduler.jsx — secondary full-path text removed'
+        )
