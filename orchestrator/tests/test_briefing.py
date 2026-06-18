@@ -228,3 +228,54 @@ class TestBuildPlanCompletionPrompt:
     async def test_includes_agent_identity(self, briefing: BriefingAssembler):
         prompt = await self._build(briefing)
         assert 'claude-task-3822-architect' in prompt
+
+
+@pytest.mark.asyncio
+class TestAntiAnchorFirstDerivation:
+    """C-A1 / C-A2 integration tests.
+
+    C-A1: build_architect_prompt (first/fresh derivation) must EXCLUDE the
+          **Files:** label so the architect cannot rubber-stamp metadata.files.
+    C-A2: build_revalidation_prompt (revalidation pass) must STILL INCLUDE
+          the **Files:** label — the revalidation path is explicitly exempt.
+    """
+
+    def _task(self) -> dict:
+        return {
+            'id': '1835',
+            'title': 'Anti-anchor title',
+            'description': 'Derive files independently',
+            'metadata': {'files': ['orchestrator', 'shared']},
+        }
+
+    async def test_architect_prompt_excludes_files(
+        self, briefing: BriefingAssembler,
+    ):
+        """C-A1: build_architect_prompt must not expose metadata.files."""
+        prompt = await briefing.build_architect_prompt(
+            self._task(), worktree=None, context='',
+        )
+        assert '**Files:**' not in prompt
+
+    async def test_architect_prompt_keeps_description(
+        self, briefing: BriefingAssembler,
+    ):
+        """C-A1: description and title must survive the files suppression."""
+        prompt = await briefing.build_architect_prompt(
+            self._task(), worktree=None, context='',
+        )
+        assert 'Derive files independently' in prompt
+        assert 'Anti-anchor title' in prompt
+
+    async def test_revalidation_prompt_includes_files(
+        self, briefing: BriefingAssembler,
+    ):
+        """C-A2 exemption: build_revalidation_prompt must still show Files."""
+        prompt = await briefing.build_revalidation_prompt(
+            self._task(),
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert '**Files:**' in prompt
