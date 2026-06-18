@@ -579,11 +579,12 @@ class Harness:
             config.project_root / 'data' / 'orchestrator' / 'merge_queue.json'
         )
 
-        # Post-merge staleness hook — restart fused-memory.service when a
-        # landed diff touches fused-memory/src/.  Built in _start_merge_worker
-        # (where git_ops/event_store/config are all live) and fired from the
-        # run-forever idle branch (a verified no-dispatched-agents quiet window).
-        self._service_restart_coordinator: StaleServiceRestartCoordinator | None = None
+        # Post-merge staleness hook — restart services when a landed diff
+        # touches their watched paths.  Built in _start_merge_worker (where
+        # git_ops/event_store/config are all live).  The list holds two entries:
+        #   [0] fused-memory (require_idle=True — idle quiet window only)
+        #   [1] dashboard    (require_idle=False — fires even during dispatch)
+        self._service_restart_coordinators: list[StaleServiceRestartCoordinator] = []
 
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
@@ -3650,7 +3651,10 @@ Output JSON matching the schema. Every task must appear in the output.
             self.config, merge_ahead_bound=_k, num_hosts=_k,
         )
 
-        self._service_restart_coordinator = self._build_service_restart_coordinator()
+        self._service_restart_coordinators = [
+            self._build_service_restart_coordinator(),
+            self._build_dashboard_restart_coordinator(),
+        ]
 
         # Build the callback factory here (where self.scheduler is live) and
         # inject it opaquely into the worker so task γ can construct
@@ -3663,7 +3667,7 @@ Output JSON matching the schema. Every task must appear in the output.
             self._merge_queue,
             speculation_depth=_k,
             event_store=self.event_store,
-            on_merge_landed=self._service_restart_coordinator.note_merge,
+            on_merge_landed=self._service_restart_coordinators[0].note_merge,
             escalation_queue=self._escalation_queue,
             train_callback_factory=train_callback_factory,
             merge_store=self._merge_store,
