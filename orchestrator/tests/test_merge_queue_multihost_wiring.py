@@ -1909,3 +1909,64 @@ class TestReprobeQuarantinedHosts:
 
         # The ok-host should still have been cleared despite crash-host failing
         assert 'ok-host' in alloc.cleared
+
+    async def test_secs_zero_disables_time_based_alarm(self):
+        """escalate_after_secs=0 → time-based alarm NEVER fires, even with huge downtime.
+
+        Covers the config contract documented in config.py:1709 and defaults.yaml:407:
+        ``verify_host_unreachable_escalate_after_secs=0`` disables the time-based trip
+        (streak-only).  With the current guard ``downtime_s >= secs`` this reduces to
+        ``9999 >= 0.0`` which is always True, firing a spurious alarm on the first
+        reprobe call — a bug this test surfaces.
+        """
+        # Build a worker with the time-based trip disabled (secs=0)
+        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe({'zero-secs-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        # Very large downtime — would trip the alarm if the guard is `>= 0`
+        self._seed_ru_tracker(worker, 'zero-secs-host', first_unavailable_at=now - 9999)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        # NO time-based L1 alarm should be submitted when secs=0
+        l1_escs = [e for e in eq.submitted if getattr(e, 'level', None) == 1]
+        assert l1_escs == [], (
+            'escalate_after_secs=0 should disable the time-based alarm; '
+            f'got unexpected L1 escalations: {l1_escs}'
+        )
+
+    async def test_secs_zero_still_runs_reprobe_and_recovery(self):
+        """escalate_after_secs=0 disables ONLY the time-based alarm, not recovery sweep.
+
+        With secs=0 and health()=True the host must still be recovered (clear_quarantine
+        called, tracker cleared) and no L1 alarm must be submitted.
+        """
+        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({'recover-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'recover-host', first_unavailable_at=now - 9999)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        # Recovery sweep must still happen
+        assert 'recover-host' in alloc.cleared, (
+            'clear_quarantine must be called for a healthy host even when secs=0'
+        )
+        assert 'recover-host' not in worker._runner_unavailable, (
+            'tracker entry must be cleared on recovery'
+        )
+        # Still no L1 alarm (time-based path disabled, no streak-based path in reprobe)
+        l1_escs = [e for e in eq.submitted if getattr(e, 'level', None) == 1]
+        assert l1_escs == [], (
+            f'no L1 alarm expected with secs=0; got: {l1_escs}'
+        )
