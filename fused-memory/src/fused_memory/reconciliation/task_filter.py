@@ -344,6 +344,14 @@ def cross_verify_task_counts(tree: FilteredTaskTree, statuses: dict[str, str] | 
             authoritative (dict): census from statuses (when available).
             tree (dict): {'total': tree.total_count, 'done': tree.done_count}.
 
+    Note on read-skew: the census and the tree are produced by two independent reads
+    (get_tasks then get_statuses) taken a moment apart. A status transition committed
+    between the two reads can produce a transient total_mismatch/done_mismatch that
+    resolves itself next cycle — these are read-skew artefacts rather than the
+    truncation incident this diagnostic is designed to catch. Single-cycle divergences
+    should be treated as advisory; only divergence that persists across consecutive
+    cycles warrants escalation.
+
     Pure: no I/O, no side effects.
     """
     _unavailable = {

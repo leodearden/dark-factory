@@ -23,7 +23,6 @@ Covers:
 
 from __future__ import annotations
 
-import contextlib
 import json
 import re
 from datetime import UTC, datetime
@@ -1120,18 +1119,6 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
         )
         dedup_mock = AsyncMock(return_value=[])
 
-        import pytest
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
-                new=dedup_mock,
-            ),
-            pytest.raises(Exception, match='.') if False else contextlib.nullcontext(),
-        ):
-            pass
-
-        # Use caplog-style approach: check via a separate caplog test
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
@@ -1411,6 +1398,11 @@ class TestStage1PayloadTaskCountCensus:
         assert '608' in result, 'Authoritative done=608 must appear in the census section'
         # Source attribution
         assert 'get_statuses' in result, "'get_statuses' must be named as the source"
+        # Divergence note: fixture has consistent=False (tree done=600 vs authoritative done=608)
+        assert 'Divergence detected' in result, (
+            "Divergence note must appear when consistent=False; got:\n{result!r}"
+        )
+        assert '600' in result, 'Tree done=600 must appear in the divergence note'
 
     @pytest.mark.asyncio
     async def test_census_section_in_assembled_payload_path(self):
@@ -1430,6 +1422,11 @@ class TestStage1PayloadTaskCountCensus:
         assert '635' in result, 'Authoritative total=635 must appear in census section'
         assert '608' in result, 'Authoritative done=608 must appear in census section'
         assert 'get_statuses' in result, "'get_statuses' must be named as the source"
+        # Divergence note: fixture has consistent=False (tree done=600 vs authoritative done=608)
+        assert 'Divergence detected' in result, (
+            "Divergence note must appear when consistent=False; got:\n{result!r}"
+        )
+        assert '600' in result, 'Tree done=600 must appear in the divergence note'
 
     @pytest.mark.asyncio
     async def test_census_section_absent_when_verification_is_none(self):
