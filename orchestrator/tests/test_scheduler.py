@@ -6080,6 +6080,99 @@ class TestGetExternalStatuses:
 
 
 # ---------------------------------------------------------------------------
+# TestGetExternalStatusesFailsLoud (task 1799 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetExternalStatusesFailsLoud:
+    """``Scheduler.get_external_statuses`` must fail LOUD on non-dict/unparseable results.
+
+    Today the non-dict branch falls through to ``return {}, None`` (err is None),
+    silently stranding tasks.  After the fix:
+    - Non-dict / missing-'statuses'-key → ``({}, ExternalResolverError(...))``
+    - A WARNING is logged naming the failure.
+    - The existing exception-raised path (``({}, exception)``) is unchanged.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        """Return a JSON-RPC envelope with a single text block."""
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_dict_statuses_returns_error(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """Non-dict 'statuses' value (e.g. missing key) → ({}, ExternalResolverError).
+
+        When ``_parse_tool_text_result(result, 'statuses')`` returns None (missing key
+        or unparseable JSON), the method must return an error, NOT ``({}, None)``.
+        A WARNING must be logged so the failure is visible in journalctl / caplog.
+        """
+        import logging
+        import orchestrator.scheduler as _sched_module
+
+        # Response whose JSON has NO 'statuses' key → _parse_tool_text_result returns None.
+        response = self._envelope({'data': 'not-a-statuses-dict'})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            statuses, err = await scheduler.get_external_statuses(['upstream_proj:1'])
+
+        assert statuses == {}, f'Expected empty dict; got {statuses!r}'
+        assert err is not None, (
+            'Expected ExternalResolverError in error slot; got None '
+            '(non-dict branch fell through to return {}, None)'
+        )
+        assert isinstance(err, _sched_module.ExternalResolverError), (
+            f'Expected ExternalResolverError; got {type(err).__name__}'
+        )
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'Expected a WARNING log; got records={caplog.records!r}'
+
+    @pytest.mark.asyncio
+    async def test_non_dict_result_no_state_leak(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Non-dict error leaves no persistent state; next call still works correctly."""
+        import json
+        import orchestrator.scheduler as _sched_module
+
+        # First call: non-dict response.
+        response_bad = self._envelope({'no_statuses_here': True})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response_bad),
+        )
+        _stat_bad, err_bad = await scheduler.get_external_statuses(['upstream_proj:1'])
+        assert err_bad is not None
+        assert isinstance(err_bad, _sched_module.ExternalResolverError)
+
+        # Second call: correct response.
+        response_ok = self._envelope({'statuses': {'upstream_proj:1': 'done'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response_ok),
+        )
+        stat_ok, err_ok = await scheduler.get_external_statuses(['upstream_proj:1'])
+        assert err_ok is None
+        assert stat_ok == {'upstream_proj:1': 'done'}
+
+
+# ---------------------------------------------------------------------------
 # TestDepsSatisfiedExternalGate (task 1580 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
