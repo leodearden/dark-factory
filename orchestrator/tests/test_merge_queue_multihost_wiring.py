@@ -10,6 +10,8 @@ Covers:
     (step-13 RED / step-14 GREEN)
   - Drift-task stop() cancellation + worktree cleanup
     (step-15 RED / step-16 GREEN)
+  - InflightVerifyResult.reason field + RUNNER_UNAVAILABLE reason capture
+    (1795/step-3 RED / 1795/step-4 GREEN)
 """
 
 import asyncio
@@ -951,3 +953,1038 @@ class TestDriftCheckTaskStopCleanup:
             if not t.done():
                 t.cancel()
             await asyncio.gather(t, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-3 RED: InflightVerifyResult.reason field + RUNNER_UNAVAILABLE capture
+# ---------------------------------------------------------------------------
+
+
+class TestInflightVerifyResultReasonField:
+    """InflightVerifyResult has a reason: str | None = None field (task 1795 step-3).
+
+    RED until step-4 GREEN adds the field to the dataclass.
+    """
+
+    def test_reason_field_defaults_to_none(self):
+        """InflightVerifyResult() has reason attribute defaulting to None."""
+        from orchestrator.merge_queue import InflightVerifyResult
+        ivr = InflightVerifyResult(outcome=None, merge_wt=None)
+        # RED: AttributeError until the field is added
+        assert ivr.reason is None
+
+    def test_reason_field_accepts_string(self):
+        """InflightVerifyResult(reason='...') stores the value."""
+        from orchestrator.merge_queue import InflightVerifyResult
+        ivr = InflightVerifyResult(outcome=None, merge_wt=None, reason='ssh timeout')
+        assert ivr.reason == 'ssh timeout'
+
+    def test_reason_field_in_runner_unavailable_sentinel(self):
+        """InflightVerifyResult with status='RUNNER_UNAVAILABLE' can carry reason."""
+        from orchestrator.merge_queue import InflightVerifyResult
+        ivr = InflightVerifyResult(
+            outcome=None,
+            merge_wt=None,
+            status='RUNNER_UNAVAILABLE',
+            reason='ssh: Could not resolve hostname leo-laptop',
+        )
+        assert ivr.status == 'RUNNER_UNAVAILABLE'
+        assert ivr.reason is not None
+        assert 'Could not resolve hostname' in ivr.reason
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyRunnerUnavailableReason:
+    """_run_inflight_verify captures RunnerUnavailable message into reason (task 1795 step-3).
+
+    RED until step-4 GREEN changes `except RunnerUnavailable:` to
+    `except RunnerUnavailable as exc:` and sets reason=str(exc).
+    """
+
+    async def test_reason_captured_from_exception_message(self, tmp_path):
+        """REMOTE lease RunnerUnavailable → reason field holds the exception message."""
+        from orchestrator.merge_queue import SpeculativeItem, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        error_msg = 'ssh: Could not resolve hostname leo-laptop'
+
+        git_ops = _make_git_ops_mock()
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+
+        # Minimal SpeculativeItem: only the fields asserted in _run_inflight_verify
+        merge_wt_path = tmp_path / 'merge-wt'
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=[], worktree=tmp_path)
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt_path,
+            base_sha='base123',
+            speculative=False,
+            skip_verify=False,
+        )
+
+        # REMOTE lease — bypasses local warm-swap path
+        fake_runner = MagicMock()
+        fake_runner.name = 'leo-laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+
+        # Patch _run_post_merge_verify to raise RunnerUnavailable immediately
+        async def _raise_unavailable(*args, **kwargs):
+            raise RunnerUnavailable(error_msg)
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable):
+            result = await worker._run_inflight_verify(item, lease)
+
+        assert result.status == 'RUNNER_UNAVAILABLE'
+        # RED: reason is None until step-4 adds `except RunnerUnavailable as exc:` + reason=str(exc)
+        assert result.reason is not None, (
+            'reason must be captured from RunnerUnavailable exception — '
+            'add `except RunnerUnavailable as exc:` and reason=str(exc)'
+        )
+        assert 'Could not resolve hostname' in result.reason
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-5 RED: per-host unavailability tracker on the worker
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerUnavailableTracker:
+    """Per-host streak tracker _record_runner_unavailable / _record_runner_recovered.
+
+    RED until step-6 GREEN adds _HostUnavailability, _runner_unavailable dict,
+    and the two methods to SpeculativeMergeWorker.
+    """
+
+    def _make_worker(self, *, escalate_after_n=2):
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        git_ops = MagicMock()
+        git_ops.project_root = None
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        # Override threshold to a small value (test-overridable attr)
+        worker._unreachable_escalate_after_n = escalate_after_n
+        return worker
+
+    def test_first_call_sets_streak_one_and_returns_false_below_threshold(self):
+        """First _record_runner_unavailable call: streak=1, returns False when N=2."""
+        import time
+        worker = self._make_worker(escalate_after_n=2)
+        now = time.time()
+        # RED: AttributeError until the method is added
+        result = worker._record_runner_unavailable('host1', 'ssh timeout', now)
+        assert result is False  # streak=1 < N=2
+
+    def test_first_call_stores_first_unavailable_at(self):
+        """first_unavailable_at is set to `now` on the first call."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        now = time.time()
+        worker._record_runner_unavailable('host1', 'ssh error', now)
+        entry = worker._runner_unavailable['host1']
+        assert entry.first_unavailable_at == now
+
+    def test_first_call_stores_reason(self):
+        """reason is stored in the tracker entry on first call."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        now = time.time()
+        worker._record_runner_unavailable('host1', 'Connection refused', now)
+        entry = worker._runner_unavailable['host1']
+        assert entry.reason == 'Connection refused'
+
+    def test_repeated_calls_increment_streak_keep_first_at_fixed(self):
+        """Repeated calls increment streak; first_unavailable_at is NOT updated."""
+        import time
+        worker = self._make_worker(escalate_after_n=5)
+        t0 = time.time()
+        worker._record_runner_unavailable('host1', 'err', t0)
+        t1 = t0 + 30.0
+        worker._record_runner_unavailable('host1', 'err2', t1)
+        t2 = t0 + 60.0
+        worker._record_runner_unavailable('host1', 'err3', t2)
+        entry = worker._runner_unavailable['host1']
+        assert entry.streak == 3
+        assert entry.first_unavailable_at == t0  # unchanged
+
+    def test_returns_true_exactly_when_streak_reaches_n(self):
+        """Returns True (should-escalate) on the call that reaches streak==N."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        t = time.time()
+        r1 = worker._record_runner_unavailable('host1', 'e', t)
+        r2 = worker._record_runner_unavailable('host1', 'e', t + 1)
+        r3 = worker._record_runner_unavailable('host1', 'e', t + 2)  # streak=3 == N
+        assert r1 is False
+        assert r2 is False
+        assert r3 is True
+
+    def test_returns_true_again_beyond_n(self):
+        """Returns True for every call once streak >= N (persistent alarm condition)."""
+        import time
+        worker = self._make_worker(escalate_after_n=2)
+        t = time.time()
+        worker._record_runner_unavailable('host1', 'e', t)      # streak=1 False
+        r2 = worker._record_runner_unavailable('host1', 'e', t + 1)  # streak=2 True
+        r3 = worker._record_runner_unavailable('host1', 'e', t + 2)  # streak=3 True
+        assert r2 is True
+        assert r3 is True
+
+    def test_recovered_clears_tracker_state(self):
+        """_record_runner_recovered removes the host entry; next call starts fresh."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        t = time.time()
+        worker._record_runner_unavailable('host1', 'err', t)
+        worker._record_runner_unavailable('host1', 'err', t + 1)
+
+        worker._record_runner_recovered('host1')
+
+        assert 'host1' not in worker._runner_unavailable
+
+    def test_recovered_idempotent_on_absent_host(self):
+        """_record_runner_recovered on a host that was never tracked is a no-op."""
+        worker = self._make_worker()
+        # Should not raise
+        worker._record_runner_recovered('ghost-host')
+
+    def test_recovered_allows_fresh_episode(self):
+        """After recovery, a new failure starts a fresh streak (first_unavailable_at resets)."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        t0 = time.time()
+        worker._record_runner_unavailable('host1', 'err', t0)
+        worker._record_runner_unavailable('host1', 'err', t0 + 1)
+
+        worker._record_runner_recovered('host1')
+
+        t1 = t0 + 100.0
+        r = worker._record_runner_unavailable('host1', 'new err', t1)
+        assert r is False  # streak=1 < N=3
+        entry = worker._runner_unavailable['host1']
+        assert entry.streak == 1
+        assert entry.first_unavailable_at == t1  # fresh episode
+
+    def test_independent_hosts_tracked_separately(self):
+        """Two different hosts maintain independent streak counters."""
+        import time
+        worker = self._make_worker(escalate_after_n=3)
+        t = time.time()
+        worker._record_runner_unavailable('host1', 'e', t)
+        worker._record_runner_unavailable('host1', 'e', t + 1)  # host1 streak=2
+        worker._record_runner_unavailable('host2', 'e', t)      # host2 streak=1
+
+        worker._record_runner_recovered('host1')
+
+        assert 'host1' not in worker._runner_unavailable
+        assert 'host2' in worker._runner_unavailable
+        assert worker._runner_unavailable['host2'].streak == 1
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-7 RED: _alarm_verify_host_unreachable module-level helper
+# ---------------------------------------------------------------------------
+
+
+class _FakeEscalationQueue:
+    """Minimal fake escalation queue for testing _alarm_verify_host_unreachable."""
+
+    def __init__(self, *, open_l1: bool = False):
+        self._open_l1 = open_l1
+        self._seq = 0
+        self.submitted: list = []
+
+    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+        return self._open_l1
+
+    def make_id(self, task_id: str) -> str:
+        self._seq += 1
+        return f'esc-{self._seq}'
+
+    def submit(self, esc) -> None:
+        self.submitted.append(esc)
+
+    def open_it(self):
+        """Simulate a prior open L1 (for dedup tests)."""
+        self._open_l1 = True
+
+
+class _FakeEventStore:
+    """Minimal fake event store for testing event emission."""
+
+    def __init__(self):
+        self.emitted: list = []
+
+    def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
+        self.emitted.append({'event_type': event_type, 'task_id': task_id, 'data': data or {}})
+
+
+class TestAlarmVerifyHostUnreachable:
+    """_alarm_verify_host_unreachable module-level helper (task 1795 step-7).
+
+    RED until step-8 GREEN adds the function and sentinel to merge_queue.py.
+    """
+
+    def _call(self, eq, host, reason, *, streak=3, duration_s=120.0, event_store=None):
+        from orchestrator.merge_queue import _alarm_verify_host_unreachable
+        _alarm_verify_host_unreachable(
+            eq, host, reason,
+            streak=streak,
+            duration_s=duration_s,
+            event_store=event_store,
+        )
+
+    def test_none_queue_is_noop(self):
+        """None escalation_queue → returns silently, no raise."""
+        self._call(None, 'host1', 'ssh timeout', streak=3, duration_s=60.0)
+        # No assertion needed — must not raise
+
+    def test_first_call_submits_exactly_one_escalation(self):
+        """First call submits exactly one Escalation."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'host1', 'ssh timeout', streak=3, duration_s=120.0)
+        assert len(eq.submitted) == 1
+
+    def test_escalation_has_level_1(self):
+        """Submitted Escalation has level==1 (L1 blocking, not L2 critical)."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'host1', 'ssh timeout', streak=3, duration_s=120.0)
+        esc = eq.submitted[0]
+        assert esc.level == 1
+
+    def test_escalation_has_verify_host_unreachable_category(self):
+        """Submitted Escalation has category=='verify_host_unreachable'."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'host1', 'ssh timeout', streak=3, duration_s=120.0)
+        esc = eq.submitted[0]
+        assert esc.category == 'verify_host_unreachable'
+
+    def test_category_is_not_halting(self):
+        """category is NOT in {wip_conflict, unmerged_state} (non-halting invariant)."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'host1', 'err', streak=3, duration_s=120.0)
+        esc = eq.submitted[0]
+        assert esc.category not in {'wip_conflict', 'unmerged_state'}
+
+    def test_escalation_task_id_is_per_host_sentinel(self):
+        """task_id is the per-host sentinel __verify_host_unreachable__<host>."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, 'my-laptop', 'err', streak=3, duration_s=120.0)
+        esc = eq.submitted[0]
+        assert esc.task_id == '__verify_host_unreachable__my-laptop'
+
+    def test_escalation_summary_names_host_and_reason(self):
+        """summary includes both the host name and the reason string."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        reason = 'ssh: Could not resolve hostname leo-laptop'
+        self._call(eq, 'leo-laptop', reason, streak=5, duration_s=300.0)
+        esc = eq.submitted[0]
+        assert 'leo-laptop' in esc.summary
+        assert reason in esc.summary or 'Could not resolve hostname' in esc.summary
+
+    def test_escalation_detail_names_host_reason_duration(self):
+        """detail includes host, reason, and a human-readable duration."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        reason = 'Connection refused'
+        self._call(eq, 'build-box', reason, streak=4, duration_s=900.0)
+        esc = eq.submitted[0]
+        assert 'build-box' in esc.detail
+        assert reason in esc.detail
+
+    def test_second_call_with_open_l1_is_deduped(self):
+        """When has_open_l1 returns True the function submits nothing (dedup)."""
+        eq = _FakeEscalationQueue(open_l1=True)  # alarm already open
+        self._call(eq, 'host1', 'ssh timeout', streak=5, duration_s=200.0)
+        assert len(eq.submitted) == 0
+
+    def test_event_store_emits_verify_host_unreachable_event(self):
+        """When event_store is provided, a verify_host_unreachable event is emitted."""
+        from orchestrator.event_store import EventType
+        eq = _FakeEscalationQueue(open_l1=False)
+        es = _FakeEventStore()
+        self._call(eq, 'host1', 'ssh error', streak=3, duration_s=60.0, event_store=es)
+        assert len(es.emitted) >= 1
+        types = [e['event_type'] for e in es.emitted]
+        assert EventType.verify_host_unreachable in types
+
+    def test_event_names_the_host(self):
+        """The emitted verify_host_unreachable event includes the host name in data."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        es = _FakeEventStore()
+        self._call(eq, 'build-machine', 'err', streak=3, duration_s=90.0, event_store=es)
+        from orchestrator.event_store import EventType
+        events = [e for e in es.emitted if e['event_type'] == EventType.verify_host_unreachable]
+        assert events, 'no verify_host_unreachable event emitted'
+        host_in_data = any('build-machine' in str(e['data']) for e in events)
+        assert host_in_data
+
+    def test_no_event_when_event_store_none(self):
+        """When event_store is None no exception is raised and no event is emitted."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        # Must not raise even though event_store=None
+        self._call(eq, 'host1', 'err', streak=3, duration_s=60.0, event_store=None)
+        assert len(eq.submitted) == 1  # escalation still submitted
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-9 RED: RU branch of _finalize_inflight wired to tracker + alarm
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeInflightRunnerUnavailableEscalation:
+    """_finalize_inflight RUNNER_UNAVAILABLE branch wires tracker + alarm (task 1795 step-9).
+
+    RED until step-10 GREEN adds the tracker/alarm calls in the RU branch.
+    """
+
+    def _make_worker(self, *, escalate_after_n=2):
+        """Build a minimal SpeculativeMergeWorker with fake allocator + escalation queue."""
+        import asyncio
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        git_ops = _make_git_ops_mock()
+        git_ops.project_root = None  # no real git needed for this test
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        worker._unreachable_escalate_after_n = escalate_after_n
+
+        # Fake escalation queue
+        eq = _FakeEscalationQueue(open_l1=False)
+        worker._escalation_queue = eq
+
+        # Fake host allocator with async quarantine_and_release
+        fake_alloc = MagicMock()
+        fake_alloc.quarantine_and_release = AsyncMock()
+        fake_alloc.release = AsyncMock()
+        fake_alloc.cancel_and_release = AsyncMock()
+        worker._host_allocator = fake_alloc
+
+        return worker, eq, fake_alloc
+
+    def _make_ru_entry(self, worker, host_name, reason='ssh timeout'):
+        """Build an InflightEntry whose verify_task yields RUNNER_UNAVAILABLE."""
+        import asyncio
+
+        from orchestrator.merge_queue import (
+            InflightEntry,
+            InflightVerifyResult,
+            MergeRequest,
+            SpeculativeItem,
+        )
+        from orchestrator.verify_runner import HostLease
+
+        loop = asyncio.get_event_loop()
+        req = MergeRequest(
+            task_id='task-ru',
+            branch='task/ru',
+            worktree=MagicMock(),
+            pre_rebased=False,
+            task_files=[],
+            module_configs=[],
+            config=_make_config(),
+            result=loop.create_future(),
+        )
+
+        fake_runner = MagicMock()
+        fake_runner.name = host_name
+        fake_runner.is_local = False
+        lease = HostLease(name=host_name, runner=fake_runner, is_local=False)
+
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'deadbeefdeadbeef1234'
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=MagicMock(),
+            base_sha='base123',
+            speculative=False,
+            skip_verify=False,
+        )
+
+        async def _fake_ru_verify():
+            return InflightVerifyResult(
+                outcome=None,
+                merge_wt=item.merge_wt,
+                status='RUNNER_UNAVAILABLE',
+                reason=reason,
+            )
+
+        verify_task = asyncio.ensure_future(_fake_ru_verify())
+        return InflightEntry(
+            item=item,
+            lease=lease,
+            verify_task=verify_task,
+            merge_wt=item.merge_wt,
+            was_speculative=False,
+            phase='verifying',
+        )
+
+    async def test_quarantine_and_release_still_runs(self):
+        """RUNNER_UNAVAILABLE → quarantine_and_release called (existing behavior preserved)."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import SpeculativeItem
+
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=3)
+        entry = self._make_ru_entry(worker, 'laptop')
+
+        # Patch _remerge so we don't need a real git repo
+        remerged = MagicMock(spec=SpeculativeItem)
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            result = await worker._finalize_inflight(entry)
+
+        fake_alloc.quarantine_and_release.assert_awaited_once()
+        assert result is False  # RU path always returns False
+
+    async def test_host_in_runner_quarantine_after_ru(self):
+        """After RUNNER_UNAVAILABLE the lease host is in worker._runner_quarantine."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import SpeculativeItem
+
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=3)
+        entry = self._make_ru_entry(worker, 'laptop')
+
+        # Simulate quarantine_and_release adding to the shared set
+        async def _fake_qar(lease):
+            worker._runner_quarantine.add(lease.name)
+
+        fake_alloc.quarantine_and_release = AsyncMock(side_effect=_fake_qar)
+
+        remerged = MagicMock(spec=SpeculativeItem)
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            await worker._finalize_inflight(entry)
+
+        assert 'laptop' in worker._runner_quarantine
+
+    async def test_nth_ru_submits_exactly_one_escalation(self):
+        """After N RU events for same host exactly ONE escalation is submitted."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import SpeculativeItem
+
+        n = 2
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
+        remerged = MagicMock(spec=SpeculativeItem)
+
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for _ in range(n):
+                entry = self._make_ru_entry(worker, 'laptop', reason='ssh: connect failed')
+                await worker._finalize_inflight(entry)
+
+        # RED: no escalation submitted until step-10 wires the tracker
+        assert len(eq.submitted) == 1, (
+            f'Expected 1 escalation after N={n} RU events; got {len(eq.submitted)}'
+        )
+
+    async def test_nth_escalation_names_host_and_reason(self):
+        """The submitted escalation names the host and captured reason."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import SpeculativeItem
+
+        n = 2
+        reason = 'ssh: Could not resolve hostname laptop'
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
+        remerged = MagicMock(spec=SpeculativeItem)
+
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for _ in range(n):
+                entry = self._make_ru_entry(worker, 'laptop', reason=reason)
+                await worker._finalize_inflight(entry)
+
+        assert len(eq.submitted) == 1
+        esc = eq.submitted[0]
+        assert 'laptop' in esc.summary or 'laptop' in esc.task_id
+        assert reason in esc.summary or reason in esc.detail
+
+    async def test_further_ru_events_do_not_submit_second_escalation(self):
+        """Additional RU events after threshold are dedup'd (has_open_l1 guard)."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import SpeculativeItem
+
+        n = 2
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
+        remerged = MagicMock(spec=SpeculativeItem)
+
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for i in range(n + 3):  # 5 total (n=2 threshold + 3 extra)
+                entry = self._make_ru_entry(worker, 'laptop', reason='timeout')
+                await worker._finalize_inflight(entry)
+                if i == n - 1:
+                    # After the Nth call, fake the alarm as now-open so dedup fires
+                    eq.open_it()
+
+        assert len(eq.submitted) == 1  # no duplicate
+
+    async def test_n_failed_stays_false_on_ru(self):
+        """RUNNER_UNAVAILABLE does not set _n_failed (item should be re-dispatched)."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import SpeculativeItem
+
+        n = 2
+        worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
+        remerged = MagicMock(spec=SpeculativeItem)
+
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            for _ in range(n):
+                entry = self._make_ru_entry(worker, 'laptop')
+                await worker._finalize_inflight(entry)
+
+        # _n_failed is written from _n_failed_val inside finalize; read back
+        # via the worker's attribute — it must stay False after RU.
+        assert worker._n_failed is False
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-11 RED: _clear_verify_host_unreachable module-level helper
+# ---------------------------------------------------------------------------
+
+
+class _FakeEscalationQueueWithResolution(_FakeEscalationQueue):
+    """Extends _FakeEscalationQueue to support get_by_task / resolve for recovery tests."""
+
+    def __init__(self, *, open_l1: bool = False):
+        super().__init__(open_l1=open_l1)
+        # Map from task_id → list of fake pending escalation SimpleNamespace objects
+        self._by_task: dict = {}
+        self.resolved: list = []  # list of (escalation_id, resolution) pairs
+
+    def seed_pending_l1(self, task_id: str, esc_id: str = 'esc-1001') -> None:
+        """Pre-seed a pending L1 escalation for the given task_id."""
+        from types import SimpleNamespace
+        esc = SimpleNamespace(id=esc_id, task_id=task_id, status='pending', level=1)
+        self._by_task.setdefault(task_id, []).append(esc)
+        # Mark the queue as having an open L1 so has_open_l1 returns True
+        self._open_l1 = True
+
+    def get_by_task(self, task_id: str, status: str | None = None) -> list:
+        escs = list(self._by_task.get(task_id, []))
+        if status is not None:
+            escs = [e for e in escs if e.status == status]
+        return escs
+
+    def resolve(self, escalation_id: str, resolution: str, **kwargs) -> None:
+        self.resolved.append((escalation_id, resolution))
+        # Update the in-memory status so subsequent get_by_task(status='pending') sees 0
+        for escs in self._by_task.values():
+            for e in escs:
+                if e.id == escalation_id:
+                    e.status = 'resolved'
+        # Once resolved, has_open_l1 should return False
+        self._open_l1 = False
+
+
+class TestClearVerifyHostUnreachable:
+    """_clear_verify_host_unreachable module-level helper (task 1795 step-11).
+
+    RED until step-12 GREEN adds the function to merge_queue.py.
+    """
+
+    def _call(self, eq, es, host, *, downtime_s: float = 300.0):
+        from orchestrator.merge_queue import _clear_verify_host_unreachable
+        _clear_verify_host_unreachable(eq, es, host, downtime_s=downtime_s)
+
+    def test_none_queue_is_noop(self):
+        """None escalation_queue → returns silently, no raise."""
+        self._call(None, None, 'host1')
+        # Must not raise
+
+    def test_resolves_open_pending_l1(self):
+        """Pending L1 for the host sentinel is resolved (resolve() called with its id)."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        sentinel = _verify_host_unreachable_sentinel('host1')
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(sentinel, 'esc-1001')
+        self._call(eq, None, 'host1')
+        assert len(eq.resolved) >= 1
+        assert 'esc-1001' in [r[0] for r in eq.resolved]
+
+    def test_pending_l1_no_longer_pending_after_call(self):
+        """After the call the seeded L1 is no longer returned by get_by_task(..., status='pending')."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        sentinel = _verify_host_unreachable_sentinel('myhost')
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(sentinel, 'esc-2002')
+        self._call(eq, None, 'myhost')
+        still_pending = eq.get_by_task(sentinel, status='pending')
+        assert len(still_pending) == 0, 'L1 should no longer be pending after recovery'
+
+    def test_emits_verify_host_recovered_event(self):
+        """When event_store is provided and an alarm was open, a recovered event is emitted."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('recover-host'))
+        es = _FakeEventStore()
+        self._call(eq, es, 'recover-host', downtime_s=180.0)
+        types = [e['event_type'] for e in es.emitted]
+        assert EventType.verify_host_recovered in types
+
+    def test_recovery_event_names_the_host(self):
+        """The emitted verify_host_recovered event data includes the host name."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('my-box'))
+        es = _FakeEventStore()
+        self._call(eq, es, 'my-box', downtime_s=120.0)
+        events = [e for e in es.emitted if e['event_type'] == EventType.verify_host_recovered]
+        assert events, 'no verify_host_recovered event emitted'
+        assert any('my-box' in str(e) for e in events)
+
+    def test_submits_info_severity_recovery_escalation(self):
+        """An info-severity recovery escalation is submitted when an alarm was open."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('recovered-host'))
+        self._call(eq, None, 'recovered-host', downtime_s=60.0)
+        assert len(eq.submitted) >= 1
+        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
+        assert info_escs, f'Expected info-severity escalation; got {eq.submitted}'
+
+    def test_recovery_escalation_has_level_0(self):
+        """The recovery escalation is level=0 (informational, not L1 blocking)."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('recovered-host'))
+        self._call(eq, None, 'recovered-host', downtime_s=60.0)
+        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
+        assert info_escs
+        assert all(e.level == 0 for e in info_escs)
+
+    def test_recovery_escalation_names_the_host(self):
+        """Recovery escalation summary, detail, or task_id includes the host name."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('worker-node'))
+        self._call(eq, None, 'worker-node', downtime_s=90.0)
+        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
+        assert info_escs
+        esc = info_escs[0]
+        host_present = (
+            'worker-node' in (esc.summary or '')
+            or 'worker-node' in (esc.detail or '')
+            or 'worker-node' in (esc.task_id or '')
+        )
+        assert host_present, f'Host not found in recovery escalation: {esc}'
+
+    def test_safe_when_no_open_l1(self):
+        """No L1 pre-seeded → resolve() is never called; no recovery noise emitted."""
+        eq = _FakeEscalationQueueWithResolution()
+        # Must not raise even when there is no pending L1 to resolve
+        self._call(eq, None, 'fresh-host')
+        assert len(eq.resolved) == 0
+        assert len(eq.submitted) == 0, 'no recovery noise when no alarm was open'
+
+    def test_no_event_when_event_store_none(self):
+        """No event store → no event emitted; info escalation still submitted when alarm was open."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('host1'))
+        self._call(eq, None, 'host1', downtime_s=60.0)
+        # Recovery escalation is still submitted even without an event store
+        assert len(eq.submitted) >= 1
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-13 RED: _reprobe_quarantined_hosts async method
+# ---------------------------------------------------------------------------
+
+
+class _FakeAllocatorForReprobe:
+    """Fake HostAllocator for reprobe tests: configurable quarantined remote list."""
+
+    def __init__(self, quarantined: dict):
+        """quarantined: {name: runner_mock} for all quarantined remotes."""
+        self._quarantined = dict(quarantined)
+        self.cleared: list[str] = []
+
+    def quarantined_remote_runners(self):
+        return list(self._quarantined.items())
+
+    def clear_quarantine(self, name: str) -> None:
+        self.cleared.append(name)
+        self._quarantined.pop(name, None)
+
+
+@pytest.mark.asyncio
+class TestReprobeQuarantinedHosts:
+    """worker._reprobe_quarantined_hosts(now) async method (task 1795 step-13).
+
+    RED until step-14 GREEN implements the method.
+    """
+
+    def _make_worker_with_reprobe(
+        self,
+        *,
+        escalate_after_secs: float = 5.0,
+        escalate_after_n: int = 3,
+    ):
+        """Build a bare worker with fake allocator + escalation queue."""
+        import asyncio
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        git_ops = _make_git_ops_mock()
+        git_ops.project_root = None
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        worker._unreachable_escalate_after_secs = escalate_after_secs
+        worker._unreachable_escalate_after_n = escalate_after_n
+
+        eq = _FakeEscalationQueueWithResolution()
+        worker._escalation_queue = eq
+
+        return worker, eq
+
+    def _seed_ru_tracker(self, worker, host: str, first_unavailable_at: float, streak: int = 5):
+        """Manually seed the RU tracker so the host appears RU-quarantined."""
+        from orchestrator.merge_queue import _HostUnavailability
+        worker._runner_unavailable[host] = _HostUnavailability(
+            streak=streak,
+            first_unavailable_at=first_unavailable_at,
+            reason='ssh: connect refused',
+        )
+
+    async def test_unhealthy_stays_quarantined(self):
+        """health()=False → clear_quarantine not called, tracker entry stays."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe({'bad-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        # Seed as RU-quarantined, not yet past time threshold
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'bad-host', first_unavailable_at=now - 2.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert alloc.cleared == [], 'host should stay quarantined when health returns False'
+        assert 'bad-host' in worker._runner_unavailable, 'tracker entry should remain'
+
+    async def test_unhealthy_past_time_threshold_fires_time_based_alarm(self):
+        """health()=False AND past T threshold → time-based alarm fires (dedup'd)."""
+        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=5.0)
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe({'slow-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'slow-host', first_unavailable_at=now - 60.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        # Alarm must have fired
+        assert len(eq.submitted) >= 1
+        alarm_escs = [e for e in eq.submitted if getattr(e, 'level', 0) == 1]
+        assert alarm_escs, 'expected an L1 escalation from the time-based alarm path'
+        assert alloc.cleared == [], 'host should still be quarantined'
+
+    async def test_unhealthy_time_based_alarm_is_deduped(self):
+        """Second reprobe with open L1 does not submit a second alarm."""
+        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=5.0)
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe({'slow-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'slow-host', first_unavailable_at=now - 60.0)
+
+        # First call fires the alarm
+        await worker._reprobe_quarantined_hosts(now)
+        count_after_first = len(eq.submitted)
+
+        # Simulate open L1 so dedup fires on second call
+        eq._open_l1 = True
+
+        await worker._reprobe_quarantined_hosts(now + 1.0)
+        assert len(eq.submitted) == count_after_first, 'dedup should prevent second alarm'
+
+    async def test_healthy_host_clear_quarantine_called(self):
+        """health()=True → clear_quarantine called for the host."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({'good-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert 'good-host' in alloc.cleared, 'clear_quarantine should be called on recovery'
+
+    async def test_healthy_host_tracker_cleared(self):
+        """health()=True → _record_runner_recovered clears the tracker entry."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({'good-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert 'good-host' not in worker._runner_unavailable, 'tracker entry should be cleared'
+
+    async def test_healthy_host_recovery_escalation_submitted(self):
+        """health()=True with an open alarm → _clear_verify_host_unreachable submits info escalation."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        worker, eq = self._make_worker_with_reprobe()
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({'good-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
+        # Pre-seed an open L1 alarm so _clear_verify_host_unreachable emits the
+        # recovery signal (mirrors the realistic path where _finalize_inflight
+        # already fired the alarm via the streak-based path).
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('good-host'))
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
+        assert info_escs, 'expected recovery info escalation after healthy reprobe with open alarm'
+
+    async def test_divergence_quarantined_host_is_skipped(self):
+        """CRITICAL: host in allocator quarantine but NOT in RU tracker is never touched."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=True)
+        # Host is in the allocator quarantine (as returned by quarantined_remote_runners)
+        alloc = _FakeAllocatorForReprobe({'diverged-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        # Crucially: do NOT seed 'diverged-host' in the RU tracker
+        now = 1000.0
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        # health() must NEVER be called for divergence-quarantined hosts
+        fake_runner.health.assert_not_called()
+        assert alloc.cleared == [], 'divergence-quarantined host must not be cleared'
+
+    async def test_no_op_when_no_host_allocator(self):
+        """_reprobe_quarantined_hosts is a no-op when host_allocator is None."""
+        worker, eq = self._make_worker_with_reprobe()
+        worker._host_allocator = None
+        # Must not raise
+        await worker._reprobe_quarantined_hosts(1000.0)
+
+    async def test_one_host_failure_does_not_abort_sweep(self):
+        """An exception probing one host does not prevent other hosts from being probed."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        bad_runner = MagicMock()
+        bad_runner.health = AsyncMock(side_effect=Exception('unexpected ssh crash'))
+        good_runner = MagicMock()
+        good_runner.health = AsyncMock(return_value=True)
+
+        alloc = _FakeAllocatorForReprobe({
+            'crash-host': bad_runner,
+            'ok-host': good_runner,
+        })
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'crash-host', first_unavailable_at=now - 10.0)
+        self._seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 10.0)
+
+        # Must not raise even when one host's health() blows up
+        await worker._reprobe_quarantined_hosts(now)
+
+        # The ok-host should still have been cleared despite crash-host failing
+        assert 'ok-host' in alloc.cleared
+
+    async def test_secs_zero_disables_time_based_alarm(self):
+        """escalate_after_secs=0 → time-based alarm NEVER fires, even with huge downtime.
+
+        Covers the config contract documented in config.py:1709 and defaults.yaml:407:
+        ``verify_host_unreachable_escalate_after_secs=0`` disables the time-based trip
+        (streak-only).  With the current guard ``downtime_s >= secs`` this reduces to
+        ``9999 >= 0.0`` which is always True, firing a spurious alarm on the first
+        reprobe call — a bug this test surfaces.
+        """
+        # Build a worker with the time-based trip disabled (secs=0)
+        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe({'zero-secs-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        # Very large downtime — would trip the alarm if the guard is `>= 0`
+        self._seed_ru_tracker(worker, 'zero-secs-host', first_unavailable_at=now - 9999)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        # NO time-based L1 alarm should be submitted when secs=0
+        l1_escs = [e for e in eq.submitted if getattr(e, 'level', None) == 1]
+        assert l1_escs == [], (
+            'escalate_after_secs=0 should disable the time-based alarm; '
+            f'got unexpected L1 escalations: {l1_escs}'
+        )
+
+    async def test_secs_zero_still_runs_reprobe_and_recovery(self):
+        """escalate_after_secs=0 disables ONLY the time-based alarm, not recovery sweep.
+
+        With secs=0 and health()=True the host must still be recovered (clear_quarantine
+        called, tracker cleared) and no L1 alarm must be submitted.
+        """
+        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+
+        fake_runner = MagicMock()
+        fake_runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({'recover-host': fake_runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'recover-host', first_unavailable_at=now - 9999)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        # Recovery sweep must still happen
+        assert 'recover-host' in alloc.cleared, (
+            'clear_quarantine must be called for a healthy host even when secs=0'
+        )
+        assert 'recover-host' not in worker._runner_unavailable, (
+            'tracker entry must be cleared on recovery'
+        )
+        # Still no L1 alarm (time-based path disabled, no streak-based path in reprobe)
+        l1_escs = [e for e in eq.submitted if getattr(e, 'level', None) == 1]
+        assert l1_escs == [], (
+            f'no L1 alarm expected with secs=0; got: {l1_escs}'
+        )

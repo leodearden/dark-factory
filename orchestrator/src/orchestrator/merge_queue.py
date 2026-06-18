@@ -3630,6 +3630,25 @@ class InflightEntry:
 
 
 @dataclass
+class _HostUnavailability:
+    """Per-host RunnerUnavailable streak tracker entry (task 1795).
+
+    Tracks consecutive failures so the worker can fire a dedup'd escalation
+    once the streak threshold is reached, and can clear state on recovery.
+
+    Fields
+    ------
+    streak              : consecutive RunnerUnavailable count for this host.
+    first_unavailable_at: time.time() of the first failure in this episode.
+    reason              : str(exc) from the most recent RunnerUnavailable.
+    """
+
+    streak: int
+    first_unavailable_at: float
+    reason: str
+
+
+@dataclass
 class InflightVerifyResult:
     """Result returned by SpeculativeMergeWorker._run_inflight_verify.
 
@@ -3645,12 +3664,17 @@ class InflightVerifyResult:
                   'REQUEUED'          — operator halt; req re-queued on _queue
                   'RUNNER_UNAVAILABLE' — remote runner raised RunnerUnavailable;
                                         merge_wt NOT cleaned (will be re-dispatched)
+    reason      : str(exc) from the RunnerUnavailable exception when status is
+                  'RUNNER_UNAVAILABLE'; None on all other paths.  Used by the
+                  unavailability tracker + alarm to name the actual failure cause
+                  in escalation summaries.
     """
 
     outcome: MergeOutcome | None
     merge_wt: Path | None
     warm_results: dict[str, str] = dataclasses.field(default_factory=dict)
     status: str | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
+    reason: str | None = None  # str(RunnerUnavailable exc) when status='RUNNER_UNAVAILABLE'
 
 
 class _TrainMergeHost(Protocol):
@@ -5007,6 +5031,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._reprobe_task: asyncio.Task | None = None
         # In-flight request being processed by the merger loop. Set after
         # dequeue, cleared after the SpeculativeItem is pushed to the verifier
         # queue. Used by stop() to resolve Futures for requests that were
@@ -5055,6 +5080,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # tradeoff accepted; see plan.json §Mechanism-4 design notes).
         self._drift_land_count: int = 0
         self._runner_quarantine: set[str] = set()
+        # Per-host RunnerUnavailable streak tracker (task 1795).  Keyed by
+        # runner name; entries created on first failure, popped on recovery.
+        # Used by _record_runner_unavailable / _record_runner_recovered to fire
+        # a dedup'd escalation and auto-reprobe on recovery.  None-safe at call
+        # sites: only populated when remote runners are configured.
+        self._runner_unavailable: dict[str, _HostUnavailability] = {}
+        # Thresholds for firing / probing (copies of config knobs set by
+        # _ensure_host_allocator; defaults keep bare-worker tests green).
+        # Override in tests to drive threshold logic synchronously (mirrors
+        # _heartbeat_interval_s precedent).
+        self._unreachable_escalate_after_n: int = 3
+        self._unreachable_escalate_after_secs: float = 600.0
+        self._reprobe_interval_s: float = 120.0
         # In-flight drift-detective asyncio.Tasks.  asyncio keeps only a WEAK
         # reference to running tasks, so without a strong ref here the drift
         # detective can be GC'd mid-run and a remote-PASS / local-FAIL
@@ -5188,11 +5226,135 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._host_allocator = HostAllocator(
                 remotes, quarantine=self._runner_quarantine
             )
+            # Copy config knobs onto worker attrs so operator config drives
+            # production while __init__ defaults keep bare-worker tests green
+            # (mirrors _heartbeat_interval_s precedent).
+            self._unreachable_escalate_after_n = (
+                config.verify_host_unreachable_escalate_after_n
+            )
+            self._unreachable_escalate_after_secs = (
+                config.verify_host_unreachable_escalate_after_secs
+            )
+            self._reprobe_interval_s = config.verify_host_reprobe_interval_s
             return self._host_allocator
         # project_root unavailable: return a transient empty-remote allocator
         # without caching so a subsequent call with project_root set builds the
         # fully-populated instance.
         return HostAllocator([], quarantine=self._runner_quarantine)
+
+    # ── per-host RunnerUnavailable streak tracker (task 1795) ────────────
+
+    def _record_runner_unavailable(
+        self, host: str, reason: str, now: float
+    ) -> bool:
+        """Record one RunnerUnavailable failure for *host* and return whether to escalate.
+
+        Creates a new ``_HostUnavailability`` entry on the first call, then
+        increments ``streak`` on each subsequent call.  ``first_unavailable_at``
+        is fixed to the first-call timestamp so duration can be computed later.
+        ``reason`` is refreshed to the most-recent exception message.
+
+        Returns ``True`` when ``streak >= self._unreachable_escalate_after_n``
+        (the caller should fire ``_alarm_verify_host_unreachable``), ``False``
+        otherwise.  The streak is persistent until ``_record_runner_recovered``
+        clears it, so consecutive calls beyond the threshold continue returning
+        ``True`` (the alarm helper's ``has_open_l1`` dedup prevents re-submitting).
+        """
+        if host in self._runner_unavailable:
+            entry = self._runner_unavailable[host]
+            entry.streak += 1
+            entry.reason = reason
+        else:
+            self._runner_unavailable[host] = _HostUnavailability(
+                streak=1,
+                first_unavailable_at=now,
+                reason=reason,
+            )
+        return self._runner_unavailable[host].streak >= self._unreachable_escalate_after_n
+
+    def _record_runner_recovered(self, host: str) -> None:
+        """Clear the unavailability tracker entry for *host* (idempotent).
+
+        After this call, a subsequent ``_record_runner_unavailable`` starts a
+        fresh episode with ``streak=1`` and a new ``first_unavailable_at``.
+        """
+        self._runner_unavailable.pop(host, None)
+
+    async def _reprobe_quarantined_hosts(self, now: float) -> None:
+        """Probe each RU-quarantined remote host and clear on recovery.
+
+        Called periodically by :meth:`_reprobe_loop`.  For each host that is
+        **both** in the allocator's quarantine set **and** tracked as
+        RunnerUnavailable (``self._runner_unavailable``):
+
+        1. Probes the host via ``runner.health()`` (cheap SSH reachability check).
+        2. **On success** (host recovered): clears quarantine, resets the tracker,
+           and calls :func:`_clear_verify_host_unreachable` to resolve the open
+           L1 and emit a recovery event.
+        3. **On failure** (host still unreachable): if
+           ``self._unreachable_escalate_after_secs > 0`` **and**
+           ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
+           fires the time-based variant of the unreachability alarm (dedup'd via
+           ``has_open_l1``).  When *escalate_after_secs* is **0** the time-based
+           trip is disabled (streak-only mode); see
+           ``OrchestratorConfig.verify_host_unreachable_escalate_after_secs``.
+           Probing before alarming avoids a spurious open→immediate-resolve L1
+           churn for a host that recovers in the same cycle it would have tripped
+           the time-based threshold.
+
+        **Correctness invariant**: hosts quarantined by :class:`DriftDetector`
+        for verdict divergence are intentionally skipped — they are in the
+        allocator quarantine but absent from ``self._runner_unavailable``.
+        Clearing them on mere SSH reachability would bypass the drift parity
+        gate (Invariant 5).
+
+        Per-host exceptions are caught so one host's failure cannot abort the
+        sweep for the remaining hosts.
+        """
+        if self._host_allocator is None:
+            return
+
+        for name, runner in self._host_allocator.quarantined_remote_runners():
+            # Skip divergence-quarantined hosts — not tracked as RunnerUnavailable.
+            entry = self._runner_unavailable.get(name)
+            if entry is None:
+                continue
+
+            try:
+                downtime_s = now - entry.first_unavailable_at
+
+                # Probe health first so a host that recovers in the same cycle
+                # it would have tripped the time-based threshold goes directly
+                # to the recovery path, avoiding a spurious open→immediate-
+                # resolve L1 notification.
+                if await runner.health():
+                    self._host_allocator.clear_quarantine(name)
+                    self._record_runner_recovered(name)
+                    _clear_verify_host_unreachable(
+                        self._escalation_queue,
+                        self._event_store,
+                        name,
+                        downtime_s=downtime_s,
+                    )
+                else:
+                    # Host still unreachable: fire the time-based alarm path
+                    # (dedup'd — no-op if already open).
+                    # `> 0` guard: secs=0 disables the time-based trip
+                    # (streak-only).
+                    if self._unreachable_escalate_after_secs > 0 and downtime_s >= self._unreachable_escalate_after_secs:
+                        _alarm_verify_host_unreachable(
+                            self._escalation_queue,
+                            name,
+                            entry.reason,
+                            streak=entry.streak,
+                            duration_s=downtime_s,
+                            event_store=self._event_store,
+                        )
+            except Exception:
+                logger.exception(
+                    'reprobe_quarantined_hosts: unexpected error probing %r; skipping',
+                    name,
+                )
 
     # ── owned-worktree liveness ledger ───────────────────────────────────
 
@@ -5721,30 +5883,54 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
 
+    async def _reprobe_loop(self) -> None:
+        """Periodically probe quarantined remote hosts and clear on recovery.
+
+        Runs independently of the merger/verifier loops so it fires even when
+        those are idle.  Wakes every ``_reprobe_interval_s`` seconds and delegates
+        to the clock-injectable :meth:`_reprobe_quarantined_hosts`.
+
+        Any unexpected exception is logged and swallowed (same pattern as
+        _heartbeat_loop) so a probe bug can never crash the worker.
+        """
+        while self._running:
+            await asyncio.sleep(self._reprobe_interval_s)
+            try:
+                await self._reprobe_quarantined_hosts(time.time())
+            except Exception:
+                logger.exception('reprobe_quarantined_hosts: unexpected error in loop')
+
     async def run(self) -> None:
-        """Start merger, verifier, and heartbeat coroutines; wait for merge tasks."""
+        """Start merger, verifier, heartbeat, and reprobe coroutines; wait for merge tasks."""
         self._merger_task = asyncio.create_task(self._merger_loop())
         self._verifier_task = asyncio.create_task(self._verifier_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._reprobe_task = asyncio.create_task(self._reprobe_loop())
         try:
             await asyncio.gather(self._merger_task, self._verifier_task)
         except BaseException:
-            for t in (self._merger_task, self._verifier_task, self._heartbeat_task):
+            for t in (
+                self._merger_task, self._verifier_task,
+                self._heartbeat_task, self._reprobe_task,
+            ):
                 if t and not t.done():
                     t.cancel()
             await asyncio.gather(
-                self._merger_task, self._verifier_task, self._heartbeat_task,
+                self._merger_task, self._verifier_task,
+                self._heartbeat_task, self._reprobe_task,
                 return_exceptions=True,
             )
             raise
         finally:
-            # Cancel the heartbeat on both normal and exceptional exit so its
-            # lifetime is self-contained regardless of why the merge loops exit.
-            # On the exception path the except block already cleaned it up, so
-            # _heartbeat_task.done() is True and this is a no-op.
+            # Cancel both background tasks on both normal and exceptional exit.
+            # On the exception path the except block already cleaned them up, so
+            # .done() is True and these are no-ops.
             if self._heartbeat_task and not self._heartbeat_task.done():
                 self._heartbeat_task.cancel()
                 await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+            if self._reprobe_task and not self._reprobe_task.done():
+                self._reprobe_task.cancel()
+                await asyncio.gather(self._reprobe_task, return_exceptions=True)
 
     async def stop(self) -> None:
         """Graceful shutdown: drain queues and resolve all pending Futures."""
@@ -5915,13 +6101,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if self._inflight_req is not None and not self._inflight_req.result.done():
             self._inflight_req.result.set_result(shutdown)
 
-        # Cancel the heartbeat task — it loops independently (no sentinel path).
-        # _running is already False so the loop will not re-enter after the
-        # cancellation; we await it to ensure the task is done before stop() returns.
+        # Cancel background tasks that loop independently (no sentinel path).
+        # _running is already False so the loops will not re-enter after
+        # cancellation; we await each to ensure they are done before stop() returns.
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
+        if self._reprobe_task is not None and not self._reprobe_task.done():
+            self._reprobe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reprobe_task
 
         # Cancel in-flight drift-check detective tasks so their finally blocks run
         # (i.e. _run_drift_check's cleanup_merge_worktree call executes during
@@ -7660,7 +7850,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merge_wt=None,
                         status='REQUEUED',
                     )
-        except RunnerUnavailable:
+        except RunnerUnavailable as exc:
             # Remote transport failure: do NOT clean merge_wt — the item will
             # be re-dispatched on a free host (local fallback) with its worktree
             # intact.  _finalize_inflight calls quarantine_and_release so the
@@ -7674,6 +7864,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 outcome=None,
                 merge_wt=merge_wt,
                 status='RUNNER_UNAVAILABLE',
+                reason=str(exc),
             )
         except Exception as exc:
             logger.info(
@@ -7820,6 +8011,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 _n_failed_val = False  # not a chain failure
                 if entry.lease is not None and self._host_allocator is not None:
                     await self._host_allocator.quarantine_and_release(entry.lease)
+                # ── Unavailability tracker + alarm (task 1795) ──────────────
+                # Record the failure in the per-host streak tracker.  If the
+                # streak reaches the configured threshold (or the time-based
+                # threshold is exceeded via the reprobe loop) fire a dedup'd
+                # L1 'verify_host_unreachable' escalation so an operator is
+                # notified.  The dedup guard (has_open_l1) ensures exactly one
+                # open alarm per host per downtime episode regardless of how
+                # many RU events accumulate.
+                if entry.lease is not None:
+                    _ru_host = entry.lease.name
+                    _ru_reason = vr.reason or '<unknown>'
+                    _ru_now = time.time()  # capture once for consistent timestamps
+                    _should_escalate = self._record_runner_unavailable(
+                        _ru_host, _ru_reason, _ru_now
+                    )
+                    if _should_escalate:
+                        _ru_entry = self._runner_unavailable.get(_ru_host)
+                        _alarm_verify_host_unreachable(
+                            self._escalation_queue,
+                            _ru_host,
+                            _ru_reason,
+                            streak=_ru_entry.streak if _ru_entry is not None else 1,
+                            duration_s=(
+                                _ru_now - _ru_entry.first_unavailable_at
+                                if _ru_entry is not None else 0.0
+                            ),
+                            event_store=self._event_store,
+                        )
                 # Re-merge against actual main and front-insert into _redispatch
                 # so the item is retried before any newer queue arrivals.
                 # The head-failure cascade (fired because this returns False) will
@@ -9061,6 +9280,223 @@ _WARM_COLD_SHADOW_SENTINEL = '__warm_cold_shadow__'
 # Kept DISTINCT from _WARM_COLD_SHADOW_SENTINEL so a divergence alarm and an
 # unparseable-format alarm dedup independently.
 _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL = '__warm_cold_shadow_unparseable__'
+
+# Prefix for per-host verify-unreachable escalation sentinels (task 1795).
+# Each host gets its own sentinel: ``__verify_host_unreachable__<host>``.
+# This keeps divergence-quarantine alarms (DriftDetector) and
+# unreachability alarms (RunnerUnavailable) in separate dedup namespaces.
+_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX = '__verify_host_unreachable__'
+
+# Distinct prefix for recovery info sentinels — kept separate from the
+# unreachable-alarm prefix so a host literally named ``'recovered__X'``
+# cannot alias the unreachable sentinel for host ``'X'``
+# (``'__verify_host_unreachable__recovered__X'`` vs
+#  ``'__verify_host_recovered__X'`` — no collision).
+_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX = '__verify_host_recovered__'
+
+
+def _verify_host_unreachable_sentinel(host: str) -> str:
+    """Return the per-host dedup sentinel task_id for unreachability alarms."""
+    return f'{_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX}{host}'
+
+
+def _alarm_verify_host_unreachable(
+    escalation_queue: Any,
+    host: str,
+    reason: str,
+    *,
+    streak: int,
+    duration_s: float,
+    event_store: Any = None,
+) -> None:
+    """Submit a dedup'd L1 escalation when a remote verify host is persistently unreachable.
+
+    Fires at most ONCE per downtime episode per host (dedup'd via
+    ``has_open_l1(sentinel)``).  Recovery clears the open L1 via
+    :func:`_clear_verify_host_unreachable`.
+
+    The escalation is:
+
+    * ``level=1`` (L1 blocking) — loud (steward→auto-watcher→human ladder)
+      but NON-halting: the merge-halt gate fires only for categories
+      ``wip_conflict`` / ``unmerged_state``; ``verify_host_unreachable`` is
+      intentionally excluded so the serial-local fallback keeps flowing.
+    * ``category='verify_host_unreachable'``
+    * ``task_id=_verify_host_unreachable_sentinel(host)``
+
+    None-safe: returns immediately when *escalation_queue* is None.
+    Dedup: returns immediately when an open L1 already exists for the sentinel.
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        host: Remote runner name (e.g. ``'leo-laptop'``).
+        reason: ``str(exc)`` from the most-recent ``RunnerUnavailable`` exception.
+        streak: Consecutive RunnerUnavailable failure count for this episode.
+        duration_s: Seconds since the first failure in this episode.
+        event_store: Optional event store; when provided a
+            ``EventType.verify_host_unreachable`` event is emitted.
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = _verify_host_unreachable_sentinel(host)
+
+    # Dedup: don't re-alarm while an open L1 already exists for this host.
+    if escalation_queue.has_open_l1(sentinel):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    minutes = duration_s / 60.0
+    duration_str = f'{minutes:.1f} min' if duration_s < 3600 else f'{duration_s / 3600:.1f} h'
+    summary = (
+        f'Remote verify host {host!r} unreachable for {duration_str} '
+        f'({streak} consecutive RunnerUnavailable failures): {reason}'
+    )
+    detail = (
+        f'Host: {host}\n'
+        f'Reason: {reason}\n'
+        f'Consecutive failures: {streak}\n'
+        f'Duration since first failure: {duration_str}\n'
+        '\n'
+        f'The remote verify runner {host!r} has been quarantined after '
+        f'{streak} consecutive RunnerUnavailable failures.  '
+        'The orchestrator is falling back to serial-local verification; '
+        'throughput is degraded but correctness is preserved.\n'
+        '\n'
+        'Auto-reprobe is active: when the host becomes reachable again '
+        '(ssh health check passes) the quarantine is cleared automatically '
+        'and this alarm is resolved without a restart.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-verify-host-monitor',
+        severity='blocking',
+        level=1,
+        category='verify_host_unreachable',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            f'Check SSH connectivity to {host!r}.  '
+            'The auto-reprobe loop will clear the quarantine and resolve this '
+            'alarm once the host responds to `ssh -o BatchMode=yes -o '
+            'ConnectTimeout=10 <host> true`.  '
+            'To manually re-engage: fix SSH access and the orchestrator will '
+            'recover automatically on the next reprobe cycle.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+        event_store.emit(
+            EventType.verify_host_unreachable,
+            data={'host': host, 'reason': reason, 'streak': streak, 'duration_s': duration_s},
+        )
+
+
+def _clear_verify_host_unreachable(
+    escalation_queue: Any,
+    event_store: Any,
+    host: str,
+    *,
+    downtime_s: float,
+) -> None:
+    """Resolve any open unreachability alarm and emit a recovery event.
+
+    Called from :meth:`_reprobe_quarantined_hosts` when a previously unreachable
+    remote verify host responds to an SSH health check again.  Performs three
+    actions:
+
+    1. **Resolve open L1**: looks up all pending escalations for the per-host
+       sentinel (via ``get_by_task(sentinel, status='pending')``) and resolves
+       each one with a recovery message.
+    2. **Emit recovery event** *(conditional)*: emits
+       ``EventType.verify_host_recovered`` when an event store is provided,
+       **only if an alarm was actually open for this host**.
+    3. **Submit info escalation** *(conditional)*: submits a ``severity='info'``,
+       ``level=0`` informational escalation naming the host and the downtime
+       duration, **only if an alarm was actually open for this host**.
+
+    Steps 2 and 3 are gated on whether the escalation queue reports an open L1
+    for the per-host sentinel (checked via ``has_open_l1`` before resolving).
+    This suppresses spurious recovery noise for sub-threshold blips — a host
+    that flapped briefly without ever crossing *escalate_after_n* or
+    *escalate_after_secs* never filed an alarm, so no recovery record is needed.
+
+    None-safe: returns immediately when *escalation_queue* is None.
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        event_store: Optional event store; when provided a
+            ``EventType.verify_host_recovered`` event is emitted.
+        host: Remote runner name (e.g. ``'leo-laptop'``).
+        downtime_s: Seconds the host was unreachable (``now - first_unavailable_at``).
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = _verify_host_unreachable_sentinel(host)
+
+    # Check whether an alarm was actually open before resolving — we read this
+    # BEFORE calling resolve(), which clears the open-L1 flag in many impls.
+    alarm_was_open = escalation_queue.has_open_l1(sentinel)
+
+    # Resolve any pending L1 escalations for this host.
+    pending = escalation_queue.get_by_task(sentinel, status='pending')
+    for esc in pending:
+        resolution = (
+            f'Host {host!r} recovered automatically via SSH reprobe after '
+            f'{downtime_s / 60.0:.1f} min of unavailability.'
+        )
+        escalation_queue.resolve(esc.id, resolution, resolved_by='orchestrator-verify-host-monitor')
+
+    # Only emit recovery signal when an alarm was actually open for this host.
+    # Sub-threshold blips (host flapped briefly without crossing either
+    # escalate_after_n or escalate_after_secs) never filed an alarm, so no
+    # recovery record is needed — emitting one would be spurious audit noise.
+    if not alarm_was_open:
+        return
+
+    # Emit recovery event.
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+        event_store.emit(
+            EventType.verify_host_recovered,
+            data={'host': host, 'downtime_s': downtime_s},
+        )
+
+    # Submit an info-level recovery escalation for audit trail visibility.
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    minutes = downtime_s / 60.0
+    duration_str = f'{minutes:.1f} min' if downtime_s < 3600 else f'{downtime_s / 3600:.1f} h'
+    summary = (
+        f'Remote verify host {host!r} recovered after {duration_str} of unavailability'
+    )
+    detail = (
+        f'Host: {host}\n'
+        f'Downtime: {duration_str}\n'
+        '\n'
+        f'The remote verify runner {host!r} responded to the SSH health check.  '
+        'Quarantine cleared, host re-entered the live pool, and any open '
+        'unreachability alarm resolved.  No restart required.'
+    )
+
+    recovery_sentinel = f'{_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX}{host}'
+    esc = Escalation(
+        id=escalation_queue.make_id(recovery_sentinel),
+        task_id=recovery_sentinel,
+        agent_role='orchestrator-verify-host-monitor',
+        severity='info',
+        level=0,
+        category='verify_host_unreachable',
+        summary=summary,
+        detail=detail,
+    )
+    escalation_queue.submit(esc)
 
 
 def _submit_shadow_divergence_escalation(
