@@ -2347,7 +2347,7 @@ class GitOps:
                 'get_merge_diff_files: git diff %s..%s failed (rc=%s): %s',
                 base_sha, head_sha, rc, (stderr or '').strip()[:200],
             )
-            return [], subprocess.CalledProcessError(rc, cmd, stderr=stderr)
+            return [], subprocess.CalledProcessError(rc, cmd, output=output, stderr=stderr)
         return [f for f in output.strip().splitlines() if f.strip()], None
 
     async def get_files_touched_in_branch(
