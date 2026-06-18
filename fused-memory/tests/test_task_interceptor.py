@@ -4471,15 +4471,17 @@ class TestPathGuardFallbackMetadataFilesNegativeControl:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestPathGuardOrSkip:
-    """Unit tests for TaskInterceptor._path_guard_or_skip.
+    """Unit tests for TaskInterceptor._path_guard_or_skip (now async).
 
     Verifies the helper's contract: dark_factory short-circuit, lazy-build
     of candidate, pass-through of a pre-built candidate, and error propagation.
+    No adjudicator wired — behaviour is identical to the previous sync version.
     """
 
     # -- Case 1 -----------------------------------------------------------
-    def test_path_guard_or_skip_returns_none_for_dark_factory_project(
+    async def test_path_guard_or_skip_returns_none_for_dark_factory_project(
         self,
         interceptor,
         monkeypatch,
@@ -4503,7 +4505,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'Edit orchestrator/harness.py'},
             '/home/leo/src/dark-factory',
             'dark_factory',
@@ -4514,7 +4516,7 @@ class TestPathGuardOrSkip:
         assert guard_calls == [], '_path_guard_check must NOT be called for dark_factory'
 
     # -- Case 2 -----------------------------------------------------------
-    def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
+    async def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
         self,
         interceptor,
         monkeypatch,
@@ -4548,7 +4550,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         kwargs = {'title': 'Generic refactor'}
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             kwargs,
             '/some/project_root',
             'some_other_project',
@@ -4565,7 +4567,7 @@ class TestPathGuardOrSkip:
         assert guard_calls[0][0] is built
 
     # -- Case 3 -----------------------------------------------------------
-    def test_path_guard_or_skip_uses_provided_candidate(
+    async def test_path_guard_or_skip_uses_provided_candidate(
         self,
         interceptor,
         monkeypatch,
@@ -4598,7 +4600,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         kwargs = {'title': 'Generic refactor'}
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             kwargs,
             '/some/project_root',
             'some_other_project',
@@ -4613,7 +4615,7 @@ class TestPathGuardOrSkip:
         assert guard_calls[0][0] is sentinel
 
     # -- Case 4 -----------------------------------------------------------
-    def test_path_guard_or_skip_propagates_rejection(
+    async def test_path_guard_or_skip_propagates_rejection(
         self,
         interceptor,
         monkeypatch,
@@ -4639,7 +4641,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'prompt': 'something'},
             '/some/project_root',
             'some_other_project',
@@ -4655,13 +4657,16 @@ class TestPathGuardOrSkip:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestMultiProjectRoutingWiring:
     """Verify that when prefix_registry + scope_violation_escalator are wired,
     the path guard runs for every project (including dark_factory) and a
     rejection fires the escalator with the expected payload.
+
+    All tests are async (no adjudicator wired — behaviour identical to before).
     """
 
-    def test_registry_supersedes_dark_factory_short_circuit(
+    async def test_registry_supersedes_dark_factory_short_circuit(
         self,
         interceptor,
         monkeypatch,
@@ -4695,7 +4700,7 @@ class TestMultiProjectRoutingWiring:
 
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'Edit something'},
             str(tmp_path / 'dark-factory'),
             'dark_factory',
@@ -4704,7 +4709,7 @@ class TestMultiProjectRoutingWiring:
         assert result is None
         assert check_calls == ['dark_factory']
 
-    def test_rejection_fires_scope_violation_escalator(
+    async def test_rejection_fires_scope_violation_escalator(
         self,
         interceptor,
         monkeypatch,
@@ -4754,7 +4759,7 @@ class TestMultiProjectRoutingWiring:
             lambda self, c, k, p: verdict,
         )
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'Edit fused-memory/X'},
             str(tmp_path / 'reify'),
             'reify',
@@ -4772,7 +4777,7 @@ class TestMultiProjectRoutingWiring:
         # suggested_root resolved from registry.
         assert call['suggested_root'] == str((tmp_path / 'dark-factory').resolve())
 
-    def test_escalator_failure_swallowed(
+    async def test_escalator_failure_swallowed(
         self,
         interceptor,
         monkeypatch,
@@ -4807,13 +4812,257 @@ class TestMultiProjectRoutingWiring:
         )
 
         # Must not raise.
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'crates/widget'},
             '/foo',
             'other',
         )
         assert result is not None
         assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+
+    @pytest.mark.asyncio
+    async def test_stage2_no_hit_adjudicator_not_called(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """NO-HIT hot path: when Stage-1 returns OK, the adjudicator is never called."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        # Fake adjudicator with a spy adjudicate method.
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock()
+        interceptor._path_scope_adjudicator = fake_adj
+
+        # Force OK verdict — no heuristic hit.
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: PathGuardVerdict(outcome='ok', project_id=p),
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'Normal task'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Allowed — no error dict.
+        assert result is None
+        # Adjudicator must NOT have been called on the no-hit path.
+        fake_adj.adjudicate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stage2_hit_reject_returns_error_with_llm_reason(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """HIT + REJECT: adjudicator confirms misroute → error dict returned,
+        escalator called once carrying the adjudicator's llm_reason."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        reject_verdict = AdjudicationVerdict(
+            verdict='reject',
+            reason='genuine misroute — task edits orchestrator/harness.py',
+            llm_used=True,
+        )
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock(return_value=reject_verdict)
+        interceptor._path_scope_adjudicator = fake_adj
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='reify',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'Edit fused-memory/X'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Rejection error dict returned.
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        # Escalator called exactly once with the LLM reason.
+        assert len(escalator_calls) == 1
+        call = escalator_calls[0]
+        assert call['llm_reason'] == 'genuine misroute — task edits orchestrator/harness.py'
+
+    @pytest.mark.asyncio
+    async def test_stage2_hit_failsafe_rejects_and_escalates_with_reason(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """HIT + FAIL-SAFE (uncertain/failed): LLM outage never lets misroute through;
+        escalator is called with llm_reason from the fail-safe verdict."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        # Fail-safe verdict (uncertain + failed — simulates breaker-open / hang).
+        failsafe_verdict = AdjudicationVerdict(
+            verdict='uncertain',
+            reason='breaker-open',
+            failed=True,
+            llm_used=False,
+        )
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock(return_value=failsafe_verdict)
+        interceptor._path_scope_adjudicator = fake_adj
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='other',
+            matched_paths=('crates/',),
+            suggested_project='reify',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'crates/widget'},
+            '/foo',
+            'other',
+        )
+        # Guard preserved — misroute rejected even with LLM outage.
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        # Escalated once, carrying the fail-safe reason.
+        assert len(escalator_calls) == 1
+        assert escalator_calls[0]['llm_reason'] == 'breaker-open'
+
+    @pytest.mark.asyncio
+    async def test_stage2_hit_allow_permits_creation_no_escalation(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """HIT + ALLOW: adjudicator confident allow → creation permitted, no escalation."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        # Adjudicator returns confident allow.
+        allow_verdict = AdjudicationVerdict(
+            verdict='allow',
+            reason='incidental example mention in description',
+            llm_used=True,
+        )
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock(return_value=allow_verdict)
+        interceptor._path_scope_adjudicator = fake_adj
+
+        # Spy escalator — must NOT be called on allow.
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        # Force Stage-1 rejection.
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='reify',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'Task mentioning fused-memory/ as example'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Adjudicator downgraded heuristic hit → creation permitted.
+        assert result is None
+        # Adjudicator was called exactly once.
+        fake_adj.adjudicate.assert_called_once()
+        # Escalator must NOT be called when adjudicator allows.
+        assert escalator_calls == []
 
 
 # ─────────────────────────────────────────────────────────────────────
