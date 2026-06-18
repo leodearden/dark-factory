@@ -887,13 +887,21 @@ class TestTeardownStampClear:
             '_action_teardown_tasks must be cleared once the slot clears'
         )
 
-    async def test_park_stamp_present_during_kill_and_cleared(self, harness: Harness):
-        """park action stamps before cancel and clears after slot clears."""
+    async def test_park_blocked_write_not_stamped(self, harness: Harness):
+        """park does NOT stamp _action_teardown_tasks (target='blocked', no suppression needed).
+
+        A racing workflow _mark_blocked writes the same value (idempotent); stamping would
+        suppress park's OWN write via scheduler _suppress_blocked_write.  So _action_teardown_and_set_status
+        must skip the stamp/clear entirely when target_status=='blocked'.
+
+        Fails: current code stamps unconditionally, so stamped_at_cancel[task_id] is True.
+        """
         stamped_at_cancel: dict[str, bool] = {}
         call_log: list[str] = []
 
         def fake_cancel(tid: str) -> None:
             call_log.append(f'cancel:{tid}')
+            # Record whether the stamp was present at cancel time — expect False for park.
             stamped_at_cancel[tid] = tid in harness._action_teardown_tasks
 
         def fake_is_active(tid: str) -> bool:
@@ -910,20 +918,23 @@ class TestTeardownStampClear:
         esc = _make_esc(
             task_id=task_id,
             resolution_action='park',
-            status='dismissed',
+            status='pending',
             resolved_by='interactive',
-            level=1,
+            level=2,
         )
 
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        assert stamped_at_cancel.get(task_id) is True, (
-            f'task_id must be stamped when cancel_workflow is called for park; '
+        harness.cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
+        # park must NOT stamp: _action_teardown_tasks must be empty at cancel time.
+        assert stamped_at_cancel.get(task_id) is False, (
+            f'task_id must NOT be in _action_teardown_tasks when cancel_workflow is called for park; '
             f'stamped_at_cancel={stamped_at_cancel}'
         )
+        # Counter must remain empty after teardown completes.
         assert task_id not in harness._action_teardown_tasks, (
-            'stamp must be cleared after slot clears'
+            '_action_teardown_tasks must stay empty for park (no stamp/clear)'
         )
 
     async def test_abandon_stamp_cleared_no_crash(self, harness: Harness):
