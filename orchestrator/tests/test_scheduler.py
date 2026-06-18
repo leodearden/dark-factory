@@ -3532,6 +3532,12 @@ class TestBlastRadiusRefinement:
         """Plan scope narrows to a sibling file — the initial lock is freed."""
         lt = scheduler.lock_table
         assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        # The success branch now persists metadata.files when stale is non-empty.
+        # Mock get_task/update_task so the test remains hermetic (no network I/O).
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
         ok = await scheduler.handle_blast_radius_expansion(
             '936',
             current=['crates/reify-compiler/src/lib.rs'],
@@ -3561,6 +3567,12 @@ class TestBlastRadiusRefinement:
         """Plan refines to a mixed set: acquire new, release stale."""
         lt = scheduler.lock_table
         assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        # The success branch persists metadata.files when stale is non-empty.
+        # Mock get_task/update_task so the test remains hermetic (no network I/O).
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
         ok = await scheduler.handle_blast_radius_expansion(
             '936',
             current=['crates/reify-compiler/src/lib.rs'],
@@ -3739,12 +3751,14 @@ class TestBlastRadiusRefinement:
 
     @pytest.mark.asyncio
     async def test_narrowing_emits_set_to_plan_event(self, scheduler: Scheduler):
-        """Narrowing must emit exactly one set_to_plan event after the persist.
+        """A shift (lib.rs → conformance.rs) must emit exactly one set_to_plan
+        event after the persist.
 
         Payload must carry:
           - files: the needed (narrowed) set
-          - released: the stale modules that were released
-          - acquired: empty for a pure narrowing (no new modules needed)
+          - released: the stale modules that were released (lib.rs)
+          - acquired: the additional modules acquired (non-empty for a shift —
+            here, conformance.rs is newly acquired in the same call)
           - persisted: True when update_task succeeds
         """
         lt = scheduler.lock_table
