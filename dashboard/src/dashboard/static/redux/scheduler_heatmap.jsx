@@ -86,6 +86,18 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
     parked_by: parkedByModule[`${m.project || ''}/${m.path}`] || null,
   }));
 
+  // Memoised against `enriched` to avoid the O(n^2 * segments) scan on every
+  // re-render not triggered by a change in module data (e.g. row selection).
+  // Hook MUST run on every render path, so it precedes the early-return guard
+  // below — `rows` legitimately toggles empty/non-empty on a live dashboard,
+  // and a conditionally-called hook would change the hook count and crash.
+  const labelMap = useMemo(
+    () => (window.DF_SCHED_UTILS || {}).disambiguateLabels
+      ? window.DF_SCHED_UTILS.disambiguateLabels(enriched.map(m => m.path))
+      : null,
+    [enriched]
+  );
+
   if (!rows || rows.length === 0) {
     return (
       <div className="sched-empty">
@@ -93,15 +105,6 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
       </div>
     );
   }
-
-  // Memoised against `enriched` to avoid the O(n^2 * segments) scan on every
-  // re-render not triggered by a change in module data (e.g. row selection).
-  const labelMap = useMemo(
-    () => (window.DF_SCHED_UTILS || {}).disambiguateLabels
-      ? window.DF_SCHED_UTILS.disambiguateLabels(enriched.map(m => m.path))
-      : null,
-    [enriched]
-  );
 
   return (
     <div className="sched-heatmap-wrap">
