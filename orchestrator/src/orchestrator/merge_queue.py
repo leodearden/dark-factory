@@ -7896,6 +7896,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 _n_failed_val = False  # not a chain failure
                 if entry.lease is not None and self._host_allocator is not None:
                     await self._host_allocator.quarantine_and_release(entry.lease)
+                # ── Unavailability tracker + alarm (task 1795) ──────────────
+                # Record the failure in the per-host streak tracker.  If the
+                # streak reaches the configured threshold (or the time-based
+                # threshold is exceeded via the reprobe loop) fire a dedup'd
+                # L1 'verify_host_unreachable' escalation so an operator is
+                # notified.  The dedup guard (has_open_l1) ensures exactly one
+                # open alarm per host per downtime episode regardless of how
+                # many RU events accumulate.
+                if entry.lease is not None:
+                    _ru_host = entry.lease.name
+                    _ru_reason = vr.reason or '<unknown>'
+                    _should_escalate = self._record_runner_unavailable(
+                        _ru_host, _ru_reason, time.time()
+                    )
+                    if _should_escalate:
+                        _ru_entry = self._runner_unavailable.get(_ru_host)
+                        _alarm_verify_host_unreachable(
+                            self._escalation_queue,
+                            _ru_host,
+                            _ru_reason,
+                            streak=_ru_entry.streak if _ru_entry is not None else 1,
+                            duration_s=(
+                                time.time() - _ru_entry.first_unavailable_at
+                                if _ru_entry is not None else 0.0
+                            ),
+                            event_store=self._event_store,
+                        )
                 # Re-merge against actual main and front-insert into _redispatch
                 # so the item is retried before any newer queue arrivals.
                 # The head-failure cascade (fired because this returns False) will
