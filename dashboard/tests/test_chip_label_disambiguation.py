@@ -341,3 +341,31 @@ class TestTabSchedulerJsxModulesViewWiring:
         assert '{m.path}' in tab_scheduler_jsx_body, (
             '{m.path} not found in tab_scheduler.jsx — secondary full-path text removed'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-13: Source-structure tests for tab_curator.jsx (ticket-files ChipList)
+# (RED because tab_curator.jsx still renders f.split('/').pop())
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def tab_curator_jsx_body(_client):
+    return _client.get('/static/redux/tab_curator.jsx').text
+
+
+class TestTabCuratorJsxFileChipWiring:
+    def test_f_basename_removed(self, tab_curator_jsx_body):
+        assert "f.split('/').pop()" not in tab_curator_jsx_body, (
+            "f.split('/').pop() still present in tab_curator.jsx — should be replaced"
+        )
+
+    def test_disambiguate_labels_routed(self, tab_curator_jsx_body):
+        assert 'disambiguateLabels(' in tab_curator_jsx_body, (
+            'disambiguateLabels( not found in tab_curator.jsx — wiring missing'
+        )
+
+    def test_full_key_title_preserved(self, tab_curator_jsx_body):
+        # The file chip must still have title={f}
+        assert 'title={f}' in tab_curator_jsx_body, (
+            'title={f} not found in tab_curator.jsx — full key hover removed'
+        )
