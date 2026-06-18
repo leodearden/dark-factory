@@ -238,6 +238,39 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     """)
 
 
+def _warn_malformed_metadata_once(
+    project_root: str,
+    tag: str,
+    task_id: int,
+    metadata_raw: str,
+    *,
+    resolution: str,
+) -> None:
+    """Emit a deduped WARNING for a malformed metadata JSON blob.
+
+    Owned by the module-level ``_warned_malformed_task_ids`` set, keyed by
+    ``(project_root, tag, task_id)``.  Warns at most once per distinct triple
+    per process, regardless of whether the access came from the read path
+    (``_row_to_task``) or a write path (``_merge_metadata``).
+
+    ``resolution`` is appended after the semicolon; ``'coerced to {}'``
+    reproduces the pre-existing ``_row_to_task`` message verbatim so the
+    four covering WARNING-assertion tests remain green across the extraction.
+    """
+    dedup_key = (project_root, tag, task_id)
+    if dedup_key not in _warned_malformed_task_ids:
+        _warned_malformed_task_ids.add(dedup_key)
+        logger.warning(
+            'sqlite_task_backend: malformed metadata JSON — project_root=%s'
+            ' tag=%s id=%s metadata_raw=%s; %s',
+            project_root,
+            tag,
+            task_id,
+            repr(metadata_raw)[:80],
+            resolution,
+        )
+
+
 def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: str) -> dict[str, Any]:
     """Convert a tasks-table row into the get_tasks/get_task wire dict.
 
@@ -254,17 +287,10 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
             # `(task.get('metadata') or {}).get(...)` callers never see a str.
             # WARN once per (project_root, tag, id) per process so a corrupted-row
             # batch doesn't fan out to one log line per row per get_tasks call.
-            dedup_key = (project_root, row['tag'], row['id'])
-            if dedup_key not in _warned_malformed_task_ids:
-                _warned_malformed_task_ids.add(dedup_key)
-                logger.warning(
-                    'sqlite_task_backend: malformed metadata JSON — project_root=%s'
-                    ' tag=%s id=%s metadata_raw=%s; coerced to {}',
-                    project_root,
-                    row['tag'],
-                    row['id'],
-                    repr(metadata_raw)[:80],
-                )
+            _warn_malformed_metadata_once(
+                project_root, row['tag'], row['id'], metadata_raw,
+                resolution='coerced to {}',
+            )
             metadata = {}
 
     return {
@@ -838,8 +864,15 @@ class SqliteTaskBackend:
                 set_values.append(new_details)
 
             if metadata is not None:
+                # Behavior note: on append=True, _merge_metadata RAISES
+                # TaskmasterError if the stored blob is corrupt — preventing a
+                # silent clobber.  The _txn wrapper rolls back, leaving the
+                # original bytes intact.  To repair a corrupt row, call
+                # update_task with append=False (explicit replace, which
+                # bypasses the merge path and overwrites unconditionally).
                 new_metadata = _merge_metadata(
                     row['metadata'], metadata, append=append,
+                    project_root=project_root, tag=tag, task_id=tid,
                 )
                 set_columns.append('metadata = ?')
                 set_values.append(new_metadata)
@@ -1018,10 +1051,19 @@ class SqliteTaskBackend:
                         'TASKMASTER_TOOL_ERROR',
                         f'No tasks found for ID(s): {tid}',
                     )
+                # If the stored blob is corrupt, _merge_metadata raises
+                # TaskmasterError (propagates through _txn → rollback → no
+                # write).  This is intentionally ASYMMETRIC with
+                # remove_dependency, which returns a non-removal message
+                # rather than raising: a merge into a corrupt blob would
+                # clobber (must refuse), while a remove is idempotent and
+                # the dep is provably absent in an unparseable blob (no
+                # write needed, accurate message suffices).
                 new_meta = _merge_metadata(
                     row['metadata'],
                     json.dumps({'external_deps': [canonical]}),
                     append=True,
+                    project_root=project_root, tag=tag, task_id=tid,
                 )
                 await conn.execute(
                     'UPDATE tasks SET metadata = ?, updated_at = ? '
@@ -1103,7 +1145,29 @@ class SqliteTaskBackend:
                     try:
                         meta = json.loads(row['metadata'] or '{}')
                     except (TypeError, ValueError):
-                        meta = {}
+                        # Corrupt stored blob: warn once via the shared gate and
+                        # return an accurate message — do NOT claim removal, do
+                        # NOT write (blob left intact).
+                        #
+                        # Intentionally does NOT raise (contrast with
+                        # add_dependency, which raises on a corrupt blob):
+                        # remove is idempotent — the dep is provably absent
+                        # in an unparseable blob, so no write is needed and
+                        # an accurate return value is the right signal.
+                        # add_dependency must refuse because a merge into a
+                        # corrupt blob would clobber external_deps.
+                        _warn_malformed_metadata_once(
+                            project_root, tag, tid, row['metadata'] or '',
+                            resolution='remove_dependency skipped — corrupt blob left intact',
+                        )
+                        return {
+                            'id': str(tid),
+                            'dependency_id': canonical,
+                            'message': (
+                                f'Could not remove external dependency {canonical} from task {tid}:'
+                                f' metadata blob is corrupt and was left intact.'
+                            ),
+                        }
                     existing = meta.get('external_deps', [])
                     if canonical in existing:
                         updated = [e for e in existing if e != canonical]
@@ -1250,7 +1314,15 @@ def _normalize_legacy_memory_hints_value(value: object) -> object:
     return {"entities": entities, "queries": queries}
 
 
-def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) -> str:
+def _merge_metadata(
+    existing_raw: str | None,
+    incoming: str,
+    *,
+    append: bool,
+    project_root: str | None = None,
+    tag: str | None = None,
+    task_id: int | None = None,
+) -> str:
     """Merge ``incoming`` metadata JSON into ``existing_raw``.
 
     When ``append=True`` the merge is additive and recursive:
@@ -1277,8 +1349,29 @@ def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) ->
     """
     if existing_raw is None or not append:
         return incoming
+    # Parse the existing blob first so a corrupt EXISTING blob is distinguishable
+    # from a corrupt incoming blob — the two cases have different semantics.
     try:
         old = json.loads(existing_raw)
+    except (TypeError, ValueError) as err:
+        # Corrupt EXISTING blob on the append path: refuse to clobber.
+        # Warn once through the shared dedup gate when context is available.
+        if project_root is not None and tag is not None and task_id is not None:
+            _warn_malformed_metadata_once(
+                project_root, tag, task_id, existing_raw,
+                resolution='refused metadata merge — original bytes preserved',
+            )
+        raise TaskmasterError(
+            'TASKMASTER_TOOL_ERROR',
+            f'Task {task_id} has a corrupt metadata blob; refusing to overwrite it '
+            f'(original bytes preserved).',
+            raw=existing_raw,
+        ) from err
+    # Corrupt INCOMING blob: intentionally last-write-wins (pre-existing
+    # Taskmaster fallback behaviour).  Callers normally pass json.dumps(…)
+    # so a corrupt incoming string is unlikely in practice; validating it
+    # before persisting is a potential follow-up, out of scope here.
+    try:
         new = json.loads(incoming)
     except (TypeError, ValueError):
         return incoming

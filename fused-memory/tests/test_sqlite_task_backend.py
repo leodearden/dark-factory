@@ -1730,3 +1730,261 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
     assert result_c == {'tasks': []}, (
         f'Expected empty tasks list for statuses=[], got: {result_c}'
     )
+
+
+# ── Corrupt-blob refusal tests (task 1813) ──────────────────────────────
+
+
+# Shared corrupt blob constant: invalid JSON that still contains the
+# external_deps substring so tests can assert it survives unchanged.
+_CORRUPT_BLOB = '{"external_deps": ["dark_factory:42"], BROKEN'
+
+
+def test_merge_metadata_refuses_to_clobber_corrupt_existing_blob():
+    """_merge_metadata must raise TaskmasterError when the EXISTING blob is
+    corrupt JSON and append=True — it must NOT return incoming and clobber.
+
+    Also locks the two escape hatches:
+    - append=False always returns incoming (last-write-wins; the sanctioned
+      repair path — caller explicitly chose to replace the corrupt row).
+    - existing_raw=None + append=True returns incoming (no existing data to
+      preserve).
+
+    RED: current code's ``except (TypeError, ValueError): return incoming``
+    returns incoming on the append path instead of raising TaskmasterError.
+    After step-2 the kwargs ``project_root/tag/task_id`` are added to
+    ``_merge_metadata`` and the corrupt-existing branch raises.
+    """
+    incoming = json.dumps({"note": "x"})
+
+    # (a) Main assertion: corrupt existing + append=True must raise TaskmasterError.
+    with pytest.raises(TaskmasterError) as exc:
+        _merge_metadata(
+            _CORRUPT_BLOB, incoming, append=True,
+            project_root='/p', tag='master', task_id=1,
+        )
+    assert exc.value.raw == _CORRUPT_BLOB, (
+        f'Expected exc.value.raw == _CORRUPT_BLOB (original bytes preserved as '
+        f'distinguishable signal), got: {exc.value.raw!r}'
+    )
+
+    # (b) Escape hatch: append=False must return incoming (explicit replace —
+    #     the sanctioned path to repair a corrupt row).
+    result_replace = _merge_metadata(_CORRUPT_BLOB, incoming, append=False)
+    assert result_replace == incoming
+
+    # (c) No-op escape hatch: existing_raw=None + append=True returns incoming.
+    result_none = _merge_metadata(None, incoming, append=True)
+    assert result_none == incoming
+
+
+@pytest.mark.asyncio
+async def test_update_task_refuses_to_clobber_corrupt_metadata(
+    backend, project_root, caplog,
+):
+    """update_task raises TaskmasterError and emits exactly one deduped
+    malformed-metadata WARNING when the stored blob is corrupt and append=True.
+    The stored metadata column must be byte-for-byte unchanged after the
+    refused write (external_deps substring survives).
+
+    Setup deliberately avoids a read-path access before the write so the
+    dedup slot is not pre-consumed by _row_to_task.
+
+    RED after step-2: _merge_metadata raises (so raises+bytes-preserved
+    assertions pass) but update_task passes no context kwargs to _merge_metadata
+    → _warn_malformed_metadata_once is not called → zero WARNINGs → the
+    warn-count assertion fails.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    # Directly inject a corrupt blob WITHOUT reading the row first.
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ), pytest.raises(TaskmasterError):
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'note': 'incoming'}),
+            append=True,
+        )
+
+    # Exactly one deduped malformed-metadata WARNING must have been emitted.
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly one malformed-metadata WARNING; got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
+
+    # The original corrupt blob must be byte-for-byte unchanged (no overwrite).
+    # Use raw SQL — NOT get_task — so _row_to_task does not pollute the
+    # WARNING count or hide the raw bytes via its own coercion path.
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute(
+        'SELECT metadata FROM tasks WHERE id = 1',
+    )
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'Expected metadata unchanged (corrupt blob preserved); got: {row["metadata"]!r}'
+    )
+    assert 'dark_factory:42' in row['metadata'], (
+        f'Expected external_deps substring in preserved metadata; got: {row["metadata"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_qualified_refuses_corrupt_metadata(
+    backend, project_root, caplog,
+):
+    """add_dependency raises TaskmasterError and emits exactly one deduped
+    malformed-metadata WARNING when the stored metadata blob is corrupt,
+    leaving the blob byte-for-byte unchanged (the new dep was NOT added).
+
+    RED after step-4: _merge_metadata raises (raises+bytes-preserved pass)
+    but add_dependency's qualified path passes no context kwargs to
+    _merge_metadata → zero WARNINGs → warn-count assertion fails.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ), pytest.raises(TaskmasterError):
+        await backend.add_dependency(
+            '1', 'dark_factory:13', project_root=project_root,
+        )
+
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly one malformed-metadata WARNING; got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
+
+    # The new external dep must NOT have been added; original blob unchanged.
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute('SELECT metadata FROM tasks WHERE id = 1')
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'Expected metadata unchanged; got: {row["metadata"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_dependency_qualified_warns_and_does_not_falsely_claim_removal(
+    backend, project_root, caplog,
+):
+    """remove_dependency warns once and returns an accurate DependencyResult
+    (NOT claiming clean removal) when the stored metadata blob is corrupt.
+    The blob must remain byte-for-byte unchanged (no write occurs).
+
+    RED: current except sets meta={}, finds nothing to remove, then returns
+    the false 'Removed external dependency: …' message with no WARNING.
+    After step-8 the except block warns via the shared gate and returns an
+    accurate message that does NOT start with 'Removed external dependency'.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        result = await backend.remove_dependency(
+            '1', 'dark_factory:13', project_root=project_root,
+        )
+
+    # Exactly one deduped malformed-metadata WARNING.
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly one malformed-metadata WARNING; got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
+
+    # Result message must NOT falsely claim the dep was removed.
+    assert 'Removed external dependency' not in result['message'], (
+        f'Result message falsely claims removal: {result["message"]!r}'
+    )
+    # Message should convey the blob was left intact / could not remove.
+    msg_lower = result['message'].lower()
+    assert 'corrupt' in msg_lower or 'intact' in msg_lower, (
+        f'Result message should convey blob left intact; got: {result["message"]!r}'
+    )
+
+    # Blob is byte-for-byte unchanged.
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute('SELECT metadata FROM tasks WHERE id = 1')
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'Expected metadata unchanged; got: {row["metadata"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
+    backend, project_root, caplog,
+):
+    """The shared _warned_malformed_task_ids set deduplicates across the read
+    and write paths: a read via get_task followed by a write via update_task
+    on the SAME (project_root, tag='master', id=1) produces exactly ONE
+    malformed-metadata WARNING total.
+
+    Locks the 'unify onto the extracted handler, don't duplicate' directive:
+    a regression that gave the write path a separate dedup set would yield
+    2 WARNING records and fail this assertion.
+
+    Behavior delivered by steps 2+4; this step adds no production code.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        # Read path warns once via _row_to_task → _warn_malformed_metadata_once.
+        await backend.get_task('1', project_root=project_root)
+
+        # Write path on the same (project_root, master, 1) — the dedup key
+        # was already added above, so the shared gate skips the second WARN.
+        with pytest.raises(TaskmasterError):
+            await backend.update_task(
+                '1', project_root=project_root,
+                metadata=json.dumps({'x': 1}),
+                append=True,
+            )
+
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly 1 malformed-metadata WARNING (deduped across '
+        f'read+write paths on same key); got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
