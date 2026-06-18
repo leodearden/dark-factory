@@ -75,9 +75,18 @@ class MemoryConsolidator(BaseStage):
     _entity_summary_snapshot_lines_stripped: int = 0
 
     # Fetch degraded sources for the current run — reset at the top of assemble_payload
-    # and copied to report.stats['stage1_fetch_degraded'] in run() (task 1812).
-    # Empty list = genuine empty corpus; non-empty = fetch failure on that source.
-    _fetch_degraded_sources: list = []
+    # and _format_assembled_payload; copied to report.stats['stage1_fetch_degraded'] in run()
+    # (task 1812). Empty list = genuine empty corpus; non-empty = fetch failure on that source.
+    # Initialized per-instance in __init__ to avoid the shared-mutable-default hazard.
+    _fetch_degraded_sources: list
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-instance initialisation: avoids shared-mutable-default hazard.
+        # A class-level [] would be mutated in-place by any append() that ran before
+        # the run-local reset in assemble_payload / _format_assembled_payload, leaking
+        # state across all instances (and across reused-instance runs).
+        self._fetch_degraded_sources: list = []
 
     async def run(
         self,
@@ -316,15 +325,7 @@ class MemoryConsolidator(BaseStage):
             ]
 
         # 3. Store stats
-        try:
-            status = await self.memory.get_status(project_id=self.project_id)
-        except Exception as e:
-            logger.warning(
-                'reconciliation.stage1_status_fetch_failed',
-                extra={'project_id': self.project_id, 'error': str(e)},
-            )
-            status = {}
-            self._fetch_degraded_sources.append('status')
+        status = await self._fetch_status()
 
         # 4. Events summary
         event_summary = _format_events(events)
@@ -392,18 +393,37 @@ Review the above data and perform memory consolidation:
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
+    async def _fetch_status(self) -> dict:
+        """Fetch store status, logging a WARNING and tracking degradation on failure.
+
+        Single source of truth for the status-fetch try/except that both
+        assemble_payload (legacy time-windowed path) and _format_assembled_payload
+        (assembled/token-budget path) share.  The caller is responsible for resetting
+        self._fetch_degraded_sources before calling this method.
+        """
+        try:
+            return await self.memory.get_status(project_id=self.project_id)
+        except Exception as e:
+            logger.warning(
+                'reconciliation.stage1_status_fetch_failed',
+                extra={'project_id': self.project_id, 'error': str(e)},
+            )
+            self._fetch_degraded_sources.append('status')
+            return {}
+
     async def _format_assembled_payload(self, watermark: Watermark) -> str:
         """Format a payload from ContextAssembler output — event-driven context."""
         ap = self.assembled_payload
         assert ap is not None
 
+        # assemble_payload's line-262 reset is bypassed by the early return at lines 250-251.
+        # Reset here so each assembled-path call starts clean (no leak from a prior run).
+        self._fetch_degraded_sources = []
+
         event_summary = _format_events(ap.events)
 
         # Store status (cheap fetch, always useful)
-        try:
-            status = await self.memory.get_status(project_id=self.project_id)
-        except Exception:
-            status = {}
+        status = await self._fetch_status()
 
         # Prior S3 findings
         prior_s3_section = ''
