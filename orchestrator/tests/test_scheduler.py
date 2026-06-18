@@ -7768,6 +7768,102 @@ class TestAcquireNextDepBackfillFromGetStatuses:
 
 
 # ---------------------------------------------------------------------------
+# TestAcquireNextLocalBackfillFailsSafe (task 1807 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextLocalBackfillFailsSafe:
+    """acquire_next() must fail-safe-wait + emit WARNING when the dep-backfill get_statuses degrades.
+
+    Drives a full acquire_next() tick via mocked ``dispatch_tool`` (not
+    ``get_statuses`` directly) so the real ``get_statuses`` parse is exercised:
+
+    - ``get_tasks`` returns pending B with local dep A.
+    - ``get_statuses`` is fed a malformed response (non-dict 'statuses') so the
+      real method returns ``({}, EnvelopeParseError)``.
+    - The backfill failure must be VISIBLE: ``orchestrator.scheduler`` WARNING
+      naming the degraded dep ids, and ``_local_backfill_unresolved_counts``
+      bumped for ``('B', 'A')``.
+    - B remains held (fail-safe-wait) — NOT dispatched.
+
+    Fails today: ``_backfill_err`` is ignored → no scheduler WARNING, no
+    counter (silent strand).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_malformed_backfill_emits_warning_and_holds_task(
+        self, scheduler: Scheduler, caplog
+    ):
+        """Malformed get_statuses response → WARNING + counter bump + B not dispatched.
+
+        Fails today: _backfill_err is ignored → no WARNING from orchestrator.scheduler,
+        no _local_backfill_unresolved_counts attribute.
+        """
+        import logging
+
+        task_b = {
+            'id': 'B',
+            'title': 'Task B — depends on A',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['backend/module_b']},
+        }
+
+        async def _dispatch(tool_name, arguments, **kwargs):
+            if tool_name == 'get_tasks':
+                # Valid response: only B is active (A is done, absent from active fetch).
+                return self._envelope({'tasks': [task_b]})
+            if tool_name == 'get_statuses':
+                # Malformed: 'statuses' is a list, not a dict → real get_statuses
+                # returns ({}, EnvelopeParseError).
+                return self._envelope({'statuses': ['not', 'a', 'dict']})
+            return {}
+
+        scheduler.dispatch_tool = AsyncMock(side_effect=_dispatch)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler.acquire_next()
+
+        # B must NOT be dispatched — fail-safe-wait (dep A status unknown).
+        assert result is None, (
+            f'Expected None (fail-safe-wait) but got task_id={result.task_id!r}; '
+            'backfill failure should hold B, not dispatch it'
+        )
+
+        # orchestrator.scheduler must emit a WARNING naming the backfill degradation.
+        sched_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.scheduler'
+        ]
+        assert sched_warnings, (
+            'Expected a WARNING from orchestrator.scheduler about backfill degradation; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+
+        # _local_backfill_unresolved_counts must be bumped for (B, A).
+        assert hasattr(scheduler, '_local_backfill_unresolved_counts'), (
+            '_local_backfill_unresolved_counts attribute must exist after backfill failure'
+        )
+        count = scheduler._local_backfill_unresolved_counts.get(('B', 'A'), 0)
+        assert count >= 1, (
+            f'Expected _local_backfill_unresolved_counts[(B, A)] >= 1; got {count}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-7 RED: bookkeeping purged for tasks absent from active fetch (not only terminal)
 # ---------------------------------------------------------------------------
 
