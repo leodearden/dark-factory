@@ -78,6 +78,40 @@ class SubstrateVerdict:
 # ---------------------------------------------------------------------------
 
 
+def carries_substrate_probe(task: dict[str, Any]) -> bool:
+    """Return True iff the task dict declares a ``substrate_probe`` key in metadata.
+
+    Uses the same JSON-string→dict coercion as ``extract_probe_set`` so the
+    predicate is robust to the fused-memory wire format (metadata may arrive as
+    a dict, a JSON string, or absent/None).
+
+    Returns True when:
+    - ``task['metadata']`` is a dict (or JSON string that decodes to a dict)
+    - the dict contains ``'substrate_probe'`` as a key (regardless of its value)
+
+    Returns False in all other cases (no metadata, non-dict, parse error).
+
+    Used by ``run_substrate_recheck`` to distinguish "probe declared but malformed"
+    (should fail CLOSED) from "probe genuinely absent" (should SKIP).
+    """
+    raw = task.get('metadata')
+
+    # Coerce JSON string to dict (mirrors extract_probe_set / Scheduler._normalize)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        raw = parsed
+
+    if not isinstance(raw, dict):
+        return False
+
+    return 'substrate_probe' in raw
+
+
 def extract_probe_set(task: dict[str, Any]) -> dict[str, Any] | None:
     """Extract the ``substrate_probe`` descriptor from a task dict, or None.
 
@@ -227,8 +261,23 @@ def run_substrate_recheck(
 
     descriptor = extract_probe_set(task)
 
-    # --- No descriptor → SKIP (gate no-op) ---
+    # --- No descriptor → SKIP or FLIP (fail-closed) ---
     if descriptor is None:
+        if carries_substrate_probe(task):
+            # substrate_probe key is PRESENT but malformed (not a dict, or missing/
+            # empty probe_set) — fail CLOSED to prevent silently skipping the gate.
+            logger.warning(
+                'substrate_gate: task %r declares substrate_probe but descriptor is '
+                'malformed — failing closed (verdict=FLIP)',
+                task.get('id'),
+            )
+            return SubstrateVerdict(
+                verdict=FLIP,
+                exit_code=None,
+                checker_argv=None,
+                probe_set=None,
+                reason='substrate_probe declared but malformed — failing closed',
+            )
         return SubstrateVerdict(
             verdict=SKIP,
             exit_code=None,
