@@ -31,3 +31,28 @@ class TestExtractAgentVerdictWarningKey:
         assert any('no_tool_calls' in r.message for r in warning_records), (
             f'no WARNING record contained token "no_tool_calls"; records: {[r.message for r in warning_records]}'
         )
+
+
+class TestExtractAgentVerdictHappyPath:
+    """Success path: dict with truthy 'verdict' — must return real verdict silently."""
+
+    def test_happy_path_returns_real_verdict_silently(self, caplog):
+        """{'verdict': 'confirmed', ...} → AgentVerdict with real verdict, no WARNING."""
+        payload = {'verdict': 'confirmed', 'summary': 'looks good', 'confidence': 0.9}
+        with caplog.at_level(logging.WARNING):
+            result = extract_agent_verdict(
+                payload,
+                default_verdict='ERROR',
+                error_summary='unused',
+            )
+
+        assert isinstance(result, AgentVerdict)
+        assert result.verdict == 'confirmed'
+        assert result.summary == 'looks good'
+        assert result.failed is False
+        assert result.raw == payload, 'raw must pass the full input dict through'
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'success path must emit NO WARNING; got: {[r.message for r in warning_records]}'
+        )
