@@ -11,6 +11,7 @@ version = "0.1.0"
 description = "Escalation MCP server — agents escalate issues they can't solve at their scope"
 requires-python = ">=3.11,<4"
 dependencies = [
+    "dark-factory-shared",
     "fastmcp>=2.0",
     "inotify_simple>=1.3",
     "uvicorn>=0.30",
@@ -32,6 +33,7 @@ dev = [
 ]
 
 [tool.uv.sources]
+dark-factory-shared = { workspace = true }
 orchestrator = { workspace = true }
 
 [tool.pytest.ini_options]
@@ -44,7 +46,7 @@ timeout_method = "signal"
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "tests"]
+extraPaths = ["src", "tests", "../shared/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 
