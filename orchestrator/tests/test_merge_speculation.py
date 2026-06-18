@@ -53,10 +53,13 @@ from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run  # noqa: F401
 from orchestrator.merge_queue import (  # noqa: F401
     SpeculativeMergeWorker,
+    SpeculativeItem,
     _acquire_warm_verify_worktree,
     _maybe_schedule_shadow_compare,
+    _run_cold_shadow_verify,
     _submit_shadow_divergence_escalation,
 )
+from orchestrator.verify import VerifyResult  # noqa: F401
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 
 # ---------------------------------------------------------------------------
@@ -609,3 +612,214 @@ class TestAcquireWarmVerifyWorktreeSpecRouting:
         path, warm = result
         assert path == lane_path
         assert warm is True
+
+
+# ===========================================================================
+# Step-15: RED — spec-lane warm verify feeds shadow safety valve (parity case)
+# ===========================================================================
+
+
+def _make_minimal_worker(tmp_path: Path) -> SpeculativeMergeWorker:
+    """Build a SpeculativeMergeWorker with a mock git_ops for _run_inflight_verify tests.
+
+    Sets ``project_root`` on the mock so ``_shadow_state_path`` resolves to a
+    real path under ``tmp_path`` (enabling ``_maybe_schedule_shadow_compare``
+    cadence state persistence).  All git operations are left as MagicMock so
+    no real worktree I/O occurs in the test.
+    """
+    mock_git_ops = MagicMock()
+    mock_git_ops.project_root = tmp_path
+    return SpeculativeMergeWorker(mock_git_ops, asyncio.Queue())
+
+
+def _make_spec_item(
+    tmp_path: Path,
+    cfg: OrchestratorConfig,
+    *,
+    speculative: bool = True,
+) -> SpeculativeItem:
+    """Build a minimal SpeculativeItem for _run_inflight_verify tests.
+
+    Uses a real asyncio.Future for ``req.result`` so ``_request_abandoned``
+    (which checks ``.cancelled()``) returns False — preventing the abort path.
+    The merge_wt is a real directory so path comparison works correctly.
+    """
+    result_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    fake_req = MagicMock()
+    fake_req.task_id = 'task-spec-shadow-15'
+    fake_req.config = cfg
+    fake_req.result = result_fut
+
+    merge_wt = tmp_path / '_merge-abc'
+    merge_wt.mkdir(parents=True, exist_ok=True)
+
+    return SpeculativeItem(
+        request=fake_req,
+        merge_result=MagicMock(merge_commit='deadbeef01234567890a'),
+        merge_wt=merge_wt,
+        base_sha='aabbccdd00000000aaaa',
+        speculative=speculative,
+        skip_verify=False,
+    )
+
+
+@pytest.mark.asyncio
+class TestSpecLaneWarmPathShadowParity:
+    """Spec-lane warm verify must feed _maybe_schedule_shadow_compare (parity case).
+
+    The existing shadow safety valve (κ invariant 6) is already wired in the
+    speculative finalize path (merge_queue.py:8137) and fires when
+    ``warm_results`` is non-empty.  For this to cover spec-lane verifies,
+    ``_is_warm_path`` must be True when ``_spec_warm=True``
+    (task η step-16 extends the predicate).
+
+    Until step-16 (GREEN): ``_is_warm_path = persistent_merge_worktree and not _due``
+    is False for the spec-pool-only config (``persistent_merge_worktree=False``),
+    so ``on_result=None`` → ``_warm_capture`` empty → ``warm_results={}``
+    → shadow no-ops → these tests FAIL (RED).
+    """
+
+    async def test_spec_lane_warm_results_captured(self, tmp_path: Path):
+        """warm_results in InflightVerifyResult must be non-empty for spec-lane warm verify.
+
+        RED: _is_warm_path=False → on_result=None → _warm_capture empty → warm_results={}.
+        GREEN (step-16): _is_warm_path extended to include spec lane → populated.
+        """
+        # Config: spec pool on, shadow on, NO persistent worktree for serial head.
+        # _is_warm_path must be True from the spec-lane path, not persistent_merge_worktree.
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            git=_make_spec_git_config(
+                on=True,
+                warm_verify_shadow_compare=True,
+                warm_verify_shadow_compare_every_n_merges=1,
+            ),
+        )
+        worker = _make_minimal_worker(tmp_path)
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+
+        # Fake VerifyResult with parseable per-test output
+        fake_vr = VerifyResult(
+            passed=True,
+            test_output='        PASS [0.05s] spec::test_warm_shadow\n',
+            lint_output='',
+            type_output='',
+            summary='',
+        )
+
+        # Mock verify: invoke on_result callback if provided (simulates warm capture).
+        # When _is_warm_path=True, on_result=_warm_capture.append is passed.
+        # When _is_warm_path=False, on_result=None → callback never invoked.
+        async def _mock_verify(*args, **kwargs):
+            on_result = kwargs.get('on_result')
+            if on_result is not None:
+                on_result(fake_vr)
+            return None  # verify passed
+
+        # Fake spec lane (spec pool is on, acquire returns this path as warm)
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        with patch(
+            'orchestrator.merge_queue._acquire_warm_verify_worktree',
+            new=AsyncMock(return_value=(fake_lane, True)),
+        ), patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            new=_mock_verify,
+        ):
+            vr = await worker._run_inflight_verify(item, _make_local_lease())
+
+        # RED: warm_results={} because _is_warm_path=False ignores _spec_warm
+        # GREEN (step-16): warm_results={'spec::test_warm_shadow': 'pass'}
+        assert vr.warm_results, (
+            'spec-lane warm verify must populate warm_results so the shadow '
+            'safety valve can compare warm vs cold per-test; '
+            f'got warm_results={vr.warm_results!r}'
+        )
+
+    async def test_spec_lane_parity_shadow_fires_no_escalation(self, tmp_path: Path):
+        """Shadow fires for spec-lane warm verify; warm==cold → no escalation.
+
+        RED: warm_results={} → _maybe_schedule_shadow_compare no-ops →
+        cold verify NOT called → assertion on cold_verify_calls fails.
+        GREEN (step-16): warm_results populated → shadow fires → cold called →
+        parity → escalation_queue.submit not called.
+        """
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            git=_make_spec_git_config(
+                on=True,
+                warm_verify_shadow_compare=True,
+                warm_verify_shadow_compare_every_n_merges=1,  # always due
+            ),
+        )
+        worker = _make_minimal_worker(tmp_path)
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+
+        fake_vr = VerifyResult(
+            passed=True,
+            test_output='        PASS [0.05s] spec::test_warm_shadow\n',
+            lint_output='',
+            type_output='',
+            summary='',
+        )
+
+        async def _mock_verify(*args, **kwargs):
+            on_result = kwargs.get('on_result')
+            if on_result is not None:
+                on_result(fake_vr)
+            return None
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        cold_verify_calls: list[tuple] = []
+
+        # Cold verify returns SAME results as warm (parity case)
+        async def _mock_cold_shadow_verify(*args, **kwargs):
+            cold_verify_calls.append(args)
+            return {'spec::test_warm_shadow': 'pass'}  # parity with warm
+
+        escalation_queue = _make_escalation_queue()
+
+        with patch(
+            'orchestrator.merge_queue._acquire_warm_verify_worktree',
+            new=AsyncMock(return_value=(fake_lane, True)),
+        ), patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            new=_mock_verify,
+        ), patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify',
+            new=_mock_cold_shadow_verify,
+        ):
+            vr = await worker._run_inflight_verify(item, _make_local_lease())
+
+            # Drive _maybe_schedule_shadow_compare with the captured warm_results
+            await _maybe_schedule_shadow_compare(
+                worker,
+                worker._git_ops,
+                item.request,
+                'deadbeef01234567890a',
+                warm_results=vr.warm_results,
+                escalation_queue=escalation_queue,
+                event_store=None,
+            )
+            # Drain the background shadow task (if one was spawned)
+            if worker._shadow_compare_tasks:
+                await asyncio.gather(*list(worker._shadow_compare_tasks))
+
+        # RED: cold_verify_calls=[] (shadow never ran; warm_results empty)
+        # GREEN (step-16): cold_verify_calls non-empty (shadow ran on spec-lane warm result)
+        assert cold_verify_calls, (
+            'shadow safety valve must run cold verify for spec-lane warm verify; '
+            'spec-lane not treated as warm path → warm_results={} → shadow no-ops'
+        )
+        # Parity: no escalation submitted
+        escalation_queue.submit.assert_not_called()
+
+
+def _make_local_lease() -> MagicMock:
+    """Build a mock HostLease with is_local=True for _run_inflight_verify tests."""
+    lease = MagicMock()
+    lease.is_local = True
+    return lease
