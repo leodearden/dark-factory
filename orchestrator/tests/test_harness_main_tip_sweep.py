@@ -124,3 +124,56 @@ class TestRunMainTipSweepHarness:
         assert 'test_failure' in submitted_esc.summary, (
             f'Expected failure category in summary: {submitted_esc.summary!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_pass_no_escalation(self) -> None:
+        """When run_main_tip_sweep returns a passing VerifyResult, submit is NOT called
+        and h._last_swept_main_sha is updated to the swept SHA."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+
+        with patch.object(
+            verify_module,
+            'run_main_tip_sweep',
+            new=AsyncMock(return_value=(MAIN_SHA, PASSING_RESULT)),
+        ):
+            await h._run_main_tip_sweep()
+
+        h._escalation_queue.submit.assert_not_called()
+        assert h._last_swept_main_sha == MAIN_SHA, (
+            f'Expected _last_swept_main_sha={MAIN_SHA!r}, got {h._last_swept_main_sha!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_sha_dedup(self) -> None:
+        """When _last_swept_main_sha equals the current main SHA, verify.run_main_tip_sweep
+        is NOT called (expensive full verify skipped for unchanged tip)."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+        h._last_swept_main_sha = MAIN_SHA  # pre-set to current SHA
+
+        mock_sweep = AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT))
+        with patch.object(verify_module, 'run_main_tip_sweep', new=mock_sweep):
+            await h._run_main_tip_sweep()
+
+        mock_sweep.assert_not_called()
+        h._escalation_queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_no_queue_noop(self) -> None:
+        """When _escalation_queue is None and drift is detected, no exception
+        is raised and the method returns cleanly."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+        h._escalation_queue = None  # bare-harness: no queue attached
+
+        with patch.object(
+            verify_module,
+            'run_main_tip_sweep',
+            new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+        ):
+            # Must not raise
+            await h._run_main_tip_sweep()
