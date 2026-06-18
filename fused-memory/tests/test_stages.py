@@ -1672,6 +1672,23 @@ class TestStage2PromptNonceMechanism:
             "— the nonce is additive, not a replacement (task 1572 NOTE)."
         )
 
+    def test_stage2_prompt_contains_retry_nonce_token(self):
+        """build_stage2_system_prompt('dark_factory') must include 'retry_nonce'.
+
+        Guards that the count=0 retry path (both per-cycle and reconstruction sections)
+        references the retry_nonce dedup-defeat mechanism. Without this, a future edit
+        could accidentally drop the nonce-retry guidance, reverting to identical-content
+        retry that re-triggers Mem0's ~0.92 cosine dedup (task 1796).
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        result = build_stage2_system_prompt('dark_factory')
+        assert 'retry_nonce' in result, (
+            "build_stage2_system_prompt('dark_factory') must reference 'retry_nonce' "
+            "in the count=0 retry guidance so the Stage 2 agent uses a deterministic "
+            "nonce on retry (extends summary_nonce dedup-defeat pattern; task 1796)."
+        )
+
 
 class TestStage2NoTaskIdCeiling:
     """Task IDs above the old 606 ceiling must NOT block task writes.
@@ -11299,4 +11316,3 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
         report = self._fresh_report()
         stage.record_task_dump_spot_check(report)
         assert 'task_dump_spot_check' not in report.stats
-

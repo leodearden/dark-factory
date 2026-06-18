@@ -278,10 +278,23 @@ After writing the per-cycle summary, you MUST call \
 `mcp__fused-memory__count_memories_by_metadata(project_id, \
 {{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}})` — \
 the triple filter including `stage` — and confirm it returns >= 1 to verify the stage \
-key persisted. A return of 0 means the stage key did not persist (the same failure that \
+key persisted. Use the full run_id UUID exactly as provided in the payload context — \
+never a truncated short/8-character prefix (e.g. the recon-xxxxxxxx display id). \
+Never construct IDs from truncated sources: a prefix will miss the written memory and \
+silently trigger the retry path. \
+A return of 0 means the stage key did not persist (the same failure that \
 would cause cross-stage verification to falsely report this Stage 2 summary as missing): \
-retry the `add_memory` write once with the same content and metadata before noting \
-the failure in the cycle report.
+retry the `add_memory` write once, this time PREPENDING a deterministic `retry_nonce` line \
+as a new first line of the content (metadata unchanged) to defeat Mem0's ~0.92 \
+cosine-similarity dedup — retrying with identical content re-triggers dedup (the \
+same mechanism that silently lost write 74b902f8); the `retry_nonce` extends the \
+existing `summary_nonce` dedup-defeat pattern. \
+Construct the `retry_nonce` value from available payload context using the pattern \
+`RETRY_<full_run_id_UUID>_1_<iso_timestamp_with_seconds>` \
+(e.g. `retry_nonce: RETRY_3d8f9a1c-...-abcd_1_2026-05-26T11:59:25+00:00`); \
+do NOT generate an arbitrary or random token — low-entropy strings \
+embed nearly identically and re-trigger the same ~0.92 cosine dedup. \
+Note the outcome in the cycle report.
 
 **Per-Cycle Counter Schema** — include all three of the following fields in your \
 structured `stats` output (omitting them causes Stage 3's flag-accounting audit to \
@@ -310,12 +323,36 @@ When you reconstruct a memory to resolve a carry-forward finding flagged by Stag
 Stage 3 — most commonly a `missing_stage2_summary` finding where a prior run's per-cycle \
 summary is absent — you MUST re-run the Path-2 existence check AFTER your reconstruction \
 `add_memory` write, never before. \
+The reconstruction `add_memory` MUST carry \
+`metadata={{'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', \
+'run_id': <reconstructed run's full UUID>, 'recon_pool': 'stage2_cycle_summary'}}` — \
+where `run_id` is the TOP-LEVEL metadata key set to the reconstructed run's full UUID \
+(the prior run whose summary is being reconstructed, NOT the current run_id). \
+This matches the per-cycle metadata convention (see 'Per-Cycle Summary Uniqueness' above) \
+so the retroactive write is deterministically findable by metadata-keyed lookup and \
+subject to the stage2_cycle_summary pool cap. \
 \
 Concretely: AFTER your reconstruction `add_memory` write returns, call \
 `mcp__fused-memory__count_memories_by_metadata(project_id, \
 {{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}})` AGAIN. \
+Use the full run_id UUID of the run being reconstructed, exactly as provided in the \
+carry-forward finding — never a truncated short/8-character prefix. \
+Never construct IDs from truncated sources: a prefix will miss the written memory \
+and cause the count to return 0, falsely triggering re-carry-forward. \
 If the count is now > 0, the write succeeded — emit the finding as RESOLVED (or omit it). \
-Only propagate (carry forward) the finding as unresolved if the count is STILL 0 after the write. \
+If the count is STILL 0, treat the reconstruction write as FAILED: retry the \
+reconstruction `add_memory` once, this time PREPENDING a deterministic `retry_nonce` line \
+as a new first line of the content (metadata unchanged) to defeat Mem0's ~0.92 \
+cosine-similarity dedup — retrying with identical content re-triggers dedup (the same \
+mechanism that silently lost write 74b902f8); the `retry_nonce` extends the existing \
+`summary_nonce` dedup-defeat pattern. \
+Construct the `retry_nonce` value from available payload context using the pattern \
+`RETRY_<reconstructed_run_id_UUID>_1_<iso_timestamp_with_seconds>` \
+(e.g. `retry_nonce: RETRY_3d8f9a1c-...-abcd_1_2026-05-26T11:59:25+00:00`); \
+do NOT generate an arbitrary or random token — low-entropy strings \
+embed nearly identically and re-trigger the same ~0.92 cosine dedup. \
+Re-run the count check after the nonce retry. \
+Only propagate (carry forward) the finding as unresolved if the count is STILL 0 after the nonce retry. \
 \
 Failure mode: drafting the carry-forward finding from the pre-write count (0 by definition, \
 since that is why you are reconstructing) re-emits an already-resolved finding as unresolved \
