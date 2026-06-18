@@ -199,6 +199,56 @@ class TestMissingFifo:
 
 
 # ---------------------------------------------------------------------------
+# Broken-FIFO (OSError) fail-open + WARNING test
+# ---------------------------------------------------------------------------
+
+
+class TestBrokenFifoFailOpen:
+    def test_broken_fifo_logs_warning(self, fifo_path, monkeypatch, caplog):
+        """pytest_configure must log a WARNING and fail open when os.open raises OSError.
+
+        A real FIFO is used so os.path.exists passes the early-return guard.
+        os.open is monkeypatched to raise OSError(13, 'Permission denied')
+        so the except OSError branch is exercised deterministically and
+        root-safely (chmod 000 is bypassed when CI runs as root).
+        """
+        monkeypatch.setenv('PYTEST_JOBSERVER_FIFO', fifo_path)
+        monkeypatch.setenv('PYTEST_JOBSERVER_TIMEOUT', '5.0')
+
+        def _raise_oserror(path, flags):
+            raise OSError(13, 'Permission denied')
+
+        monkeypatch.setattr(_js.os, 'open', _raise_oserror)
+
+        with caplog.at_level(logging.WARNING, logger='shared.pytest_jobserver'):
+            _js.pytest_configure(config=None)
+
+        # Fail-open state: both globals must remain None
+        assert _js._fd is None, 'Expected _fd to be None after OSError fail-open'
+        assert _js._tok is None, 'Expected _tok to be None after OSError fail-open'
+
+        # A WARNING must have been emitted by the jobserver logger
+        jobserver_warnings = [
+            r for r in caplog.records
+            if r.name == 'shared.pytest_jobserver' and r.levelno >= logging.WARNING
+        ]
+        assert jobserver_warnings, (
+            'Expected at least one WARNING from shared.pytest_jobserver after OSError, '
+            f'got: {caplog.records}'
+        )
+        assert any(r.levelno == logging.WARNING for r in jobserver_warnings), (
+            f'Expected WARNING level, got: {[r.levelno for r in jobserver_warnings]}'
+        )
+        msgs = [r.getMessage() for r in jobserver_warnings]
+        assert any(fifo_path in m for m in msgs), (
+            f'Expected FIFO path {fifo_path!r} in warning message, got: {msgs}'
+        )
+        assert any('unthrottled' in m for m in msgs), (
+            f"Expected 'unthrottled' in warning message, got: {msgs}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Unconfigure-after-timeout safety test
 # ---------------------------------------------------------------------------
 
