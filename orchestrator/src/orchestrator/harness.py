@@ -4852,6 +4852,12 @@ Output JSON matching the schema. Every task must appear in the output.
         ensuring a re-dispatched (restart→pending) workflow can write 'blocked'
         legitimately in its next incarnation rather than being permanently suppressed.
 
+        Suppression stamp is SKIPPED when target_status == 'blocked' (park, version-a):
+          For park, the target itself is 'blocked'.  Stamping would cause
+          _suppress_blocked_write to absorb park's own set_task_status('blocked') write
+          → silent no-op.  There is no clobber risk: a racing workflow _mark_blocked
+          writes the same value (idempotent), so no suppression is needed.
+
         Concurrency note: ``_action_teardown_tasks`` uses a Counter so that overlapping
         teardown coros for the same task_id (low probability — each L2 cascade member is
         a distinct task_id) do not prematurely clear each other's suppression windows.
@@ -4874,7 +4880,14 @@ Output JSON matching the schema. Every task must appear in the output.
         # absorbed by the scheduler guard and cannot clobber the action's target status.
         # Counter increment (not set.add) so overlapping teardowns for the same task_id
         # don't prematurely clear each other's suppression window (step-12 amend).
-        self._action_teardown_tasks[task_id] += 1
+        #
+        # SKIP the stamp when target_status == 'blocked' (park, version-a):
+        # The scheduler's _suppress_blocked_write would absorb park's OWN write.
+        # A racing _mark_blocked writes the same 'blocked' value (idempotent) — no
+        # suppression is needed.  restart('pending') and abandon('cancelled') still stamp.
+        _should_stamp = target_status != 'blocked'
+        if _should_stamp:
+            self._action_teardown_tasks[task_id] += 1
         try:
             try:
                 await self.scheduler.set_task_status(task_id, target_status)
@@ -4912,13 +4925,14 @@ Output JSON matching the schema. Every task must appear in the output.
                     )
                     self.hard_cancel_workflow(task_id)
         finally:
-            # Decrement the suppression refcount once the kill window closes (step-12).
-            # Delete the key when it reaches zero so Counter.__contains__ returns False
-            # and a re-dispatched (restart→pending) workflow can write 'blocked'
-            # legitimately in its next incarnation.
-            self._action_teardown_tasks[task_id] -= 1
-            if self._action_teardown_tasks[task_id] <= 0:
-                del self._action_teardown_tasks[task_id]
+            if _should_stamp:
+                # Decrement the suppression refcount once the kill window closes (step-12).
+                # Delete the key when it reaches zero so Counter.__contains__ returns False
+                # and a re-dispatched (restart→pending) workflow can write 'blocked'
+                # legitimately in its next incarnation.
+                self._action_teardown_tasks[task_id] -= 1
+                if self._action_teardown_tasks[task_id] <= 0:
+                    del self._action_teardown_tasks[task_id]
 
     def _resolve_escalation_action(self, escalation) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.
