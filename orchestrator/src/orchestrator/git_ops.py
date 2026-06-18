@@ -1102,19 +1102,16 @@ class GitOps:
                 )
                 self.warm_lane_pool.drop_assignment(branch_name)
                 await self._reset_warm_lane(lane, full_branch, start_ref)
-                # D10: always re-seed from current base after identity-mismatch reset
+                # D10: always re-seed from current base after identity-mismatch reset.
+                # Fail-soft: a recycled lane already has a usable (if stale) target/,
+                # so a failed re-seed degrades to the prior warmth — never cold-fallback.
                 ok = await self._seed_warm_lane(lane, '--fresh-checkout')
                 if not ok:
                     logger.warning(
-                        'acquire_warm_lane: seed failed for %s; removing and cold-falling back',
+                        'acquire_warm_lane: re-seed failed for recycled lane %s; '
+                        'proceeding with retained target — degraded warmth',
                         lane,
                     )
-                    await _run(
-                        ['git', 'worktree', 'remove', str(lane), '--force'],
-                        cwd=self.project_root,
-                    )
-                    await self.warm_lane_pool.release(lane)
-                    return None
                 # Falls through to shared tail
 
             elif not await self._is_registered_worktree(lane):
@@ -1195,19 +1192,17 @@ class GitOps:
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
                 await self._reset_warm_lane(lane, full_branch, start_ref)
-                # D10: always re-seed from current base after fresh reset
+                # D10: always re-seed from current base after fresh reset.
+                # Fail-soft: a recycled lane already has a usable (if stale) target/,
+                # so a failed re-seed degrades to the prior warmth — never cold-fallback
+                # or block dispatch (D10 / inv.6).
                 ok = await self._seed_warm_lane(lane, '--fresh-checkout')
                 if not ok:
                     logger.warning(
-                        'acquire_warm_lane: seed failed for %s; removing and cold-falling back',
+                        'acquire_warm_lane: re-seed failed for recycled lane %s; '
+                        'proceeding with retained target — degraded warmth',
                         lane,
                     )
-                    await _run(
-                        ['git', 'worktree', 'remove', str(lane), '--force'],
-                        cwd=self.project_root,
-                    )
-                    await self.warm_lane_pool.release(lane)
-                    return None
 
             # ── Shared tail: gitignore, scrub, base, debug-port ──────────
             _ensure_task_gitignore(lane)
