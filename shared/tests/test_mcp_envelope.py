@@ -110,8 +110,8 @@ _ABNORMAL_CASES = [
     ),
     # NO_TEXT_BLOCK — result completely missing result key
     (EnvelopeShape.NO_TEXT_BLOCK, {}, "k", dict),
-    # JSON_DECODE_ERROR — text block present but invalid JSON
-    (EnvelopeShape.JSON_DECODE_ERROR, _env.__func__ if hasattr(_env, "__func__") else None, "k", dict),
+    # JSON_DECODE_ERROR — text block present but invalid JSON (placeholder; replaced below)
+    (EnvelopeShape.JSON_DECODE_ERROR, None, "k", dict),
     # INNER_NOT_DICT — parsed JSON is a list (not a dict)
     (EnvelopeShape.INNER_NOT_DICT, _env([1, 2, 3]), "k", dict),
     # INNER_NOT_DICT — parsed JSON is a scalar

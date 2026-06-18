@@ -162,7 +162,7 @@ def parse_tool_result(
         # --- JSON decode -------------------------------------------------------
         try:
             data = json.loads(raw_text)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError):
             return _fail(EnvelopeShape.JSON_DECODE_ERROR, key, raw_text)  # noqa: B904
 
         # --- {data:{…}} unwrap -------------------------------------------------
