@@ -400,3 +400,45 @@ class EventStore:
         except Exception:
             logger.warning('event_store.latest_merge_finalized failed', exc_info=True)
             return None
+
+    def fetch_events_by_type(self, event_type: 'str | EventType') -> 'list[dict]':
+        """Return all events of *event_type* emitted in the current run, ordered by id.
+
+        The ``data`` column of every returned row is parsed from JSON back to a
+        dict.  Returns an empty list when no rows match.  Errors are logged and
+        return [] (read path is fire-safe).
+        """
+        try:
+            type_str = event_type.value if isinstance(event_type, EventType) else str(event_type)
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    'SELECT id, timestamp, run_id, task_id, event_type, phase, role, '
+                    '       data, cost_usd, duration_ms '
+                    'FROM events '
+                    'WHERE event_type = ? AND run_id = ? '
+                    'ORDER BY id',
+                    (type_str, self.run_id),
+                ).fetchall()
+            finally:
+                conn.close()
+            result = []
+            for row in rows:
+                (row_id, timestamp, run_id, task_id, evt_type, phase,
+                 role, raw_data, cost_usd, duration_ms) = row
+                result.append({
+                    'id': row_id,
+                    'timestamp': timestamp,
+                    'run_id': run_id,
+                    'task_id': task_id,
+                    'event_type': evt_type,
+                    'phase': phase,
+                    'role': role,
+                    'data': json.loads(raw_data) if raw_data else {},
+                    'cost_usd': cost_usd,
+                    'duration_ms': duration_ms,
+                })
+            return result
+        except Exception:
+            logger.warning('event_store.fetch_events_by_type failed', exc_info=True)
+            return []
