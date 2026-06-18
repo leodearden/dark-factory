@@ -242,13 +242,15 @@ def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
             if not isinstance(payload, Mapping):
                 continue
             ts_raw = payload.get('ts')
-            try:
-                ts_dt = (
-                    datetime.fromisoformat(ts_raw) if isinstance(ts_raw, str) else None
+            from shared.timestamps import parse_timestamp_or_warn
+            if ts_raw is None:
+                ts_dt, ts_ok = None, True  # missing ts is benign
+            else:
+                ts_dt, ts_ok = parse_timestamp_or_warn(
+                    ts_raw,
+                    context=f'wal_status {server_url}/{store_name}',
                 )
-            except ValueError:
-                ts_dt = None
-            age_s = (now - ts_dt).total_seconds() if ts_dt else None
+            age_s = (now - ts_dt).total_seconds() if ts_dt is not None and ts_ok else None
             busy = int(payload.get('busy') or 0)
             log_frames = int(payload.get('log') or 0)
 
@@ -260,6 +262,9 @@ def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
             elif busy > 0:
                 row_status = 'red'
                 row_reason = f'busy={busy}'
+            elif not ts_ok:
+                row_status = 'red'
+                row_reason = 'corrupt ts'
             elif age_s is not None and age_s > _WAL_STALE_SECONDS:
                 row_status = 'red'
                 row_reason = f'stale ({int(age_s)}s)'
