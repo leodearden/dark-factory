@@ -19,8 +19,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.workflow import TaskWorkflow
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +66,53 @@ def config(git_repo: Path) -> OrchestratorConfig:
 @pytest.fixture
 def git_ops(config: OrchestratorConfig) -> GitOps:
     return GitOps(config.git, config.project_root)
+
+
+@pytest.fixture
+def task_assignment() -> TaskAssignment:
+    return TaskAssignment(
+        task_id='42',
+        task={
+            'id': '42', 'title': 'X', 'description': '',
+            'status': 'pending', 'metadata': {'files': ['lib']},
+            'dependencies': [],
+        },
+        modules=['lib'],
+    )
+
+
+def _make_workflow(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    assignment: TaskAssignment,
+    worktree: Path,
+) -> tuple[TaskWorkflow, TaskArtifacts]:
+    """Wire a minimal TaskWorkflow with heavy collaborators mocked.
+
+    Mirrors the pattern in test_verify_phase_rebase.py._make_workflow.
+    """
+    from orchestrator.agents.invoke import AgentResult
+
+    workflow = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=MagicMock(),  # type: ignore[arg-type]
+        briefing=MagicMock(),  # type: ignore[arg-type]
+        mcp=MagicMock(),  # type: ignore[arg-type]
+    )
+    workflow.worktree = worktree
+    artifacts = TaskArtifacts(worktree)
+    artifacts.init('42', 'X', 'desc', base_commit='base-sha-old')
+    workflow.artifacts = artifacts
+    workflow.plan = {'task_id': '42', 'steps': []}
+    workflow._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+    workflow.briefing.build_debugger_prompt = AsyncMock(return_value='debug')  # type: ignore[attr-defined]
+    workflow._invoke = AsyncMock(  # type: ignore[method-assign]
+        return_value=AgentResult(success=True, output=''),
+    )
+    workflow._get_head_commit = AsyncMock(return_value='head-sha')  # type: ignore[method-assign]
+    return workflow, artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -307,3 +357,114 @@ def test_classify_rebase_cohort(distance, is_first, threshold, expected):
         f'classify_rebase_cohort({distance}, {is_first}, {threshold}) '
         f'=> {result!r}, expected {expected!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-11 RED: _inter_iteration_rebase distance+cohort enrichment
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInterIterationRebaseEnrichment:
+    async def test_iteration_log_has_distance_and_cohort(
+        self, config, git_ops, task_assignment,
+    ):
+        """After a real rebase, the iteration log entry gains distance_commits + cohort."""
+        # Use threshold=2 so 3 commits always lands in a non-continuous cohort.
+        config.rebase_reseed_distance_threshold = 2
+        repo = config.project_root
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # Advance main by N=3 commits beyond the worktree's base.
+        n = 3
+        for i in range(n):
+            (repo / f'enrich_{i}.txt').write_text(f'{i}\n')
+            await _run(['git', 'add', '-A'], cwd=repo)
+            await _run(['git', 'commit', '-m', f'enrich {i}'], cwd=repo)
+
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        result = await workflow._inter_iteration_rebase(event_label='verify_phase_rebase')
+
+        assert result is not None, 'Expected a real rebase (main advanced by 3 commits)'
+
+        # (a) iteration log entry must carry distance_commits and cohort
+        entries, _ = artifacts.read_iteration_log()
+        rebase_entries = [e for e in entries if e.get('event') == 'verify_phase_rebase']
+        assert len(rebase_entries) == 1, f'Expected 1 rebase entry; got: {entries}'
+        entry = rebase_entries[0]
+        assert entry.get('distance_commits') == n, (
+            f'Expected distance_commits={n}, got {entry.get("distance_commits")}'
+        )
+        assert isinstance(entry.get('cohort'), str), (
+            f'Expected cohort to be a string, got {entry.get("cohort")!r}'
+        )
+
+        # (b) returned dict must include distance_commits, cohort, is_first_rebase
+        assert result.get('distance_commits') == n, (
+            f'Returned dict: expected distance_commits={n}, got {result.get("distance_commits")}'
+        )
+        assert isinstance(result.get('cohort'), str), (
+            f'Returned dict: expected cohort string, got {result.get("cohort")!r}'
+        )
+        assert result.get('is_first_rebase') is True, (
+            f'Returned dict: expected is_first_rebase=True on first rebase, '
+            f'got {result.get("is_first_rebase")!r}'
+        )
+
+    async def test_first_rebase_above_threshold_is_post_unblock(
+        self, config, git_ops, task_assignment,
+    ):
+        """First rebase with distance >= threshold → cohort 'post-unblock'."""
+        config.rebase_reseed_distance_threshold = 2
+        repo = config.project_root
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 3 commits, threshold=2: 3>=2 + is_first → 'post-unblock'
+        for i in range(3):
+            (repo / f'pu_{i}.txt').write_text(f'{i}\n')
+            await _run(['git', 'add', '-A'], cwd=repo)
+            await _run(['git', 'commit', '-m', f'pu {i}'], cwd=repo)
+
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        result = await workflow._inter_iteration_rebase(event_label='verify_phase_rebase')
+
+        assert result is not None
+        assert result['cohort'] == 'post-unblock', (
+            f'Expected post-unblock (first rebase, distance 3 >= threshold 2); '
+            f'got {result["cohort"]!r}'
+        )
+        assert result['is_first_rebase'] is True
+
+    async def test_first_rebase_below_threshold_is_continuous(
+        self, config, git_ops, task_assignment,
+    ):
+        """First rebase with distance < threshold → cohort 'continuous'."""
+        config.rebase_reseed_distance_threshold = 5
+        repo = config.project_root
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2 commits, threshold=5: 2 < 5 → 'continuous'
+        for i in range(2):
+            (repo / f'cont_{i}.txt').write_text(f'{i}\n')
+            await _run(['git', 'add', '-A'], cwd=repo)
+            await _run(['git', 'commit', '-m', f'cont {i}'], cwd=repo)
+
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        result = await workflow._inter_iteration_rebase(event_label='verify_phase_rebase')
+
+        assert result is not None
+        assert result['cohort'] == 'continuous', (
+            f'Expected continuous (distance 2 < threshold 5); got {result["cohort"]!r}'
+        )
