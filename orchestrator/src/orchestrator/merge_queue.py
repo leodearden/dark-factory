@@ -5031,6 +5031,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._reprobe_task: asyncio.Task | None = None
         # In-flight request being processed by the merger loop. Set after
         # dequeue, cleared after the SpeculativeItem is pushed to the verifier
         # queue. Used by stop() to resolve Futures for requests that were
@@ -5225,6 +5226,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._host_allocator = HostAllocator(
                 remotes, quarantine=self._runner_quarantine
             )
+            # Copy config knobs onto worker attrs so operator config drives
+            # production while __init__ defaults keep bare-worker tests green
+            # (mirrors _heartbeat_interval_s precedent).
+            self._unreachable_escalate_after_n = (
+                config.verify_host_unreachable_escalate_after_n
+            )
+            self._unreachable_escalate_after_secs = (
+                config.verify_host_unreachable_escalate_after_secs
+            )
+            self._reprobe_interval_s = config.verify_host_reprobe_interval_s
             return self._host_allocator
         # project_root unavailable: return a transient empty-remote allocator
         # without caching so a subsequent call with project_root set builds the
@@ -5859,30 +5870,54 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
 
+    async def _reprobe_loop(self) -> None:
+        """Periodically probe quarantined remote hosts and clear on recovery.
+
+        Runs independently of the merger/verifier loops so it fires even when
+        those are idle.  Wakes every ``_reprobe_interval_s`` seconds and delegates
+        to the clock-injectable :meth:`_reprobe_quarantined_hosts`.
+
+        Any unexpected exception is logged and swallowed (same pattern as
+        _heartbeat_loop) so a probe bug can never crash the worker.
+        """
+        while self._running:
+            await asyncio.sleep(self._reprobe_interval_s)
+            try:
+                await self._reprobe_quarantined_hosts(time.time())
+            except Exception:
+                logger.exception('reprobe_quarantined_hosts: unexpected error in loop')
+
     async def run(self) -> None:
-        """Start merger, verifier, and heartbeat coroutines; wait for merge tasks."""
+        """Start merger, verifier, heartbeat, and reprobe coroutines; wait for merge tasks."""
         self._merger_task = asyncio.create_task(self._merger_loop())
         self._verifier_task = asyncio.create_task(self._verifier_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._reprobe_task = asyncio.create_task(self._reprobe_loop())
         try:
             await asyncio.gather(self._merger_task, self._verifier_task)
         except BaseException:
-            for t in (self._merger_task, self._verifier_task, self._heartbeat_task):
+            for t in (
+                self._merger_task, self._verifier_task,
+                self._heartbeat_task, self._reprobe_task,
+            ):
                 if t and not t.done():
                     t.cancel()
             await asyncio.gather(
-                self._merger_task, self._verifier_task, self._heartbeat_task,
+                self._merger_task, self._verifier_task,
+                self._heartbeat_task, self._reprobe_task,
                 return_exceptions=True,
             )
             raise
         finally:
-            # Cancel the heartbeat on both normal and exceptional exit so its
-            # lifetime is self-contained regardless of why the merge loops exit.
-            # On the exception path the except block already cleaned it up, so
-            # _heartbeat_task.done() is True and this is a no-op.
+            # Cancel both background tasks on both normal and exceptional exit.
+            # On the exception path the except block already cleaned them up, so
+            # .done() is True and these are no-ops.
             if self._heartbeat_task and not self._heartbeat_task.done():
                 self._heartbeat_task.cancel()
                 await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+            if self._reprobe_task and not self._reprobe_task.done():
+                self._reprobe_task.cancel()
+                await asyncio.gather(self._reprobe_task, return_exceptions=True)
 
     async def stop(self) -> None:
         """Graceful shutdown: drain queues and resolve all pending Futures."""
@@ -6053,13 +6088,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if self._inflight_req is not None and not self._inflight_req.result.done():
             self._inflight_req.result.set_result(shutdown)
 
-        # Cancel the heartbeat task — it loops independently (no sentinel path).
-        # _running is already False so the loop will not re-enter after the
-        # cancellation; we await it to ensure the task is done before stop() returns.
+        # Cancel background tasks that loop independently (no sentinel path).
+        # _running is already False so the loops will not re-enter after
+        # cancellation; we await each to ensure they are done before stop() returns.
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
+        if self._reprobe_task is not None and not self._reprobe_task.done():
+            self._reprobe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reprobe_task
 
         # Cancel in-flight drift-check detective tasks so their finally blocks run
         # (i.e. _run_drift_check's cleanup_merge_worktree call executes during
