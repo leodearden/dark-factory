@@ -12,7 +12,7 @@ set -euo pipefail
 # Fire-and-forget detachment is handled by the coordinator's default executor
 # (start_new_session=True), so this script must not background itself.
 
-HEALTH_URL="http://127.0.0.1:8080/"
+HEALTH_URL="http://127.0.0.1:8080/healthz"
 SERVICE="dark-factory-dashboard.service"
 HEALTH_TIMEOUT=30
 
