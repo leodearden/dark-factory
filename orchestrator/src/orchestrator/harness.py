@@ -4680,6 +4680,12 @@ Output JSON matching the schema. Every task must appear in the output.
             return 0
         statuses, error = await self.scheduler.get_statuses(active_ids)
         if error is not None:
+            logger.warning(
+                'Terminal-status watcher: get_statuses(%d active) failed: %s'
+                ' — skipping scan this cycle',
+                len(active_ids),
+                error,
+            )
             return 0
 
         threshold = self.config.terminal_status_hard_cancel_polls
