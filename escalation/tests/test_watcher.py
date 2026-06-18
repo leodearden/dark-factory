@@ -330,7 +330,7 @@ class TestInitialScan:
         esc.timestamp = 'not-a-timestamp'
         _write_esc(queue_dir, esc)
 
-        with caplog.at_level(logging.WARNING, logger='escalation.watcher'):
+        with caplog.at_level(logging.WARNING, logger='shared.timestamps'):
             result = _initial_scan(queue_dir, task_id=None, level=None)
 
         # (a) Entry still CONSIDERED — datetime.min sorts oldest, included in results

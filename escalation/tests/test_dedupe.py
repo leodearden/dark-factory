@@ -407,7 +407,7 @@ class TestFindDedupeParent:
         )
         now = datetime.now(UTC) + timedelta(seconds=5)
 
-        with caplog.at_level(logging.WARNING, logger='escalation.dedupe'):
+        with caplog.at_level(logging.WARNING, logger='shared.timestamps'):
             result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
 
         # (a) Candidate must fold into the corrupt-ts parent (not re-filed as None)

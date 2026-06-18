@@ -292,6 +292,12 @@ def find_dedupe_parent(
         # fallback=datetime.max: corrupt-ts parent is retained (not dropped) and
         # sorts LAST so it never displaces a valid older match. With datetime.min,
         # effective_now - datetime.min >> 600s window → parent re-dropped (same bug).
+        # NOTE — asymmetry: because effective_now - datetime.max is always negative
+        # (< 0 < window), a corrupt-ts parent is NEVER aged out by the window filter.
+        # Valid parents expire after infra_dedupe_window_secs; corrupt ones don't.
+        # This is intentional (a malformed timestamp is a bug worth investigating,
+        # not silently discarding), but means a corrupt parent persists as a fold
+        # target until it is explicitly resolved or the queue is cleared.
         parent_ts, _ = parse_timestamp_or_warn(
             parent.timestamp,
             fallback=datetime.max.replace(tzinfo=UTC),

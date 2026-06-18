@@ -1964,7 +1964,7 @@ class TestFindPendingL2ByRootCause:
         l2.timestamp = 'not-a-timestamp'
         queue.submit(l2)
 
-        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+        with caplog.at_level(logging.WARNING, logger='shared.timestamps'):
             result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
 
         # (a) Entry still CONSIDERED — datetime.min sorts oldest, included in results
