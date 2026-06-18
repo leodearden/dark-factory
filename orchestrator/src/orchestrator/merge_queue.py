@@ -7882,7 +7882,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: verify end '
                 f'(merge={merge_commit[:8]}, error)'
             )
-            if _spec_warm:
+            if _spec_warm and merge_wt is not None:
                 await self._git_ops.release_spec_lane(merge_wt, warm=True)
             else:
                 await self._cleanup_owned_merge_worktree(merge_wt)

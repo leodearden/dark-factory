@@ -56,11 +56,11 @@ from orchestrator.merge_queue import (  # noqa: F401
     InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
-    SpeculativeMergeWorker,
     SpeculativeItem,
+    SpeculativeMergeWorker,
     _acquire_warm_verify_worktree,
-    _maybe_schedule_shadow_compare,
     _maybe_run_drift_check,
+    _maybe_schedule_shadow_compare,
     _run_cold_shadow_verify,
     _submit_shadow_divergence_escalation,
 )
@@ -1218,9 +1218,6 @@ class TestB9CapstoneIntegration:
             f'Expected 2 advance_main calls, got {len(advance_calls)}'
         )
         # First call must use item0's base_sha (submission order preserved)
-        expected_main_0 = advance_calls[0].kwargs.get(
-            'expected_main', advance_calls[0].args[4] if len(advance_calls[0].args) > 4 else None
-        )
         # advance_main(current_sha, merge_wt, branch=..., max_attempts=..., expected_main=...)
         # Use kwargs since it's called as a keyword argument
         call0_kwargs = advance_calls[0].kwargs
