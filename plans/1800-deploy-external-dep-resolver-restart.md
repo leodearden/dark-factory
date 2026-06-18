@@ -39,7 +39,26 @@ The running orchestrator-reify.service process PREDATED the 1799 merge and there
 
 ## Restart Action
 
-*(To be appended in step-2 after the detached restart is scheduled.)*
+| Field | Value |
+|---|---|
+| Mechanism | `scripts/orchestrator-redeploy-restart.sh` — schedule mode (task 4620 wrapper) |
+| Transient unit | `orch-redeploy-restart` (timer: `orch-redeploy-restart.timer`) |
+| On-active delay | 60 s after scheduling agent exits (no self-kill) |
+| Exec-mode action | blocking `systemctl --user stop` → `systemctl --user start` (never `restart`) |
+| project_root guard | `/home/leo/src/reify` — verified clean at schedule time |
+| Scheduled at | approx 12:25 BST (step-2 schedule-mode agent exited) |
+| Expected fire time | approx 12:26 BST (+60 s on-active delay after agent exit) |
+| Expected active by | approx 12:28 BST (+≤90 s TimeoutStopSec graceful stop) |
+
+Script output:
+```
+Running timer as unit: orch-redeploy-restart.timer
+Will run service as unit: orch-redeploy-restart.service
+orchestrator-redeploy-restart.sh: scheduled restart of 'orchestrator-reify.service'
+  Transient unit: orch-redeploy-restart
+  Fires in:       60s (after the scheduling agent exits)
+  project_root:   /home/leo/src/reify (clean at schedule time)
+```
 
 ---
 
