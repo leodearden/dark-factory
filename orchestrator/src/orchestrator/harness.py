@@ -19,6 +19,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
+from shared.safe_io import load_json_or_warn
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -2233,13 +2234,42 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return 'reverted'
 
-        # Lock exists — check whether the owner is still alive.
-        owner_alive = False
-        try:
-            lock_data = json.loads(lock_path.read_text())
-            if not isinstance(lock_data, dict):
-                raise ValueError('plan.lock is not a JSON object')
-            owner_pid = lock_data.get('owner_pid')
+        # Lock exists — parse it via the shared safe reader, then classify.
+        lock_data, lock_ok = load_json_or_warn(lock_path, default=None, on_corrupt='warn')
+        lock_usable = lock_ok and isinstance(lock_data, dict)
+
+        if not lock_usable:
+            # Unreadable or non-dict lock: we cannot read owner_pid, so we cannot
+            # confirm the owner is dead.  On the STARTUP sweep fail CLOSED — leave
+            # the worktree intact rather than risk reaping a live owner.  On a
+            # MID-RUN sweep the dispatch-table filter already excluded
+            # actively-held tasks, so a task that reached here has an exited
+            # owner; reaping is safe.
+            if not mid_run:
+                # Use ERROR (not WARNING) because the task is now stranded
+                # in-progress indefinitely and requires operator intervention:
+                # the lock cannot be read, so automated reconcile cannot
+                # determine liveness and will skip the task every cycle.
+                logger.error(
+                    'Reconcile: task %s plan.lock unreadable/corrupt'
+                    ' — cannot confirm owner is dead;'
+                    ' leaving worktree intact (fail-closed).'
+                    ' OPERATOR ACTION REQUIRED: inspect worktree and lock'
+                    ' to determine whether to reap or allow task to continue.',
+                    tid,
+                )
+                return None  # do NOT reap a possibly-live owner's worktree
+            else:
+                logger.warning(
+                    'Reconcile: task %s plan.lock unreadable/corrupt'
+                    ' during mid-run sweep; treating as stale and reaping',
+                    tid,
+                )
+                owner_alive = False  # fall through to stale-lock cleanup below
+        else:
+            # Valid dict — use the existing owner_pid liveness logic.
+            owner_alive = False
+            owner_pid = lock_data.get('owner_pid')  # type: ignore[union-attr]
             if owner_pid is None:
                 logger.warning(
                     'Reconcile: plan.lock for task %s has no owner_pid;'
@@ -2251,8 +2281,6 @@ Output JSON matching the schema. Every task must appear in the output.
                     owner_alive = _pid_alive(int(owner_pid))
                 except (TypeError, ValueError):
                     owner_alive = False
-        except (OSError, json.JSONDecodeError, ValueError):
-            owner_alive = False
 
         # R3: during a mid_run sweep, owner_pid is almost always the harness
         # PID (which IS alive by definition).  The dispatch-table filter at
@@ -4067,9 +4095,10 @@ Output JSON matching the schema. Every task must appear in the output.
             branch_prefix=self.config.git.branch_prefix,
         )
         logger.info(
-            '_recover_pending_merges: recovered=%d dropped=%d',
+            '_recover_pending_merges: recovered=%d dropped=%d journal_corrupt=%s',
             report.get('recovered', 0),
             report.get('dropped', 0),
+            report.get('journal_corrupt', False),
         )
 
     async def _stop_escalation_server(self) -> None:

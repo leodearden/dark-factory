@@ -321,9 +321,14 @@ class TestReconcileStrandedInProgress:
     @pytest.mark.parametrize(
         'lock_contents,task_id,expect_reverted,expect_lock_exists,warn_pattern',
         [
-            # (a) Corrupt JSON → revert + unlink (JSONDecodeError still caught)
+            # (a) Corrupt JSON → fail-closed: do NOT revert, leave lock intact + ERROR.
+            #     An unreadable lock means we cannot confirm the owner is dead; fail-closed
+            #     = assume possibly-live and don't reap (task-1808 step-9).
+            #     ERROR (not WARNING) because the task is now stranded indefinitely
+            #     and requires operator intervention (task-1808 amend).
             pytest.param(
-                'not-valid-json', 9, True, False, None,
+                'not-valid-json', 9, False, True,
+                r'(unreadable|corrupt).*leaving worktree intact',
                 id='corrupt-json',
             ),
             # (b) Missing owner_pid key → owner_pid=None via .get() → owner_alive=False
@@ -350,9 +355,12 @@ class TestReconcileStrandedInProgress:
                 42, True, False, None,
                 id='non-numeric-owner-pid',
             ),
-            # (e) Non-dict JSON (list) → treated as corruption → revert + unlink
+            # (e) Non-dict JSON (list) → fail-closed: do NOT revert, leave lock intact + ERROR.
+            #     Same semantics as (a): unreadable/non-dict lock cannot confirm owner is dead
+            #     (task-1808 step-9). ERROR level because task stranded indefinitely (amend).
             pytest.param(
-                '["not", "an", "object"]', 14, True, False, None,
+                '["not", "an", "object"]', 14, False, True,
+                r'(unreadable|corrupt).*leaving worktree intact',
                 id='non-dict-json',
             ),
             # (c) Numeric-string owner_pid of a live process → task NOT reverted
@@ -421,11 +429,20 @@ class TestReconcileStrandedInProgress:
                 if re.search(warn_pattern, r.message, re.IGNORECASE)
             ]
             assert len(matching) >= 1, (
-                f'Expected WARNING matching {warn_pattern!r} in orchestrator.harness logs, '
+                f'Expected log record matching {warn_pattern!r} in orchestrator.harness logs, '
                 f'got: {[r.message for r in caplog.records]}'
             )
-            assert matching[0].levelno == logging.WARNING, (
-                f'Expected WARNING level, got {logging.getLevelName(matching[0].levelno)}'
+            # Corrupt/unreadable lock on startup → ERROR (task stranded indefinitely,
+            # operator action required). Other warn_pattern cases (missing/null owner_pid)
+            # remain at WARNING level.
+            expected_level = (
+                logging.ERROR
+                if re.search(r'(unreadable|corrupt).*leaving worktree intact', warn_pattern)
+                else logging.WARNING
+            )
+            assert matching[0].levelno == expected_level, (
+                f'Expected {logging.getLevelName(expected_level)} level, '
+                f'got {logging.getLevelName(matching[0].levelno)}'
             )
 
         # Verify cleanup_worktree call behavior.
@@ -440,6 +457,57 @@ class TestReconcileStrandedInProgress:
             )
         else:
             harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_corrupt_plan_lock_not_reaped_on_startup(
+        self, harness: Harness, caplog
+    ):
+        """Corrupt plan.lock on startup sweep (mid_run=False) → fail-closed: do NOT reap.
+
+        An unreadable lock means we cannot confirm the owner is dead.  Reaping a
+        possibly-live owner's worktree is the safety-bearing failure mode; fail-closed
+        means leave the worktree intact + emit an ERROR so an operator can intervene.
+        ERROR (not WARNING) because the task is now stranded in-progress indefinitely
+        and requires manual inspection — automated reconcile will skip it every cycle.
+
+        CRITICAL: get_statuses must return a NON-EMPTY dict so the resolver_failed guard
+        in _reconcile_stranded_in_progress does not abort the sweep before the lock branch.
+        """
+        import logging
+
+        tid = '200'
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        lock_dir = harness.git_ops.worktree_base / tid / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text('not-valid-json')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
+
+        # Must NOT revert — cannot confirm owner is dead
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        # Must NOT clean up the worktree
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        # Lock file must still exist
+        assert lock_path.exists(), 'corrupt lock must be left intact (fail-closed)'
+        # An ERROR under orchestrator.harness must be emitted (task stranded indefinitely,
+        # operator action required — ERROR level signals this needs human attention).
+        import re
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR
+            and r.name == 'orchestrator.harness'
+        ]
+        assert len(error_records) >= 1, (
+            f'Expected ERROR under orchestrator.harness for corrupt plan.lock; '
+            f'got: {[(r.name, r.levelname, r.message) for r in caplog.records]}'
+        )
+        pattern = r'(unreadable|corrupt).*leaving worktree intact'
+        matching = [r for r in error_records if re.search(pattern, r.message, re.IGNORECASE)]
+        assert len(matching) >= 1, (
+            f'Expected ERROR matching {pattern!r}; got: {[r.message for r in error_records]}'
+        )
 
     async def test_no_lock_worktree_cleaned_when_not_recovered(
         self, harness: Harness, tmp_path: Path
