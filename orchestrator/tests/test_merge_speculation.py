@@ -404,3 +404,95 @@ class TestAcquireSpecLaneFallback:
                 f'acquire_spec_lane raised {type(exc).__name__} on exhaustion: {exc}'
             )
         assert result is not None
+
+
+# ===========================================================================
+# Step-11: RED — GitOps.release_spec_lane
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestReleaseSpecLane:
+    """release_spec_lane: warm lane → FREE (target retained); cold → cleanup; idempotent."""
+
+    async def test_release_warm_lane_flips_to_free(self, spec_git_repo: Path):
+        """Releasing a warm _spec- lane sets its state back to FREE in spec_warm_lane_pool."""
+        await _add_recording_seed_to_repo(spec_git_repo)
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        lane_path, warm = await git_ops.acquire_spec_lane(merge_commit)
+        assert warm is True
+
+        # Lane is ASSIGNED — release it
+        await git_ops.release_spec_lane(lane_path, warm=warm)
+
+        assert git_ops.spec_warm_lane_pool is not None
+        assert git_ops.spec_warm_lane_pool._lanes[lane_path] == LaneState.FREE
+
+    async def test_release_warm_lane_retains_worktree(self, spec_git_repo: Path):
+        """release_spec_lane does NOT remove the worktree (target/ warmth retained)."""
+        await _add_recording_seed_to_repo(spec_git_repo)
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        lane_path, warm = await git_ops.acquire_spec_lane(merge_commit)
+
+        await git_ops.release_spec_lane(lane_path, warm=warm)
+
+        # Worktree must still exist on disk
+        assert lane_path.exists(), (
+            f'release_spec_lane deleted the warm lane directory {lane_path}'
+        )
+        # And still registered as a git worktree
+        assert await git_ops._is_registered_worktree(lane_path), (
+            f'release_spec_lane un-registered the warm lane {lane_path}'
+        )
+
+    async def test_release_cold_fallback_removes_worktree(self, spec_git_repo: Path):
+        """Releasing a cold-fallback (warm=False) worktree removes it via cleanup."""
+        # No seed script → seed fails → cold fallback
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        cold_path, warm = await git_ops.acquire_spec_lane(merge_commit)
+        assert warm is False
+
+        assert cold_path.exists(), 'cold fallback path should exist before release'
+
+        await git_ops.release_spec_lane(cold_path, warm=warm)
+
+        assert not cold_path.exists(), (
+            f'release_spec_lane(warm=False) must remove the cold worktree {cold_path}'
+        )
+
+    async def test_release_idempotent_on_free_lane(self, spec_git_repo: Path):
+        """Releasing an already-FREE or unknown lane never raises (idempotent)."""
+        await _add_recording_seed_to_repo(spec_git_repo)
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        lane_path = git_ops.worktree_base / '_spec-0'
+
+        # Lane was never acquired — release should be a no-op
+        try:
+            await git_ops.release_spec_lane(lane_path, warm=True)
+        except Exception as exc:
+            pytest.fail(
+                f'release_spec_lane raised {type(exc).__name__} on FREE lane: {exc}'
+            )
