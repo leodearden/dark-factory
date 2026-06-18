@@ -1884,3 +1884,60 @@ async def test_add_dependency_qualified_refuses_corrupt_metadata(
     assert row['metadata'] == _CORRUPT_BLOB, (
         f'Expected metadata unchanged; got: {row["metadata"]!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_remove_dependency_qualified_warns_and_does_not_falsely_claim_removal(
+    backend, project_root, caplog,
+):
+    """remove_dependency warns once and returns an accurate DependencyResult
+    (NOT claiming clean removal) when the stored metadata blob is corrupt.
+    The blob must remain byte-for-byte unchanged (no write occurs).
+
+    RED: current except sets meta={}, finds nothing to remove, then returns
+    the false 'Removed external dependency: …' message with no WARNING.
+    After step-8 the except block warns via the shared gate and returns an
+    accurate message that does NOT start with 'Removed external dependency'.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        result = await backend.remove_dependency(
+            '1', 'dark_factory:13', project_root=project_root,
+        )
+
+    # Exactly one deduped malformed-metadata WARNING.
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly one malformed-metadata WARNING; got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
+
+    # Result message must NOT falsely claim the dep was removed.
+    assert 'Removed external dependency' not in result['message'], (
+        f'Result message falsely claims removal: {result["message"]!r}'
+    )
+    # Message should convey the blob was left intact / could not remove.
+    msg_lower = result['message'].lower()
+    assert 'corrupt' in msg_lower or 'intact' in msg_lower, (
+        f'Result message should convey blob left intact; got: {result["message"]!r}'
+    )
+
+    # Blob is byte-for-byte unchanged.
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute('SELECT metadata FROM tasks WHERE id = 1')
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'Expected metadata unchanged; got: {row["metadata"]!r}'
+    )
