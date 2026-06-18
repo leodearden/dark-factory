@@ -6290,6 +6290,6 @@ class TestGetFilesTouchedInBranchWarning:
             'got no warnings'
         )
         assert any(
-            'get_files_touched_in_branch' in t.lower() or 'git log' in t.lower()
+            'get_files_touched_in_branch' in t.lower()
             for t in warning_texts
-        ), f'Expected WARNING to mention get_files_touched_in_branch or git log; got: {warning_texts}'
+        ), f'Expected WARNING to mention get_files_touched_in_branch; got: {warning_texts}'
