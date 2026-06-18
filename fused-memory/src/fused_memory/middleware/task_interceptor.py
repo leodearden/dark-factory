@@ -66,6 +66,7 @@ if TYPE_CHECKING:
 
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
+    from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
