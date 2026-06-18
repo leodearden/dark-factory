@@ -44,6 +44,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    cross_verify_task_counts,
     filter_task_tree,
 )
 from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
@@ -1435,6 +1436,13 @@ class ReconciliationHarness:
         # Fetch filtered task tree once for the whole cycle (ref: task 455)
         filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
 
+        # Fetch authoritative task-count census and cross-verify against tree (task 1785)
+        statuses = await self._fetch_task_count_census(project_root)
+        task_count_verification = cross_verify_task_counts(filtered_task_tree, statuses)
+
+        # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
+        graphiti_queue_health = await self._check_graphiti_queue_health(project_id)
+
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
         stages = self._make_stages()
@@ -1454,6 +1462,8 @@ class ReconciliationHarness:
                         cycle_fence_time=cycle_start_time,
                         assembled_payload=assembled_payload,
                         filtered_task_tree=filtered_task_tree,
+                        task_count_verification=task_count_verification,
+                        graphiti_queue_health=graphiti_queue_health,
                     )
 
                 # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
