@@ -163,6 +163,69 @@ def test_aggregate_results_all_zero_duration():
 
 
 # ---------------------------------------------------------------------------
+# step-09 RED: EventStore.fetch_events_by_type
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_events_by_type_returns_matching_rows(tmp_path):
+    """fetch_events_by_type returns only rebase_verify_cost rows for this run_id."""
+    from orchestrator.event_store import EventStore, EventType
+
+    db = tmp_path / 'events.db'
+    store = EventStore(db_path=db, run_id='run-abc')
+
+    data1 = {'old_base': 'aaa', 'new_base': 'bbb', 'distance_commits': 3, 'cohort': 'continuous'}
+    data2 = {'old_base': 'bbb', 'new_base': 'ccc', 'distance_commits': 30, 'cohort': 'post-unblock'}
+
+    store.emit(EventType.rebase_verify_cost, task_id='42', phase='verify', data=data1)
+    store.emit(EventType.rebase_verify_cost, task_id='42', phase='verify', data=data2)
+    # Unrelated event (different type) — must not appear in results
+    store.emit(EventType.phase_enter, task_id='42', phase='verify', data={'phase': 'verify'})
+
+    rows = store.fetch_events_by_type('rebase_verify_cost')
+    assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}: {rows}'
+
+    # Each row must have its data column parsed back to a dict.
+    assert isinstance(rows[0]['data'], dict), 'data must be a dict, not a string'
+    assert rows[0]['data']['cohort'] == 'continuous'
+    assert rows[1]['data']['cohort'] == 'post-unblock'
+
+
+def test_fetch_events_by_type_empty_for_unknown_type(tmp_path):
+    """fetch_events_by_type returns [] for a type with no rows."""
+    from orchestrator.event_store import EventStore
+
+    db = tmp_path / 'events_empty.db'
+    store = EventStore(db_path=db, run_id='run-xyz')
+    store.emit(
+        __import__('orchestrator.event_store', fromlist=['EventType']).EventType.phase_enter,
+        task_id='1', phase='execute', data={},
+    )
+    rows = store.fetch_events_by_type('rebase_verify_cost')
+    assert rows == [], f'Expected empty list, got {rows}'
+
+
+def test_fetch_events_by_type_scoped_to_run_id(tmp_path):
+    """fetch_events_by_type is scoped to the current run_id (no cross-run leakage)."""
+    from orchestrator.event_store import EventStore, EventType
+
+    db = tmp_path / 'events_scoped.db'
+    store_a = EventStore(db_path=db, run_id='run-A')
+    store_b = EventStore(db_path=db, run_id='run-B')
+
+    # run-A emits a rebase_verify_cost event.
+    store_a.emit(EventType.rebase_verify_cost, task_id='1', data={'cohort': 'continuous'})
+    # run-B should NOT see run-A's event.
+    rows = store_b.fetch_events_by_type('rebase_verify_cost')
+    assert rows == [], f'run-B must not see run-A events; got {rows}'
+
+    # run-A should see exactly its own event.
+    rows_a = store_a.fetch_events_by_type('rebase_verify_cost')
+    assert len(rows_a) == 1
+    assert rows_a[0]['data']['cohort'] == 'continuous'
+
+
+# ---------------------------------------------------------------------------
 # step-05 RED: VerifyResult.duration_secs field + _verify_duration_secs helper
 # ---------------------------------------------------------------------------
 
