@@ -5007,7 +5007,12 @@ Output JSON matching the schema. Every task must appear in the output.
         if main_sha == self._last_swept_main_sha:
             return
 
-        outcome = await verify_mod.run_main_tip_sweep(self.config, self.git_ops)
+        # Pass the already-resolved SHA so verify skips a second git rev-parse
+        # and both the dedup gate and the worktree pin use the same value
+        # (closes the TOCTOU window — suggestion 2 from the code review).
+        outcome = await verify_mod.run_main_tip_sweep(
+            self.config, self.git_ops, main_sha=main_sha
+        )
         if outcome is None:
             # Infra failure in the sweep itself — retry next tick, don't mark swept.
             return
@@ -5030,6 +5035,13 @@ Output JSON matching the schema. Every task must appear in the output.
         from escalation.models import Escalation  # noqa: PLC0415
 
         task_id = f'main-sweep-{swept_sha[:12]}'
+        # Dedup against a surviving L1 from a prior run: _last_swept_main_sha
+        # resets to None on every restart, so without this guard a main that
+        # stays broken would re-file a fresh duplicate each boot.  Matches the
+        # convention in every other L1-filing path in this file
+        # (_file_restored_pause_escalation, _mark_blocked, scheduler-pause, etc.).
+        if self._escalation_queue.has_open_l1(task_id):
+            return
         summary = f'Main-tip integrity sweep failed at {swept_sha[:12]}: {vr.category}'[:200]
         detail = (
             f'Full verification of main at {swept_sha} failed.\n'

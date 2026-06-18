@@ -2758,6 +2758,8 @@ async def verify_failure_is_preexisting_on_main(
 async def run_main_tip_sweep(
     config: 'OrchestratorConfig',
     git_ops: object,
+    *,
+    main_sha: str | None = None,
 ) -> 'tuple[str, VerifyResult] | None':
     """Run a full unscoped verification sweep against the current main-tip SHA.
 
@@ -2766,6 +2768,15 @@ async def run_main_tip_sweep(
     ``_merge-``/``_mainprobe-`` so the disk-pressure prune never reclaims it
     mid-run).  Runs ``run_full_verification`` (all subprojects: test + lint +
     typecheck in parallel) and returns ``(main_sha, result)``.
+
+    Args:
+        config: Orchestrator configuration.
+        git_ops: GitOps instance (needs ``get_main_sha``, ``worktree_base``).
+        main_sha: Optional pre-resolved SHA.  When provided the internal
+            ``git_ops.get_main_sha()`` call is skipped, eliminating a redundant
+            subprocess and closing the TOCTOU window between the harness
+            SHA-dedup gate and the worktree pin.  Callers that already resolved
+            the SHA (e.g. ``_run_main_tip_sweep`` in harness.py) should pass it.
 
     Returns:
         ``(main_sha, VerifyResult)`` on success (result.passed may be False).
@@ -2788,12 +2799,16 @@ async def run_main_tip_sweep(
     tmp_path: Path | None = None
     worktree_added: bool = False
     try:
-        # Resolve the current main SHA.
-        try:
-            main_sha: str = await git_ops.get_main_sha()  # type: ignore[union-attr]
-        except Exception:
-            logger.debug('run_main_tip_sweep: get_main_sha failed', exc_info=True)
-            return None
+        # Resolve the current main SHA unless the caller pre-resolved it.
+        # Accepting a pre-resolved value eliminates a redundant git rev-parse
+        # subprocess and closes the TOCTOU window between the harness SHA-dedup
+        # gate and the worktree pin (both now use the same resolved value).
+        if main_sha is None:
+            try:
+                main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
+            except Exception:
+                logger.debug('run_main_tip_sweep: get_main_sha failed', exc_info=True)
+                return None
         if not main_sha:
             return None
 

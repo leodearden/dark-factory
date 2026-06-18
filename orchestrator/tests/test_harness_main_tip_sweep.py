@@ -162,7 +162,8 @@ class TestRunMainTipSweepHarness:
     @pytest.mark.asyncio
     async def test_run_main_tip_sweep_no_queue_noop(self) -> None:
         """When _escalation_queue is None and drift is detected, no exception
-        is raised and the method returns cleanly."""
+        is raised and the method returns cleanly.  The SHA is still marked swept
+        so the loop doesn't re-trigger every tick when no queue is wired."""
         from orchestrator import verify as verify_module
 
         h = _make_sweep_harness()
@@ -175,6 +176,37 @@ class TestRunMainTipSweepHarness:
         ):
             # Must not raise
             await h._run_main_tip_sweep()
+
+        assert h._last_swept_main_sha == MAIN_SHA, (
+            f'Expected _last_swept_main_sha={MAIN_SHA!r} even when queue is None, '
+            f'got {h._last_swept_main_sha!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_has_open_l1_dedup(self) -> None:
+        """When has_open_l1 returns True for the sweep task_id, submit is NOT
+        called — prevents duplicate L1 escalations across restarts for the same
+        bad SHA.  In-process _last_swept_main_sha resets to None on every restart
+        so has_open_l1 is the persistent dedup layer that covers restart loops.
+        The SHA is still marked swept so subsequent ticks (same SHA) skip the
+        expensive verify."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+        h._escalation_queue.has_open_l1 = MagicMock(return_value=True)  # type: ignore[union-attr]
+
+        with patch.object(
+            verify_module,
+            'run_main_tip_sweep',
+            new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+        ):
+            await h._run_main_tip_sweep()
+
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+        assert h._last_swept_main_sha == MAIN_SHA, (
+            f'SHA should be marked swept even when has_open_l1 skips filing, '
+            f'got {h._last_swept_main_sha!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
