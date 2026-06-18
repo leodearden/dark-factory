@@ -19861,8 +19861,6 @@ class TestRefreshWarmBaseWiring:
 
         Fails against current impl (no call site in merge_queue.py).
         """
-        from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME as _PMN
-
         # Build a warm config (persistent_merge_worktree=True)
         warm_git_config = GitConfig(
             main_branch=config.git.main_branch,
