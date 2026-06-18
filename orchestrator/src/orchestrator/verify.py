@@ -2753,3 +2753,99 @@ async def verify_failure_is_preexisting_on_main(
                 # Belt-and-suspenders: rmtree the probe dir in case git worktree
                 # remove left an empty skeleton, or the worktree add never ran.
                 shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+async def run_main_tip_sweep(
+    config: 'OrchestratorConfig',
+    git_ops: object,
+) -> 'tuple[str, VerifyResult] | None':
+    """Run a full unscoped verification sweep against the current main-tip SHA.
+
+    Creates a throwaway detached worktree pinned at *main_sha* under
+    ``git_ops.worktree_base`` (``_mainsweep-<hex>`` prefix — distinct from
+    ``_merge-``/``_mainprobe-`` so the disk-pressure prune never reclaims it
+    mid-run).  Runs ``run_full_verification`` (all subprojects: test + lint +
+    typecheck in parallel) and returns ``(main_sha, result)``.
+
+    Returns:
+        ``(main_sha, VerifyResult)`` on success (result.passed may be False).
+        ``None`` (fail-safe) when:
+          - ``get_main_sha()`` raises or returns an empty string.
+          - ``git worktree add --detach`` fails after retries.
+          - Any unexpected exception during sweep setup.
+        The harness treats ``None`` as "no signal — retry next tick" and does
+        NOT mark the SHA as swept, so the same tip is retried on the next interval.
+
+    Cleanup: scoped ``git worktree remove --force <tmp_path>`` + ``shutil.rmtree``
+    always runs in a ``finally`` block.  NO broad ``git worktree prune`` (DD5
+    guarantee: a broad prune would deregister concurrently-active sibling
+    probe/merge worktrees).
+    """
+    import uuid
+
+    from orchestrator.git_ops import _run  # noqa: PLC0415, I001 — lazy, mirrors verify_failure_is_preexisting_on_main
+
+    # git worktree add CREATES tmp_path; do NOT pre-create or strict git rejects it.
+    tmp_path: Path | None = None
+    worktree_added: bool = False
+    try:
+        # Resolve the current main SHA.
+        try:
+            main_sha: str = await git_ops.get_main_sha()  # type: ignore[union-attr]
+        except Exception:
+            logger.debug('run_main_tip_sweep: get_main_sha failed', exc_info=True)
+            return None
+        if not main_sha:
+            return None
+
+        # Build the sweep worktree path under worktree_base.  The '_mainsweep-'
+        # prefix is distinct from '_merge-' and '_mainprobe-' so the disk-pressure
+        # prune (prune_stale_merge_worktrees, targeting '_merge-*' only) never
+        # reclaims the probe mid-run.  Same env-parity reasoning as mainprobe.
+        base: Path = git_ops.worktree_base  # type: ignore[union-attr]
+        base.mkdir(parents=True, exist_ok=True)
+        tmp_path = base / f'_mainsweep-{uuid.uuid4().hex[:8]}'
+
+        # Retry worktree add on transient git lock contention (serialised metadata
+        # writes mean concurrent sibling probes can hit LOCK_MAX).
+        _MAX_ADD_RETRIES = 3
+        rc, _, err = 1, '', 'not attempted'
+        for _attempt in range(_MAX_ADD_RETRIES):
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(tmp_path), main_sha],
+                cwd=config.project_root,  # type: ignore[union-attr]
+            )
+            if rc == 0:
+                worktree_added = True
+                break
+            if _attempt < _MAX_ADD_RETRIES - 1:
+                await asyncio.sleep(0.5 * (_attempt + 1))
+        if not worktree_added:
+            logger.warning(
+                'run_main_tip_sweep: worktree add failed after %d retries '
+                '(rc=%d): %s — sweep skipped for this tick',
+                _MAX_ADD_RETRIES, rc, err,
+            )
+            return None
+
+        # Run full (unscoped) verification — all discovered subprojects, no scope filter.
+        result = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
+        return (main_sha, result)
+
+    except Exception:
+        logger.debug('run_main_tip_sweep: unexpected error', exc_info=True)
+        return None
+    finally:
+        # Scoped cleanup: remove only this specific sweep worktree.
+        # INTENTIONALLY NO 'git worktree prune' (DD5 guarantee).
+        if worktree_added and tmp_path is not None:
+            try:
+                await _run(
+                    ['git', 'worktree', 'remove', '--force', str(tmp_path)],
+                    cwd=config.project_root,  # type: ignore[union-attr]
+                )
+            except Exception:
+                logger.debug('run_main_tip_sweep: worktree remove failed', exc_info=True)
+        if tmp_path is not None:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(tmp_path, ignore_errors=True)
