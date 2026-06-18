@@ -1113,7 +1113,30 @@ class GitOps:
                     await self.warm_lane_pool.release(lane)
                     return None
             else:
-                # ── Reset-in-place branch (fresh task on registered lane) ─
+                # ── Already-registered lane — check on-disk backstop first ─
+                # If the lane still carries THIS task's plan.json (e.g. after a
+                # process restart that cleared the in-memory _assignments map),
+                # treat it as a REUSE: restore the assignment and route to
+                # _reuse_warm_lane so .task/plan.json + WIP are preserved.
+                # Any read/parse error falls safe toward the fresh reset path.
+                disk_reuse = False
+                try:
+                    plan_path = lane / '.task' / 'plan.json'
+                    if plan_path.exists():
+                        import json as _json
+                        data = _json.loads(plan_path.read_text())
+                        if data.get('task_id') == branch_name:
+                            # Record the mapping and route to reuse
+                            self.warm_lane_pool.note_assignment(branch_name, lane)
+                            disk_reuse = True
+                except Exception:
+                    # Fail safe: unreadable or non-JSON plan → treat fresh
+                    pass
+
+                if disk_reuse:
+                    return await self._reuse_warm_lane(lane, full_branch)
+
+                # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
                 await self._reset_warm_lane(lane, full_branch, start_ref)
 
             # ── Shared tail: gitignore, scrub, base, debug-port ──────────
