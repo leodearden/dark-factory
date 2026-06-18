@@ -18,6 +18,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.harness import Harness, _pid_alive
+from orchestrator.warm_lane_pool import WarmLanePool
 
 # ---------------------------------------------------------------------------
 # _pid_alive helper tests
@@ -2625,3 +2626,118 @@ async def test_sweep_excludes_merge_deferred(harness: Harness):
         assert tid_arg != '77', (
             f'_reconcile_one_stranded was called for merge-deferred task 77: {call}'
         )
+
+
+# ===========================================================================
+# Step-9 RED: warm-lane resolution in _reconcile_one_stranded /
+#             _mark_in_progress_done
+# ===========================================================================
+
+
+def _attach_reconcile_pool(harness: Harness, size: int = 2) -> WarmLanePool:
+    """Attach a WarmLanePool to harness.git_ops.warm_lane_pool.
+
+    Must be constructed against the same worktree_base as the fixture assigns
+    (h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()) so that
+    is_lane/assignment_for path comparisons match.
+    """
+    base = harness.git_ops.worktree_base
+    base.mkdir(parents=True, exist_ok=True)
+    pool = WarmLanePool(worktree_base=base, size=size)
+    harness.git_ops.warm_lane_pool = pool
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_reconcile_stale_lock_uses_lane_path(harness: Harness, monkeypatch):
+    """_reconcile_one_stranded resolves the worktree via the pool assignment.
+
+    When a WarmLanePool is attached and task '42' is assigned to '_lane-0',
+    the lock-state classification must inspect base/'_lane-0'/.task/plan.lock
+    (not the non-existent base/'42'/.task/plan.lock).  After clearing the stale
+    lock, cleanup_worktree must be called with (base/'_lane-0', '42').
+
+    Fails today because worktree_path = worktree_base / tid computes base/'42'.
+    """
+    pool = _attach_reconcile_pool(harness, size=2)
+    base = harness.git_ops.worktree_base
+    lane_path = base / '_lane-0'
+    cold_path = base / '42'
+
+    # Create the lane dir with a stale plan.lock (dead PID)
+    lock_dir = lane_path / '.task'
+    lock_dir.mkdir(parents=True)
+    lock_path = lock_dir / 'plan.lock'
+    lock_path.write_text(json.dumps({
+        'session_id': '42-dead',
+        'locked_at': datetime.now(UTC).isoformat(),
+        'owner_pid': 99999,
+    }))
+
+    # Restore the assignment so the pool knows '42' lives in '_lane-0'
+    pool.restore_assignment('42', lane_path)
+
+    monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+    # is_ancestor False → skip the found-on-main path, go to lock-state branch
+    harness.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+
+    result = await harness._reconcile_one_stranded('42', 'in-progress', mid_run=False)
+
+    # Task must be reverted to pending
+    harness.scheduler.set_task_status.assert_called_once_with('42', 'pending')  # type: ignore[attr-defined]
+    # cleanup_worktree must have been called with the LANE path, not base/'42'
+    cleanup_calls = harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
+    cleanup_paths = [c.args[0] for c in cleanup_calls]
+    assert lane_path in cleanup_paths, (
+        f'cleanup_worktree must be called with lane path {lane_path}; '
+        f'actual calls: {cleanup_paths}'
+    )
+    assert cold_path not in cleanup_paths, (
+        f'cleanup_worktree must NOT be called with cold path {cold_path}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_mark_in_progress_done_uses_lane_path(harness: Harness):
+    """_mark_in_progress_done resolves the worktree via the pool assignment.
+
+    When task '42' is assigned to '_lane-0', the done path must call
+    cleanup_worktree with (base/'_lane-0', '42'), not (base/'42', '42').
+
+    Setup: force the found-on-main flip (is_ancestor→True, valid citation,
+    no branch_base_sha guard), and create the lane dir so cleanup fires.
+
+    Fails today because worktree_path = worktree_base / tid computes base/'42'.
+    """
+    pool = _attach_reconcile_pool(harness, size=2)
+    base = harness.git_ops.worktree_base
+    lane_path = base / '_lane-0'
+    cold_path = base / '42'
+
+    # Create the lane dir on disk so cleanup_worktree has something to act on
+    lane_path.mkdir(parents=True, exist_ok=True)
+
+    # Restore the assignment so the pool maps '42' → '_lane-0'
+    pool.restore_assignment('42', lane_path)
+
+    # Force the found-on-main path: is_ancestor→True, citation found,
+    # no branch_base_sha in metadata → Guard 3 skips
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    citation_sha = 'cafebabe' + 'b' * 32
+    harness.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)  # type: ignore[attr-defined]
+    harness.scheduler.get_task = AsyncMock(return_value=None)  # no metadata → Guard 3 skips  # type: ignore[attr-defined]
+
+    result = await harness._reconcile_one_stranded('42', 'in-progress', mid_run=False)
+
+    assert result == 'marked_done', f'Expected marked_done, got {result!r}'
+
+    # cleanup_worktree must have been called with the LANE path
+    cleanup_calls = harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
+    cleanup_paths = [c.args[0] for c in cleanup_calls]
+    assert lane_path in cleanup_paths, (
+        f'cleanup_worktree must be called with lane path {lane_path}; '
+        f'actual calls: {cleanup_paths}'
+    )
+    assert cold_path not in cleanup_paths, (
+        f'cleanup_worktree must NOT be called with cold path {cold_path}'
+    )
