@@ -52,7 +52,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.scheduler = MagicMock()
     h.scheduler._dispatched = set()
     h.event_store = MagicMock()
-    h.git_ops.get_merge_diff_files = AsyncMock(return_value=[])
+    h.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
     return h
 
 
@@ -324,14 +324,14 @@ class TestNoteMergeAll:
     async def test_git_ops_failure_skips_all_coordinators(
         self, harness: Harness, caplog
     ):
-        """When the shared git diff fetch fails, no coordinator's note_merge is called.
+        """When the shared git diff fetch returns an error, no coordinator's note_merge is called.
 
-        A git/IO error in get_merge_diff_files would have failed for every
-        coordinator independently (same git_ops instance, same SHAs); skipping all
-        coordinators early is both correct and avoids N redundant failures.
+        get_merge_diff_files is now total (never raises) — errors come via the
+        error slot.  _note_merge_all must check err is not None and skip all
+        coordinators, logging 'skipping all coordinators'.
         """
         harness.git_ops.get_merge_diff_files = AsyncMock(
-            side_effect=RuntimeError('git boom')
+            return_value=([], RuntimeError('git boom'))
         )
         coord_a = MagicMock()
         coord_a.note_merge = AsyncMock()
