@@ -277,9 +277,8 @@ class TestDbPool:
         db_path.write_bytes(b'not a sqlite db')  # file exists, but corrupt
 
         pool = DbPool()
-        with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
-            with patch('aiosqlite.connect', side_effect=sqlite3.OperationalError('file is not a database')):
-                result = await pool.get(db_path)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.db'), patch('aiosqlite.connect', side_effect=sqlite3.OperationalError('file is not a database')):
+            result = await pool.get(db_path)
 
         assert result is None
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'dashboard.data.db']

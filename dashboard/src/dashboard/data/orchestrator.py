@@ -19,10 +19,10 @@ import subprocess
 from pathlib import Path
 
 import httpx
+from shared.safe_io import load_json_or_warn
 
 from dashboard.config import DashboardConfig
 from dashboard.data.tasks import fetch_tasks
-from shared.safe_io import load_json_or_warn
 
 logger = logging.getLogger(__name__)
 

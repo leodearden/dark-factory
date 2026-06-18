@@ -178,7 +178,7 @@ async def fetch_external_statuses(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     deps: list[str],
-) -> dict[str, str]:
+) -> dict[str, str | bool]:
     """Fetch a ``{dep_id: status}`` map for a list of external dep strings via MCP.
 
     Calls ``get_external_statuses`` which returns a BARE ``{dep: status}`` map
