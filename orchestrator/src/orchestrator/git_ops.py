@@ -513,6 +513,12 @@ class GitOps:
             )
         else:
             self.spec_warm_lane_pool = None
+        # Serialize first-time `git worktree add` for _spec- lanes.
+        # Git serializes worktree administration via a repo-level lock; concurrent
+        # adds from the same project_root can transiently fail during the initial
+        # K>1 warm-up burst.  Reset-in-place (already-registered) acquires are
+        # per-lane and don't contend, so this only guards the one-time create path.
+        self._spec_wt_create_lock: asyncio.Lock = asyncio.Lock()
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -1171,27 +1177,39 @@ class GitOps:
 
         # ── Create-once or reset-in-place ────────────────────────────────────
         if not await self._is_registered_worktree(lane):
-            # Create-once: self-heal a stale unregistered directory first
-            # (mirrors reset_persistent_merge_worktree's self-heal pattern).
-            if lane.exists():
-                import shutil as _shutil
-                _shutil.rmtree(lane)
-            lane.parent.mkdir(parents=True, exist_ok=True)
-            rc, _, err = await _run(
-                ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
-                cwd=self.project_root,
-            )
-            if rc != 0:
-                logger.debug(
-                    'acquire_spec_lane: worktree add failed for %s (rc=%d, err=%r)'
-                    ' — releasing lane, cold fallback', lane, rc, err,
+            # Create-once: serialized via _spec_wt_create_lock so that the K>1
+            # initial warm-up burst does not issue concurrent `git worktree add`
+            # calls against the same repo-level git lock (which would cause
+            # transient failures and a burst of cold fallbacks at warm-up time).
+            # Reset-in-place acquires (already-registered path below) are
+            # per-lane and don't contend, so no lock is needed there.
+            async with self._spec_wt_create_lock:
+                # Pool ownership is per-lane exclusive (try_acquire assigns a
+                # unique lane to exactly one caller), so no double-check is needed
+                # here — we're the only caller that can be creating this lane.
+                # The lock purely serializes the repo-level git worktree add
+                # against other lanes' concurrent first-time creates.
+                # Self-heal a stale unregistered directory first
+                # (mirrors reset_persistent_merge_worktree's self-heal pattern).
+                if lane.exists():
+                    import shutil as _shutil
+                    _shutil.rmtree(lane)
+                lane.parent.mkdir(parents=True, exist_ok=True)
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
+                    cwd=self.project_root,
                 )
-                await self.spec_warm_lane_pool.release(lane)
-                wt = await self.create_throwaway_verify_worktree(merge_commit)
-                return wt, False
-            logger.info(
-                'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
-            )
+                if rc != 0:
+                    logger.warning(
+                        'acquire_spec_lane: worktree add failed for %s (rc=%d,'
+                        ' err=%r) — releasing lane, cold fallback', lane, rc, err,
+                    )
+                    await self.spec_warm_lane_pool.release(lane)
+                    wt = await self.create_throwaway_verify_worktree(merge_commit)
+                    return wt, False
+                logger.info(
+                    'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
+                )
         else:
             # Reset-in-place: mirror reset_persistent_merge_worktree's exact sequence
             # (git reset --hard + ONE git clean with all -e flags in a single pass).
