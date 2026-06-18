@@ -76,4 +76,6 @@ Live state read via `systemctl --user show orchestrator-reify.service -p MainPID
 
 **Delta:** Service restarted **15 min 12 s AFTER** the #1799 merge (12:26:28 BST vs 12:11:16 BST merge) — new process loads post-#1799 resolver code.
 
-**Result: #1799 external-dep resolver fix is DEPLOYED.** orchestrator-reify.service PID 2433578 loads the fixed `get_external_statuses` / `external_deps` dispatch gate and `_mark_blocked` routing from dark-factory main @ 90c9be96b3 (and beyond, as main has since advanced to 50db20417d54).
+**Result: #1799 external-dep resolver fix is DEPLOYED (structural criteria a–d GREEN).** orchestrator-reify.service PID 2433578 loads the fixed `get_external_statuses` / `external_deps` dispatch gate and `_mark_blocked` routing from dark-factory main @ 90c9be96b3 (and beyond, as main has since advanced to 50db20417d54).
+
+> **Note — runtime behavior unverified (criterion e deferred):** Criteria (a)–(d) confirm a fresh process is running with the correct source on disk. Criterion (e) — a live dispatch probe exercising the cross-project dep gate end-to-end — was not run (provisioning a new external-dep task was impractical at deploy time). The behavioral path is confirmed only by source-symbol presence. A follow-up smoke probe during normal operations is recommended to close this gap.
