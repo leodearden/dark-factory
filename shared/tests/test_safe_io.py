@@ -135,3 +135,43 @@ class TestQuarantine:
         # Exactly one WARNING must name the path.
         assert len(caplog.records) == 1, f'Expected exactly one WARNING, got: {caplog.records}'
         assert str(p) in caplog.records[0].message
+
+
+class TestDedup:
+    """Warn-once-per-path dedup: repeated calls on the same path emit only one WARNING."""
+
+    def test_same_corrupt_path_warns_only_once(self, tmp_path, caplog):
+        """Two calls on the same corrupt path return (default, False) twice but emit ONE WARNING."""
+        from shared.safe_io import load_json_or_warn
+
+        p = tmp_path / 'state.json'
+        p.write_bytes(b'{not json')
+
+        with caplog.at_level(logging.WARNING):
+            r1, ok1 = load_json_or_warn(p, default=SENTINEL)
+            r2, ok2 = load_json_or_warn(p, default=SENTINEL)
+
+        assert ok1 is False
+        assert ok2 is False
+        assert r1 is SENTINEL
+        assert r2 is SENTINEL
+        assert len(caplog.records) == 1, (
+            f'Same path should emit exactly ONE WARNING across two calls, got: {len(caplog.records)}'
+        )
+
+    def test_two_different_corrupt_paths_each_warn_once(self, tmp_path, caplog):
+        """One call each on two different corrupt paths emits TWO WARNINGs (dedup is per-path)."""
+        from shared.safe_io import load_json_or_warn
+
+        p1 = tmp_path / 'a.json'
+        p2 = tmp_path / 'b.json'
+        p1.write_bytes(b'{bad')
+        p2.write_bytes(b'{also bad')
+
+        with caplog.at_level(logging.WARNING):
+            load_json_or_warn(p1, default=SENTINEL)
+            load_json_or_warn(p2, default=SENTINEL)
+
+        assert len(caplog.records) == 2, (
+            f'Two distinct paths should each emit one WARNING, got: {len(caplog.records)}'
+        )
