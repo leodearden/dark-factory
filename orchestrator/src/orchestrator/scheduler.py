@@ -165,8 +165,8 @@ class ExternalResolverError(RuntimeError):
 
     Raised (into the error slot of the ``(statuses, error)`` tuple) in two cases:
 
-    1. **Non-dict / unparseable result** — ``_parse_tool_text_result`` returned
-       ``None`` (missing 'statuses' key, wrong type, or JSON parse failure).
+    1. **Non-dict / unparseable result** — ``parse_tool_result`` returned an
+       error (missing 'statuses' key, wrong type, or JSON parse failure).
        The returned statuses dict is ``{}``.
 
     2. **Partial-result (missing keys)** — the 'statuses' dict was present but did
@@ -1236,8 +1236,8 @@ class Scheduler:
                 arguments,
                 timeout=15,
             )
-            tasks = self._parse_tool_text_result(result, 'tasks')
-            if isinstance(tasks, list):
+            tasks, tasks_err = parse_tool_result(result, 'tasks', list)
+            if tasks_err is None:
                 for t in tasks:
                     if isinstance(t, dict):
                         self._normalize_task_metadata(t)
@@ -1458,10 +1458,8 @@ class Scheduler:
                 task_id, type(e).__name__, e,
             )
             return None
-        status = self._parse_tool_text_result(result, 'status')
-        if isinstance(status, str):
-            return status
-        return None
+        status, status_err = parse_tool_result(result, 'status', str)
+        return status if status_err is None else None
 
     async def get_task(self, task_id: str) -> dict | None:
         """Fetch the full task dict (including metadata) from fused-memory.
@@ -1556,8 +1554,8 @@ class Scheduler:
             ``(partial_dict, ExternalResolverError)`` when the response dict is
             missing one or more requested dep keys (resolver-degraded; partial
             dict preserved for logging but error slot forces fail-safe wait).
-            ``({}, ExternalResolverError)`` when ``_parse_tool_text_result``
-            returns a non-dict/None (unparseable JSON or missing 'statuses' key).
+            ``({}, ExternalResolverError)`` when ``parse_tool_result``
+            returns a parse error (unparseable JSON or missing 'statuses' key).
             ``({}, exception)`` on any raised exception — transient raises are
             swallowed into the error slot (fail-safe; caller should skip policy
             effects).
@@ -1591,7 +1589,7 @@ class Scheduler:
                 e,
             )
             return {}, e
-        # Non-dict / unparseable result — _parse_tool_text_result returned None.
+        # Non-dict / unparseable result — parse_tool_result returned an error.
         msg = (
             f'get_external_statuses: response was non-dict/unparseable for '
             f'{len(deps)} dep(s) — failing LOUD into error slot (fail-safe wait)'
