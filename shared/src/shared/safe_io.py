@@ -94,7 +94,7 @@ def load_json_or_warn(
         # Validate mode early so an unknown value raises rather than silently
         # behaving like 'warn'.
         if on_corrupt not in ('warn', 'quarantine'):
-            raise ValueError(f'unknown on_corrupt={on_corrupt!r}')
+            raise ValueError(f'unknown on_corrupt={on_corrupt!r}') from None
 
         # warn / quarantine both emit the deduped WARNING — once per path per
         # process (mirrors sqlite_task_backend._warned_malformed_task_ids:51).

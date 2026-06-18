@@ -87,9 +87,8 @@ class TestOnCorruptDispatch:
         p = tmp_path / 'state.json'
         p.write_bytes(b'{not json')
 
-        with caplog.at_level(logging.WARNING):
-            with pytest.raises(ValueError):
-                load_json_or_warn(p, default=SENTINEL, on_corrupt='fail_closed')
+        with caplog.at_level(logging.WARNING), pytest.raises(ValueError):
+            load_json_or_warn(p, default=SENTINEL, on_corrupt='fail_closed')
 
         assert len(caplog.records) == 0, (
             f'fail_closed must emit NO WARNING (exception is the loud channel), '
