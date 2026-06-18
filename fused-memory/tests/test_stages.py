@@ -11442,3 +11442,84 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
         report = self._fresh_report()
         stage.record_task_dump_spot_check(report)
         assert 'task_dump_spot_check' not in report.stats
+
+
+_MC_LOGGER = 'fused_memory.reconciliation.stages.memory_consolidator'
+
+
+class TestMemoryConsolidatorMem0ResultsKeyWarns:
+    """MemoryConsolidator.assemble_payload emits WARNING when mem0.get_all returns malformed 'results'.
+
+    Step-9 (RED): `all_memories.get('results', [])` defaults silently — no WARNING emitted.
+    Step-10 (GREEN): guard + logger.warning when 'results' is absent/non-list.
+    """
+
+    def _make_stage(self, get_all_return):
+        """Build a MemoryConsolidator with mem0.get_all returning the given value."""
+        config = ReconciliationConfig()
+        mem_svc = AsyncMock()
+        mem_svc.get_episodes = AsyncMock(return_value=[])
+        mem_svc.get_status = AsyncMock(return_value={})
+        mem_svc.mem0 = AsyncMock()
+        mem_svc.mem0.get_all = AsyncMock(return_value=get_all_return)
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            mem_svc, AsyncMock(), AsyncMock(), config,
+        )
+        stage.project_id = 'dark_factory'
+        stage.episode_limit = 100
+        stage.memory_limit = 200
+        return stage
+
+    @pytest.mark.asyncio
+    async def test_missing_results_key_emits_warning(self, caplog):
+        """mem0.get_all returning dict without 'results' key => [] AND a WARNING.
+
+        Currently RED: .get('results', []) defaults silently.
+        """
+        stage = self._make_stage({'other_key': 'data'})
+        watermark = Watermark(project_id='dark_factory')
+        with caplog.at_level(logging.WARNING, logger=_MC_LOGGER):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        warns = [
+            r for r in caplog.records
+            if r.name == _MC_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING when mem0.get_all returns a dict with no 'results' key; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_list_results_emits_warning(self, caplog):
+        """mem0.get_all returning {'results': 'not-a-list'} => [] AND a WARNING.
+
+        Currently RED: .get('results', []) returns 'not-a-list', no warning emitted.
+        """
+        stage = self._make_stage({'results': 'not-a-list'})
+        watermark = Watermark(project_id='dark_factory')
+        with caplog.at_level(logging.WARNING, logger=_MC_LOGGER):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        warns = [
+            r for r in caplog.records
+            if r.name == _MC_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING when mem0.get_all returns {'results': 'not-a-list'}; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_list_results_no_warning(self, caplog):
+        """REGRESSION: mem0.get_all returns {'results': []} => [] with ZERO warnings."""
+        stage = self._make_stage({'results': []})
+        watermark = Watermark(project_id='dark_factory')
+        with caplog.at_level(logging.WARNING, logger=_MC_LOGGER):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        warns = [
+            r for r in caplog.records
+            if r.name == _MC_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f"legit empty results must not emit WARNINGs; got {[r.message for r in warns]!r}"
+        )
