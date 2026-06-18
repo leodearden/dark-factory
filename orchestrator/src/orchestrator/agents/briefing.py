@@ -67,7 +67,7 @@ class BriefingAssembler:
         if context is None:
             context = await self._get_memory_context(task.get('id'))
 
-        task_block = self._format_task(task)
+        task_block = self._format_task(task, include_files=False)
         identity = self._agent_identity(task.get('id'), 'architect')
 
         return f"""\
