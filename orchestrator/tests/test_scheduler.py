@@ -3832,6 +3832,128 @@ class TestGetStatuses:
         )
 
 
+# ---------------------------------------------------------------------------
+# TestGetStatusesFailsLoud (task 1807 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetStatusesFailsLoud:
+    """``Scheduler.get_statuses`` must fail LOUD on non-dict/unparseable results.
+
+    Today the non-dict branch falls through to ``return {}, None`` (err is None),
+    silently stranding tasks.  After the fix:
+    - Non-dict 'statuses' value (e.g. a list) → ``({}, EnvelopeParseError(...))``
+    - 'statuses' key absent → ``({}, EnvelopeParseError(...))``
+    - A WARNING is logged naming the failure.
+    - The existing exception-raised path (``({}, exception)``) is unchanged.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        """Return a JSON-RPC envelope with a single text block."""
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_dict_statuses_returns_error(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """Non-dict 'statuses' value (e.g. a list) → ({}, EnvelopeParseError).
+
+        When the 'statuses' payload is a list (not a dict), the error slot must be
+        set.  A WARNING must be logged so the failure is visible in journalctl / caplog.
+
+        Fails today: get_statuses falls through to ``return {}, None`` on non-dict.
+        """
+        import logging
+        from shared.mcp_envelope import EnvelopeParseError as _EnvelopeParseError
+
+        # Response whose 'statuses' is a list, not a dict → wrong type.
+        response = self._envelope({'statuses': ['not', 'a', 'dict']})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            statuses, err = await scheduler.get_statuses()
+
+        assert statuses == {}, f'Expected empty dict; got {statuses!r}'
+        assert err is not None, (
+            'Expected EnvelopeParseError in error slot; got None '
+            '(non-dict branch fell through to return {}, None)'
+        )
+        assert isinstance(err, _EnvelopeParseError), (
+            f'Expected EnvelopeParseError; got {type(err).__name__}'
+        )
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'Expected a WARNING log; got records={caplog.records!r}'
+
+    @pytest.mark.asyncio
+    async def test_absent_statuses_key_returns_error(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """'statuses' key absent from response → ({}, EnvelopeParseError).
+
+        When the response JSON has no 'statuses' key, the error slot must be set,
+        not silently returned as ``({}, None)``.
+        """
+        import logging
+        from shared.mcp_envelope import EnvelopeParseError as _EnvelopeParseError
+
+        # Response with no 'statuses' key at all.
+        response = self._envelope({'data': 'not-a-statuses-dict'})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            statuses, err = await scheduler.get_statuses()
+
+        assert statuses == {}
+        assert err is not None, 'Expected error on absent key; got None'
+        assert isinstance(err, _EnvelopeParseError)
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_non_dict_error_leaves_no_state(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Non-dict error leaves no persistent state; next call still works correctly."""
+        import json as _json
+        from shared.mcp_envelope import EnvelopeParseError as _EnvelopeParseError
+
+        # First call: non-dict response.
+        response_bad = self._envelope({'no_statuses_here': True})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response_bad),
+        )
+        _stat_bad, err_bad = await scheduler.get_statuses()
+        assert err_bad is not None
+        assert isinstance(err_bad, _EnvelopeParseError)
+
+        # Second call: correct response — no cross-call state leakage.
+        response_ok = self._envelope({'statuses': {'1': 'done'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response_ok),
+        )
+        stat_ok, err_ok = await scheduler.get_statuses()
+        assert err_ok is None
+        assert stat_ok == {'1': 'done'}
+
+
 class TestFairnessConfigSchema:
     """Schema assertions for FairnessConfig and the scheduler's fairness config."""
 
