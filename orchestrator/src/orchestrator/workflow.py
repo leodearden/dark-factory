@@ -4221,7 +4221,16 @@ class TaskWorkflow:
             return None
 
         self.artifacts.update_base_commit(current_main)
+
+        # Capture is_first BEFORE incrementing the counter (0 == this is the
+        # first rebase of a fresh per-dispatch WorkflowMetrics instance).
+        is_first = self.metrics.inter_iteration_rebases == 0
         self.metrics.inter_iteration_rebases += 1
+
+        distance = await self.git_ops.get_rebase_distance(old_base, current_main)
+        cohort = classify_rebase_cohort(
+            distance, is_first, self.config.rebase_reseed_distance_threshold,
+        )
 
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
@@ -4230,6 +4239,8 @@ class TaskWorkflow:
             'old_base': old_base,
             'new_base': current_main,
             'files_changed_on_main': changed_files[:50],
+            'distance_commits': distance,
+            'cohort': cohort,
             'source': 'orchestrator',
             'summary': (
                 f'Rebased onto main ({old_base[:8]} -> {current_main[:8]}), '
@@ -4247,6 +4258,9 @@ class TaskWorkflow:
             'old_base': old_base,
             'new_base': current_main,
             'changed_files': changed_files,
+            'distance_commits': distance,
+            'cohort': cohort,
+            'is_first_rebase': is_first,
         }
 
     async def _verify_debugfix_loop(self) -> WorkflowOutcome:
