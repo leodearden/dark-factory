@@ -20,7 +20,6 @@ import subprocess
 import pytest
 from starlette.testclient import TestClient
 
-
 SCHED_UTILS_PATH = str(
     pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux/scheduler_utils.jsx'
 )
