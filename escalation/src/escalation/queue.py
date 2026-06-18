@@ -13,6 +13,8 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
+from shared.timestamps import parse_timestamp_or_warn
+
 from escalation import archive
 from escalation.models import Escalation
 
@@ -634,14 +636,12 @@ class EscalationQueue:
             if esc.root_cause.strip() != candidate:
                 continue
             # Parse timestamp; fall back to datetime.min on bad input so malformed
-            # entries are treated as oldest (never silently dropped).
-            try:
-                ts = datetime.fromisoformat(esc.timestamp)
-                # Ensure tz-aware for comparison
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=UTC)
-            except (ValueError, AttributeError):
-                ts = datetime.min.replace(tzinfo=UTC)
+            # entries are treated as oldest (never silently dropped). Emits a WARNING
+            # (loud-over-silent) via parse_timestamp_or_warn when the timestamp is bad.
+            ts, _ = parse_timestamp_or_warn(
+                esc.timestamp,
+                context='queue.find_pending_l2_by_root_cause',
+            )
             if ts < oldest_ts:
                 oldest_ts = ts
                 oldest_id = esc.id

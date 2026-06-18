@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from shared.timestamps import parse_timestamp_or_warn
+
 if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
@@ -287,13 +289,20 @@ def find_dedupe_parent(
         if _key_fn(parent) != candidate_key:
             continue
         # Parse timestamp for age filter and oldest-match selection.
-        try:
-            parent_ts = datetime.fromisoformat(parent.timestamp)
-        except (ValueError, AttributeError):
-            continue
-        # Ensure timezone-aware for comparison.
-        if parent_ts.tzinfo is None:
-            parent_ts = parent_ts.replace(tzinfo=UTC)
+        # fallback=datetime.max: corrupt-ts parent is retained (not dropped) and
+        # sorts LAST so it never displaces a valid older match. With datetime.min,
+        # effective_now - datetime.min >> 600s window → parent re-dropped (same bug).
+        # NOTE — asymmetry: because effective_now - datetime.max is always negative
+        # (< 0 < window), a corrupt-ts parent is NEVER aged out by the window filter.
+        # Valid parents expire after infra_dedupe_window_secs; corrupt ones don't.
+        # This is intentional (a malformed timestamp is a bug worth investigating,
+        # not silently discarding), but means a corrupt parent persists as a fold
+        # target until it is explicitly resolved or the queue is cleared.
+        parent_ts, _ = parse_timestamp_or_warn(
+            parent.timestamp,
+            fallback=datetime.max.replace(tzinfo=UTC),
+            context='dedupe.find_dedupe_parent',
+        )
         # Time-window filter — skipped entirely when window is unbounded (inf).
         if window is not None and effective_now - parent_ts > window:
             continue
