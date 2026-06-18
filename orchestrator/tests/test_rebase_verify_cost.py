@@ -119,6 +119,50 @@ class TestGetRebaseDistance:
 
 
 # ---------------------------------------------------------------------------
+# step-07 RED: _aggregate_results duration_secs propagation
+# ---------------------------------------------------------------------------
+
+
+def _make_verify_result(passed: bool = True, duration_secs: float = 0.0) -> 'VerifyResult':
+    from orchestrator.verify import VerifyResult
+    return VerifyResult(
+        passed=passed, test_output='', lint_output='', type_output='',
+        summary='ok', duration_secs=duration_secs,
+    )
+
+
+def test_aggregate_results_multi_children_duration_is_max():
+    """_aggregate_results sets duration_secs to max across children (wall approx)."""
+    from orchestrator.verify import _aggregate_results
+    children = [
+        _make_verify_result(duration_secs=1.0),
+        _make_verify_result(duration_secs=4.0),
+        _make_verify_result(duration_secs=2.0),
+    ]
+    result = _aggregate_results(children)
+    assert result.duration_secs == pytest.approx(4.0), (
+        f'Expected max 4.0, got {result.duration_secs}'
+    )
+
+
+def test_aggregate_results_single_child_preserved():
+    """_aggregate_results fast-path (len==1) returns child unchanged, duration preserved."""
+    from orchestrator.verify import _aggregate_results
+    child = _make_verify_result(duration_secs=7.5)
+    result = _aggregate_results([child])
+    assert result is child, 'Fast path must return the same object'
+    assert result.duration_secs == pytest.approx(7.5)
+
+
+def test_aggregate_results_all_zero_duration():
+    """_aggregate_results with all-zero children returns 0.0."""
+    from orchestrator.verify import _aggregate_results
+    children = [_make_verify_result(duration_secs=0.0)] * 3
+    result = _aggregate_results(children)
+    assert result.duration_secs == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
 # step-05 RED: VerifyResult.duration_secs field + _verify_duration_secs helper
 # ---------------------------------------------------------------------------
 
