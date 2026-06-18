@@ -1424,9 +1424,12 @@ class TaskInterceptor:
         *,
         project_root: str,
         metadata,
-    ) -> dict | None:
-        """Return an existing task's identity if ``(escalation_id,
-        suggestion_hash)`` in ``metadata`` matches a non-cancelled task.
+    ) -> tuple[dict | None, bool]:
+        """Return ``(hit, check_failed)`` where ``hit`` is an existing task's
+        identity if ``(escalation_id, suggestion_hash)`` in ``metadata``
+        matches a non-cancelled task, and ``check_failed`` is ``True`` when
+        ``get_tasks`` raised (so callers can fall through to CREATE rather than
+        treating a failure as a clean no-hit).
 
         R4: authoritative and cheap — no LLM, no embedding lookup.
         Works even when the curator is disabled or broken, which is
@@ -1435,24 +1438,24 @@ class TaskInterceptor:
         """
         meta = self._extract_metadata_dict(metadata)
         if not meta:
-            return None
+            return (None, False)
         esc_id = meta.get('escalation_id')
         sug_hash = meta.get('suggestion_hash')
         if not isinstance(esc_id, str) or not isinstance(sug_hash, str):
-            return None
+            return (None, False)
         if not esc_id or not sug_hash:
-            return None
+            return (None, False)
 
         if self.taskmaster is None:
-            return None
+            return (None, False)
         try:
             tasks_result = await self.taskmaster.get_tasks(project_root)
         except Exception:
-            logger.debug(
+            logger.warning(
                 'r4: get_tasks failed during idempotency check',
                 exc_info=True,
             )
-            return None
+            return (None, True)
         for task in flatten_task_tree(tasks_result):
             tmeta = task.get('metadata')
             if not isinstance(tmeta, dict):
@@ -1473,14 +1476,17 @@ class TaskInterceptor:
                 esc_id,
                 sug_hash,
             )
-            return {
-                'id': tid,
-                'title': str(task.get('title', '')),
-                'deduplicated': True,
-                'action': 'idempotency_hit',
-                'reason': 'escalation+suggestion matched',
-            }
-        return None
+            return (
+                {
+                    'id': tid,
+                    'title': str(task.get('title', '')),
+                    'deduplicated': True,
+                    'action': 'idempotency_hit',
+                    'reason': 'escalation+suggestion matched',
+                },
+                False,
+            )
+        return (None, False)
 
     async def submit_task(self, project_root: str, **kwargs: Any) -> dict:
         """Phase-1 of the two-phase add: persist a ticket and return its id immediately.
@@ -2482,9 +2488,11 @@ class TaskInterceptor:
                 # Short-circuits curator when (escalation_id, suggestion_hash) in
                 # metadata matches a non-cancelled existing task — avoids duplicate
                 # tasks when reconciliation retries an escalation suggestion.
-                idempotency_hit = await self._check_escalation_idempotency(
-                    project_root=project_root,
-                    metadata=metadata,
+                idempotency_hit, _idem_check_failed = (
+                    await self._check_escalation_idempotency(
+                        project_root=project_root,
+                        metadata=metadata,
+                    )
                 )
                 if idempotency_hit is not None:
                     existing_task_id = str(idempotency_hit.get('id', ''))
@@ -2497,6 +2505,9 @@ class TaskInterceptor:
                     )
                     self._signal_ticket_event(ticket_id)
                     return
+                # check_failed=True means get_tasks raised; fall through to
+                # the curator gate so the ticket is not lost (loud bypass —
+                # WARNING already emitted inside _check_escalation_idempotency).
 
                 # ── Curator gate ─────────────────────────────────────────────
                 curator = await self._get_curator()
@@ -2692,9 +2703,11 @@ class TaskInterceptor:
             # 'combined' immediately and excluded from the curate call.
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
-                idempotency_hit = await self._check_escalation_idempotency(
-                    project_root=t.project_root,
-                    metadata=t.metadata,
+                idempotency_hit, _idem_check_failed = (
+                    await self._check_escalation_idempotency(
+                        project_root=t.project_root,
+                        metadata=t.metadata,
+                    )
                 )
                 if idempotency_hit is not None:
                     existing_id = str(idempotency_hit.get('id', ''))
@@ -2707,6 +2720,8 @@ class TaskInterceptor:
                     )
                     self._signal_ticket_event(t.ticket_id)
                 else:
+                    # check_failed=True (get_tasks raised) → fall through to
+                    # CREATE; WARNING already emitted at source.
                     active_ticket_data.append(t)
             ticket_data = active_ticket_data
 
