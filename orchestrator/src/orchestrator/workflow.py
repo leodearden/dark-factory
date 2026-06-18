@@ -467,6 +467,40 @@ def _select_train_members(
     return selected
 
 
+def classify_rebase_cohort(
+    distance_commits: int,
+    is_first_rebase: bool,
+    threshold: int,
+) -> str:
+    """Label a rebase event into one of four cohorts.
+
+    Args:
+        distance_commits: Commit count in old_base..new_base (from
+            ``get_rebase_distance``).  -1 means the distance could not be
+            measured.
+        is_first_rebase: True when this is the first rebase of the current
+            per-dispatch WorkflowMetrics instance (i.e.
+            ``metrics.inter_iteration_rebases == 0`` captured BEFORE the
+            counter is incremented).
+        threshold: ``config.rebase_reseed_distance_threshold`` — the labelling
+            boundary between 'continuous' and large-jump cohorts.
+
+    Returns:
+        'unknown'      — distance < 0 (measurement failed; fail-safe)
+        'continuous'   — 0 <= distance < threshold (normal orchestrator cadence)
+        'post-unblock' — distance >= threshold AND is_first_rebase (first
+                         rebase of a fresh instance; likely long-idle gap /
+                         post-unblock resume)
+        'big-jump'     — distance >= threshold AND NOT is_first_rebase
+                         (large mid-run jump; hypothesis-refuting outlier)
+    """
+    if distance_commits < 0:
+        return 'unknown'
+    if distance_commits < threshold:
+        return 'continuous'
+    return 'post-unblock' if is_first_rebase else 'big-jump'
+
+
 @dataclass
 class WorkflowMetrics:
     total_cost_usd: float = 0.0
