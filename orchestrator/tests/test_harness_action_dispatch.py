@@ -467,15 +467,15 @@ class TestDispatchTeardownNoKill:
             task_id, 'pending',
         )
 
-    async def test_park_sets_deferred(self, harness: Harness):
-        """resolution_action='park' → set_task_status('deferred')."""
+    async def test_park_sets_blocked(self, harness: Harness):
+        """resolution_action='park' → set_task_status('blocked') (version-a: kept open, not dismissed)."""
         task_id = 'task-park'
         esc = _make_esc(
             task_id=task_id,
             resolution_action='park',
-            status='dismissed',
+            status='pending',
             resolved_by='interactive',
-            level=1,
+            level=2,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
         harness.is_workflow_active = MagicMock(return_value=False)
@@ -484,7 +484,7 @@ class TestDispatchTeardownNoKill:
         await asyncio.gather(*list(harness._background_tasks))
 
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            task_id, 'deferred',
+            task_id, 'blocked',
         )
 
     async def test_abandon_sets_cancelled(self, harness: Harness):
@@ -520,7 +520,8 @@ class TestDispatchTeardownNoKill:
                 esc = _make_esc(
                     task_id=task_id,
                     resolution_action=action,
-                    status='dismissed' if action in ('park', 'abandon') else 'resolved',
+                    # park stays 'pending' (version-a: kept open at L2); abandon → dismissed; restart → resolved
+                    status='pending' if action == 'park' else ('dismissed' if action == 'abandon' else 'resolved'),
                     resolved_by='interactive',
                     level=1,
                 )
@@ -540,7 +541,7 @@ class TestDispatchTeardownNoKill:
 
         for action, expected_target in (
             ('restart', 'pending'),
-            ('park', 'deferred'),
+            ('park', 'blocked'),
             ('abandon', 'cancelled'),
         ):
             harness.scheduler.get_status = AsyncMock(return_value='blocked')
@@ -550,7 +551,8 @@ class TestDispatchTeardownNoKill:
             esc = _make_esc(
                 task_id=task_id,
                 resolution_action=action,
-                status='dismissed' if action in ('park', 'abandon') else 'resolved',
+                # park stays 'pending' (version-a: kept open at L2); abandon → dismissed; restart → resolved
+                status='pending' if action == 'park' else ('dismissed' if action == 'abandon' else 'resolved'),
                 resolved_by='interactive',
                 level=0,  # level=0 — no level gate for teardown actions
             )
@@ -697,16 +699,16 @@ class TestTeardownKillSequence:
 
     async def test_park_kills_workflow(self, harness: Harness):
         """resolution_action='park' on live workflow: cancel_workflow called,
-        task written to 'deferred'.
+        task written to 'blocked' (version-a: park keeps escalation open at L2).
         """
         self._make_kill_harness(harness)
         task_id = 'task-kill-park'
         esc = _make_esc(
             task_id=task_id,
             resolution_action='park',
-            status='dismissed',
+            status='pending',
             resolved_by='interactive',
-            level=1,
+            level=2,
         )
 
         harness._on_escalation_resolved(esc)
@@ -714,7 +716,7 @@ class TestTeardownKillSequence:
 
         harness.cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            task_id, 'deferred',
+            task_id, 'blocked',
         )
 
     async def test_abandon_kills_workflow(self, harness: Harness):
