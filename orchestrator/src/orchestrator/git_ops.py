@@ -1050,8 +1050,11 @@ class GitOps:
             returned (caller falls through to the cold path — inv.6).
 
         **Reset-in-place path** (lane already registered — added in step-10):
-            Handled by :meth:`_reset_warm_lane`; skips re-seed (target/ already
-            warm from the previous assignment).
+            Handled by :meth:`_reset_warm_lane` then always re-seeded from the
+            current base via ``_seed_warm_lane(lane, '--fresh-checkout')`` (D10
+            always-re-seed-at-acquire).  The lane is the ``§9.5`` within-assignment
+            reset_lane primitive; the re-seed layers on top to deliver at-head
+            warmth for the NEW task.
 
         **Identity guard** (``expected_title``, step-26):
             When *expected_title* is supplied, any reuse candidate (in-memory
@@ -1099,6 +1102,19 @@ class GitOps:
                 )
                 self.warm_lane_pool.drop_assignment(branch_name)
                 await self._reset_warm_lane(lane, full_branch, start_ref)
+                # D10: always re-seed from current base after identity-mismatch reset
+                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if not ok:
+                    logger.warning(
+                        'acquire_warm_lane: seed failed for %s; removing and cold-falling back',
+                        lane,
+                    )
+                    await _run(
+                        ['git', 'worktree', 'remove', str(lane), '--force'],
+                        cwd=self.project_root,
+                    )
+                    await self.warm_lane_pool.release(lane)
+                    return None
                 # Falls through to shared tail
 
             elif not await self._is_registered_worktree(lane):
@@ -1179,6 +1195,19 @@ class GitOps:
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
                 await self._reset_warm_lane(lane, full_branch, start_ref)
+                # D10: always re-seed from current base after fresh reset
+                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if not ok:
+                    logger.warning(
+                        'acquire_warm_lane: seed failed for %s; removing and cold-falling back',
+                        lane,
+                    )
+                    await _run(
+                        ['git', 'worktree', 'remove', str(lane), '--force'],
+                        cwd=self.project_root,
+                    )
+                    await self.warm_lane_pool.release(lane)
+                    return None
 
             # ── Shared tail: gitignore, scrub, base, debug-port ──────────
             _ensure_task_gitignore(lane)
