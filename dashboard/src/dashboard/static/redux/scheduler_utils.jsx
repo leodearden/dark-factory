@@ -54,4 +54,48 @@ function buildSchedLockInfo(task, schedulerData) {
   return { rawTaskId, lockSet, moduleByPath };
 }
 
-window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo };
+// Build a Map<fullPath, label> where each label is the shortest trailing
+// path suffix that uniquely identifies the path within the given set.
+//
+// Algorithm:
+//   1. Dedupe the input (same path appearing N times counts once).
+//   2. For each unique path p, compute k = 1 + max over every OTHER unique
+//      path q of sharedTrailingSegments(p, q).  (k=1 when the set has 0 or
+//      1 members, or when no trailing segments are shared with any peer.)
+//   3. label(p) = last min(k, segCount(p)) segments joined with '/'.
+//   4. Return a Map keyed by the original full path string (including dupes).
+//
+// Deduping is essential: a path repeated across projects is NOT forced to its
+// full length (the only "other" copy is itself, contributing 0 shared segments
+// rather than a full-length collision).
+function disambiguateLabels(paths) {
+  const unique = [...new Set(paths)];
+  const segs = {};
+  for (const p of unique) segs[p] = p.split('/');
+
+  function sharedTrailing(aSegs, bSegs) {
+    let count = 0;
+    const la = aSegs.length, lb = bSegs.length;
+    while (count < la && count < lb && aSegs[la - 1 - count] === bSegs[lb - 1 - count]) {
+      count++;
+    }
+    return count;
+  }
+
+  const labelMap = new Map();
+  for (const p of unique) {
+    const ps = segs[p];
+    let maxShared = 0;
+    for (const q of unique) {
+      if (q === p) continue;
+      const shared = sharedTrailing(ps, segs[q]);
+      if (shared > maxShared) maxShared = shared;
+    }
+    const k = 1 + maxShared;
+    const label = ps.slice(-Math.min(k, ps.length)).join('/');
+    labelMap.set(p, label);
+  }
+  return labelMap;
+}
+
+window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels };
