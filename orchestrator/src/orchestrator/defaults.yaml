@@ -391,3 +391,27 @@ orch_daily_cost_ceiling_usd: 200.0
 merge_train_former_enabled: false
 merge_train_max_members: 3
 merge_train_coalesce_enabled: false
+
+# Lever C: remote-verify host availability monitoring (task 1795).
+#
+# verify_host_unreachable_escalate_after_n: raise a verify_host_unreachable L1
+#   escalation (naming the host, failure reason, and elapsed downtime) after
+#   this many consecutive RunnerUnavailable failures from the same remote host.
+#   The streak path fires fast when the remote is being hammered; the
+#   time-based leg (escalate_after_secs) fires even under sparse load.
+#   Both legs feed the same dedup'd alarm — at most one open L1 per host per
+#   downtime episode.  Requires Lever C on (verify_runners non-empty).
+#
+# verify_host_unreachable_escalate_after_secs: escalate after the host has
+#   been continuously unreachable for at least this many seconds (evaluated on
+#   the reprobe cadence).  0 = time-based leg disabled (streak-only).
+#   600 s (10 min) is the default — calibrated to close the 1.5-day-silent
+#   incident that motivated this task.
+#
+# verify_host_reprobe_interval_s: the _reprobe_loop checks quarantined remote
+#   hosts for reachability (ssh BatchMode health probe) every this many
+#   seconds.  On recovery the host is immediately cleared back into the live
+#   pool without a restart; the open L1 escalation is resolved automatically.
+verify_host_unreachable_escalate_after_n: 3
+verify_host_unreachable_escalate_after_secs: 600.0
+verify_host_reprobe_interval_s: 120.0

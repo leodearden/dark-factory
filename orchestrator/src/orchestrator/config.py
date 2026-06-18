@@ -1688,6 +1688,40 @@ class OrchestratorConfig(BaseSettings):
             'warm_verify_shadow_compare_every_n_merges cadence knob pattern.'
         ),
     )
+    verify_host_unreachable_escalate_after_n: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'When Lever C is on, escalate a verify_host_unreachable alarm after this '
+            'many consecutive RunnerUnavailable failures for the same remote host.  '
+            'Must be >= 1.  A streak-based trip fires fast when the remote is being '
+            'hammered; the time-based threshold (verify_host_unreachable_escalate_after_secs) '
+            'fires even under sparse load.  Both feed the same dedup\'d alarm so at '
+            'most one L1 is open per host per downtime episode.'
+        ),
+    )
+    verify_host_unreachable_escalate_after_secs: float = Field(
+        default=600.0,
+        ge=0,
+        description=(
+            'When Lever C is on, escalate a verify_host_unreachable alarm after the '
+            'remote host has been continuously unreachable for at least this many '
+            'seconds (evaluated on the reprobe cadence).  0 disables the time-based '
+            'trip (streak-only).  Complements verify_host_unreachable_escalate_after_n: '
+            'the time-based threshold guarantees the alarm fires within ~T seconds even '
+            'when merges are sparse and RU events are infrequent.'
+        ),
+    )
+    verify_host_reprobe_interval_s: float = Field(
+        default=120.0,
+        ge=1,
+        description=(
+            'When Lever C is on, the _reprobe_loop checks quarantined remote hosts '
+            'for reachability (via RemoteRunner.health()) every this many seconds.  '
+            'On recovery the quarantine is cleared and the host re-enters the live '
+            'pool without an orchestrator restart.  Must be >= 1.'
+        ),
+    )
 
     # Usage cap handling
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)

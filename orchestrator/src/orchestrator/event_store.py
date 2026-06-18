@@ -75,6 +75,12 @@ class EventType(StrEnum):
     # Queue-scoped (task_id=None). Payload: {depth, oldest_age_secs, head_of_line,
     # verify_in_progress}.  Closes the journalctl blind spot during long queue waits.
     merge_heartbeat = 'merge_heartbeat'
+    # Emitted when a remote verify host becomes persistently unreachable (after
+    # crossing the streak or time threshold).  Payload: {host, reason}.
+    verify_host_unreachable = 'verify_host_unreachable'
+    # Emitted when a previously-unreachable remote verify host passes health()
+    # and is cleared back into the live pool.  Payload: {host, downtime_s}.
+    verify_host_recovered = 'verify_host_recovered'
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
