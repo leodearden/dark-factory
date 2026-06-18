@@ -1806,13 +1806,12 @@ async def test_update_task_refuses_to_clobber_corrupt_metadata(
 
     with caplog.at_level(
         logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
-    ):
-        with pytest.raises(TaskmasterError):
-            await backend.update_task(
-                '1', project_root=project_root,
-                metadata=json.dumps({'note': 'incoming'}),
-                append=True,
-            )
+    ), pytest.raises(TaskmasterError):
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'note': 'incoming'}),
+            append=True,
+        )
 
     # Exactly one deduped malformed-metadata WARNING must have been emitted.
     warn_records = [
@@ -1862,11 +1861,10 @@ async def test_add_dependency_qualified_refuses_corrupt_metadata(
 
     with caplog.at_level(
         logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
-    ):
-        with pytest.raises(TaskmasterError):
-            await backend.add_dependency(
-                '1', 'dark_factory:13', project_root=project_root,
-            )
+    ), pytest.raises(TaskmasterError):
+        await backend.add_dependency(
+            '1', 'dark_factory:13', project_root=project_root,
+        )
 
     warn_records = [
         r for r in caplog.records

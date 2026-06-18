@@ -1331,7 +1331,7 @@ def _merge_metadata(
     # from a corrupt incoming blob — the two cases have different semantics.
     try:
         old = json.loads(existing_raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as err:
         # Corrupt EXISTING blob on the append path: refuse to clobber.
         # Warn once through the shared dedup gate when context is available.
         if project_root is not None and tag is not None and task_id is not None:
@@ -1344,7 +1344,7 @@ def _merge_metadata(
             f'Task {task_id} has a corrupt metadata blob; refusing to overwrite it '
             f'(original bytes preserved).',
             raw=existing_raw,
-        )
+        ) from err
     # Corrupt incoming keeps last-write-wins (matches Taskmaster's fallback).
     try:
         new = json.loads(incoming)
