@@ -2473,6 +2473,56 @@ async def test_citation_missing_still_escalates_when_branch_advanced(
     assert esc_b.level == 1
     assert tid not in harness._reconcile_skip_counts
 
+    # ------------------------------------------------------------------
+    # Case C: valid branch_base_sha but resolve_branch_sha returns None
+    # (branch ref vanished mid-sweep).  _branch_is_degenerate returns
+    # False → escalation must still fire.
+    # ------------------------------------------------------------------
+    q_c = _StubEscalationQueue()
+    harness._escalation_queue = q_c  # type: ignore[assignment]
+    harness._reconcile_skip_counts.pop(tid, None)
+
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}},
+    )
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(q_c.submissions) == 1, (
+        f'valid base_sha + resolve_branch_sha=None + citation-miss must '
+        f'still escalate; got {len(q_c.submissions)}'
+    )
+    assert q_c.submissions[0].category == 'reconcile_citation_missing'
+    assert tid not in harness._reconcile_skip_counts
+
+    # ------------------------------------------------------------------
+    # Case D: malformed branch_base_sha (non-40-hex string).
+    # _is_valid_sha_40 rejects it → _branch_is_degenerate returns False
+    # → escalation fires (distinct from Case B which tests absent key).
+    # ------------------------------------------------------------------
+    q_d = _StubEscalationQueue()
+    harness._escalation_queue = q_d  # type: ignore[assignment]
+    harness._reconcile_skip_counts.pop(tid, None)
+
+    harness.git_ops.resolve_branch_sha = AsyncMock(  # type: ignore[attr-defined]
+        return_value='deadbeef' + 'a' * 32,
+    )
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {'branch_base_sha': 'not-a-sha'}},
+    )
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(q_d.submissions) == 1, (
+        f'malformed branch_base_sha + citation-miss must still escalate; '
+        f'got {len(q_d.submissions)}'
+    )
+    assert q_d.submissions[0].category == 'reconcile_citation_missing'
+    assert tid not in harness._reconcile_skip_counts
+
 
 @pytest.mark.asyncio
 async def test_failure_counter_resets_on_success(harness: Harness):
