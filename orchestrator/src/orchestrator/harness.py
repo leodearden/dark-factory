@@ -554,6 +554,15 @@ class Harness:
         # without waiting for the next orchestrator restart.  See Fix 4.
         self._stranded_reconcile_task: asyncio.Task | None = None
 
+        # Main-tip integrity sweep — task 1832.
+        # Periodic full-suite sweep of the current main tip in a throwaway
+        # detached worktree; escalates L1 on drift.  Completely off the merge
+        # hot-path (per-merge latency untouched).
+        self._main_tip_sweep_task: asyncio.Task | None = None
+        # Last main SHA successfully swept; used to skip the expensive full
+        # verify when main has not advanced since the previous pass.
+        self._last_swept_main_sha: str | None = None
+
         # Per-task consecutive-failure counter for the reconcile sweep —
         # cleared on any successful mark_done, used to gate L1 escalation.
         self._reconcile_failure_counts: dict[str, int] = {}
@@ -4920,6 +4929,63 @@ Output JSON matching the schema. Every task must appear in the output.
                 raise
             except Exception:
                 logger.exception('Stranded-in-progress reconcile pass failed')
+
+    async def _run_main_tip_sweep(self) -> None:
+        """Single testable pass of the main-tip integrity sweep.
+
+        Resolves the current main SHA, runs a full unscoped verification against
+        a throwaway detached worktree at that SHA, and files a level-1 infra_issue
+        escalation when the sweep finds a failure on main.
+
+        Dedup by SHA (``_last_swept_main_sha``) is added in step-10 so the
+        expensive full verify is skipped when main has not advanced.  The
+        no-queue guard is also added in step-10.  See _start_main_tip_sweep /
+        _main_tip_sweep_loop for the periodic invocation context.
+        """
+        from orchestrator import verify as verify_mod  # noqa: PLC0415
+
+        main_sha: str = await self.git_ops.get_main_sha()  # type: ignore[union-attr]
+        if not main_sha:
+            return
+
+        outcome = await verify_mod.run_main_tip_sweep(self.config, self.git_ops)
+        if outcome is None:
+            # Infra failure in the sweep itself — retry next tick, don't mark swept.
+            return
+
+        swept_sha, vr = outcome
+        self._last_swept_main_sha = swept_sha
+
+        if vr.passed:
+            return
+
+        # Drift detected: file one L1 escalation per distinct bad SHA.
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        task_id = f'main-sweep-{swept_sha[:12]}'
+        summary = f'Main-tip integrity sweep failed at {swept_sha[:12]}: {vr.category}'[:200]
+        detail = (
+            f'Full verification of main at {swept_sha} failed.\n'
+            f'Category: {vr.category}\n'
+            f'Cause: {vr.cause_hint or "(no hint)"}\n'
+            f'Summary: {vr.summary}'
+        )
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-main-sweep',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning(
+            'Main-tip integrity sweep: filed L1 escalation %s for SHA %s (%s)',
+            esc.id, swept_sha[:12], vr.category,
+        )
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
