@@ -135,7 +135,7 @@ def main() -> int:
             blocked_tasks.append(label)
 
     n_tasks = len(per_task)
-    print(f"skipped {skipped_unreadable} unreadable review file{'s' if skipped_unreadable != 1 else ''}")
+    print(f"skipped {skipped_unreadable} unreadable review files")
     print()
 
     # ── per-reviewer summary table ─────────────────────────────────────
