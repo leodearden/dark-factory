@@ -1118,15 +1118,21 @@ class GitOps:
 
         Added as a stub here (step-8); fully exercised by step-10 tests.
         """
+        # -f (force) discards local modifications to tracked files before the
+        # branch switch — required when the lane is being reused from a prior
+        # task that left uncommitted work.  -B creates or resets the branch.
         rc, _, err = await _run(
-            ['git', 'checkout', '-B', full_branch, target_commit],
+            ['git', 'checkout', '-f', '-B', full_branch, target_commit],
             cwd=lane_dir,
         )
         if rc != 0:
             raise RuntimeError(
-                f'_reset_warm_lane: checkout -B {full_branch} {target_commit} '
+                f'_reset_warm_lane: checkout -f -B {full_branch} {target_commit} '
                 f'failed for {lane_dir}: {err}'
             )
+        # Single invocation excluding ALL artifact dirs at once — every
+        # configured build-output dir survives in one pass.  A per-dir loop
+        # would leave NONE surviving with >1 dir (κ step-19 regression).
         clean_cmd = ['git', 'clean', '-xfd']
         for artifact_dir in self.config.reap_build_artifact_dirs:
             clean_cmd += ['-e', artifact_dir]
