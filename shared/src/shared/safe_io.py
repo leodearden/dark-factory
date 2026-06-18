@@ -57,6 +57,18 @@ def load_json_or_warn(
         ``(parsed, True)`` — valid JSON was read.
 
         ``(default, True)`` — file did not exist (benign, no log emitted).
+
+        ``(default, False)`` — file was corrupt; a WARNING was emitted and
+        the corrective action was taken.
+
+    Raises
+    ------
+    json.JSONDecodeError / ValueError
+        When *on_corrupt='fail_closed'*.
+    ValueError
+        When *on_corrupt* is an unrecognised value.
+    OSError
+        When any OS error other than ``FileNotFoundError`` occurs.
     """
     p = Path(path)
 
@@ -69,5 +81,11 @@ def load_json_or_warn(
     # Other OSErrors propagate uncaught (PermissionError, IsADirectoryError, …).
 
     # --- parse phase ---
-    parsed = json.loads(text)
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        # Corrupt branch: warn once per path, then return (default, False).
+        logger.warning('safe_io: corrupt JSON at %s: %s', p, exc)
+        return (default, False)
+
     return (parsed, True)
