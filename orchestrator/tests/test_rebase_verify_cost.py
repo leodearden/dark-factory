@@ -111,3 +111,40 @@ class TestGetRebaseDistance:
         assert distance == -1, (
             f'Expected -1 sentinel for bogus refs, got {distance}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-03 RED: classify_rebase_cohort pure function
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('distance,is_first,threshold,expected', [
+    # distance < 0 → 'unknown'
+    (-1, True, 25, 'unknown'),
+    (-1, False, 25, 'unknown'),
+    # 0 <= distance < threshold → 'continuous' (ignores is_first_rebase)
+    (0, True, 25, 'continuous'),
+    (0, False, 25, 'continuous'),
+    (24, True, 25, 'continuous'),
+    (24, False, 25, 'continuous'),
+    (1, True, 25, 'continuous'),
+    # distance == threshold and is_first → 'post-unblock' (exact boundary)
+    (25, True, 25, 'post-unblock'),
+    # distance == threshold and not is_first → 'big-jump' (exact boundary)
+    (25, False, 25, 'big-jump'),
+    # distance > threshold and is_first → 'post-unblock'
+    (100, True, 25, 'post-unblock'),
+    # distance > threshold and not is_first → 'big-jump'
+    (100, False, 25, 'big-jump'),
+    # Different threshold value
+    (10, True, 10, 'post-unblock'),
+    (9, True, 10, 'continuous'),
+    (9, False, 10, 'continuous'),
+])
+def test_classify_rebase_cohort(distance, is_first, threshold, expected):
+    from orchestrator.workflow import classify_rebase_cohort
+    result = classify_rebase_cohort(distance, is_first, threshold)
+    assert result == expected, (
+        f'classify_rebase_cohort({distance}, {is_first}, {threshold}) '
+        f'=> {result!r}, expected {expected!r}'
+    )
