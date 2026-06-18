@@ -275,7 +275,7 @@ class TestAcquireWarmVerifyWorktree:
             stub, req, ephemeral, 'sha-abc', safety_valve_due=False
         )
 
-        assert result == ephemeral, 'knob OFF: must return merge_wt unchanged'
+        assert result == (ephemeral, False), 'knob OFF: must return (merge_wt, False)'
         stub.reset_persistent_merge_worktree.assert_not_called()
         stub.cleanup_merge_worktree.assert_not_called()
 
@@ -293,7 +293,7 @@ class TestAcquireWarmVerifyWorktree:
             stub, req, ephemeral, 'sha-abc', safety_valve_due=False
         )
 
-        assert result == warm_path, 'knob ON+not due: must return warm path'
+        assert result == (warm_path, True), 'knob ON+not due: must return (warm path, True)'
         stub.reset_persistent_merge_worktree.assert_awaited_once_with('sha-abc')
         stub.cleanup_merge_worktree.assert_awaited_once_with(ephemeral)
 
@@ -311,7 +311,7 @@ class TestAcquireWarmVerifyWorktree:
             stub, req, ephemeral, 'sha-abc', safety_valve_due=True
         )
 
-        assert result == ephemeral, 'safety_valve_due=True: must return merge_wt unchanged (cold path)'
+        assert result == (ephemeral, False), 'safety_valve_due=True: must return (merge_wt, False)'
         stub.reset_persistent_merge_worktree.assert_not_called()
         stub.cleanup_merge_worktree.assert_not_called()
 
@@ -328,7 +328,7 @@ class TestAcquireWarmVerifyWorktree:
             stub, req, None, 'sha-abc', safety_valve_due=False
         )
 
-        assert result == warm_path
+        assert result == (warm_path, True)
         stub.reset_persistent_merge_worktree.assert_awaited_once_with('sha-abc')
         stub.cleanup_merge_worktree.assert_not_called()
 

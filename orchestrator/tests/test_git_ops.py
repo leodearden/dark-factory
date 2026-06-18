@@ -6086,6 +6086,37 @@ class TestCleanupWorktreePoolAware:
 
         assert not info.path.exists(), 'Cold worktree must be removed when pool disabled'
 
+    async def test_cleanup_routes_spec_lane_to_release(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a '_spec-' lane releases it back to the spec pool.
+
+        Symmetric with the warm_lane_pool routing: a merge-speculation lane
+        must be RELEASED (retain worktree + target/, flip FREE) rather than
+        git-worktree-removed.  The crash-recovery sweep routes no-plan spec
+        lanes through cleanup_worktree, so this routing is what prevents a
+        spec lane from being destroyed (and its pool slot stranded) at
+        recovery time.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+            merge_spec_warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, merge_spec_warm_lane_pool_size=2)
+        assert git_ops.spec_warm_lane_pool is not None
+        assert git_ops.warm_lane_pool is None  # only the spec pool is active
+
+        spec_lane = git_ops.worktree_base / '_spec-0'
+        git_ops.spec_warm_lane_pool.is_lane = MagicMock(return_value=True)
+        git_ops.release_spec_lane = AsyncMock()
+
+        await git_ops.cleanup_worktree(spec_lane, '_spec-0')
+
+        git_ops.release_spec_lane.assert_awaited_once_with(spec_lane, warm=True)
+
 
 # ===========================================================================
 # Step-25: RED — create_worktree requeue-of-a-warm-task end-to-end

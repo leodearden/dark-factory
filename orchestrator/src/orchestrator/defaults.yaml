@@ -248,6 +248,14 @@ git:
   warm_verify_shadow_compare_every_n_merges: 40
   # Nightly-timer trigger leg: trigger after this many seconds since last run.
   warm_verify_shadow_compare_nightly_interval_secs: 86400.0
+  # PRD §9.5 merge-speculation warm-lane pool (reify B9).
+  # When true, LOCAL speculative verify slots allocate from a per-box pool of K
+  # CoW-seeded _spec-{0..K-1} warm lanes (K = speculation_depth =
+  # 1+len(enabled_verify_runners)).  Each acquire re-seeds target/ from the
+  # current warm base (inv.8).  Pool exhaustion/seed-fail → cold ephemeral
+  # fallback (inv.6, never blocks).  The existing warm_verify_shadow_compare
+  # valve covers spec-lane warm verifies automatically.  Default false.
+  merge_spec_warm_lane_pool: false
 
 # Autonomous dry-run unblock hook
 unblock_auto:

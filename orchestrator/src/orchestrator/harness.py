@@ -413,6 +413,11 @@ class Harness:
             warm_lane_pool_size=(
                 config.max_concurrent_tasks if config.git.warm_lane_pool else 0
             ),
+            # Spec-pool size: K (same as speculation_depth) when knob on, else 0.
+            # self._speculation_k is safe here — self.config is already set above.
+            merge_spec_warm_lane_pool_size=(
+                self._speculation_k if config.git.merge_spec_warm_lane_pool else 0
+            ),
         )
         self.scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
         # Wire the park-stop trip callback: Scheduler trips → Harness.pause_scheduler.
@@ -604,6 +609,19 @@ class Harness:
 
         # Singleton lock — held for the duration of run()
         self._lock_file: IO | None = None
+
+    @property
+    def _speculation_k(self) -> int:
+        """Single shared K source: 1 + len(enabled_verify_runners).
+
+        Used by BOTH GitOps spec-pool sizing (harness.__init__) and
+        _start_merge_worker (speculation_depth + enforce_persistent_worktree_serial_lane)
+        so the spec pool size and the worker cap cannot drift as verify_runners grows.
+
+        Mirrors the invariant comment at _start_merge_worker: all three Lever-C knobs
+        derive from ONE expression.
+        """
+        return 1 + len(self.config.enabled_verify_runners)
 
     def _init_digest_state(self) -> None:
         """Initialise task-1327 AFK-hardening digest counters.
@@ -1385,7 +1403,17 @@ Output JSON matching the schema. Every task must appear in the output.
             if not entry.is_dir():
                 continue
             pool = self.git_ops.warm_lane_pool
-            is_lane = pool is not None and pool.is_lane(entry)
+            spec_pool = self.git_ops.spec_warm_lane_pool
+            # '_spec-' merge-speculation lanes are a SEPARATE pool: they have
+            # no '.task/plan.json' and their dir name is not a live task id,
+            # so without this they would hit the mid-crash cold cleanup branch
+            # and be removed.  Treat them as lanes too — they take the no-plan
+            # branch (no recoverable task identity) and route through
+            # cleanup_worktree, which now releases '_spec-' lanes back to the
+            # spec pool instead of removing them.
+            is_lane = (pool is not None and pool.is_lane(entry)) or (
+                spec_pool is not None and spec_pool.is_lane(entry)
+            )
             task_id = entry.name
             plan_path = entry / '.task' / 'plan.json'
 
@@ -1661,9 +1689,19 @@ Output JSON matching the schema. Every task must appear in the output.
             # (it moves the dir), so moving a lane would leave the pool's
             # registered path dangling.  Crash-recovery already handles
             # lanes; the reaper must not undo a just-recovered lane.
+            # The merge-speculation pool ('_spec-' lanes) is a SEPARATE
+            # WarmLanePool instance — its lanes are not '_merge-*', not
+            # members of warm_lane_pool, and their names are not live task
+            # ids, so they would otherwise fall through to the orphan branch
+            # and get moved/removed mid-verify.  Protect them identically.
             if (
                 self.git_ops.warm_lane_pool is not None
                 and self.git_ops.warm_lane_pool.is_lane(entry)
+            ):
+                continue
+            if (
+                self.git_ops.spec_warm_lane_pool is not None
+                and self.git_ops.spec_warm_lane_pool.is_lane(entry)
             ):
                 continue
             # Skip live, recovered, preserved, and in-flight worktrees.
@@ -3814,7 +3852,9 @@ Output JSON matching the schema. Every task must appear in the output.
         # config.verify_runners by task 1716 (Lever C operator-enable path).
         # DO NOT flip reify's orchestrator.yaml verify_runners on until the
         # verdict-parity report is green (PRD D6 gate; see task 1716 analysis).
-        _k: int = 1 + len(self.config.enabled_verify_runners)
+        # NOTE: use self._speculation_k — single shared source so GitOps spec-pool
+        # size (set at __init__) and speculation_depth here cannot drift apart.
+        _k: int = self._speculation_k
 
         # Fail-CLOSED on an over-budget liveness verdict: refuse to start the merge
         # worker and propagate MergeLivenessConfigError to the caller.

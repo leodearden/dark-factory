@@ -837,6 +837,24 @@ class GitConfig(BaseModel):
             'Set only when the seed base lives at a non-default location.'
         ),
     )
+    merge_spec_warm_lane_pool: bool = Field(
+        default=False,
+        description=(
+            'When True, LOCAL speculative merge-verify slots allocate from a '
+            'per-box pool of K CoW-seeded warm lanes (_spec-0 .. _spec-{K-1}), '
+            'one per speculation depth, instead of using the single serial '
+            '_merge-verify worktree.  K = 1 + len(enabled_verify_runners) '
+            '(same expression as speculation_depth).  Each acquire re-seeds '
+            'target/ from the CURRENT warm base (inv.8 always-re-seed-at-acquire). '
+            'On pool exhaustion or seed failure, falls back to a cold ephemeral '
+            'worktree — never blocks the scheduler (inv.6).  The existing '
+            'warm/cold SHADOW safety valve (warm_verify_shadow_compare) covers '
+            'spec-lane warm verifies automatically (steps 15-18).  '
+            'Default False → byte-identical to today (trivially revertible, '
+            'mirrors warm_lane_pool convention).  Requires reify §9.5 '
+            'seed-warm-lane.sh and a CoW-capable XFS volume.'
+        ),
+    )
 
 
 class VerifyRunnerConfig(BaseModel):

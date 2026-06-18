@@ -237,3 +237,43 @@ async def test_reaper_skips_pool_lanes(harness: Harness):
         f'Lane {lane_path} must NOT be quarantined by the orphan reaper '
         f'(quarantine_worktree is not pool-aware — it would move the dir)'
     )
+
+
+@pytest.mark.asyncio
+async def test_reaper_skips_spec_pool_lanes(harness: Harness):
+    """_reap_orphan_worktrees must NOT quarantine or reap '_spec-' pool lanes.
+
+    The merge-speculation pool is a SEPARATE WarmLanePool instance
+    (name_prefix='_spec-').  A '_spec-N' dir is not '_merge-*', is not a
+    member of warm_lane_pool, and its name is not a live task id — so without
+    a spec-pool-aware skip it falls through to the orphan branch and is moved
+    (quarantine) or removed (cleanup), stranding the spec pool and potentially
+    clobbering a lane that is mid-verify if the periodic reaper fires
+    concurrently.  This is the exact hazard warm_lane_pool lanes are protected
+    from; spec lanes must be protected identically.
+    """
+    base = harness.git_ops.worktree_base
+    # Attach a spec pool (with its '_spec-' prefix) to git_ops; leave the
+    # plain warm pool unset to prove the spec skip stands on its own.
+    spec_pool = WarmLanePool(worktree_base=base, size=2, name_prefix='_spec-')
+    harness.git_ops.warm_lane_pool = None
+    harness.git_ops.spec_warm_lane_pool = spec_pool
+    spec_lane_path = _mk(base, '_spec-0')
+    # Live set does NOT include '_spec-0'.
+    harness.scheduler.get_statuses = AsyncMock(
+        return_value=({'100': 'pending', '101': 'done'}, None)
+    )
+    # Simulate unsaved work so the lane WOULD be quarantined without the skip.
+    harness.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=True)
+
+    await harness._reap_orphan_worktrees()
+
+    cleanup_paths = [c.args[0] for c in harness.git_ops.cleanup_worktree.call_args_list]  # type: ignore[attr-defined]
+    quarantine_paths = [c.args[0] for c in harness.git_ops.quarantine_worktree.call_args_list]  # type: ignore[attr-defined]
+    assert spec_lane_path not in cleanup_paths, (
+        f'Spec lane {spec_lane_path} must NOT be reaped by the orphan reaper'
+    )
+    assert spec_lane_path not in quarantine_paths, (
+        f'Spec lane {spec_lane_path} must NOT be quarantined by the orphan '
+        f'reaper (quarantine_worktree is not pool-aware — it would move the dir)'
+    )
