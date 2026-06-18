@@ -177,3 +177,83 @@ class TestRunMainTipSweepHarness:
         ):
             # Must not raise
             await h._run_main_tip_sweep()
+
+
+# ---------------------------------------------------------------------------
+# step-11: start/stop lifecycle wiring
+# ---------------------------------------------------------------------------
+
+
+def _make_lifecycle_harness(*, enabled: bool = True) -> Harness:
+    """Build a minimal Harness for lifecycle tests (no real project_root needed)."""
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    config = OrchestratorConfig()
+    config = config.model_copy(update={'main_tip_sweep_enabled': enabled})
+    h.config = config
+    h._main_tip_sweep_task = None
+    h._last_swept_main_sha = None
+    return h
+
+
+class TestMainTipSweepLifecycle:
+    """step-11: _start/_stop_main_tip_sweep lifecycle wiring."""
+
+    def test_start_main_tip_sweep_creates_task(self) -> None:
+        """When main_tip_sweep_enabled=True, _start_main_tip_sweep creates an asyncio.Task
+        named 'main-tip-sweep' and stores it in h._main_tip_sweep_task."""
+        h = _make_lifecycle_harness(enabled=True)
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = False
+        mock_task.get_name.return_value = 'main-tip-sweep'
+
+        def _create_task(coro, *, name=None):
+            coro.close()
+            return mock_task
+
+        with patch('orchestrator.harness.asyncio.create_task', side_effect=_create_task) as mock_ct:
+            h._start_main_tip_sweep()
+
+        assert h._main_tip_sweep_task is mock_task
+        _, kwargs = mock_ct.call_args
+        assert kwargs.get('name') == 'main-tip-sweep', (
+            f'Expected task name main-tip-sweep, got {kwargs.get("name")!r}'
+        )
+
+    def test_start_main_tip_sweep_disabled(self) -> None:
+        """When main_tip_sweep_enabled=False, _start_main_tip_sweep is a no-op."""
+        h = _make_lifecycle_harness(enabled=False)
+        with patch('orchestrator.harness.asyncio.create_task') as mock_ct:
+            h._start_main_tip_sweep()
+            mock_ct.assert_not_called()
+        assert h._main_tip_sweep_task is None
+
+    @pytest.mark.asyncio
+    async def test_stop_main_tip_sweep_cancels(self) -> None:
+        """After _start_main_tip_sweep, _stop_main_tip_sweep cancels the task
+        and resets h._main_tip_sweep_task to None."""
+        h = _make_lifecycle_harness(enabled=True)
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = False
+
+        def _create_task(coro, *, name=None):
+            coro.close()
+            return mock_task
+
+        with patch('orchestrator.harness.asyncio.create_task', side_effect=_create_task):
+            h._start_main_tip_sweep()
+
+        assert h._main_tip_sweep_task is mock_task
+
+        # Make the mock task behave like a cancelled task on await
+        mock_task.cancel.return_value = True
+
+        async def _await_cancelled():
+            raise asyncio.CancelledError()
+
+        mock_task.__await__ = lambda self: _await_cancelled().__await__()
+
+        await h._stop_main_tip_sweep()
+
+        mock_task.cancel.assert_called_once()
+        assert h._main_tip_sweep_task is None
