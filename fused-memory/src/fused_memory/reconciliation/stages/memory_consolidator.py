@@ -285,6 +285,10 @@ class MemoryConsolidator(BaseStage):
                 results = []
             mem0_memories = results
         except Exception:
+            logger.warning(
+                "mem0.get_all raised an exception; treating as empty memories.",
+                exc_info=True,
+            )
             mem0_memories = []
 
         new_memories = mem0_memories

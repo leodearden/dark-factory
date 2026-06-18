@@ -2488,6 +2488,9 @@ class TaskInterceptor:
                 # Short-circuits curator when (escalation_id, suggestion_hash) in
                 # metadata matches a non-cancelled existing task — avoids duplicate
                 # tasks when reconciliation retries an escalation suggestion.
+                # _idem_check_failed is intentionally unused today: both hit=None,
+                # check_failed=True and hit=None, check_failed=False fall through to
+                # the curator gate — the tuple is retained for future observability/metrics.
                 idempotency_hit, _idem_check_failed = (
                     await self._check_escalation_idempotency(
                         project_root=project_root,
@@ -2703,6 +2706,9 @@ class TaskInterceptor:
             # 'combined' immediately and excluded from the curate call.
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
+                # _idem_check_failed is intentionally unused today: both
+                # check_failed=True and check_failed=False with hit=None fall
+                # through to CREATE — retained for future observability/metrics.
                 idempotency_hit, _idem_check_failed = (
                     await self._check_escalation_idempotency(
                         project_root=t.project_root,

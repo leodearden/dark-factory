@@ -10511,9 +10511,9 @@ class TestApplyPostFlightGuardsStatusCacheBuildWarns:
             r for r in caplog.records
             if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
         ]
-        assert any('9901' in r.message for r in warns), (
+        assert any('9901' in r.getMessage() for r in warns), (
             f"expected a WARNING mentioning task_id='9901' for non-dict get_task result; "
-            f"got warns={[r.message for r in warns]!r}"
+            f"got warns={[r.getMessage() for r in warns]!r}"
         )
 
     @pytest.mark.asyncio
@@ -10549,9 +10549,9 @@ class TestApplyPostFlightGuardsStatusCacheBuildWarns:
             r for r in caplog.records
             if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
         ]
-        assert any('9902' in r.message for r in warns), (
+        assert any('9902' in r.getMessage() for r in warns), (
             f"expected a WARNING mentioning task_id='9902' for unknown-status result; "
-            f"got warns={[r.message for r in warns]!r}"
+            f"got warns={[r.getMessage() for r in warns]!r}"
         )
 
     @pytest.mark.asyncio
