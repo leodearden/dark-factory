@@ -271,13 +271,19 @@ _NEXTEST_MULTI_CRATE = """\
 
 
 class TestParsePerTestResults:
-    """Unit tests for parse_per_test_results(test_output) -> dict[str, bool]."""
+    """Unit tests for parse_per_test_results(test_output) -> dict[str, str].
+
+    Verdict vocabulary:
+      'pass'        — nextest PASS or LEAK; libtest 'ok'
+      'fail'        — nextest FAIL; libtest 'FAILED'
+      'inconclusive' — nextest TIMEOUT or SIGSEGV (non-deterministic execution artifact)
+    """
 
     def test_parses_pass_and_fail(self) -> None:
         result = parse_per_test_results(_NEXTEST_SAMPLE)
-        assert result["reify-core some::mod::test_a"] is True
-        assert result["reify-eval other::test_b"] is False
-        assert result["reify-eval some::other::test_c"] is True
+        assert result["reify-core some::mod::test_a"] == 'pass'
+        assert result["reify-eval other::test_b"] == 'fail'
+        assert result["reify-eval some::other::test_c"] == 'pass'
 
     def test_test_id_is_crate_space_path(self) -> None:
         result = parse_per_test_results(_NEXTEST_SAMPLE)
@@ -302,61 +308,79 @@ class TestParsePerTestResults:
 
     def test_multi_crate_output(self) -> None:
         result = parse_per_test_results(_NEXTEST_MULTI_CRATE)
-        assert result["crate-alpha alpha::test_one"] is True
-        assert result["crate-beta beta::test_two"] is False
-        assert result["crate-alpha alpha::test_three"] is False
-        assert result["crate-beta beta::test_four"] is True
+        assert result["crate-alpha alpha::test_one"] == 'pass'
+        assert result["crate-beta beta::test_two"] == 'fail'
+        assert result["crate-alpha alpha::test_three"] == 'fail'
+        assert result["crate-beta beta::test_four"] == 'pass'
 
     def test_tolerates_varying_leading_whitespace(self) -> None:
         # Same test line with more leading spaces
         output = "         PASS [   0.010s] my-crate my::test\n"
         result = parse_per_test_results(output)
         assert "my-crate my::test" in result
-        assert result["my-crate my::test"] is True
+        assert result["my-crate my::test"] == 'pass'
 
-    def test_fail_is_false(self) -> None:
+    def test_fail_is_fail(self) -> None:
         output = "        FAIL [  99.999s] my-crate long::test::path\n"
         result = parse_per_test_results(output)
-        assert result.get("my-crate long::test::path") is False
+        assert result.get("my-crate long::test::path") == 'fail'
 
     def test_only_fail_lines(self) -> None:
         output = "        FAIL [0.1s] c1 t1\n        FAIL [0.2s] c2 t2\n"
         result = parse_per_test_results(output)
-        assert result == {"c1 t1": False, "c2 t2": False}
+        assert result == {"c1 t1": 'fail', "c2 t2": 'fail'}
 
-    # --- Amendment: non-PASS nextest terminal statuses (suggestion 2) ---
+    # --- non-PASS nextest terminal statuses ---
 
-    def test_nextest_timeout_treated_as_failure(self) -> None:
-        """TIMEOUT is a non-PASS terminal status and must map to False."""
+    def test_nextest_timeout_is_inconclusive(self) -> None:
+        """TIMEOUT is a non-deterministic execution artifact and must map to 'inconclusive'.
+
+        Core fix: TIMEOUT does not change the suite verdict (the test may pass on retry);
+        mapping it to 'inconclusive' prevents a TIMEOUT-vs-PASS warm/cold pair from
+        triggering a false-positive born-at-L2 alarm.
+        """
         output = "        TIMEOUT [   5.000s] my-crate my::test::slow\n"
         result = parse_per_test_results(output)
-        assert result.get("my-crate my::test::slow") is False
+        assert result.get("my-crate my::test::slow") == 'inconclusive'
 
-    def test_nextest_sigsegv_treated_as_failure(self) -> None:
-        """SIGSEGV is a non-PASS terminal status and must map to False."""
+    def test_nextest_sigsegv_is_inconclusive(self) -> None:
+        """SIGSEGV is a non-deterministic execution artifact and must map to 'inconclusive'.
+
+        Core fix: SIGSEGV (crash) is a non-deterministic OS-level event; mapping it to
+        'inconclusive' prevents a SIGSEGV-vs-PASS warm/cold pair from triggering a
+        false-positive born-at-L2 alarm.
+        """
         output = "        SIGSEGV [   0.001s] my-crate crash::test\n"
         result = parse_per_test_results(output)
-        assert result.get("my-crate crash::test") is False
+        assert result.get("my-crate crash::test") == 'inconclusive'
 
-    def test_nextest_leak_treated_as_failure(self) -> None:
-        """LEAK is a non-PASS terminal status and must map to False."""
+    def test_nextest_leak_is_pass(self) -> None:
+        """LEAK must map to 'pass', mirroring nextest's own default leak-timeout semantics.
+
+        Core fix (esc-31, esc-32): nextest counts LEAK as a PASS by default
+        (leak-timeout=100ms; suite exit stays 0).  Under host contention, fast
+        deterministic tests spuriously trip leak detection.  If one warm/cold leg sees
+        LEAK→'fail' and the other sees PASS→'pass', the comparator fires a false-positive
+        born-at-L2 alarm recommending rollback of a healthy commit.  Mapping LEAK→'pass'
+        mirrors nextest's own contract and eliminates this false-positive class.
+        """
         output = "        LEAK [   0.050s] my-crate leaky::test\n"
         result = parse_per_test_results(output)
-        assert result.get("my-crate leaky::test") is False
+        assert result.get("my-crate leaky::test") == 'pass'
 
-    # --- Amendment: libtest (plain cargo test) format support (suggestion 2) ---
+    # --- libtest (plain cargo test) format support ---
 
     def test_libtest_ok_format(self) -> None:
-        """Libtest 'test <path> ... ok' line is parsed as True."""
+        """Libtest 'test <path> ... ok' line is parsed as 'pass'."""
         output = "test some::mod::test_name ... ok\n"
         result = parse_per_test_results(output)
-        assert result.get("some::mod::test_name") is True
+        assert result.get("some::mod::test_name") == 'pass'
 
     def test_libtest_failed_format(self) -> None:
-        """Libtest 'test <path> ... FAILED' line is parsed as False."""
+        """Libtest 'test <path> ... FAILED' line is parsed as 'fail'."""
         output = "test other::test_b ... FAILED\n"
         result = parse_per_test_results(output)
-        assert result.get("other::test_b") is False
+        assert result.get("other::test_b") == 'fail'
 
     def test_libtest_ignored_excluded(self) -> None:
         """Libtest 'ignored' lines are excluded (not run = not a test result)."""
@@ -376,8 +400,8 @@ class TestParsePerTestResults:
         )
         result = parse_per_test_results(output)
         assert result == {
-            "alpha::test_one": True,
-            "alpha::test_two": False,
+            "alpha::test_one": 'pass',
+            "alpha::test_two": 'fail',
         }
 
 
@@ -1839,7 +1863,7 @@ class TestParsePerTestResultsWithCounter:
     def test_pass_line_produces_clean_key(self) -> None:
         """PASS line with counter must yield key 'pkg::bin test_path' (no counter)."""
         result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
-        assert result.get("reify-cli::cli_affine_eval eval_x") is True, (
+        assert result.get("reify-cli::cli_affine_eval eval_x") == 'pass', (
             "PASS line with counter must produce stable key 'pkg::bin test'; "
             f"got keys: {sorted(result)}"
         )
@@ -1847,7 +1871,7 @@ class TestParsePerTestResultsWithCounter:
     def test_fail_line_produces_clean_key(self) -> None:
         """FAIL line with counter must yield clean key."""
         result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
-        assert result.get("reify-core::some_crate test_b") is False, (
+        assert result.get("reify-core::some_crate test_b") == 'fail', (
             f"FAIL line with counter must produce 'reify-core::some_crate test_b'; "
             f"got keys: {sorted(result)}"
         )
@@ -1855,7 +1879,7 @@ class TestParsePerTestResultsWithCounter:
     def test_release_pass_present(self) -> None:
         """Release-pass test (counter  1/  1) must produce clean key."""
         result = parse_per_test_results(_NEXTEST_REIFY_COUNTER_SAMPLE)
-        assert result.get("reify-cli::release_tests release_test_a") is True, (
+        assert result.get("reify-cli::release_tests release_test_a") == 'pass', (
             f"Release pass test must appear with clean key; got keys: {sorted(result)}"
         )
 
@@ -1881,6 +1905,6 @@ class TestParsePerTestResultsWithCounter:
     def test_backward_compat_no_counter_format_unchanged(self) -> None:
         """Old no-counter format (_NEXTEST_SAMPLE) must still parse correctly."""
         result = parse_per_test_results(_NEXTEST_SAMPLE)
-        assert result["reify-core some::mod::test_a"] is True
-        assert result["reify-eval other::test_b"] is False
-        assert result["reify-eval some::other::test_c"] is True
+        assert result["reify-core some::mod::test_a"] == 'pass'
+        assert result["reify-eval other::test_b"] == 'fail'
+        assert result["reify-eval some::other::test_c"] == 'pass'
