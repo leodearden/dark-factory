@@ -1424,9 +1424,12 @@ class TaskInterceptor:
         *,
         project_root: str,
         metadata,
-    ) -> dict | None:
-        """Return an existing task's identity if ``(escalation_id,
-        suggestion_hash)`` in ``metadata`` matches a non-cancelled task.
+    ) -> tuple[dict | None, bool]:
+        """Return ``(hit, check_failed)`` where ``hit`` is an existing task's
+        identity if ``(escalation_id, suggestion_hash)`` in ``metadata``
+        matches a non-cancelled task, and ``check_failed`` is ``True`` when
+        ``get_tasks`` raised (so callers can fall through to CREATE rather than
+        treating a failure as a clean no-hit).
 
         R4: authoritative and cheap — no LLM, no embedding lookup.
         Works even when the curator is disabled or broken, which is
@@ -1435,24 +1438,24 @@ class TaskInterceptor:
         """
         meta = self._extract_metadata_dict(metadata)
         if not meta:
-            return None
+            return (None, False)
         esc_id = meta.get('escalation_id')
         sug_hash = meta.get('suggestion_hash')
         if not isinstance(esc_id, str) or not isinstance(sug_hash, str):
-            return None
+            return (None, False)
         if not esc_id or not sug_hash:
-            return None
+            return (None, False)
 
         if self.taskmaster is None:
-            return None
+            return (None, False)
         try:
             tasks_result = await self.taskmaster.get_tasks(project_root)
         except Exception:
-            logger.debug(
+            logger.warning(
                 'r4: get_tasks failed during idempotency check',
                 exc_info=True,
             )
-            return None
+            return (None, True)
         for task in flatten_task_tree(tasks_result):
             tmeta = task.get('metadata')
             if not isinstance(tmeta, dict):
@@ -1473,14 +1476,17 @@ class TaskInterceptor:
                 esc_id,
                 sug_hash,
             )
-            return {
-                'id': tid,
-                'title': str(task.get('title', '')),
-                'deduplicated': True,
-                'action': 'idempotency_hit',
-                'reason': 'escalation+suggestion matched',
-            }
-        return None
+            return (
+                {
+                    'id': tid,
+                    'title': str(task.get('title', '')),
+                    'deduplicated': True,
+                    'action': 'idempotency_hit',
+                    'reason': 'escalation+suggestion matched',
+                },
+                False,
+            )
+        return (None, False)
 
     async def submit_task(self, project_root: str, **kwargs: Any) -> dict:
         """Phase-1 of the two-phase add: persist a ticket and return its id immediately.
@@ -2482,9 +2488,14 @@ class TaskInterceptor:
                 # Short-circuits curator when (escalation_id, suggestion_hash) in
                 # metadata matches a non-cancelled existing task — avoids duplicate
                 # tasks when reconciliation retries an escalation suggestion.
-                idempotency_hit = await self._check_escalation_idempotency(
-                    project_root=project_root,
-                    metadata=metadata,
+                # _idem_check_failed is intentionally unused today: both hit=None,
+                # check_failed=True and hit=None, check_failed=False fall through to
+                # the curator gate — the tuple is retained for future observability/metrics.
+                idempotency_hit, _idem_check_failed = (
+                    await self._check_escalation_idempotency(
+                        project_root=project_root,
+                        metadata=metadata,
+                    )
                 )
                 if idempotency_hit is not None:
                     existing_task_id = str(idempotency_hit.get('id', ''))
@@ -2497,6 +2508,9 @@ class TaskInterceptor:
                     )
                     self._signal_ticket_event(ticket_id)
                     return
+                # check_failed=True means get_tasks raised; fall through to
+                # the curator gate so the ticket is not lost (loud bypass —
+                # WARNING already emitted inside _check_escalation_idempotency).
 
                 # ── Curator gate ─────────────────────────────────────────────
                 curator = await self._get_curator()
@@ -2692,9 +2706,14 @@ class TaskInterceptor:
             # 'combined' immediately and excluded from the curate call.
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
-                idempotency_hit = await self._check_escalation_idempotency(
-                    project_root=t.project_root,
-                    metadata=t.metadata,
+                # _idem_check_failed is intentionally unused today: both
+                # check_failed=True and check_failed=False with hit=None fall
+                # through to CREATE — retained for future observability/metrics.
+                idempotency_hit, _idem_check_failed = (
+                    await self._check_escalation_idempotency(
+                        project_root=t.project_root,
+                        metadata=t.metadata,
+                    )
                 )
                 if idempotency_hit is not None:
                     existing_id = str(idempotency_hit.get('id', ''))
@@ -2707,6 +2726,8 @@ class TaskInterceptor:
                     )
                     self._signal_ticket_event(t.ticket_id)
                 else:
+                    # check_failed=True (get_tasks raised) → fall through to
+                    # CREATE; WARNING already emitted at source.
                     active_ticket_data.append(t)
             ticket_data = active_ticket_data
 
@@ -3362,9 +3383,13 @@ def _extract_status(task_data: dict) -> str:
 def _extract_metadata_files(task_data: Any) -> list[str]:
     """Return ``metadata.files`` as a list[str] from a Taskmaster task dict.
 
-    Silently returns ``[]`` when the field is absent, empty, or malformed —
-    the phantom-done gate only fires when files is a non-empty list of
-    strings, so defensive behaviour here means "do not gate".
+    Silently returns ``[]`` when the field is absent, empty, or the task_data /
+    metadata are not dicts — these are benign-absent paths and the phantom-done
+    gate simply does not fire.
+
+    Emits a WARNING when ``metadata.files`` is *present* but not a list (the gate
+    would silently self-exempt), and when a non-empty files list yields dropped
+    non-str / empty entries (partial data loss is observable).
     """
     if not isinstance(task_data, dict):
         return []
@@ -3372,9 +3397,28 @@ def _extract_metadata_files(task_data: Any) -> list[str]:
     if not isinstance(metadata, dict):
         return []
     files = metadata.get('files')
-    if not isinstance(files, list):
+    if files is None:
+        # Benign absent — phantom-done gate simply does not fire.
         return []
-    return [f for f in files if isinstance(f, str) and f]
+    if not isinstance(files, list):
+        logger.warning(
+            "_extract_metadata_files: metadata.files is present but not a list "
+            "(type=%s); treating as empty. got: %s",
+            type(files).__name__,
+            repr(files)[:200],
+        )
+        return []
+    filtered = [f for f in files if isinstance(f, str) and f]
+    if files and len(filtered) < len(files):
+        dropped = len(files) - len(filtered)
+        logger.warning(
+            "_extract_metadata_files: dropped %d non-str/empty entr%s from metadata.files. "
+            "got: %s",
+            dropped,
+            'y' if dropped == 1 else 'ies',
+            repr(files)[:200],
+        )
+    return filtered
 
 
 def _missing_files(project_root: str, declared: list[str]) -> list[str]:
@@ -3764,15 +3808,17 @@ def interceptor_write_succeeded(resp: object) -> bool:
     that does not include an explicit ``success`` field still classifies correctly.
     Non-dict responses (``None``, strings, lists) are always treated as failures.
 
-    .. warning::
-        An empty dict ``{}`` is treated as success (both ``success`` and ``error`` are
-        absent, so both default to their "no problem" values). This is intentional for
-        fixture compatibility, but it means a future upstream bug that returns ``{}``
-        instead of ``{'success': True, 'id': …}`` would be silently classified as a
-        successful write. Production Taskmaster responses always include at least one
-        of ``success`` or ``id``; if you see a ``{}`` in logs, investigate the caller.
+    An empty dict ``{}`` carries no positive write signal and is therefore treated as
+    **failure** (``bool({})`` is ``False``). Production Taskmaster responses always
+    include at least one of ``success`` or ``id``; if you see ``{}`` in logs,
+    investigate the caller.
     """
-    return isinstance(resp, dict) and bool(resp.get('success', True)) and not resp.get('error')
+    return (
+        isinstance(resp, dict)
+        and bool(resp)
+        and bool(resp.get('success', True))
+        and not resp.get('error')
+    )
 
 
 def _done_provenance_missing_error(task_id: str) -> dict:

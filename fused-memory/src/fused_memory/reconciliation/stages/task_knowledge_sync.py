@@ -1686,9 +1686,21 @@ class TaskKnowledgeSync(BaseStage):
                         )
                         continue  # omit entry; helpers detect missing key -> skip
                     if not isinstance(result, dict):
+                        logger.warning(
+                            'reconciliation._apply_post_flight_guards: '
+                            'get_task returned a non-dict for task_id=%s'
+                            ' (type=%s); guards will skip ops on this task',
+                            tid, type(result).__name__,
+                        )
                         continue  # non-dict result; omit entry so helpers skip
                     extracted = _extract_status(result)
                     if extracted == 'unknown':
+                        logger.warning(
+                            'reconciliation._apply_post_flight_guards: '
+                            'could not resolve status for task_id=%s'
+                            ' (no status key or data.status); guards will skip ops on this task',
+                            tid,
+                        )
                         continue  # unresolvable status; omit entry so helpers skip
                     status_cache[tid] = extracted
 

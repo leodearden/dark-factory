@@ -12,11 +12,16 @@ health record that reconciliation can surface in Stage 1 report.stats and WARNIN
 logs, making the silent-drop observable without any change to add_memory's public
 interface.
 
-Design: pure, no I/O.  All I/O is performed by the harness in
-_check_graphiti_queue_health(); only interpretation lives here.
+Design: no I/O except for WARNING log on malformed input.  All other I/O is
+performed by the harness in _check_graphiti_queue_health(); only interpretation
+lives here.
 """
 
 from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def summarize_graphiti_queue_health(stats: dict) -> dict:
@@ -38,11 +43,37 @@ def summarize_graphiti_queue_health(stats: dict) -> dict:
             oldest_pending_age_seconds (float | None): Age of the oldest pending/retry item.
             healthy (bool): True when dead_count == 0.
 
-    Pure: no I/O, no side effects.
+    Emits a WARNING log when *stats* is malformed (not a dict, or 'counts' key
+    present but not a dict) and forces *healthy* to False in those cases.
+    A benign-absent 'counts' key remains silent and healthy.
     """
-    counts = stats.get('counts') if isinstance(stats, dict) else {}
-    if not isinstance(counts, dict):
+    malformed = False
+
+    if not isinstance(stats, dict):
+        logger.warning(
+            "summarize_graphiti_queue_health: stats is not a dict"
+            " (type=%s, repr=%s); forcing healthy=False",
+            type(stats).__name__,
+            repr(stats)[:200],
+        )
+        malformed = True
         counts = {}
+    else:
+        raw_counts = stats.get('counts')
+        if raw_counts is not None and not isinstance(raw_counts, dict):
+            logger.warning(
+                "summarize_graphiti_queue_health: stats['counts'] is present but"
+                " not a dict (type=%s, repr=%s); forcing healthy=False",
+                type(raw_counts).__name__,
+                repr(raw_counts)[:200],
+            )
+            malformed = True
+            counts = {}
+        elif isinstance(raw_counts, dict):
+            counts = raw_counts
+        else:
+            # 'counts' key absent — benign, stays silent
+            counts = {}
 
     dead_count = int(counts.get('dead', 0))
     pending_count = int(counts.get('pending', 0))
@@ -51,10 +82,12 @@ def summarize_graphiti_queue_health(stats: dict) -> dict:
         stats.get('oldest_pending_age_seconds') if isinstance(stats, dict) else None
     )
 
+    healthy = (dead_count == 0) and not malformed
+
     return {
         'dead_count': dead_count,
         'pending_count': pending_count,
         'retry_count': retry_count,
         'oldest_pending_age_seconds': oldest_pending_age_seconds,
-        'healthy': dead_count == 0,
+        'healthy': healthy,
     }

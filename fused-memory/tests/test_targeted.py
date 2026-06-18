@@ -1,5 +1,6 @@
 """Tests for targeted reconciliation."""
 
+import logging
 import re
 from unittest.mock import AsyncMock
 
@@ -1595,6 +1596,111 @@ class TestSweepCancelledDescendants:
         ]
         assert not skip_actions, (
             f'expected no skip actions on re-check failure, got {skip_actions}'
+        )
+
+    # --- Step-5 (task 1810): malformed get_tasks => WARNING + sweep_aborted action ---
+
+    _TARGETED_LOGGER = 'fused_memory.reconciliation.targeted'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_tasks_data", [None, "bad-string", 42])
+    async def test_non_dict_get_tasks_warns_and_returns_sweep_aborted(
+        self, bad_tasks_data, wired_reconciler, mock_taskmaster, caplog,
+    ):
+        """get_tasks returning a non-dict => WARNING + sweep_aborted action in result.
+
+        Currently RED: non-dict tasks_data returns [] silently (no warning, no action).
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=bad_tasks_data)
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await wired_reconciler.reconcile_task(
+                task_id='A', transition='cancelled',
+                project_id='test-project', project_root='/tmp/test',
+                task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+            )
+
+        actions = result.get('actions', [])
+        aborted = [a for a in actions if a.get('type') == 'sweep_aborted']
+        assert aborted, (
+            f"non-dict tasks_data {bad_tasks_data!r} must produce a sweep_aborted action;"
+            f" got actions={actions!r}"
+        )
+        assert aborted[0].get('reason') == 'malformed_get_tasks', (
+            f"sweep_aborted action must have reason='malformed_get_tasks'; got {aborted[0]!r}"
+        )
+        assert aborted[0].get('parent_id') is not None, (
+            f"sweep_aborted action must include parent_id; got {aborted[0]!r}"
+        )
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            f"expected a WARNING on {self._TARGETED_LOGGER!r} for non-dict tasks_data "
+            f"{bad_tasks_data!r}, got none"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tasks_key_not_a_list_warns_and_returns_sweep_aborted(
+        self, wired_reconciler, mock_taskmaster, caplog,
+    ):
+        """get_tasks returning {'tasks': 'not-a-list'} => WARNING + sweep_aborted action.
+
+        Currently RED: the non-list branch returns actions silently (no warning, no action).
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value={'tasks': 'not-a-list'})
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await wired_reconciler.reconcile_task(
+                task_id='A', transition='cancelled',
+                project_id='test-project', project_root='/tmp/test',
+                task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+            )
+
+        actions = result.get('actions', [])
+        aborted = [a for a in actions if a.get('type') == 'sweep_aborted']
+        assert aborted, (
+            f"tasks='not-a-list' must produce a sweep_aborted action; got {actions!r}"
+        )
+        assert aborted[0].get('reason') == 'malformed_get_tasks'
+        assert aborted[0].get('parent_id') is not None
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            f"expected a WARNING on {self._TARGETED_LOGGER!r} for tasks='not-a-list'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_well_formed_empty_tasks_no_warning_no_aborted(
+        self, wired_reconciler, mock_taskmaster, caplog,
+    ):
+        """REGRESSION: well-formed {'tasks': []} => empty actions with ZERO warnings."""
+        mock_taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await wired_reconciler.reconcile_task(
+                task_id='A', transition='cancelled',
+                project_id='test-project', project_root='/tmp/test',
+                task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+            )
+
+        actions = result.get('actions', [])
+        aborted = [a for a in actions if a.get('type') == 'sweep_aborted']
+        assert not aborted, (
+            f"well-formed {{tasks:[]}} must not produce sweep_aborted; got {aborted!r}"
+        )
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f"well-formed {{tasks:[]}} must emit no WARNINGs; got {warns!r}"
         )
 
 

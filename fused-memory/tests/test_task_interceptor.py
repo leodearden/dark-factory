@@ -5644,9 +5644,12 @@ class TestInterceptorWriteSucceeded:
         """{'success': True, 'id': '1.1'} → True (extra keys, no error key → success)."""
         assert self._fn()({'success': True, 'id': '1.1'}) is True
 
-    def test_empty_dict_is_success(self):
-        """{} → True (defaults: success=True, error=None — some fixtures use bare {})."""
-        assert self._fn()({}) is True
+    def test_empty_dict_is_failure(self):
+        """{} → False (bare {} carries no positive write signal).
+
+        Currently RED: {} returns True via the defaulted success=True branch.
+        """
+        assert self._fn()({}) is False
 
     def test_reject_status_via_update_task(self):
         """_reject_status_in_update_task shape → False."""
@@ -6469,3 +6472,249 @@ async def test_get_tasks_threads_statuses(interceptor, taskmaster):
     assert kwargs2.get('statuses') is None, (
         f'Expected statuses=None when omitted, call_args: {taskmaster.get_tasks.call_args}'
     )
+
+
+# ── task-1810 step-11/12: _extract_metadata_files WARNING on present-but-malformed ──
+
+_TI_LOGGER = 'fused_memory.middleware.task_interceptor'
+
+
+class TestExtractMetadataFilesWarns:
+    """Module-level _extract_metadata_files emits WARNING when metadata.files is
+    present-but-malformed.
+
+    Step-11 (RED): all malformed paths return silently.
+    Step-12 (GREEN): WARNING when files present-but-not-a-list, and when non-str/empty entries
+    are dropped from a non-empty list.
+    """
+
+    def _fn(self):
+        from fused_memory.middleware.task_interceptor import _extract_metadata_files
+        return _extract_metadata_files
+
+    def test_files_not_a_list_returns_empty_and_warns(self, caplog):
+        """{'metadata':{'files':'a.py'}} => [] AND a WARNING.
+
+        Currently RED: isinstance-guard returns [] silently.
+        """
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': 'a.py'}})
+        assert result == [], f"expected [], got {result!r}"
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING when metadata.files is present but not a list; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    def test_list_with_dropped_entries_warns(self, caplog):
+        """{'metadata':{'files':['ok.py', 123, '']}} => ['ok.py'] AND a WARNING noting drops.
+
+        Currently RED: filter runs silently, no WARNING emitted.
+        """
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': ['ok.py', 123, '']}})
+        assert result == ['ok.py'], f"expected ['ok.py'], got {result!r}"
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING noting dropped non-str/empty entries; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    def test_absent_files_key_no_warning(self, caplog):
+        """REGRESSION: metadata dict with no 'files' key => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {}})
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"absent files must not emit WARNINGs; got {warns!r}"
+
+    def test_absent_metadata_no_warning(self, caplog):
+        """REGRESSION: task dict with no 'metadata' key => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'id': '1', 'title': 'task'})
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"absent metadata must not emit WARNINGs; got {warns!r}"
+
+    def test_non_dict_task_data_no_warning(self, caplog):
+        """REGRESSION: non-dict task_data => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn('not-a-dict')
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"non-dict task_data must not emit WARNINGs; got {warns!r}"
+
+    def test_empty_files_list_no_warning(self, caplog):
+        """REGRESSION: metadata.files=[] => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': []}})
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"empty files list must not emit WARNINGs; got {warns!r}"
+
+    def test_valid_files_list_no_warning(self, caplog):
+        """REGRESSION: metadata.files=['a.py','b.py'] => ['a.py','b.py'] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': ['a.py', 'b.py']}})
+        assert result == ['a.py', 'b.py']
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"valid files list must not emit WARNINGs; got {warns!r}"
+
+
+# ── task-1810 step-15/16: _check_escalation_idempotency tuple sentinel ──
+
+
+class TestCheckEscalationIdempotencyTuple:
+    """_check_escalation_idempotency returns (hit, check_failed) tuple.
+
+    Step-15 (RED): function returns dict|None (no tuple) and logs DEBUG on get_tasks raise.
+    Step-16 (GREEN): return type changed to tuple[dict|None, bool]; get_tasks raise =>
+      WARNING + (None, True); happy paths => (result, False).
+    """
+
+    def _make_interceptor(self, taskmaster_mock, reconciler_mock=None, event_buffer_mock=None):
+        """Build a minimal TaskInterceptor for direct method testing."""
+        from fused_memory.reconciliation.event_buffer import EventBuffer
+        if reconciler_mock is None:
+            reconciler_mock = AsyncMock()
+        if event_buffer_mock is None:
+            event_buffer_mock = AsyncMock(spec=EventBuffer)
+        return TaskInterceptor(taskmaster_mock, reconciler_mock, event_buffer_mock)
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_raise_returns_tuple_none_true_and_warns(self, caplog):
+        """taskmaster.get_tasks raises => (None, True) AND a WARNING.
+
+        Currently RED: returns bare None (not tuple) and logs DEBUG.
+        """
+        import logging
+        tm = AsyncMock()
+        tm.get_tasks = AsyncMock(side_effect=RuntimeError('db unavailable'))
+        interceptor = self._make_interceptor(tm)
+
+        metadata = {
+            'escalation_id': 'esc-r4-test',
+            'suggestion_hash': 'abc123abc123',
+        }
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = await interceptor._check_escalation_idempotency(
+                project_root='/project',
+                metadata=metadata,
+            )
+
+        # Must return a 2-tuple
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"expected (None, True) tuple; got {result!r}"
+        )
+        hit, check_failed = result
+        assert hit is None, f"expected hit=None; got {hit!r}"
+        assert check_failed is True, f"expected check_failed=True; got {check_failed!r}"
+
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING on get_tasks raise; "
+            f"got records={[(r.levelno, r.message) for r in caplog.records]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_happy_no_match_returns_none_false(self):
+        """No match in task list => (None, False).
+
+        Currently RED: returns bare None (not tuple).
+        """
+        tm = AsyncMock()
+        tm.get_tasks = AsyncMock(return_value={'tasks': []})
+        interceptor = self._make_interceptor(tm)
+
+        metadata = {
+            'escalation_id': 'esc-nomatch',
+            'suggestion_hash': 'nomatch_hash',
+        }
+        result = await interceptor._check_escalation_idempotency(
+            project_root='/project',
+            metadata=metadata,
+        )
+
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"expected (None, False) tuple; got {result!r}"
+        )
+        hit, check_failed = result
+        assert hit is None, f"expected hit=None; got {hit!r}"
+        assert check_failed is False, f"expected check_failed=False; got {check_failed!r}"
+
+    @pytest.mark.asyncio
+    async def test_happy_match_returns_dict_false(self):
+        """Match on non-cancelled task => (dict_with_id, False).
+
+        Currently RED: returns bare dict (not tuple).
+        """
+        tm = AsyncMock()
+        tm.get_tasks = AsyncMock(return_value={
+            'tasks': [{
+                'id': '42',
+                'title': 'Existing escalation task',
+                'status': 'in-progress',
+                'metadata': {
+                    'escalation_id': 'esc-r4-match',
+                    'suggestion_hash': 'match_hash_xyz',
+                },
+            }],
+        })
+        interceptor = self._make_interceptor(tm)
+
+        metadata = {
+            'escalation_id': 'esc-r4-match',
+            'suggestion_hash': 'match_hash_xyz',
+        }
+        result = await interceptor._check_escalation_idempotency(
+            project_root='/project',
+            metadata=metadata,
+        )
+
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"expected (dict, False) tuple; got {result!r}"
+        )
+        hit, check_failed = result
+        assert hit is not None and isinstance(hit, dict), (
+            f"expected hit dict; got {hit!r}"
+        )
+        assert hit.get('id') == '42', f"expected hit id='42'; got {hit!r}"
+        assert check_failed is False, f"expected check_failed=False; got {check_failed!r}"
