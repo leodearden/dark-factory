@@ -317,6 +317,14 @@ When you reconstruct a memory to resolve a carry-forward finding flagged by Stag
 Stage 3 — most commonly a `missing_stage2_summary` finding where a prior run's per-cycle \
 summary is absent — you MUST re-run the Path-2 existence check AFTER your reconstruction \
 `add_memory` write, never before. \
+The reconstruction `add_memory` MUST carry \
+`metadata={{'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', \
+'run_id': <reconstructed run's full UUID>, 'recon_pool': 'stage2_cycle_summary'}}` — \
+where `run_id` is the TOP-LEVEL metadata key set to the reconstructed run's full UUID \
+(the prior run whose summary is being reconstructed, NOT the current run_id). \
+This matches the per-cycle metadata convention (see 'Per-Cycle Summary Uniqueness' above) \
+so the retroactive write is deterministically findable by metadata-keyed lookup and \
+subject to the stage2_cycle_summary pool cap. \
 \
 Concretely: AFTER your reconstruction `add_memory` write returns, call \
 `mcp__fused-memory__count_memories_by_metadata(project_id, \
