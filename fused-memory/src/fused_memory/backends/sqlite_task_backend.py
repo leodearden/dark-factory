@@ -864,14 +864,14 @@ class SqliteTaskBackend:
                 set_values.append(new_details)
 
             if metadata is not None:
-                # Behavior note: on append=True, _merge_metadata RAISES
+                # Behavior note: on merge/additive, _merge_metadata RAISES
                 # TaskmasterError if the stored blob is corrupt — preventing a
                 # silent clobber.  The _txn wrapper rolls back, leaving the
-                # original bytes intact.  To repair a corrupt row, call
-                # update_task with append=False (explicit replace, which
-                # bypasses the merge path and overwrites unconditionally).
+                # original bytes intact.  To repair a corrupt row, pass
+                # metadata_mode='replace' (bypasses the guard intentionally).
                 new_metadata = _merge_metadata(
-                    row['metadata'], metadata, append=append,
+                    row['metadata'], metadata,
+                    mode=_resolve_metadata_mode(None, append),
                     project_root=project_root, tag=tag, task_id=tid,
                 )
                 set_columns.append('metadata = ?')
@@ -1062,7 +1062,7 @@ class SqliteTaskBackend:
                 new_meta = _merge_metadata(
                     row['metadata'],
                     json.dumps({'external_deps': [canonical]}),
-                    append=True,
+                    mode='additive',
                     project_root=project_root, tag=tag, task_id=tid,
                 )
                 await conn.execute(
@@ -1348,43 +1348,43 @@ def _merge_metadata(
     existing_raw: str | None,
     incoming: str,
     *,
-    append: bool,
+    mode: str,
     project_root: str | None = None,
     tag: str | None = None,
     task_id: int | None = None,
 ) -> str:
-    """Merge ``incoming`` metadata JSON into ``existing_raw``.
+    """Merge ``incoming`` metadata JSON into ``existing_raw`` using ``mode``.
 
-    When ``append=True`` the merge is additive and recursive:
-    * List-valued keys are concatenated and deduplicated (hashable items only)
-      in stable old-then-new order.
-    * Dict-valued keys are merged recursively with the same rules.
-    * Scalar collisions and type-mismatched collisions resolve to OLD-wins,
-      preserving audit fields such as ``prd`` and ``spawned_from``.
+    ``mode`` must be one of the three values produced by
+    :func:`_resolve_metadata_mode`:
 
-    When ``append=False`` (or when ``existing_raw`` is ``None``) the incoming
-    value replaces whatever was there — last-write-wins.
+    * ``'replace'`` — return ``incoming`` verbatim; bypasses the corrupt-blob
+      guard (the sanctioned path to repair a corrupt row).
+    * ``'merge'`` — shallow last-write-wins: ``{**existing, **incoming}``.
+      Omitted keys are preserved; every supplied key (scalar **or** list)
+      overwrites wholesale.  Falls back to ``incoming`` when either side is
+      valid JSON but not a dict.
+    * ``'additive'`` — existing recursive ``_merge_values`` semantics: list
+      union+dedup, dict-recursive, scalar/type-collision OLD-wins.  Keeps the
+      legacy ``memory_hints`` list-shape normalisation before the dict union.
 
-    If either side fails to JSON-decode, the new value replaces the old
-    verbatim — matches Taskmaster's "last write wins" fallback.
+    For ``'merge'`` and ``'additive'``, a corrupt *existing* blob raises
+    :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) — refusing to clobber
+    it.  The ``_txn`` rollback leaves the original bytes intact.  Pass
+    ``project_root``/``tag``/``task_id`` to emit a deduplicated WARNING.
 
-    Special case — ``memory_hints``:  when **both** sides carry a
-    ``memory_hints`` key and either side's value is the legacy list-of-dicts
-    shape (``[{"entity": ..., "query": ...}, ...]``), that side is normalised to
-    the canonical dict shape before ``_merge_values`` runs, so the merge falls
-    into the dict-vs-dict recursive union path rather than the type-mismatch
-    OLD-wins path.  Normalization is scoped to the merge-collision path: a write
-    that does not include ``memory_hints`` leaves a stored legacy-shape value
-    unchanged.  All other keys are unaffected.
+    A ``None`` ``existing_raw`` is treated as empty: ``incoming`` is returned
+    for all three modes (nothing to preserve or merge into).
     """
-    if existing_raw is None or not append:
+    # replace (or no existing data): return incoming verbatim, no guard.
+    if existing_raw is None or mode == 'replace':
         return incoming
-    # Parse the existing blob first so a corrupt EXISTING blob is distinguishable
-    # from a corrupt incoming blob — the two cases have different semantics.
+    # merge and additive: parse the existing blob first so a corrupt EXISTING
+    # blob is distinguishable from a corrupt incoming blob.
     try:
         old = json.loads(existing_raw)
     except (TypeError, ValueError) as err:
-        # Corrupt EXISTING blob on the append path: refuse to clobber.
+        # Corrupt EXISTING blob: refuse to clobber on merge/additive.
         # Warn once through the shared dedup gate when context is available.
         if project_root is not None and tag is not None and task_id is not None:
             _warn_malformed_metadata_once(
@@ -1398,15 +1398,17 @@ def _merge_metadata(
             raw=existing_raw,
         ) from err
     # Corrupt INCOMING blob: intentionally last-write-wins (pre-existing
-    # Taskmaster fallback behaviour).  Callers normally pass json.dumps(…)
-    # so a corrupt incoming string is unlikely in practice; validating it
-    # before persisting is a potential follow-up, out of scope here.
+    # Taskmaster fallback behaviour).
     try:
         new = json.loads(incoming)
     except (TypeError, ValueError):
         return incoming
     if not isinstance(old, dict) or not isinstance(new, dict):
         return incoming
+    if mode == 'merge':
+        # Shallow last-write-wins: every supplied key overwrites wholesale.
+        return json.dumps({**old, **new})
+    # mode == 'additive': recursive _merge_values with memory_hints normalization.
     # Normalize legacy memory_hints list shape on both sides before merging.
     # Only fires when BOTH sides carry memory_hints — i.e. on the merge collision
     # path — so a write that omits memory_hints does not silently migrate the

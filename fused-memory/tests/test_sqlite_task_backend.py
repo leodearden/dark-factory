@@ -331,14 +331,14 @@ async def test_update_task_overwrites_metadata_without_append(backend, project_r
 
 def test_merge_metadata_list_collision_appends():
     """(a) Top-level list collision under append=True concatenates."""
-    result = json.loads(_merge_metadata('{"tags":["a"]}', '{"tags":["b"]}', append=True))
+    result = json.loads(_merge_metadata('{"tags":["a"]}', '{"tags":["b"]}', mode='additive'))
     assert result == {"tags": ["a", "b"]}
 
 
 def test_merge_metadata_list_collision_dedupes_stable_order():
     """(b) Duplicate items are deduped in stable old-then-new order."""
     result = json.loads(
-        _merge_metadata('{"tags":["a","b"]}', '{"tags":["b","c"]}', append=True)
+        _merge_metadata('{"tags":["a","b"]}', '{"tags":["b","c"]}', mode='additive')
     )
     assert result == {"tags": ["a", "b", "c"]}
 
@@ -346,7 +346,7 @@ def test_merge_metadata_list_collision_dedupes_stable_order():
 def test_merge_metadata_scalar_collision_old_wins_under_append():
     """(c) Regression: scalar collision still resolves OLD-wins under append=True."""
     result = json.loads(
-        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', append=True)
+        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', mode='additive')
     )
     assert result == {"prd": "old.md"}
 
@@ -354,7 +354,7 @@ def test_merge_metadata_scalar_collision_old_wins_under_append():
 def test_merge_metadata_append_false_replaces_verbatim():
     """(d) Regression: append=False replaces the metadata verbatim."""
     result = json.loads(
-        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', append=False)
+        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', mode='replace')
     )
     assert result == {"prd": "new.md"}
 
@@ -366,7 +366,7 @@ def test_merge_metadata_nested_dict_lists_union():
     """(a) memory_hints dict shape: inner list values union additively."""
     old_raw = '{"memory_hints":{"entities":["A"],"queries":["q1"]}}'
     new_raw = '{"memory_hints":{"entities":["B"],"queries":["q2"]}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result == {"memory_hints": {"entities": ["A", "B"], "queries": ["q1", "q2"]}}
 
 
@@ -374,7 +374,7 @@ def test_merge_metadata_nested_dict_lists_dedup():
     """(b) Overlap within inner lists is deduped in stable order."""
     old_raw = '{"memory_hints":{"entities":["A","B"],"queries":[]}}'
     new_raw = '{"memory_hints":{"entities":["B","C"],"queries":[]}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result == {"memory_hints": {"entities": ["A", "B", "C"], "queries": []}}
 
 
@@ -382,7 +382,7 @@ def test_merge_metadata_nested_scalar_collision_old_wins():
     """(c) Nested scalar collision resolves OLD-wins."""
     old_raw = '{"audit":{"created_by":"x"}}'
     new_raw = '{"audit":{"created_by":"y","updated_by":"z"}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result == {"audit": {"created_by": "x", "updated_by": "z"}}
 
 
@@ -436,7 +436,7 @@ def test_merge_metadata_list_of_dicts_concatenates_without_dedup():
     """Unhashable list items (dicts) fall back to plain concatenation — no dedup."""
     old_raw = '{"x":[{"k":1}]}'
     new_raw = '{"x":[{"k":1}]}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     # Both dicts present; unhashable items are NOT deduped (plain concat).
     assert result == {"x": [{"k": 1}, {"k": 1}]}
 
@@ -455,7 +455,7 @@ def test_merge_metadata_type_mismatch_old_wins_for_non_hint_keys():
     """
     old_raw = '{"x":[1,2]}'
     new_raw = '{"x":{"a":1}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result["x"] == [1, 2]
 
 
@@ -481,19 +481,19 @@ def test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict():
     # Primary case: old=legacy list, new=canonical dict
     old_raw = '{"memory_hints":[{"entity":"E1","query":"q1"},{"entity":"E2","query":"q2"}]}'
     new_raw = '{"memory_hints":{"entities":["E3"],"queries":["q3"]}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result == {"memory_hints": {"entities": ["E1", "E2", "E3"], "queries": ["q1", "q2", "q3"]}}
 
     # Symmetric case 1: old=canonical dict, new=legacy list → union
     old_raw_sym = '{"memory_hints":{"entities":["E1"],"queries":["q1"]}}'
     new_raw_sym = '{"memory_hints":[{"entity":"E2","query":"q2"}]}'
-    result_sym = json.loads(_merge_metadata(old_raw_sym, new_raw_sym, append=True))
+    result_sym = json.loads(_merge_metadata(old_raw_sym, new_raw_sym, mode='additive'))
     assert result_sym == {"memory_hints": {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}}
 
     # Symmetric case 2: old=legacy list, new=legacy list → both coerced, then unioned
     old_raw_ll = '{"memory_hints":[{"entity":"E1","query":"q1"}]}'
     new_raw_ll = '{"memory_hints":[{"entity":"E2","query":"q2"}]}'
-    result_ll = json.loads(_merge_metadata(old_raw_ll, new_raw_ll, append=True))
+    result_ll = json.loads(_merge_metadata(old_raw_ll, new_raw_ll, mode='additive'))
     assert result_ll == {"memory_hints": {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}}
 
 
@@ -508,7 +508,7 @@ def test_merge_metadata_legacy_hints_not_normalized_on_one_sided_write():
     """
     old_raw = '{"tag":"old","memory_hints":[{"entity":"E1","query":"q1"}]}'
     new_raw = '{"tag":"new"}'  # does not carry memory_hints
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     # scalar collision on "tag" → OLD wins
     assert result["tag"] == "old"
     # memory_hints was NOT in the incoming write, so normalization does not fire;
@@ -1761,7 +1761,7 @@ def test_merge_metadata_refuses_to_clobber_corrupt_existing_blob():
     # (a) Main assertion: corrupt existing + append=True must raise TaskmasterError.
     with pytest.raises(TaskmasterError) as exc:
         _merge_metadata(
-            _CORRUPT_BLOB, incoming, append=True,
+            _CORRUPT_BLOB, incoming, mode='additive',
             project_root='/p', tag='master', task_id=1,
         )
     assert exc.value.raw == _CORRUPT_BLOB, (
@@ -1771,11 +1771,11 @@ def test_merge_metadata_refuses_to_clobber_corrupt_existing_blob():
 
     # (b) Escape hatch: append=False must return incoming (explicit replace —
     #     the sanctioned path to repair a corrupt row).
-    result_replace = _merge_metadata(_CORRUPT_BLOB, incoming, append=False)
+    result_replace = _merge_metadata(_CORRUPT_BLOB, incoming, mode='replace')
     assert result_replace == incoming
 
     # (c) No-op escape hatch: existing_raw=None + append=True returns incoming.
-    result_none = _merge_metadata(None, incoming, append=True)
+    result_none = _merge_metadata(None, incoming, mode='additive')
     assert result_none == incoming
 
 
@@ -2031,3 +2031,60 @@ def test_resolve_metadata_mode_invalid_raises():
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
         f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
     )
+
+
+# ── _merge_metadata mode= API (step-3 RED / step-4 GREEN) ───────────────────
+
+
+def test_merge_metadata_mode_merge_shallow_last_write_wins():
+    """mode='merge': sibling key preserved, scalar collision overwrites (not OLD-wins),
+    list collision overwrites wholesale (can shrink)."""
+    existing = json.dumps({'_causation_id': 'abc', 'branch': 'old', 'files': [1, 2, 3]})
+    incoming = json.dumps({'branch': 'new', 'files': [4]})
+    result = json.loads(_merge_metadata(existing, incoming, mode='merge'))
+    # Sibling preserved
+    assert result['_causation_id'] == 'abc', f'sibling clobbered: {result}'
+    # Scalar overwritten (not old-wins)
+    assert result['branch'] == 'new', f'scalar not updated: {result}'
+    # List overwritten wholesale (can shrink)
+    assert result['files'] == [4], f'list not overwritten: {result}'
+
+
+def test_merge_metadata_mode_merge_corrupt_existing_raises():
+    """mode='merge' with a corrupt existing blob raises TaskmasterError and
+    exc.value.raw == the corrupt bytes."""
+    incoming = json.dumps({'note': 'x'})
+    with pytest.raises(TaskmasterError) as exc:
+        _merge_metadata(_CORRUPT_BLOB, incoming, mode='merge',
+                        project_root='/p', tag='master', task_id=1)
+    assert exc.value.raw == _CORRUPT_BLOB, (
+        f'Expected raw == corrupt bytes; got {exc.value.raw!r}'
+    )
+
+
+def test_merge_metadata_mode_replace_returns_incoming_verbatim():
+    """mode='replace' returns incoming verbatim and bypasses the corrupt guard."""
+    incoming = json.dumps({'new': 'val'})
+    # Non-corrupt existing: returns incoming
+    result = _merge_metadata(json.dumps({'old': 1}), incoming, mode='replace')
+    assert result == incoming
+    # Corrupt existing: replace bypasses the guard (no raise)
+    result_corrupt = _merge_metadata(_CORRUPT_BLOB, incoming, mode='replace')
+    assert result_corrupt == incoming
+
+
+def test_merge_metadata_mode_additive_unions_lists_and_old_wins_scalars():
+    """mode='additive': list union+dedup, scalar collisions OLD-wins."""
+    existing = json.dumps({'items': [1, 2], 'flag': 'original'})
+    incoming = json.dumps({'items': [2, 3], 'flag': 'updated'})
+    result = json.loads(_merge_metadata(existing, incoming, mode='additive'))
+    # List union+dedup stable order
+    assert result['items'] == [1, 2, 3], f'additive list wrong: {result}'
+    # Scalar OLD-wins
+    assert result['flag'] == 'original', f'additive scalar should be old-wins: {result}'
+
+
+def test_merge_metadata_mode_merge_existing_none_returns_incoming():
+    """mode='merge' with existing_raw=None returns incoming (no existing data)."""
+    incoming = json.dumps({'k': 'v'})
+    assert _merge_metadata(None, incoming, mode='merge') == incoming
