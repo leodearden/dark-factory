@@ -671,3 +671,47 @@ class TestClassifyFailSafeBranches:
             f'dedupe_fingerprint must be empty (fingerprint helper failed); '
             f'got {outcome.dedupe_fingerprint!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-11: _main_health_fingerprint emits WARNING on composition failure
+# (task 1809 step-11 RED)
+# ---------------------------------------------------------------------------
+
+
+class TestMainHealthFingerprintWarning:
+    """Step-11 (RED): when compute_preexisting_main_break_fingerprint raises,
+    _main_health_fingerprint must return '' AND emit a WARNING at
+    'orchestrator.merge_queue'.
+
+    Before step-12 impl: the except block is silent (no WARNING) → RED.
+    After step-12 impl: WARNING is emitted.
+    """
+
+    def test_fingerprint_failure_emits_warning(self, caplog) -> None:
+        import logging
+
+        from orchestrator.merge_queue import _main_health_fingerprint
+
+        with (
+            patch(
+                'orchestrator.workflow.compute_preexisting_main_break_fingerprint',
+                side_effect=RuntimeError('fingerprint composition exploded'),
+            ),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        ):
+            result = _main_health_fingerprint('compile_error', 'some hint', 'abc123')
+
+        assert result == '', (
+            f'Expected empty string on composition failure; got {result!r}'
+        )
+
+        warning_texts = [
+            r.message for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert warning_texts, (
+            f'Expected a WARNING at orchestrator.merge_queue; got no warnings'
+        )
+        assert any(
+            'fingerprint' in t.lower() for t in warning_texts
+        ), f'Expected WARNING to mention fingerprint; got: {warning_texts}'
