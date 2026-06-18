@@ -1142,6 +1142,57 @@ class GitOps:
                 f'_reset_warm_lane: git clean failed for {lane_dir}: {err}'
             )
 
+    async def release_warm_lane(self, lane_dir: Path, branch_name: str) -> None:
+        """Release a warm lane back to the FREE pool, retaining warmth.
+
+        Steps:
+        1. ``git -C <lane> checkout --detach`` — detach HEAD so the just-used
+           branch is deletable while the lane stays checked-out warm.
+        2. ``git branch -D task/<branch_name>`` — best-effort; logs on failure.
+        3. ``await self.warm_lane_pool.release(lane_dir)`` — flip ASSIGNED→FREE.
+
+        Never removes the worktree; ``target/`` is retained for the next
+        assignment.  Fully best-effort / never-raise (mirrors
+        ``cleanup_merge_worktree`` contract) so a hiccup cannot strand the
+        scheduler.
+        """
+        if self.warm_lane_pool is None:
+            return
+
+        full_branch = f'{self.config.branch_prefix}{branch_name}'
+        try:
+            # Detach HEAD so the task branch can be deleted while the lane
+            # remains checked out warm (target/ survives).
+            rc, _, err = await _run(
+                ['git', 'checkout', '--detach'],
+                cwd=lane_dir,
+            )
+            if rc != 0:
+                logger.warning(
+                    'release_warm_lane: checkout --detach failed for %s: %s', lane_dir, err,
+                )
+        except Exception:
+            logger.warning(
+                'release_warm_lane: checkout --detach error for %s', lane_dir, exc_info=True,
+            )
+
+        try:
+            rc, _, err = await _run(
+                ['git', 'branch', '-D', full_branch],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                logger.warning(
+                    'release_warm_lane: branch -D %s failed: %s', full_branch, err,
+                )
+        except Exception:
+            logger.warning(
+                'release_warm_lane: branch -D error for %s', full_branch, exc_info=True,
+            )
+
+        await self.warm_lane_pool.release(lane_dir)
+        logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
+
     async def _provision_reify_debug_port(self, worktree_path: Path) -> int | None:
         """Run setup-worktree-debug-port.sh in the worktree and return the allocated port.
 
