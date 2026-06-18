@@ -89,6 +89,7 @@ def main() -> int:
     # Each task: {reviewer_name: [(location_normalized, category, severity), ...]}
     per_task: dict[str, dict[str, list[tuple[str, str, str]]]] = {}
     blocked_tasks: list[str] = []  # tasks where any reviewer flagged blocking
+    skipped_unreadable: int = 0   # present-but-unparseable reviewer files
 
     for d in review_dirs:
         label = task_label(d)
@@ -100,6 +101,7 @@ def main() -> int:
                 continue
             data = load_review(f)
             if data is None:
+                skipped_unreadable += 1
                 continue
 
             per_rev_present[name] += 1
@@ -133,6 +135,8 @@ def main() -> int:
             blocked_tasks.append(label)
 
     n_tasks = len(per_task)
+    print(f'skipped {skipped_unreadable} unreadable review files')
+    print()
 
     # ── per-reviewer summary table ─────────────────────────────────────
     print('=' * 78)
