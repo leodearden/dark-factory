@@ -159,7 +159,7 @@ def _make_fake_scheduler(harness, initial_metadata: dict | None = None):
     async def fake_get_task(tid):
         return {'id': tid, 'metadata': dict(persisted_metadata)}
 
-    async def fake_update_task(tid, md, *, append=False):
+    async def fake_update_task(tid, md, *, append=False, metadata_mode=None):
         if isinstance(md, dict):
             persisted_metadata.update(md)
         call_order.append('update_task')
@@ -538,12 +538,20 @@ def _make_clobber_fake_scheduler(harness, initial_metadata: dict):
     async def fake_get_status(tid):
         return task_state['status']
 
-    async def fake_update_task(tid, md, *, append=False):
-        """append=True → recursive merge; append=False → replace whole blob."""
-        if append:
+    async def fake_update_task(tid, md, *, append=False, metadata_mode=None):
+        """Simulates the #1827 metadata_mode contract.
+
+        metadata_mode='merge': shallow last-write-wins, siblings preserved.
+        metadata_mode='additive' / append=True: recursive deep merge.
+        metadata_mode='replace' / default: whole-blob replace (clobber hazard).
+        """
+        # Resolve effective mode: metadata_mode > append True→additive > default
+        if metadata_mode == 'merge':
+            task_state['metadata'] = {**task_state['metadata'], **md}
+        elif metadata_mode == 'additive' or (metadata_mode is None and append):
             task_state['metadata'] = _deep_merge(task_state['metadata'], md)
         else:
-            # Simulate the clobber hazard: replace the entire metadata blob.
+            # replace: simulate the clobber hazard (metadata_mode='replace' or default)
             task_state['metadata'] = dict(md)
         call_order.append('update_task')
         return True
