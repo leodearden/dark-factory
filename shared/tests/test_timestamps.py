@@ -39,3 +39,77 @@ class TestSuccessPath:
             parse_timestamp_or_warn('2026-06-18T12:00:00+00:00')
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_records == []
+
+
+_DEFAULT_SENTINEL = datetime.min.replace(tzinfo=UTC)
+
+
+class TestFailureFallback:
+    """Every failure mode returns the sortable UTC sentinel and emits a WARNING."""
+
+    def test_malformed_string_returns_sentinel(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            dt, ok = parse_timestamp_or_warn('not-a-timestamp')
+        assert ok is False
+        assert dt == _DEFAULT_SENTINEL
+
+    def test_none_returns_sentinel(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            dt, ok = parse_timestamp_or_warn(None)
+        assert ok is False
+        assert dt == _DEFAULT_SENTINEL
+
+    def test_non_str_int_returns_sentinel(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            dt, ok = parse_timestamp_or_warn(12345)
+        assert ok is False
+        assert dt == _DEFAULT_SENTINEL
+
+    def test_malformed_string_emits_exactly_one_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            parse_timestamp_or_warn('not-a-timestamp')
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+
+    def test_none_emits_exactly_one_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            parse_timestamp_or_warn(None)
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+
+    def test_non_str_emits_exactly_one_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            parse_timestamp_or_warn(12345)
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+
+    def test_warning_message_contains_context(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            parse_timestamp_or_warn('bad', context='dedupe.find_parent')
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert 'dedupe.find_parent' in warnings[0].getMessage()
+
+    def test_warning_message_contains_repr_of_raw(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            parse_timestamp_or_warn('bad-value', context='ctx')
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert repr('bad-value') in warnings[0].getMessage()
+
+    def test_warning_message_contains_context_for_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            parse_timestamp_or_warn(None, context='dedupe.find_parent')
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert 'dedupe.find_parent' in warnings[0].getMessage()
+
+    def test_sortable_sentinel_sorts_oldest(self):
+        """Malformed sentinel sorts BEFORE any real timestamp — 'never silently dropped'."""
+        valid_raw = '2026-06-18T12:00:00+00:00'
+        dt_valid, _ = parse_timestamp_or_warn(valid_raw)
+        dt_bad, _ = parse_timestamp_or_warn('garbage')
+        mixed = [dt_valid, dt_bad]
+        mixed.sort()
+        # The sentinel (datetime.min) must sort first — before the real timestamp
+        assert mixed[0] == _DEFAULT_SENTINEL
+        assert mixed[1] == dt_valid
