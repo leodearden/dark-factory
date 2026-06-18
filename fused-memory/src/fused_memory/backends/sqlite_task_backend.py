@@ -613,6 +613,22 @@ class SqliteTaskBackend:
             for row in rows
         }
 
+    async def get_statuses(
+        self,
+        project_root: str,
+        ids: list[str] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, str]:
+        """Return ``{id_str: status_str}`` for tasks in *project_root*.
+
+        Higher-level counterpart to :meth:`get_statuses_raw`.  For the SQLite
+        backend the ``NULL`` → ``'unknown'`` coercion already happens in
+        ``get_statuses_raw``, so this simply delegates — keeping a single
+        SQL/coercion path while still satisfying ``TaskBackendProtocol`` (the
+        reconciliation harness calls ``taskmaster.get_statuses`` directly).
+        """
+        return await self.get_statuses_raw(project_root, tag=tag, ids=ids)
+
     async def set_task_status(
         self,
         task_id: str,
