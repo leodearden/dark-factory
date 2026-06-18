@@ -3415,6 +3415,37 @@ class Scheduler:
         """
         await self._write_snapshot_best_effort(force=True)
 
+    async def _persist_files_metadata(self, task_id: str, needed: list[str]) -> bool:
+        """Persist ``needed`` as ``metadata['files']`` via a Stage-2-preserving
+        read-modify-write.
+
+        Sibling keys attached by Stage-2 reconciliation (``memory_hints``,
+        ``_causation_id``) survive because the merge policy is
+        ``{**fresh_md, 'files': needed}`` — existing keys win except ``files``.
+
+        ``needed`` is module-granularity (the output of ``files_to_modules``),
+        not raw file paths.  Writing module paths to ``metadata.files`` is
+        idempotent on restart because ``normalize_lock`` on an
+        already-depth-normalized path is identity, so the derived lock set is
+        unchanged after a reload.  This mirrors the failure-branch convention.
+
+        Returns ``True`` when ``update_task`` reports success, ``False``
+        otherwise.  Logs a warning on failure but never raises — callers that
+        have already applied the in-memory narrowing should continue even when
+        the durable write fails (reconcile/next-plan will retry).
+        """
+        fresh = await self.get_task(task_id)
+        fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
+        merged = {**fresh_md, 'files': needed}
+        updated = bool(await self.update_task(task_id, merged))
+        if not updated:
+            logger.warning(
+                'Task %s: metadata.files persist failed (non-critical — '
+                'in-memory state already applied; reconcile/next-plan will retry).',
+                task_id,
+            )
+        return updated
+
     async def handle_blast_radius_expansion(
         self,
         task_id: str,
@@ -3452,17 +3483,9 @@ class Scheduler:
                 # on startup and re-acquires the released modules, re-introducing
                 # the over-claim (δ bug).  Best-effort: in-memory narrowing already
                 # applied via release_subset; return True even on update failure.
-                # Mirrors the requeue-branch read-modify-write (see ~line 3466).
-                fresh = await self.get_task(task_id)
-                fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
-                merged = {**fresh_md, 'files': needed}
-                updated = await self.update_task(task_id, merged)
-                if not updated:
-                    logger.warning(
-                        'Task %s: set-to-plan metadata persist failed (non-critical — '
-                        'in-memory modules already narrowed; reconcile/next-plan will retry).',
-                        task_id,
-                    )
+                # Shares the same read-modify-write logic as the requeue branch
+                # (see _persist_files_metadata below).
+                updated = await self._persist_files_metadata(task_id, needed)
                 # Emit set_to_plan to signal the DURABLE persist (lock_released
                 # above signals the in-memory release; this signals durability).
                 # persisted=False lets the reify ζ gate distinguish a failed
@@ -3490,20 +3513,12 @@ class Scheduler:
         # Read-modify-write so memory_hints / _causation_id attached by Stage-2
         # reconciliation survive the blast-radius-failure files write (task 1511).
         # get_task already swallows MCP errors → None, so the isinstance guard
-        # degrades gracefully to the prior {'files': needed} write.
-        # Note: this is intentionally backend-only — the scheduler holds no per-task
-        # in-memory metadata to merge with (unlike workflow._reconcile_metadata_files_for_done,
-        # which overlays backend onto in-memory via _merge_fresh_metadata). The merge policy
-        # is {**fresh_md, 'files': needed}: Stage-2 sibling keys survive, 'files' wins.
-        fresh = await self.get_task(task_id)
-        fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
-        merged = {**fresh_md, 'files': needed}
-        updated = await self.update_task(task_id, merged)
-        if not updated:
-            logger.warning(
-                f'Task {task_id}: metadata update failed (non-critical — '
-                f'using in-memory module cache for scheduling).'
-            )
+        # degrades gracefully to the prior {'files': needed} write (see
+        # _persist_files_metadata).  This is intentionally backend-only — the
+        # scheduler holds no per-task in-memory metadata to merge with (unlike
+        # workflow._reconcile_metadata_files_for_done which uses _merge_fresh_metadata).
+        # Merge policy: {**fresh_md, 'files': needed} — Stage-2 sibling keys survive.
+        await self._persist_files_metadata(task_id, needed)
         try:
             await self.set_task_status(task_id, 'pending')
         except RuntimeError as e:
