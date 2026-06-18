@@ -1229,6 +1229,141 @@ class TestAcquireWarmLaneReuse:
 
 
 # ===========================================================================
+# Step-23: RED — on-disk backstop: same-task plan.json survives restart
+#
+# Acquire 'A' fresh, write .task/plan.json with task_id 'A' + tracked WIP.
+# Construct a BRAND-NEW GitOps (simulating a process restart — empty
+# _assignments).  acquire_warm_lane('A', sha_main) should detect that
+# _lane-0's plan.json has task_id == 'A' and route to _reuse_warm_lane
+# (preserving .task/plan.json + rebasing).
+#
+# Contrast (fresh, different task): a new GitOps with the SAME registered
+# _lane-0 whose plan.json has task_id 'A' but we acquire for 'Z' → treated
+# FRESH → .task/plan.json is gone (git clean removed it) and target/ retained.
+#
+# Today the fresh-but-registered branch always calls _reset_warm_lane →
+# git clean -xfd -e target deletes .task/ even for the same task → RED.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneOnDiskBackstop:
+    """On-disk backstop: plan.json task_id match restores REUSE across restart."""
+
+    async def test_same_task_plan_preserved_after_restart(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """After a restart (new GitOps), same-task acquire preserves .task/plan.json."""
+        import json
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+
+        # First GitOps: fresh acquire for 'task-A'
+        git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+
+        # Simulate agent writing plan.json + tracked WIP
+        plan_file = info1.path / '.task' / 'plan.json'
+        plan_file.write_text('{"task_id": "task-A", "title": "task A work"}')
+        (info1.path / 'task_work.txt').write_text('WIP after restart\n')
+
+        # Simulate process restart: fresh GitOps with empty _assignments
+        git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        assert git_ops2.warm_lane_pool is not None
+        # Confirm: in-memory map is empty (simulating restart)
+        assert git_ops2.warm_lane_pool.assignment_for('task-A') is None
+
+        # Reacquire same task on fresh GitOps — disk backstop should detect REUSE
+        info2 = await git_ops2.acquire_warm_lane('task-A', sha_main)
+
+        # TODAY: fresh-but-registered → _reset_warm_lane → git clean → .task/ gone
+        # After step-24: reads plan.json, detects task_id match → _reuse_warm_lane
+        assert info2 is not None
+        assert info2.path == info1.path  # same _lane-0
+
+        assert plan_file.exists(), '.task/plan.json must be preserved by disk backstop'
+        data = json.loads(plan_file.read_text())
+        assert data['task_id'] == 'task-A', (
+            f'plan.json was overwritten; got {data}'
+        )
+
+    async def test_same_task_wip_committed_after_restart(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """After restart, same-task reacquire commits tracked WIP + rebases."""
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+
+        git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+        plan_file = info1.path / '.task' / 'plan.json'
+        plan_file.write_text('{"task_id": "task-A"}')
+        (info1.path / 'task_work.txt').write_text('WIP work\n')
+
+        # Restart
+        git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        info2 = await git_ops2.acquire_warm_lane('task-A', sha_main)
+        assert info2 is not None
+
+        # sha_main must be ancestor of HEAD (rebased)
+        rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', sha_main, 'HEAD'],
+            cwd=info2.path,
+        )
+        assert rc == 0, f'{sha_main} not ancestor of HEAD — rebase did not run'
+
+    async def test_different_task_gets_fresh_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """A different task on the same registered lane gets a FRESH reset (plan.json cleared)."""
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+
+        # Acquire for 'task-A', write plan.json
+        git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+        plan_file = info1.path / '.task' / 'plan.json'
+        plan_file.write_text('{"task_id": "task-A"}')
+
+        # Release so pool marks the lane FREE (different task can acquire it)
+        await git_ops1.release_warm_lane(info1.path, 'task-A')
+
+        # Fresh restart: acquire for 'task-Z' (different branch)
+        git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        info2 = await git_ops2.acquire_warm_lane('task-Z', sha_main)
+        assert info2 is not None
+        assert info2.path == info1.path  # same _lane-0 (pool gave it)
+
+        # .task/plan.json should be GONE (fresh reset cleaned it)
+        # (task-Z's plan.json != task-A's, so the disk backstop routes FRESH)
+        assert not plan_file.exists(), (
+            'Fresh acquire for task-Z should have cleared the prior task-A plan.json'
+        )
+
+    async def test_different_task_retains_target_warmth(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Fresh acquire for different task keeps target/ warmth (reset-in-place)."""
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+
+        git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+        plan_file = info1.path / '.task' / 'plan.json'
+        plan_file.write_text('{"task_id": "task-A"}')
+        cache_file = info1.path / 'target' / 'cache.bin'
+        cache_file.write_bytes(b'\xca\xfe' * 64)
+
+        await git_ops1.release_warm_lane(info1.path, 'task-A')
+
+        git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        info2 = await git_ops2.acquire_warm_lane('task-Z', sha_main)
+        assert info2 is not None
+
+        assert cache_file.exists(), 'target/cache.bin must be retained on fresh reset'
+
+
+# ===========================================================================
 # Step-19: RED — WarmLanePool.acquire_for + assignment_for
 #   Branch->lane assignment map for in-memory live-requeue detection.
 #   acquire_for / assignment_for are absent today → AttributeError → RED.
