@@ -157,8 +157,17 @@ After writing the per-cycle summary, you MUST call \
 the triple filter including `stage` — and confirm it returns >= 1 to verify the stage \
 key persisted. A return of 0 means the stage key did not persist (the same failure that \
 makes Stage 3's triple-filter verification falsely report "Stage 1 summary missing"): \
-retry the `add_memory` write once with the same content and metadata before noting \
-the failure in the cycle report (mirrors the dedup-retry pattern at "Verifying Writes" above).
+retry the `add_memory` write once, this time PREPENDING a deterministic `retry_nonce` line \
+as a new first line of the content (metadata unchanged) to defeat Mem0's ~0.92 \
+cosine-similarity dedup — retrying with identical content re-triggers dedup (the \
+same mechanism that silently lost the per-cycle summary write); the `retry_nonce` extends the \
+existing `summary_nonce` dedup-defeat pattern. \
+Construct the `retry_nonce` value from available payload context using the pattern \
+`RETRY_<full_run_id_UUID>_1_<iso_timestamp_with_seconds>` \
+(e.g. `retry_nonce: RETRY_7ec2e500-fc7a-478e-a82e-7c60ee382e3a_1_2026-06-18T09:00:50`); \
+do NOT generate an arbitrary or random token — low-entropy strings \
+embed nearly identically and re-trigger the same ~0.92 cosine dedup. \
+Note the outcome in the cycle report.
 
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
