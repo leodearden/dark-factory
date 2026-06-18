@@ -58,6 +58,7 @@ __all__ = [
     'TerminalExitRejection',
     'DoneGateRejection',
     'ProvenanceValidationRejection',
+    'ExternalResolverError',
     'extract_rejection',
     'extract_structured_rejection',
     'is_transient_rejection',
@@ -157,6 +158,26 @@ class ProvenanceValidationRejection(SetTaskStatusRejected):
                 f'{error_code} — {raw}'
             ),
         )
+
+class ExternalResolverError(RuntimeError):
+    """Synthesised error: ``get_external_statuses`` returned an unusable result.
+
+    Raised (into the error slot of the ``(statuses, error)`` tuple) in two cases:
+
+    1. **Non-dict / unparseable result** — ``_parse_tool_text_result`` returned
+       ``None`` (missing 'statuses' key, wrong type, or JSON parse failure).
+       The returned statuses dict is ``{}``.
+
+    2. **Partial-result (missing keys)** — the 'statuses' dict was present but did
+       not contain a key for every requested dep string.  The returned statuses dict
+       is the partial dict (not ``{}``) so callers can log what was received, but
+       the error flag forces a fail-safe wait (do not silently treat missing keys
+       as non-done statuses).
+
+    In both cases ``_external_resolver_failed`` becomes ``True`` via the existing
+    ``external_err is not None`` plumbing — no gate-logic changes needed.
+    """
+
 
 # Error-type names that indicate a transient backend failure (taskmaster
 # child reconnecting, fused-memory crashed mid-call, network blip).  Matches
@@ -1520,9 +1541,15 @@ class Scheduler:
         ``malformed``) are surfaced as-is — the caller decides policy.
 
         Returns:
-            ``({dep: status}, None)`` on success.
-            ``({}, exception)`` on any failure — transient raises are swallowed
-            into the error slot (fail-safe; caller should skip policy effects).
+            ``({dep: status}, None)`` on success (all requested dep keys present).
+            ``(partial_dict, ExternalResolverError)`` when the response dict is
+            missing one or more requested dep keys (resolver-degraded; partial
+            dict preserved for logging but error slot forces fail-safe wait).
+            ``({}, ExternalResolverError)`` when ``_parse_tool_text_result``
+            returns a non-dict/None (unparseable JSON or missing 'statuses' key).
+            ``({}, exception)`` on any raised exception — transient raises are
+            swallowed into the error slot (fail-safe; caller should skip policy
+            effects).
         """
         try:
             arguments: dict = {'deps': list(deps)}
@@ -1531,6 +1558,20 @@ class Scheduler:
             )
             statuses = self._parse_tool_text_result(result, 'statuses')
             if isinstance(statuses, dict):
+                # Guard: the real tool always keys its response by the verbatim
+                # dep string and always sets a value (real status or a sentinel).
+                # A missing dep key is a genuine contract violation, not normal
+                # operation, so treat it as resolver-degraded (fail-safe wait).
+                missing = [d for d in deps if d not in statuses]
+                if missing:
+                    msg = (
+                        f'get_external_statuses: response missing {len(missing)}'
+                        f' of {len(deps)} requested dep keys '
+                        f'(sample: {missing[:3]!r}) — resolver-degraded; '
+                        'fail-safe wait this tick'
+                    )
+                    logger.warning(msg)
+                    return statuses, ExternalResolverError(msg)
                 return statuses, None
         except Exception as e:
             logger.exception(
@@ -1539,7 +1580,13 @@ class Scheduler:
                 e,
             )
             return {}, e
-        return {}, None
+        # Non-dict / unparseable result — _parse_tool_text_result returned None.
+        msg = (
+            f'get_external_statuses: response was non-dict/unparseable for '
+            f'{len(deps)} dep(s) — failing LOUD into error slot (fail-safe wait)'
+        )
+        logger.warning(msg)
+        return {}, ExternalResolverError(msg)
 
     _EXTERNAL_SENTINEL_STATUSES: frozenset[str] = frozenset(
         {'unknown_project', 'unknown_task', 'malformed'}
