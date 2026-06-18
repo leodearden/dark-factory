@@ -1073,6 +1073,127 @@ class TestRunShadowCompare:
         q.submit.assert_not_called()
         event_store.emit.assert_called_once()
 
+    # --- Option B: re-confirmation tests (RED until step-6 adds the logic) ---
+
+    @pytest.mark.asyncio
+    async def test_persistent_divergence_calls_cold_twice_and_escalates(
+        self, tmp_path: Path
+    ) -> None:
+        """G2 clause 2: a genuine warm='pass'/cold='fail' flip that PERSISTS across both
+        cold runs produces exactly one born-at-L2 alarm; the cold leg is invoked twice.
+
+        RED: current code calls cold only once and escalates immediately on any divergence.
+        After step-6: calls cold twice; escalates only on the intersection of persistent tests.
+        """
+        warm = {'t': 'pass'}
+        cold1 = {'t': 'fail'}
+        cold2 = {'t': 'fail'}
+        q = _make_escalation_queue()
+        req = _make_mock_req(tmp_path)
+        mock_cold = AsyncMock(side_effect=[cold1, cold2])
+
+        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, MagicMock())
+
+        # Cold leg must be invoked exactly twice (initial run + re-confirmation)
+        assert mock_cold.call_count == 2, (
+            f'Expected cold leg called twice (first run + re-confirm); '
+            f'got call_count={mock_cold.call_count}'
+        )
+        # Exactly one born-at-L2 escalation for the persistent divergence
+        q.submit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_flaky_divergence_no_escalation_no_parity_ok(
+        self, tmp_path: Path
+    ) -> None:
+        """G2 clause 2: a flip that clears on re-run → NO alarm and NO parity-ok event.
+
+        cold1={'t':'fail'} diverges from warm={'t':'pass'}, but cold2={'t':'pass'} agrees.
+        The transient flip is logged at WARNING; neither an alarm nor parity-ok is emitted.
+
+        RED: current code escalates on any divergence without re-confirmation.
+        """
+        warm = {'t': 'pass'}
+        cold1 = {'t': 'fail'}
+        cold2 = {'t': 'pass'}
+        q = _make_escalation_queue()
+        event_store = MagicMock()
+        req = _make_mock_req(tmp_path)
+        mock_cold = AsyncMock(side_effect=[cold1, cold2])
+
+        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store)
+
+        # Transient flip → no alarm (flaky, not a real divergence)
+        q.submit.assert_not_called()
+        # No parity-ok either — one cold leg showed a divergence, result is uncertain
+        event_store.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_inconclusive_only_no_reconfirm_emits_parity_ok(
+        self, tmp_path: Path
+    ) -> None:
+        """Inconclusive-only diff (has_divergence=False) → NO second cold run, parity-ok emitted.
+
+        Re-confirmation is only triggered on has_divergence=True (genuine 'pass'↔'fail' flip).
+        An inconclusive-only diff must fall through to the existing parity-ok emission with
+        exactly one cold call.
+        """
+        warm = {'t': 'pass'}
+        cold = {'t': 'inconclusive'}
+        q = _make_escalation_queue()
+        event_store = MagicMock()
+        req = _make_mock_req(tmp_path)
+        mock_cold = AsyncMock(return_value=cold)
+
+        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store)
+
+        # No re-confirmation: cold called exactly once (no alarm-worthy divergence)
+        assert mock_cold.call_count == 1, (
+            f'Expected cold leg called once (no re-confirm on inconclusive); '
+            f'got {mock_cold.call_count}'
+        )
+        # No alarm
+        q.submit.assert_not_called()
+        # Parity-ok event emitted (no alarm-worthy divergence → existing happy-path)
+        event_store.emit.assert_called_once()
+        emit_args = event_store.emit.call_args
+        assert emit_args[0][0] == EventType.verdict_parity_ok
+
+    @pytest.mark.asyncio
+    async def test_empty_cold2_on_rerun_is_inconclusive_no_escalation(
+        self, tmp_path: Path
+    ) -> None:
+        """When cold2 is empty on re-run, treat it as inconclusive and emit no alarm.
+
+        side_effect=[{'x':'fail'}, {}]: diff1 has_divergence=True (genuine flip) →
+        re-confirmation triggered → cold2={} with non-empty warm → empty-cold inconclusive
+        guard applies → no escalation, no parity-ok (indeterminate result).
+
+        RED: current code calls cold once and escalates immediately on diff1.
+        """
+        warm = {'x': 'pass'}
+        cold1 = {'x': 'fail'}
+        cold2: dict[str, str] = {}  # simulates cold re-run build/infra failure
+        q = _make_escalation_queue()
+        event_store = MagicMock()
+        req = _make_mock_req(tmp_path)
+        mock_cold = AsyncMock(side_effect=[cold1, cold2])
+
+        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store)
+
+        # Cold must be called twice (first run + re-confirm attempt)
+        assert mock_cold.call_count == 2, (
+            f'Expected cold called twice; got {mock_cold.call_count}'
+        )
+        # cold2 empty → inconclusive, no escalation
+        q.submit.assert_not_called()
+        # No parity-ok either (re-confirm was inconclusive)
+        event_store.emit.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Step-13: _maybe_schedule_shadow_compare (non-blocking scheduler)
