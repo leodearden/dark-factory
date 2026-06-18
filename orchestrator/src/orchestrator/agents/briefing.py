@@ -918,8 +918,18 @@ Handle this escalation, then call `resolve_issue` with a summary.
             logger.debug(f'MCP search failed for "{query}": {e}')
             return None
 
-    def _format_task(self, task: dict) -> str:
-        """Format a task dict as readable text."""
+    def _format_task(self, task: dict, *, include_files: bool = True) -> str:
+        """Format a task dict as readable text.
+
+        Args:
+            task: Task dict with id, title, description, metadata, etc.
+            include_files: When False, the ``metadata.files`` line is omitted
+                from the output.  Defaults to True so all existing callers are
+                unaffected.  Pass ``include_files=False`` from
+                ``build_architect_prompt`` to anti-anchor the first plan
+                derivation (C-A1): the architect must derive its own file
+                footprint rather than echoing the queue-time metadata guess.
+        """
         lines = []
         if task.get('id'):
             lines.append(f'**ID:** {task["id"]}')
@@ -929,7 +939,7 @@ Handle this escalation, then call `resolve_issue` with a summary.
             lines.append(f'**Description:** {task["description"]}')
         if task.get('details'):
             lines.append(f'**Details:** {task["details"]}')
-        if task.get('metadata', {}).get('files'):
+        if include_files and task.get('metadata', {}).get('files'):
             lines.append(f'**Files:** {", ".join(task["metadata"]["files"])}')
         deps = task.get('dependencies', [])
         if deps:
