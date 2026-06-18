@@ -479,9 +479,18 @@ class GitOps:
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
-        # Warm-lane pool — wired in step-4; None until then.
+        # Warm-lane pool — None when knob off or size=0 (default-off, trivially
+        # revertible, mirrors persistent_merge_worktree).  Size is passed from
+        # OrchestratorConfig.max_concurrent_tasks by Harness at startup (D9).
         self._warm_lane_pool_size = warm_lane_pool_size
-        self.warm_lane_pool = None
+        if warm_lane_pool_size > 0 and config.warm_lane_pool:
+            from orchestrator.warm_lane_pool import WarmLanePool
+            self.warm_lane_pool: 'WarmLanePool | None' = WarmLanePool(
+                worktree_base=self.worktree_base,
+                size=warm_lane_pool_size,
+            )
+        else:
+            self.warm_lane_pool = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -1858,6 +1867,25 @@ class GitOps:
         when the feature is off.
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+    @property
+    def warm_lane_base_target_path(self) -> Path:
+        """Absolute path of the warm BASE target/ to CoW-seed lane target/ from.
+
+        Resolution order:
+        1. ``config.warm_lane_base_target_dir`` when explicitly set (override).
+        2. ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
+           (derived default: ``<worktree_base>/_merge-verify/target``).
+        3. Fallback to ``'target'`` when ``reap_build_artifact_dirs`` is empty.
+        """
+        if self.config.warm_lane_base_target_dir is not None:
+            return Path(self.config.warm_lane_base_target_dir)
+        artifact_dir = (
+            self.config.reap_build_artifact_dirs[0]
+            if self.config.reap_build_artifact_dirs
+            else 'target'
+        )
+        return self.persistent_merge_worktree_path / artifact_dir
 
     #: Name of the counter file used to persist the verify attempt count across
     #: stateless CLI invocations.  Scope is **per-project-worktree** — the file
