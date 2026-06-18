@@ -8,11 +8,11 @@ Test layout (mirrors the plan):
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
-from fused_memory.config.schema import FusedMemoryConfig, PathScopeAdjudicatorConfig
-
+from fused_memory.config.schema import PathScopeAdjudicatorConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,7 +42,7 @@ def _agent_result(
         output=output,
         structured_output=structured_output,
         timed_out=timed_out,
-        subtype=subtype,
+        subtype=subtype or '',
     )
 
 
@@ -87,6 +87,7 @@ class TestSuccessPathParsing:
         assert 'incidental example mention' in verdict.reason
         # invoke was called
         mock_invoke.assert_awaited_once()
+        assert mock_invoke.await_args is not None
         call_kwargs = mock_invoke.await_args.kwargs
         # model from config
         assert call_kwargs.get('model') == PathScopeAdjudicatorConfig().model
@@ -134,6 +135,7 @@ class TestSuccessPathParsing:
         with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)) as mock_invoke:
             await _do_adjudicate(adj)
 
+        assert mock_invoke.await_args is not None
         call_kwargs = mock_invoke.await_args.kwargs
         assert call_kwargs.get('permission_mode') == 'bypassPermissions'
 

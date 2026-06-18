@@ -26,20 +26,20 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from shared.cli_invoke import (
     AgentResult,  # noqa: F401 (re-exported for tests)
-    AllAccountsCappedException,
     invoke_with_cap_retry,
     is_zero_output_timeout,
 )
 
 if TYPE_CHECKING:
-    from fused_memory.config.schema import PathScopeAdjudicatorConfig
     from shared.usage_gate import UsageGate
+
+    from fused_memory.config.schema import PathScopeAdjudicatorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -156,8 +156,8 @@ class PathScopeAdjudicator:
 
     def __init__(
         self,
-        config: 'PathScopeAdjudicatorConfig',
-        usage_gate: 'UsageGate | None' = None,
+        config: PathScopeAdjudicatorConfig,
+        usage_gate: UsageGate | None = None,
         cwd: Path | None = None,
     ) -> None:
         self._config = config

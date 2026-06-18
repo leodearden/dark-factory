@@ -149,7 +149,7 @@ class ScopeViolationEscalator:
         detail = '\n'.join(detail_lines)
 
         try:
-            esc = Escalation(
+            esc = Escalation(  # type: ignore[possibly-unbound]
                 id=queue.make_id(_ANCHOR_TASK_ID),
                 task_id=_ANCHOR_TASK_ID,
                 agent_role=_AGENT_ROLE,
