@@ -1555,6 +1555,9 @@ class TestConsolidatorFetchDegradedSources:
     Case B (mem0): when mem0.get_all raises, 'mem0' must appear in
     stage._fetch_degraded_sources.
 
+    Case C (status): when get_status raises, a WARNING must be emitted AND
+    'status' must appear in stage._fetch_degraded_sources.
+
     RED until step-02 wires the tracking and logging.
     """
 
@@ -1572,10 +1575,14 @@ class TestConsolidatorFetchDegradedSources:
         with caplog.at_level(logging.WARNING, logger='fused_memory'):
             await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
 
-        # Must emit a WARNING for the episodes fetch failure
+        # Must emit a WARNING for the episodes fetch failure, with the specific event key
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings, (
-            'Expected a WARNING log when get_episodes raises, got none. '
+        assert any(
+            'reconciliation.stage1_episodes_fetch_failed' in r.getMessage()
+            for r in warnings
+        ), (
+            "Expected a WARNING log containing 'reconciliation.stage1_episodes_fetch_failed' "
+            'when get_episodes raises, got none. '
             'RED: the episodes except is a bare `except Exception: episodes=[]` with no log.'
         )
 
@@ -1612,6 +1619,42 @@ class TestConsolidatorFetchDegradedSources:
         assert 'mem0' in degraded, (
             f"Expected 'mem0' in _fetch_degraded_sources, got: {degraded!r}. "
             "RED: mem0 except does not append to _fetch_degraded_sources."
+        )
+
+    @pytest.mark.asyncio
+    async def test_status_fetch_failure_logs_warning_and_tracks_degraded_source(
+        self, caplog
+    ):
+        """Case C: get_status raises → WARNING emitted AND 'status' in _fetch_degraded_sources."""
+        import logging
+
+        stage = _make_consolidator()
+        stage.memory.get_status = AsyncMock(side_effect=RuntimeError('status backend down'))
+        watermark = Watermark(project_id='test_project')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory'):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        # Must emit a WARNING for the status fetch failure, with the specific event key
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            'reconciliation.stage1_status_fetch_failed' in r.getMessage()
+            for r in warnings
+        ), (
+            "Expected a WARNING log containing 'reconciliation.stage1_status_fetch_failed' "
+            'when get_status raises, got none. '
+            'RED: the store-stats except is a bare `except Exception: status={}` with no log.'
+        )
+
+        # Must track the degraded source
+        degraded = getattr(stage, '_fetch_degraded_sources', None)
+        assert degraded is not None, (
+            '_fetch_degraded_sources attribute does not exist on MemoryConsolidator. '
+            'RED: attribute not yet declared.'
+        )
+        assert 'status' in degraded, (
+            f"Expected 'status' in _fetch_degraded_sources, got: {degraded!r}. "
+            "RED: store-stats except does not append to _fetch_degraded_sources."
         )
 
     @pytest.mark.asyncio
