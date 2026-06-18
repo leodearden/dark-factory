@@ -94,6 +94,10 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
     );
   }
 
+  const labelMap = (window.DF_SCHED_UTILS || {}).disambiguateLabels
+    ? window.DF_SCHED_UTILS.disambiguateLabels(enriched.map(m => m.path))
+    : null;
+
   return (
     <div className="sched-heatmap-wrap">
       <table className="sched-heatmap">
@@ -107,7 +111,7 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
                 className="sched-col-label"
                 title={m.project ? `${m.path} · ${m.project}` : m.path}
               >
-                <span className="sched-col-path">{m.path.split('/').pop()}</span>
+                <span className="sched-col-path">{labelMap ? labelMap.get(m.path) : m.path}</span>
                 {m.contention > 1 && (
                   <span className="sched-col-count">{m.contention}</span>
                 )}
