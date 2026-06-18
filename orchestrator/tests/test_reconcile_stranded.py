@@ -2741,3 +2741,57 @@ async def test_mark_in_progress_done_uses_lane_path(harness: Harness):
     assert cold_path not in cleanup_paths, (
         f'cleanup_worktree must NOT be called with cold path {cold_path}'
     )
+
+# ---------------------------------------------------------------------------
+# Step-3 RED: _reconcile_stranded_in_progress err/empty guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileStrandedResolverGuard:
+    """RED tests: _reconcile_stranded_in_progress must guard on resolver errors."""
+
+    async def test_case_a_transient_error_with_data_aborts_sweep_warning(
+        self, harness: Harness, caplog
+    ):
+        """CASE A: get_statuses returns error tuple → sweep aborted, WARNING emitted.
+
+        Pre-fix: err is discarded (statuses, _ = ...), loop iterates {'5': 'in-progress'}
+        and calls _reconcile_one_stranded('5', ...).  After fix: returns 0 without
+        calling _reconcile_one_stranded, and emits WARNING naming 'error'.
+        """
+        harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+            return_value=({'5': 'in-progress'}, RuntimeError('mcp down'))
+        )
+
+        with patch.object(harness, '_reconcile_one_stranded', new_callable=AsyncMock) as mock_one:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+                result = await harness._reconcile_stranded_in_progress()
+
+        assert result == 0, f'Expected 0, got {result!r}'
+        mock_one.assert_not_awaited()  # pre-fix fails here (loop iterates '5')
+        assert any(
+            r.levelno >= logging.WARNING and 'error' in r.message.lower()
+            for r in caplog.records
+        ), f'Expected WARNING naming error; got: {[r.message for r in caplog.records]!r}'
+
+    async def test_case_b_genuine_empty_returns_zero_with_warning(
+        self, harness: Harness, caplog
+    ):
+        """CASE B: get_statuses returns ({}, None) → returns 0 + WARNING naming 'empty'.
+
+        Pre-fix: returns 0 but no WARNING fires (empty dict → loop body never runs,
+        no guard exists).  After fix: WARNING at 'orchestrator.harness' naming 'empty'.
+        """
+        harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+            return_value=({}, None)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress()
+
+        assert result == 0, f'Expected 0, got {result!r}'
+        assert any(
+            r.levelno >= logging.WARNING and 'empty' in r.message.lower()
+            for r in caplog.records
+        ), f'Expected WARNING naming empty; got: {[r.message for r in caplog.records]!r}'
