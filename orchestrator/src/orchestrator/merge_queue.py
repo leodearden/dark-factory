@@ -9274,6 +9274,90 @@ def _alarm_verify_host_unreachable(
         )
 
 
+def _clear_verify_host_unreachable(
+    escalation_queue: Any,
+    event_store: Any,
+    host: str,
+    *,
+    downtime_s: float,
+) -> None:
+    """Resolve any open unreachability alarm and emit a recovery event.
+
+    Called from :meth:`_reprobe_quarantined_hosts` when a previously unreachable
+    remote verify host responds to an SSH health check again.  Performs three
+    actions:
+
+    1. **Resolve open L1**: looks up all pending escalations for the per-host
+       sentinel (via ``get_by_task(sentinel, status='pending')``) and resolves
+       each one with a recovery message.
+    2. **Emit recovery event**: emits ``EventType.verify_host_recovered`` when an
+       event store is provided.
+    3. **Submit info escalation**: submits a ``severity='info'``, ``level=0``
+       informational escalation naming the host and the downtime duration so the
+       audit trail captures the recovery.
+
+    None-safe: returns immediately when *escalation_queue* is None.
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        event_store: Optional event store; when provided a
+            ``EventType.verify_host_recovered`` event is emitted.
+        host: Remote runner name (e.g. ``'leo-laptop'``).
+        downtime_s: Seconds the host was unreachable (``now - first_unavailable_at``).
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = _verify_host_unreachable_sentinel(host)
+
+    # Resolve any pending L1 escalations for this host.
+    pending = escalation_queue.get_by_task(sentinel, status='pending')
+    for esc in pending:
+        resolution = (
+            f'Host {host!r} recovered automatically via SSH reprobe after '
+            f'{downtime_s / 60.0:.1f} min of unavailability.'
+        )
+        escalation_queue.resolve(esc.id, resolution, resolved_by='orchestrator-verify-host-monitor')
+
+    # Emit recovery event.
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+        event_store.emit(
+            EventType.verify_host_recovered,
+            data={'host': host, 'downtime_s': downtime_s},
+        )
+
+    # Submit an info-level recovery escalation for audit trail visibility.
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    minutes = downtime_s / 60.0
+    duration_str = f'{minutes:.1f} min' if downtime_s < 3600 else f'{downtime_s / 3600:.1f} h'
+    summary = (
+        f'Remote verify host {host!r} recovered after {duration_str} of unavailability'
+    )
+    detail = (
+        f'Host: {host}\n'
+        f'Downtime: {duration_str}\n'
+        '\n'
+        f'The remote verify runner {host!r} responded to the SSH health check.  '
+        'Quarantine cleared, host re-entered the live pool, and any open '
+        'unreachability alarm resolved.  No restart required.'
+    )
+
+    recovery_sentinel = f'{_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX}recovered__{host}'
+    esc = Escalation(
+        id=escalation_queue.make_id(recovery_sentinel),
+        task_id=recovery_sentinel,
+        agent_role='orchestrator-verify-host-monitor',
+        severity='info',
+        level=0,
+        category='verify_host_unreachable',
+        summary=summary,
+        detail=detail,
+    )
+    escalation_queue.submit(esc)
+
+
 def _submit_shadow_divergence_escalation(
     escalation_queue: Any,
     merge_commit: str,
