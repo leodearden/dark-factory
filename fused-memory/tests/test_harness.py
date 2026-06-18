@@ -7291,6 +7291,55 @@ class TestHarnessFetchTaskCountCensus:
 
         assert result == {}
 
+    # --- Step-3 (task 1810): non-dict get_statuses emits WARNING ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_return", [["list", "not", "dict"], None])
+    async def test_non_dict_statuses_returns_empty_and_warns(
+        self, bad_return, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """get_statuses returning a non-dict (without raising) => {} + WARNING.
+
+        Currently RED: the non-dict branch returns {} silently (no logger call).
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_statuses = AsyncMock(return_value=bad_return)  # type: ignore[union-attr,attr-defined]
+
+        _HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
+        with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
+            result = await harness._fetch_task_count_census('/abs/project')
+
+        assert result == {}
+        warns = [
+            r for r in caplog.records
+            if r.name == _HARNESS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            f"expected a WARNING on {_HARNESS_LOGGER!r} for non-dict statuses "
+            f"({bad_return!r}), got none"
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_dict_statuses_returns_empty_no_warning(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """REGRESSION: legit-empty {} from get_statuses => {} with ZERO warnings."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_statuses = AsyncMock(return_value={})  # type: ignore[union-attr,attr-defined]
+
+        _HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
+        with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
+            result = await harness._fetch_task_count_census('/abs/project')
+
+        assert result == {}
+        warns = [
+            r for r in caplog.records
+            if r.name == _HARNESS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f"legit-empty {{}} statuses must not emit WARNINGs; got {warns!r}"
+        )
+
 
 # ── Tests for task 1785: harness._check_graphiti_queue_health ──────────────────
 
