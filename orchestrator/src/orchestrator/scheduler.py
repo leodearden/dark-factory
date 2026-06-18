@@ -3437,6 +3437,7 @@ class Scheduler:
         if not additional and not stale:
             return True
 
+        released: list[str] = []
         if not additional or self.lock_table.try_acquire_additional(task_id, additional):
             if stale:
                 released = self.lock_table.release_subset(task_id, stale)
@@ -3445,6 +3446,22 @@ class Scheduler:
                         EventType.lock_released,
                         task_id=task_id,
                         data={'modules': released, 'reason': 'plan_refinement'},
+                    )
+                # Persist the narrowed set so it survives a restart.  Without
+                # this, the scheduler re-reads the over-declared metadata.files
+                # on startup and re-acquires the released modules, re-introducing
+                # the over-claim (δ bug).  Best-effort: in-memory narrowing already
+                # applied via release_subset; return True even on update failure.
+                # Mirrors the requeue-branch read-modify-write (see ~line 3466).
+                fresh = await self.get_task(task_id)
+                fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
+                merged = {**fresh_md, 'files': needed}
+                updated = await self.update_task(task_id, merged)
+                if not updated:
+                    logger.warning(
+                        'Task %s: set-to-plan metadata persist failed (non-critical — '
+                        'in-memory modules already narrowed; reconcile/next-plan will retry).',
+                        task_id,
                     )
             logger.info(f'Task {task_id} expanded to modules: {needed}')
             return True

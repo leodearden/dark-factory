@@ -2462,6 +2462,8 @@ class TaskWorkflow:
                     f'plan modules: {sorted(plan_modules)}.'
                 )
                 return WorkflowOutcome.REQUEUED
+            # Persistence of the tightened lock set is centralized in
+            # handle_blast_radius_expansion (success branch) — not here.
             self.modules = plan_modules
             self._module_configs = self._resolve_module_configs()
 
@@ -2567,6 +2569,8 @@ class TaskWorkflow:
                     self.task_id,
                 )
                 return None
+            # Persistence of the tightened lock set is centralized in
+            # handle_blast_radius_expansion (success branch) — not here.
             self.modules = plan_modules
             self._module_configs = self._resolve_module_configs()
 
@@ -2721,6 +2725,8 @@ class TaskWorkflow:
                     self.task_id, self.modules, plan_modules,
                 )
                 if expanded:
+                    # Persistence of the tightened lock set is centralized in
+                    # handle_blast_radius_expansion (success branch) — not here.
                     self.modules = plan_modules
                     self._module_configs = self._resolve_module_configs()
 
