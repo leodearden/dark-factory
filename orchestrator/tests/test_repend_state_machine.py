@@ -520,7 +520,7 @@ class TestClusterActionsB4B5:
         assert l2_record is not None and l2_record.status == 'pending', (
             f'L2 must stay open (pending); got {l2_record}'
         )
-        for l1, tid in ((l1_a, 'task-b4-a'), (l1_b, 'task-b4-b')):
+        for _l1, tid in ((l1_a, 'task-b4-a'), (l1_b, 'task-b4-b')):
             pending_l1s = queue.get_by_task(tid, status='pending')
             assert pending_l1s, (
                 f'Member L1 for {tid} must stay pending (open); found: {pending_l1s}'
