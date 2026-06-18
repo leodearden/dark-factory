@@ -1,0 +1,186 @@
+"""Tests for reify PRD boundary-test B9 — merge-spec warm-lane slot correctness.
+
+Task η (1789): K>1 speculative LOCAL verifies run WARM in parallel on one box,
+each in a distinct `_spec-` CoW-seeded lane.  `main` advances strictly
+serial+ordered via CAS.  A cold from-scratch safety-valve verify agrees — else
+a HARD ALARM (born-at-L2).
+
+B9 capstone: speculation_depth=2 + merge_spec_warm_lane_pool on →
+  * each verify WARM in a DISTINCT `_spec-` lane (per-lane seed invoked, lanes
+    ASSIGNED concurrently — mechanism, not wall-time)
+  * `main` advances strictly serial+ordered via CAS
+  * cold safety-valve agrees → no alarm; injected divergence → born-at-L2 alarm
+
+All wall-time assertions are improvement-direction/recorded-delta only (PRD §G6):
+tests assert MECHANISM (seed invoked, lanes distinct+ASSIGNED, advance ordering/
+CAS, alarm fired on injected divergence), never timing.
+
+Shared helpers
+--------------
+_write_recording_script(lane, name)
+    Drop an executable ``<lane>/scripts/<name>`` that appends its argv (space-
+    joined) to ``<lane>/scripts/<name>.argv``.  Mirrors the fake seed-warm-lane.sh
+    pattern from test_warm_lane_pool.py::TestSeedWarmLane.
+
+spec_git_repo (fixture)
+    Real git repo initialised at ``tmp_path/repo`` with worktrees base
+    ``repo/.worktrees``.  Used by GitOps + WarmLanePool tests.
+
+_make_spec_git_config(*, on, tmp_path) (helper)
+    Build a GitConfig with merge_spec_warm_lane_pool=on.  Wraps GitConfig() with
+    the common fields set so each test does not repeat boilerplate.
+
+_make_escalation_queue(*, has_open) (helper)
+    MagicMock escalation_queue with the standard API stubs (make_id, has_open_l1,
+    get_by_task, submit).  Mirrors test_merge_queue_warm_cold_shadow.py.
+
+_patch_cold_shadow_verify(monkeypatch, return_value) (helper)
+    Patch ``_run_cold_shadow_verify`` to return a controlled per-test dict so
+    cold-shadow assertions do not require a real git repo or runner subprocess.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import stat
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from _orch_helpers import make_placeholder_future, pydantic_spec  # noqa: F401
+
+from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
+from orchestrator.git_ops import GitOps, WorktreeInfo, _run  # noqa: F401
+from orchestrator.merge_queue import (  # noqa: F401
+    SpeculativeMergeWorker,
+    _maybe_schedule_shadow_compare,
+    _submit_shadow_divergence_escalation,
+)
+from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_recording_script(lane: Path, name: str) -> Path:
+    """Install an executable ``<lane>/scripts/<name>`` that records its argv.
+
+    Each invocation appends the space-joined argv to
+    ``<lane>/scripts/<name>.argv``, one line per call.  The script exits 0.
+
+    Returns the Path of the created script so callers can inspect the argv
+    file at ``script.parent / (script.name + '.argv')``.
+
+    Mirrors the fake seed-warm-lane.sh pattern in
+    ``test_warm_lane_pool.py::TestSeedWarmLane``.
+
+    Usage::
+
+        script = _write_recording_script(lane, 'seed-warm-lane.sh')
+        argv_file = script.parent / (script.name + '.argv')
+        ...
+        recorded = argv_file.read_text().strip()
+        assert recorded == f'{base_target} {lane} --reset-in-place'
+    """
+    scripts_dir = lane / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / name
+    argv_file = scripts_dir / (name + '.argv')
+    script.write_text(
+        f'#!/usr/bin/env bash\necho "$@" >> {argv_file}\n'
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+# ---------------------------------------------------------------------------
+# Git repo fixture
+# ---------------------------------------------------------------------------
+
+
+async def _init_repo(repo: Path) -> None:
+    """Initialise a bare-minimum git repository with one commit on ``main``."""
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def spec_git_repo(tmp_path: Path) -> Path:
+    """Real git repository at ``tmp_path/repo`` ready for worktree operations.
+
+    Returns the repo Path.  The worktree base (``repo/.worktrees``) is created
+    lazily by git worktree operations or by GitOps construction.
+    """
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_repo(repo))
+    return repo
+
+
+# ---------------------------------------------------------------------------
+# GitConfig helper
+# ---------------------------------------------------------------------------
+
+
+def _make_spec_git_config(*, on: bool = True, **extra) -> GitConfig:
+    """Build a GitConfig with ``merge_spec_warm_lane_pool=on``.
+
+    Passes ``**extra`` through to GitConfig() so individual tests can override
+    fields (e.g. ``warm_verify_shadow_compare=True``) without repeating all
+    the boilerplate fields.
+    """
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        merge_spec_warm_lane_pool=on,
+        **extra,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Escalation-queue spy
+# ---------------------------------------------------------------------------
+
+
+def _make_escalation_queue(*, has_open: bool = False) -> MagicMock:
+    """Return a MagicMock escalation_queue with standard API stubs.
+
+    Mirrors ``_make_escalation_queue`` in
+    ``test_merge_queue_warm_cold_shadow.py``.
+    """
+    q = MagicMock()
+    q.make_id = MagicMock(return_value='esc-spec-shadow-1')
+    q.has_open_l1 = MagicMock(return_value=has_open)
+    q.get_by_task = MagicMock(return_value=None)
+    q.submit = MagicMock()
+    return q
+
+
+# ---------------------------------------------------------------------------
+# Cold-shadow-verify patcher
+# ---------------------------------------------------------------------------
+
+
+def _patch_cold_shadow_verify(monkeypatch, return_value: dict[str, str]) -> None:
+    """Patch ``_run_cold_shadow_verify`` to return a controlled per-test dict.
+
+    Allows shadow-valve tests to inject warm==cold (parity) or warm!=cold
+    (divergence) without a real git repo or runner subprocess.
+
+    Usage::
+
+        _patch_cold_shadow_verify(monkeypatch, {'test_a': 'pass', 'test_b': 'pass'})
+    """
+    mock = AsyncMock(return_value=return_value)
+    monkeypatch.setattr(
+        'orchestrator.merge_queue._run_cold_shadow_verify',
+        mock,
+    )
