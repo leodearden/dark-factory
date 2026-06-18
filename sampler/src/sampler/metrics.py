@@ -205,10 +205,7 @@ def collect_process_metrics(
     if proc_iter is None:
         proc_iter = psutil.process_iter
 
-    try:
-        procs = list(proc_iter(['pid', 'name', 'cmdline', 'memory_info']))
-    except Exception:
-        procs = []
+    procs = list(proc_iter(['pid', 'name', 'cmdline', 'memory_info']))
 
     # No separate cmdline() probe loop: _is_occt_gated and _is_verify_sh each
     # have their own try/except that silently skips processes that died or are
