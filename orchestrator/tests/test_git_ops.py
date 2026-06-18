@@ -6212,3 +6212,43 @@ class TestCreateWorktreeRequeueAndRecycledId:
             'Recycled-id task MUST NOT inherit the prior task\'s plan.json '
             '(identity guard should route to fresh reset)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 1809 step-13: get_merge_diff_files emits WARNING on rc!=0
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGetMergeDiffFilesWarning:
+    """Step-13 (RED): get_merge_diff_files must emit a WARNING when git diff
+    exits non-zero (e.g. non-existent base SHA), while still returning [].
+
+    Before step-14 impl: rc!=0 path is silent → RED (no WARNING).
+    After step-14 impl: WARNING captured at 'orchestrator.git_ops'.
+    """
+
+    async def test_nonexistent_sha_returns_empty_and_warns(
+        self, git_repo: Path, git_config: GitConfig, caplog,
+    ) -> None:
+        import logging
+
+        ops = GitOps(git_config, git_repo)
+        non_existent = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await ops.get_merge_diff_files(non_existent, 'HEAD')
+
+        assert result == [], (
+            f'Expected [] on git error; got {result!r}'
+        )
+
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_texts, (
+            'Expected a WARNING at orchestrator.git_ops when git diff fails; '
+            f'got no warnings'
+        )
+        assert any(
+            'get_merge_diff_files' in t.lower() or 'diff' in t.lower()
+            for t in warning_texts
+        ), f'Expected WARNING to mention diff failure; got: {warning_texts}'
