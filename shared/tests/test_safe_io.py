@@ -105,3 +105,33 @@ class TestOnCorruptDispatch:
 
         with pytest.raises(ValueError, match='unknown on_corrupt'):
             load_json_or_warn(p, default=SENTINEL, on_corrupt='bogus')
+
+
+class TestQuarantine:
+    """on_corrupt='quarantine': rename file to <name>.corrupt, return (default, False)."""
+
+    def test_quarantine_renames_file_and_returns_default_false(self, tmp_path, caplog):
+        """Corrupt file is renamed to x.json.corrupt; returns (SENTINEL, False) with one WARNING."""
+        from shared.safe_io import load_json_or_warn
+
+        corrupt_bytes = b'{not json'
+        p = tmp_path / 'x.json'
+        p.write_bytes(corrupt_bytes)
+
+        with caplog.at_level(logging.WARNING):
+            result, ok = load_json_or_warn(p, default=SENTINEL, on_corrupt='quarantine')
+
+        assert ok is False
+        assert result is SENTINEL
+
+        # Original file must be gone.
+        assert not p.exists(), f'Original file should have been quarantined but still exists: {p}'
+
+        # Quarantine sibling must exist with the original bytes.
+        quarantine = tmp_path / 'x.json.corrupt'
+        assert quarantine.exists(), f'Quarantine file missing: {quarantine}'
+        assert quarantine.read_bytes() == corrupt_bytes
+
+        # Exactly one WARNING must name the path.
+        assert len(caplog.records) == 1, f'Expected exactly one WARNING, got: {caplog.records}'
+        assert str(p) in caplog.records[0].message
