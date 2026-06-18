@@ -1276,12 +1276,15 @@ class TestUnreachableHostCapstone:
     async def test_n_ru_events_produce_exactly_one_escalation(self):
         """N consecutive RunnerUnavailable finalize events → exactly one L1 escalation."""
         import asyncio
+        from unittest.mock import patch
+
         from orchestrator.merge_queue import (
-            InflightEntry, InflightVerifyResult,
-            MergeOutcome, MergeRequest, SpeculativeItem,
+            InflightEntry,
+            InflightVerifyResult,
+            MergeRequest,
+            SpeculativeItem,
         )
         from orchestrator.verify_runner import HostLease
-        from unittest.mock import patch
 
         n = 2
         worker = _make_minimal_worker()
@@ -1298,8 +1301,7 @@ class TestUnreachableHostCapstone:
         def _make_entry(host_name: str, reason: str):
             loop = asyncio.get_event_loop()
             config = OrchestratorConfig(
-                git=GitConfig(project_root='/tmp/fake'),
-                enable_speculative_merge=False,
+                project_root='/tmp/fake',
             )
             req = MergeRequest(
                 task_id='task-cap',
@@ -1354,12 +1356,12 @@ class TestUnreachableHostCapstone:
         This exercises _reprobe_quarantined_hosts directly (already implemented in step-14).
         The reprobe loop (step-16) will wire this to run automatically.
         """
-        from orchestrator.merge_queue import _HostUnavailability
         from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _HostUnavailability
 
         worker = _make_minimal_worker()
         es = _RecordingEventStore()
-        worker._event_store = es
+        worker._event_store = es  # type: ignore[assignment]
 
         eq = _make_minimal_escalation_queue()
         worker._escalation_queue = eq
@@ -1392,15 +1394,15 @@ class TestUnreachableHostCapstone:
 
         RED until step-16 wires _reprobe_loop into run() with a small interval.
         """
-        from orchestrator.merge_queue import _HostUnavailability
         from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _HostUnavailability
 
         worker = _make_minimal_worker()
         worker._reprobe_interval_s = 0.01  # fire almost immediately
         worker._unreachable_escalate_after_secs = 9999.0  # only check via n-streak path
 
         es = _RecordingEventStore()
-        worker._event_store = es
+        worker._event_store = es  # type: ignore[assignment]
 
         eq = _make_minimal_escalation_queue()
         worker._escalation_queue = eq

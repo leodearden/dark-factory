@@ -1003,7 +1003,7 @@ class TestRunInflightVerifyRunnerUnavailableReason:
 
     async def test_reason_captured_from_exception_message(self, tmp_path):
         """REMOTE lease RunnerUnavailable → reason field holds the exception message."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker, SpeculativeItem
+        from orchestrator.merge_queue import SpeculativeItem, SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
         error_msg = 'ssh: Could not resolve hostname leo-laptop'
@@ -1064,8 +1064,9 @@ class TestRunnerUnavailableTracker:
     """
 
     def _make_worker(self, *, escalate_after_n=2):
-        from unittest.mock import MagicMock
         import asyncio
+        from unittest.mock import MagicMock
+
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
         git_ops = MagicMock()
@@ -1351,6 +1352,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     def _make_worker(self, *, escalate_after_n=2):
         """Build a minimal SpeculativeMergeWorker with fake allocator + escalation queue."""
         import asyncio
+
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
         git_ops = _make_git_ops_mock()
@@ -1375,9 +1377,12 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     def _make_ru_entry(self, worker, host_name, reason='ssh timeout'):
         """Build an InflightEntry whose verify_task yields RUNNER_UNAVAILABLE."""
         import asyncio
+
         from orchestrator.merge_queue import (
-            InflightEntry, InflightVerifyResult,
-            MergeOutcome, MergeRequest, SpeculativeItem,
+            InflightEntry,
+            InflightVerifyResult,
+            MergeRequest,
+            SpeculativeItem,
         )
         from orchestrator.verify_runner import HostLease
 
@@ -1431,6 +1436,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     async def test_quarantine_and_release_still_runs(self):
         """RUNNER_UNAVAILABLE → quarantine_and_release called (existing behavior preserved)."""
         from unittest.mock import patch
+
         from orchestrator.merge_queue import SpeculativeItem
 
         worker, eq, fake_alloc = self._make_worker(escalate_after_n=3)
@@ -1447,6 +1453,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     async def test_host_in_runner_quarantine_after_ru(self):
         """After RUNNER_UNAVAILABLE the lease host is in worker._runner_quarantine."""
         from unittest.mock import patch
+
         from orchestrator.merge_queue import SpeculativeItem
 
         worker, eq, fake_alloc = self._make_worker(escalate_after_n=3)
@@ -1467,6 +1474,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     async def test_nth_ru_submits_exactly_one_escalation(self):
         """After N RU events for same host exactly ONE escalation is submitted."""
         from unittest.mock import patch
+
         from orchestrator.merge_queue import SpeculativeItem
 
         n = 2
@@ -1486,6 +1494,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     async def test_nth_escalation_names_host_and_reason(self):
         """The submitted escalation names the host and captured reason."""
         from unittest.mock import patch
+
         from orchestrator.merge_queue import SpeculativeItem
 
         n = 2
@@ -1506,6 +1515,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     async def test_further_ru_events_do_not_submit_second_escalation(self):
         """Additional RU events after threshold are dedup'd (has_open_l1 guard)."""
         from unittest.mock import patch
+
         from orchestrator.merge_queue import SpeculativeItem
 
         n = 2
@@ -1525,6 +1535,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     async def test_n_failed_stays_false_on_ru(self):
         """RUNNER_UNAVAILABLE does not set _n_failed (item should be re-dispatched)."""
         from unittest.mock import patch
+
         from orchestrator.merge_queue import SpeculativeItem
 
         n = 2
@@ -1715,6 +1726,7 @@ class TestReprobeQuarantinedHosts:
     ):
         """Build a bare worker with fake allocator + escalation queue."""
         import asyncio
+
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
         git_ops = _make_git_ops_mock()
@@ -1745,7 +1757,7 @@ class TestReprobeQuarantinedHosts:
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=False)
         alloc = _FakeAllocatorForReprobe({'bad-host': fake_runner})
-        worker._host_allocator = alloc
+        worker._host_allocator = alloc  # type: ignore[assignment]
 
         # Seed as RU-quarantined, not yet past time threshold
         now = 1000.0
@@ -1758,13 +1770,12 @@ class TestReprobeQuarantinedHosts:
 
     async def test_unhealthy_past_time_threshold_fires_time_based_alarm(self):
         """health()=False AND past T threshold → time-based alarm fires (dedup'd)."""
-        from orchestrator.event_store import EventType
         worker, eq = self._make_worker_with_reprobe(escalate_after_secs=5.0)
 
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=False)
         alloc = _FakeAllocatorForReprobe({'slow-host': fake_runner})
-        worker._host_allocator = alloc
+        worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
         self._seed_ru_tracker(worker, 'slow-host', first_unavailable_at=now - 60.0)
@@ -1784,7 +1795,7 @@ class TestReprobeQuarantinedHosts:
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=False)
         alloc = _FakeAllocatorForReprobe({'slow-host': fake_runner})
-        worker._host_allocator = alloc
+        worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
         self._seed_ru_tracker(worker, 'slow-host', first_unavailable_at=now - 60.0)
@@ -1806,7 +1817,7 @@ class TestReprobeQuarantinedHosts:
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
         alloc = _FakeAllocatorForReprobe({'good-host': fake_runner})
-        worker._host_allocator = alloc
+        worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
         self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
@@ -1822,7 +1833,7 @@ class TestReprobeQuarantinedHosts:
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
         alloc = _FakeAllocatorForReprobe({'good-host': fake_runner})
-        worker._host_allocator = alloc
+        worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
         self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
@@ -1838,7 +1849,7 @@ class TestReprobeQuarantinedHosts:
         fake_runner = MagicMock()
         fake_runner.health = AsyncMock(return_value=True)
         alloc = _FakeAllocatorForReprobe({'good-host': fake_runner})
-        worker._host_allocator = alloc
+        worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
         self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
@@ -1856,7 +1867,7 @@ class TestReprobeQuarantinedHosts:
         fake_runner.health = AsyncMock(return_value=True)
         # Host is in the allocator quarantine (as returned by quarantined_remote_runners)
         alloc = _FakeAllocatorForReprobe({'diverged-host': fake_runner})
-        worker._host_allocator = alloc
+        worker._host_allocator = alloc  # type: ignore[assignment]
 
         # Crucially: do NOT seed 'diverged-host' in the RU tracker
         now = 1000.0
@@ -1887,7 +1898,7 @@ class TestReprobeQuarantinedHosts:
             'crash-host': bad_runner,
             'ok-host': good_runner,
         })
-        worker._host_allocator = alloc
+        worker._host_allocator = alloc  # type: ignore[assignment]
 
         now = 1000.0
         self._seed_ru_tracker(worker, 'crash-host', first_unavailable_at=now - 10.0)
