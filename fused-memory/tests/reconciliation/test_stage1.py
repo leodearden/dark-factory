@@ -1366,3 +1366,85 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
             "When stage.graphiti_queue_health is None, the key must be absent from "
             f"report.stats; got stats={report.stats!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-15 (RED) / step-16 (GREEN): Task Count Census payload section
+# ---------------------------------------------------------------------------
+
+
+class TestStage1PayloadTaskCountCensus:
+    """Task Count Census section appears in both payload paths when verification is set.
+
+    step-15 (RED): _build_task_count_census_section does not exist yet.
+    step-16 (GREEN): add the helper + wire into both payload methods.
+    """
+
+    _CENSUS_HEADER = '### Task Count Census'
+
+    def _make_stage_with_census(self) -> MemoryConsolidator:
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.task_count_verification = {
+            'available': True,
+            'consistent': False,
+            'done_mismatch': True,
+            'total_mismatch': False,
+            'authoritative': {'done': 608, 'total': 635},
+            'tree': {'done': 600, 'total': 635},
+        }
+        return stage
+
+    @pytest.mark.asyncio
+    async def test_census_section_in_legacy_assemble_payload(self):
+        """assemble_payload (legacy time-windowed path) includes Task Count Census section."""
+        stage = self._make_stage_with_census()
+        watermark = Watermark(project_id='test_project')
+
+        result = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        assert self._CENSUS_HEADER in result, (
+            f"assemble_payload must include '{self._CENSUS_HEADER}' when "
+            f"task_count_verification is set; got:\n{result!r}"
+        )
+        # Authoritative counts must appear in the section
+        assert '635' in result, 'Authoritative total=635 must appear in the census section'
+        assert '608' in result, 'Authoritative done=608 must appear in the census section'
+        # Source attribution
+        assert 'get_statuses' in result, "'get_statuses' must be named as the source"
+
+    @pytest.mark.asyncio
+    async def test_census_section_in_assembled_payload_path(self):
+        """_format_assembled_payload (ContextAssembler path) includes Task Count Census section."""
+        stage = self._make_stage_with_census()
+        stage.assembled_payload = AssembledPayload(events=[], context_items={})
+        watermark = Watermark(project_id='test_project')
+
+        result = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        assert self._CENSUS_HEADER in result, (
+            f"_format_assembled_payload must include '{self._CENSUS_HEADER}' when "
+            f"task_count_verification is set; got:\n{result!r}"
+        )
+        assert '635' in result, 'Authoritative total=635 must appear in census section'
+        assert '608' in result, 'Authoritative done=608 must appear in census section'
+        assert 'get_statuses' in result, "'get_statuses' must be named as the source"
+
+    @pytest.mark.asyncio
+    async def test_census_section_absent_when_verification_is_none(self):
+        """Census section must be absent when task_count_verification is None."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        # task_count_verification defaults to None — don't set it
+        watermark = Watermark(project_id='test_project')
+
+        result = await stage.assemble_payload(
+            events=[], watermark=watermark, prior_reports=[]
+        )
+
+        assert self._CENSUS_HEADER not in result, (
+            f"Census section must be absent when task_count_verification is None; "
+            f"got:\n{result!r}"
+        )
