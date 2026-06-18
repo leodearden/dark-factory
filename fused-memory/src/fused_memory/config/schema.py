@@ -656,6 +656,34 @@ class CuratorConfig(BaseModel):
     )
 
 
+class PathScopeAdjudicatorConfig(BaseModel):
+    """LLM adjudicator config for Stage-2 path-scope guard filtering.
+
+    Fires only on a Stage-1 heuristic HIT (rare). The prompt is tiny
+    (title + description + matched prefixes) so timeout/budget are much
+    smaller than the curator's 30-entry pool.
+
+    Fail-safe asymmetry: only a clean LLM success with verdict=='allow'
+    downgrades the heuristic hit; every other outcome preserves the guard.
+    """
+
+    enabled: bool = Field(default=True)
+    model: str = Field(default='sonnet')
+    # 60s bounds a silent Anthropic-API hang for this much smaller prompt;
+    # the curator uses 180s for a 30-entry pool, but title+description+prefixes
+    # is far smaller so ~1/3 of that budget is sufficient.
+    timeout_seconds: float = Field(default=60.0)
+    max_budget_usd: float = Field(default=0.10)
+    # Per-call turn cap. Must be ≥ 3: schema burns one tool-use turn,
+    # an optional reasoning turn may precede it, and the final assistant
+    # response is the third. Matches the json-schema turn floor noted in
+    # CuratorConfig.
+    max_turns: int = Field(default=3, ge=3)
+    # Zero-output-timeout circuit-breaker knobs (mirrors CuratorConfig).
+    zero_output_breaker_threshold: int = Field(default=2, ge=1)
+    zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
+
+
 # --- Top-level ---
 
 
@@ -689,6 +717,9 @@ class FusedMemoryConfig(BaseSettings):
     taskmaster: TaskmasterConfig | None = Field(default=None)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
+    path_scope_adjudicator: PathScopeAdjudicatorConfig = Field(
+        default_factory=PathScopeAdjudicatorConfig,
+    )
     # Curator's usage-gate pool; independent from ``reconciliation.usage_cap``
     # because each UsageGate instance tracks cap state per-process / per-loop.
     usage_cap: UsageCapConfig | None = Field(default_factory=_default_curator_usage_cap)
