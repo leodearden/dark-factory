@@ -74,6 +74,45 @@ class TestFormatTaskMetadataInvariant:
         assert 'Modules' not in out
 
 
+class TestFormatTaskIncludeFiles:
+    """Unit tests for the include_files parameter on _format_task.
+
+    Locks in the anti-anchor mechanic introduced for C-A1: when
+    include_files=False the Files line must be absent so the first architect
+    derivation cannot rubber-stamp the queue-time metadata.files guess.
+    """
+
+    def _task_with_files(self) -> dict:
+        return {
+            'id': '1835',
+            'title': 'Anti-anchor task',
+            'description': 'Derive files independently',
+            'metadata': {'files': ['orchestrator', 'shared']},
+        }
+
+    def test_include_files_false_omits_files_line(
+        self, briefing: BriefingAssembler,
+    ):
+        """include_files=False must hide the Files line."""
+        out = briefing._format_task(self._task_with_files(), include_files=False)
+        assert '**Files:**' not in out
+
+    def test_include_files_false_keeps_description(
+        self, briefing: BriefingAssembler,
+    ):
+        """include_files=False must not suppress Description or other fields."""
+        out = briefing._format_task(self._task_with_files(), include_files=False)
+        assert '**Description:**' in out
+        assert '**Title:**' in out
+
+    def test_include_files_default_still_shows_files(
+        self, briefing: BriefingAssembler,
+    ):
+        """Default call (no flag) must still render the Files line."""
+        out = briefing._format_task(self._task_with_files())
+        assert '**Files:** orchestrator, shared' in out
+
+
 @pytest.mark.asyncio
 class TestBuildPlanTighteningPrompt:
     """Architect narrowing pass after the plan-files-not-touched gate.
