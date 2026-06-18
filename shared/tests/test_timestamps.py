@@ -2,7 +2,7 @@
 
 Covers:
   - TestSuccessPath: valid tz-aware and naive ISO strings parse correctly,
-    no WARNING emitted.
+    no WARNING emitted.  Includes 'Z' (Zulu) suffix and non-UTC offset cases.
   - TestFailureFallback: None / non-str / malformed strings all return the
     sortable UTC sentinel and emit exactly one WARNING carrying context.
   - TestCallerFallback: caller-supplied ``fallback`` is returned on failure
@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from shared.timestamps import parse_timestamp_or_warn
 
@@ -33,6 +33,28 @@ class TestSuccessPath:
         assert ok is True
         assert dt.tzinfo is not None
         assert dt.tzinfo == UTC
+
+    def test_zulu_suffix_parsed_as_utc(self, caplog):
+        """'Z' (Zulu) suffix is handled natively on Python 3.11+ (no pre-processing needed)."""
+        raw = '2026-06-18T12:00:00Z'
+        with caplog.at_level(logging.WARNING):
+            dt, ok = parse_timestamp_or_warn(raw)
+        assert ok is True
+        assert dt == datetime(2026, 6, 18, 12, 0, tzinfo=UTC)
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_records == []
+
+    def test_non_utc_offset_preserved_not_converted(self, caplog):
+        """Tz-aware inputs with a non-UTC offset keep their original offset (NOT converted to UTC)."""
+        raw = '2026-06-18T12:00:00+05:00'
+        with caplog.at_level(logging.WARNING):
+            dt, ok = parse_timestamp_or_warn(raw)
+        assert ok is True
+        assert dt.utcoffset() == timedelta(hours=5)
+        # Must NOT have been silently converted to UTC
+        assert dt.tzinfo != UTC
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_records == []
 
     def test_success_emits_no_warning(self, caplog):
         with caplog.at_level(logging.WARNING):

@@ -41,11 +41,23 @@ def parse_timestamp_or_warn(
     Returns
     -------
     tuple[datetime, bool]
-        ``(dt, True)`` on success — *dt* is always tz-aware.
+        ``(dt, True)`` on success — *dt* is always tz-aware.  **Naive inputs
+        are stamped UTC; tz-aware inputs preserve their original offset and
+        are NOT converted to UTC.**  Callers that need UTC-normalised values
+        must call ``dt.astimezone(UTC)`` themselves.
         ``(sentinel, False)`` on failure — WARNING is emitted with *context*
-        and ``repr(raw)``.  The sentinel sorts *before* any real timestamp so
-        that "oldest-first" folds always include malformed records rather than
-        silently dropping them.
+        and ``repr(raw)``.
+
+    Sentinel direction
+    ------------------
+    The default sentinel ``datetime.min.replace(tzinfo=UTC)`` sorts *before*
+    any real timestamp.  This is correct for "oldest-first" folds that
+    **include** malformed records (e.g. escalation queue / watcher).
+
+    Call sites whose selection logic picks the **oldest/min** record as
+    canonical (e.g. escalation dedupe, backfill recon) must pass
+    ``fallback=datetime.max.replace(tzinfo=UTC)`` so that a malformed record
+    sorts to the end and is never mistakenly selected as canonical.
     """
     sentinel = fallback if fallback is not None else datetime.min.replace(tzinfo=UTC)
     ctx_tag = f' [{context}]' if context else ''
