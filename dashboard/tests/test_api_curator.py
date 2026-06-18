@@ -996,3 +996,56 @@ def test_api_curator_uses_days_seven_lookback(tmp_path: Path):
         'capped_accounts': ['acc-a'],
         'account_names': ['acc-a'],
     }, f'Expected accounts_summary with total=1, got {state.get("accounts_summary")!r}'
+
+
+# ---------------------------------------------------------------------------
+# step-17 (task-1814): accounts_summary exception must log at WARNING
+# ---------------------------------------------------------------------------
+
+
+def test_api_curator_accounts_summary_failure_logs_warning(tmp_path: Path, caplog):
+    """When summarize_accounts raises, api_curator logs a WARNING (not DEBUG).
+
+    Fails today because the except block calls logger.debug (invisible at INFO).
+    After the fix, a WARNING containing 'accounts_summary' must appear in caplog.
+    The response must still be 200 with an empty accounts_summary (graceful degrade).
+    """
+    import logging
+
+    config = _make_config(tmp_path)
+    empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
+
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+        patch(
+            'dashboard.app.summarize_accounts',
+            side_effect=RuntimeError('simulated summarize_accounts failure'),
+        ),
+        caplog.at_level(logging.WARNING, logger='dashboard.app'),
+    ):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200, (
+        f'Expected 200 (graceful degrade), got {resp.status_code}'
+    )
+    state = resp.json()['CURATOR_STATE']['state']
+    # Degrade to empty accounts_summary.
+    assert state['accounts_summary'] == {
+        'total': 0,
+        'capped': 0,
+        'available': 0,
+        'capped_accounts': [],
+        'account_names': [],
+    }, f'Expected empty accounts_summary on failure, got {state.get("accounts_summary")!r}'
+
+    # A WARNING mentioning accounts_summary must have been emitted.
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'accounts_summary' in r.message
+    ]
+    assert warning_records, (
+        'Expected a WARNING mentioning accounts_summary when summarize_accounts raises, '
+        f'but only found: {[r.message for r in caplog.records]}'
+    )
