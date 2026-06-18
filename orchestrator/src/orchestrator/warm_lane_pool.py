@@ -48,6 +48,8 @@ class WarmLanePool:
             worktree_base / f'{name_prefix}{k}': LaneState.FREE
             for k in range(size)
         }
+        # branch_name -> lane_path assignment map (for live-requeue + disk backstop)
+        self._assignments: dict[str, Path] = {}
         self._lock = asyncio.Lock()
 
     # ── Public properties ──────────────────────────────────────────────────
@@ -76,17 +78,52 @@ class WarmLanePool:
         """Mark *lane* as FREE.
 
         Idempotent: releasing a FREE lane or an unknown path is a no-op
-        (never raises).
+        (never raises).  Also drops any ``_assignments`` entry whose value
+        resolves to *lane* so the assignment map stays coherent.
         """
         resolved = lane.resolve() if lane.exists() else lane
         async with self._lock:
             # Match by resolved path to handle symlinks
+            matched: Path | None = None
             for known_lane in self._lanes:
                 known_resolved = known_lane.resolve() if known_lane.exists() else known_lane
                 if known_resolved == resolved or known_lane == lane:
                     self._lanes[known_lane] = LaneState.FREE
-                    return
+                    matched = known_lane
+                    break
+            # Drop any assignment entry pointing at this lane
+            if matched is not None:
+                to_drop = [
+                    br for br, assigned in self._assignments.items()
+                    if assigned == matched or assigned == lane
+                ]
+                for br in to_drop:
+                    del self._assignments[br]
             # Unknown path — silently ignore (idempotent)
+
+    async def acquire_for(self, branch_name: str) -> tuple[Path, bool] | None:
+        """Acquire a lane for *branch_name*, reusing the existing one if mapped.
+
+        Returns:
+            ``(lane_path, reused)`` where *reused* is True when the pool
+            already had *branch_name* mapped to a lane (live-requeue path),
+            or False for a fresh allocation.  Returns ``None`` if *branch_name*
+            has no existing mapping AND no FREE lane is available (exhaustion).
+
+        Thread/coroutine-safe: runs under the pool lock.
+        """
+        async with self._lock:
+            # Reuse: if this branch is already mapped, return the same lane.
+            if branch_name in self._assignments:
+                return self._assignments[branch_name], True
+            # Fresh: find the first FREE lane.
+            for lane, state in self._lanes.items():
+                if state == LaneState.FREE:
+                    self._lanes[lane] = LaneState.ASSIGNED
+                    self._assignments[branch_name] = lane
+                    return lane, False
+            # Exhausted
+            return None
 
     # ── Read-only helpers ──────────────────────────────────────────────────
 
@@ -126,3 +163,17 @@ class WarmLanePool:
             if known_resolved == resolved:
                 return lane_state
         return None
+
+    def assignment_for(self, branch_name: str) -> Path | None:
+        """Return the lane path currently assigned to *branch_name*, or None."""
+        return self._assignments.get(branch_name)
+
+    def note_assignment(self, branch_name: str, lane: Path) -> None:
+        """Record *branch_name* → *lane* in the assignment map.
+
+        Used by the on-disk backstop in ``acquire_warm_lane`` to restore the
+        in-memory map after a process restart (when *lane* is discovered on
+        disk carrying *branch_name*'s plan.json).  Does NOT change lane state —
+        the caller must ensure the lane is ASSIGNED before calling.
+        """
+        self._assignments[branch_name] = lane
