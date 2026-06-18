@@ -22,6 +22,7 @@ import httpx
 
 from dashboard.config import DashboardConfig
 from dashboard.data.tasks import fetch_tasks
+from shared.safe_io import load_json_or_warn
 
 logger = logging.getLogger(__name__)
 
@@ -189,14 +190,14 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     done_count = 0
     total_count = 0
     files: list[str] = []
-    try:
-        plan_data = json.loads((task_dir / 'plan.json').read_text())
+    plan_data, _ok = load_json_or_warn(task_dir / 'plan.json', default=None)
+    if isinstance(plan_data, dict):
         steps = plan_data.get('steps', [])
-        total_count = len(steps)
-        done_count = sum(1 for s in steps if s.get('status') == 'done')
-        files = plan_data.get('files', [])
-    except (FileNotFoundError, json.JSONDecodeError, AttributeError, TypeError):
-        pass
+        if isinstance(steps, list):
+            total_count = len(steps)
+            done_count = sum(1 for s in steps if isinstance(s, dict) and s.get('status') == 'done')
+        raw_files = plan_data.get('files', [])
+        files = raw_files if isinstance(raw_files, list) else []
 
     if total_count == 0:
         phase = 'PLAN'
