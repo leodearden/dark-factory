@@ -11,8 +11,6 @@ process-scanning and worktree-artifact helpers remain sync and run via
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import logging
 import re
 import subprocess
@@ -182,9 +180,9 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     task_dir = worktree_path / '.task'
 
     # Metadata
-    metadata = None
-    with contextlib.suppress(FileNotFoundError, json.JSONDecodeError):
-        metadata = json.loads((task_dir / 'metadata.json').read_text())
+    metadata, _meta_ok = load_json_or_warn(task_dir / 'metadata.json', default=None)
+    if not isinstance(metadata, dict):
+        metadata = None
 
     # Plan progress, phase, and files
     done_count = 0
@@ -223,12 +221,9 @@ def read_task_artifacts(worktree_path: Path) -> dict:
             total_reviews = len(review_files)
             passed = 0
             for review_file in review_files:
-                try:
-                    review = json.loads(review_file.read_text())
-                    if review.get('verdict') == 'PASS':
-                        passed += 1
-                except (json.JSONDecodeError, FileNotFoundError):
-                    pass
+                review, _ok = load_json_or_warn(review_file, default=None)
+                if isinstance(review, dict) and review.get('verdict') == 'PASS':
+                    passed += 1
             review_summary = f'{passed}/{total_reviews} passed'
 
     return {
@@ -338,7 +333,7 @@ async def discover_orchestrators(
             'summary': summary,
             'offline': offline,
         }
-        if fetch_error is not None:
+        if fetch_error:
             entry['error'] = fetch_error
         result.append(entry)
 

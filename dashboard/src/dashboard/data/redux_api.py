@@ -13,6 +13,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from shared.timestamps import parse_timestamp_or_warn
+
 from dashboard.data.escalations import resolve_owning_project
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.stats_utils import percentile
@@ -242,7 +244,6 @@ def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
             if not isinstance(payload, Mapping):
                 continue
             ts_raw = payload.get('ts')
-            from shared.timestamps import parse_timestamp_or_warn
             if ts_raw is None:
                 ts_dt, ts_ok = None, True  # missing ts is benign
             else:
