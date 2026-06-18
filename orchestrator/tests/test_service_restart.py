@@ -214,6 +214,49 @@ async def test_note_merge_disabled_short_circuits() -> None:
     mock_diff.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_note_merge_uses_prefetched_diff_and_skips_git_call() -> None:
+    """When prefetched_diff is provided, get_merge_diff_files is NOT called.
+
+    This is the hot-path used by _note_merge_all to avoid redundant git diff
+    invocations when multiple coordinators are notified for the same merge.
+    The coordinator applies its own prefix filter against the supplied list.
+    """
+    # git_ops would return unrelated files, but we supply a watched-path diff
+    coord, mock_diff = _make_coordinator(
+        ['some-unrelated/file.py'],
+        watch_prefixes=['fused-memory/src/'],
+        clock_values=[1000.0],
+    )
+    prefetched = ['fused-memory/src/server/main.py', 'fused-memory/docs/overview.md']
+    result = await coord.note_merge(
+        'task-42', 'base_sha', 'head_sha', prefetched_diff=prefetched
+    )
+
+    assert result is True
+    assert coord.is_pending is True
+    # git_ops must NOT be consulted when the caller already supplied the diff
+    mock_diff.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_note_merge_prefetched_diff_no_match_returns_false() -> None:
+    """prefetched_diff that doesn't touch watched paths returns False without arming."""
+    coord, mock_diff = _make_coordinator(
+        ['fused-memory/src/server/main.py'],  # git_ops value (not used)
+        watch_prefixes=['fused-memory/src/'],
+        clock_values=[1000.0],
+    )
+    prefetched = ['fused-memory/docs/overview.md', 'orchestrator/src/harness.py']
+    result = await coord.note_merge(
+        'task-99', 'base_sha', 'head_sha', prefetched_diff=prefetched
+    )
+
+    assert result is False
+    assert coord.is_pending is False
+    mock_diff.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # maybe_restart tests
 # ---------------------------------------------------------------------------

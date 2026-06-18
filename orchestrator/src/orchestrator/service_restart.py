@@ -187,16 +187,30 @@ class StaleServiceRestartCoordinator:
         task_id: str,
         base_sha: str,
         head_sha: str,
+        *,
+        prefetched_diff: list[str] | None = None,
     ) -> bool:
         """Called by ``SpeculativeMergeWorker`` when a merge lands on main.
 
         Returns True when this merge armed (or re-armed) the pending-restart
         flag; False when it was ignored (disabled, no watched files, git error).
+
+        Parameters
+        ----------
+        prefetched_diff:
+            Optional pre-computed list of changed file paths (base_sha..head_sha).
+            When provided, the git diff invocation is skipped and this list is used
+            directly, which avoids redundant git calls when multiple coordinators
+            are notified for the same merge (see ``Harness._note_merge_all``).
         """
         if not self._enabled:
             return False
 
-        changed = await self._git_ops.get_merge_diff_files(base_sha, head_sha)
+        changed = (
+            prefetched_diff
+            if prefetched_diff is not None
+            else await self._git_ops.get_merge_diff_files(base_sha, head_sha)
+        )
         # Compute the matched subset once — used for both the gate decision and
         # the log count, avoiding a redundant O(files × prefixes) re-scan.
         watched_changed = [

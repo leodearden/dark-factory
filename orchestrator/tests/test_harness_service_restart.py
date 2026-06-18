@@ -285,7 +285,7 @@ class TestNoteMergeAll:
     """_note_merge_all fans out note_merge to every coordinator, fail-open per coordinator."""
 
     async def test_fans_out_to_all_coordinators(self, harness: Harness):
-        """_note_merge_all awaits note_merge on every coordinator with identical args."""
+        """_note_merge_all pre-fetches diff once then passes it to every coordinator's note_merge."""
         coord_a = MagicMock()
         coord_a.note_merge = AsyncMock()
         coord_b = MagicMock()
@@ -294,8 +294,13 @@ class TestNoteMergeAll:
 
         await harness._note_merge_all('task-1', 'base-sha', 'head-sha')
 
-        coord_a.note_merge.assert_awaited_once_with('task-1', 'base-sha', 'head-sha')
-        coord_b.note_merge.assert_awaited_once_with('task-1', 'base-sha', 'head-sha')
+        # Pre-fetched diff comes from fixture's AsyncMock(return_value=[])
+        coord_a.note_merge.assert_awaited_once_with(
+            'task-1', 'base-sha', 'head-sha', prefetched_diff=[]
+        )
+        coord_b.note_merge.assert_awaited_once_with(
+            'task-1', 'base-sha', 'head-sha', prefetched_diff=[]
+        )
 
     async def test_fail_open_when_first_coordinator_raises(
         self, harness: Harness, caplog
@@ -311,8 +316,35 @@ class TestNoteMergeAll:
             # Must NOT raise
             await harness._note_merge_all('task-2', 'base2', 'head2')
 
-        coord_b.note_merge.assert_awaited_once_with('task-2', 'base2', 'head2')
+        coord_b.note_merge.assert_awaited_once_with(
+            'task-2', 'base2', 'head2', prefetched_diff=[]
+        )
         assert 'note boom' in caplog.text
+
+    async def test_git_ops_failure_skips_all_coordinators(
+        self, harness: Harness, caplog
+    ):
+        """When the shared git diff fetch fails, no coordinator's note_merge is called.
+
+        A git/IO error in get_merge_diff_files would have failed for every
+        coordinator independently (same git_ops instance, same SHAs); skipping all
+        coordinators early is both correct and avoids N redundant failures.
+        """
+        harness.git_ops.get_merge_diff_files = AsyncMock(
+            side_effect=RuntimeError('git boom')
+        )
+        coord_a = MagicMock()
+        coord_a.note_merge = AsyncMock()
+        coord_b = MagicMock()
+        coord_b.note_merge = AsyncMock()
+        harness._service_restart_coordinators = [coord_a, coord_b]
+
+        with caplog.at_level(logging.WARNING):
+            await harness._note_merge_all('task-3', 'base3', 'head3')
+
+        coord_a.note_merge.assert_not_awaited()
+        coord_b.note_merge.assert_not_awaited()
+        assert 'skipping all coordinators' in caplog.text
 
     async def test_noop_when_list_is_empty(self, harness: Harness):
         """_note_merge_all does not crash when list is empty."""
@@ -345,3 +377,97 @@ class TestStartMergeWorkerOnMergeLandedWiring:
 
         call_kwargs = mock_smw.call_args.kwargs
         assert call_kwargs['on_merge_landed'] == harness._note_merge_all
+
+
+# ---------------------------------------------------------------------------
+# (g) Busy-branch no-double-fire: _maybe_restart_stale_service(agents_idle=False)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMaybeRestartStaleServiceBusyPath:
+    """Verify busy-path (agents_idle=False) behavior with real coordinator instances.
+
+    The run() busy-wait branch calls _maybe_restart_stale_service(agents_idle=False)
+    on every tick.  These tests confirm:
+    - A dashboard coordinator (require_idle=False) fires exactly once after being
+      armed; the second call is a no-op (pending was cleared on first fire).
+    - A fused-memory coordinator (require_idle=True) never fires on the busy path.
+    """
+
+    async def test_dashboard_coordinator_fires_at_most_once_across_busy_ticks(
+        self, harness: Harness
+    ):
+        """Calling _maybe_restart_stale_service(agents_idle=False) twice fires at most once.
+
+        This models two consecutive busy-wait ticks, confirming the no-double-fire
+        invariant documented in the busy-branch comment.
+        """
+        executor = AsyncMock()
+        current_time: list[float] = [0.0]
+
+        dashboard_coord = StaleServiceRestartCoordinator(
+            git_ops=harness.git_ops,
+            event_store=harness.event_store,
+            watch_prefixes=['dashboard/src/'],
+            debounce_secs=0.0,  # no debounce — fire immediately after arm
+            enabled=True,
+            restart_executor=executor,
+            clock=lambda: current_time[0],
+            service_name='dashboard',
+            require_idle=False,
+        )
+        harness._service_restart_coordinators = [dashboard_coord]
+
+        # Arm via pre-fetched diff (skip git_ops)
+        await dashboard_coord.note_merge('task-leaf', 'base', 'head', prefetched_diff=['dashboard/src/app.py'])
+        assert dashboard_coord.is_pending is True
+
+        # First busy tick: coordinator fires and clears pending
+        current_time[0] = 1.0
+        first = await harness._maybe_restart_stale_service(agents_idle=False)
+        assert first is True
+        executor.assert_awaited_once()
+        assert dashboard_coord.is_pending is False
+
+        # Second busy tick (consecutive): pending already cleared — must NOT double-fire
+        second = await harness._maybe_restart_stale_service(agents_idle=False)
+        assert second is False
+        executor.assert_awaited_once()  # still exactly one call total
+
+    async def test_fused_memory_coordinator_never_fires_on_busy_path(
+        self, harness: Harness
+    ):
+        """require_idle=True coordinator is a no-op when agents_idle=False.
+
+        Confirms that fused-memory stays reserved for the idle branch even when
+        _maybe_restart_stale_service is called with agents_idle=False on the
+        busy-wait path.
+        """
+        executor = AsyncMock()
+        current_time: list[float] = [0.0]
+
+        fused_coord = StaleServiceRestartCoordinator(
+            git_ops=harness.git_ops,
+            event_store=harness.event_store,
+            watch_prefixes=['fused-memory/src/'],
+            debounce_secs=0.0,
+            enabled=True,
+            restart_executor=executor,
+            clock=lambda: current_time[0],
+            service_name='fused-memory',
+            require_idle=True,  # idle-only — must not fire on busy path
+        )
+        harness._service_restart_coordinators = [fused_coord]
+
+        await fused_coord.note_merge('task-1', 'base', 'head', prefetched_diff=['fused-memory/src/server.py'])
+        assert fused_coord.is_pending is True
+
+        # Multiple busy ticks: fused-memory must never fire
+        current_time[0] = 1.0
+        for _ in range(3):
+            result = await harness._maybe_restart_stale_service(agents_idle=False)
+            assert result is False
+
+        executor.assert_not_awaited()
+        assert fused_coord.is_pending is True  # still pending — waiting for the idle branch

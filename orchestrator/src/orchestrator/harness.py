@@ -3700,14 +3700,29 @@ Output JSON matching the schema. Every task must appear in the output.
         """Fan out a merge-landed notification to every service-restart coordinator.
 
         Passed as the SpeculativeMergeWorker's ``on_merge_landed`` callback.
+        The changed-file list is fetched once (shared across all coordinators) to
+        avoid redundant git diff invocations — each coordinator applies its own
+        prefix filter against the pre-fetched list.
+
         Each coordinator is notified independently inside its own try/except so
-        that a git/IO error in one coordinator (e.g. fused-memory) cannot prevent
-        the remaining coordinators from being armed.  Errors are logged at WARNING
-        level and re-execution continues (fail-open).
+        that an error in one coordinator cannot prevent the remaining coordinators
+        from being armed.  Errors are logged at WARNING level and execution
+        continues (fail-open).
         """
+        try:
+            prefetched_diff = await self.git_ops.get_merge_diff_files(base_sha, head_sha)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                '_note_merge_all: git diff fetch failed for %s..%s; skipping all coordinators',
+                base_sha[:12],
+                head_sha[:12],
+                exc_info=True,
+            )
+            return
+
         for coord in self._service_restart_coordinators:
             try:
-                await coord.note_merge(task_id, base_sha, head_sha)
+                await coord.note_merge(task_id, base_sha, head_sha, prefetched_diff=prefetched_diff)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     '_note_merge_all: coordinator %s note_merge failed: %s',
