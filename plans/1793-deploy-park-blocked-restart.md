@@ -60,7 +60,7 @@ orchestrator-redeploy-restart.sh: scheduled restart of 'orchestrator-reify.servi
 
 ## Verification (out-of-band, post-restart)
 
-Performed in step-3 (separate post-restart invocation — see below).
+Performed in step-3 (separate post-restart invocation).
 
 **GREEN criteria:**
 - `systemctl --user show orchestrator-reify.service -p ActiveState` → `active`
@@ -68,4 +68,15 @@ Performed in step-3 (separate post-restart invocation — see below).
 - `ActiveEnterTimestamp` is **after** `2026-06-18 10:09:40 +0100`
 - `_ACTION_TARGETS['park'] == 'blocked'` in the editable harness.py loaded by the new process
 
-**Outcome:** _TBD — to be filled by step-3 out-of-band check_
+**Outcome: ✅ GREEN — all criteria satisfied**
+
+| Criterion | Expected | Actual | Result |
+|---|---|---|---|
+| ActiveState | `active` | `active` | ✅ |
+| Main PID | ≠ 349637 (fresh process) | `154121` | ✅ |
+| ActiveEnterTimestamp | after `2026-06-18 10:09:40 BST` | `Thu 2026-06-18 10:29:26 BST` (+19 min 46 s after merge) | ✅ |
+| `_ACTION_TARGETS['park']` | `'blocked'` | `'blocked'` (harness.py:4795) | ✅ |
+
+The live orchestrator-reify.service is now running on the post-1792 codebase.
+`park` resolves to `'blocked'` (not `'deferred'`), and the L2 escalation remains open on park.
+Incident 4641 fix is DEPLOYED.
