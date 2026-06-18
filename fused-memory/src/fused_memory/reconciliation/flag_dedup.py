@@ -1274,7 +1274,7 @@ def filter_stale_count_snapshot_corrections(
             kept.append(flag)
             continue
 
-        deltas = [p - c for c, p in zip(current, proposed)]
+        deltas = [p - c for c, p in zip(current, proposed, strict=True)]
         # Not monotonic (any decrease) → KEEP as potential integrity finding
         if any(d < 0 for d in deltas):
             kept.append(flag)
