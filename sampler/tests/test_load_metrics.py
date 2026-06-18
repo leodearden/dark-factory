@@ -6,6 +6,7 @@ fd9-exists predicates) so they are fully deterministic and safe to run in pytest
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -121,6 +122,40 @@ class TestCollectPsi:
         result = collect_psi(read=self._fake_read(mapping))
         for key, val in result.items():
             assert isinstance(val, float), f'{key} is not float: {val!r}'
+
+    def test_total_miss_skips_source_and_warns(self, caplog):
+        """collect_psi must skip a source whose parse returns None and emit WARNING.
+
+        Current code (before step-6) passes parsed['some_avg10'] etc. directly,
+        which would raise TypeError after step-4 changes parse to return None on
+        a total miss.  Against step-4 code this test FAILS with TypeError (not
+        the skip+warn behaviour) — confirming RED either way.
+        """
+        from sampler.metrics import collect_psi
+
+        # cpu gets garbage — total miss -> None from parse_pressure_file
+        # memory and io get valid text — should still appear in the result
+        mapping = {
+            'cpu': 'garbage no avg10\n',
+            'memory': PSI_MEM_TEXT,
+            'io': PSI_IO_TEXT,
+        }
+        with caplog.at_level(logging.WARNING):
+            result = collect_psi(read=self._fake_read(mapping))
+
+        # cpu keys must be absent — no fabricated 0.0
+        assert 'psi_cpu_some_avg10' not in result
+        assert 'psi_cpu_full_avg10' not in result
+        # memory and io keys must be present
+        assert set(result) == {
+            'psi_mem_some_avg10', 'psi_mem_full_avg10',
+            'psi_io_some_avg10', 'psi_io_full_avg10',
+        }
+        # At least one WARNING record must mention the skipped source name
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('cpu' in msg for msg in warning_messages), (
+            f'Expected a WARNING mentioning "cpu"; got: {warning_messages}'
+        )
 
 
 # ---------------------------------------------------------------------------
