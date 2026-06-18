@@ -1776,3 +1776,65 @@ def test_merge_metadata_refuses_to_clobber_corrupt_existing_blob():
     # (c) No-op escape hatch: existing_raw=None + append=True returns incoming.
     result_none = _merge_metadata(None, incoming, append=True)
     assert result_none == incoming
+
+
+@pytest.mark.asyncio
+async def test_update_task_refuses_to_clobber_corrupt_metadata(
+    backend, project_root, caplog,
+):
+    """update_task raises TaskmasterError and emits exactly one deduped
+    malformed-metadata WARNING when the stored blob is corrupt and append=True.
+    The stored metadata column must be byte-for-byte unchanged after the
+    refused write (external_deps substring survives).
+
+    Setup deliberately avoids a read-path access before the write so the
+    dedup slot is not pre-consumed by _row_to_task.
+
+    RED after step-2: _merge_metadata raises (so raises+bytes-preserved
+    assertions pass) but update_task passes no context kwargs to _merge_metadata
+    → _warn_malformed_metadata_once is not called → zero WARNINGs → the
+    warn-count assertion fails.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    # Directly inject a corrupt blob WITHOUT reading the row first.
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        with pytest.raises(TaskmasterError):
+            await backend.update_task(
+                '1', project_root=project_root,
+                metadata=json.dumps({'note': 'incoming'}),
+                append=True,
+            )
+
+    # Exactly one deduped malformed-metadata WARNING must have been emitted.
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly one malformed-metadata WARNING; got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
+
+    # The original corrupt blob must be byte-for-byte unchanged (no overwrite).
+    # Use raw SQL — NOT get_task — so _row_to_task does not pollute the
+    # WARNING count or hide the raw bytes via its own coercion path.
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute(
+        'SELECT metadata FROM tasks WHERE id = 1',
+    )
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'Expected metadata unchanged (corrupt blob preserved); got: {row["metadata"]!r}'
+    )
+    assert 'dark_factory:42' in row['metadata'], (
+        f'Expected external_deps substring in preserved metadata; got: {row["metadata"]!r}'
+    )
