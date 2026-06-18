@@ -384,9 +384,18 @@ class AgentLoop:
             try:
                 structured = json.loads(structured)
             except json.JSONDecodeError:
-                structured = {'thinking': structured, 'tool_calls': []}
+                logger.warning(
+                    'cli_output_unparseable: Claude CLI reported success but structured_output'
+                    ' was unparseable JSON; treating as empty tool-call turn. Raw prefix: %s',
+                    structured[:200],
+                )
+                structured = {'thinking': structured, 'tool_calls': [], 'warning': 'cli_output_unparseable'}
         if not structured:
-            structured = {'thinking': '', 'tool_calls': []}
+            logger.warning(
+                'cli_output_empty: Claude CLI reported success but structured_output'
+                ' was empty/missing; treating as empty tool-call turn.',
+            )
+            structured = {'thinking': '', 'tool_calls': [], 'warning': 'cli_output_empty'}
 
         return _CLIResponseAdapter(structured, session_id=result.session_id)
 
@@ -419,7 +428,19 @@ class _CLIResponseAdapter:
     Exposes both the legacy ``.content`` list (for drop-in compatibility with
     the anthropic/openai branches) and direct attribute access (for
     delegation-level tests and future callers that don't need the block list):
-    ``.thinking``, ``.tool_calls``, ``.session_id``.
+    ``.thinking``, ``.tool_calls``, ``.session_id``, ``.warning``.
+
+    Note on ``.warning``: this attribute surfaces the specific CLI-failure
+    token (``'cli_output_unparseable'`` / ``'cli_output_empty'``) to the log
+    and to delegation-level tests.  It is intentionally **not** propagated
+    through ``AgentLoop.run()``'s return value, which emits the generic
+    ``{'warning': 'no_tool_calls'}`` shape regardless of the origin.
+    Site-22's ``extract_agent_verdict`` guard already converts that shape
+    into the loud ``'agent-failed:no_tool_calls'`` sentinel end-to-end, so
+    threading the more specific token through ``run()`` would add surface
+    area (and break existing adapter-independent tests) for no required
+    behaviour change.  Revisit if a downstream caller ever needs to
+    distinguish the two origins.
     """
 
     def __init__(self, structured_output: dict, session_id: str = ''):
@@ -430,6 +451,7 @@ class _CLIResponseAdapter:
         self.thinking: str = structured_output.get('thinking', '')
         self.tool_calls: list = structured_output.get('tool_calls', [])
         self.session_id: str = session_id
+        self.warning: str = structured_output.get('warning', '')
 
         if self.thinking:
             self.content.append(_TextBlock(self.thinking))
