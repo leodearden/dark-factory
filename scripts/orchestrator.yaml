@@ -1,5 +1,11 @@
 # Scripts orchestrator configuration
 # Scopes verification to tests/scripts/ — the Python test suite for this module.
 # Bash scripts (verify-migration.sh, migrate.sh, etc.) are not linted here.
-
-test_command: "uv run pytest tests/scripts/ --tb=short -q"
+#
+# --project shared: tests/scripts/ lives at the repo root, not in a workspace
+# member, so a bare `uv run pytest` resolves against the workspace-ROOT project
+# (dark-factory) which declares no deps and no pytest -> verify dies with
+# "Failed to spawn: pytest" on a freshly-synced venv. Pin --project shared (a
+# member that declares pytest) so pytest is installed; no --directory, so cwd
+# stays at the worktree root and the tests/scripts/ path still resolves.
+test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q"
