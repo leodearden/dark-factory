@@ -273,3 +273,70 @@ class TestMaybeRestartStaleService:
         result = await harness._maybe_restart_stale_service(agents_idle=True)
 
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# (e) _note_merge_all fan-out + fail-open tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestNoteMergeAll:
+    """_note_merge_all fans out note_merge to every coordinator, fail-open per coordinator."""
+
+    async def test_fans_out_to_all_coordinators(self, harness: Harness):
+        """_note_merge_all awaits note_merge on every coordinator with identical args."""
+        coord_a = MagicMock()
+        coord_a.note_merge = AsyncMock()
+        coord_b = MagicMock()
+        coord_b.note_merge = AsyncMock()
+        harness._service_restart_coordinators = [coord_a, coord_b]
+
+        await harness._note_merge_all('task-1', 'base-sha', 'head-sha')
+
+        coord_a.note_merge.assert_awaited_once_with('task-1', 'base-sha', 'head-sha')
+        coord_b.note_merge.assert_awaited_once_with('task-1', 'base-sha', 'head-sha')
+
+    async def test_fail_open_when_first_coordinator_raises(
+        self, harness: Harness, caplog
+    ):
+        """When the first coordinator's note_merge raises, the second is still awaited."""
+        coord_a = MagicMock()
+        coord_a.note_merge = AsyncMock(side_effect=RuntimeError('note boom'))
+        coord_b = MagicMock()
+        coord_b.note_merge = AsyncMock()
+        harness._service_restart_coordinators = [coord_a, coord_b]
+
+        with caplog.at_level(logging.WARNING):
+            # Must NOT raise
+            await harness._note_merge_all('task-2', 'base2', 'head2')
+
+        coord_b.note_merge.assert_awaited_once_with('task-2', 'base2', 'head2')
+        assert 'note boom' in caplog.text
+
+    async def test_noop_when_list_is_empty(self, harness: Harness):
+        """_note_merge_all does not crash when list is empty."""
+        harness._service_restart_coordinators = []
+
+        # Must NOT raise
+        await harness._note_merge_all('task-3', 'base3', 'head3')
+
+
+# ---------------------------------------------------------------------------
+# (f) _start_merge_worker wires on_merge_landed to _note_merge_all
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStartMergeWorkerOnMergeLandedWiring:
+    """After _start_merge_worker, SpeculativeMergeWorker receives on_merge_landed=harness._note_merge_all."""
+
+    async def test_worker_wired_with_note_merge_all(self, harness: Harness):
+        """_start_merge_worker passes harness._note_merge_all as on_merge_landed."""
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+             patch('asyncio.create_task'), \
+             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+            await harness._start_merge_worker()
+
+        call_kwargs = mock_smw.call_args.kwargs
+        assert call_kwargs['on_merge_landed'] is harness._note_merge_all
