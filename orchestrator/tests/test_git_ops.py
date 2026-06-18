@@ -5840,3 +5840,131 @@ class TestRecoverRedMain:
             f'No dirty-tree warning found in records; all warnings: '
             f'{[r.getMessage() for r in warnings]}'
         )
+
+
+# ===========================================================================
+# Step-13: RED — create_worktree routes through warm-lane pool (B8 + B10)
+# ===========================================================================
+
+
+async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
+    """Commit stub seed-warm-lane.sh + setup-worktree-debug-port.sh into repo."""
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    seed_script = scripts_dir / 'seed-warm-lane.sh'
+    seed_script.write_text(
+        '#!/usr/bin/env bash\nmkdir -p "$2/target"\necho "seeded" > "$2/target/seeded.bin"\n'
+    )
+    seed_script.chmod(0o755)
+    debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+    debug_script.write_text(f'#!/usr/bin/env bash\necho {port}\n')
+    debug_script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeWarmLaneRouting:
+    """create_worktree uses the pool when enabled, falls back to cold on exhaustion."""
+
+    async def test_warm_path_returns_lane_not_branch_named_dir(
+        self, git_repo: Path,
+    ):
+        """With pool enabled, create_worktree returns _lane-0 not <worktree_base>/A."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        info = await git_ops.create_worktree('A')
+
+        expected_lane = git_ops.worktree_base / '_lane-0'
+        assert info.path == expected_lane, (
+            f'Expected _lane-0 ({expected_lane}), got {info.path}'
+        )
+
+    async def test_warm_path_lane_registered_on_task_branch(
+        self, git_repo: Path,
+    ):
+        """The returned lane is a registered worktree on branch task/A."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        assert await git_ops._is_registered_worktree(info.path)
+        _, branch, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=info.path,
+        )
+        assert branch.strip() == 'task/A'
+
+    async def test_warm_path_landlock_confined_to_lane(
+        self, git_repo: Path,
+    ):
+        """build_landlock_command with lane path produces --writable paths within the lane."""
+        from orchestrator.agents.landlock import build_landlock_command
+
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        # Simulate landlock wrapping with the returned path
+        cmd = build_landlock_command(['cargo', 'test'], info.path, ['src'])
+
+        # All --writable paths must be under the lane, not some other dir
+        writable_paths = [
+            cmd[i + 1] for i, arg in enumerate(cmd) if arg == '--writable'
+        ]
+        lane_resolved = str(info.path.resolve())
+        for wp in writable_paths:
+            assert wp.startswith(lane_resolved), (
+                f'--writable {wp!r} is not under lane {lane_resolved!r}'
+            )
+
+    async def test_cold_fallback_on_pool_exhaustion(
+        self, git_repo: Path,
+    ):
+        """Pool exhausted: create_worktree returns a cold branch-named worktree."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        # Exhaust the pool
+        info_A = await git_ops.create_worktree('A')
+        assert info_A.path == git_ops.worktree_base / '_lane-0'
+
+        # Pool exhausted — should fall back to cold (branch-named dir)
+        info_B = await git_ops.create_worktree('B')
+        expected_cold = git_ops.worktree_base / 'B'
+        assert info_B.path == expected_cold, (
+            f'Expected cold path {expected_cold}, got {info_B.path}'
+        )
+        assert info_B.path.exists()
+        assert await git_ops._is_registered_worktree(info_B.path)
+
+    async def test_knob_off_cold_path_unchanged(
+        self, git_ops: GitOps,
+    ):
+        """With warm_lane_pool=False (default fixture), create_worktree is byte-identical to today."""
+        # Default git_ops fixture has warm_lane_pool=False, no warm_lane_pool_size
+        assert git_ops.warm_lane_pool is None
+        info = await git_ops.create_worktree('C')
+        expected = git_ops.worktree_base / 'C'
+        assert info.path == expected
+        assert info.path.exists()
