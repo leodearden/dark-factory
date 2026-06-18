@@ -14,10 +14,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import _init_harness_state_for_test, pydantic_spec
 
+import json as _json
+
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -313,3 +315,62 @@ async def test_extract_task_id_handles_structured_content_dict(tmp_path: Path):
     )
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
     assert 'redo-77' in f.harness._auto_eval_redo_task_ids
+
+
+@pytest.mark.asyncio
+async def test_auto_eval_back_link_forwards_merge_mode(tmp_path: Path, monkeypatch):
+    """Back-link update_task wire call must carry metadata_mode='merge' (#4271 fix).
+
+    The auto-eval redo back-link writes the full task_metadata blob enriched
+    with auto_eval_pair.  Under merge (shallow last-write-wins) sibling keys
+    present in the DB but absent from task_metadata survive; under replace they
+    are silently deleted.
+
+    RED today: wrapper forwards nothing instead of metadata_mode='merge'.
+    GREEN after step-5 impl (scheduler.py update_task gains metadata_mode param).
+    """
+    # Seed task_metadata with a sibling key so the full-blob assertion can
+    # verify it is present in the wire payload.
+    f = _make(project_root=tmp_path / 'proj')
+    f.assignment.task['metadata']['memory_hints'] = ['hint-A']
+
+    # Capture update_task wire calls via a REAL Scheduler + monkeypatched mcp_call.
+    captured_update_payloads: list[dict] = []
+
+    async def mock_mcp_call(url, method, payload, **kwargs):
+        captured_update_payloads.append(payload)
+        return {}
+
+    real_scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+    monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+    # Replace only update_task on the mock scheduler; dispatch_tool stays on the
+    # MagicMock so submit_task/set_task_status return the stubbed fixture responses.
+    f.harness.scheduler.update_task = real_scheduler.update_task
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    # update_task must have been called exactly once (the back-link write).
+    update_wire_calls = [
+        p for p in captured_update_payloads if p.get('name') == 'update_task'
+    ]
+    assert len(update_wire_calls) == 1, (
+        f'Expected 1 update_task wire call; got {len(update_wire_calls)} '
+        f'(all: {[p.get("name") for p in captured_update_payloads]})'
+    )
+    arguments = update_wire_calls[0]['arguments']
+    assert arguments.get('metadata_mode') == 'merge', (
+        f"auto-eval back-link must forward metadata_mode='merge'; got: {arguments}"
+    )
+    assert 'append' not in arguments, (
+        f"'append' key must not appear on the wire; got: {arguments}"
+    )
+
+    # Full-blob assertions: auto_eval_pair and seeded sibling memory_hints both present.
+    blob = _json.loads(arguments['metadata'])
+    assert blob.get('auto_eval_pair') == 'redo-1', (
+        f"auto_eval_pair must be 'redo-1' in blob; got: {blob}"
+    )
+    assert blob.get('memory_hints') == ['hint-A'], (
+        f"Sibling memory_hints must survive in written blob; got: {blob}"
+    )
