@@ -1110,6 +1110,193 @@ def compute_content_fingerprint_signature(
 
 
 # --------------------------------------------------------------------------- #
+# Stale count-snapshot correction filter (task-1786)
+# --------------------------------------------------------------------------- #
+
+#: Per-cycle task-count drift bound used by filter_stale_count_snapshot_corrections.
+#:
+#: Rationale: in normal operation the authoritative ## Active Task Tree header advances
+#: by at most one task between consecutive snapshot writes (one task created or
+#: completed per recon cycle).  The incident (run 929b4135 finding 2ebc814c) showed
+#: a drift of exactly +1/+1, consistent with one task-creation event between the edge
+#: write and the Stage-1 LLM read.  This constant bounds the "stale but correct" zone:
+#: a componentwise delta ≤ 1 on a monotonically-increasing snapshot pair is explained
+#: by normal task-count churn and must NOT be treated as a data-integrity error.
+#:
+#: Widen ONLY if operational evidence shows that cycles routinely create or complete
+#: more than one task between snapshot writes — today's cadence does not justify >1.
+STALE_SNAPSHOT_CADENCE_DELTA: int = 1
+
+#: Correction-language triggers used by filter_stale_count_snapshot_corrections.
+#: A flag's combined description+suggested_action text must contain at least one of
+#: these substrings (or match the word-boundary 'incorrect' regex below) to qualify
+#: as a potential correction finding.
+#:
+#: 'correct' alone is intentionally EXCLUDED: "snapshot X is correct" must NOT trigger
+#: the gate.  'incorrect' is included via a word-boundary regex so that 'is correct'
+#: does not fire.
+_CORRECTION_LANGUAGE_SUBSTRINGS: tuple[str, ...] = (
+    'off by',
+    'off-by',
+    'should be',
+    'should read',
+    'should now be',
+    'corrected to',
+    'is wrong',
+    'actual count',
+)
+
+#: Word-boundary regex for 'incorrect' — matches the word 'incorrect' but NOT when
+#: preceded by 'not ' (which would give 'not incorrect' = positive) and critically
+#: NOT matching 'is correct' (which shares the 'correct' substring).
+_INCORRECT_WORD_RE: re.Pattern[str] = re.compile(r'\bincorrect\b', re.IGNORECASE)
+
+#: Count-group regex: matches ≥2 integers joined by separators that appear in
+#: task-count snapshot strings.  The separators allow optional status words
+#: (done|cancelled|pending|in-progress|blocked|deferred|review|total|merge-deferred)
+#: between the integers, mirroring the lexicon in task_filter.COUNT_SNAPSHOT_RE.
+#:
+#: NOTE: this is a LOCAL copy of the snapshot-detection lexicon from
+#: task_filter.COUNT_SNAPSHOT_RE to honour the no-import-inversion convention
+#: (reconciliation must not import from middleware).  If task_filter's status-word
+#: list ever changes, update this regex accordingly.
+#:
+#: The pattern requires at least 2 integers (arity≥2) so that stray single-digit
+#: numerals (e.g. the '1' in 'off by 1') are structurally excluded from being
+#: treated as a count-pair operand.
+_COUNT_GROUP_RE: re.Pattern[str] = re.compile(
+    r'\d+'                                           # first integer
+    r'(?:'                                           # separator group (non-capturing)
+    r'[\s,/]+'                                       # plain separator: space, comma, slash
+    r'(?:'                                           # optional status-word interleave
+    r'(?:done|cancelled|pending|in[-\s]?progress|blocked|deferred|review|total|merge-deferred)'
+    r'[\s,/]+'
+    r')?'
+    r'\d+'                                           # subsequent integer
+    r')+'                                            # one or more additional integer slots
+,
+    re.IGNORECASE,
+)
+
+
+def _extract_count_groups(text: str) -> list[tuple[int, ...]]:
+    """Extract count-groups of arity ≥2 from *text*.
+
+    Returns a list of tuples, each containing the integers found in one matched
+    count-group.  Only groups with arity ≥ 2 (i.e. at least two integers) are
+    returned; single-integer matches are structurally excluded by _COUNT_GROUP_RE.
+
+    Example:
+        '634 done / 607 total but should be 635 done / 608 total' →
+        [(634, 607), (635, 608)]
+    """
+    groups: list[tuple[int, ...]] = []
+    for match in _COUNT_GROUP_RE.finditer(text):
+        integers = tuple(int(n) for n in re.findall(r'\d+', match.group()))
+        if len(integers) >= 2:
+            groups.append(integers)
+    return groups
+
+
+def _has_correction_language(text: str) -> bool:
+    """Return True iff *text* contains at least one correction-language trigger."""
+    lowered = text.lower()
+    if any(sub in lowered for sub in _CORRECTION_LANGUAGE_SUBSTRINGS):
+        return True
+    return bool(_INCORRECT_WORD_RE.search(text))
+
+
+def filter_stale_count_snapshot_corrections(
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop flags that are false 'off-by-N correction' findings on stale task-count snapshot edges.
+
+    A flag is DROPPED iff all three conditions hold:
+      (a) The combined ``description`` + ``suggested_action`` text contains
+          correction language (fixed lexicon: 'off by', 'off-by', 'should be',
+          'should read', 'should now be', 'corrected to', 'is wrong', 'actual count',
+          or the word 'incorrect' at a word boundary — but NOT bare 'correct').
+      (b) At least two count-groups of arity ≥ 2 are extractable from the combined
+          text (paired snapshots like '634/607' or '634 done / 607 total').
+          Requiring arity ≥ 2 structurally excludes stray digits like the '1' in
+          'off by 1' from becoming a comparison operand.
+      (c) The first two groups (treated as current and proposed) have equal arity,
+          proposed ≥ current componentwise (monotonic drift), and the maximum
+          componentwise delta ≤ :data:`STALE_SNAPSHOT_CADENCE_DELTA`.
+
+    Otherwise the flag is KEPT (fail-open).  This conservative posture ensures that
+    large discrepancies, count DECREASES, arity mismatches, and flags without
+    extractable snapshot pairs are never silently discarded.
+
+    This is the third (finding-side) layer of the snapshot-discipline defense:
+    - Layer 1 (input-side): ``strip_snapshot_lines`` / ``is_count_snapshot`` in
+      ``task_filter.py`` strips count-snapshot lines from the pre-assembled payload.
+    - Layer 2 (write-side): ``ReconSnapshotWriteRejected`` server guard in
+      ``server/tools.py`` blocks ``recon-stage-*`` agents from writing
+      ``temporal_facts`` count-snapshot edges.
+    - Layer 3 (this function): post-processor over ``items_flagged`` that drops
+      findings whose text matches the stale-by-design oscillation signature.
+
+    The first two layers miss the finding because the Stage 1 LLM can discover stale
+    snapshot edges via its own live ``search``/``get_entity`` calls mid-run; this
+    filter catches those findings before they reach ``dedup_flags`` and write a
+    ``stage1_flag_marker`` or trigger a Stage 2 action.
+
+    Pure, sync, no I/O — safe to call from any context.
+
+    Args:
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        Filtered list with false stale-snapshot-correction flags removed.
+    """
+    kept: list[dict[str, Any]] = []
+    for flag in flags:
+        description = flag.get('description') or ''
+        suggested_action = flag.get('suggested_action') or ''
+        combined = f'{description} {suggested_action}'.strip()
+
+        # Condition (a): correction language present?
+        if not _has_correction_language(combined):
+            kept.append(flag)
+            continue
+
+        # Condition (b): ≥2 count-groups of arity ≥2 extractable?
+        groups = _extract_count_groups(combined)
+        if len(groups) < 2:
+            kept.append(flag)
+            continue
+
+        current, proposed = groups[0], groups[1]
+
+        # Condition (c): equal arity, monotonic, delta ≤ STALE_SNAPSHOT_CADENCE_DELTA?
+        if len(current) != len(proposed):
+            kept.append(flag)
+            continue
+
+        deltas = [p - c for c, p in zip(current, proposed)]
+        # Not monotonic (any decrease) → KEEP as potential integrity finding
+        if any(d < 0 for d in deltas):
+            kept.append(flag)
+            continue
+
+        # Delta too large → KEEP as potential integrity finding
+        if max(deltas) > STALE_SNAPSHOT_CADENCE_DELTA:
+            kept.append(flag)
+            continue
+
+        # All conditions met → DROP (stale-by-design, not erroneous)
+        logger.debug(
+            'filter_stale_count_snapshot_corrections: dropping stale snapshot correction flag '
+            'task_id=%s flag_type=%s current=%s proposed=%s max_delta=%d',
+            flag.get('task_id'), flag.get('flag_type'), current, proposed, max(deltas),
+        )
+        # do NOT append to kept — flag is dropped
+
+    return kept
+
+
+# --------------------------------------------------------------------------- #
 # Terminal-metadata guard helpers (task-1725)
 # --------------------------------------------------------------------------- #
 
