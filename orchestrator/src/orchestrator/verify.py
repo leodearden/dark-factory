@@ -2256,6 +2256,10 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         category=category,
         worktree_log_paths=worktree_log_paths,
         archive_log_paths=archive_log_paths,
+        # Wall-clock approximation: modules run concurrently via asyncio.gather
+        # so the slowest module dominates the total elapsed time.  Single-module
+        # tasks hit the len==1 fast path above and carry the exact value.
+        duration_secs=max((r.duration_secs for r in results), default=0.0),
     )
 
 
