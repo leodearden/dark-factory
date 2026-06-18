@@ -475,7 +475,14 @@ def parse_diff_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
 class GitOps:
     """Git worktree and merge operations."""
 
-    def __init__(self, config: GitConfig, project_root: Path, *, warm_lane_pool_size: int = 0):
+    def __init__(
+        self,
+        config: GitConfig,
+        project_root: Path,
+        *,
+        warm_lane_pool_size: int = 0,
+        merge_spec_warm_lane_pool_size: int = 0,
+    ):
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
@@ -491,6 +498,21 @@ class GitOps:
             )
         else:
             self.warm_lane_pool = None
+        # Merge-speculation warm-lane pool — None when knob off or size=0.
+        # Second WarmLanePool instance with name_prefix='_spec-' for K>1 LOCAL
+        # speculative verify slots.  Size K = speculation_depth, sized from the
+        # SAME shared K source as the worker (steps 5-6, harness.py).
+        # Default-off, byte-identical at default, mirrors warm_lane_pool above.
+        self._merge_spec_warm_lane_pool_size = merge_spec_warm_lane_pool_size
+        if merge_spec_warm_lane_pool_size > 0 and config.merge_spec_warm_lane_pool:
+            from orchestrator.warm_lane_pool import WarmLanePool as _WLP
+            self.spec_warm_lane_pool: WarmLanePool | None = _WLP(
+                worktree_base=self.worktree_base,
+                size=merge_spec_warm_lane_pool_size,
+                name_prefix='_spec-',
+            )
+        else:
+            self.spec_warm_lane_pool = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
