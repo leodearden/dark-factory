@@ -1,16 +1,17 @@
-"""Tests for harness wiring of StaleServiceRestartCoordinator (step-11).
+"""Tests for harness wiring of StaleServiceRestartCoordinator (multi-coordinator API).
 
-Mirrors the mocked-Harness fixture from test_orphan_reaper.py:
-patch McpLifecycle/Scheduler/BriefingAssembler; set h.event_store=MagicMock().
+Two coordinators are built and stored in a list:
+  - fused-memory (service_name='fused-memory', require_idle=True)
+  - dashboard   (service_name='dashboard', require_idle=False)
 
 Asserts:
-  (a) _build_service_restart_coordinator() returns a coordinator whose fields
-      reflect the fused_memory_restart_* config values.
-  (b) _start_merge_worker constructs SpeculativeMergeWorker with
-      on_merge_landed bound to the coordinator's note_merge.
-  (c) _maybe_restart_stale_service(agents_idle=True) delegates to
-      coordinator.maybe_restart(agents_idle=True); no-op when coordinator
-      is None.
+  (a) _build_service_restart_coordinator() returns fused-memory coordinator.
+  (b) _build_dashboard_restart_coordinator() returns dashboard coordinator.
+  (c) After _start_merge_worker, harness._service_restart_coordinators is a
+      list of two coordinators.
+  (d) _maybe_restart_stale_service(agents_idle=X) calls maybe_restart(agents_idle=X)
+      on EVERY coordinator in the list; returns True iff any returned True.
+      No-op returning False when list is empty.
 """
 
 from __future__ import annotations
@@ -31,11 +32,17 @@ from orchestrator.service_restart import StaleServiceRestartCoordinator
 
 @pytest.fixture
 def harness(tmp_path: Path, mock_orch_config):
-    """Minimal harness with mocked heavy deps, configured for service restart."""
+    """Minimal harness with mocked heavy deps, configured for both service restarts."""
+    # fused-memory restart config
     mock_orch_config.fused_memory_restart_on_merge_enabled = True
     mock_orch_config.fused_memory_restart_debounce_secs = 60.0
     mock_orch_config.fused_memory_restart_watch_prefixes = ['fused-memory/src/']
     mock_orch_config.fused_memory_restart_script = 'scripts/restart-fused-memory.sh'
+    # dashboard restart config
+    mock_orch_config.dashboard_restart_on_merge_enabled = True
+    mock_orch_config.dashboard_restart_debounce_secs = 20.0
+    mock_orch_config.dashboard_restart_watch_prefixes = ['dashboard/src/']
+    mock_orch_config.dashboard_restart_script = 'scripts/restart-dashboard.sh'
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -50,7 +57,7 @@ def harness(tmp_path: Path, mock_orch_config):
 
 
 # ---------------------------------------------------------------------------
-# (a) _build_service_restart_coordinator
+# (a) _build_service_restart_coordinator — fused-memory builder unchanged
 # ---------------------------------------------------------------------------
 
 
@@ -90,44 +97,108 @@ class TestBuildServiceRestartCoordinator:
 
         assert coord._project_root == Path(harness.config.project_root)
 
+    def test_fused_memory_coordinator_has_correct_service_name(self, harness: Harness):
+        """Fused-memory coordinator has service_name='fused-memory'."""
+        coord = harness._build_service_restart_coordinator()
+
+        assert coord._service_name == 'fused-memory'
+
+    def test_fused_memory_coordinator_requires_idle(self, harness: Harness):
+        """Fused-memory coordinator has require_idle=True (idle-only restart)."""
+        coord = harness._build_service_restart_coordinator()
+
+        assert coord._require_idle is True
+
 
 # ---------------------------------------------------------------------------
-# (b) _start_merge_worker wires on_merge_landed → coordinator.note_merge
+# (b) _build_dashboard_restart_coordinator — new leaf-service builder
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDashboardRestartCoordinator:
+    """_build_dashboard_restart_coordinator() reads dashboard_restart_* config fields."""
+
+    def test_builds_coordinator_with_correct_config_values(self, harness: Harness):
+        """Dashboard coordinator fields match the dashboard_restart_* config values."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert isinstance(coord, StaleServiceRestartCoordinator)
+        assert coord.enabled is True
+        assert coord._debounce_secs == 20.0
+        assert coord._watch_prefixes == ['dashboard/src/']
+        assert coord._script_path == 'scripts/restart-dashboard.sh'
+
+    def test_dashboard_coordinator_has_correct_service_name(self, harness: Harness):
+        """Dashboard coordinator has service_name='dashboard'."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._service_name == 'dashboard'
+
+    def test_dashboard_coordinator_does_not_require_idle(self, harness: Harness):
+        """Dashboard coordinator has require_idle=False (leaf — fires while agents dispatch)."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._require_idle is False
+
+    def test_dashboard_coordinator_has_empty_script_args(self, harness: Harness):
+        """Dashboard coordinator has script_args=[] (no --drain)."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._script_args == []
+
+    def test_dashboard_coordinator_git_ops_is_harness_git_ops(self, harness: Harness):
+        """Dashboard coordinator receives the harness's git_ops instance."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._git_ops is harness.git_ops
+
+    def test_dashboard_coordinator_project_root_matches_config(self, harness: Harness):
+        """Dashboard coordinator project_root matches config.project_root."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._project_root == Path(harness.config.project_root)
+
+    def test_builds_disabled_coordinator_when_config_says_false(
+        self, harness: Harness
+    ):
+        """When config disables restart, dashboard coordinator.enabled is False."""
+        harness.config.dashboard_restart_on_merge_enabled = False
+
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert isinstance(coord, StaleServiceRestartCoordinator)
+        assert coord.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# (c) _start_merge_worker stores list of two coordinators
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestStartMergeWorkerWiresCallback:
-    """_start_merge_worker passes on_merge_landed bound to coordinator's note_merge."""
+class TestStartMergeWorkerBuildsCoordinatorList:
+    """After _start_merge_worker, harness._service_restart_coordinators is a list of two."""
 
-    async def test_on_merge_landed_is_coordinator_note_merge(
-        self, harness: Harness
-    ):
-        """After _start_merge_worker, SpeculativeMergeWorker received
-        on_merge_landed=coordinator.note_merge."""
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+    async def test_coordinators_list_has_two_entries(self, harness: Harness):
+        """_start_merge_worker populates _service_restart_coordinators with fused+dashboard."""
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_queue.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
-        # Coordinator should have been created and stored
-        assert harness._service_restart_coordinator is not None
-        assert isinstance(harness._service_restart_coordinator, StaleServiceRestartCoordinator)
-
-        # SpeculativeMergeWorker constructor captured the callback
-        mock_smw.assert_called_once()
-        call_kwargs = mock_smw.call_args.kwargs
-        assert 'on_merge_landed' in call_kwargs
-        assert call_kwargs['on_merge_landed'] == \
-            harness._service_restart_coordinator.note_merge
+        assert isinstance(harness._service_restart_coordinators, list)
+        assert len(harness._service_restart_coordinators) == 2
+        # First entry: fused-memory (require_idle=True)
+        assert harness._service_restart_coordinators[0]._service_name == 'fused-memory'
+        assert harness._service_restart_coordinators[0]._require_idle is True
+        # Second entry: dashboard (require_idle=False)
+        assert harness._service_restart_coordinators[1]._service_name == 'dashboard'
+        assert harness._service_restart_coordinators[1]._require_idle is False
 
     async def test_start_merge_worker_continues_when_liveness_check_raises(
         self, harness: Harness, caplog
     ):
-        """_start_merge_worker must not propagate exceptions from the advisory
-        check_merge_liveness_margin helper; the worker must still be constructed
-        and the background task must still be scheduled.
-        """
+        """_start_merge_worker must not propagate liveness-check exceptions; list still built."""
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task') as mock_ct, \
              patch(
@@ -135,55 +206,70 @@ class TestStartMergeWorkerWiresCallback:
                  side_effect=RuntimeError('liveness boom'),
              ), \
              caplog.at_level(logging.WARNING):
-            # Must NOT raise — helper is advisory only.
             await harness._start_merge_worker()
 
-        # Worker still constructed despite the liveness-check failure.
         mock_smw.assert_called_once()
-        assert harness._service_restart_coordinator is not None
-
-        # Background task still scheduled — startup proceeds past the advisory check.
+        assert isinstance(harness._service_restart_coordinators, list)
+        assert len(harness._service_restart_coordinators) == 2
         mock_ct.assert_called_once()
-
-        # Swallow is observable: a WARNING is logged.
         assert 'liveness boom' in caplog.text
 
 
 # ---------------------------------------------------------------------------
-# (c) _maybe_restart_stale_service delegates to coordinator
+# (d) _maybe_restart_stale_service delegates to ALL coordinators in list
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestMaybeRestartStaleService:
-    """_maybe_restart_stale_service delegates to coordinator.maybe_restart."""
+    """_maybe_restart_stale_service iterates every coordinator in the list."""
 
-    async def test_delegates_agents_idle_true(self, harness: Harness):
-        """_maybe_restart_stale_service(agents_idle=True) → coordinator.maybe_restart(agents_idle=True)."""
-        coord = MagicMock()
-        coord.maybe_restart = AsyncMock(return_value=True)
-        harness._service_restart_coordinator = coord
+    async def test_iterates_all_coordinators_agents_idle_true(self, harness: Harness):
+        """Calls maybe_restart(agents_idle=True) on every coordinator; returns True if any fired."""
+        coord_a = MagicMock()
+        coord_a.maybe_restart = AsyncMock(return_value=True)
+        coord_b = MagicMock()
+        coord_b.maybe_restart = AsyncMock(return_value=False)
+        harness._service_restart_coordinators = [coord_a, coord_b]
 
         result = await harness._maybe_restart_stale_service(agents_idle=True)
 
-        coord.maybe_restart.assert_awaited_once_with(agents_idle=True)
+        coord_a.maybe_restart.assert_awaited_once_with(agents_idle=True)
+        coord_b.maybe_restart.assert_awaited_once_with(agents_idle=True)
         assert result is True
 
+    async def test_returns_false_when_no_coordinator_fires(self, harness: Harness):
+        """Returns False when all coordinators return False."""
+        coord_a = MagicMock()
+        coord_a.maybe_restart = AsyncMock(return_value=False)
+        coord_b = MagicMock()
+        coord_b.maybe_restart = AsyncMock(return_value=False)
+        harness._service_restart_coordinators = [coord_a, coord_b]
+
+        result = await harness._maybe_restart_stale_service(agents_idle=True)
+
+        coord_a.maybe_restart.assert_awaited_once_with(agents_idle=True)
+        coord_b.maybe_restart.assert_awaited_once_with(agents_idle=True)
+        assert result is False
+
     async def test_delegates_agents_idle_false(self, harness: Harness):
-        """_maybe_restart_stale_service(agents_idle=False) → coordinator.maybe_restart(agents_idle=False)."""
-        coord = MagicMock()
-        coord.maybe_restart = AsyncMock(return_value=False)
-        harness._service_restart_coordinator = coord
+        """Passes agents_idle=False to every coordinator."""
+        coord_a = MagicMock()
+        coord_a.maybe_restart = AsyncMock(return_value=False)
+        coord_b = MagicMock()
+        coord_b.maybe_restart = AsyncMock(return_value=True)
+        harness._service_restart_coordinators = [coord_a, coord_b]
 
         result = await harness._maybe_restart_stale_service(agents_idle=False)
 
-        coord.maybe_restart.assert_awaited_once_with(agents_idle=False)
-        assert result is False
+        coord_a.maybe_restart.assert_awaited_once_with(agents_idle=False)
+        coord_b.maybe_restart.assert_awaited_once_with(agents_idle=False)
+        assert result is True
 
-    async def test_noop_when_coordinator_is_none(self, harness: Harness):
-        """_maybe_restart_stale_service returns False and does not crash when coordinator is None."""
-        harness._service_restart_coordinator = None
+    async def test_noop_when_list_is_empty(self, harness: Harness):
+        """Returns False and does not crash when list is empty."""
+        harness._service_restart_coordinators = []
 
         result = await harness._maybe_restart_stale_service(agents_idle=True)
 
-        assert not result  # False or None — just don't crash or fire
+        assert result is False
