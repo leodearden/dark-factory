@@ -2000,6 +2000,57 @@ Output JSON matching the schema. Every task must appear in the output.
                 pattern_template=self.git_ops.config.commit_citation_pattern,
             )
             if citation_sha is None:
+                # -------------------------------------------------------
+                # #1823 degenerate-provisioning-branch guard.
+                #
+                # Context: Guard 3 (below, ~line 2031) recognises the
+                # degenerate shape (tip == branch_base_sha → zero commits
+                # beyond creation point) and vetoes the FLIP on the
+                # citation-HIT path.  But Guard 3 is only reachable when
+                # citation_sha is not None; on the citation-MISS path
+                # (here) Guard 2 bails with `return None` at line 2016
+                # BEFORE Guard 3 runs.  Each bail increments the skip
+                # counter, so after MAX_RECONCILE_FAILURES sweeps the
+                # reconciler escalates — incorrectly, because the branch
+                # is genuinely degenerate (provisioning-only, no work
+                # ever pushed).  Repro: esc-4598-6 cluster.
+                #
+                # Fix: mirror Guard 3's branch-advanced check here,
+                # immediately before the skip-count increment, using the
+                # same branch_base_sha already loaded into `metadata` at
+                # line 1966 (shared by both fast-paths).  If the live tip
+                # equals branch_base_sha the branch never advanced past
+                # creation → suppress the escalation silently (debug-log
+                # only), pop any stale pre-deployment counter, and return.
+                #
+                # Precision: we use tip==branch_base_sha, NOT a literal
+                # `git rev-list --count main..task/<id>` == 0.  Under
+                # is_ancestor==True every commit on the branch is on main
+                # by definition, so that count is trivially 0 for ALL
+                # ancestor branches — degenerate AND merged-under-non-
+                # conventional-subject alike.  branch_base_sha equality
+                # (the #1226 signal) is the only precise degeneracy test.
+                #
+                # Backward-compat: missing / malformed branch_base_sha
+                # (_is_valid_sha_40 == False) falls through to the
+                # existing increment+escalate path unchanged, keeping
+                # pre-#1226 tasks and test_reconcile_persistent_citation_
+                # miss_escalates_l1 green.
+                branch_base_sha = metadata.get('branch_base_sha')
+                if _is_valid_sha_40(branch_base_sha):
+                    branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
+                    if branch_tip_sha == branch_base_sha:
+                        logger.debug(
+                            'Reconcile: task %s branch is degenerate '
+                            '(zero commits beyond main; tip == '
+                            'branch_base_sha %s); skipping citation-'
+                            'missing escalation (provisioning-only branch)',
+                            tid, branch_base_sha,
+                        )
+                        self._reconcile_skip_counts.pop(tid, None)
+                        return None
+                # -------------------------------------------------------
+
                 count = self._reconcile_skip_counts.get(tid, 0) + 1
                 self._reconcile_skip_counts[tid] = count
                 logger.info(
