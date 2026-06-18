@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from shared.locking import files_to_modules, modules_conflict, normalize_lock
+from shared.mcp_envelope import parse_tool_result, resolver_failed
 
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -164,8 +165,8 @@ class ExternalResolverError(RuntimeError):
 
     Raised (into the error slot of the ``(statuses, error)`` tuple) in two cases:
 
-    1. **Non-dict / unparseable result** — ``_parse_tool_text_result`` returned
-       ``None`` (missing 'statuses' key, wrong type, or JSON parse failure).
+    1. **Non-dict / unparseable result** — ``parse_tool_result`` returned an
+       error (missing 'statuses' key, wrong type, or JSON parse failure).
        The returned statuses dict is ``{}``.
 
     2. **Partial-result (missing keys)** — the 'statuses' dict was present but did
@@ -831,6 +832,11 @@ class Scheduler:
         # Process-local — a scheduler restart is an acceptable implicit reset,
         # matching _requeue_counts/_skip_count idioms above.
         self._external_unresolved_counts: dict[tuple[str, str], int] = {}
+        # Per-(task_id, dep_id) count of consecutive ticks where the LOCAL dep
+        # backfill get_statuses call degraded (parse failure or empty result).
+        # Mirrors _external_unresolved_counts for local deps.  GC'd in the
+        # per-tick stale-id sweep alongside _external_unresolved_counts.
+        self._local_backfill_unresolved_counts: dict[tuple[str, str], int] = {}
         # Per-task_id count of consecutive ticks where the external-dep gate
         # held dispatch (either because the resolver was degraded, or because
         # all deps returned live non-done statuses).  Keyed by task_id (str).
@@ -1120,40 +1126,6 @@ class Scheduler:
         from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
         return extract_probe_set(task) is not None
 
-    @staticmethod
-    def _parse_tool_text_result(result: dict, key: str) -> Any:
-        """Parse a text-content MCP result block and return ``inner[key]``.
-
-        Handles the ``{data: {...}}`` envelope that taskmaster sometimes wraps
-        responses in.  Returns ``None`` if no text block is found, JSON cannot
-        be parsed, or the key is absent.
-
-        Args:
-            result: Raw response from ``dispatch_tool``.
-            key: The key to retrieve from the (optionally unwrapped) payload.
-        """
-        content = result.get('result', {}).get('content', [])
-        for block in content:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                try:
-                    data = json.loads(block['text'])
-                except (ValueError, TypeError):
-                    logger.warning(
-                        'Failed to parse MCP tool text block as JSON '
-                        '(key=%r, text_prefix=%r)',
-                        key,
-                        block.get('text', '')[:200],
-                    )
-                    return None
-                # Unwrap taskmaster's {data: {...}} envelope when present.
-                inner = (
-                    data.get('data')
-                    if isinstance(data.get('data'), dict)
-                    else data
-                )
-                return inner.get(key) if isinstance(inner, dict) else None
-        return None
-
     async def tasks_by_train(self, train_id: str) -> list[dict]:
         """Return tasks belonging to ``train_id``, sorted ascending by train.order (root→tip).
 
@@ -1235,8 +1207,8 @@ class Scheduler:
                 arguments,
                 timeout=15,
             )
-            tasks = self._parse_tool_text_result(result, 'tasks')
-            if isinstance(tasks, list):
+            tasks, tasks_err = parse_tool_result(result, 'tasks', list)
+            if tasks_err is None and tasks is not None:
                 for t in tasks:
                     if isinstance(t, dict):
                         self._normalize_task_metadata(t)
@@ -1457,10 +1429,8 @@ class Scheduler:
                 task_id, type(e).__name__, e,
             )
             return None
-        status = self._parse_tool_text_result(result, 'status')
-        if isinstance(status, str):
-            return status
-        return None
+        status, status_err = parse_tool_result(result, 'status', str)
+        return status if status_err is None else None
 
     async def get_task(self, task_id: str) -> dict | None:
         """Fetch the full task dict (including metadata) from fused-memory.
@@ -1530,15 +1500,16 @@ class Scheduler:
             if ids is not None:
                 arguments['ids'] = list(ids)
             result = await self.dispatch_tool('get_statuses', arguments, timeout=15)
-            statuses = self._parse_tool_text_result(result, 'statuses')
-            if isinstance(statuses, dict):
-                return statuses, None
+            statuses, err = parse_tool_result(result, 'statuses', dict)
+            if err is not None:
+                return {}, err
+            assert statuses is not None  # invariant: parse_tool_result → (None, err) | (value, None)
+            return statuses, None
         except Exception as e:
             logger.exception(
                 'Failed to fetch task statuses: %s: %s', type(e).__name__, e,
             )
             return {}, e
-        return {}, None
 
     async def get_external_statuses(
         self, deps: list[str]
@@ -1557,8 +1528,8 @@ class Scheduler:
             ``(partial_dict, ExternalResolverError)`` when the response dict is
             missing one or more requested dep keys (resolver-degraded; partial
             dict preserved for logging but error slot forces fail-safe wait).
-            ``({}, ExternalResolverError)`` when ``_parse_tool_text_result``
-            returns a non-dict/None (unparseable JSON or missing 'statuses' key).
+            ``({}, ExternalResolverError)`` when ``parse_tool_result``
+            returns a parse error (unparseable JSON or missing 'statuses' key).
             ``({}, exception)`` on any raised exception — transient raises are
             swallowed into the error slot (fail-safe; caller should skip policy
             effects).
@@ -1568,23 +1539,26 @@ class Scheduler:
             result = await self.dispatch_tool(
                 'get_external_statuses', arguments, timeout=15
             )
-            statuses = self._parse_tool_text_result(result, 'statuses')
-            if isinstance(statuses, dict):
-                # Guard: the real tool always keys its response by the verbatim
-                # dep string and always sets a value (real status or a sentinel).
-                # A missing dep key is a genuine contract violation, not normal
-                # operation, so treat it as resolver-degraded (fail-safe wait).
-                missing = [d for d in deps if d not in statuses]
-                if missing:
-                    msg = (
-                        f'get_external_statuses: response missing {len(missing)}'
-                        f' of {len(deps)} requested dep keys '
-                        f'(sample: {missing[:3]!r}) — resolver-degraded; '
-                        'fail-safe wait this tick'
-                    )
-                    logger.warning(msg)
-                    return statuses, ExternalResolverError(msg)
-                return statuses, None
+            statuses, parse_err = parse_tool_result(result, 'statuses', dict)
+            if parse_err is not None:
+                # primitive already emitted the WARNING; preserve ExternalResolverError type.
+                return {}, ExternalResolverError(str(parse_err))
+            assert statuses is not None  # invariant: parse_tool_result → (None, err) | (value, None)
+            # Guard: the real tool always keys its response by the verbatim
+            # dep string and always sets a value (real status or a sentinel).
+            # A missing dep key is a genuine contract violation, not normal
+            # operation, so treat it as resolver-degraded (fail-safe wait).
+            missing = [d for d in deps if d not in statuses]
+            if missing:
+                msg = (
+                    f'get_external_statuses: response missing {len(missing)}'
+                    f' of {len(deps)} requested dep keys '
+                    f'(sample: {missing[:3]!r}) — resolver-degraded; '
+                    'fail-safe wait this tick'
+                )
+                logger.warning(msg)
+                return statuses, ExternalResolverError(msg)
+            return statuses, None
         except Exception as e:
             logger.exception(
                 'Failed to fetch external dep statuses: %s: %s',
@@ -1592,13 +1566,6 @@ class Scheduler:
                 e,
             )
             return {}, e
-        # Non-dict / unparseable result — _parse_tool_text_result returned None.
-        msg = (
-            f'get_external_statuses: response was non-dict/unparseable for '
-            f'{len(deps)} dep(s) — failing LOUD into error slot (fail-safe wait)'
-        )
-        logger.warning(msg)
-        return {}, ExternalResolverError(msg)
 
     _EXTERNAL_SENTINEL_STATUSES: frozenset[str] = frozenset(
         {'unknown_project', 'unknown_task', 'malformed'}
@@ -2628,8 +2595,107 @@ class Scheduler:
             _backfilled, _backfill_err = await self.get_statuses(
                 ids=_missing_dep_ids
             )
-            if _backfilled:
+            if resolver_failed(_backfilled, _backfill_err):
+                logger.warning(
+                    'acquire_next: dep-status backfill degraded '
+                    '(err=%r, missing_dep_ids=%r) — affected pending tasks '
+                    'held fail-safe-wait',
+                    _backfill_err,
+                    _missing_dep_ids,
+                )
+                for _t in tasks:
+                    _tid = str(_t.get('id', ''))
+                    if _t.get('status') != 'pending' or not _tid:
+                        continue
+                    for _d in (_t.get('dependencies') or []):
+                        _dep_id = str(
+                            _d.get('id', _d) if isinstance(_d, dict) else _d
+                        )
+                        if _dep_id in _missing_dep_ids:
+                            _key = (_tid, _dep_id)
+                            self._local_backfill_unresolved_counts[_key] = (
+                                self._local_backfill_unresolved_counts.get(_key, 0) + 1
+                            )
+                            _cnt = self._local_backfill_unresolved_counts[_key]
+                            # Reuse max_external_dep_unresolved_cycles as the
+                            # grace threshold — same "consecutive ticks before
+                            # loud escalation" semantics as the external-dep
+                            # resolver-degraded path being mirrored here.
+                            # A dedicated max_local_backfill_unresolved_cycles
+                            # field is deferred (config.py is out of scope).
+                            if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                                logger.warning(
+                                    'acquire_next: local dep backfill unresolved '
+                                    'for %d consecutive ticks '
+                                    '(task=%s, dep=%s) — possible scheduler '
+                                    'degradation',
+                                    _cnt,
+                                    _tid,
+                                    _dep_id,
+                                )
+            else:
                 status_map.update(_backfilled)
+                # Reset the consecutive-tick counters for deps that resolved
+                # successfully in this backfill — mirrors the
+                # _external_unresolved_counts.pop(...) on the 'done' branch in
+                # _apply_external_dep_policy.  Without this reset, a dep that
+                # degrades → recovers → degrades again accumulates across the
+                # gap, making the "consecutive" counters and warning messages
+                # misreport the streak length.
+                for _t in tasks:
+                    _tid = str(_t.get('id', ''))
+                    if _t.get('status') != 'pending' or not _tid:
+                        continue
+                    for _d in (_t.get('dependencies') or []):
+                        _dep_id = str(
+                            _d.get('id', _d) if isinstance(_d, dict) else _d
+                        )
+                        if _dep_id in _backfilled:
+                            self._local_backfill_unresolved_counts.pop(
+                                (_tid, _dep_id), None
+                            )
+                # Partial-response guard: get_statuses returned a valid
+                # (non-error) dict that is still missing some of the requested
+                # dep ids.  Treat those still-missing ids as degraded — warn +
+                # bump counter — mirroring the missing-key guard in
+                # get_external_statuses (~1545).  The absent ids stay out of
+                # status_map so _deps_satisfied returns False → fail-safe-wait,
+                # now VISIBLE rather than a silent idle.
+                _still_missing = set(_missing_dep_ids) - set(_backfilled)
+                if _still_missing:
+                    logger.warning(
+                        'acquire_next: dep-status backfill returned partial '
+                        'result (missing %d/%d dep ids: %r) — affected '
+                        'pending tasks held fail-safe-wait',
+                        len(_still_missing),
+                        len(_missing_dep_ids),
+                        sorted(_still_missing),
+                    )
+                    for _t in tasks:
+                        _tid = str(_t.get('id', ''))
+                        if _t.get('status') != 'pending' or not _tid:
+                            continue
+                        for _d in (_t.get('dependencies') or []):
+                            _dep_id = str(
+                                _d.get('id', _d) if isinstance(_d, dict) else _d
+                            )
+                            if _dep_id in _still_missing:
+                                _key = (_tid, _dep_id)
+                                self._local_backfill_unresolved_counts[_key] = (
+                                    self._local_backfill_unresolved_counts.get(_key, 0) + 1
+                                )
+                                _cnt = self._local_backfill_unresolved_counts[_key]
+                                # Same threshold as the degraded path above.
+                                if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                                    logger.warning(
+                                        'acquire_next: local dep absent from '
+                                        'backfill for %d consecutive ticks '
+                                        '(task=%s, dep=%s) — possible '
+                                        'scheduler degradation',
+                                        _cnt,
+                                        _tid,
+                                        _dep_id,
+                                    )
 
         # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
         # a park whose owner is terminal / missing / deps-unsatisfied has no
@@ -2708,6 +2774,13 @@ class Scheduler:
             ]
             for k in _stale_ext_keys:
                 del self._external_unresolved_counts[k]
+        if _stale_ids and self._local_backfill_unresolved_counts:
+            _stale_local_keys = [
+                k for k in self._local_backfill_unresolved_counts
+                if k[0] in _stale_ids
+            ]
+            for k in _stale_local_keys:
+                del self._local_backfill_unresolved_counts[k]
         # _external_hold_streak and _external_hold_cause are keyed by task_id
         # (str); GC alongside _external_unresolved_counts so they stay bounded.
         if _stale_ids and (self._external_hold_streak or self._external_hold_cause):

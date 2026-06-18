@@ -496,49 +496,161 @@ class TestGetTasksNormalizesMetadata:
             assert task['metadata'] == expected, f'failed for input: {task}'
 
 
-class TestParseToolTextResultWarning:
-    """_parse_tool_text_result must emit a WARNING when JSON parsing fails.
+# ---------------------------------------------------------------------------
+# TestGetTasksAndGetStatusFailsLoud (task 1807 — step-3 RED / step-4 GREEN)
+#
+# Replaces TestParseToolTextResultWarning: resolver-level loud tests that
+# drive get_tasks / get_status directly and assert WARNINGs emitted by the
+# shared.mcp_envelope primitive (not from orchestrator.scheduler directly).
+# ---------------------------------------------------------------------------
 
-    A malformed text block should still return None (preserving existing
-    contract) but must log a WARNING containing a ≤200-char prefix of the
-    offending text so operators can identify the source of bad output.
+class TestGetTasksAndGetStatusFailsLoud:
+    """``get_tasks`` and ``get_status`` must emit loud WARNINGs on malformed envelopes.
+
+    After migrating to ``parse_tool_result``, the WARNING logger is
+    ``shared.mcp_envelope``, not ``orchestrator.scheduler``.
+
+    Fails today:
+    - ``get_tasks`` non-list 'tasks' branch returns ``[]`` silently (no WARNING).
+    - ``get_tasks`` unparseable-JSON WARNING comes from ``orchestrator.scheduler``
+      not ``shared.mcp_envelope``.
+    - ``get_status`` non-str 'status' branch returns ``None`` silently (no WARNING).
     """
 
-    def test_invalid_json_returns_none_and_logs_warning(self, caplog):
-        import logging as _logging
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
 
-        # Build a long invalid-JSON payload so we can validate truncation.
-        bad_text = 'not valid json payload ' * 30  # 23*30 = 690 chars
-        result_envelope = {
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
             'result': {
-                'content': [
-                    {'type': 'text', 'text': bad_text},
-                ]
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
             }
         }
 
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
-            value = Scheduler._parse_tool_text_result(result_envelope, 'tasks')
+    @staticmethod
+    def _bad_json_envelope(text: str) -> dict:
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': text}]
+            }
+        }
 
-        # (1) Return contract is preserved.
-        assert value is None
+    # --- get_tasks ---
 
-        # (2) A WARNING is emitted.
-        warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
-        assert warnings, f'Expected a WARNING log. Records: {[r.message for r in caplog.records]}'
+    @pytest.mark.asyncio
+    async def test_get_tasks_non_list_emits_warning_from_shared_envelope(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """get_tasks fed a non-list 'tasks' value emits a WARNING from shared.mcp_envelope.
 
-        warning_text = ' '.join(r.getMessage() for r in warnings)
+        Fails today: the non-list branch is silent (no WARNING, just returns []).
+        """
+        import logging
 
-        # (3) The log contains a truncated prefix of the offending text.
-        truncated_prefix = bad_text[:200]
-        assert truncated_prefix in warning_text, (
-            f'Expected log to contain truncated text prefix. Got: {warning_text}'
+        # 'tasks' is a dict, not a list.
+        response = self._envelope({'tasks': {'id': '1'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
         )
 
-        # (4) The full original text is NOT present in the log (validates truncation).
-        assert bad_text not in warning_text, (
-            'Full (690-char) text must NOT appear in log — only the truncated ≤200-char prefix.'
+        with caplog.at_level(logging.WARNING):
+            result = await scheduler.get_tasks()
+
+        assert result == [], f'Expected [] on non-list; got {result!r}'
+        mcp_envelope_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'shared.mcp_envelope'
+        ]
+        assert mcp_envelope_warnings, (
+            f'Expected a WARNING from shared.mcp_envelope; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_unparseable_json_emits_warning_from_shared_envelope(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """get_tasks fed unparseable JSON emits a WARNING from shared.mcp_envelope.
+
+        Fails today: the WARNING comes from orchestrator.scheduler (via
+        _parse_tool_text_result), not from shared.mcp_envelope.
+        """
+        import logging
+
+        bad_text = 'not valid json payload ' * 30  # 690 chars
+        response = self._bad_json_envelope(bad_text)
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await scheduler.get_tasks()
+
+        assert result == [], f'Expected [] on unparseable JSON; got {result!r}'
+        mcp_envelope_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'shared.mcp_envelope'
+        ]
+        assert mcp_envelope_warnings, (
+            f'Expected a WARNING from shared.mcp_envelope; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+
+    # --- get_status ---
+
+    @pytest.mark.asyncio
+    async def test_get_status_non_str_emits_warning(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """get_status fed a non-str 'status' value emits a WARNING and returns None.
+
+        Fails today: the non-str branch is silent (no WARNING).
+        """
+        import logging
+
+        # 'status' is a dict, not a str.
+        response = self._envelope({'status': {'value': 'pending'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await scheduler.get_status('42')
+
+        assert result is None, f'Expected None on non-str; got {result!r}'
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'Expected a WARNING; got {caplog.records!r}'
+
+    @pytest.mark.asyncio
+    async def test_get_status_absent_key_emits_warning(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """get_status fed a response with no 'status' key emits a WARNING and returns None.
+
+        Fails today: the absent-key branch is silent (no WARNING).
+        """
+        import logging
+
+        # No 'status' key.
+        response = self._envelope({'task': {'id': '42'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await scheduler.get_status('42')
+
+        assert result is None
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
 class TestAcquireNextNoDuplicates:
@@ -3832,6 +3944,129 @@ class TestGetStatuses:
         )
 
 
+# ---------------------------------------------------------------------------
+# TestGetStatusesFailsLoud (task 1807 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetStatusesFailsLoud:
+    """``Scheduler.get_statuses`` must fail LOUD on non-dict/unparseable results.
+
+    Today the non-dict branch falls through to ``return {}, None`` (err is None),
+    silently stranding tasks.  After the fix:
+    - Non-dict 'statuses' value (e.g. a list) → ``({}, EnvelopeParseError(...))``
+    - 'statuses' key absent → ``({}, EnvelopeParseError(...))``
+    - A WARNING is logged naming the failure.
+    - The existing exception-raised path (``({}, exception)``) is unchanged.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        """Return a JSON-RPC envelope with a single text block."""
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_dict_statuses_returns_error(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """Non-dict 'statuses' value (e.g. a list) → ({}, EnvelopeParseError).
+
+        When the 'statuses' payload is a list (not a dict), the error slot must be
+        set.  A WARNING must be logged so the failure is visible in journalctl / caplog.
+
+        Fails today: get_statuses falls through to ``return {}, None`` on non-dict.
+        """
+        import logging
+
+        from shared.mcp_envelope import EnvelopeParseError as _EnvelopeParseError
+
+        # Response whose 'statuses' is a list, not a dict → wrong type.
+        response = self._envelope({'statuses': ['not', 'a', 'dict']})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            statuses, err = await scheduler.get_statuses()
+
+        assert statuses == {}, f'Expected empty dict; got {statuses!r}'
+        assert err is not None, (
+            'Expected EnvelopeParseError in error slot; got None '
+            '(non-dict branch fell through to return {}, None)'
+        )
+        assert isinstance(err, _EnvelopeParseError), (
+            f'Expected EnvelopeParseError; got {type(err).__name__}'
+        )
+        assert any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        ), f'Expected a WARNING log; got records={caplog.records!r}'
+
+    @pytest.mark.asyncio
+    async def test_absent_statuses_key_returns_error(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """'statuses' key absent from response → ({}, EnvelopeParseError).
+
+        When the response JSON has no 'statuses' key, the error slot must be set,
+        not silently returned as ``({}, None)``.
+        """
+        import logging
+
+        from shared.mcp_envelope import EnvelopeParseError as _EnvelopeParseError
+
+        # Response with no 'statuses' key at all.
+        response = self._envelope({'data': 'not-a-statuses-dict'})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            statuses, err = await scheduler.get_statuses()
+
+        assert statuses == {}
+        assert err is not None, 'Expected error on absent key; got None'
+        assert isinstance(err, _EnvelopeParseError)
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_non_dict_error_leaves_no_state(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Non-dict error leaves no persistent state; next call still works correctly."""
+        from shared.mcp_envelope import EnvelopeParseError as _EnvelopeParseError
+
+        # First call: non-dict response.
+        response_bad = self._envelope({'no_statuses_here': True})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response_bad),
+        )
+        _stat_bad, err_bad = await scheduler.get_statuses()
+        assert err_bad is not None
+        assert isinstance(err_bad, _EnvelopeParseError)
+
+        # Second call: correct response — no cross-call state leakage.
+        response_ok = self._envelope({'statuses': {'1': 'done'}})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response_ok),
+        )
+        stat_ok, err_ok = await scheduler.get_statuses()
+        assert err_ok is None
+        assert stat_ok == {'1': 'done'}
+
+
 class TestFairnessConfigSchema:
     """Schema assertions for FairnessConfig and the scheduler's fairness config."""
 
@@ -6162,6 +6397,83 @@ class TestGetExternalStatusesFailsLoud:
 
 
 # ---------------------------------------------------------------------------
+# TestGetExternalStatusesFoldRegression (task 1807 — step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetExternalStatusesFoldRegression:
+    """Fold-regression: get_external_statuses parse must route through shared.mcp_envelope.
+
+    After folding get_external_statuses' parse onto ``parse_tool_result``, a
+    non-dict response must:
+    - Still return ``({}, ExternalResolverError)`` (existing contract preserved).
+    - Emit a WARNING from the ``shared.mcp_envelope`` logger (proving the
+      primitive is in the parse path).
+
+    Fails today: the non-dict path warns only from ``orchestrator.scheduler``
+    (the hand-rolled ``_parse_tool_text_result`` fallback), so no
+    ``shared.mcp_envelope`` record exists.
+
+    Existing ``TestGetExternalStatusesFailsLoud`` / ``TestGetExternalStatusesPartialResult``
+    must remain green throughout (they check ``any(level>=WARNING)`` without
+    filtering by logger name, so the primitive's WARNING keeps them green after
+    the fold drops the redundant scheduler-level WARNING).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_dict_emits_warning_from_shared_mcp_envelope(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """Non-dict 'statuses' returns ({}, ExternalResolverError) + WARNING from shared.mcp_envelope.
+
+        Fails today: WARNING comes from orchestrator.scheduler (not shared.mcp_envelope).
+        """
+        import logging
+
+        import orchestrator.scheduler as _sched_module
+
+        # Response whose JSON has no 'statuses' key → non-dict parse path.
+        response = self._envelope({'data': 'not-a-statuses-dict'})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            statuses, err = await scheduler.get_external_statuses(['upstream_proj:1'])
+
+        # Existing contract preserved: ({}, ExternalResolverError).
+        assert statuses == {}
+        assert err is not None
+        assert isinstance(err, _sched_module.ExternalResolverError), (
+            f'Expected ExternalResolverError; got {type(err).__name__}'
+        )
+
+        # NEW: the WARNING must come from shared.mcp_envelope (fold regression).
+        shared_env_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'shared.mcp_envelope'
+        ]
+        assert shared_env_warnings, (
+            f'Expected a WARNING from shared.mcp_envelope logger; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestGetExternalStatusesPartialResult (task 1799 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -7453,6 +7765,236 @@ class TestAcquireNextDepBackfillFromGetStatuses:
         assert 'A' in ids_called, (
             f"Expected get_statuses to be called with 'A' in ids, "
             f"but got ids={ids_called}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAcquireNextLocalBackfillFailsSafe (task 1807 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestAcquireNextLocalBackfillFailsSafe:
+    """acquire_next() must fail-safe-wait + emit WARNING when the dep-backfill get_statuses degrades.
+
+    Drives a full acquire_next() tick via mocked ``dispatch_tool`` (not
+    ``get_statuses`` directly) so the real ``get_statuses`` parse is exercised:
+
+    - ``get_tasks`` returns pending B with local dep A.
+    - ``get_statuses`` is fed a malformed response (non-dict 'statuses') so the
+      real method returns ``({}, EnvelopeParseError)``.
+    - The backfill failure must be VISIBLE: ``orchestrator.scheduler`` WARNING
+      naming the degraded dep ids, and ``_local_backfill_unresolved_counts``
+      bumped for ``('B', 'A')``.
+    - B remains held (fail-safe-wait) — NOT dispatched.
+
+    Fails today: ``_backfill_err`` is ignored → no scheduler WARNING, no
+    counter (silent strand).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_malformed_backfill_emits_warning_and_holds_task(
+        self, scheduler: Scheduler, caplog
+    ):
+        """Malformed get_statuses response → WARNING + counter bump + B not dispatched.
+
+        Fails today: _backfill_err is ignored → no WARNING from orchestrator.scheduler,
+        no _local_backfill_unresolved_counts attribute.
+        """
+        import logging
+
+        task_b = {
+            'id': 'B',
+            'title': 'Task B — depends on A',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['backend/module_b']},
+        }
+
+        async def _dispatch(tool_name, arguments, **kwargs):
+            if tool_name == 'get_tasks':
+                # Valid response: only B is active (A is done, absent from active fetch).
+                return self._envelope({'tasks': [task_b]})
+            if tool_name == 'get_statuses':
+                # Malformed: 'statuses' is a list, not a dict → real get_statuses
+                # returns ({}, EnvelopeParseError).
+                return self._envelope({'statuses': ['not', 'a', 'dict']})
+            return {}
+
+        scheduler.dispatch_tool = AsyncMock(side_effect=_dispatch)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler.acquire_next()
+
+        # B must NOT be dispatched — fail-safe-wait (dep A status unknown).
+        assert result is None, (
+            f'Expected None (fail-safe-wait) but got task_id={result.task_id!r}; '
+            'backfill failure should hold B, not dispatch it'
+        )
+
+        # orchestrator.scheduler must emit a WARNING naming the backfill degradation.
+        sched_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.scheduler'
+        ]
+        assert sched_warnings, (
+            'Expected a WARNING from orchestrator.scheduler about backfill degradation; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+
+        # _local_backfill_unresolved_counts must be bumped for (B, A).
+        assert hasattr(scheduler, '_local_backfill_unresolved_counts'), (
+            '_local_backfill_unresolved_counts attribute must exist after backfill failure'
+        )
+        count = scheduler._local_backfill_unresolved_counts.get(('B', 'A'), 0)
+        assert count >= 1, (
+            f'Expected _local_backfill_unresolved_counts[(B, A)] >= 1; got {count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_on_success_after_failure(
+        self, scheduler: Scheduler, caplog
+    ):
+        """Counter must be RESET (popped) when backfill succeeds after a prior failure.
+
+        Amendment 1 (suggestion 1 from reviewer): _local_backfill_unresolved_counts
+        claims consecutive-tick semantics in its comment and warning message, but
+        without a reset-on-success the count accumulates across the gap.  The fix
+        mirrors _external_unresolved_counts.pop(...) on 'done' in
+        _apply_external_dep_policy.
+
+        Step 1: fail → counter bumped for (B, A).
+        Step 2: success → counter popped for (B, A).
+        """
+        import logging
+
+        task_b = {
+            'id': 'B',
+            'title': 'Task B — depends on A',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['backend/module_b']},
+        }
+
+        call_count = {'n': 0}
+
+        async def _dispatch_fail_then_succeed(tool_name, arguments, **kwargs):
+            if tool_name == 'get_tasks':
+                return self._envelope({'tasks': [task_b]})
+            if tool_name == 'get_statuses':
+                call_count['n'] += 1
+                if call_count['n'] == 1:
+                    # First call: malformed → EnvelopeParseError
+                    return self._envelope({'statuses': ['not', 'a', 'dict']})
+                else:
+                    # Second call: A now resolves as done
+                    return self._envelope({'statuses': {'A': 'done'}})
+            return {}
+
+        scheduler.dispatch_tool = AsyncMock(side_effect=_dispatch_fail_then_succeed)
+
+        # Tick 1: backfill fails → counter bumped
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler.acquire_next()
+
+        assert scheduler._local_backfill_unresolved_counts.get(('B', 'A'), 0) >= 1, (
+            'Counter should be > 0 after first (failed) tick'
+        )
+
+        # Tick 2: backfill succeeds → counter must be reset (popped)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler.acquire_next()
+
+        remaining = scheduler._local_backfill_unresolved_counts.get(('B', 'A'), 0)
+        assert remaining == 0, (
+            f'Expected counter reset to 0 after successful backfill; got {remaining}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_backfill_warns_for_missing_ids(
+        self, scheduler: Scheduler, caplog
+    ):
+        """Partial backfill (valid dict but missing some requested ids) → WARNING + counter.
+
+        Amendment 2 (suggestion 2 from reviewer): get_statuses returns a non-empty
+        dict that omits some of the requested dep ids.  resolver_failed() returns
+        False (no error, non-empty), so the old code updated status_map and held
+        the still-missing dep silently.  The fix mirrors the missing-key guard in
+        get_external_statuses: compute still_missing and treat it as degraded.
+
+        Setup:
+        - B depends on both A and C.
+        - get_tasks returns [B] (active only; A and C are done, absent from active).
+        - get_statuses returns {'C': 'done'} — C resolved but A is missing from
+          the response (partial).
+
+        Expected:
+        - orchestrator.scheduler WARNING naming A as the missing dep.
+        - _local_backfill_unresolved_counts[('B', 'A')] bumped.
+        - _local_backfill_unresolved_counts[('B', 'C')] NOT bumped (resolved).
+        - B NOT dispatched (A still absent from status_map → deps not satisfied).
+        """
+        import logging
+
+        task_b = {
+            'id': 'B',
+            'title': 'Task B — depends on A and C',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}, {'id': 'C'}],
+            'metadata': {'files': ['backend/module_b']},
+        }
+
+        async def _dispatch(tool_name, arguments, **kwargs):
+            if tool_name == 'get_tasks':
+                return self._envelope({'tasks': [task_b]})
+            if tool_name == 'get_statuses':
+                # Partial: C resolved, A absent (partial response)
+                return self._envelope({'statuses': {'C': 'done'}})
+            return {}
+
+        scheduler.dispatch_tool = AsyncMock(side_effect=_dispatch)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler.acquire_next()
+
+        # B must NOT be dispatched (A is still unknown)
+        assert result is None, (
+            f'Expected None (fail-safe-wait for missing A) but got {result!r}'
+        )
+
+        # WARNING must be emitted naming the partial result
+        partial_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and r.name == 'orchestrator.scheduler'
+            and 'partial' in r.getMessage().lower()
+        ]
+        assert partial_warnings, (
+            'Expected a WARNING about partial backfill result; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+
+        # Counter bumped for still-missing A, not for resolved C
+        count_a = scheduler._local_backfill_unresolved_counts.get(('B', 'A'), 0)
+        assert count_a >= 1, (
+            f'Expected counter bumped for (B, A); got {count_a}'
+        )
+        count_c = scheduler._local_backfill_unresolved_counts.get(('B', 'C'), 0)
+        assert count_c == 0, (
+            f'Expected counter 0 for resolved (B, C); got {count_c}'
         )
 
 
