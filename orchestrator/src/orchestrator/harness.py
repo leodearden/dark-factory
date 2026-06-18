@@ -554,6 +554,15 @@ class Harness:
         # without waiting for the next orchestrator restart.  See Fix 4.
         self._stranded_reconcile_task: asyncio.Task | None = None
 
+        # Main-tip integrity sweep — task 1832.
+        # Periodic full-suite sweep of the current main tip in a throwaway
+        # detached worktree; escalates L1 on drift.  Completely off the merge
+        # hot-path (per-merge latency untouched).
+        self._main_tip_sweep_task: asyncio.Task | None = None
+        # Last main SHA successfully swept; used to skip the expensive full
+        # verify when main has not advanced since the previous pass.
+        self._last_swept_main_sha: str | None = None
+
         # Per-task consecutive-failure counter for the reconcile sweep —
         # cleared on any successful mark_done, used to gate L1 escalation.
         self._reconcile_failure_counts: dict[str, int] = {}
@@ -823,6 +832,10 @@ class Harness:
             # Catches tasks stranded by transient backend failures during a
             # long run so they don't accumulate until the next restart.
             self._start_stranded_reconcile()
+
+            # 1c1d. Start periodic main-tip integrity sweep (task 1832).
+            # Catches test-suite drift that scoped per-merge verify misses.
+            self._start_main_tip_sweep()
 
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
@@ -1179,6 +1192,10 @@ class Harness:
                 await self._stop_stranded_reconcile()
             except Exception as e:
                 logger.warning(f'_stop_stranded_reconcile() failed: {e}')
+            try:
+                await self._stop_main_tip_sweep()
+            except Exception as e:
+                logger.warning(f'_stop_main_tip_sweep() failed: {e}')
             try:
                 await self._stop_escalation_server()
             except Exception as e:
@@ -4920,6 +4937,134 @@ Output JSON matching the schema. Every task must appear in the output.
                 raise
             except Exception:
                 logger.exception('Stranded-in-progress reconcile pass failed')
+
+    def _start_main_tip_sweep(self) -> None:
+        """Start the periodic main-tip integrity sweep.
+
+        Mirrors _start_stranded_reconcile: a long-lived asyncio.Task wakes every
+        ``main_tip_sweep_interval_secs``, resolves the current main SHA, and runs
+        a FULL unscoped verification in a throwaway detached worktree.  The sweep
+        is completely off the serial merge lane — per-merge latency is untouched.
+        """
+        if not self.config.main_tip_sweep_enabled:
+            return
+        if (
+            self._main_tip_sweep_task is not None
+            and not self._main_tip_sweep_task.done()
+        ):
+            return
+        self._main_tip_sweep_task = asyncio.create_task(
+            self._main_tip_sweep_loop(),
+            name='main-tip-sweep',
+        )
+        logger.info(
+            'Main-tip integrity sweep started (interval=%.0fs)',
+            self.config.main_tip_sweep_interval_secs,
+        )
+
+    async def _stop_main_tip_sweep(self) -> None:
+        """Cancel the main-tip integrity sweep loop."""
+        if self._main_tip_sweep_task is not None:
+            self._main_tip_sweep_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._main_tip_sweep_task
+            self._main_tip_sweep_task = None
+            logger.info('Main-tip integrity sweep stopped')
+
+    async def _main_tip_sweep_loop(self) -> None:
+        """Wake periodically and run the main-tip sweep pass."""
+        interval = self.config.main_tip_sweep_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._run_main_tip_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('Main-tip integrity sweep pass failed')
+
+    async def _run_main_tip_sweep(self) -> None:
+        """Single testable pass of the main-tip integrity sweep.
+
+        Resolves the current main SHA, runs a full unscoped verification against
+        a throwaway detached worktree at that SHA, and files a level-1 infra_issue
+        escalation when the sweep finds a failure on main.
+
+        SHA dedup (``_last_swept_main_sha``) skips the expensive full verify
+        when main has not advanced — N merges within one interval cost one sweep.
+        When ``_escalation_queue`` is None the drift is logged but not submitted.
+        See ``_start_main_tip_sweep`` / ``_main_tip_sweep_loop`` for the periodic
+        invocation context.
+        """
+        from orchestrator import verify as verify_mod  # noqa: PLC0415
+
+        main_sha: str = await self.git_ops.get_main_sha()  # type: ignore[union-attr]
+        if not main_sha:
+            return
+
+        # SHA dedup: skip the expensive full verify when main has not advanced.
+        # This is the batching gate — N merges within one interval cost one sweep.
+        if main_sha == self._last_swept_main_sha:
+            return
+
+        # Pass the already-resolved SHA so verify skips a second git rev-parse
+        # and both the dedup gate and the worktree pin use the same value
+        # (closes the TOCTOU window — suggestion 2 from the code review).
+        outcome = await verify_mod.run_main_tip_sweep(
+            self.config, self.git_ops, main_sha=main_sha
+        )
+        if outcome is None:
+            # Infra failure in the sweep itself — retry next tick, don't mark swept.
+            return
+
+        swept_sha, vr = outcome
+        self._last_swept_main_sha = swept_sha
+
+        if vr.passed:
+            return
+
+        # Drift detected: file one L1 escalation per distinct bad SHA.
+        if not self._escalation_queue:
+            logger.warning(
+                'Main-tip integrity sweep: drift detected at %s (%s) but no escalation '
+                'queue attached — skipping L1 file',
+                swept_sha[:12], vr.category,
+            )
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        task_id = f'main-sweep-{swept_sha[:12]}'
+        # Dedup against a surviving L1 from a prior run: _last_swept_main_sha
+        # resets to None on every restart, so without this guard a main that
+        # stays broken would re-file a fresh duplicate each boot.  Matches the
+        # convention in every other L1-filing path in this file
+        # (_file_restored_pause_escalation, _mark_blocked, scheduler-pause, etc.).
+        if self._escalation_queue.has_open_l1(task_id):
+            return
+        summary = f'Main-tip integrity sweep failed at {swept_sha[:12]}: {vr.category}'[:200]
+        detail = (
+            f'Full verification of main at {swept_sha} failed.\n'
+            f'Category: {vr.category}\n'
+            f'Cause: {vr.cause_hint or "(no hint)"}\n'
+            f'Summary: {vr.summary}'
+        )
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-main-sweep',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning(
+            'Main-tip integrity sweep: filed L1 escalation %s for SHA %s (%s)',
+            esc.id, swept_sha[:12], vr.category,
+        )
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
