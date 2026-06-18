@@ -1138,25 +1138,34 @@ class GitOps:
         from the latest base regardless of which lane it lands on.
 
         **Cold-fallback path** (pool exhausted or seed failure — inv.6):
-            Implemented in step-10.  The current implementation returns the
-            warm path only; callers must not rely on a non-None guarantee until
-            step-10 is complete.
+            On any failure (pool exhausted, worktree creation failure, seed
+            failure) the partially-acquired lane (if any) is released back to
+            FREE and an ephemeral cold worktree is returned with warm=False.
+            Logs at DEBUG; never raises (a fallback cannot block the scheduler).
 
         Args:
             merge_commit: The merge commit SHA to check out in the spec lane.
 
         Returns:
             ``(lane_path, True)`` when the warm spec lane is ready;
-            ``(cold_path, False)`` on pool exhaustion or seed failure (step-10).
+            ``(cold_path, False)`` on pool exhaustion or any failure (inv.6).
         """
         if self.spec_warm_lane_pool is None:
             # Knob off or size=0 — always cold (byte-identical to default).
+            logger.debug(
+                'acquire_spec_lane: spec pool absent (knob off) — cold fallback '
+                'for %s', merge_commit[:8],
+            )
             wt = await self.create_throwaway_verify_worktree(merge_commit)
             return wt, False
 
         lane = await self.spec_warm_lane_pool.try_acquire()
         if lane is None:
-            # Pool exhausted — cold fallback (full release-on-fallback in step-10).
+            # Pool exhausted — inv.6: cold ephemeral fallback, never block.
+            logger.debug(
+                'acquire_spec_lane: pool exhausted — cold fallback for %s',
+                merge_commit[:8],
+            )
             wt = await self.create_throwaway_verify_worktree(merge_commit)
             return wt, False
 
@@ -1173,6 +1182,10 @@ class GitOps:
                 cwd=self.project_root,
             )
             if rc != 0:
+                logger.debug(
+                    'acquire_spec_lane: worktree add failed for %s (rc=%d, err=%r)'
+                    ' — releasing lane, cold fallback', lane, rc, err,
+                )
                 await self.spec_warm_lane_pool.release(lane)
                 wt = await self.create_throwaway_verify_worktree(merge_commit)
                 return wt, False
@@ -1187,6 +1200,10 @@ class GitOps:
                 cwd=lane,
             )
             if rc != 0:
+                logger.debug(
+                    'acquire_spec_lane: reset --hard failed for %s (rc=%d, err=%r)'
+                    ' — releasing lane, cold fallback', lane, rc, err,
+                )
                 await self.spec_warm_lane_pool.release(lane)
                 wt = await self.create_throwaway_verify_worktree(merge_commit)
                 return wt, False
@@ -1195,6 +1212,10 @@ class GitOps:
                 clean_cmd += ['-e', artifact_dir]
             rc, _, err = await _run(clean_cmd, cwd=lane)
             if rc != 0:
+                logger.debug(
+                    'acquire_spec_lane: git clean failed for %s (rc=%d, err=%r)'
+                    ' — releasing lane, cold fallback', lane, rc, err,
+                )
                 await self.spec_warm_lane_pool.release(lane)
                 wt = await self.create_throwaway_verify_worktree(merge_commit)
                 return wt, False
@@ -1205,8 +1226,12 @@ class GitOps:
         # ── inv.8: ALWAYS re-seed target/ from the current warm base ─────────
         ok = await self._seed_warm_lane(lane, '--reset-in-place')
         if not ok:
-            # Seed failed — release the partially-acquired lane (step-10 covers
-            # the test for this path; the release here is the correct behaviour).
+            # Seed failed — release the partially-acquired lane back to FREE
+            # (inv.6: cold fallback on seed failure, never block scheduler).
+            logger.debug(
+                'acquire_spec_lane: seed failed for %s — releasing lane, cold fallback',
+                lane,
+            )
             await self.spec_warm_lane_pool.release(lane)
             wt = await self.create_throwaway_verify_worktree(merge_commit)
             return wt, False
