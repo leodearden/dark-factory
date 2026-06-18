@@ -52,7 +52,7 @@ def shape_orchestrators(
         primary_pid = pids[0] if pids else None
         project_root = o.get('project_root') or ''
         active_roots.add(str(project_root))
-        out_orchs.append({
+        orch_entry: dict = {
             'pid': primary_pid,
             'pids': list(pids),
             'label': o.get('label') or _project_label(project_root),
@@ -62,7 +62,11 @@ def shape_orchestrators(
             'started': o.get('started') or '',
             'last_update': o.get('last_update'),
             'summary': dict(o.get('summary') or {}),
-        })
+            'offline': bool(o.get('offline')),
+        }
+        if o.get('error') is not None:
+            orch_entry['error'] = o['error']
+        out_orchs.append(orch_entry)
 
     # PROJECTS: union of active roots + known roots.  ``active`` reflects
     # whether an orchestrator is currently running for that root.

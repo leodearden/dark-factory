@@ -283,17 +283,26 @@ async def discover_orchestrators(
 
     # Cache per-project data so we don't re-fetch the same task list
     # when multiple processes share a project root.
-    project_cache: dict[Path, tuple[list[dict], dict[int, dict]]] = {}
+    # Cache tuple: (tasks, worktrees, offline, error)
+    project_cache: dict[Path, tuple[list[dict], dict[int, dict], bool, str | None]] = {}
 
     result: list[dict] = []
     for project_root, group in groups.items():
         if project_root not in project_cache:
             fetched = await fetch_tasks(client, config, project_root)
-            tasks = fetched if isinstance(fetched, list) else []
+            if isinstance(fetched, list):
+                tasks = fetched
+                offline = False
+                fetch_error: str | None = None
+            else:
+                # Offline marker: {'offline': True, 'error': ...}
+                tasks = []
+                offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
+                fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
             worktrees = await asyncio.to_thread(_scan_worktrees, project_root / '.worktrees')
-            project_cache[project_root] = (tasks, worktrees)
+            project_cache[project_root] = (tasks, worktrees, offline, fetch_error)
 
-        tasks, worktrees = project_cache[project_root]
+        tasks, worktrees, offline, fetch_error = project_cache[project_root]
         summary = {
             'total': len(tasks),
             'done': sum(1 for t in tasks if t.get('status') == 'done'),
@@ -316,7 +325,7 @@ async def discover_orchestrators(
         prd = next((p['prd'] for p in group if p.get('prd')), None)
         label = prd if prd else str(project_root)
 
-        result.append({
+        entry: dict = {
             'pids': [p['pid'] for p in group],
             'prd': prd,
             'label': label,
@@ -327,6 +336,10 @@ async def discover_orchestrators(
             'tasks': tasks,
             'worktrees': worktrees,
             'summary': summary,
-        })
+            'offline': offline,
+        }
+        if fetch_error is not None:
+            entry['error'] = fetch_error
+        result.append(entry)
 
     return result
