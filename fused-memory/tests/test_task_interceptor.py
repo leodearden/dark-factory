@@ -6469,3 +6469,125 @@ async def test_get_tasks_threads_statuses(interceptor, taskmaster):
     assert kwargs2.get('statuses') is None, (
         f'Expected statuses=None when omitted, call_args: {taskmaster.get_tasks.call_args}'
     )
+
+
+# ── task-1810 step-11/12: _extract_metadata_files WARNING on present-but-malformed ──
+
+_TI_LOGGER = 'fused_memory.middleware.task_interceptor'
+
+
+class TestExtractMetadataFilesWarns:
+    """Module-level _extract_metadata_files emits WARNING when metadata.files is
+    present-but-malformed.
+
+    Step-11 (RED): all malformed paths return silently.
+    Step-12 (GREEN): WARNING when files present-but-not-a-list, and when non-str/empty entries
+    are dropped from a non-empty list.
+    """
+
+    def _fn(self):
+        from fused_memory.middleware.task_interceptor import _extract_metadata_files
+        return _extract_metadata_files
+
+    def test_files_not_a_list_returns_empty_and_warns(self, caplog):
+        """{'metadata':{'files':'a.py'}} => [] AND a WARNING.
+
+        Currently RED: isinstance-guard returns [] silently.
+        """
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': 'a.py'}})
+        assert result == [], f"expected [], got {result!r}"
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING when metadata.files is present but not a list; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    def test_list_with_dropped_entries_warns(self, caplog):
+        """{'metadata':{'files':['ok.py', 123, '']}} => ['ok.py'] AND a WARNING noting drops.
+
+        Currently RED: filter runs silently, no WARNING emitted.
+        """
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': ['ok.py', 123, '']}})
+        assert result == ['ok.py'], f"expected ['ok.py'], got {result!r}"
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING noting dropped non-str/empty entries; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    def test_absent_files_key_no_warning(self, caplog):
+        """REGRESSION: metadata dict with no 'files' key => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {}})
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"absent files must not emit WARNINGs; got {warns!r}"
+
+    def test_absent_metadata_no_warning(self, caplog):
+        """REGRESSION: task dict with no 'metadata' key => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'id': '1', 'title': 'task'})
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"absent metadata must not emit WARNINGs; got {warns!r}"
+
+    def test_non_dict_task_data_no_warning(self, caplog):
+        """REGRESSION: non-dict task_data => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn('not-a-dict')
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"non-dict task_data must not emit WARNINGs; got {warns!r}"
+
+    def test_empty_files_list_no_warning(self, caplog):
+        """REGRESSION: metadata.files=[] => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': []}})
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"empty files list must not emit WARNINGs; got {warns!r}"
+
+    def test_valid_files_list_no_warning(self, caplog):
+        """REGRESSION: metadata.files=['a.py','b.py'] => ['a.py','b.py'] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': ['a.py', 'b.py']}})
+        assert result == ['a.py', 'b.py']
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"valid files list must not emit WARNINGs; got {warns!r}"
