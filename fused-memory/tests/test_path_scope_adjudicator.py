@@ -174,9 +174,9 @@ class TestFailSafeOnLLMTrouble:
     async def test_zero_output_returns_fail_safe(self, tmp_path):
         """Zero-output AgentResult → fail-safe verdict, failed=True."""
         adj = _make_adjudicator(tmp_path=tmp_path)
-        # is_zero_output_timeout: success=False + subtype='error_empty_output'
+        # Zero-output means timed out with no turns (is_zero_output_timeout).
         result = _agent_result(
-            success=False, output='', subtype='error_empty_output',
+            success=False, output='', timed_out=True, subtype='error',
         )
         with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
             verdict = await _do_adjudicate(adj)
@@ -215,7 +215,8 @@ class TestFailSafeOnLLMTrouble:
         from shared.cli_invoke import AllAccountsCappedException
 
         adj = _make_adjudicator(tmp_path=tmp_path)
-        with patch(_INVOKE_PATH, side_effect=AllAccountsCappedException('no accounts')):
+        exc = AllAccountsCappedException(retries=3, elapsed_secs=300.0, label='test')
+        with patch(_INVOKE_PATH, side_effect=exc):
             verdict = await _do_adjudicate(adj)  # must not raise
 
         assert verdict.should_allow_creation is False
@@ -235,8 +236,9 @@ class TestZeroOutputBreakerCircuit:
         cfg = PathScopeAdjudicatorConfig(zero_output_breaker_threshold=1)
         adj = _make_adjudicator(config=cfg, tmp_path=tmp_path)
 
+        # A real ZOT: timed_out=True, turns=0, cost_usd=0.0.
         zot_result = _agent_result(
-            success=False, output='', subtype='error_empty_output',
+            success=False, output='', timed_out=True, subtype='error',
         )
         # First call opens the breaker (threshold=1).
         with patch(_INVOKE_PATH, new=AsyncMock(return_value=zot_result)) as mock_invoke:
@@ -258,8 +260,9 @@ class TestZeroOutputBreakerCircuit:
         cfg = PathScopeAdjudicatorConfig(zero_output_breaker_threshold=threshold)
         adj = _make_adjudicator(config=cfg, tmp_path=tmp_path)
 
+        # A real ZOT: timed_out=True, turns=0, cost_usd=0.0.
         zot_result = _agent_result(
-            success=False, output='', subtype='error_empty_output',
+            success=False, output='', timed_out=True, subtype='error',
         )
         with patch(_INVOKE_PATH, new=AsyncMock(return_value=zot_result)):
             for _ in range(threshold):
