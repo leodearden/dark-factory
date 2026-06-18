@@ -77,6 +77,8 @@ Performed in step-3 (separate post-restart invocation).
 | ActiveEnterTimestamp | after `2026-06-18 10:09:40 BST` | `Thu 2026-06-18 10:29:26 BST` (+19 min 46 s after merge) | ✅ |
 | `_ACTION_TARGETS['park']` | `'blocked'` | `'blocked'` (harness.py:4795) | ✅ |
 
+**Timing note:** The actual `ActiveEnterTimestamp` (10:29:26 BST) landed ~16 minutes later than the predicted "active by ≈ 10:13 BST" in the Restart Action section. The prediction assumed a 60 s on-active delay plus ≤90 s graceful stop (≈ 2.5 min total). The overshoot is consistent with the orchestrator processing one or more in-flight tasks through their natural completion before honouring SIGTERM, consuming the full TimeoutStopSec=90 s window and potentially experiencing a brief systemd timer-queue delay on top. No unexpected condition occurred — the restart completed successfully; the discrepancy is noted here so it is traceable rather than silently inconsistent with the planned timeline.
+
 The live orchestrator-reify.service is now running on the post-1792 codebase.
 `park` resolves to `'blocked'` (not `'deferred'`), and the L2 escalation remains open on park.
 Incident 4641 fix is DEPLOYED.
