@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from sampler.metrics import collect_psi, collect_process_metrics
+from sampler.metrics import collect_process_metrics, collect_psi
 from sampler.sampler import run_tick
 from sampler.store import LoadSampleStore
 

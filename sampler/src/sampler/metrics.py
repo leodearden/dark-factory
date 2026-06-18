@@ -31,6 +31,7 @@ refactored to use a different FD number.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -196,10 +197,8 @@ def sum_verify_rss(procs: Iterable[Any]) -> int:
             if p.pid in seen_pids:
                 continue
             seen_pids.add(p.pid)
-            try:
+            with contextlib.suppress(Exception):
                 total += p.memory_info().rss
-            except Exception:
-                pass
     return total
 
 

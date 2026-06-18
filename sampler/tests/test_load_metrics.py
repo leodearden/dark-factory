@@ -7,11 +7,8 @@ fd9-exists predicates) so they are fully deterministic and safe to run in pytest
 from __future__ import annotations
 
 import logging
-import os
-from pathlib import Path
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -62,6 +59,7 @@ class TestParsePressureFile:
 
         text = 'some avg10=99.99 avg60=0.00 avg300=0.00 total=0\n'
         result = parse_pressure_file(text)
+        assert result is not None
         assert result['some_avg10'] == pytest.approx(99.99)
         assert result['full_avg10'] == 0.0
 
@@ -172,7 +170,7 @@ class FakeProc:
         name: str = 'bash',
         cmdline: list[str] | None = None,
         rss: int = 0,
-        children: list['FakeProc'] | None = None,
+        children: list[FakeProc] | None = None,
     ):
         self.pid = pid
         self._name = name
@@ -192,7 +190,7 @@ class FakeProc:
                 self.rss = rss
         return _MI(self._rss)
 
-    def children(self, recursive: bool = False) -> list['FakeProc']:
+    def children(self, recursive: bool = False) -> list[FakeProc]:
         if recursive:
             result = []
             for ch in self._children:
