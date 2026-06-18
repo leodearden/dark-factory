@@ -8143,6 +8143,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await _maybe_run_drift_check(
                             self, self._git_ops, req, merge_commit,
                         )
+                        # D10 promote-provenance: advance the rolling warm base
+                        # from the _merge-verify lane's target (the just-landed
+                        # commit's warm build).  Gated on the warm worktree name
+                        # so the refresh only fires when the verify ran in the
+                        # persistent _merge-verify lane (knob on, safety-valve
+                        # not due) — i.e. the source is the post-CAS confirmed
+                        # head.  On the cold/ephemeral round the base stays at
+                        # H-1 (benign-degrading, never blocks dispatch).
+                        # refresh_warm_base is best-effort and never raises.
+                        if merge_wt.name == PERSISTENT_MERGE_WORKTREE_NAME:
+                            await self._git_ops.refresh_warm_base()
                     advanced = True
                     return True
 

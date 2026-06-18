@@ -1034,6 +1034,67 @@ class GitOps:
             )
             return False
 
+    async def refresh_warm_base(self) -> bool:
+        """Advance the rolling warm base by running the refresh script.
+
+        Invokes ``<_merge-verify>/scripts/refresh-warm-base.sh <advancing> <base>``
+        where:
+        - *advancing* = ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
+          (the _merge-verify lane's target — the warm build of the just-landed commit)
+        - *base* = ``warm_lane_base_target_path`` (the configured rolling base)
+
+        **inv.9 promote-provenance** is enforced STRUCTURALLY: the advancing dir
+        is hardcoded to the _merge-verify target and no caller-supplied advancing
+        parameter is exposed, so DF can never source a task lane (un-landed WIP).
+        The reify B12 guard inside refresh-warm-base.sh is defense-in-depth.
+
+        Self-guards (all return False, never raise):
+        - ``warm_lane_pool is None`` — pool knob off; refresh has no meaning.
+        - ``advancing == base`` — no separate rolling base configured; degenerate
+          self-copy skipped (default config has ``warm_lane_base_target_dir=None``
+          so base == ``_merge-verify/target`` == advancing).
+        - Script absent or non-zero exit — fail-soft.
+
+        Returns:
+            True  — script ran and exited 0 (base refreshed).
+            False — any guard triggered or the script absent/failed (fail-soft;
+                    never raises — a base-refresh hiccup cannot block merges).
+        """
+        if self.warm_lane_pool is None:
+            return False
+
+        try:
+            advancing = self._merge_verify_artifact_path
+            base = self.warm_lane_base_target_path
+
+            if advancing.resolve() == base.resolve():
+                logger.debug(
+                    'refresh_warm_base: advancing == base (%s) — no separate rolling '
+                    'base configured, skipping degenerate self-copy', advancing,
+                )
+                return False
+
+            script = self.persistent_merge_worktree_path / 'scripts' / 'refresh-warm-base.sh'
+            if not script.exists():
+                logger.debug(
+                    'refresh_warm_base: script absent at %s — no-op', script,
+                )
+                return False
+
+            rc, _, err = await _run(
+                [str(script), str(advancing), str(base)],
+                cwd=self.persistent_merge_worktree_path,
+            )
+            if rc != 0:
+                logger.warning(
+                    'refresh_warm_base: script exited %d (stderr=%r)', rc, err,
+                )
+                return False
+            return True
+        except Exception:
+            logger.warning('refresh_warm_base: unexpected error', exc_info=True)
+            return False
+
     async def acquire_warm_lane(
         self,
         branch_name: str,
@@ -1050,8 +1111,11 @@ class GitOps:
             returned (caller falls through to the cold path — inv.6).
 
         **Reset-in-place path** (lane already registered — added in step-10):
-            Handled by :meth:`_reset_warm_lane`; skips re-seed (target/ already
-            warm from the previous assignment).
+            Handled by :meth:`_reset_warm_lane` then always re-seeded from the
+            current base via ``_seed_warm_lane(lane, '--fresh-checkout')`` (D10
+            always-re-seed-at-acquire).  The lane is the ``§9.5`` within-assignment
+            reset_lane primitive; the re-seed layers on top to deliver at-head
+            warmth for the NEW task.
 
         **Identity guard** (``expected_title``, step-26):
             When *expected_title* is supplied, any reuse candidate (in-memory
@@ -1099,6 +1163,16 @@ class GitOps:
                 )
                 self.warm_lane_pool.drop_assignment(branch_name)
                 await self._reset_warm_lane(lane, full_branch, start_ref)
+                # D10: always re-seed from current base after identity-mismatch reset.
+                # Fail-soft: a recycled lane already has a usable (if stale) target/,
+                # so a failed re-seed degrades to the prior warmth — never cold-fallback.
+                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if not ok:
+                    logger.warning(
+                        'acquire_warm_lane: re-seed failed for recycled lane %s; '
+                        'proceeding with retained target — degraded warmth',
+                        lane,
+                    )
                 # Falls through to shared tail
 
             elif not await self._is_registered_worktree(lane):
@@ -1179,6 +1253,17 @@ class GitOps:
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
                 await self._reset_warm_lane(lane, full_branch, start_ref)
+                # D10: always re-seed from current base after fresh reset.
+                # Fail-soft: a recycled lane already has a usable (if stale) target/,
+                # so a failed re-seed degrades to the prior warmth — never cold-fallback
+                # or block dispatch (D10 / inv.6).
+                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if not ok:
+                    logger.warning(
+                        'acquire_warm_lane: re-seed failed for recycled lane %s; '
+                        'proceeding with retained target — degraded warmth',
+                        lane,
+                    )
 
             # ── Shared tail: gitignore, scrub, base, debug-port ──────────
             _ensure_task_gitignore(lane)
@@ -1295,18 +1380,21 @@ class GitOps:
             )
 
     async def release_warm_lane(self, lane_dir: Path, branch_name: str) -> None:
-        """Release a warm lane back to the FREE pool, retaining warmth.
+        """Release a warm lane back to the FREE pool.
 
         Steps:
         1. ``git -C <lane> checkout --detach`` — detach HEAD so the just-used
-           branch is deletable while the lane stays checked-out warm.
+           branch is deletable while the lane directory stays in place.
         2. ``git branch -D task/<branch_name>`` — best-effort; logs on failure.
         3. ``await self.warm_lane_pool.release(lane_dir)`` — flip ASSIGNED→FREE.
 
-        Never removes the worktree; ``target/`` is retained for the next
-        assignment.  Fully best-effort / never-raise (mirrors
-        ``cleanup_merge_worktree`` contract) so a hiccup cannot strand the
-        scheduler.
+        Never removes the worktree; ``target/`` is left in place incidentally
+        (CoW-cheap, harmless).  The *next* :meth:`acquire_warm_lane` always
+        re-seeds from the current base (D10), so a released lane's target/
+        drift is irrelevant — retention is no longer a contract promise.
+
+        Fully best-effort / never-raise (mirrors ``cleanup_merge_worktree``
+        contract) so a hiccup cannot strand the scheduler.
         """
         if self.warm_lane_pool is None:
             return
@@ -2251,23 +2339,36 @@ class GitOps:
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
 
     @property
-    def warm_lane_base_target_path(self) -> Path:
-        """Absolute path of the warm BASE target/ to CoW-seed lane target/ from.
+    def _merge_verify_artifact_path(self) -> Path:
+        """Path of the build-artifact directory inside the persistent _merge-verify worktree.
 
-        Resolution order:
-        1. ``config.warm_lane_base_target_dir`` when explicitly set (override).
-        2. ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
-           (derived default: ``<worktree_base>/_merge-verify/target``).
-        3. Fallback to ``'target'`` when ``reap_build_artifact_dirs`` is empty.
+        ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
+        (``<worktree_base>/_merge-verify/target`` by default when
+        ``reap_build_artifact_dirs`` is empty).
+
+        This is the single canonical spelling used as the *advancing* side in
+        :meth:`refresh_warm_base` and as the derived default in
+        :attr:`warm_lane_base_target_path`, so both stay in sync automatically.
         """
-        if self.config.warm_lane_base_target_dir is not None:
-            return Path(self.config.warm_lane_base_target_dir)
         artifact_dir = (
             self.config.reap_build_artifact_dirs[0]
             if self.config.reap_build_artifact_dirs
             else 'target'
         )
         return self.persistent_merge_worktree_path / artifact_dir
+
+    @property
+    def warm_lane_base_target_path(self) -> Path:
+        """Absolute path of the warm BASE target/ to CoW-seed lane target/ from.
+
+        Resolution order:
+        1. ``config.warm_lane_base_target_dir`` when explicitly set (override).
+        2. :attr:`_merge_verify_artifact_path`
+           (derived default: ``<worktree_base>/_merge-verify/target``).
+        """
+        if self.config.warm_lane_base_target_dir is not None:
+            return Path(self.config.warm_lane_base_target_dir)
+        return self._merge_verify_artifact_path
 
     #: Name of the counter file used to persist the verify attempt count across
     #: stateless CLI invocations.  Scope is **per-project-worktree** — the file

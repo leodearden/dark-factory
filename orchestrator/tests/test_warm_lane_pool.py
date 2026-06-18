@@ -286,6 +286,58 @@ def wl_git_config_off() -> GitConfig:
     )
 
 
+@pytest.fixture
+def wl_git_config_rolling_base(tmp_path: Path) -> GitConfig:
+    """GitConfig with warm_lane_base_target_dir pointing to a SEPARATE rolling-base.
+
+    The rolling base dir is ``tmp_path/rolling_base``.  Since
+    ``advancing`` (= ``<worktree_base>/_merge-verify/target``) differs from
+    ``base`` (= ``tmp_path/rolling_base``), ``refresh_warm_base()`` will not
+    short-circuit the advancing == base guard and the refresh actually fires.
+
+    Tests that need the rolling-base path can compute it as
+    ``tmp_path / 'rolling_base'``.
+    """
+    rolling = tmp_path / 'rolling_base'
+    rolling.mkdir(parents=True, exist_ok=True)
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=True,
+        warm_lane_base_target_dir=str(rolling),
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1 helpers: fake refresh-warm-base.sh recorder scripts
+# ---------------------------------------------------------------------------
+
+
+def _install_refresh_recorder(scripts_dir: Path, recorder_file: Path) -> None:
+    """Install a refresh-warm-base.sh that records its args ($1 advancing, $2 base)
+    to *recorder_file* and exits 0.
+
+    Mirrors the fake seed-warm-lane.sh pattern used by TestSeedWarmLane.
+    """
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'refresh-warm-base.sh'
+    script.write_text(
+        f'#!/usr/bin/env bash\necho "$1 $2" >> {recorder_file}\n'
+    )
+    script.chmod(0o755)
+
+
+def _install_refresh_failing(scripts_dir: Path) -> None:
+    """Install a refresh-warm-base.sh that exits non-zero (fail-soft test variant)."""
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'refresh-warm-base.sh'
+    script.write_text('#!/usr/bin/env bash\necho "refresh failed" >&2\nexit 1\n')
+    script.chmod(0o755)
+
+
 class TestGitOpsPoolWiring:
     def test_pool_constructed_when_enabled_with_size(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
@@ -817,29 +869,52 @@ class TestAcquireWarmLaneResetInPlace:
     async def test_reacquire_retains_target_warmth(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """target/cache.bin survives the reset-in-place (warmth retention)."""
+        """Recycled lane's target/ is RE-SEEDED on the recycle path (D10).
+
+        Before D10 this test asserted silent retention of target/cache.bin.
+        D10 changes the contract: target/ is always re-seeded from the current
+        base on a fresh-recycle acquire, so the assertion is that seed WAS
+        invoked (seed_calls.txt gained a new entry), not just that a prior
+        artifact survived silently.
+        """
         sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        seed_marker = wl_git_repo / 'seed_calls.txt'
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
         assert info_a is not None
-        # Write a warm artifact into target/
-        (info_a.path / 'target').mkdir(exist_ok=True)
-        cache_file = info_a.path / 'target' / 'cache.bin'
-        cache_file.write_bytes(b'\x00' * 128)
+        calls_after_first = (
+            seed_marker.read_text() if seed_marker.exists() else ''
+        ).splitlines()
 
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
         assert info_b is not None
 
-        # Warm artifact must still be there
-        assert cache_file.exists(), 'target/cache.bin was removed (warmth lost)'
+        calls_after_second = (
+            seed_marker.read_text() if seed_marker.exists() else ''
+        ).splitlines()
+        # D10: seed MUST have been called on the recycle path
+        assert len(calls_after_second) > len(calls_after_first), (
+            'seed-warm-lane.sh was NOT called on recycle (D10 violation: no re-seed)'
+        )
+        # The recycle call must be with --fresh-checkout mode
+        assert any('--fresh-checkout' in ln for ln in calls_after_second), (
+            f'No --fresh-checkout call found in seed log: {calls_after_second}'
+        )
 
-    async def test_reacquire_does_not_call_seed(
+    async def test_reacquire_calls_seed_fresh_checkout(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """seed-warm-lane.sh is NOT called on warm reacquire (marker unchanged)."""
+        """Second acquire for a DIFFERENT task on a recycled FREE lane MUST invoke
+        _seed_warm_lane with mode '--fresh-checkout' (D10 always-re-seed-at-acquire).
+
+        Before D10 this test was named test_reacquire_does_not_call_seed and
+        asserted the opposite (no call on warm reacquire).  D10 inverts the
+        contract: the fresh-recycle path always re-seeds, so seed_calls.txt
+        must gain a new '--fresh-checkout' entry after the second acquire.
+        """
         sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
@@ -856,8 +931,14 @@ class TestAcquireWarmLaneResetInPlace:
         assert info_b is not None
 
         calls_after_second = seed_marker.read_text() if seed_marker.exists() else ''
-        assert calls_after_second == calls_after_first, (
-            'seed-warm-lane.sh was called on warm reacquire (should be skipped)'
+        # D10: seed MUST be called on the recycle path (new line in marker)
+        assert calls_after_second != calls_after_first, (
+            'seed-warm-lane.sh was NOT called on recycle (D10 violation: no re-seed)'
+        )
+        # The recycle call must use --fresh-checkout mode
+        new_calls = calls_after_second[len(calls_after_first):]
+        assert '--fresh-checkout' in new_calls, (
+            f'Recycle seed call did not use --fresh-checkout: {new_calls!r}'
         )
 
     async def test_reacquire_single_worktree_registration(
@@ -883,6 +964,62 @@ class TestAcquireWarmLaneResetInPlace:
             if line.startswith('worktree ') and '_lane-0' in line
         ]
         assert len(lane_registrations) == 1
+
+    async def test_recycle_reseed_failure_keeps_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Recycle path: failed re-seed is fail-soft — lane kept with degraded warmth.
+
+        When seed-warm-lane.sh exits non-zero on the RECYCLE path,
+        acquire_warm_lane must still return a usable WorktreeInfo (lane remains
+        registered, worktree NOT removed).  Contrast with create-once where a
+        seed failure triggers cold-fallback (returns None).
+
+        Fails against step-2 impl (which treats recycle seed failure as fatal,
+        returning None).  Passes after step-4's fail-soft implementation.
+        """
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # First acquire (create-once): passing seed → lane registered, target/ warm
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info_a is not None, 'prerequisite: create-once acquire must succeed'
+
+        # Place a retained artifact so we can verify it survives fail-soft recycle
+        (info_a.path / 'target').mkdir(exist_ok=True)
+        retained_artifact = info_a.path / 'target' / 'prior.bin'
+        retained_artifact.write_bytes(b'\xca\xfe' * 32)
+
+        # Overwrite the seed script in the MAIN REPO to exit 1 and commit it.
+        # After _reset_warm_lane resets the lane to this commit, the lane's
+        # seed script will exit non-zero.
+        fail_script = wl_git_repo / 'scripts' / 'seed-warm-lane.sh'
+        fail_script.write_text(
+            '#!/usr/bin/env bash\necho "forced failure" >&2\nexit 1\n'
+        )
+        fail_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=wl_git_repo)
+        await _run(['git', 'commit', '-m', 'fail: seed script exits 1'], cwd=wl_git_repo)
+        _, sha_fail, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        sha_fail = sha_fail.strip()
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(info_a.path)
+
+        # Second acquire for a DIFFERENT task at sha_fail: seed exits 1.
+        # step-2 (fatal): returns None.  step-4 (fail-soft): WorktreeInfo.
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_fail)
+
+        # D10 fail-soft: must return a usable lane (NOT None / cold-fallback)
+        assert info_b is not None, (
+            'Recycle seed failure must be fail-soft: return WorktreeInfo, not None'
+        )
+        # Worktree must NOT be removed (the retained target/ survives)
+        assert await git_ops._is_registered_worktree(info_b.path), (
+            'Worktree must not be removed on recycle seed failure'
+        )
+        # Same recycled lane path
+        assert info_b.path == info_a.path
 
 
 # ===========================================================================
@@ -961,15 +1098,22 @@ class TestReleaseWarmLane:
     async def test_release_retains_target_dir(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """target/ (including seeded.bin) is retained after release."""
+        """target/ is NOT deleted by release (incidental; next acquire re-seeds).
+
+        D10: release leaves target/ in place incidentally (CoW-cheap, harmless).
+        target/ retention is no longer a warmth-contract promise — the next
+        acquire_warm_lane always re-seeds from the current base, so the
+        released lane's target/ drift is irrelevant.  This test is a regression
+        guard: release must not actively delete target/.
+        """
         git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
         target_file = info.path / 'target' / 'seeded.bin'
         assert target_file.exists(), 'prerequisite: seed.bin should exist after acquire'
 
         await git_ops.release_warm_lane(info.path, 'task-A')
 
-        assert (info.path / 'target').exists(), 'target/ must be retained after release'
-        assert target_file.exists(), 'target/seeded.bin must be retained'
+        assert (info.path / 'target').exists(), 'target/ must not be deleted by release'
+        assert target_file.exists(), 'target/seeded.bin must not be deleted by release'
 
     async def test_release_makes_lane_reacquirable(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
@@ -1343,16 +1487,24 @@ class TestAcquireWarmLaneOnDiskBackstop:
     async def test_different_task_retains_target_warmth(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Fresh acquire for different task keeps target/ warmth (reset-in-place)."""
-        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+        """Fresh acquire for a different task RE-SEEDS target/ (D10 always-re-seed).
+
+        Before D10 this asserted silent retention of target/cache.bin.  D10
+        changes the contract: the fresh-reset path for a new task always
+        re-seeds, so we verify that seed-warm-lane.sh was invoked on the
+        fresh-recycle acquire (seed_calls.txt must gain a new entry after the
+        task-Z acquire).
+        """
+        sha_a, sha_main, seed_marker = await _make_repo_for_reuse_test(wl_git_repo)
 
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert info1 is not None
         plan_file = info1.path / '.task' / 'plan.json'
         plan_file.write_text('{"task_id": "task-A"}')
-        cache_file = info1.path / 'target' / 'cache.bin'
-        cache_file.write_bytes(b'\xca\xfe' * 64)
+        calls_after_first = (
+            seed_marker.read_text() if seed_marker.exists() else ''
+        ).splitlines()
 
         await git_ops1.release_warm_lane(info1.path, 'task-A')
 
@@ -1360,7 +1512,13 @@ class TestAcquireWarmLaneOnDiskBackstop:
         info2 = await git_ops2.acquire_warm_lane('task-Z', sha_main)
         assert info2 is not None
 
-        assert cache_file.exists(), 'target/cache.bin must be retained on fresh reset'
+        calls_after_second = (
+            seed_marker.read_text() if seed_marker.exists() else ''
+        ).splitlines()
+        # D10: seed MUST be called on the fresh-recycle path for a new task
+        assert len(calls_after_second) > len(calls_after_first), (
+            'seed-warm-lane.sh was NOT called on fresh-recycle for new task (D10 violation)'
+        )
 
 
 # ===========================================================================
@@ -1623,3 +1781,187 @@ class TestRestoreAssignment:
         pool.restore_assignment('42', lane_0)
 
         assert pool.state(lane_1) == LaneState.FREE
+
+
+# ===========================================================================
+# Step-6: RED — GitOps.refresh_warm_base unit + inv.9 promote-provenance
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRefreshWarmBase:
+    """GitOps.refresh_warm_base: invoke <_merge-verify>/scripts/refresh-warm-base.sh."""
+
+    async def _setup_merge_verify(
+        self,
+        repo: Path,
+        recorder_file: Path,
+    ) -> Path:
+        """Create _merge-verify/target/ and install the recorder script."""
+        worktree_base = repo / '.worktrees'
+        merge_verify = worktree_base / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        _install_refresh_recorder(merge_verify / 'scripts', recorder_file)
+        return merge_verify
+
+    async def test_refresh_invokes_script_with_correct_args(
+        self,
+        wl_git_repo: Path,
+        wl_git_config_rolling_base: GitConfig,
+        tmp_path: Path,
+    ):
+        """refresh_warm_base() invokes the script with <advancing> <base> args."""
+        recorder = tmp_path / 'refresh_args.txt'
+        await self._setup_merge_verify(wl_git_repo, recorder)
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops.refresh_warm_base()
+
+        assert result is True, 'refresh_warm_base must return True on success'
+        assert recorder.exists(), 'refresh-warm-base.sh was not called (recorder missing)'
+        recorded = recorder.read_text().strip()
+
+        advancing = str(git_ops.persistent_merge_worktree_path / 'target')
+        base = str(git_ops.warm_lane_base_target_path)
+        expected = f'{advancing} {base}'
+        assert recorded == expected, (
+            f'Wrong args: got {recorded!r}, expected {expected!r}'
+        )
+
+    async def test_refresh_advancing_is_merge_verify_not_lane(
+        self,
+        wl_git_repo: Path,
+        wl_git_config_rolling_base: GitConfig,
+        tmp_path: Path,
+    ):
+        """inv.9 promote-provenance: advancing arg is always _merge-verify/target,
+        never a task-lane path (_lane-K).
+
+        refresh_warm_base() hardcodes the advancing dir to
+        persistent_merge_worktree_path/<artifact_dir> and exposes no caller-
+        supplied advancing parameter, so DF can never source un-landed WIP.
+        """
+        recorder = tmp_path / 'refresh_args.txt'
+        await self._setup_merge_verify(wl_git_repo, recorder)
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
+
+        await git_ops.refresh_warm_base()
+
+        assert recorder.exists(), 'refresh-warm-base.sh was not called'
+        recorded = recorder.read_text().strip()
+        advancing_arg = recorded.split(' ')[0]  # first positional arg
+
+        # inv.9: advancing must include '_merge-verify' in the path
+        assert '_merge-verify' in advancing_arg, (
+            f'Advancing arg must reference _merge-verify, got: {advancing_arg!r}'
+        )
+        # inv.9: advancing must NEVER be a pool lane path
+        assert '_lane-' not in advancing_arg, (
+            f'Advancing arg must NOT be a task-lane path, got: {advancing_arg!r}'
+        )
+
+
+# ===========================================================================
+# Step-8: RED — refresh_warm_base guards + fail-soft
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRefreshWarmBaseGuards:
+    """refresh_warm_base guards and fail-soft behavior.
+
+    Tests (a) and (b) fail against the step-7 happy-only impl (no guards).
+    Tests (c) and (d) verify fail-soft behavior already present in step-7
+    (regression guards).
+    """
+
+    async def test_no_op_when_pool_is_none(
+        self, wl_git_repo: Path, wl_git_config_rolling_base: GitConfig, tmp_path: Path,
+    ):
+        """(a) refresh_warm_base returns False and does NOT invoke the script when
+        warm_lane_pool is None (knob off / size-0).
+
+        Fails against step-7 (no pool-None guard — would invoke the script).
+        """
+        recorder = tmp_path / 'refresh_args.txt'
+        # Set up the _merge-verify dir and recorder script
+        merge_verify = wl_git_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        _install_refresh_recorder(merge_verify / 'scripts', recorder)
+
+        # warm_lane_pool_size=0 → warm_lane_pool is None
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=0)
+        assert git_ops.warm_lane_pool is None, 'prerequisite: pool must be None'
+
+        result = await git_ops.refresh_warm_base()
+
+        assert result is False, 'refresh_warm_base must return False when pool is None'
+        assert not recorder.exists(), (
+            'refresh-warm-base.sh must NOT be invoked when pool is None'
+        )
+
+    async def test_no_op_when_advancing_equals_base(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, tmp_path: Path,
+    ):
+        """(b) refresh_warm_base returns False / script NOT invoked when advancing == base.
+
+        When warm_lane_base_target_dir is unset, warm_lane_base_target_path defaults
+        to persistent_merge_worktree_path/target — same as the advancing dir.  Refreshing
+        would be a degenerate self-copy, so it is skipped.
+
+        Fails against step-7 (no advancing==base guard — would invoke the script).
+        """
+        recorder = tmp_path / 'refresh_args.txt'
+        merge_verify = wl_git_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        _install_refresh_recorder(merge_verify / 'scripts', recorder)
+
+        # wl_git_config_on has NO warm_lane_base_target_dir → advancing == base
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        advancing = git_ops.persistent_merge_worktree_path / 'target'
+        base = git_ops.warm_lane_base_target_path
+        assert advancing == base, 'prerequisite: advancing and base must be the same path'
+
+        result = await git_ops.refresh_warm_base()
+
+        assert result is False, (
+            'refresh_warm_base must return False (no-op) when advancing == base'
+        )
+        assert not recorder.exists(), (
+            'refresh-warm-base.sh must NOT be invoked when advancing == base'
+        )
+
+    async def test_absent_script_returns_false(
+        self, wl_git_repo: Path, wl_git_config_rolling_base: GitConfig,
+    ):
+        """(c) Absent script returns False without raising (fail-soft).
+
+        Regression guard: already passes in step-7 (existence guard present).
+        """
+        merge_verify = wl_git_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        # Do NOT install any script
+
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
+        result = await git_ops.refresh_warm_base()
+        assert result is False, 'Absent script must return False (fail-soft)'
+
+    async def test_failing_script_returns_false(
+        self, wl_git_repo: Path, wl_git_config_rolling_base: GitConfig,
+    ):
+        """(d) Non-zero-exit script returns False without raising (fail-soft).
+
+        Regression guard: already passes in step-7 (rc!=0 → return False).
+        """
+        merge_verify = wl_git_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        _install_refresh_failing(merge_verify / 'scripts')
+
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
+        result = await git_ops.refresh_warm_base()
+        assert result is False, 'Non-zero script exit must return False (fail-soft)'
