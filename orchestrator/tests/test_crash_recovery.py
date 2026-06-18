@@ -628,3 +628,73 @@ class TestRecoverCrashedTasksWarmLane:
 
         assert '42' in harness._recovered_plans
         assert '55' in harness._recovered_plans
+
+
+# ===========================================================================
+# Step-5 RED: warm-lane edge cases
+# (a) Stamped-but-no-progress lane
+# (b) Plan-less lane (only agent_session.json sidecar, no plan.json)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRecoverCrashedTasksWarmLaneEdgeCases:
+    """Edge cases for warm-lane crash recovery."""
+
+    async def test_stamped_no_progress_lane_preserved(self, harness: Harness):
+        """(a) Stamped plan + 0 done steps on a lane → '77' in _preserved_worktrees,
+        plan.lock removed, lane path NOT in _preserved_worktrees (stored by real id),
+        pool assignment restored and state ASSIGNED.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(
+            steps_done=0, steps_total=4, task_id='77',
+            session_id='77-aabbccddeeff',
+        )
+        lane_path = _setup_lane(base, '_lane-1', plan)
+        lock_path = lane_path / '.task' / 'plan.lock'
+        lock_path.write_text(json.dumps({'session_id': 'old', 'owner_pid': 1}))
+
+        await harness._recover_crashed_tasks()
+
+        # Preserved under the real task_id, not the lane dir name
+        assert '77' in harness._preserved_worktrees
+        assert '_lane-1' not in harness._preserved_worktrees
+        # Stale lock cleared
+        assert not lock_path.exists()
+        # Pool assignment restored and lane reserved
+        assert pool.assignment_for('77') == lane_path
+        assert pool.state(lane_path) == LaneState.ASSIGNED
+        # cleanup NOT called (worktree preserved)
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_planless_lane_released_to_pool(self, harness: Harness):
+        """(b) Lane with only agent_session.json sidecar (no plan.json) →
+        cleanup_worktree called with (base/'_lane-0', '_lane-0') and
+        NEITHER '_lane-0' nor any session stored in _recovered_sessions/
+        _recovered_plans.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane_path = base / '_lane-0'
+        task_dir = lane_path / '.task'
+        task_dir.mkdir(parents=True)
+        sidecar = {
+            'session_id': 'uuid-lane-mid-flight',
+            'role': 'architect',
+            'started_at': '2026-06-18T10:00:00+00:00',
+            'owner_pid': 4242,
+        }
+        (task_dir / 'agent_session.json').write_text(json.dumps(sidecar))
+
+        await harness._recover_crashed_tasks()
+
+        # cleanup_worktree called for the lane (routes to release_warm_lane)
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            lane_path, '_lane-0'
+        )
+        # Sidecar NOT stored (no task_id → can't key it)
+        assert '_lane-0' not in harness._recovered_sessions
+        assert '_lane-0' not in harness._preserved_worktrees
+        assert '_lane-0' not in harness._recovered_plans
