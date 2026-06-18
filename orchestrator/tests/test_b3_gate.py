@@ -320,7 +320,7 @@ class TestCorruptStateFailsClosed:
         )
 
     def test_run_check_cap_remaining_zero_on_corrupt(self, tmp_path):
-        """run_check with a corrupt state file reports cap_remaining==0."""
+        """run_check with a corrupt state file reports cap_remaining==0 and already_attempted==False."""
         import argparse
         import contextlib
         import io as _io
@@ -345,6 +345,13 @@ class TestCorruptStateFailsClosed:
         result = _json.loads(buf.getvalue())
         assert result['cap_remaining'] == 0, (
             f'Expected cap_remaining=0 for corrupt state; got {result}'
+        )
+        # Both state-derived fields must reflect the fail-closed contract.
+        # already_attempted=False is the *permissive* value, but it is correct
+        # here because we cannot read prior records — consumers must gate on
+        # cap_remaining (or charge()), not already_attempted.
+        assert result['already_attempted'] is False, (
+            f'Expected already_attempted=False for corrupt state; got {result}'
         )
 
     def test_record_launch_on_corrupt_fails_closed(self, tmp_path):

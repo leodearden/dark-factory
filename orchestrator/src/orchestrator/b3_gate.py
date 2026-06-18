@@ -100,9 +100,12 @@ def _load_state_checked(path: Path) -> tuple[dict[str, Any], bool]:
 def _load_state(path: Path) -> dict[str, Any]:
     """Load b3 state from *path*; return empty state on any error.
 
-    Thin wrapper around _load_state_checked that discards the ok flag.
-    Used by state-inspection callers (tests, _already_attempted, _cap_remaining)
-    that don't make cap-bearing decisions — keeping those ~18 call sites unchanged.
+    Thin backward-compatible wrapper around _load_state_checked that discards
+    the ok flag.  Retained **solely** as a test-suite helper — the ~18 call
+    sites in test_b3_gate.py use this shim so they do not need to unpack a
+    (state, ok) tuple.  There are **no production callers**: record_launch,
+    charge, and run_check all call _load_state_checked directly so they can
+    act on the ok flag and fail CLOSED on corruption.
     """
     return _load_state_checked(path)[0]
 
@@ -161,13 +164,24 @@ def record_launch(
     on each write to bound state-file growth; this horizon is comfortably beyond
     any re-armable window.
     Returns ``{'recorded': bool, 'already_attempted': bool}``.
+    On a corrupt state file also includes ``'reason': str`` so callers can
+    distinguish a corruption failure from a genuine "not yet attempted" result.
+    **Consumers must gate on ``recorded``, not ``already_attempted``**: on
+    corruption both are False (we cannot confirm prior attempts), but only
+    ``recorded=False`` reliably signals that the launch was NOT written.
     """
     retention_cutoff = now - timedelta(days=_LAUNCH_RETENTION_DAYS)
     with _locked_state(state_path):
         state, ok = _load_state_checked(state_path)
         if not ok:
             # Corrupt state — refuse without writing to preserve forensic bytes.
-            return {'recorded': False, 'already_attempted': False}
+            # Include 'reason' so callers can distinguish corruption from a
+            # genuine "not yet attempted" result (both yield already_attempted=False).
+            return {
+                'recorded': False,
+                'already_attempted': False,
+                'reason': 'corrupt state — cannot read state file',
+            }
         # Prune stale launch entries to bound file growth
         state['launches'] = [
             e for e in state['launches']

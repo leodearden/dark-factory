@@ -2246,10 +2246,16 @@ Output JSON matching the schema. Every task must appear in the output.
             # actively-held tasks, so a task that reached here has an exited
             # owner; reaping is safe.
             if not mid_run:
-                logger.warning(
+                # Use ERROR (not WARNING) because the task is now stranded
+                # in-progress indefinitely and requires operator intervention:
+                # the lock cannot be read, so automated reconcile cannot
+                # determine liveness and will skip the task every cycle.
+                logger.error(
                     'Reconcile: task %s plan.lock unreadable/corrupt'
                     ' — cannot confirm owner is dead;'
-                    ' leaving worktree intact (fail-closed)',
+                    ' leaving worktree intact (fail-closed).'
+                    ' OPERATOR ACTION REQUIRED: inspect worktree and lock'
+                    ' to determine whether to reap or allow task to continue.',
                     tid,
                 )
                 return None  # do NOT reap a possibly-live owner's worktree
