@@ -833,6 +833,10 @@ class Harness:
             # long run so they don't accumulate until the next restart.
             self._start_stranded_reconcile()
 
+            # 1c1d. Start periodic main-tip integrity sweep (task 1832).
+            # Catches test-suite drift that scoped per-merge verify misses.
+            self._start_main_tip_sweep()
+
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
                 hours, rem = divmod(delay_secs, 3600)
@@ -1188,6 +1192,10 @@ class Harness:
                 await self._stop_stranded_reconcile()
             except Exception as e:
                 logger.warning(f'_stop_stranded_reconcile() failed: {e}')
+            try:
+                await self._stop_main_tip_sweep()
+            except Exception as e:
+                logger.warning(f'_stop_main_tip_sweep() failed: {e}')
             try:
                 await self._stop_escalation_server()
             except Exception as e:
@@ -4930,6 +4938,51 @@ Output JSON matching the schema. Every task must appear in the output.
             except Exception:
                 logger.exception('Stranded-in-progress reconcile pass failed')
 
+    def _start_main_tip_sweep(self) -> None:
+        """Start the periodic main-tip integrity sweep.
+
+        Mirrors _start_stranded_reconcile: a long-lived asyncio.Task wakes every
+        ``main_tip_sweep_interval_secs``, resolves the current main SHA, and runs
+        a FULL unscoped verification in a throwaway detached worktree.  The sweep
+        is completely off the serial merge lane — per-merge latency is untouched.
+        """
+        if not self.config.main_tip_sweep_enabled:
+            return
+        if (
+            self._main_tip_sweep_task is not None
+            and not self._main_tip_sweep_task.done()
+        ):
+            return
+        self._main_tip_sweep_task = asyncio.create_task(
+            self._main_tip_sweep_loop(),
+            name='main-tip-sweep',
+        )
+        logger.info(
+            'Main-tip integrity sweep started (interval=%.0fs)',
+            self.config.main_tip_sweep_interval_secs,
+        )
+
+    async def _stop_main_tip_sweep(self) -> None:
+        """Cancel the main-tip integrity sweep loop."""
+        if self._main_tip_sweep_task is not None:
+            self._main_tip_sweep_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._main_tip_sweep_task
+            self._main_tip_sweep_task = None
+            logger.info('Main-tip integrity sweep stopped')
+
+    async def _main_tip_sweep_loop(self) -> None:
+        """Wake periodically and run the main-tip sweep pass."""
+        interval = self.config.main_tip_sweep_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._run_main_tip_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('Main-tip integrity sweep pass failed')
+
     async def _run_main_tip_sweep(self) -> None:
         """Single testable pass of the main-tip integrity sweep.
 
@@ -4937,10 +4990,11 @@ Output JSON matching the schema. Every task must appear in the output.
         a throwaway detached worktree at that SHA, and files a level-1 infra_issue
         escalation when the sweep finds a failure on main.
 
-        Dedup by SHA (``_last_swept_main_sha``) is added in step-10 so the
-        expensive full verify is skipped when main has not advanced.  The
-        no-queue guard is also added in step-10.  See _start_main_tip_sweep /
-        _main_tip_sweep_loop for the periodic invocation context.
+        SHA dedup (``_last_swept_main_sha``) skips the expensive full verify
+        when main has not advanced — N merges within one interval cost one sweep.
+        When ``_escalation_queue`` is None the drift is logged but not submitted.
+        See ``_start_main_tip_sweep`` / ``_main_tip_sweep_loop`` for the periodic
+        invocation context.
         """
         from orchestrator import verify as verify_mod  # noqa: PLC0415
 
