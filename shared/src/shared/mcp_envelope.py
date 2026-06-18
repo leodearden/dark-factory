@@ -144,7 +144,8 @@ def parse_tool_result(
         if not isinstance(result, dict):
             return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
 
-        content = result.get("result", {}).get("content", [])
+        inner_result = result.get("result")
+        content = inner_result.get("content", []) if isinstance(inner_result, dict) else None
         if not isinstance(content, list):
             return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
 

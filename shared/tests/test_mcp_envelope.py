@@ -110,6 +110,8 @@ _ABNORMAL_CASES = [
     ),
     # NO_TEXT_BLOCK — result completely missing result key
     (EnvelopeShape.NO_TEXT_BLOCK, {}, "k", dict),
+    # NO_TEXT_BLOCK — result["result"] is a non-dict (e.g. string); second .get would raise
+    (EnvelopeShape.NO_TEXT_BLOCK, {"result": "oops"}, "k", dict),
     # JSON_DECODE_ERROR — text block present but invalid JSON (placeholder; replaced below)
     (EnvelopeShape.JSON_DECODE_ERROR, None, "k", dict),
     # INNER_NOT_DICT — parsed JSON is a list (not a dict)
@@ -126,7 +128,7 @@ _ABNORMAL_CASES = [
 
 # Build the JSON_DECODE_ERROR case properly (None slot was placeholder)
 _JSON_DECODE_ENV = {"result": {"content": [{"type": "text", "text": "{not json"}]}}
-_ABNORMAL_CASES[4] = (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", dict)
+_ABNORMAL_CASES[5] = (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", dict)
 
 
 @pytest.mark.parametrize(
@@ -137,6 +139,7 @@ _ABNORMAL_CASES[4] = (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", di
         "no_text_block_empty_content",
         "no_text_block_no_text_type",
         "no_text_block_missing_result",
+        "no_text_block_result_not_dict",
         "json_decode_error",
         "inner_not_dict_list",
         "inner_not_dict_scalar",
