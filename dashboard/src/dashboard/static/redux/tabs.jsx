@@ -105,11 +105,6 @@ function aggEscalationRate(perf, kind /* 'steward_rate' | 'interactive_rate' */)
 }
 
 // ── Deps + locks chip lists ──
-function shortPath(p) {
-  // strip leading dirs, keep filename + parent
-  const parts = p.split('/');
-  return parts.length <= 2 ? p : parts.slice(-2).join('/');
-}
 
 function DepChip({ dep }) {
   return (
@@ -119,7 +114,7 @@ function DepChip({ dep }) {
   );
 }
 
-function LockChip({ path, holder, holderProject, currentTaskId, currentProject }) {
+function LockChip({ path, label, holder, holderProject, currentTaskId, currentProject }) {
   let cls, hint;
   const isOwn = holder && holder === currentTaskId && (holderProject || currentProject) === currentProject;
   const holderDisplay = holder ? `T-${holder}` : null;
@@ -128,7 +123,7 @@ function LockChip({ path, holder, holderProject, currentTaskId, currentProject }
   else { cls = 'lock-taken'; hint = `held by ${holderDisplay}`; }
   return (
     <span className={`chip ${cls}`} title={`${path} · ${hint}`}>
-      {shortPath(path)}
+      {label != null ? label : path.split('/').pop()}
       {cls === 'lock-taken' && <span className="holder">⊘ {holderDisplay}</span>}
     </span>
   );
@@ -167,7 +162,7 @@ function DepsCell({ task }) {
 }
 
 function LocksCell({ task }) {
-  const { buildSchedLockInfo } = window.DF_SCHED_UTILS || {};
+  const { buildSchedLockInfo, disambiguateLabels } = window.DF_SCHED_UTILS || {};
   const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
     ? buildSchedLockInfo(task, DF.SCHEDULER)
     : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
@@ -178,9 +173,10 @@ function LocksCell({ task }) {
     const blockedB = hb && hb !== rawTaskId ? 0 : 1;
     return blockedA - blockedB; // blocked-by-other first
   });
+  const labelMap = disambiguateLabels ? disambiguateLabels(sorted) : null;
   return <ChipList items={sorted} renderChip={(modPath) => {
     const m = moduleByPath.get(modPath);
-    return <LockChip key={modPath} path={modPath} holder={m && m.holder} holderProject={m && m.holder_project} currentTaskId={rawTaskId} currentProject={task.project} />;
+    return <LockChip key={modPath} path={modPath} label={labelMap ? labelMap.get(modPath) : modPath.split('/').pop()} holder={m && m.holder} holderProject={m && m.holder_project} currentTaskId={rawTaskId} currentProject={task.project} />;
   }} maxInline={2} persistKey={`df.locks.${task.id}`} expandLayout="column" alwaysToggle={true} />;
 }
 
