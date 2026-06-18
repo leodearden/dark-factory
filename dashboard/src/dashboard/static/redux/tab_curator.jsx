@@ -111,29 +111,30 @@ function QueueRow({ ticket, onCancel }) {
   const age = age_seconds != null
     ? (age_seconds < 60 ? `${age_seconds}s` : age_seconds < 3600 ? `${Math.round(age_seconds / 60)}m` : `${Math.round(age_seconds / 3600)}h`)
     : timeago(created_at);
+  // Lifted out of the render body: compute once per files-identity change, not per render.
+  // React.useMemo avoids the O(n^2 * segments) scan on re-renders unrelated to file changes.
+  const labelMap = React.useMemo(
+    () => (window.DF_SCHED_UTILS || {}).disambiguateLabels
+      ? window.DF_SCHED_UTILS.disambiguateLabels(files || [])
+      : null,
+    [files]
+  );
   return (
     <tr>
       <td className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>{shortTicketId(ticket_id)}</td>
       <td style={{ maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis' }} title={title}>{title || '—'}</td>
       <td>
         {files && files.length > 0 ? (
-          (() => {
-            const labelMap = (window.DF_SCHED_UTILS || {}).disambiguateLabels
-              ? window.DF_SCHED_UTILS.disambiguateLabels(files)
-              : null;
-            return (
-              <ChipList
-                items={files}
-                renderChip={(f, i) => (
-                  <span key={i} className="chip" title={f} style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>
-                    {labelMap ? labelMap.get(f) : f}
-                  </span>
-                )}
-                maxInline={2}
-                persistKey={`df.curator.files.${ticket_id}`}
-              />
-            );
-          })()
+          <ChipList
+            items={files}
+            renderChip={(f, i) => (
+              <span key={i} className="chip" title={f} style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>
+                {labelMap ? labelMap.get(f) : f}
+              </span>
+            )}
+            maxInline={2}
+            persistKey={`df.curator.files.${ticket_id}`}
+          />
         ) : (
           <span style={{ color: 'var(--fg-3)' }}>—</span>
         )}

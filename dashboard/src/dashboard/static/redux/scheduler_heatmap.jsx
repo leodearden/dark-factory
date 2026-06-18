@@ -65,7 +65,7 @@ function HeatmapCell({ state, holder }) {
 //   onRowClick    fn(row)     — called when a task row is clicked
 //   selectedTaskId string     — task_id of the currently-selected row (or null)
 function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
-  const { useState } = React;
+  const { useState, useMemo } = React;
 
   // Pre-compute parked rows keyed by `(project, module)` so cellStateFor
   // can classify 'parked-by-other' without leaking parks across projects
@@ -94,9 +94,14 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
     );
   }
 
-  const labelMap = (window.DF_SCHED_UTILS || {}).disambiguateLabels
-    ? window.DF_SCHED_UTILS.disambiguateLabels(enriched.map(m => m.path))
-    : null;
+  // Memoised against `enriched` to avoid the O(n^2 * segments) scan on every
+  // re-render not triggered by a change in module data (e.g. row selection).
+  const labelMap = useMemo(
+    () => (window.DF_SCHED_UTILS || {}).disambiguateLabels
+      ? window.DF_SCHED_UTILS.disambiguateLabels(enriched.map(m => m.path))
+      : null,
+    [enriched]
+  );
 
   return (
     <div className="sched-heatmap-wrap">

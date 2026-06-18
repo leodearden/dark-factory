@@ -98,4 +98,15 @@ function disambiguateLabels(paths) {
   return labelMap;
 }
 
-window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels };
+// labelFor(paths) is the stable-contract companion to disambiguateLabels.
+// Unlike calling disambiguateLabels directly, labelFor is safe to destructure
+// and invoke unconditionally at call sites that already hard-depend on
+// window.DF_SCHED_UTILS (scheduler_drawer.jsx, tab_scheduler.jsx): because
+// scheduler_utils.jsx loads first, labelFor is always present.
+// The function is intentionally a thin wrapper so node-vm tests for
+// disambiguateLabels continue to cover the core logic without change.
+function labelFor(paths) {
+  return disambiguateLabels(paths || []);
+}
+
+window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor };

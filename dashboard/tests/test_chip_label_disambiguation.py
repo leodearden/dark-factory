@@ -17,6 +17,7 @@ RED→GREEN coverage via the node-vm sandbox below.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -58,6 +59,8 @@ process.stdout.write(JSON.stringify(sandbox.__result) + '\n');
 def _node():
     path = shutil.which('node')
     if not path:
+        if os.environ.get('CI'):
+            pytest.fail('node is required in CI but not found on PATH')
         pytest.skip('node not available')
     return path
 

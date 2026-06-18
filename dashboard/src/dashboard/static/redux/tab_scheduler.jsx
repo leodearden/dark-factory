@@ -15,7 +15,7 @@ const { Segmented, ProjectChips, timeago, fmtDateTime } = window.DF_SHELL;
 const { SchedulerHeatmap, cellStateFor } = window.DF_SCHED_HEATMAP;
 const { SchedulerDrawer } = window.DF_SCHED_DRAWER;
 // Shared helpers loaded by scheduler_utils.jsx (must come before this script).
-const { fmtAge, totalEvents, avgWaitSeconds, disambiguateLabels } = window.DF_SCHED_UTILS;
+const { fmtAge, totalEvents, avgWaitSeconds, labelFor } = window.DF_SCHED_UTILS;
 
 const D = window.DF_DATA;
 
@@ -153,7 +153,9 @@ function ModulesView({ modules, rows, eventsMap }) {
     return idx;
   }, [rows]);
 
-  const labelMap = disambiguateLabels ? disambiguateLabels(modules.map(m => m.path)) : null;
+  // Memoised against `modules` (same pattern as rowByCompositeKey above) to
+  // avoid the O(n^2 * segments) disambiguation scan on every poll-driven re-render.
+  const labelMap = stUseMemo(() => labelFor(modules.map(m => m.path)), [modules]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -178,7 +180,7 @@ function ModulesView({ modules, rows, eventsMap }) {
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 8 }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="mono" style={{ fontSize: 11, color: 'var(--fg-0)', overflow: 'hidden', textOverflow: 'ellipsis' }} title={m.path}>
-                  {labelMap ? labelMap.get(m.path) : m.path}
+                  {labelMap.get(m.path)}
                 </div>
                 <div style={{ fontSize: 10, color: 'var(--fg-3)', overflow: 'hidden', textOverflow: 'ellipsis' }} title={m.path}>
                   {m.path}
