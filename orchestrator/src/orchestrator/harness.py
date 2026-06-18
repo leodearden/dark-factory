@@ -4790,7 +4790,9 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         # restart / park / abandon → teardown + status write.
-        _ACTION_TARGETS = {'restart': 'pending', 'park': 'deferred', 'abandon': 'cancelled'}
+        # park → 'blocked' (version-a): quiescence rests on the open L2 escalation
+        # suppressing Fix #1b stranded_blocked re-filing, not on the 'deferred' status.
+        _ACTION_TARGETS = {'restart': 'pending', 'park': 'blocked', 'abandon': 'cancelled'}
         target = _ACTION_TARGETS.get(action)
         if target is not None:
             self._schedule_coro_threadsafe(
@@ -4828,7 +4830,8 @@ Output JSON matching the schema. Every task must appear in the output.
             Any non-terminal current status is intentionally overwritten — restart is
             a forced re-pend.  SetTaskStatusRejected handles the terminal-exit gate
             if the task transitions terminally between the recheck and the write.
-          - park:    task must be non-terminal; target='deferred'.  Same TOCTOU note.
+          - park:    task must be non-terminal; target='blocked'.  Same TOCTOU note.
+            Quiescence from the open L2 escalation (Fix #1b skip gate), not from status.
           - abandon: task must be non-terminal; target='cancelled'.  SetTaskStatusRejected
             is redundant here (cancelled is terminal and the scheduler's terminal-exit
             gate would also catch it), but the recheck still avoids a no-op write.
