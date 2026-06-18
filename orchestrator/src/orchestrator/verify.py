@@ -1325,8 +1325,11 @@ def _verify_duration_secs(runs: list[dict]) -> float:
     Each entry is expected to have a ``duration_secs`` key (float); entries
     that are missing the key contribute 0.0.  Returns 0.0 for an empty list.
 
-    Used to populate :attr:`VerifyResult.duration_secs` from the already-
-    measured per-command durations in ``run_verification``.
+    This is the correct wall-clock measure when commands were run **serially**
+    (sum of sequential durations).  For the **concurrent** branch (asyncio.gather
+    of test/lint/type) the caller should use ``max(...)`` of the individual
+    durations — mirroring the multi-module logic in ``_aggregate_results`` — to
+    avoid overstating wall-clock by ~3×.
     """
     return sum(r.get('duration_secs', 0.0) for r in runs)
 
@@ -1343,9 +1346,12 @@ class VerifyResult:
     category: str = ''
     worktree_log_paths: list[str] = field(default_factory=list)
     archive_log_paths: list[str] = field(default_factory=list)
-    # Total wall-clock verify cost (sum of per-command duration_secs, or max
-    # across concurrently-run modules in _aggregate_results).  Populated by
-    # run_verification; defaults to 0.0 for _trivial_pass and mocked results.
+    # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
+    # when the three commands ran concurrently (asyncio.gather), or their sum
+    # when run serially.  For a multi-module run: max across child
+    # VerifyResults (set by _aggregate_results — modules run concurrently via
+    # asyncio.gather so max approximates wall-time).  Defaults to 0.0 for
+    # _trivial_pass and mocked results.
     duration_secs: float = 0.0
 
     def failure_report(self) -> str:
@@ -2149,6 +2155,14 @@ async def run_verification(
         except Exception as exc:  # noqa: BLE001
             logger.warning('run_verification: persistence error (non-fatal): %s', exc)
 
+    # When the three verify commands ran concurrently (asyncio.gather) the
+    # true wall-clock cost is the longest single command, not their sum.
+    # Serial mode is rare (legacy / explicit opt-out) and sums correctly.
+    if concurrent:
+        _wall_secs = max(test_duration, lint_duration, type_duration)
+    else:
+        _wall_secs = _verify_duration_secs(runs)
+
     result = VerifyResult(
         passed=passed,
         test_output=test_out,
@@ -2160,7 +2174,7 @@ async def run_verification(
         category=category,
         worktree_log_paths=worktree_log_paths,
         archive_log_paths=archive_log_paths,
-        duration_secs=_verify_duration_secs(runs),
+        duration_secs=_wall_secs,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),

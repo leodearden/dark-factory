@@ -39,9 +39,16 @@ def summarize_rebase_verify_cost(rows: list[dict]) -> dict:
     from the row itself.
 
     Returns a dict keyed by cohort name, each with:
-    - ``n``: int — number of rows in this cohort
-    - ``distance_p50``: float — median ``distance_commits``
-    - ``verify_secs_p50``: float — median ``next_verify_wall_secs``
+    - ``n``: int — number of rows in this cohort (all rows, including those
+      with the -1 sentinel distance returned by ``get_rebase_distance`` on
+      git error).
+    - ``distance_p50``: float | None — median ``distance_commits`` computed
+      only over rows whose distance is ≥ 0 (i.e. valid measurements).
+      ``None`` when every row in the cohort carries the -1 sentinel (all
+      measurements failed).  The 'unknown' cohort will always have
+      ``distance_p50=None`` because ``classify_rebase_cohort`` only assigns
+      that label when ``distance < 0``.
+    - ``verify_secs_p50``: float — median ``next_verify_wall_secs``.
 
     Returns ``{}`` for an empty input.
     """
@@ -50,6 +57,7 @@ def summarize_rebase_verify_cost(rows: list[dict]) -> dict:
 
     cohort_distances: dict[str, list[float]] = {}
     cohort_verify_secs: dict[str, list[float]] = {}
+    cohort_counts: dict[str, int] = {}
 
     for row in rows:
         # Support both fetch_events_by_type rows (nested 'data') and flat dicts.
@@ -58,16 +66,22 @@ def summarize_rebase_verify_cost(rows: list[dict]) -> dict:
         distance = float(payload.get('distance_commits', 0))
         verify_secs = float(payload.get('next_verify_wall_secs', 0.0))
 
-        cohort_distances.setdefault(cohort, []).append(distance)
+        cohort_counts[cohort] = cohort_counts.get(cohort, 0) + 1
+        # Exclude -1 sentinel (failed measurement) from the distance distribution
+        # so it does not corrupt the median for callers treating distance_p50
+        # numerically.  Rows are still counted in 'n'.
+        if distance >= 0:
+            cohort_distances.setdefault(cohort, []).append(distance)
         cohort_verify_secs.setdefault(cohort, []).append(verify_secs)
 
     result: dict = {}
-    for cohort, distances in cohort_distances.items():
-        verify_list = cohort_verify_secs[cohort]
+    for cohort, count in cohort_counts.items():
+        valid_distances = cohort_distances.get(cohort, [])
+        verify_list = cohort_verify_secs.get(cohort, [])
         result[cohort] = {
-            'n': len(distances),
-            'distance_p50': statistics.median(distances),
-            'verify_secs_p50': statistics.median(verify_list),
+            'n': count,
+            'distance_p50': statistics.median(valid_distances) if valid_distances else None,
+            'verify_secs_p50': statistics.median(verify_list) if verify_list else 0.0,
         }
 
     return result

@@ -579,6 +579,94 @@ class TestVerifyDebugfixLoopEmit:
             f'Expected no rebase_verify_cost events when main unchanged; got {rows}'
         )
 
+    async def test_emits_two_events_on_two_separate_rebases(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """Two verify iterations, each with a new rebase → two distinct events.
+
+        Regression guard: ``rebase_notice`` is re-initialised to ``None`` at the
+        TOP of every ``while True:`` iteration (workflow.py:4312).  Hoisting that
+        initialisation above the loop would cause the second iteration to re-emit
+        the stale first-rebase notice (or suppress the new one), breaking the
+        one-event-per-rebase invariant — and no prior test would have caught it.
+        """
+        from orchestrator.event_store import EventStore
+        from orchestrator.verify import VerifyResult
+
+        config.rebase_reseed_distance_threshold = 2
+        # Disable preexisting-break probe (requires running real verify on main).
+        config.escalate_preexisting_main_break = False
+
+        db = tmp_path / 'events_multi.db'
+        store = EventStore(db_path=db, run_id='run-multi')
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        repo = config.project_root
+
+        # Advance main by N1=3 commits before the loop starts.
+        n1 = 3
+        for i in range(n1):
+            (repo / f'multi_iter1_{i}.txt').write_text(f'{i}\n')
+            await _run(['git', 'add', '-A'], cwd=repo)
+            await _run(['git', 'commit', '-m', f'multi iter1 {i}'], cwd=repo)
+
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt, event_store=store)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        # First call: advance main by N2=2 MORE commits then return passed=False.
+        # Second call: return passed=True (second rebase picks up the N2 commits).
+        n2 = 2
+        call_count = 0
+
+        async def _mock_verify(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                for i in range(n2):
+                    (repo / f'multi_iter2_{i}.txt').write_text(f'{i}\n')
+                    await _run(['git', 'add', '-A'], cwd=repo)
+                    await _run(['git', 'commit', '-m', f'multi iter2 {i}'], cwd=repo)
+                return VerifyResult(
+                    passed=False, test_output='FAIL', lint_output='', type_output='',
+                    summary='tests failed', duration_secs=4.0,
+                )
+            return VerifyResult(
+                passed=True, test_output='ok', lint_output='', type_output='',
+                summary='passed', duration_secs=3.0,
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', _mock_verify)
+
+        from orchestrator.workflow import WorkflowOutcome
+        outcome = await workflow._verify_debugfix_loop()
+        assert outcome == WorkflowOutcome.DONE
+
+        rows = store.fetch_events_by_type('rebase_verify_cost')
+        assert len(rows) == 2, (
+            f'Expected 2 rebase_verify_cost events (one per real rebase); '
+            f'got {len(rows)}: {rows}'
+        )
+
+        data1 = rows[0]['data']
+        data2 = rows[1]['data']
+
+        # Each event must record the distance for ITS OWN rebase.
+        assert data1['distance_commits'] == n1, (
+            f'Event 1: expected distance_commits={n1}, got {data1["distance_commits"]}'
+        )
+        assert data2['distance_commits'] == n2, (
+            f'Event 2: expected distance_commits={n2}, got {data2["distance_commits"]}'
+        )
+
+        # Verify cost tied to the immediately-following run_scoped_verification call.
+        assert data1['next_verify_wall_secs'] == pytest.approx(4.0), (
+            f'Event 1: expected next_verify_wall_secs=4.0, got {data1["next_verify_wall_secs"]}'
+        )
+        assert data2['next_verify_wall_secs'] == pytest.approx(3.0), (
+            f'Event 2: expected next_verify_wall_secs=3.0, got {data2["next_verify_wall_secs"]}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-15 RED: summarize_rebase_verify_cost pure readout function
