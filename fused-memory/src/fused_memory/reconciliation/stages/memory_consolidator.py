@@ -62,6 +62,14 @@ class MemoryConsolidator(BaseStage):
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
 
+    # Authoritative task-count cross-verification record — set by harness (task 1785).
+    # None when the status map was unavailable (e.g. taskmaster down) or in remediation passes.
+    task_count_verification: dict | None = None
+
+    # Graphiti async-queue health record — set by harness (task 1785).
+    # None when durable_queue was unavailable or in remediation passes.
+    graphiti_queue_health: dict | None = None
+
     # Count of snapshot lines stripped from the payload in the current cycle (task 1547)
     _entity_summary_snapshot_lines_stripped: int = 0
 
@@ -141,6 +149,39 @@ class MemoryConsolidator(BaseStage):
                         'run_id': run_id,
                         'census_max': self.filtered_task_tree.max_task_id,
                         'offending_ids': inconsistent,
+                    },
+                )
+
+        # ── Task-count cross-verification (task 1785) ─────────────────────────
+        # Surface the authoritative get_statuses census vs. get_tasks-derived
+        # FilteredTaskTree comparison so the async judge / recon report can act
+        # on count divergence without relying on a possibly-dropped Graphiti edge.
+        if self.task_count_verification is not None:
+            report.stats['task_count_verification'] = self.task_count_verification
+            if not self.task_count_verification.get('consistent', True):
+                logger.warning(
+                    'reconciliation.task_count_divergence',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                        'authoritative': self.task_count_verification.get('authoritative'),
+                        'tree': self.task_count_verification.get('tree'),
+                    },
+                )
+
+        # ── Graphiti async-queue health (task 1785) ────────────────────────────
+        # Surface the dead-letter count from DurableWriteQueue so the silent
+        # add_memory drop (success=True at enqueue, dead-lettered asynchronously)
+        # is visible in the Stage 1 report.
+        if self.graphiti_queue_health is not None:
+            report.stats['graphiti_queue_health'] = self.graphiti_queue_health
+            if not self.graphiti_queue_health.get('healthy', True):
+                logger.warning(
+                    'reconciliation.graphiti_queue_unhealthy_stage1',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                        'dead_count': self.graphiti_queue_health.get('dead_count'),
                     },
                 )
 
