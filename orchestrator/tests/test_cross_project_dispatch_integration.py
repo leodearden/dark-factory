@@ -36,7 +36,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
-from orchestrator.scheduler import ExternalResolverError
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TwoProjectMcpSession
@@ -731,7 +731,7 @@ class TestMalformedExternalResult:
         harness, session = build_harness(tmp_path)
         # Inject a recording event store so we can assert gate_held events.
         rec = _RecordingEventStore()
-        harness.scheduler.event_store = rec
+        harness.scheduler.event_store = rec  # type: ignore[assignment]
 
         upstream_task_id = '42'
         dep_string = f'{_UPSTREAM_PROJECT}:{upstream_task_id}'
