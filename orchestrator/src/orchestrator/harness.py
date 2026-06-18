@@ -1393,9 +1393,24 @@ Output JSON matching the schema. Every task must appear in the output.
                 # sidecar pins the Claude session UUID so the next workflow
                 # can --resume it with a "continue" prompt instead of spawning
                 # a fresh agent.
-                # Note: for lanes, step-6 will skip the sidecar store (the
-                # sidecar carries no task_id) and release instead; this
-                # existing cold-path logic is left unchanged here.
+                #
+                # For lanes: the sidecar (agent_session.json) carries
+                # session_id/role/owner_pid but NO task_id.  The in-memory
+                # assignment map is empty after a restart, so there is no way
+                # to map a sidecar-only lane back to its real task.  Storing
+                # _recovered_sessions['_lane-k'] would be dead state (dispatch
+                # keys off the real task_id) and would also wrongly shield the
+                # lane from the orphan reaper.  Release it back to the pool
+                # (cleanup_worktree routes lanes to release_warm_lane).
+                if is_lane:
+                    logger.info(
+                        f'Recovery: lane {task_id} has no plan — '
+                        f'releasing back to pool'
+                    )
+                    await self.git_ops.cleanup_worktree(entry, task_id)
+                    cleaned += 1
+                    continue
+
                 sidecar_path = entry / '.task' / 'agent_session.json'
                 if sidecar_path.exists():
                     try:
@@ -1438,6 +1453,18 @@ Output JSON matching the schema. Every task must appear in the output.
             # the lane dir is named after the pool slot, not the task.
             # Cold path: recovery_id == task_id (entry.name) — byte-identical.
             recovery_id = plan.get('task_id') if is_lane else task_id
+
+            # For lanes: if plan.json has no task_id there is no recoverable
+            # identity — release the lane back to the pool.
+            if is_lane and not recovery_id:
+                logger.warning(
+                    'Recovery: lane %s plan.json has no task_id — '
+                    'releasing back to pool',
+                    task_id,
+                )
+                await self.git_ops.cleanup_worktree(entry, task_id)
+                cleaned += 1
+                continue
 
             # Validate plan belongs to this task (cold path only).
             # Lanes skip this check: lane name != task_id is expected by
