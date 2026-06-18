@@ -1319,6 +1319,18 @@ def _build_fallback_config(
     )
 
 
+def _verify_duration_secs(runs: list[dict]) -> float:
+    """Sum per-command ``duration_secs`` values from a verification runs list.
+
+    Each entry is expected to have a ``duration_secs`` key (float); entries
+    that are missing the key contribute 0.0.  Returns 0.0 for an empty list.
+
+    Used to populate :attr:`VerifyResult.duration_secs` from the already-
+    measured per-command durations in ``run_verification``.
+    """
+    return sum(r.get('duration_secs', 0.0) for r in runs)
+
+
 @dataclass
 class VerifyResult:
     passed: bool
@@ -1331,6 +1343,10 @@ class VerifyResult:
     category: str = ''
     worktree_log_paths: list[str] = field(default_factory=list)
     archive_log_paths: list[str] = field(default_factory=list)
+    # Total wall-clock verify cost (sum of per-command duration_secs, or max
+    # across concurrently-run modules in _aggregate_results).  Populated by
+    # run_verification; defaults to 0.0 for _trivial_pass and mocked results.
+    duration_secs: float = 0.0
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -2144,6 +2160,7 @@ async def run_verification(
         category=category,
         worktree_log_paths=worktree_log_paths,
         archive_log_paths=archive_log_paths,
+        duration_secs=_verify_duration_secs(runs),
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
