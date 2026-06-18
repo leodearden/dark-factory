@@ -689,3 +689,189 @@ class TestAcquireWarmLaneCreateOnce:
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
         assert info is None
+
+
+# ===========================================================================
+# Step-9: RED — reset-in-place reuse (reset-determinism + warmth retention)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneResetInPlace:
+    """Second acquire on an already-registered lane: reset-in-place, no re-seed."""
+
+    async def _make_two_commits(self, repo: Path) -> tuple[str, str]:
+        """Make two distinct commits in repo; return (sha_A, sha_B)."""
+        # Commit A: add file_a.txt
+        (repo / 'file_a.txt').write_text('version A\n')
+        await _run(['git', 'add', '-A'], cwd=repo)
+        await _run(['git', 'commit', '-m', 'commit A'], cwd=repo)
+        _, sha_a, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+
+        # Commit B: replace file_a.txt with different content
+        (repo / 'file_a.txt').write_text('version B\n')
+        await _run(['git', 'add', '-A'], cwd=repo)
+        await _run(['git', 'commit', '-m', 'commit B'], cwd=repo)
+        _, sha_b, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+        return sha_a.strip(), sha_b.strip()
+
+    async def _make_repo_with_scripts_and_two_commits(
+        self, repo: Path,
+    ) -> tuple[str, str]:
+        """Add seed+debug scripts, then make two commits. Returns (sha_A, sha_B)."""
+        # Add a seed script that logs calls (not creates target/ — warmth test uses
+        # manually written target/ file to simulate a prior warm build)
+        scripts_dir = repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        seed_marker = repo / 'seed_calls.txt'
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(
+            f'#!/usr/bin/env bash\n'
+            f'echo "called:$3" >> {seed_marker}\n'
+            f'mkdir -p "$2/target"\n'
+            f'echo "seeded" > "$2/target/seeded.bin"\n'
+        )
+        seed_script.chmod(0o755)
+        debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+        debug_script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        debug_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=repo)
+        await _run(['git', 'commit', '-m', 'add scripts'], cwd=repo)
+
+        return await self._make_two_commits(repo)
+
+    async def test_reacquire_returns_same_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Second acquire of a released lane returns the same _lane-0 path."""
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info_a is not None
+        # Release the lane (mark FREE directly — release_warm_lane comes in step-12)
+        await git_ops.warm_lane_pool.release(info_a.path)
+
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+        assert info_b is not None
+        assert info_b.path == info_a.path  # same _lane-0
+
+    async def test_reacquire_head_is_at_new_commit(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """After reset-in-place, HEAD is at commit B (different from A)."""
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info_a is not None
+        await git_ops.warm_lane_pool.release(info_a.path)
+
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+        assert info_b is not None
+
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_b.path)
+        assert head_sha.strip() == sha_b
+
+    async def test_reacquire_source_tree_is_clean(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Source tree is bit-identical to a fresh checkout: stray.txt gone, git status clean."""
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info_a is not None
+
+        # Simulate stray work: untracked file and modification of tracked file
+        (info_a.path / 'stray.txt').write_text('should be gone\n')
+        (info_a.path / 'file_a.txt').write_text('dirty modification\n')
+        # Warm artifact must survive
+        (info_a.path / 'target').mkdir(exist_ok=True)
+        (info_a.path / 'target' / 'cache.bin').write_bytes(b'\x00' * 128)
+
+        await git_ops.warm_lane_pool.release(info_a.path)
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+        assert info_b is not None
+
+        # stray.txt must be gone
+        assert not (info_b.path / 'stray.txt').exists()
+
+        # git status must be clean (only target/ excluded)
+        _, status_out, _ = await _run(
+            ['git', 'status', '--porcelain'], cwd=info_b.path,
+        )
+        # strip target/-related lines from status (target/ is excluded from clean)
+        non_target_lines = [
+            line for line in status_out.splitlines()
+            if not line.strip().startswith('?? target/')
+            and not line.strip().startswith('?? .task/')
+        ]
+        assert non_target_lines == [], f'Unexpected dirty files: {non_target_lines}'
+
+    async def test_reacquire_retains_target_warmth(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """target/cache.bin survives the reset-in-place (warmth retention)."""
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info_a is not None
+        # Write a warm artifact into target/
+        (info_a.path / 'target').mkdir(exist_ok=True)
+        cache_file = info_a.path / 'target' / 'cache.bin'
+        cache_file.write_bytes(b'\x00' * 128)
+
+        await git_ops.warm_lane_pool.release(info_a.path)
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+        assert info_b is not None
+
+        # Warm artifact must still be there
+        assert cache_file.exists(), 'target/cache.bin was removed (warmth lost)'
+
+    async def test_reacquire_does_not_call_seed(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """seed-warm-lane.sh is NOT called on warm reacquire (marker unchanged)."""
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        seed_marker = wl_git_repo / 'seed_calls.txt'
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info_a is not None
+        # Record marker state after first (create-once) acquire
+        calls_after_first = seed_marker.read_text() if seed_marker.exists() else ''
+
+        await git_ops.warm_lane_pool.release(info_a.path)
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+        assert info_b is not None
+
+        calls_after_second = seed_marker.read_text() if seed_marker.exists() else ''
+        assert calls_after_second == calls_after_first, (
+            'seed-warm-lane.sh was called on warm reacquire (should be skipped)'
+        )
+
+    async def test_reacquire_single_worktree_registration(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Exactly one _lane-0 registration in git worktree list after reacquire."""
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info_a is not None
+        await git_ops.warm_lane_pool.release(info_a.path)
+
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+        assert info_b is not None
+
+        _, wt_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=wl_git_repo,
+        )
+        lane_registrations = [
+            line for line in wt_list.splitlines()
+            if line.startswith('worktree ') and '_lane-0' in line
+        ]
+        assert len(lane_registrations) == 1
