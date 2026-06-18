@@ -14,6 +14,7 @@ import pytest
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
+from orchestrator.warm_lane_pool import WarmLanePool
 
 
 @pytest.fixture
@@ -183,4 +184,56 @@ async def test_reaper_uses_get_statuses_and_spares_done_task_worktree(harness: H
     )
     assert orphan_path not in quarantine_paths, (
         f'Done task worktree {orphan_path} must NOT be quarantined (get_statuses treats it as live)'
+    )
+
+
+# ===========================================================================
+# Step-7 RED: reaper skips warm pool lanes
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_reaper_skips_pool_lanes(harness: Harness):
+    """_reap_orphan_worktrees must NOT quarantine or reap pool lanes.
+
+    quarantine_worktree is not pool-aware (it moves the dir), so moving a lane
+    would leave the pool's registered lane path dangling.  The reaper must skip
+    lanes entirely via the is_lane check — the same guarantee that protects a
+    just-recovered lane from being immediately undone by the reaper.
+
+    Setup:
+      - worktree_orphan_reaper_enabled = True
+      - get_statuses returns a non-empty live set that does NOT include any
+        lane dir name ('_lane-0' is not a task id)
+      - A WarmLanePool is attached with a '_lane-0' dir on disk
+      - worktree_has_unsaved_work returns True (so without the skip the lane
+        WOULD be quarantined)
+
+    Assertions:
+      - quarantine_worktree was NOT called for the lane
+      - cleanup_worktree was NOT called for the lane
+    """
+    base = harness.git_ops.worktree_base
+    # Attach a pool to git_ops
+    pool = WarmLanePool(worktree_base=base, size=2)
+    harness.git_ops.warm_lane_pool = pool
+    # Create the lane dir on disk (so the iterdir loop sees it)
+    lane_path = _mk(base, '_lane-0')
+    # get_statuses returns a live set that does NOT include '_lane-0'
+    harness.scheduler.get_statuses = AsyncMock(
+        return_value=({'100': 'pending', '101': 'done'}, None)
+    )
+    # Simulate unsaved work so the lane WOULD be quarantined without the skip
+    harness.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=True)
+
+    await harness._reap_orphan_worktrees()
+
+    cleanup_paths = [c.args[0] for c in harness.git_ops.cleanup_worktree.call_args_list]  # type: ignore[attr-defined]
+    quarantine_paths = [c.args[0] for c in harness.git_ops.quarantine_worktree.call_args_list]  # type: ignore[attr-defined]
+    assert lane_path not in cleanup_paths, (
+        f'Lane {lane_path} must NOT be reaped by the orphan reaper'
+    )
+    assert lane_path not in quarantine_paths, (
+        f'Lane {lane_path} must NOT be quarantined by the orphan reaper '
+        f'(quarantine_worktree is not pool-aware — it would move the dir)'
     )
