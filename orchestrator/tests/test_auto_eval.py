@@ -7,14 +7,13 @@ branch + worktree and submits a sibling task with ``force_full_path=True``.
 
 from __future__ import annotations
 
+import json as _json
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test, pydantic_spec
-
-import json as _json
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType

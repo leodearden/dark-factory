@@ -7,6 +7,7 @@ invocation_end event tagging, sha-stamping, and keep-last-N trim.
 
 from __future__ import annotations
 
+import json as _json
 import subprocess
 from importlib import resources as pkg_resources
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,8 +15,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 from _orch_helpers import pydantic_spec
-
-import json as _json
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler
