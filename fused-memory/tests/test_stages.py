@@ -11366,3 +11366,24 @@ class TestStage2RetroactiveSummaryWriteReliability:
             "retrying identical content re-triggers Mem0 ~0.92 cosine dedup — the exact "
             "mechanism that silently lost write 74b902f8 (task 1796 root cause)."
         )
+
+    def test_reconstruction_write_carries_run_id_metadata(self):
+        """build_stage2_system_prompt('dark_factory') must include \"reconstructed run's full UUID\".
+
+        The reconstruction (retroactive) add_memory write for a missing_stage2_summary
+        must carry run_id as a top-level metadata key set to the reconstructed run's full
+        UUID — so the retroactive write is deterministically findable by
+        count_memories_by_metadata and subject to the stage2_cycle_summary pool cap.
+        The '## Re-Verify Reconstruction Writes Before Carry-Forward' section currently
+        specifies no metadata for the reconstruction write.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        result = build_stage2_system_prompt('dark_factory')
+        assert "reconstructed run's full UUID" in result, (
+            "build_stage2_system_prompt('dark_factory') must instruct the Stage 2 agent "
+            "to pass run_id (the reconstructed run's full UUID) as a top-level metadata "
+            "key on the reconstruction add_memory write — so the retroactive write is "
+            "deterministically findable by count_memories_by_metadata and subject to the "
+            "stage2_cycle_summary pool cap (task 1796, fix 3)."
+        )
