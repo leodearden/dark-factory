@@ -467,11 +467,22 @@ class TestSimpleDispatchB7B8B14:
 class TestClusterActionsB4B5:
     """L2 cluster park/abandon with follow-on sweep quiescence."""
 
-    async def test_b4_l2_park_members_deferred_sweep_quiescent(
+    async def test_b4_l2_park_members_blocked_open_l2_sweep_quiescent(
         self, harness: Harness, tmp_path: Path
     ):
-        """[B4] L2 cluster park: both L1 member tasks set to 'deferred';
-        two sweep passes with members reported as 'deferred' → no stranded_blocked filed."""
+        """[B4] L2 cluster park (version-a): both L1 member tasks set to 'blocked';
+        L2 and member L1 escalations stay OPEN (pending); two sweep passes with members
+        reported 'blocked' → no stranded_blocked filed (Fix #1b skip via open escalation).
+
+        Quiescence mechanism: members are 'blocked' (inside _RECONCILE_SWEEP_STATUSES),
+        but Fix #1b's gate `not get_by_task(tid, status='pending')` finds the still-pending
+        member L1 escalations and skips re-filing.
+
+        Positive control: a 'blocked' task with NO open escalation → sweep files stranded_blocked,
+        proving Fix #1b ran and did not universally skip.
+
+        Fails: queue.park() member cascade not yet implemented (step-8).
+        """
         queue = EscalationQueue(tmp_path / 'esc_b4')
         l1_a = _make_l1_for_queue(queue, 'esc-b4-l1-a', 'task-b4-a')
         l1_b = _make_l1_for_queue(queue, 'esc-b4-l1-b', 'task-b4-b')
@@ -484,11 +495,11 @@ class TestClusterActionsB4B5:
         harness.is_workflow_active = MagicMock(return_value=False)
         queue.set_resolve_callback(harness._on_escalation_resolved)
 
-        # Park the L2 cluster — cascades to both L1 members.
-        queue.resolve(l2.id, 'park the cluster', dismiss=True)
+        # Park the L2 cluster (new path: queue.park keeps record open).
+        queue.park(l2.id, 'park the cluster')
         await asyncio.gather(*list(harness._background_tasks))
 
-        # Both member task ids must be written to 'deferred'.
+        # Both member task ids must be written to 'blocked' (version-a target).
         awaits = harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
         task_ids_written = {a.args[0]: a.args[1] for a in awaits}
         assert 'task-b4-a' in task_ids_written, (
@@ -497,10 +508,25 @@ class TestClusterActionsB4B5:
         assert 'task-b4-b' in task_ids_written, (
             f'task-b4-b not written; all writes: {task_ids_written}'
         )
-        assert task_ids_written['task-b4-a'] == 'deferred'
-        assert task_ids_written['task-b4-b'] == 'deferred'
+        assert task_ids_written['task-b4-a'] == 'blocked', (
+            f"task-b4-a: expected 'blocked', got {task_ids_written['task-b4-a']!r}"
+        )
+        assert task_ids_written['task-b4-b'] == 'blocked', (
+            f"task-b4-b: expected 'blocked', got {task_ids_written['task-b4-b']!r}"
+        )
 
-        # Sweep quiescence: 2 passes with members reported 'deferred' → no stranded_blocked.
+        # L2 and BOTH member L1s must still be open (status='pending').
+        l2_record = queue.get(l2.id)
+        assert l2_record is not None and l2_record.status == 'pending', (
+            f'L2 must stay open (pending); got {l2_record}'
+        )
+        for l1, tid in ((l1_a, 'task-b4-a'), (l1_b, 'task-b4-b')):
+            pending_l1s = queue.get_by_task(tid, status='pending')
+            assert pending_l1s, (
+                f'Member L1 for {tid} must stay pending (open); found: {pending_l1s}'
+            )
+
+        # Sweep quiescence: 2 passes with members reported 'blocked' → no stranded_blocked.
         harness.config.stranded_blocked_escalate_enabled = True
         harness.git_ops.is_ancestor = AsyncMock(return_value=False)
         harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
@@ -508,20 +534,21 @@ class TestClusterActionsB4B5:
         harness.scheduler.lock_table = MagicMock()
         harness.scheduler.lock_table._held = set()
 
-        # Positive control: a 'blocked' sibling that the sweep DOES file for,
-        # proving the sweep actually ran and the deferred members were skipped by
-        # status — not for an unrelated reason (e.g. the loop never executing).
+        # Positive control: a 'blocked' task with NO open escalation → sweep DOES file.
+        # Proves the sweep actually ran and members were skipped by Fix #1b (open escalation),
+        # not by an unrelated reason.
         ctrl_id = 'task-b4-ctrl'
         _make_resolved_l1(queue, 'esc-b4-ctrl-prior', ctrl_id)
-        # Clear event tracking so the control task is not gated by in-flight events.
+        # Clear event tracking so no in-flight events gate the sweep.
         harness._escalation_events.clear()
         harness._workflow_cancel_at.clear()
 
-        # Members reported 'deferred' (filtered by _RECONCILE_SWEEP_STATUSES);
-        # control is 'blocked' so the sweep processes it.
+        # Members reported 'blocked' (now in _RECONCILE_SWEEP_STATUSES);
+        # Fix #1b's open-escalation gate prevents stranded_blocked re-filing.
+        # Control is 'blocked' with no open escalation → filed.
         harness.scheduler.get_statuses = AsyncMock(
             return_value=(
-                {'task-b4-a': 'deferred', 'task-b4-b': 'deferred', ctrl_id: 'blocked'},
+                {'task-b4-a': 'blocked', 'task-b4-b': 'blocked', ctrl_id: 'blocked'},
                 None,
             )
         )
@@ -531,17 +558,17 @@ class TestClusterActionsB4B5:
             harness.scheduler.set_task_status = AsyncMock()
             await harness._reconcile_stranded_in_progress()
 
-            # Deferred members: no stranded_blocked filed.
+            # Parked members have open L1 escalations → Fix #1b skips re-filing.
             for tid in ('task-b4-a', 'task-b4-b'):
-                new_filed = queue.get_by_task(tid, status='pending')
-                stranded = [e for e in new_filed if e.category == 'stranded_blocked']
+                all_pending = queue.get_by_task(tid, status='pending')
+                stranded = [e for e in all_pending if e.category == 'stranded_blocked']
                 assert not stranded, (
-                    f'Sweep must not file stranded_blocked for deferred task {tid}; '
+                    f'Sweep must not file stranded_blocked for {tid} (open L1 present); '
                     f'got {stranded}'
                 )
 
         # Positive control: ctrl_id was filed in pass 1 (self-dedup suppressed pass 2),
-        # proving the sweep ran and deferred members were filtered by status.
+        # proving Fix #1b ran and the open-escalation skip is the quiescence mechanism.
         ctrl_filed = queue.get_by_task(ctrl_id, status='pending')
         ctrl_stranded = [e for e in ctrl_filed if e.category == 'stranded_blocked']
         assert len(ctrl_stranded) == 1, (

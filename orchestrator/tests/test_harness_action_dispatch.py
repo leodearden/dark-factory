@@ -563,14 +563,17 @@ class TestDispatchTeardownNoKill:
                 task_id, expected_target,
             ), f'level=0 {action} must write {expected_target}'
 
-    async def test_l2_park_cascade_sets_both_members_deferred(
+    async def test_l2_park_cascade_sets_both_members_blocked(
         self, harness: Harness, tmp_path: Path
     ):
-        """Integration: L2 cluster resolved with park + two blocked L1 members
-        → both get set_task_status('deferred') via parent-action lookup.
+        """Integration: L2 cluster parked via queue.park() + two blocked L1 members
+        → all three tasks get set_task_status('blocked') via parent-action lookup;
+        L2 stays pending (open, not dismissed).
 
         Requires harness._escalation_queue wired so the member callbacks can
         read the parent L2's resolution_action.
+
+        Fails: queue.park() member cascade not yet implemented (step-8).
         """
         queue = EscalationQueue(tmp_path / 'esc_c')
         l1_a = _make_l1_for_queue(queue, 'esc-c-l1-a', 'task-park-a')
@@ -585,15 +588,15 @@ class TestDispatchTeardownNoKill:
         harness.is_workflow_active = MagicMock(return_value=False)
         queue.set_resolve_callback(harness._on_escalation_resolved)
 
-        queue.resolve(l2.id, 'park the cluster', dismiss=True)
+        # Version-a: queue.park() keeps the L2 open and cascades in-memory to members.
+        queue.park(l2.id, 'park the cluster')
         await asyncio.gather(*list(harness._background_tasks))
 
         awaits = harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
-        # All three tasks should be set to 'deferred': the L2 cluster task itself
+        # All three tasks should be set to 'blocked': the L2 cluster task itself
         # ('task-cluster-c') is also written because the L2's own _on_escalation_resolved
         # callback fires first (before the member cascades) and dispatches the same park
-        # teardown for its own task_id.  Making this explicit avoids a confusing failure
-        # if the L2 self-write semantics change intentionally (amend: Suggestion 5).
+        # teardown for its own task_id.
         task_ids_written = [a.args[0] for a in awaits]
         assert 'task-park-a' in task_ids_written, (
             f'task-park-a not written; writes: {task_ids_written}'
@@ -604,12 +607,17 @@ class TestDispatchTeardownNoKill:
         assert 'task-cluster-c' in task_ids_written, (
             f'task-cluster-c (L2 self-write) not written; writes: {task_ids_written}'
         )
-        # All three writes must target 'deferred'.
+        # All three writes must target 'blocked' (version-a).
         statuses_written = {a.args[0]: a.args[1] for a in awaits}
         for tid in ('task-park-a', 'task-park-b', 'task-cluster-c'):
-            assert statuses_written[tid] == 'deferred', (
-                f'{tid}: expected deferred, got {statuses_written[tid]}'
+            assert statuses_written[tid] == 'blocked', (
+                f'{tid}: expected blocked, got {statuses_written[tid]}'
             )
+        # L2 must stay pending (open) — not dismissed.
+        l2_record = queue.get(l2.id)
+        assert l2_record is not None and l2_record.status == 'pending', (
+            f'L2 must stay open (status=pending); got {l2_record}'
+        )
 
     async def test_l2_legacy_dismiss_no_touch(
         self, harness: Harness, tmp_path: Path
