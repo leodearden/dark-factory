@@ -86,10 +86,12 @@ def _make_workflow(
     git_ops: GitOps,
     assignment: TaskAssignment,
     worktree: Path,
+    event_store=None,
 ) -> tuple[TaskWorkflow, TaskArtifacts]:
     """Wire a minimal TaskWorkflow with heavy collaborators mocked.
 
     Mirrors the pattern in test_verify_phase_rebase.py._make_workflow.
+    Accepts an optional event_store so step-13+ tests can wire a real one.
     """
     from orchestrator.agents.invoke import AgentResult
 
@@ -100,6 +102,7 @@ def _make_workflow(
         scheduler=MagicMock(),  # type: ignore[arg-type]
         briefing=MagicMock(),  # type: ignore[arg-type]
         mcp=MagicMock(),  # type: ignore[arg-type]
+        event_store=event_store,
     )
     workflow.worktree = worktree
     artifacts = TaskArtifacts(worktree)
@@ -467,4 +470,112 @@ class TestInterIterationRebaseEnrichment:
         assert result is not None
         assert result['cohort'] == 'continuous', (
             f'Expected continuous (distance 2 < threshold 5); got {result["cohort"]!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-13 RED: _verify_debugfix_loop rebase→verify join + emit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyDebugfixLoopEmit:
+    async def test_emits_one_rebase_verify_cost_event_when_main_advanced(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """When main advanced, _verify_debugfix_loop emits ONE rebase_verify_cost event.
+
+        Checks: data contains old_base, new_base, distance_commits, files_changed_on_main
+        (as a count), next_verify_wall_secs, cohort, and verify_scope.
+        """
+        from orchestrator.event_store import EventStore
+        from orchestrator.verify import VerifyResult
+
+        config.rebase_reseed_distance_threshold = 2  # small threshold
+
+        db = tmp_path / 'events.db'
+        store = EventStore(db_path=db, run_id='run-join-1')
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # Advance main by 3 commits (>= threshold=2 → post-unblock for first rebase).
+        repo = config.project_root
+        n = 3
+        for i in range(n):
+            (repo / f'join_{i}.txt').write_text(f'{i}\n')
+            await _run(['git', 'add', '-A'], cwd=repo)
+            await _run(['git', 'commit', '-m', f'join {i}'], cwd=repo)
+
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt, event_store=store)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        expected_duration = 5.0
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='ok', lint_output='', type_output='',
+                summary='passed', duration_secs=expected_duration,
+            )),
+        )
+
+        from orchestrator.workflow import WorkflowOutcome
+        outcome = await workflow._verify_debugfix_loop()
+        assert outcome == WorkflowOutcome.DONE
+
+        rows = store.fetch_events_by_type('rebase_verify_cost')
+        assert len(rows) == 1, f'Expected exactly 1 rebase_verify_cost event; got {len(rows)}: {rows}'
+
+        data = rows[0]['data']
+        assert 'old_base' in data, f'data missing old_base: {data}'
+        assert 'new_base' in data, f'data missing new_base: {data}'
+        assert data.get('distance_commits') == n, (
+            f'Expected distance_commits={n}, got {data.get("distance_commits")}'
+        )
+        assert isinstance(data.get('files_changed_on_main'), int), (
+            f'files_changed_on_main must be int count; got {data.get("files_changed_on_main")!r}'
+        )
+        assert data.get('next_verify_wall_secs') == pytest.approx(expected_duration), (
+            f'Expected next_verify_wall_secs={expected_duration}, got {data.get("next_verify_wall_secs")}'
+        )
+        assert isinstance(data.get('cohort'), str), (
+            f'cohort must be a string; got {data.get("cohort")!r}'
+        )
+        assert 'verify_scope' in data, f'data missing verify_scope: {data}'
+        assert isinstance(data['verify_scope'], dict), (
+            f'verify_scope must be a dict; got {data["verify_scope"]!r}'
+        )
+
+    async def test_emits_zero_events_when_main_unchanged(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """When main has NOT advanced (rebase short-circuits to None), no event is emitted."""
+        from orchestrator.event_store import EventStore
+        from orchestrator.verify import VerifyResult
+
+        db = tmp_path / 'events_noop.db'
+        store = EventStore(db_path=db, run_id='run-join-2')
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt, event_store=store)
+        # Set base_commit to the CURRENT main sha — so main == base → no rebase.
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='ok', lint_output='', type_output='',
+                summary='passed', duration_secs=2.0,
+            )),
+        )
+
+        from orchestrator.workflow import WorkflowOutcome
+        outcome = await workflow._verify_debugfix_loop()
+        assert outcome == WorkflowOutcome.DONE
+
+        rows = store.fetch_events_by_type('rebase_verify_cost')
+        assert rows == [], (
+            f'Expected no rebase_verify_cost events when main unchanged; got {rows}'
         )
