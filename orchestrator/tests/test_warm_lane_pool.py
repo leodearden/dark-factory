@@ -995,3 +995,172 @@ class TestReleaseWarmLane:
         await git_ops.release_warm_lane(lane, 'task-A')
         # Second call — pool thinks it's FREE, method must not raise
         await git_ops.release_warm_lane(lane, 'task-A')  # must not raise
+
+
+# ===========================================================================
+# Step-19: RED — WarmLanePool.acquire_for + assignment_for
+#   Branch->lane assignment map for in-memory live-requeue detection.
+#   acquire_for / assignment_for are absent today → AttributeError → RED.
+# ===========================================================================
+
+
+class TestAcquireFor:
+    """Pure state-machine tests — no git I/O."""
+
+    def test_acquire_for_fresh_returns_lane_and_false(self, tmp_path: Path):
+        """First acquire_for('A') returns (lane, False) — a fresh allocation."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+
+        result = asyncio.run(pool.acquire_for('A'))
+
+        assert result is not None
+        lane, reused = result
+        assert lane == base / '_lane-0'
+        assert reused is False
+
+    def test_acquire_for_fresh_marks_lane_assigned(self, tmp_path: Path):
+        """After acquire_for('A'), _lane-0 is ASSIGNED."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+
+        asyncio.run(pool.acquire_for('A'))
+
+        assert pool.state(base / '_lane-0') == LaneState.ASSIGNED
+
+    def test_acquire_for_records_assignment(self, tmp_path: Path):
+        """After acquire_for('A'), assignment_for('A') == _lane-0."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+
+        asyncio.run(pool.acquire_for('A'))
+
+        assert pool.assignment_for('A') == base / '_lane-0'
+
+    def test_acquire_for_reuse_returns_same_lane_and_true(self, tmp_path: Path):
+        """Second acquire_for('A') (without release) returns (same_lane, True)."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+
+        result1 = asyncio.run(pool.acquire_for('A'))
+        assert result1 is not None
+
+        result2 = asyncio.run(pool.acquire_for('A'))
+        assert result2 is not None
+        lane2, reused2 = result2
+        assert lane2 == base / '_lane-0'
+        assert reused2 is True
+
+    def test_acquire_for_reuse_consumes_no_new_lane(self, tmp_path: Path):
+        """Second acquire_for('A') does NOT consume _lane-1 or _lane-2."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+
+        asyncio.run(pool.acquire_for('A'))
+        asyncio.run(pool.acquire_for('A'))  # reuse — must not consume _lane-1
+
+        assert pool.state(base / '_lane-1') == LaneState.FREE
+        assert pool.state(base / '_lane-2') == LaneState.FREE
+
+    def test_acquire_for_different_branch_gets_new_lane(self, tmp_path: Path):
+        """acquire_for('B') after acquire_for('A') returns _lane-1, not _lane-0."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+
+        asyncio.run(pool.acquire_for('A'))
+        result_b = asyncio.run(pool.acquire_for('B'))
+
+        assert result_b is not None
+        lane_b, reused_b = result_b
+        assert lane_b == base / '_lane-1'
+        assert reused_b is False
+
+    def test_assignment_for_unknown_branch_returns_none(self, tmp_path: Path):
+        """assignment_for('Z') returns None when 'Z' was never acquired."""
+        pool = _make_pool(tmp_path, size=3)
+        assert pool.assignment_for('Z') is None
+
+    def test_release_drops_assignment(self, tmp_path: Path):
+        """After release(_lane-0), assignment_for('A') is None and lane is FREE."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+        lane_0 = base / '_lane-0'
+
+        asyncio.run(pool.acquire_for('A'))
+        asyncio.run(pool.release(lane_0))
+
+        assert pool.assignment_for('A') is None
+        assert pool.state(lane_0) == LaneState.FREE
+
+    def test_release_allows_fresh_reacquire(self, tmp_path: Path):
+        """After release, acquire_for('A') returns fresh (reused=False)."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+        lane_0 = base / '_lane-0'
+
+        asyncio.run(pool.acquire_for('A'))
+        asyncio.run(pool.release(lane_0))
+
+        result = asyncio.run(pool.acquire_for('A'))
+        assert result is not None
+        lane, reused = result
+        assert reused is False
+
+    def test_exhaustion_returns_none_for_new_branch(self, tmp_path: Path):
+        """On a size-1 pool, acquire_for('X') exhausts it; acquire_for('Y') returns None."""
+        pool = _make_pool(tmp_path, size=1)
+
+        result_x = asyncio.run(pool.acquire_for('X'))
+        assert result_x is not None
+        _, reused_x = result_x
+        assert reused_x is False
+
+        result_y = asyncio.run(pool.acquire_for('Y'))
+        assert result_y is None
+
+    def test_back_compat_try_acquire_unchanged(self, tmp_path: Path):
+        """try_acquire() still works as before (does not touch _assignments)."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+
+        lane = asyncio.run(pool.try_acquire())
+        assert lane == base / '_lane-0'
+        assert pool.state(lane) == LaneState.ASSIGNED
+        # assignment_for is not touched by try_acquire
+        assert pool.assignment_for('anything') is None
+
+    def test_back_compat_release_still_works(self, tmp_path: Path):
+        """release() still works for lanes acquired via try_acquire (back-compat)."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+        lane_0 = base / '_lane-0'
+
+        asyncio.run(pool.try_acquire())
+        asyncio.run(pool.release(lane_0))
+
+        assert pool.state(lane_0) == LaneState.FREE
+
+    def test_note_assignment_records_mapping(self, tmp_path: Path):
+        """note_assignment records branch->lane for on-disk backstop use."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+        lane_0 = base / '_lane-0'
+
+        pool.note_assignment('A', lane_0)
+
+        assert pool.assignment_for('A') == lane_0
+
+    def test_concurrent_acquire_for_no_duplicates(self, tmp_path: Path):
+        """Concurrent acquire_for calls with distinct branches get distinct lanes."""
+        pool = _make_pool(tmp_path, size=5)
+
+        async def run():
+            branches = ['br-A', 'br-B', 'br-C', 'br-D', 'br-E']
+            tasks = [pool.acquire_for(b) for b in branches]
+            results = await asyncio.gather(*tasks)
+            return results
+
+        results = asyncio.run(run())
+        lanes = [r[0] for r in results if r is not None]
+        assert len(lanes) == 5
+        assert len(set(lanes)) == 5  # all distinct
