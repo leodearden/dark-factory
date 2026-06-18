@@ -18,6 +18,7 @@ from fused_memory.backends.sqlite_task_backend import (
     _normalize_legacy_memory_hints_value,
     _parse_qualified_dep,
     _parse_task_id,
+    _resolve_metadata_mode,
 )
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import TaskmasterConfig
@@ -1987,4 +1988,46 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
         f'Expected exactly 1 malformed-metadata WARNING (deduped across '
         f'read+write paths on same key); got {len(warn_records)}: '
         f'{[r.message for r in warn_records]}'
+    )
+
+
+# ── _resolve_metadata_mode (step-1 RED / step-2 GREEN) ──────────────────────
+
+
+@pytest.mark.parametrize(
+    'metadata_mode, append, expected',
+    [
+        # (a) explicit metadata_mode returned verbatim regardless of append
+        ('merge',     None,  'merge'),
+        ('additive',  None,  'additive'),
+        ('replace',   None,  'replace'),
+        ('merge',     True,  'merge'),
+        ('additive',  False, 'additive'),
+        ('replace',   True,  'replace'),
+        # (b) metadata_mode=None + append=True -> 'additive'
+        (None, True,  'additive'),
+        # (c) metadata_mode=None + append=False -> 'replace'
+        (None, False, 'replace'),
+        # (d) metadata_mode=None + append=None -> 'merge' (new default)
+        (None, None,  'merge'),
+        # (f) explicit metadata_mode wins over conflicting append
+        ('merge',    True,  'merge'),
+        ('additive', False, 'additive'),
+    ],
+)
+def test_resolve_metadata_mode_mapping(metadata_mode, append, expected):
+    """_resolve_metadata_mode returns the correct mode for all precedence cases."""
+    result = _resolve_metadata_mode(metadata_mode, append)
+    assert result == expected, (
+        f'_resolve_metadata_mode({metadata_mode!r}, {append!r}) -> '
+        f'{result!r}, expected {expected!r}'
+    )
+
+
+def test_resolve_metadata_mode_invalid_raises():
+    """An invalid metadata_mode raises TaskmasterError(TASKMASTER_TOOL_ERROR)."""
+    with pytest.raises(TaskmasterError) as exc:
+        _resolve_metadata_mode('bogus', None)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
     )

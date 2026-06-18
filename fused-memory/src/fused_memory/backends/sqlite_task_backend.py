@@ -1242,6 +1242,36 @@ def _parse_dependency_list(raw: str | None) -> list[int]:
     return out
 
 
+_METADATA_MODES: frozenset[str] = frozenset({'merge', 'additive', 'replace'})
+
+
+def _resolve_metadata_mode(
+    metadata_mode: str | None,
+    append: bool | None,
+) -> str:
+    """Resolve the effective metadata merge mode from the two input signals.
+
+    Precedence (high → low):
+    1. ``metadata_mode`` — explicit tri-state wins unconditionally.
+    2. ``append`` legacy shim — True → 'additive', False → 'replace'.
+    3. Default — 'merge' (shallow last-write-wins) when both are None.
+
+    Raises :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) for an
+    unrecognised ``metadata_mode`` value (loud over silent).
+    """
+    if metadata_mode is not None:
+        if metadata_mode not in _METADATA_MODES:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                f"Invalid metadata_mode {metadata_mode!r}; "
+                f"must be one of {sorted(_METADATA_MODES)}.",
+            )
+        return metadata_mode
+    if append is not None:
+        return 'additive' if append else 'replace'
+    return 'merge'
+
+
 def _merge_values(old: object, new: object) -> object:
     """Recursively merge *new* into *old* using additive semantics.
 
