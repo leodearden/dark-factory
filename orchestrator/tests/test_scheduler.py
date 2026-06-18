@@ -17,7 +17,7 @@ from orchestrator.config import (
 )
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
+from orchestrator.scheduler import ExternalResolverError, ModuleLockTable, Scheduler, files_to_modules
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
@@ -6786,6 +6786,111 @@ class TestApplyExternalDepPolicyTransientErr:
         assert result is False, (
             'external_resolver_failed=True must block dispatch regardless of cache'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestExternalDepGateHeld_ResolverDegraded (task 1799 — step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestExternalDepGateHeld_ResolverDegraded:
+    """_apply_external_dep_policy emits external_dep_gate_held when resolver is degraded.
+
+    When ``external_err is not None`` (degraded resolver tick):
+    - After ``threshold`` consecutive degraded ticks, exactly ONE
+      ``EventType.external_dep_gate_held`` event must be recorded with
+      ``cause='resolver_degraded'``, ``task_id='T'``, and ``ticks==threshold``.
+    - ``_external_unresolved_counts`` must NOT have any entry — degraded ticks
+      must NOT bump the sentinel counter (fail-safe invariant from task 1580).
+    - No exception must be raised even when ``_on_external_dep_block`` is None
+      (no escalation on a degraded tick — only an event).
+
+    This fails today because ``EventType.external_dep_gate_held`` does not exist
+    and the degraded branch simply returns without emitting anything.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config, event_store=_RecordingEventStore())
+
+    def _pending_task_with_ext(self, task_id: str = 'T') -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['upstream_proj:1']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_degraded_resolver_emits_gate_held_at_threshold(
+        self, scheduler: Scheduler
+    ):
+        """After threshold degraded ticks → one external_dep_gate_held(cause='resolver_degraded')."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {},  # empty cache — resolver degraded
+                ExternalResolverError('simulated degraded resolver'),
+            )
+
+        gate_held_events = [
+            (evt, data)
+            for evt, data in scheduler.event_store.events
+            if evt == str(EventType.external_dep_gate_held)
+        ]
+        assert len(gate_held_events) == 1, (
+            f'Expected exactly 1 external_dep_gate_held event after {threshold} degraded ticks; '
+            f'got {len(gate_held_events)}: {gate_held_events!r}'
+        )
+        _evt_type, evt_data = gate_held_events[0]
+        assert evt_data['task_id'] == 'T', (
+            f'Expected task_id="T"; got {evt_data["task_id"]!r}'
+        )
+        assert evt_data['data'].get('cause') == 'resolver_degraded', (
+            f'Expected cause="resolver_degraded"; got {evt_data["data"]!r}'
+        )
+        assert evt_data['data'].get('ticks') == threshold, (
+            f'Expected ticks={threshold}; got {evt_data["data"].get("ticks")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_degraded_resolver_does_not_bump_sentinel_counter(
+        self, scheduler: Scheduler
+    ):
+        """Degraded ticks must NOT touch _external_unresolved_counts (fail-safe invariant)."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {'upstream_proj:1': 'unknown_task'},  # cache has a sentinel
+                ExternalResolverError('degraded'),
+            )
+
+        assert scheduler._external_unresolved_counts == {}, (
+            f'Degraded ticks must NOT bump sentinel counter; '
+            f'got {scheduler._external_unresolved_counts!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_degraded_resolver_no_escalation_without_callback(
+        self, scheduler: Scheduler
+    ):
+        """No exception raised when _on_external_dep_block is None (degraded → event only)."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+        # _on_external_dep_block is None by default — must not raise.
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {},
+                ExternalResolverError('degraded'),
+            )
+        # No assertion needed — the test passes if no exception was raised.
 
 
 # ---------------------------------------------------------------------------
