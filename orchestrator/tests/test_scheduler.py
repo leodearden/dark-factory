@@ -6396,6 +6396,83 @@ class TestGetExternalStatusesFailsLoud:
 
 
 # ---------------------------------------------------------------------------
+# TestGetExternalStatusesFoldRegression (task 1807 — step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestGetExternalStatusesFoldRegression:
+    """Fold-regression: get_external_statuses parse must route through shared.mcp_envelope.
+
+    After folding get_external_statuses' parse onto ``parse_tool_result``, a
+    non-dict response must:
+    - Still return ``({}, ExternalResolverError)`` (existing contract preserved).
+    - Emit a WARNING from the ``shared.mcp_envelope`` logger (proving the
+      primitive is in the parse path).
+
+    Fails today: the non-dict path warns only from ``orchestrator.scheduler``
+    (the hand-rolled ``_parse_tool_text_result`` fallback), so no
+    ``shared.mcp_envelope`` record exists.
+
+    Existing ``TestGetExternalStatusesFailsLoud`` / ``TestGetExternalStatusesPartialResult``
+    must remain green throughout (they check ``any(level>=WARNING)`` without
+    filtering by logger name, so the primitive's WARNING keeps them green after
+    the fold drops the redundant scheduler-level WARNING).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(payload: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_dict_emits_warning_from_shared_mcp_envelope(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """Non-dict 'statuses' returns ({}, ExternalResolverError) + WARNING from shared.mcp_envelope.
+
+        Fails today: WARNING comes from orchestrator.scheduler (not shared.mcp_envelope).
+        """
+        import logging
+
+        import orchestrator.scheduler as _sched_module
+
+        # Response whose JSON has no 'statuses' key → non-dict parse path.
+        response = self._envelope({'data': 'not-a-statuses-dict'})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            statuses, err = await scheduler.get_external_statuses(['upstream_proj:1'])
+
+        # Existing contract preserved: ({}, ExternalResolverError).
+        assert statuses == {}
+        assert err is not None
+        assert isinstance(err, _sched_module.ExternalResolverError), (
+            f'Expected ExternalResolverError; got {type(err).__name__}'
+        )
+
+        # NEW: the WARNING must come from shared.mcp_envelope (fold regression).
+        shared_env_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'shared.mcp_envelope'
+        ]
+        assert shared_env_warnings, (
+            f'Expected a WARNING from shared.mcp_envelope logger; '
+            f'got records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestGetExternalStatusesPartialResult (task 1799 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
