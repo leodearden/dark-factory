@@ -391,7 +391,11 @@ class AgentLoop:
                 )
                 structured = {'thinking': structured, 'tool_calls': [], 'warning': 'cli_output_unparseable'}
         if not structured:
-            structured = {'thinking': '', 'tool_calls': []}
+            logger.warning(
+                'cli_output_empty: Claude CLI reported success but structured_output'
+                ' was empty/missing; treating as empty tool-call turn.',
+            )
+            structured = {'thinking': '', 'tool_calls': [], 'warning': 'cli_output_empty'}
 
         return _CLIResponseAdapter(structured, session_id=result.session_id)
 
