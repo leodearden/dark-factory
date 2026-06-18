@@ -275,7 +275,15 @@ class MemoryConsolidator(BaseStage):
         scope = Scope(project_id=self.project_id)
         try:
             all_memories = await self.memory.mem0.get_all(scope, limit=self.memory_limit)
-            mem0_memories = all_memories.get('results', [])
+            results = all_memories.get('results') if isinstance(all_memories, dict) else None
+            if not isinstance(results, list):
+                logger.warning(
+                    "mem0.get_all returned malformed/absent 'results' key; "
+                    "treating as empty. got: %s",
+                    repr(all_memories)[:200],
+                )
+                results = []
+            mem0_memories = results
         except Exception:
             mem0_memories = []
 
