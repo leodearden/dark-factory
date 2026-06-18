@@ -3645,12 +3645,17 @@ class InflightVerifyResult:
                   'REQUEUED'          — operator halt; req re-queued on _queue
                   'RUNNER_UNAVAILABLE' — remote runner raised RunnerUnavailable;
                                         merge_wt NOT cleaned (will be re-dispatched)
+    reason      : str(exc) from the RunnerUnavailable exception when status is
+                  'RUNNER_UNAVAILABLE'; None on all other paths.  Used by the
+                  unavailability tracker + alarm to name the actual failure cause
+                  in escalation summaries.
     """
 
     outcome: MergeOutcome | None
     merge_wt: Path | None
     warm_results: dict[str, str] = dataclasses.field(default_factory=dict)
     status: str | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
+    reason: str | None = None  # str(RunnerUnavailable exc) when status='RUNNER_UNAVAILABLE'
 
 
 class _TrainMergeHost(Protocol):
@@ -7660,7 +7665,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merge_wt=None,
                         status='REQUEUED',
                     )
-        except RunnerUnavailable:
+        except RunnerUnavailable as exc:
             # Remote transport failure: do NOT clean merge_wt — the item will
             # be re-dispatched on a free host (local fallback) with its worktree
             # intact.  _finalize_inflight calls quarantine_and_release so the
@@ -7674,6 +7679,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 outcome=None,
                 merge_wt=merge_wt,
                 status='RUNNER_UNAVAILABLE',
+                reason=str(exc),
             )
         except Exception as exc:
             logger.info(
