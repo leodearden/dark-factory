@@ -5979,3 +5979,29 @@ class TestFilterStaleCountSnapshotCorrections:
         result = filter_stale_count_snapshot_corrections([])
         assert result == []
 
+    def test_keep_collapsed_single_distinct_group(self):
+        """(KEEP) Proposed value restated in both description and suggested_action collapses
+        to one distinct group after dedup — must KEEP (fail-open) without raising IndexError.
+
+        When both description and suggested_action mention *only* the proposed value
+        (e.g. 'should be 635/608' appears in both fields), raw extraction yields
+        groups=[(635,608),(635,608)] (len 2, so the len(groups)<2 early-out does NOT fire).
+        After deduplication, unique_groups=[(635,608)] has len 1.  The pre-fix guard
+        ``if len(unique_groups) > 2`` does not trigger, so execution falls through to
+        ``current, proposed = unique_groups[0], unique_groups[1]`` → IndexError, which
+        would abort the entire Stage 1 run.  Post-fix: ``if len(unique_groups) != 2``
+        catches len==1 and bails to KEEP (fail-open).
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='The snapshot should be 635/608; currently incorrect.',
+            suggested_action='Set it to 635/608.',
+        )
+        # Must not raise AND must return the flag unchanged (KEEP, fail-open)
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Collapsed-to-one-distinct-group case must be KEPT (fail-open), not raise IndexError; '
+            f'filter returned {result!r}'
+        )
+
