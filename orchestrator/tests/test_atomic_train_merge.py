@@ -1109,6 +1109,12 @@ class TestScenario6ParkPrefixDerail:
             {"id": "beta6", "status": "merge-deferred"},
             {"id": "gamma6", "status": "blocked"},
         ])
+        # _reap_orphan_worktrees now uses get_statuses() (async) to build live_ids.
+        # Provide a non-empty dict so resolver_failed() does not abort the sweep.
+        harness.scheduler.get_statuses = AsyncMock(return_value=(
+            {"alpha6": "merge-deferred", "beta6": "merge-deferred", "gamma6": "blocked"},
+            None,
+        ))
         harness._recovered_plans = {}
         harness._preserved_worktrees = set()
         harness._recovered_sessions = {}

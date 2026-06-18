@@ -143,6 +143,10 @@ def harness_for_run_slot() -> Harness:
     # scheduler — only release() is called from _run_slot's finally
     h.scheduler = MagicMock()
     h.scheduler.release = MagicMock()
+    # carries_substrate_probe was added after these tests were written; mock it
+    # False so _run_slot does not call _run_substrate_gate (which dereferences
+    # git_ops.worktree_base, left None because TaskWorkflow is fully patched).
+    h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
     return h
 
 
