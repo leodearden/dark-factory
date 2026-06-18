@@ -965,6 +965,62 @@ class TestAcquireWarmLaneResetInPlace:
         ]
         assert len(lane_registrations) == 1
 
+    async def test_recycle_reseed_failure_keeps_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Recycle path: failed re-seed is fail-soft — lane kept with degraded warmth.
+
+        When seed-warm-lane.sh exits non-zero on the RECYCLE path,
+        acquire_warm_lane must still return a usable WorktreeInfo (lane remains
+        registered, worktree NOT removed).  Contrast with create-once where a
+        seed failure triggers cold-fallback (returns None).
+
+        Fails against step-2 impl (which treats recycle seed failure as fatal,
+        returning None).  Passes after step-4's fail-soft implementation.
+        """
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # First acquire (create-once): passing seed → lane registered, target/ warm
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info_a is not None, 'prerequisite: create-once acquire must succeed'
+
+        # Place a retained artifact so we can verify it survives fail-soft recycle
+        (info_a.path / 'target').mkdir(exist_ok=True)
+        retained_artifact = info_a.path / 'target' / 'prior.bin'
+        retained_artifact.write_bytes(b'\xca\xfe' * 32)
+
+        # Overwrite the seed script in the MAIN REPO to exit 1 and commit it.
+        # After _reset_warm_lane resets the lane to this commit, the lane's
+        # seed script will exit non-zero.
+        fail_script = wl_git_repo / 'scripts' / 'seed-warm-lane.sh'
+        fail_script.write_text(
+            '#!/usr/bin/env bash\necho "forced failure" >&2\nexit 1\n'
+        )
+        fail_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=wl_git_repo)
+        await _run(['git', 'commit', '-m', 'fail: seed script exits 1'], cwd=wl_git_repo)
+        _, sha_fail, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        sha_fail = sha_fail.strip()
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(info_a.path)
+
+        # Second acquire for a DIFFERENT task at sha_fail: seed exits 1.
+        # step-2 (fatal): returns None.  step-4 (fail-soft): WorktreeInfo.
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_fail)
+
+        # D10 fail-soft: must return a usable lane (NOT None / cold-fallback)
+        assert info_b is not None, (
+            'Recycle seed failure must be fail-soft: return WorktreeInfo, not None'
+        )
+        # Worktree must NOT be removed (the retained target/ survives)
+        assert await git_ops._is_registered_worktree(info_b.path), (
+            'Worktree must not be removed on recycle seed failure'
+        )
+        # Same recycled lane path
+        assert info_b.path == info_a.path
+
 
 # ===========================================================================
 # Step-11: RED — GitOps.release_warm_lane
