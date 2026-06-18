@@ -8897,11 +8897,18 @@ def diff_per_test_results(
     ``'inconclusive'``):
 
     * Tests with **identical** verdicts in both legs are omitted.
-    * Tests present in **only one** leg (presence divergences) go to
-      :attr:`~ShadowCompareDiff.only_warm` / :attr:`~ShadowCompareDiff.only_cold`
-      — alarm-worthy (structural difference).
-    * Tests where **either** verdict is ``'inconclusive'`` (TIMEOUT/SIGSEGV)
-      go to :attr:`~ShadowCompareDiff.inconclusive` — non-alarming.
+    * Tests present in **only one** leg with a ``'pass'`` or ``'fail'`` verdict
+      go to :attr:`~ShadowCompareDiff.only_warm` /
+      :attr:`~ShadowCompareDiff.only_cold` — alarm-worthy (structural
+      difference).
+    * Tests present in **only one** leg whose sole verdict is
+      ``'inconclusive'`` (TIMEOUT/SIGSEGV) go to
+      :attr:`~ShadowCompareDiff.inconclusive` — non-alarming.  A TIMEOUT in
+      one leg that the other leg simply never ran is a non-deterministic
+      execution artifact, not a suite-verdict-changing flip.
+    * Tests where **either** verdict in both legs is ``'inconclusive'``
+      (TIMEOUT/SIGSEGV) go to :attr:`~ShadowCompareDiff.inconclusive`
+      — non-alarming.
     * Tests with a genuine ``'pass'``↔``'fail'`` flip go to
       :attr:`~ShadowCompareDiff.diverging` and one of the direction buckets
       — alarm-worthy.
@@ -8941,9 +8948,21 @@ def diff_per_test_results(
                     else:
                         warm_fail_cold_pass.append(test_id)
         elif in_warm:
-            only_warm.append(test_id)
+            v = warm[test_id]
+            if v == 'inconclusive':
+                # TIMEOUT/SIGSEGV in warm with no cold result — non-deterministic
+                # artifact, not alarm-worthy.  Store as ('inconclusive', 'absent')
+                # for diagnostics.
+                inconclusive[test_id] = ('inconclusive', 'absent')
+            else:
+                only_warm.append(test_id)
         else:
-            only_cold.append(test_id)
+            v = cold[test_id]
+            if v == 'inconclusive':
+                # TIMEOUT/SIGSEGV in cold with no warm result — same reasoning.
+                inconclusive[test_id] = ('absent', 'inconclusive')
+            else:
+                only_cold.append(test_id)
 
     return ShadowCompareDiff(
         diverging=diverging,
@@ -9408,6 +9427,16 @@ async def _run_shadow_compare(
         # Option B: Re-confirm the divergence with a second independent cold run.
         # Escalate only on the intersection of alarm-worthy tests that persist
         # across both runs; a transient flip that clears on re-run is not alarmed.
+        n_alarm_worthy = (
+            len(diff1.diverging) + len(diff1.only_warm) + len(diff1.only_cold)
+        )
+        logger.info(
+            'Shadow compare first-run divergence on %s: %d alarm-worthy test(s); '
+            'starting re-confirmation cold run (Option B) — this doubles the cold '
+            'verify cost for this commit',
+            merge_commit[:8],
+            n_alarm_worthy,
+        )
         try:
             cold2 = await _run_cold_shadow_verify(
                 git_ops, req, merge_commit, event_store
@@ -9453,7 +9482,14 @@ async def _run_shadow_compare(
                 'persist across re-confirmation run); not alarming',
                 merge_commit[:8],
             )
-        # No parity-ok event in either sub-case — result is uncertain
+        # No parity-ok event in either sub-case (persistent or transient divergence).
+        # Design intent: the result is genuinely uncertain (either a real flip that
+        # triggered an alarm, or a flaky flip that was cleared); emitting parity_ok
+        # would be misleading for the persistent case and premature for the transient
+        # case.  Downstream metric accounting that needs a per-compare outcome can
+        # observe the presence/absence of the born-at-L2 alarm instead.  A new
+        # 'verdict_parity_inconclusive' EventType was explicitly ruled out of scope
+        # for this task to avoid expanding into event_store.py.
     else:
         # Parity OK — emit event (mirrors DriftDetector.check verdict_parity_ok)
         if event_store is not None:

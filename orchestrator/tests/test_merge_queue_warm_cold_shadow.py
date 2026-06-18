@@ -626,6 +626,63 @@ class TestDiffPerTestResults:
         assert diff.has_divergence is False
         assert "my-crate crash::prone::test" in diff.inconclusive
 
+    # --- Amendment: presence divergences with inconclusive verdicts (suggestion 1) ---
+
+    def test_only_warm_inconclusive_verdict_not_alarmed(self) -> None:
+        """A test present ONLY in warm with an 'inconclusive' verdict must NOT alarm.
+
+        Without this fix, a TIMEOUT in the warm leg but absent in the cold leg
+        (e.g. cold build pruned the binary) routes to only_warm → has_divergence=True
+        → false-positive alarm.  The inconclusive verdict indicates a
+        non-deterministic execution artifact; structural absence paired with
+        'inconclusive' is not alarm-worthy.
+        """
+        warm = {"my-crate slow::test": 'inconclusive'}
+        cold: dict[str, str] = {}
+        diff = diff_per_test_results(warm, cold)
+        # NOT alarm-worthy
+        assert diff.has_divergence is False
+        # Must NOT appear in the presence-divergence buckets
+        assert "my-crate slow::test" not in diff.only_warm
+        # Must land in the inconclusive bucket (for diagnostics)
+        assert "my-crate slow::test" in diff.inconclusive
+
+    def test_only_cold_inconclusive_verdict_not_alarmed(self) -> None:
+        """A test present ONLY in cold with an 'inconclusive' verdict must NOT alarm.
+
+        Mirrors test_only_warm_inconclusive_verdict_not_alarmed for the cold-leg
+        presence case (e.g. SIGSEGV in cold that didn't surface in warm).
+        """
+        warm: dict[str, str] = {}
+        cold = {"my-crate crash::test": 'inconclusive'}
+        diff = diff_per_test_results(warm, cold)
+        # NOT alarm-worthy
+        assert diff.has_divergence is False
+        # Must NOT appear in the presence-divergence buckets
+        assert "my-crate crash::test" not in diff.only_cold
+        # Must land in the inconclusive bucket (for diagnostics)
+        assert "my-crate crash::test" in diff.inconclusive
+
+    def test_only_warm_pass_verdict_still_alarmed(self) -> None:
+        """Presence divergence with a 'pass' verdict in only_warm remains alarm-worthy.
+
+        Ensures the inconclusive routing only applies when the verdict is
+        'inconclusive'; a 'pass' test missing from cold is still a real divergence.
+        """
+        warm = {"t": 'pass'}
+        cold: dict[str, str] = {}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is True
+        assert "t" in diff.only_warm
+
+    def test_only_cold_fail_verdict_still_alarmed(self) -> None:
+        """Presence divergence with a 'fail' verdict in only_cold remains alarm-worthy."""
+        warm: dict[str, str] = {}
+        cold = {"t": 'fail'}
+        diff = diff_per_test_results(warm, cold)
+        assert diff.has_divergence is True
+        assert "t" in diff.only_cold
+
 
 # ---------------------------------------------------------------------------
 # Step-9: _submit_shadow_divergence_escalation
