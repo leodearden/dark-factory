@@ -24,6 +24,13 @@ inter_iteration_rebase: true
 # rebase gap so a fully-implemented task can pick up sibling fixes on main
 # without re-running execute).
 rebase_before_verify: true
+# Cohort-labelling boundary for post-rebase cost instrumentation (task 1802).
+# LABELLING ONLY — does NOT trigger any re-seed behaviour ("wear the cost for
+# now").  At-or-above threshold commits: 'post-unblock' (first rebase of a
+# fresh dispatch instance) or 'big-jump' (subsequent large rebase).  Below
+# threshold: 'continuous'.  25 separates normal orchestrator cadence from
+# /unblock accumulated-drift rebases.
+rebase_reseed_distance_threshold: 25
 
 # Fix 2 — thrash threshold for repeated infra-issue resumes on the same
 # root cause.  Counter resets to 1 when the iteration log grows; at

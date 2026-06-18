@@ -224,6 +224,23 @@ class EventType(StrEnum):
     # data keys: {cause, ticks, detail}.
     external_dep_gate_held = 'external_dep_gate_held'
 
+    # Paired (rebase → immediately-following verify) cost record.
+    # Emitted once per real rebase (not short-circuit) in _verify_debugfix_loop.
+    # Data payload: {
+    #   old_base: str,           # SHA before rebase
+    #   new_base: str,           # SHA after rebase (current main)
+    #   distance_commits: int,   # git rev-list --count old_base..new_base (-1 = unknown)
+    #   files_changed_on_main: int,  # len(changed_files) from the rebase return
+    #   next_verify_wall_secs: float,  # VerifyResult.duration_secs of the following verify
+    #   verify_scope: {          # context for cost normalisation
+    #     n_task_files: int,
+    #     n_modules: int,
+    #     workspace: bool,       # True when self._train is not None
+    #   },
+    #   cohort: str,             # 'continuous' | 'post-unblock' | 'big-jump' | 'unknown'
+    # }
+    rebase_verify_cost = 'rebase_verify_cost'
+
 
 class EventStore:
     """Append-only SQLite event store.
