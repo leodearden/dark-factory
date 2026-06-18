@@ -68,6 +68,7 @@ def _release() -> None:
     if _tok is not None and _fd is not None:
         with contextlib.suppress(OSError):
             os.write(_fd, _tok)
+    if _fd is not None:
         with contextlib.suppress(OSError):
             os.close(_fd)
     _fd = None
@@ -96,7 +97,13 @@ def pytest_configure(config) -> None:
             _tok = None
             return
         _tok = os.read(_fd, 1)
-    except OSError:
+    except OSError as exc:
+        logger.warning(
+            'pytest_jobserver: FIFO error on %s (%s); '
+            'running unthrottled (jobserver may be misconfigured or unreachable)',
+            path,
+            exc,
+        )
         _release()
         return
     atexit.register(_release)
