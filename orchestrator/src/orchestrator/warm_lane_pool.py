@@ -187,3 +187,44 @@ class WarmLanePool:
         Idempotent: silently ignored if *branch_name* has no assignment.
         """
         self._assignments.pop(branch_name, None)
+
+    def restore_assignment(self, branch_name: str, lane: Path) -> None:
+        """Restore *branch_name* → *lane* and mark the lane ASSIGNED.
+
+        Used by the crash-recovery startup path to rebuild the in-memory
+        assignment map after a process restart.  Unlike ``note_assignment``
+        (which leaves lane state to the caller), this method atomically sets
+        *both* the assignment map AND the lane state to ASSIGNED so that a
+        concurrent fresh dispatch's ``try_acquire``/``acquire_for`` cannot grab
+        the lane before the original task is re-dispatched.
+
+        Startup is single-threaded, so no lock is needed (mirrors
+        ``note_assignment``/``drop_assignment``).
+
+        Unknown *lane* path → no-op (never raises).
+        """
+        # Find the registered lane key via exact-then-resolved-path lookup
+        # (mirrors state()/release()/is_lane() idiom).
+        matched: Path | None = None
+        if lane in self._lanes:
+            matched = lane
+        else:
+            try:
+                resolved = lane.resolve()
+            except OSError:
+                resolved = lane
+            for known_lane in self._lanes:
+                try:
+                    known_resolved = known_lane.resolve()
+                except OSError:
+                    known_resolved = known_lane
+                if known_resolved == resolved:
+                    matched = known_lane
+                    break
+
+        if matched is None:
+            # Unknown lane path — silently ignore (idempotent).
+            return
+
+        self._lanes[matched] = LaneState.ASSIGNED
+        self._assignments[branch_name] = matched
