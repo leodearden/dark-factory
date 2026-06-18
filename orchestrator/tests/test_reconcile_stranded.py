@@ -2681,7 +2681,7 @@ async def test_reconcile_stale_lock_uses_lane_path(harness: Harness, monkeypatch
     # is_ancestor False → skip the found-on-main path, go to lock-state branch
     harness.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
 
-    result = await harness._reconcile_one_stranded('42', 'in-progress', mid_run=False)
+    await harness._reconcile_one_stranded('42', 'in-progress', mid_run=False)
 
     # Task must be reverted to pending
     harness.scheduler.set_task_status.assert_called_once_with('42', 'pending')  # type: ignore[attr-defined]

@@ -1524,7 +1524,7 @@ Output JSON matching the schema. Every task must appear in the output.
             # reserved ASSIGNED before re-dispatch.  Both sets the map AND
             # flips the lane FREE→ASSIGNED, preventing a concurrent fresh
             # acquire from stealing the lane while the original task is queued.
-            if is_lane and recovery_id:
+            if pool is not None and is_lane and recovery_id:
                 pool.restore_assignment(recovery_id, entry)
 
             # Check if plan has any completed steps

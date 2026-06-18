@@ -28,6 +28,9 @@ def harness(tmp_path: Path, mock_orch_config):
     # fails open → adopt), so the pre-Fix-C recovery tests behave unchanged.
     h.scheduler.get_task = AsyncMock(return_value={})
     h.scheduler._dispatched = set()
+    # Substrate gate: return False from carries_substrate_probe so _run_slot
+    # tests skip the D4 gate entirely (no real git repo in tmp_path).
+    h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
 
     # Replace git_ops cleanup/quarantine with async mocks; keep worktree_base real
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
@@ -568,7 +571,7 @@ class TestRecoverCrashedTasksWarmLane:
         self, harness: Harness,
     ):
         """Plan recovered from _lane-0 is stored under '42', not '_lane-0'."""
-        pool = _attach_pool(harness, size=2)
+        _pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
         _setup_lane(base, '_lane-0', plan)
@@ -582,7 +585,7 @@ class TestRecoverCrashedTasksWarmLane:
 
     async def test_warm_lane_cleanup_not_called(self, harness: Harness):
         """cleanup_worktree must NOT be called for a lane with recoverable work."""
-        pool = _attach_pool(harness, size=2)
+        _pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
         _setup_lane(base, '_lane-0', plan)
@@ -615,7 +618,7 @@ class TestRecoverCrashedTasksWarmLane:
 
     async def test_warm_lane_cold_path_unaffected(self, harness: Harness):
         """Cold (non-lane) worktrees still recover normally alongside lane dirs."""
-        pool = _attach_pool(harness, size=2)
+        _pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         # Lane with completed work → recover under real task_id
         plan_lane = _make_plan(steps_done=2, steps_total=4, task_id='42')
@@ -675,7 +678,7 @@ class TestRecoverCrashedTasksWarmLaneEdgeCases:
         NEITHER '_lane-0' nor any session stored in _recovered_sessions/
         _recovered_plans.
         """
-        pool = _attach_pool(harness, size=2)
+        _pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         lane_path = base / '_lane-0'
         task_dir = lane_path / '.task'
