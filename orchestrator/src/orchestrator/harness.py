@@ -3704,18 +3704,44 @@ Output JSON matching the schema. Every task must appear in the output.
             project_root=self.config.project_root,
         )
 
-    async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
-        """Delegate to the service-restart coordinator, if one is wired.
+    def _build_dashboard_restart_coordinator(self) -> StaleServiceRestartCoordinator:
+        """Construct a StaleServiceRestartCoordinator for the dashboard (leaf service).
 
-        Called from the run-forever idle branch (active is empty — a verified
-        quiet window).  No-op when the coordinator is None or disabled.
-        Returns True when the restart was fired, False otherwise.
+        The dashboard is a leaf node — nothing depends on it — so its restart
+        must NOT wait for the orchestrator to be idle.  require_idle=False means
+        the coordinator fires as soon as the debounce window elapses, even while
+        agents are dispatching.  script_args=[] omits --drain (no recon to drain).
+
+        Called once from _start_merge_worker alongside
+        _build_service_restart_coordinator.
         """
-        if self._service_restart_coordinator is None:
-            return False
-        return await self._service_restart_coordinator.maybe_restart(
-            agents_idle=agents_idle
+        return StaleServiceRestartCoordinator(
+            git_ops=self.git_ops,
+            event_store=self.event_store,
+            watch_prefixes=self.config.dashboard_restart_watch_prefixes,
+            debounce_secs=self.config.dashboard_restart_debounce_secs,
+            enabled=self.config.dashboard_restart_on_merge_enabled,
+            script_path=self.config.dashboard_restart_script,
+            project_root=self.config.project_root,
+            service_name='dashboard',
+            require_idle=False,
+            script_args=[],
         )
+
+    async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
+        """Delegate to all service-restart coordinators in the list.
+
+        Called from the run-forever idle branch (agents_idle=True) and the
+        busy-wait branch (agents_idle=False).  Iterates every coordinator in
+        self._service_restart_coordinators and fires each whose gate conditions
+        are satisfied.  Returns True if at least one coordinator fired a restart,
+        False otherwise.  No-op (returns False) when the list is empty.
+        """
+        any_fired = False
+        for coord in self._service_restart_coordinators:
+            if await coord.maybe_restart(agents_idle=agents_idle):
+                any_fired = True
+        return any_fired
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.
