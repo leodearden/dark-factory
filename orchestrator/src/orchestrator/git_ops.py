@@ -28,6 +28,7 @@ import asyncio
 import logging
 import re
 import shutil
+import subprocess
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -2311,8 +2312,20 @@ class GitOps:
 
     async def get_merge_diff_files(
         self, base_sha: str, head_sha: str,
-    ) -> list[str]:
+    ) -> tuple[list[str], Exception | None]:
         """Files changed by the merge ``base_sha..head_sha``, excluding ``.task/``.
+
+        Returns a ``(files, error)`` tuple — **total, never raises**:
+
+        * ``(files, None)`` on success.  An empty ``files`` list is a
+          legitimate outcome (revert merges, ``.task/``-only merges).
+        * ``([], exception)`` on any error: ``rc != 0`` from ``git diff``
+          (returns :class:`subprocess.CalledProcessError`) or an unexpected
+          raise from the subprocess helper (e.g. ``WorktreeMissing``,
+          ``FileNotFoundError``).
+
+        Callers should branch on ``err is not None`` (not ``resolver_failed``),
+        because an empty diff is a valid non-error outcome for this function.
 
         Used by ``TaskWorkflow._reconcile_metadata_files_for_done`` to write
         the actually-changed paths into ``metadata.files`` instead of the
@@ -2320,25 +2333,22 @@ class GitOps:
         refactored away).  Uses ``--no-renames`` so a rename surfaces as
         both add+delete; downstream consumers can decide whether to keep
         or drop the deleted path.
-
-        Returns ``[]`` on git error — the caller treats an empty list as
-        "no scope to record" (the gate-skip in fused-memory's
-        task_interceptor.py covers the missing-paths case anyway).
         """
-        rc, output, stderr = await _run(
-            [
-                'git', 'diff', '--name-only', '--no-renames',
-                base_sha, head_sha, '--', ':!.task/',
-            ],
-            cwd=self.project_root,
-        )
+        cmd = [
+            'git', 'diff', '--name-only', '--no-renames',
+            base_sha, head_sha, '--', ':!.task/',
+        ]
+        try:
+            rc, output, stderr = await _run(cmd, cwd=self.project_root)
+        except Exception as exc:
+            return [], exc
         if rc != 0:
             logger.warning(
                 'get_merge_diff_files: git diff %s..%s failed (rc=%s): %s',
                 base_sha, head_sha, rc, (stderr or '').strip()[:200],
             )
-            return []
-        return [f for f in output.strip().splitlines() if f.strip()]
+            return [], subprocess.CalledProcessError(rc, cmd, stderr=stderr)
+        return [f for f in output.strip().splitlines() if f.strip()], None
 
     async def get_files_touched_in_branch(
         self, base_sha: str, branch_head: str,
