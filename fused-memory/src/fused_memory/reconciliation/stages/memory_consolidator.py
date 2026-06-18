@@ -397,13 +397,22 @@ Review the above data and perform memory consolidation:
         ap = self.assembled_payload
         assert ap is not None
 
+        # assemble_payload's line-262 reset is bypassed by the early return at lines 250-251,
+        # so this path must reset here to avoid mutating/leaking the shared class-level default.
+        self._fetch_degraded_sources = []
+
         event_summary = _format_events(ap.events)
 
         # Store status (cheap fetch, always useful)
         try:
             status = await self.memory.get_status(project_id=self.project_id)
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                'reconciliation.stage1_status_fetch_failed',
+                extra={'project_id': self.project_id, 'error': str(e)},
+            )
             status = {}
+            self._fetch_degraded_sources.append('status')
 
         # Prior S3 findings
         prior_s3_section = ''
