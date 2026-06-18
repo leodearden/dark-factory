@@ -15,7 +15,10 @@ import pytest
 import yaml
 from _orch_helpers import pydantic_spec
 
+import json as _json
+
 from orchestrator.config import OrchestratorConfig
+from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # step-3: config defaults
@@ -541,9 +544,15 @@ class TestShaStamping:
 class _RecordingScheduler:
     """Faithful fake scheduler for trim tests.
 
-    append=True: recursive-merge — extends dry_run_proposals list
-                  and updates any other supplied keys.
-    append=False: replaces the whole metadata blob.
+    Mirrors the #1827 metadata_mode contract:
+    - metadata_mode='additive': recursive list-union, dict-recursive, scalar OLD-wins.
+      Extends dry_run_proposals list and updates other keys.
+    - metadata_mode='merge' (default/no-append): shallow last-write-wins.
+      Supplied keys overwrite wholesale; omitted keys are preserved.
+    - metadata_mode='replace': whole-blob overwrite.
+
+    Legacy append kwarg accepted for back-compat: append=True → additive behaviour.
+
     get_task: returns {'metadata': <current blob>}.
     Tracks all update_task calls for assertion.
     """
@@ -552,22 +561,33 @@ class _RecordingScheduler:
         self._meta: dict = dict(initial_metadata)
         self.update_task_calls: list[dict] = []
 
-    async def update_task(self, task_id, metadata, *, append=False):
+    async def update_task(self, task_id, metadata, *, append=False, metadata_mode=None):
         self.update_task_calls.append({
             'task_id': task_id,
             'metadata': metadata,
             'append': append,
+            'metadata_mode': metadata_mode,
         })
-        if append:
-            # Recursive-merge: extend lists, update other keys
+        # Resolve effective mode: metadata_mode > append True→additive > default merge
+        if metadata_mode is not None:
+            effective = metadata_mode
+        elif append:
+            effective = 'additive'
+        else:
+            effective = 'merge'
+
+        if effective == 'additive':
+            # List-union, scalar overwrite (simplified — fake only needs list-union)
             for key, value in metadata.items():
                 if key in self._meta and isinstance(self._meta[key], list) and isinstance(value, list):
                     self._meta[key] = self._meta[key] + value
                 else:
                     self._meta[key] = value
-        else:
-            # Full blob replace
+        elif effective == 'replace':
             self._meta = dict(metadata)
+        else:
+            # merge: shallow last-write-wins (supplied keys overwrite, omitted preserved)
+            self._meta = {**self._meta, **metadata}
 
     async def get_task(self, task_id):
         return {'metadata': dict(self._meta)}
@@ -649,4 +669,115 @@ class TestKeepLastNTrim:
         )
         assert 'files' in trim_call['metadata'], (
             'Trim write must carry the full blob (files missing)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-4 (1828): wire-mode assertions — proposal=additive, trim=merge
+# ---------------------------------------------------------------------------
+
+class TestDryRunWireMode:
+    """Verify that the two update_task callers in dry_run_unblock forward the
+    correct metadata_mode on the wire.
+
+    Uses a REAL Scheduler with monkeypatched mcp_call so we capture the raw
+    MCP arguments exactly as they'll be received by fused-memory.
+
+    RED today: proposal call forwards 'append' key instead of metadata_mode;
+    trim call forwards nothing (no metadata_mode).
+    GREEN after step-5 impl (scheduler.py update_task gains metadata_mode).
+    """
+
+    @pytest.mark.asyncio
+    async def test_proposal_persist_forwards_additive_and_trim_forwards_merge(
+        self, tmp_path, monkeypatch
+    ):
+        """proposal persist → metadata_mode='additive'; trim write → metadata_mode='merge'."""
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        repo_dir = tmp_path / 'repo'
+        repo_dir.mkdir()
+        _init_git_repo(repo_dir)
+
+        # Seed the task with 6 proposals + siblings so the trim is triggered
+        # (keep_last=5 → len>5 triggers trim after get_task returns the blob).
+        # We'll run once: proposal persist fires, then get_task returns 6 proposals
+        # so that 6 > 5 triggers the trim write.
+        six_proposals = [
+            {'proposal_text': f'Proposal {i}', 'risk_label': 'low', 'files_referenced': []}
+            for i in range(6)
+        ]
+        seeded_task_doc = {
+            'id': 'wire-test',
+            'metadata': {
+                'dry_run_proposals': six_proposals,
+                'memory_hints': ['hint-A'],
+                'files': ['src/foo.py'],
+            },
+        }
+
+        # All wire calls captured here (both update_task and get_task payloads).
+        captured_payloads: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_payloads.append(payload)
+            name = payload.get('name', '')
+            if name == 'get_task':
+                # Return full task doc so get_task's parser can find task['metadata'].
+                return {
+                    'result': {
+                        'content': [{
+                            'type': 'text',
+                            'text': _json.dumps(seeded_task_doc),
+                        }]
+                    }
+                }
+            # update_task and any other tool → success
+            return {}
+
+        real_scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='wire-test',
+                worktree=str(repo_dir),
+                reason='verify exhausted',
+                detail='',
+                scheduler=real_scheduler,
+                mcp=MagicMock(),
+                config=_make_config(b3_proposal_keep_last=5),
+            )
+
+        update_calls = [p for p in captured_payloads if p.get('name') == 'update_task']
+        assert len(update_calls) == 2, (
+            f'Expected 2 update_task wire calls (proposal + trim); '
+            f'got {len(update_calls)} '
+            f'(all calls: {[p.get("name") for p in captured_payloads]})'
+        )
+
+        # First update_task call is the proposal persist (append=True → additive).
+        proposal_args = update_calls[0]['arguments']
+        assert proposal_args.get('metadata_mode') == 'additive', (
+            f"Proposal persist must forward metadata_mode='additive'; got: {proposal_args}"
+        )
+        assert 'append' not in proposal_args, (
+            f"'append' must not appear on the wire for proposal persist; got: {proposal_args}"
+        )
+
+        # Second update_task call is the trim write (append=False/omitted → merge).
+        trim_args = update_calls[1]['arguments']
+        assert trim_args.get('metadata_mode') == 'merge', (
+            f"Trim write must forward metadata_mode='merge'; got: {trim_args}"
+        )
+        assert 'append' not in trim_args, (
+            f"'append' must not appear on the wire for trim write; got: {trim_args}"
         )
