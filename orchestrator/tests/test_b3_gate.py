@@ -768,6 +768,7 @@ class TestResolveCap:
         Fails today: b3_gate has no module logger → zero WARNING records.
         """
         import logging as _logging
+
         from orchestrator.b3_gate import DEFAULT_CAP, _resolve_cap
 
         cfg_file = tmp_path / 'bad_config.yaml'
@@ -793,6 +794,7 @@ class TestResolveCap:
     def test_none_config_stays_silent(self, caplog):
         """_resolve_cap(None) must NOT emit any WARNING (benign no-config path)."""
         import logging as _logging
+
         from orchestrator.b3_gate import _resolve_cap
 
         with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
