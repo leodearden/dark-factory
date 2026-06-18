@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from shared.locking import files_to_modules, modules_conflict, normalize_lock
+from shared.mcp_envelope import parse_tool_result, resolver_failed
 
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -1530,15 +1531,13 @@ class Scheduler:
             if ids is not None:
                 arguments['ids'] = list(ids)
             result = await self.dispatch_tool('get_statuses', arguments, timeout=15)
-            statuses = self._parse_tool_text_result(result, 'statuses')
-            if isinstance(statuses, dict):
-                return statuses, None
+            statuses, err = parse_tool_result(result, 'statuses', dict)
+            return ({}, err) if err is not None else (statuses, None)
         except Exception as e:
             logger.exception(
                 'Failed to fetch task statuses: %s: %s', type(e).__name__, e,
             )
             return {}, e
-        return {}, None
 
     async def get_external_statuses(
         self, deps: list[str]
