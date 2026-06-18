@@ -998,6 +998,237 @@ class TestReleaseWarmLane:
 
 
 # ===========================================================================
+# Step-21: RED — acquire_warm_lane REUSE path (live-requeue, same process)
+#
+# Today acquire_warm_lane calls try_acquire() (size-1 → second acquire returns
+# None) → info2 is None → RED.
+# After step-22, acquire_for('A') recognises the mapped lane and routes to
+# _reuse_warm_lane which preserves .task/plan.json + rebases + retains target/.
+# ===========================================================================
+
+
+async def _make_repo_for_reuse_test(repo: Path) -> tuple[str, str, Path]:
+    """Setup a repo for the live-requeue reuse test.
+
+    Creates:
+    - .gitignore ignoring target/
+    - stub seed + debug-port scripts
+    - commit sha_a: adds task_work.txt (WIP target for the task branch)
+    - commit sha_main: adds main_advance.txt (different file, no conflict)
+
+    Returns (sha_a, sha_main, seed_marker_path).
+    """
+    # .gitignore so target/ artifacts stay untracked during WIP commit
+    (repo / '.gitignore').write_text('target/\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add .gitignore'], cwd=repo)
+
+    # Add stub seed + debug-port scripts
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    seed_marker = repo / 'seed_calls.txt'
+    seed_script = scripts_dir / 'seed-warm-lane.sh'
+    seed_script.write_text(
+        f'#!/usr/bin/env bash\n'
+        f'echo "called:$3" >> {seed_marker}\n'
+        f'mkdir -p "$2/target"\n'
+        f'echo "seeded" > "$2/target/seeded.bin"\n'
+    )
+    seed_script.chmod(0o755)
+    debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+    debug_script.write_text('#!/usr/bin/env bash\necho 39411\n')
+    debug_script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add scripts'], cwd=repo)
+
+    # sha_a: add task_work.txt — the tracked file WIP will modify
+    (repo / 'task_work.txt').write_text('original content\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'commit A'], cwd=repo)
+    _, sha_a, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+
+    # sha_main: advance main with a separate file (no conflict with task_work.txt)
+    (repo / 'main_advance.txt').write_text('main advanced\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'advance main'], cwd=repo)
+    _, sha_main, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+
+    return sha_a.strip(), sha_main.strip(), seed_marker
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneReuse:
+    """acquire_warm_lane REUSE path: live-requeue of same branch without releasing."""
+
+    async def test_reuse_returns_not_none(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Second acquire_warm_lane('A') without release returns info2 (not None)."""
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+
+        # Simulate agent work: WIP on a tracked file + .task/plan.json + target/
+        (info1.path / 'task_work.txt').write_text('WIP changes\n')
+        (info1.path / '.task').mkdir(exist_ok=True)
+        (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
+        (info1.path / 'target').mkdir(exist_ok=True)
+        (info1.path / 'target' / 'cache.bin').write_bytes(b'\xca\xfe' * 64)
+
+        # WITHOUT releasing, requeue the same task onto new main
+        info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
+
+        # TODAY: try_acquire() returns None (exhausted) → info2 is None → RED
+        assert info2 is not None
+
+    async def test_reuse_same_lane_path(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Re-acquired lane is the SAME _lane-0 — no new lane consumed."""
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+        (info1.path / 'task_work.txt').write_text('WIP\n')
+        (info1.path / '.task').mkdir(exist_ok=True)
+        (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
+
+        info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
+        assert info2 is not None
+        assert info2.path == info1.path
+
+    async def test_reuse_preserves_task_plan_json(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Re-acquired lane still has .task/plan.json with task_id 'task-A'."""
+        import json
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+        # Write .task/plan.json (gitignored by .task/.gitignore set up by acquire)
+        (info1.path / '.task').mkdir(exist_ok=True)
+        plan_file = info1.path / '.task' / 'plan.json'
+        plan_file.write_text('{"task_id": "task-A", "title": "my task"}')
+        (info1.path / 'task_work.txt').write_text('WIP\n')
+
+        info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
+        assert info2 is not None
+
+        assert plan_file.exists(), '.task/plan.json must be preserved on reuse'
+        data = json.loads(plan_file.read_text())
+        assert data['task_id'] == 'task-A', (
+            f'plan.json task_id was overwritten: {data}'
+        )
+
+    async def test_reuse_wip_committed_and_rebased(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """WIP commit exists on task/task-A and sha_main is now an ancestor of HEAD."""
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+        # Staged WIP on tracked file
+        (info1.path / 'task_work.txt').write_text('WIP changes\n')
+        (info1.path / '.task').mkdir(exist_ok=True)
+        (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
+
+        info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
+        assert info2 is not None
+
+        # A commit with 'save WIP' in message must be reachable from HEAD
+        _, log_out, _ = await _run(
+            ['git', 'log', '--oneline', '--all', f'{sha_main}..HEAD'],
+            cwd=info2.path,
+        )
+        wip_commits = [
+            line for line in log_out.splitlines()
+            if 'save WIP before requeue rebase' in line or 'save WIP' in line.lower()
+        ]
+        assert wip_commits, (
+            f'No WIP-save commit found in log:\n{log_out}'
+        )
+
+        # sha_main must be an ancestor of HEAD
+        rc_ancestor, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', sha_main, 'HEAD'],
+            cwd=info2.path,
+        )
+        assert rc_ancestor == 0, (
+            f'{sha_main} is not an ancestor of HEAD — rebase did not run'
+        )
+
+    async def test_reuse_retains_target_cache(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """target/cache.bin is retained (warmth) after reuse."""
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+        cache_file = info1.path / 'target' / 'cache.bin'
+        cache_file.parent.mkdir(exist_ok=True)
+        cache_file.write_bytes(b'\xca\xfe' * 64)
+        (info1.path / 'task_work.txt').write_text('WIP\n')
+        (info1.path / '.task').mkdir(exist_ok=True)
+        (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
+
+        info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
+        assert info2 is not None
+
+        assert cache_file.exists(), 'target/cache.bin must be retained on reuse'
+
+    async def test_reuse_no_reseed(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """seed-warm-lane.sh is NOT re-invoked on the reuse path."""
+        sha_a, sha_main, seed_marker = await _make_repo_for_reuse_test(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+        calls_after_first = seed_marker.read_text() if seed_marker.exists() else ''
+
+        (info1.path / 'task_work.txt').write_text('WIP\n')
+        (info1.path / '.task').mkdir(exist_ok=True)
+        (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
+
+        info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
+        assert info2 is not None
+
+        calls_after_second = seed_marker.read_text() if seed_marker.exists() else ''
+        assert calls_after_second == calls_after_first, (
+            'seed-warm-lane.sh was re-invoked on reuse (should be skipped)'
+        )
+
+    async def test_reuse_assignment_still_set(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """After reuse, assignment_for('task-A') still points to _lane-0."""
+        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert info1 is not None
+        (info1.path / 'task_work.txt').write_text('WIP\n')
+        (info1.path / '.task').mkdir(exist_ok=True)
+        (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
+
+        info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
+        assert info2 is not None
+
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.assignment_for('task-A') == info1.path
+
+
+# ===========================================================================
 # Step-19: RED — WarmLanePool.acquire_for + assignment_for
 #   Branch->lane assignment map for in-memory live-requeue detection.
 #   acquire_for / assignment_for are absent today → AttributeError → RED.
