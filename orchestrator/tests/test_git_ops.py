@@ -6085,3 +6085,130 @@ class TestCleanupWorktreePoolAware:
         await git_ops.cleanup_worktree(info.path, 'D')
 
         assert not info.path.exists(), 'Cold worktree must be removed when pool disabled'
+
+
+# ===========================================================================
+# Step-25: RED — create_worktree requeue-of-a-warm-task end-to-end
+#   + recycled-id identity guard
+#
+# Part (a): Requeue regression guard — same process requeue of a warm task
+#   should reuse _lane-0, preserve .task/plan.json, commit WIP, retain target/.
+#   This works today (steps 22-24 implemented live-requeue).
+#
+# Part (b): Recycled-id guard — after cleanup + re-dispatch with a DIFFERENT
+#   expected_title, the disk backstop should NOT inherit the stale plan.json.
+#   Today (step-24, no step-26): disk backstop detects task_id match → REUSE
+#   → stale plan.json IS inherited → test FAILS → RED.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeRequeueAndRecycledId:
+    """create_worktree requeue regression guard + recycled-id identity guard."""
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_requeue_same_lane_plan_preserved(self, git_repo: Path):
+        """(a) Requeue: same task returns _lane-0 with .task/plan.json preserved."""
+        import json as _json
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.create_worktree('A')
+        lane = info1.path
+
+        # Simulate agent work
+        (lane / '.task').mkdir(exist_ok=True)
+        plan_file = lane / '.task' / 'plan.json'
+        plan_file.write_text('{"task_id": "A", "title": "Task A"}')
+        (lane / 'README.md').write_text('WIP changes\n')
+
+        # Requeue (no cleanup)
+        info2 = await git_ops.create_worktree('A')
+
+        assert info2.path == lane, f'Expected same _lane-0 ({lane}), got {info2.path}'
+        assert plan_file.exists(), '.task/plan.json must be preserved on requeue'
+        data = _json.loads(plan_file.read_text())
+        assert data['task_id'] == 'A', f'plan.json was overwritten: {data}'
+
+    async def test_requeue_wip_committed(self, git_repo: Path):
+        """(a) Requeue: a WIP-save commit is created for uncommitted tracked changes."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.create_worktree('A')
+        lane = info1.path
+        (lane / '.task').mkdir(exist_ok=True)
+        (lane / '.task' / 'plan.json').write_text('{"task_id": "A"}')
+        (lane / 'README.md').write_text('WIP changes\n')
+
+        info2 = await git_ops.create_worktree('A')
+        assert info2.path == lane
+
+        _, log_out, _ = await _run(['git', 'log', '--oneline'], cwd=lane)
+        wip_commits = [
+            line for line in log_out.splitlines()
+            if 'save wip' in line.lower() or 'save WIP' in line
+        ]
+        assert wip_commits, f'No WIP-save commit found in log:\n{log_out}'
+
+    async def test_requeue_target_retained(self, git_repo: Path):
+        """(a) Requeue: target/cache.bin is retained (warmth preserved)."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        info1 = await git_ops.create_worktree('A')
+        lane = info1.path
+        (lane / '.task').mkdir(exist_ok=True)
+        (lane / '.task' / 'plan.json').write_text('{"task_id": "A"}')
+        (lane / 'README.md').write_text('WIP\n')
+        cache_file = lane / 'target' / 'cache.bin'
+        cache_file.write_bytes(b'\xca\xfe' * 32)
+
+        info2 = await git_ops.create_worktree('A')
+        assert info2.path == lane
+
+        assert cache_file.exists(), 'target/cache.bin must be retained on requeue'
+
+    async def test_recycled_id_stale_plan_not_inherited(self, git_repo: Path):
+        """(b) Recycled-id guard: new task with different expected_title should NOT
+        inherit the stale .task/plan.json from the prior deleted task.
+
+        Today (step-24, no step-26): disk backstop sees task_id 'A' == 'A'
+        → REUSE → plan.json IS inherited → this assertion FAILS → RED.
+        After step-26: identity guard checks read_worktree_title vs
+        expected_title → 'Old Task' != 'New Task' → MISMATCH → FRESH reset
+        → plan.json cleared → this assertion PASSES.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # First task 'A' runs on _lane-0 and writes plan.json with 'Old Task'
+        info1 = await git_ops.create_worktree('A')
+        lane = info1.path
+        (lane / '.task').mkdir(exist_ok=True)
+        plan_file = lane / '.task' / 'plan.json'
+        plan_file.write_text('{"task_id": "A", "title": "Old Task"}')
+
+        # Cleanup: lane returns to FREE; plan.json stays on disk
+        await git_ops.cleanup_worktree(lane, 'A')
+        assert plan_file.exists(), 'prereq: plan.json must still exist after cleanup'
+
+        # NEW task with recycled id 'A' but DIFFERENT title — should NOT inherit plan
+        info2 = await git_ops.create_worktree('A', expected_title='New Task')
+        assert info2.path == lane  # same pool lane
+
+        # TODAY: disk backstop reuses (task_id 'A' == 'A') → plan.json inherited → FAIL
+        # AFTER step-26: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
+        assert not plan_file.exists(), (
+            'Recycled-id task MUST NOT inherit the prior task\'s plan.json '
+            '(identity guard should route to fresh reset)'
+        )
