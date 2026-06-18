@@ -1293,9 +1293,11 @@ class TaskWorkflow:
         default ``append=False``.
         """
         if self._merge_sha and self._base_commit:
-            files = await self.git_ops.get_merge_diff_files(
+            files, err = await self.git_ops.get_merge_diff_files(
                 self._base_commit, self._merge_sha,
             )
+            if err is not None:
+                files = []
         else:
             files = []
         merged = await self._merge_fresh_metadata(
