@@ -1304,7 +1304,7 @@ class TestUnreachableHostCapstone:
         worker._host_allocator = fake_alloc
 
         def _make_entry(host_name: str, reason: str):
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             config = OrchestratorConfig(
                 project_root=Path('/tmp/fake'),
             )

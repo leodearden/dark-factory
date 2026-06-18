@@ -457,7 +457,7 @@ class TestRunInflightVerifyHappyPath:
         """Helper: create a branch, merge it to main, return (req, item)."""
         from orchestrator.merge_queue import SpeculativeItem
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
             branch=branch,
@@ -595,7 +595,7 @@ class TestRunInflightVerifyAbortPoll:
         from orchestrator.merge_queue import SpeculativeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
             branch=branch,
@@ -797,7 +797,7 @@ class TestRunInflightVerifyRunnerUnavailable:
         from orchestrator.merge_queue import SpeculativeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
             branch=branch,
@@ -906,7 +906,7 @@ class TestFinalizeInflightPass:
         from orchestrator.merge_queue import SpeculativeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
             branch=branch,
@@ -1145,7 +1145,7 @@ class TestFinalizeInflightNonPass:
         from orchestrator.merge_queue import SpeculativeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
             branch=branch,
@@ -1181,7 +1181,7 @@ class TestFinalizeInflightNonPass:
         """Build a SpeculativeItem with immediate_outcome (no real merge)."""
         from orchestrator.merge_queue import SpeculativeItem
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id='pt-task',
             branch='pt-branch',
@@ -1712,7 +1712,7 @@ class TestSingleHostSerialByteIdentical:
         worker = SpeculativeMergeWorker(git_ops, q)
         worker_task = asyncio.create_task(worker.run())
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='sh-a',
             branch='task/sh-a',
@@ -1843,7 +1843,7 @@ class TestOverlapSignal:
         # Inject two-host allocator: local + gated_remote
         _inject_two_host_allocator(worker, gated_remote)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='ov-a', branch='task/ov-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -1987,7 +1987,7 @@ class TestLastItemOfBurstFinalizes:
         worker = SpeculativeMergeWorker(git_ops, q)
         _inject_two_host_allocator(worker, remote)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id='burst-n', branch='task/burst-n', worktree=wt,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -2133,7 +2133,7 @@ class TestChainInvalidationUnderOverlap:
         worker = SpeculativeMergeWorker(git_ops, q)
         _inject_two_host_allocator(worker, gated_remote)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='ci-a', branch='task/ci-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -2285,7 +2285,7 @@ class TestHaltAndUnavailable:
         _inject_two_host_allocator(worker, gated_remote)
         worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='halt-a', branch='task/halt-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -2407,7 +2407,7 @@ class TestHaltAndUnavailable:
         worker = SpeculativeMergeWorker(git_ops, q)
         _inject_two_host_allocator(worker, dead_remote)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='unav-a', branch='task/unav-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -2521,7 +2521,6 @@ class TestStopDrainsInflight:
         verify_task_b = asyncio.ensure_future(_gated_verify_b())
 
         # Build two fake SpeculativeItems with fresh futures.
-        asyncio.get_event_loop()
         req_a = _make_request('stop-a', 'task/stop-a', git_ops.project_root, config)
         req_b = _make_request('stop-b', 'task/stop-b', git_ops.project_root, config)
 
@@ -2884,7 +2883,7 @@ class TestFinalizeInflightWarmResultsThreading:
         from orchestrator.merge_queue import SpeculativeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
             branch=branch,
@@ -3124,7 +3123,7 @@ class TestRunnerUnavailableHeadCascade:
         worker = SpeculativeMergeWorker(git_ops, q)
         _inject_two_host_allocator(worker, gated_remote)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='rucascade-a', branch='task/rucascade-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
@@ -3230,7 +3229,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         from orchestrator.merge_queue import SpeculativeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
             branch=branch,
@@ -3676,7 +3675,7 @@ class TestCascadeFiresRemoteCancel:
         worker = SpeculativeMergeWorker(git_ops, q)
         _inject_two_host_allocator(worker, fake_remote)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='casc-a', branch='task/casc-a', worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
