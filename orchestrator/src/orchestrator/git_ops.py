@@ -1005,6 +1005,137 @@ class GitOps:
             )
             return False
 
+    async def acquire_warm_lane(
+        self,
+        branch_name: str,
+        start_ref: str,
+        *,
+        expected_title: str | None = None,
+    ) -> 'WorktreeInfo | None':
+        """Allocate a FREE warm lane, seed/reset it, and return a WorktreeInfo.
+
+        **Create-once path** (lane not yet a registered worktree):
+            ``git worktree add -b task/<branch_name> <lane> <start_ref>``,
+            then seed via :meth:`_seed_warm_lane(lane, '--fresh-checkout')`.
+            If seed fails, the just-created worktree is removed and None is
+            returned (caller falls through to the cold path — inv.6).
+
+        **Reset-in-place path** (lane already registered — added in step-10):
+            Handled by :meth:`_reset_warm_lane`; skips re-seed (target/ already
+            warm from the previous assignment).
+
+        Returns:
+            WorktreeInfo on success; None on pool exhaustion, absent seed
+            script, or seed failure (never raises — cold-fallback signal).
+        """
+        if self.warm_lane_pool is None:
+            return None
+
+        lane = await self.warm_lane_pool.try_acquire()
+        if lane is None:
+            return None  # Pool exhausted → caller cold-fallback (inv.6)
+
+        full_branch = f'{self.config.branch_prefix}{branch_name}'
+
+        try:
+            if not await self._is_registered_worktree(lane):
+                # ── Create-once branch ────────────────────────────────────
+                # Self-heal: remove a stale unregistered directory so
+                # git worktree add doesn't refuse a non-empty dir.
+                if lane.exists():
+                    logger.warning(
+                        'acquire_warm_lane: lane %s exists but is not registered; '
+                        'removing stale directory (self-heal)', lane,
+                    )
+                    shutil.rmtree(lane)
+                lane.parent.mkdir(parents=True, exist_ok=True)
+
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'add', '-b', full_branch, str(lane), start_ref],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    logger.warning(
+                        'acquire_warm_lane: git worktree add failed for %s: %s', lane, err,
+                    )
+                    await self.warm_lane_pool.release(lane)
+                    return None
+
+                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if not ok:
+                    # Seed failed — remove the just-created worktree and release
+                    logger.warning(
+                        'acquire_warm_lane: seed failed for %s; removing and cold-falling back',
+                        lane,
+                    )
+                    await _run(
+                        ['git', 'worktree', 'remove', str(lane), '--force'],
+                        cwd=self.project_root,
+                    )
+                    await self.warm_lane_pool.release(lane)
+                    return None
+            else:
+                # ── Reset-in-place branch (added in step-10) ─────────────
+                await self._reset_warm_lane(lane, full_branch, start_ref)
+
+            # ── Shared tail: gitignore, scrub, base, debug-port ──────────
+            _ensure_task_gitignore(lane)
+            await scrub_task_dir_from_tree(lane, 'warm-lane-acquire', amend=False)
+
+            _, mb_out, _ = await _run(
+                ['git', 'merge-base', start_ref, 'HEAD'],
+                cwd=lane,
+            )
+            _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+            base_commit = mb_out.strip() or head_sha.strip()
+
+            port = await self._provision_reify_debug_port(lane)
+            logger.info(
+                'acquire_warm_lane: acquired %s on branch %s (base=%s, port=%s)',
+                lane, full_branch, base_commit[:8] if base_commit else '?', port,
+            )
+            return WorktreeInfo(path=lane, base_commit=base_commit, reify_debug_port=port)
+
+        except Exception:
+            logger.warning(
+                'acquire_warm_lane: unexpected error for %s; releasing', lane, exc_info=True,
+            )
+            await self.warm_lane_pool.release(lane)
+            return None
+
+    async def _reset_warm_lane(
+        self, lane_dir: Path, full_branch: str, target_commit: str,
+    ) -> None:
+        """Reset an already-registered lane to *target_commit* on *full_branch*.
+
+        Implements reset-determinism (inv.1) + warmth retention:
+        ``git checkout -B <full_branch> <target_commit>`` establishes the new
+        task branch and updates the tracked tree; then a SINGLE
+        ``git clean -xfd -e <dir>`` (one -e per reap_build_artifact_dirs)
+        removes stray untracked files while retaining all artifact dirs —
+        mirroring reset_persistent_merge_worktree's single-pass clean so
+        >1 artifact dir all survive (per-dir-loop bug from κ, step-19).
+
+        Added as a stub here (step-8); fully exercised by step-10 tests.
+        """
+        rc, _, err = await _run(
+            ['git', 'checkout', '-B', full_branch, target_commit],
+            cwd=lane_dir,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f'_reset_warm_lane: checkout -B {full_branch} {target_commit} '
+                f'failed for {lane_dir}: {err}'
+            )
+        clean_cmd = ['git', 'clean', '-xfd']
+        for artifact_dir in self.config.reap_build_artifact_dirs:
+            clean_cmd += ['-e', artifact_dir]
+        rc, _, err = await _run(clean_cmd, cwd=lane_dir)
+        if rc != 0:
+            raise RuntimeError(
+                f'_reset_warm_lane: git clean failed for {lane_dir}: {err}'
+            )
+
     async def _provision_reify_debug_port(self, worktree_path: Path) -> int | None:
         """Run setup-worktree-debug-port.sh in the worktree and return the allocated port.
 
