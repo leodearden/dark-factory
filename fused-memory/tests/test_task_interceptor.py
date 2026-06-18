@@ -4471,15 +4471,17 @@ class TestPathGuardFallbackMetadataFilesNegativeControl:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestPathGuardOrSkip:
-    """Unit tests for TaskInterceptor._path_guard_or_skip.
+    """Unit tests for TaskInterceptor._path_guard_or_skip (now async).
 
     Verifies the helper's contract: dark_factory short-circuit, lazy-build
     of candidate, pass-through of a pre-built candidate, and error propagation.
+    No adjudicator wired — behaviour is identical to the previous sync version.
     """
 
     # -- Case 1 -----------------------------------------------------------
-    def test_path_guard_or_skip_returns_none_for_dark_factory_project(
+    async def test_path_guard_or_skip_returns_none_for_dark_factory_project(
         self,
         interceptor,
         monkeypatch,
@@ -4503,7 +4505,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'Edit orchestrator/harness.py'},
             '/home/leo/src/dark-factory',
             'dark_factory',
@@ -4514,7 +4516,7 @@ class TestPathGuardOrSkip:
         assert guard_calls == [], '_path_guard_check must NOT be called for dark_factory'
 
     # -- Case 2 -----------------------------------------------------------
-    def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
+    async def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
         self,
         interceptor,
         monkeypatch,
@@ -4548,7 +4550,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         kwargs = {'title': 'Generic refactor'}
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             kwargs,
             '/some/project_root',
             'some_other_project',
@@ -4565,7 +4567,7 @@ class TestPathGuardOrSkip:
         assert guard_calls[0][0] is built
 
     # -- Case 3 -----------------------------------------------------------
-    def test_path_guard_or_skip_uses_provided_candidate(
+    async def test_path_guard_or_skip_uses_provided_candidate(
         self,
         interceptor,
         monkeypatch,
@@ -4598,7 +4600,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         kwargs = {'title': 'Generic refactor'}
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             kwargs,
             '/some/project_root',
             'some_other_project',
@@ -4613,7 +4615,7 @@ class TestPathGuardOrSkip:
         assert guard_calls[0][0] is sentinel
 
     # -- Case 4 -----------------------------------------------------------
-    def test_path_guard_or_skip_propagates_rejection(
+    async def test_path_guard_or_skip_propagates_rejection(
         self,
         interceptor,
         monkeypatch,
@@ -4639,7 +4641,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'prompt': 'something'},
             '/some/project_root',
             'some_other_project',
@@ -4655,13 +4657,16 @@ class TestPathGuardOrSkip:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestMultiProjectRoutingWiring:
     """Verify that when prefix_registry + scope_violation_escalator are wired,
     the path guard runs for every project (including dark_factory) and a
     rejection fires the escalator with the expected payload.
+
+    All tests are async (no adjudicator wired — behaviour identical to before).
     """
 
-    def test_registry_supersedes_dark_factory_short_circuit(
+    async def test_registry_supersedes_dark_factory_short_circuit(
         self,
         interceptor,
         monkeypatch,
@@ -4695,7 +4700,7 @@ class TestMultiProjectRoutingWiring:
 
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'Edit something'},
             str(tmp_path / 'dark-factory'),
             'dark_factory',
@@ -4704,7 +4709,7 @@ class TestMultiProjectRoutingWiring:
         assert result is None
         assert check_calls == ['dark_factory']
 
-    def test_rejection_fires_scope_violation_escalator(
+    async def test_rejection_fires_scope_violation_escalator(
         self,
         interceptor,
         monkeypatch,
@@ -4754,7 +4759,7 @@ class TestMultiProjectRoutingWiring:
             lambda self, c, k, p: verdict,
         )
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'Edit fused-memory/X'},
             str(tmp_path / 'reify'),
             'reify',
@@ -4772,7 +4777,7 @@ class TestMultiProjectRoutingWiring:
         # suggested_root resolved from registry.
         assert call['suggested_root'] == str((tmp_path / 'dark-factory').resolve())
 
-    def test_escalator_failure_swallowed(
+    async def test_escalator_failure_swallowed(
         self,
         interceptor,
         monkeypatch,
@@ -4807,7 +4812,7 @@ class TestMultiProjectRoutingWiring:
         )
 
         # Must not raise.
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'crates/widget'},
             '/foo',
             'other',
