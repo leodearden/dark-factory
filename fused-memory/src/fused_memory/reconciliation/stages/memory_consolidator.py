@@ -74,6 +74,11 @@ class MemoryConsolidator(BaseStage):
     # Count of snapshot lines stripped from the payload in the current cycle (task 1547)
     _entity_summary_snapshot_lines_stripped: int = 0
 
+    # Fetch degraded sources for the current run — reset at the top of assemble_payload
+    # and copied to report.stats['stage1_fetch_degraded'] in run() (task 1812).
+    # Empty list = genuine empty corpus; non-empty = fetch failure on that source.
+    _fetch_degraded_sources: list = []
+
     async def run(
         self,
         events: list[ReconciliationEvent],
@@ -92,6 +97,7 @@ class MemoryConsolidator(BaseStage):
         report.stats['entity_summary_snapshot_lines_stripped'] = (
             self._entity_summary_snapshot_lines_stripped
         )
+        report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
 
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
@@ -255,13 +261,21 @@ class MemoryConsolidator(BaseStage):
         if self.remediation_findings is not None:
             return self._assemble_remediation_payload()
 
+        # Reset run-local degraded list before fetches
+        self._fetch_degraded_sources = []
+
         # 1. Episodes since last reconciliation
         try:
             episodes = await self.memory.get_episodes(
                 project_id=self.project_id, last_n=self.episode_limit
             )
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                'reconciliation.stage1_episodes_fetch_failed',
+                extra={'project_id': self.project_id, 'error': str(e)},
+            )
             episodes = []
+            self._fetch_degraded_sources.append('episodes')
         new_episodes = episodes
         if watermark.last_episode_timestamp:
             wm_str = str(watermark.last_episode_timestamp)
@@ -290,6 +304,7 @@ class MemoryConsolidator(BaseStage):
                 exc_info=True,
             )
             mem0_memories = []
+            self._fetch_degraded_sources.append('mem0')
 
         new_memories = mem0_memories
         if watermark.last_memory_timestamp:
