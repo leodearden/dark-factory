@@ -1539,3 +1539,141 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         # _n_failed is written from _n_failed_val inside finalize; read back
         # via the worker's attribute — it must stay False after RU.
         assert worker._n_failed is False
+
+
+# ---------------------------------------------------------------------------
+# 1795/step-11 RED: _clear_verify_host_unreachable module-level helper
+# ---------------------------------------------------------------------------
+
+
+class _FakeEscalationQueueWithResolution(_FakeEscalationQueue):
+    """Extends _FakeEscalationQueue to support get_by_task / resolve for recovery tests."""
+
+    def __init__(self, *, open_l1: bool = False):
+        super().__init__(open_l1=open_l1)
+        # Map from task_id → list of fake pending escalation SimpleNamespace objects
+        self._by_task: dict = {}
+        self.resolved: list = []  # list of (escalation_id, resolution) pairs
+
+    def seed_pending_l1(self, task_id: str, esc_id: str = 'esc-1001') -> None:
+        """Pre-seed a pending L1 escalation for the given task_id."""
+        from types import SimpleNamespace
+        esc = SimpleNamespace(id=esc_id, task_id=task_id, status='pending', level=1)
+        self._by_task.setdefault(task_id, []).append(esc)
+        # Mark the queue as having an open L1 so has_open_l1 returns True
+        self._open_l1 = True
+
+    def get_by_task(self, task_id: str, status: str | None = None) -> list:
+        escs = list(self._by_task.get(task_id, []))
+        if status is not None:
+            escs = [e for e in escs if e.status == status]
+        return escs
+
+    def resolve(self, escalation_id: str, resolution: str, **kwargs) -> None:
+        self.resolved.append((escalation_id, resolution))
+        # Update the in-memory status so subsequent get_by_task(status='pending') sees 0
+        for escs in self._by_task.values():
+            for e in escs:
+                if e.id == escalation_id:
+                    e.status = 'resolved'
+        # Once resolved, has_open_l1 should return False
+        self._open_l1 = False
+
+
+class TestClearVerifyHostUnreachable:
+    """_clear_verify_host_unreachable module-level helper (task 1795 step-11).
+
+    RED until step-12 GREEN adds the function to merge_queue.py.
+    """
+
+    def _call(self, eq, es, host, *, downtime_s: float = 300.0):
+        from orchestrator.merge_queue import _clear_verify_host_unreachable
+        _clear_verify_host_unreachable(eq, es, host, downtime_s=downtime_s)
+
+    def test_none_queue_is_noop(self):
+        """None escalation_queue → returns silently, no raise."""
+        self._call(None, None, 'host1')
+        # Must not raise
+
+    def test_resolves_open_pending_l1(self):
+        """Pending L1 for the host sentinel is resolved (resolve() called with its id)."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        sentinel = _verify_host_unreachable_sentinel('host1')
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(sentinel, 'esc-1001')
+        self._call(eq, None, 'host1')
+        assert len(eq.resolved) >= 1
+        assert 'esc-1001' in [r[0] for r in eq.resolved]
+
+    def test_pending_l1_no_longer_pending_after_call(self):
+        """After the call the seeded L1 is no longer returned by get_by_task(..., status='pending')."""
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        sentinel = _verify_host_unreachable_sentinel('myhost')
+        eq = _FakeEscalationQueueWithResolution()
+        eq.seed_pending_l1(sentinel, 'esc-2002')
+        self._call(eq, None, 'myhost')
+        still_pending = eq.get_by_task(sentinel, status='pending')
+        assert len(still_pending) == 0, 'L1 should no longer be pending after recovery'
+
+    def test_emits_verify_host_recovered_event(self):
+        """When event_store is provided a verify_host_recovered event is emitted."""
+        from orchestrator.event_store import EventType
+        eq = _FakeEscalationQueueWithResolution()
+        es = _FakeEventStore()
+        self._call(eq, es, 'recover-host', downtime_s=180.0)
+        types = [e['event_type'] for e in es.emitted]
+        assert EventType.verify_host_recovered in types
+
+    def test_recovery_event_names_the_host(self):
+        """The emitted verify_host_recovered event data includes the host name."""
+        from orchestrator.event_store import EventType
+        eq = _FakeEscalationQueueWithResolution()
+        es = _FakeEventStore()
+        self._call(eq, es, 'my-box', downtime_s=120.0)
+        events = [e for e in es.emitted if e['event_type'] == EventType.verify_host_recovered]
+        assert events, 'no verify_host_recovered event emitted'
+        assert any('my-box' in str(e) for e in events)
+
+    def test_submits_info_severity_recovery_escalation(self):
+        """An info-severity (severity='info') recovery escalation is submitted."""
+        eq = _FakeEscalationQueueWithResolution()
+        self._call(eq, None, 'recovered-host', downtime_s=60.0)
+        assert len(eq.submitted) >= 1
+        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
+        assert info_escs, f'Expected info-severity escalation; got {eq.submitted}'
+
+    def test_recovery_escalation_has_level_0(self):
+        """The recovery escalation is level=0 (informational, not L1 blocking)."""
+        eq = _FakeEscalationQueueWithResolution()
+        self._call(eq, None, 'recovered-host', downtime_s=60.0)
+        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
+        assert info_escs
+        assert all(e.level == 0 for e in info_escs)
+
+    def test_recovery_escalation_names_the_host(self):
+        """Recovery escalation summary, detail, or task_id includes the host name."""
+        eq = _FakeEscalationQueueWithResolution()
+        self._call(eq, None, 'worker-node', downtime_s=90.0)
+        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
+        assert info_escs
+        esc = info_escs[0]
+        host_present = (
+            'worker-node' in (esc.summary or '')
+            or 'worker-node' in (esc.detail or '')
+            or 'worker-node' in (esc.task_id or '')
+        )
+        assert host_present, f'Host not found in recovery escalation: {esc}'
+
+    def test_safe_when_no_open_l1(self):
+        """No L1 pre-seeded → resolve() is never called, function exits cleanly."""
+        eq = _FakeEscalationQueueWithResolution()
+        # Must not raise even when there is no pending L1 to resolve
+        self._call(eq, None, 'fresh-host')
+        assert len(eq.resolved) == 0
+
+    def test_no_event_when_event_store_none(self):
+        """No raise and no event when event_store is None."""
+        eq = _FakeEscalationQueueWithResolution()
+        self._call(eq, None, 'host1', downtime_s=60.0)
+        # Recovery escalation is still submitted even without an event store
+        assert len(eq.submitted) >= 1
