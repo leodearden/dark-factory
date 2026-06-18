@@ -18,6 +18,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
+from shared.mcp_envelope import resolver_failed
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -1637,7 +1638,7 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         statuses, err = await self.scheduler.get_statuses()
-        if err is not None or not statuses:
+        if resolver_failed(statuses, err):
             logger.warning(
                 'Orphan reaper: get_statuses() returned %s — aborting sweep '
                 '(fail-safe against transient DB failure or empty task tree)',
@@ -1821,10 +1822,24 @@ Output JSON matching the schema. Every task must appear in the output.
         ``cleanup_worktree`` (swallow errors), call
         ``set_task_status('done', done_provenance={'commit': marker_sha, ...})``.
         """
-        statuses, _ = await self.scheduler.get_statuses()
+        statuses, err = await self.scheduler.get_statuses()
         reverted = 0
         marked_done = 0
         log_prefix = 'Reconcile (mid-run)' if mid_run else 'Reconcile'
+        if resolver_failed(statuses, err):
+            if err is not None:
+                logger.warning(
+                    '%s: get_statuses() returned error — aborting sweep (fail-safe)',
+                    log_prefix,
+                )
+            else:
+                # Empty-but-no-error is a normal idle state (no tasks yet);
+                # DEBUG to avoid recurring noise during early/idle periods.
+                logger.debug(
+                    '%s: get_statuses() returned empty — aborting sweep (no tasks)',
+                    log_prefix,
+                )
+            return 0
 
         # R4: sweep both 'in-progress' AND 'blocked' so out-of-band-merged
         # blocked tasks (manual `git merge` while task was blocked) get
@@ -3548,6 +3563,13 @@ Output JSON matching the schema. Every task must appear in the output.
             self.report.review_findings += review_report.findings_count
             self.report.review_tasks_created += len(review_report.tasks_created)
             self.report.review_cost_usd += review_report.cost_usd
+            if review_report.parse_failed:
+                logger.warning(
+                    'Full review %s: reviewer output was unparseable — review '
+                    'inconclusive (findings_count=%d is not a clean pass)',
+                    review_report.review_id,
+                    review_report.findings_count,
+                )
             logger.info(
                 'Full review complete: %d findings, %d tasks created',
                 review_report.findings_count,
@@ -3591,6 +3613,13 @@ Output JSON matching the schema. Every task must appear in the output.
             self.report.review_findings += review_report.findings_count
             self.report.review_tasks_created += len(review_report.tasks_created)
             self.report.review_cost_usd += review_report.cost_usd
+            if review_report.parse_failed:
+                logger.warning(
+                    'Review checkpoint %s: reviewer output was unparseable — '
+                    'review inconclusive (findings_count=%d is not a clean pass)',
+                    review_report.review_id,
+                    review_report.findings_count,
+                )
             logger.info(
                 'Review checkpoint complete: %d findings, %d tasks created, '
                 'cost=$%.2f',
@@ -4672,6 +4701,12 @@ Output JSON matching the schema. Every task must appear in the output.
             return 0
         statuses, error = await self.scheduler.get_statuses(active_ids)
         if error is not None:
+            logger.warning(
+                'Terminal-status watcher: get_statuses(%d active) failed: %s'
+                ' — skipping scan this cycle',
+                len(active_ids),
+                error,
+            )
             return 0
 
         threshold = self.config.terminal_status_hard_cancel_polls

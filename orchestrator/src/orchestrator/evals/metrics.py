@@ -217,7 +217,11 @@ async def collect_metrics(
 
 
 async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
-    """Get lines changed and files changed vs the pre-task baseline commit."""
+    """Get lines changed and files changed vs the pre-task baseline commit.
+
+    Returns (-1, -1) on git failure or subprocess error so callers can
+    distinguish a genuine zero-change diff from a failed measurement.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             'git', 'diff', '--stat', f'{base_commit}..HEAD',
@@ -225,7 +229,14 @@ async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await proc.communicate()
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                '_git_diff_stats: git diff --stat failed (rc=%s) base=%s: %s',
+                proc.returncode, base_commit,
+                stderr.decode(errors='replace')[:200],
+            )
+            return -1, -1
         output = stdout.decode().strip()
         if not output:
             return 0, 0
@@ -243,4 +254,8 @@ async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
 
         return lines_changed, files_changed
     except Exception:
-        return 0, 0
+        logger.warning(
+            '_git_diff_stats: git diff raised for base=%s',
+            base_commit, exc_info=True,
+        )
+        return -1, -1
