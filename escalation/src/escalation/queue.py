@@ -464,17 +464,25 @@ class EscalationQueue:
         resolved_by='l2-cascade:<L2-id>' stamp (does NOT persist/archive member records —
         members stay pending L1s covering their tasks).
 
-        Idempotent: if status != 'pending', returns existing record unchanged.
+        Idempotent: returns existing record unchanged if either (a) status != 'pending'
+        (already resolved/dismissed) or (b) resolution_action == 'park' AND resolution
+        is not None (already parked — resolution text was written by a prior park() call).
+        The combined second guard prevents a re-park from re-firing teardown callbacks
+        without falsely short-circuiting a first-time park() on an L2 whose
+        resolution_action was pre-set to 'park' but resolution is still None.
+        The first guard matches the contract of resolve().
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
             esc = self.get(escalation_id)
             if esc is None:
                 return None
 
-            if esc.status != 'pending':
+            if esc.status != 'pending' or (
+                esc.resolution_action == 'park' and esc.resolution is not None
+            ):
                 logger.info(
-                    'Escalation %s already %s; park() is a no-op',
-                    escalation_id, esc.status,
+                    'Escalation %s already %s (resolution_action=%r); park() is a no-op',
+                    escalation_id, esc.status, esc.resolution_action,
                 )
                 return esc
 
@@ -510,6 +518,15 @@ class EscalationQueue:
                         logger.warning(
                             'park cascade: member %s of L2 %s not found — skipping',
                             member_id, escalation_id,
+                        )
+                        continue
+                    if member.status != 'pending':
+                        # Mirror resolve()'s idempotent-member contract: skip members
+                        # that are already resolved/dismissed so that a terminal member
+                        # does not have its task driven to 'blocked' after closure.
+                        logger.debug(
+                            'park cascade: member %s of L2 %s already %s — skipping',
+                            member_id, escalation_id, member.status,
                         )
                         continue
                     # In-memory cascade signal only; no disk write.

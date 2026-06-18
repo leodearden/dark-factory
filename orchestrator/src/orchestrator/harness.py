@@ -4885,6 +4885,16 @@ Output JSON matching the schema. Every task must appear in the output.
         # The scheduler's _suppress_blocked_write would absorb park's OWN write.
         # A racing _mark_blocked writes the same 'blocked' value (idempotent) — no
         # suppression is needed.  restart('pending') and abandon('cancelled') still stamp.
+        #
+        # Trade-off: because the stamp is the mechanism that absorbs the racing
+        # _mark_blocked write, that workflow-emitted write now reaches the scheduler
+        # unsuppressed.  A 'blocked' transition triggers reconciliation per the project
+        # contract, so park can produce up to two 'blocked' writes (teardown + workflow
+        # cleanup) and therefore up to two reconciliation passes for the same task.
+        # Both writes are idempotent and the reconciliation passes converge immediately
+        # (task is already blocked + open escalation → no stranded_blocked filed).
+        # The duplicate cost is accepted because the alternative (stamping to suppress
+        # the workflow write) would also suppress park's own write → silent no-op.
         _should_stamp = target_status != 'blocked'
         if _should_stamp:
             self._action_teardown_tasks[task_id] += 1
