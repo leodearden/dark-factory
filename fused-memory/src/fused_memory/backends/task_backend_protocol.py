@@ -76,6 +76,19 @@ class TaskBackendProtocol(Protocol):
         """Return ``{id_str: status_str}`` without decoding metadata columns."""
         ...
 
+    async def get_statuses(
+        self,
+        project_root: str,
+        ids: list[str] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, str]:
+        """Return ``{id_str: status_str}`` for all tasks in *project_root*.
+
+        Higher-level counterpart to ``get_statuses_raw`` — implementations may
+        apply additional coercion (e.g. mapping ``NULL`` → ``'unknown'``).
+        """
+        ...
+
     # ── Mutations ──────────────────────────────────────────────────────
 
     async def set_task_status(

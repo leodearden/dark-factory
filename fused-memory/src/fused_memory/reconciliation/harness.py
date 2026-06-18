@@ -35,13 +35,18 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
 )
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
-from fused_memory.reconciliation.task_filter import FilteredTaskTree, filter_task_tree
+from fused_memory.reconciliation.task_filter import (
+    FilteredTaskTree,
+    cross_verify_task_counts,
+    filter_task_tree,
+)
 from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
 from fused_memory.services.memory_service import MemoryService
 
@@ -555,6 +560,8 @@ class ReconciliationHarness:
         assembled_payload: AssembledPayload | None = None,
         remediation_findings: list[dict] | None = None,
         filtered_task_tree: FilteredTaskTree | None = None,
+        task_count_verification: dict | None = None,
+        graphiti_queue_health: dict | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
 
@@ -564,6 +571,11 @@ class ReconciliationHarness:
         Note: filtered_task_tree here applies only to Stage 1 (MemoryConsolidator).
         Stage 2 (TaskKnowledgeSync) wiring is handled by the symmetric
         _configure_task_sync helper.
+
+        task_count_verification: cross_verify_task_counts record (available only
+            in full-cycle passes; None in remediation passes).
+        graphiti_queue_health: summarize_graphiti_queue_health record (available only
+            in full-cycle passes; None in remediation passes).
         """
         stage.episode_limit = tier.episode_limit
         stage.memory_limit = tier.memory_limit
@@ -572,6 +584,8 @@ class ReconciliationHarness:
         stage.assembled_payload = assembled_payload
         stage.remediation_findings = remediation_findings
         stage.filtered_task_tree = filtered_task_tree
+        stage.task_count_verification = task_count_verification
+        stage.graphiti_queue_health = graphiti_queue_health
 
     @staticmethod
     def _configure_task_sync(
@@ -667,6 +681,79 @@ class ReconciliationHarness:
                 f'_fetch_filtered_task_tree failed for {project_root!r}: {exc}'
             )
             return FilteredTaskTree()
+
+    async def _fetch_task_count_census(self, project_root: str) -> dict[str, str]:
+        """Fetch the authoritative {id: status} map from taskmaster.get_statuses().
+
+        Mirrors _fetch_filtered_task_tree's fail-open posture: guard against a
+        falsy taskmaster, an empty project_root, and any exception raised by
+        get_statuses — all degrade to an empty dict so the caller can distinguish
+        'not available' from a real status map.
+
+        Args:
+            project_root: Absolute path to the project root for taskmaster.
+
+        Returns:
+            {id: status} map, or {} when taskmaster is unavailable or the call fails.
+        """
+        if not self.taskmaster:
+            logger.info(
+                'reconciliation.task_count_census_taskmaster_disabled',
+                extra={'project_root': project_root},
+            )
+            return {}
+        if not project_root:
+            logger.info(
+                'reconciliation.task_count_census_empty_project_root',
+                extra={'project_root_repr': repr(project_root)},
+            )
+            return {}
+        try:
+            statuses = await self.taskmaster.get_statuses(project_root=project_root)
+            return statuses if isinstance(statuses, dict) else {}
+        except Exception as exc:
+            logger.warning(
+                f'_fetch_task_count_census failed for {project_root!r}: {exc}'
+            )
+            return {}
+
+    async def _check_graphiti_queue_health(self, project_id: str) -> dict | None:
+        """Read the Graphiti async-queue dead-letter count for project_id.
+
+        Uses DurableWriteQueue.get_stats(group_id=project_id) to classify the
+        queue state via summarize_graphiti_queue_health.  When dead_count > 0,
+        emits a WARNING-level log — this is the observable signal for the silent
+        drop that add_memory's success=True at enqueue time hides.
+
+        Args:
+            project_id: Project identifier, used as the queue group_id.
+
+        Returns:
+            Health record dict, or None when durable_queue is unavailable or
+            get_stats raises.
+        """
+        durable_queue = getattr(self.memory, 'durable_queue', None)
+        if durable_queue is None:
+            return None
+        try:
+            stats = await durable_queue.get_stats(group_id=project_id)
+            health = summarize_graphiti_queue_health(stats)
+            if not health['healthy']:
+                logger.warning(
+                    'reconciliation.graphiti_queue_unhealthy',
+                    extra={
+                        'project_id': project_id,
+                        'dead_count': health['dead_count'],
+                        'pending_count': health['pending_count'],
+                        'oldest_pending_age_seconds': health['oldest_pending_age_seconds'],
+                    },
+                )
+            return health
+        except Exception as exc:
+            logger.warning(
+                f'_check_graphiti_queue_health failed for project_id={project_id!r}: {exc}'
+            )
+            return None
 
     # ── Stale-run recovery ─────────────────────────────────────────────
 
@@ -1349,6 +1436,13 @@ class ReconciliationHarness:
         # Fetch filtered task tree once for the whole cycle (ref: task 455)
         filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
 
+        # Fetch authoritative task-count census and cross-verify against tree (task 1785)
+        statuses = await self._fetch_task_count_census(project_root)
+        task_count_verification = cross_verify_task_counts(filtered_task_tree, statuses)
+
+        # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
+        graphiti_queue_health = await self._check_graphiti_queue_health(project_id)
+
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
         stages = self._make_stages()
@@ -1368,6 +1462,8 @@ class ReconciliationHarness:
                         cycle_fence_time=cycle_start_time,
                         assembled_payload=assembled_payload,
                         filtered_task_tree=filtered_task_tree,
+                        task_count_verification=task_count_verification,
+                        graphiti_queue_health=graphiti_queue_health,
                     )
 
                 # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)

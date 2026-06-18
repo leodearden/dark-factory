@@ -13,6 +13,7 @@ from fused_memory.reconciliation.task_filter import (
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
     _render_task_line,
+    cross_verify_task_counts,
     detect_census_inconsistency,
     filter_task_tree,
     format_filtered_task_tree,
@@ -20,6 +21,7 @@ from fused_memory.reconciliation.task_filter import (
     id_key,
     render_active_section,
     select_visible_active,
+    summarize_statuses,
 )
 
 
@@ -2602,3 +2604,127 @@ class TestDetectTaskDumpContamination:
                 f'Expected contaminated=False for input {bad_input!r}, got {result}'
             )
             assert result['step_pattern_title_ids'] == []
+
+
+# ---------------------------------------------------------------------------
+# summarize_statuses — step-1 (RED) / step-2 (GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestSummarizeStatuses:
+    """summarize_statuses partitions a {id: status} map into census counts."""
+
+    def test_summarize_statuses_typical(self):
+        """Mixed statuses are classified correctly.
+
+        - 'pending', 'in-progress' -> active (2)
+        - 'done' x2 -> done (2)
+        - 'cancelled' -> cancelled (1)
+        - 'stalled' -> other (unknown status) (1)
+        total = 6
+        """
+        statuses = {
+            '1': 'pending',
+            '2': 'in-progress',
+            '3': 'done',
+            '4': 'done',
+            '5': 'cancelled',
+            '6': 'stalled',
+        }
+        result = summarize_statuses(statuses)
+
+        assert result['total'] == 6
+        assert result['done'] == 2
+        assert result['cancelled'] == 1
+        assert result['active'] == 2, (
+            f"Expected active=2 (pending+in-progress), got active={result['active']}"
+        )
+        assert result['other'] == 1, (
+            f"Expected other=1 (stalled=unknown), got other={result['other']}"
+        )
+
+    def test_summarize_statuses_empty(self):
+        """Empty map returns all-zero census."""
+        result = summarize_statuses({})
+
+        assert result['total'] == 0
+        assert result['done'] == 0
+        assert result['cancelled'] == 0
+        assert result['active'] == 0
+        assert result['other'] == 0
+
+    def test_summarize_statuses_all_active(self):
+        """All ACTIVE_TASK_STATUSES members map to the 'active' bucket."""
+        statuses = {
+            '1': 'pending',
+            '2': 'in-progress',
+            '3': 'blocked',
+            '4': 'deferred',
+            '5': 'review',
+            '6': 'merge-deferred',
+        }
+        result = summarize_statuses(statuses)
+
+        assert result['total'] == 6
+        assert result['active'] == 6
+        assert result['done'] == 0
+        assert result['cancelled'] == 0
+        assert result['other'] == 0
+
+
+# ---------------------------------------------------------------------------
+# cross_verify_task_counts — step-3 (RED) / step-4 (GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestCrossVerifyTaskCounts:
+    """cross_verify_task_counts compares authoritative get_statuses census against tree."""
+
+    def test_matching_returns_consistent(self):
+        """When authoritative census matches tree counts, consistent=True and no mismatches."""
+        tree = FilteredTaskTree(total_count=10, done_count=5)
+        statuses = {str(i): 'done' for i in range(5)}
+        statuses.update({str(i): 'pending' for i in range(5, 10)})
+
+        result = cross_verify_task_counts(tree, statuses)
+
+        assert result['available'] is True
+        assert result['consistent'] is True
+        assert result['total_mismatch'] is False
+        assert result['done_mismatch'] is False
+
+    def test_done_mismatch_detected(self):
+        """When authoritative done differs from tree.done_count, done_mismatch=True."""
+        tree = FilteredTaskTree(total_count=635, done_count=600)
+        # Authoritative: total=635, done=608
+        statuses = {str(i): 'done' for i in range(608)}
+        statuses.update({str(i): 'pending' for i in range(608, 635)})
+
+        result = cross_verify_task_counts(tree, statuses)
+
+        assert result['available'] is True
+        assert result['done_mismatch'] is True
+        assert result['total_mismatch'] is False
+        assert result['consistent'] is False
+        assert result['authoritative']['done'] == 608
+        assert result['authoritative']['total'] == 635
+        assert result['tree']['done'] == 600
+        assert result['tree']['total'] == 635
+
+    def test_empty_statuses_returns_unavailable_consistent(self):
+        """Empty statuses dict -> available=False, consistent=True (fail-open: no false alarm)."""
+        tree = FilteredTaskTree(total_count=100, done_count=50)
+
+        result = cross_verify_task_counts(tree, {})
+
+        assert result['available'] is False
+        assert result['consistent'] is True
+
+    def test_none_statuses_returns_unavailable_consistent(self):
+        """None statuses -> available=False, consistent=True (fail-open)."""
+        tree = FilteredTaskTree(total_count=100, done_count=50)
+
+        result = cross_verify_task_counts(tree, None)
+
+        assert result['available'] is False
+        assert result['consistent'] is True

@@ -284,6 +284,103 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
 # --------------------------------------------------------------------------- #
 
 
+def summarize_statuses(statuses: dict[str, str]) -> dict:
+    """Return a census dict from an authoritative {id: status} map.
+
+    Classifies each status using the project-wide ACTIVE_TASK_STATUSES and
+    INACTIVE_TASK_STATUSES sets so census semantics stay identical to
+    filter_task_tree — single source of truth for status classification.
+
+    Returns:
+        dict with integer counts for 'total', 'done', 'cancelled', 'active',
+        and 'other' (unknown/unrecognised statuses).
+
+    Pure: no I/O, no side effects.
+    """
+    total = 0
+    done = 0
+    cancelled = 0
+    active = 0
+    other = 0
+
+    for status in statuses.values():
+        total += 1
+        if status == 'done':
+            done += 1
+        elif status == 'cancelled':
+            cancelled += 1
+        elif status in ACTIVE_TASK_STATUSES:
+            active += 1
+        else:
+            other += 1
+
+    return {
+        'total': total,
+        'done': done,
+        'cancelled': cancelled,
+        'active': active,
+        'other': other,
+    }
+
+
+def cross_verify_task_counts(tree: FilteredTaskTree, statuses: dict[str, str] | None) -> dict:
+    """Compare authoritative get_statuses census against the get_tasks-derived tree.
+
+    When the status map is empty or None (taskmaster unavailable), returns
+    available=False, consistent=True — fail-open: no spurious mismatch warning.
+    When available, compares census total/done against tree.total_count and
+    tree.done_count and flags any discrepancy.
+
+    Args:
+        tree: FilteredTaskTree from filter_task_tree() (the get_tasks read path).
+        statuses: Compact {id: status} map from get_statuses(), or None/empty.
+
+    Returns:
+        dict with:
+            available (bool): False when statuses is empty/None.
+            consistent (bool): True when available and no mismatches.
+            total_mismatch (bool): set when available and totals differ.
+            done_mismatch (bool): set when available and done counts differ.
+            authoritative (dict): census from statuses (when available).
+            tree (dict): {'total': tree.total_count, 'done': tree.done_count}.
+
+    Note on read-skew: the census and the tree are produced by two independent reads
+    (get_tasks then get_statuses) taken a moment apart. A status transition committed
+    between the two reads can produce a transient total_mismatch/done_mismatch that
+    resolves itself next cycle — these are read-skew artefacts rather than the
+    truncation incident this diagnostic is designed to catch. Single-cycle divergences
+    should be treated as advisory; only divergence that persists across consecutive
+    cycles warrants escalation.
+
+    Pure: no I/O, no side effects.
+    """
+    _unavailable = {
+        'available': False,
+        'consistent': True,
+        'total_mismatch': False,
+        'done_mismatch': False,
+        'authoritative': None,
+        'tree': {'total': tree.total_count, 'done': tree.done_count},
+    }
+
+    if not statuses:
+        return _unavailable
+
+    census = summarize_statuses(statuses)
+    total_mismatch = census['total'] != tree.total_count
+    done_mismatch = census['done'] != tree.done_count
+    consistent = not total_mismatch and not done_mismatch
+
+    return {
+        'available': True,
+        'consistent': consistent,
+        'total_mismatch': total_mismatch,
+        'done_mismatch': done_mismatch,
+        'authoritative': census,
+        'tree': {'total': tree.total_count, 'done': tree.done_count},
+    }
+
+
 def detect_census_inconsistency(max_task_id: int, referenced_ids: Iterable) -> list[int]:
     """Return referenced task ids that strictly exceed the census maximum.
 

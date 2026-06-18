@@ -62,6 +62,14 @@ class MemoryConsolidator(BaseStage):
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
 
+    # Authoritative task-count cross-verification record — set by harness (task 1785).
+    # None when the status map was unavailable (e.g. taskmaster down) or in remediation passes.
+    task_count_verification: dict | None = None
+
+    # Graphiti async-queue health record — set by harness (task 1785).
+    # None when durable_queue was unavailable or in remediation passes.
+    graphiti_queue_health: dict | None = None
+
     # Count of snapshot lines stripped from the payload in the current cycle (task 1547)
     _entity_summary_snapshot_lines_stripped: int = 0
 
@@ -141,6 +149,39 @@ class MemoryConsolidator(BaseStage):
                         'run_id': run_id,
                         'census_max': self.filtered_task_tree.max_task_id,
                         'offending_ids': inconsistent,
+                    },
+                )
+
+        # ── Task-count cross-verification (task 1785) ─────────────────────────
+        # Surface the authoritative get_statuses census vs. get_tasks-derived
+        # FilteredTaskTree comparison so the async judge / recon report can act
+        # on count divergence without relying on a possibly-dropped Graphiti edge.
+        if self.task_count_verification is not None:
+            report.stats['task_count_verification'] = self.task_count_verification
+            if not self.task_count_verification.get('consistent', True):
+                logger.warning(
+                    'reconciliation.task_count_divergence',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                        'authoritative': self.task_count_verification.get('authoritative'),
+                        'tree': self.task_count_verification.get('tree'),
+                    },
+                )
+
+        # ── Graphiti async-queue health (task 1785) ────────────────────────────
+        # Surface the dead-letter count from DurableWriteQueue so the silent
+        # add_memory drop (success=True at enqueue, dead-lettered asynchronously)
+        # is visible in the Stage 1 report.
+        if self.graphiti_queue_health is not None:
+            report.stats['graphiti_queue_health'] = self.graphiti_queue_health
+            if not self.graphiti_queue_health.get('healthy', True):
+                logger.warning(
+                    'reconciliation.graphiti_queue_unhealthy_stage1',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                        'dead_count': self.graphiti_queue_health.get('dead_count'),
                     },
                 )
 
@@ -266,6 +307,9 @@ class MemoryConsolidator(BaseStage):
         # 7. Active task tree (task 455)
         task_tree_section = self._build_task_tree_section()
 
+        # 7b. Task Count Census (task 1785)
+        task_count_census_section = self._build_task_count_census_section()
+
         # 8. Format
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
@@ -291,7 +335,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{summary_nonce_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -339,6 +383,9 @@ Review the above data and perform memory consolidation:
         # Active task tree (task 455)
         task_tree_section = self._build_task_tree_section()
 
+        # Task Count Census (task 1785)
+        task_count_census_section = self._build_task_count_census_section()
+
         # Per-cycle summary nonce (task 1574)
         summary_nonce_section = self._build_summary_nonce_section()
 
@@ -359,7 +406,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{summary_nonce_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -392,6 +439,37 @@ Review the above data and perform memory consolidation:
         if self.filtered_task_tree is None:
             return ''
         return '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
+
+    def _build_task_count_census_section(self) -> str:
+        """Return the Task Count Census payload section, or empty string if unavailable.
+
+        Mirrors _build_task_tree_section — inserted into both assemble_payload and
+        _format_assembled_payload alongside task_tree_section.  The authoritative
+        counts come from get_statuses (a deterministic compact read) rather than the
+        async-queued Graphiti snapshot edge that triggered the run-929b4135 incident.
+
+        Returns '' when task_count_verification is None so the payload is unchanged
+        for remediation passes and for cycles where get_statuses was unavailable.
+        """
+        if self.task_count_verification is None:
+            return ''
+        v = self.task_count_verification
+        if not v.get('available'):
+            return ''
+        auth = v.get('authoritative') or {}
+        auth_total = auth.get('total', 'unknown')
+        auth_done = auth.get('done', 'unknown')
+        divergence_note = ''
+        if not v.get('consistent', True):
+            tree = v.get('tree') or {}
+            divergence_note = (
+                f'\n⚠ Divergence detected: tree reports done={tree.get("done", "?")} '
+                f'vs authoritative done={auth_done}.'
+            )
+        return (
+            f'\n### Task Count Census (authoritative — from get_statuses)\n'
+            f'Total: {auth_total}, Done: {auth_done}{divergence_note}\n'
+        )
 
     def _build_summary_nonce_section(self) -> str:
         """Return the Per-Cycle Summary Nonce payload section with a fresh STAGE1-prefixed nonce.
