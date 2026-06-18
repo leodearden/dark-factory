@@ -384,6 +384,52 @@ class TestReadTaskArtifacts:
 
         assert result['files'] == []
 
+    def test_warns_on_corrupt_plan_json(self, tmp_path, caplog):
+        """read_task_artifacts must emit a WARNING when plan.json is corrupt JSON.
+
+        After fix: routes through load_json_or_warn which warns on JSONDecodeError.
+        Fails today because bare except silently swallows corruption.
+        NOTE: give each case a distinct tmp_path (pytest does) so dedup doesn't block.
+        """
+        import logging
+
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        (task_dir / 'plan.json').write_text('{not valid json')
+
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        with caplog.at_level(logging.WARNING):
+            result = read_task_artifacts(tmp_path)
+
+        # Safe defaults
+        assert result['plan_progress'] == {'done': 0, 'total': 0}
+        assert result['files'] == []
+        # Must emit a WARNING for the corrupt file
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, 'expected a WARNING for corrupt plan.json, got none'
+
+    def test_no_warning_on_absent_plan_json(self, tmp_path, caplog):
+        """read_task_artifacts must NOT emit a WARNING for a missing (not-yet-planned) plan.json.
+
+        Benign first-run absence stays silent; only corruption is loud.
+        """
+        import logging
+
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        # No plan.json written — simulates not-yet-planned task
+
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        with caplog.at_level(logging.WARNING):
+            result = read_task_artifacts(tmp_path)
+
+        assert result['phase'] == 'PLAN'
+        assert result['plan_progress'] == {'done': 0, 'total': 0}
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings, f'expected no WARNING for absent plan.json, got: {warnings}'
+
 
 class TestExtractTaskId:
     """Tests for _extract_task_id — normalises worktree directory names to numeric task IDs."""
