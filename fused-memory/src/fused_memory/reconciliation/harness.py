@@ -1667,6 +1667,7 @@ class ReconciliationHarness:
         try:
             recent = await self.journal.get_recent_runs(project_id, limit=lookback)
             count = 0
+            any_item_fp_failed = False
             for run in recent:
                 if run.status != 'completed':
                     continue
@@ -1687,10 +1688,20 @@ class ReconciliationHarness:
                             item.get('description') or '',
                         )
                     except Exception:
+                        any_item_fp_failed = True
                         continue
                     if fp == target_fp:
                         count += 1
                         break  # one match per run is enough
+            if any_item_fp_failed:
+                logger.warning(
+                    'reconciliation.persistence_item_fingerprint_failed',
+                    extra={
+                        'project_id': project_id,
+                        'finding_category': finding.get('category', ''),
+                    },
+                )
+                return max(count, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)
             return count
         except Exception as _e:
             logger.warning(

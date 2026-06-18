@@ -257,12 +257,13 @@ class MemoryConsolidator(BaseStage):
                 f'got episode_limit={self.episode_limit}, memory_limit={self.memory_limit}'
             )
 
+        # Reset run-local degraded list before fetches (must precede every early-return so
+        # reused instances never leak a stale list into a subsequent remediation run's stats)
+        self._fetch_degraded_sources = []
+
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
             return self._assemble_remediation_payload()
-
-        # Reset run-local degraded list before fetches
-        self._fetch_degraded_sources = []
 
         # 1. Episodes since last reconciliation
         try:

@@ -103,6 +103,14 @@ class SearchResults(list):
     Attributes:
         degraded: True when one or more selected stores raised or timed out.
         failed_stores: List of store name strings (SourceStore.value) that failed.
+
+    .. warning::
+        The `degraded` and `failed_stores` metadata do **not** survive list-returning
+        operations (slicing, sorted(), concatenation, list comprehensions).  Those
+        operations return a plain ``list``, silently dropping the degrade metadata.
+        Callers that need the metadata after a transform should read the attributes
+        *before* the transform, or pass the SearchResults object directly without
+        intermediate list operations.
     """
 
     def __init__(self, iterable=(), *, degraded: bool = False, failed_stores=None):
