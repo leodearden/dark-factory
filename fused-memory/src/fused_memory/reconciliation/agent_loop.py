@@ -429,6 +429,18 @@ class _CLIResponseAdapter:
     the anthropic/openai branches) and direct attribute access (for
     delegation-level tests and future callers that don't need the block list):
     ``.thinking``, ``.tool_calls``, ``.session_id``, ``.warning``.
+
+    Note on ``.warning``: this attribute surfaces the specific CLI-failure
+    token (``'cli_output_unparseable'`` / ``'cli_output_empty'``) to the log
+    and to delegation-level tests.  It is intentionally **not** propagated
+    through ``AgentLoop.run()``'s return value, which emits the generic
+    ``{'warning': 'no_tool_calls'}`` shape regardless of the origin.
+    Site-22's ``extract_agent_verdict`` guard already converts that shape
+    into the loud ``'agent-failed:no_tool_calls'`` sentinel end-to-end, so
+    threading the more specific token through ``run()`` would add surface
+    area (and break existing adapter-independent tests) for no required
+    behaviour change.  Revisit if a downstream caller ever needs to
+    distinguish the two origins.
     """
 
     def __init__(self, structured_output: dict, session_id: str = ''):

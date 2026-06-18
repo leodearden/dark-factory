@@ -81,6 +81,52 @@ async def test_verify_agent_failure_emits_warning_and_sentinel_summary(
 
 
 # ---------------------------------------------------------------------------
+# NON-DICT failure-path test (guards the `verdict.raw or {}` fallback in
+# verify.py against future refactors — extract_agent_verdict has its own
+# unit coverage for this, but the verify()-level round-trip is distinct).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_verify_agent_failure_non_dict_uses_error_summary(caplog):
+    """When AgentLoop.run() returns a non-dict result (e.g. None),
+    extract_agent_verdict falls back to error_summary='verify_failed' as the
+    token.  verify() must:
+
+    - return verdict='inconclusive' (VerificationVerdict constraint)
+    - return summary='agent-failed:verify_failed' (error_summary token)
+    - return confidence=0.0, evidence=[], git_context=None
+      (all from ``verdict.raw or {}`` which resolves to ``{}`` when raw is None)
+    - emit at least one WARNING record containing 'verify_failed'
+    """
+    with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
+        mock_agent_instance = AsyncMock()
+        mock_agent_instance.run = AsyncMock(return_value=(None, []))
+        MockAgentLoop.return_value = mock_agent_instance
+
+        verifier = CodebaseVerifier(_default_config())
+
+        with caplog.at_level(logging.WARNING):
+            result = await verifier.verify(claim='Task X completed')
+
+    assert result.verdict == 'inconclusive', (
+        f'Expected inconclusive but got {result.verdict!r}'
+    )
+    assert result.summary == 'agent-failed:verify_failed', (
+        f'Expected agent-failed:verify_failed but got {result.summary!r}'
+    )
+    assert result.confidence == 0.0
+    assert result.evidence == []
+    assert result.git_context is None
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning_records, 'Expected at least one WARNING record, got none'
+    assert any('verify_failed' in r.message for r in warning_records), (
+        f'Expected a WARNING message containing "verify_failed", '
+        f'got: {[r.message for r in warning_records]}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # SUCCESS-PATH test (written now; must stay green before AND after step-2)
 # ---------------------------------------------------------------------------
 
