@@ -143,6 +143,7 @@ def harness_for_run_slot() -> Harness:
     # scheduler — only release() is called from _run_slot's finally
     h.scheduler = MagicMock()
     h.scheduler.release = MagicMock()
+    h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
     return h
 
 
