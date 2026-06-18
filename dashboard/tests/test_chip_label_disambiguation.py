@@ -185,3 +185,40 @@ class TestDisambiguateLabels:
                     f"Label '{label}' for key '{key}' is not minimal: "
                     f"shorter suffix '{shorter}' doesn't appear in any other key"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Step-3: Source-structure tests for tabs.jsx (LockChip wiring)
+# (RED because tabs.jsx still defines shortPath and never calls
+# disambiguateLabels)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def tabs_jsx_body(_client):
+    return _client.get('/static/redux/tabs.jsx').text
+
+
+class TestTabsJsxLockChipWiring:
+    def test_shortpath_function_removed(self, tabs_jsx_body):
+        # The duplicate local shortener must be gone
+        assert 'function shortPath' not in tabs_jsx_body, (
+            'shortPath function still present in tabs.jsx — should be deleted'
+        )
+
+    def test_shortpath_call_removed(self, tabs_jsx_body):
+        # No call site remains either
+        assert 'shortPath(' not in tabs_jsx_body, (
+            'shortPath( call still present in tabs.jsx — should be removed'
+        )
+
+    def test_disambiguate_labels_routed(self, tabs_jsx_body):
+        # LocksCell must route the lockSet through the shared helper
+        assert 'disambiguateLabels(' in tabs_jsx_body, (
+            'disambiguateLabels( not found in tabs.jsx — wiring missing'
+        )
+
+    def test_full_key_title_preserved(self, tabs_jsx_body):
+        # LockChip must still render a title containing the path
+        assert re.search(r'title=\{[^}]*path', tabs_jsx_body), (
+            'LockChip title={...path...} hover attribute not found in tabs.jsx'
+        )
