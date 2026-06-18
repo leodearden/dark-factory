@@ -1697,6 +1697,10 @@ class Scheduler:
             external_deps: list = (
                 (task.get('metadata') or {}).get('external_deps') or []
             )
+            # Track whether any dep left this task held in a live (non-done,
+            # non-sentinel) status this tick — used to drive hold-streak
+            # visibility after the dep loop.
+            held_live = False
             for dep in external_deps:
                 status = external_cache.get(dep)
 
@@ -1784,8 +1788,23 @@ class Scheduler:
                 else:
                     # Any other live status (pending, in-progress, blocked, …):
                     # wait silently and reset the sentinel counter so transient
-                    # blips don't accumulate.
+                    # blips don't accumulate.  Mark this task as held by a live
+                    # dep so we can emit a visibility event if this persists.
                     self._external_unresolved_counts.pop((task_id, dep), None)
+                    held_live = True
+
+            # After the dep loop: drive the hold-streak for live-status holds.
+            # - If any dep kept the task held (held_live): bump+emit streak.
+            # - Otherwise (all deps done or task was blocked via cancelled/sentinel):
+            #   pop the streak so recovery is visible (streak resets cleanly).
+            if held_live:
+                self._note_external_hold(
+                    task_id,
+                    cause='deps_live',
+                    threshold=threshold,
+                )
+            else:
+                self._external_hold_streak.pop(task_id, None)
 
     async def update_task(
         self,
