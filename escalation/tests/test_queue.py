@@ -1938,6 +1938,50 @@ class TestFindPendingL2ByRootCause:
             f'Expected match despite trailing whitespace; got {result!r}'
         )
 
+    def test_l2_corrupt_timestamp_still_considered_with_warning(
+        self, tmp_path: Path, caplog,
+    ):
+        """(h) Corrupt timestamp on a matching L2 → still returned AND a WARNING is emitted.
+
+        Bug in current code: silent datetime.min substitution produces no log output.
+        The entry is still considered (datetime.min sorts oldest, is included), but
+        operators can't see the data-quality issue.
+
+        Fix: parse_timestamp_or_warn emits a WARNING mentioning the context string.
+        RED assertion: zero warnings → assertion (b) fails.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = Escalation(
+            id=queue.make_id('task-99'),
+            task_id='task-99',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster corrupt-ts test',
+            level=2,
+            root_cause='Bad merge strategy',
+        )
+        l2.timestamp = 'not-a-timestamp'
+        queue.submit(l2)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.find_pending_l2_by_root_cause('Bad merge strategy')
+
+        # (a) Entry still CONSIDERED — datetime.min sorts oldest, included in results
+        assert result == l2.id, (
+            f'Expected corrupt-ts L2 to still be returned; got result={result!r}'
+        )
+
+        # (b) A WARNING must be emitted mentioning the context tag
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'queue.find_pending_l2_by_root_cause' in r.message
+        ]
+        assert warning_records, (
+            f"Expected >=1 WARNING mentioning 'queue.find_pending_l2_by_root_cause'; "
+            f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
+        )
+
 
 class TestAddMembersToL2:
     """EscalationQueue.add_members_to_l2() appends member ids to a pending L2."""
