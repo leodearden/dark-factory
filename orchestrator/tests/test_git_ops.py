@@ -5968,3 +5968,119 @@ class TestCreateWorktreeWarmLaneRouting:
         expected = git_ops.worktree_base / 'C'
         assert info.path == expected
         assert info.path.exists()
+
+
+# ===========================================================================
+# Step-15: RED — cleanup_worktree is pool-aware (releases lane, not removes)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestCleanupWorktreePoolAware:
+    """cleanup_worktree routes to release_warm_lane for lanes; cold path unchanged."""
+
+    async def test_cleanup_lane_not_removed(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a lane retains the registered worktree (not removed)."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        # Cleanup the lane
+        await git_ops.cleanup_worktree(info.path, 'A')
+
+        # The lane dir must still exist as a registered worktree
+        assert await git_ops._is_registered_worktree(info.path), (
+            '_lane-0 must remain registered after cleanup (pool-aware)'
+        )
+
+    async def test_cleanup_lane_target_retained(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a lane retains target/ warmth."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        assert (info.path / 'target' / 'seeded.bin').exists(), 'prereq: seed ran'
+        await git_ops.cleanup_worktree(info.path, 'A')
+
+        assert (info.path / 'target').exists(), 'target/ must be retained after cleanup'
+
+    async def test_cleanup_lane_pool_freed(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a lane flips the pool state back to FREE."""
+        from orchestrator.warm_lane_pool import LaneState
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
+
+        await git_ops.cleanup_worktree(info.path, 'A')
+
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE
+
+    async def test_cleanup_lane_branch_deleted(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a lane deletes branch task/A."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+        info = await git_ops.create_worktree('A')
+
+        await git_ops.cleanup_worktree(info.path, 'A')
+
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc != 0, 'task/A branch must be deleted after cleanup'
+
+    async def test_cleanup_cold_worktree_removed(
+        self, git_repo: Path,
+    ):
+        """cleanup_worktree on a cold (non-lane) path removes the worktree as before."""
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        # Exhaust the pool so Z goes to cold path
+        info_A = await git_ops.create_worktree('A')  # -> _lane-0
+        info_Z = await git_ops.create_worktree('Z')  # -> cold <base>/Z
+        cold_path = git_ops.worktree_base / 'Z'
+        assert info_Z.path == cold_path
+
+        # Cleanup the cold worktree — must be removed
+        await git_ops.cleanup_worktree(info_Z.path, 'Z')
+        assert not cold_path.exists(), 'Cold worktree must be removed by cleanup'
+
+    async def test_cleanup_knob_off_cold_path(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """With pool disabled (default fixture), cleanup_worktree removes the worktree."""
+        info = await git_ops.create_worktree('D')
+        assert info.path.exists()
+
+        await git_ops.cleanup_worktree(info.path, 'D')
+
+        assert not info.path.exists(), 'Cold worktree must be removed when pool disabled'
