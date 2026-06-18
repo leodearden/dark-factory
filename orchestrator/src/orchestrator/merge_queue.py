@@ -3630,6 +3630,25 @@ class InflightEntry:
 
 
 @dataclass
+class _HostUnavailability:
+    """Per-host RunnerUnavailable streak tracker entry (task 1795).
+
+    Tracks consecutive failures so the worker can fire a dedup'd escalation
+    once the streak threshold is reached, and can clear state on recovery.
+
+    Fields
+    ------
+    streak              : consecutive RunnerUnavailable count for this host.
+    first_unavailable_at: time.time() of the first failure in this episode.
+    reason              : str(exc) from the most recent RunnerUnavailable.
+    """
+
+    streak: int
+    first_unavailable_at: float
+    reason: str
+
+
+@dataclass
 class InflightVerifyResult:
     """Result returned by SpeculativeMergeWorker._run_inflight_verify.
 
@@ -5060,6 +5079,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # tradeoff accepted; see plan.json §Mechanism-4 design notes).
         self._drift_land_count: int = 0
         self._runner_quarantine: set[str] = set()
+        # Per-host RunnerUnavailable streak tracker (task 1795).  Keyed by
+        # runner name; entries created on first failure, popped on recovery.
+        # Used by _record_runner_unavailable / _record_runner_recovered to fire
+        # a dedup'd escalation and auto-reprobe on recovery.  None-safe at call
+        # sites: only populated when remote runners are configured.
+        self._runner_unavailable: dict[str, _HostUnavailability] = {}
+        # Thresholds for firing / probing (copies of config knobs set by
+        # _ensure_host_allocator; defaults keep bare-worker tests green).
+        # Override in tests to drive threshold logic synchronously (mirrors
+        # _heartbeat_interval_s precedent).
+        self._unreachable_escalate_after_n: int = 3
+        self._unreachable_escalate_after_secs: float = 600.0
+        self._reprobe_interval_s: float = 120.0
         # In-flight drift-detective asyncio.Tasks.  asyncio keeps only a WEAK
         # reference to running tasks, so without a strong ref here the drift
         # detective can be GC'd mid-run and a remote-PASS / local-FAIL
@@ -5198,6 +5230,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # without caching so a subsequent call with project_root set builds the
         # fully-populated instance.
         return HostAllocator([], quarantine=self._runner_quarantine)
+
+    # ── per-host RunnerUnavailable streak tracker (task 1795) ────────────
+
+    def _record_runner_unavailable(
+        self, host: str, reason: str, now: float
+    ) -> bool:
+        """Record one RunnerUnavailable failure for *host* and return whether to escalate.
+
+        Creates a new ``_HostUnavailability`` entry on the first call, then
+        increments ``streak`` on each subsequent call.  ``first_unavailable_at``
+        is fixed to the first-call timestamp so duration can be computed later.
+        ``reason`` is refreshed to the most-recent exception message.
+
+        Returns ``True`` when ``streak >= self._unreachable_escalate_after_n``
+        (the caller should fire ``_alarm_verify_host_unreachable``), ``False``
+        otherwise.  The streak is persistent until ``_record_runner_recovered``
+        clears it, so consecutive calls beyond the threshold continue returning
+        ``True`` (the alarm helper's ``has_open_l1`` dedup prevents re-submitting).
+        """
+        if host in self._runner_unavailable:
+            entry = self._runner_unavailable[host]
+            entry.streak += 1
+            entry.reason = reason
+        else:
+            self._runner_unavailable[host] = _HostUnavailability(
+                streak=1,
+                first_unavailable_at=now,
+                reason=reason,
+            )
+        return self._runner_unavailable[host].streak >= self._unreachable_escalate_after_n
+
+    def _record_runner_recovered(self, host: str) -> None:
+        """Clear the unavailability tracker entry for *host* (idempotent).
+
+        After this call, a subsequent ``_record_runner_unavailable`` starts a
+        fresh episode with ``streak=1`` and a new ``first_unavailable_at``.
+        """
+        self._runner_unavailable.pop(host, None)
 
     # ── owned-worktree liveness ledger ───────────────────────────────────
 
