@@ -4067,9 +4067,10 @@ Output JSON matching the schema. Every task must appear in the output.
             branch_prefix=self.config.git.branch_prefix,
         )
         logger.info(
-            '_recover_pending_merges: recovered=%d dropped=%d',
+            '_recover_pending_merges: recovered=%d dropped=%d journal_corrupt=%s',
             report.get('recovered', 0),
             report.get('dropped', 0),
+            report.get('journal_corrupt', False),
         )
 
     async def _stop_escalation_server(self) -> None:

@@ -271,6 +271,16 @@ async def recover_pending_merges(
     """
     from orchestrator.merge_queue import enqueue_merge_request  # avoid circular
 
+    # Detect and loudly surface a corrupt journal so pending merges are NOT
+    # silently dropped — operators must see the distinction between a corrupt
+    # journal (possible data loss) and a fresh/empty one (nothing to recover).
+    if store.journal_corrupt:
+        logger.warning(
+            'merge_queue_store: journal was corrupt at startup — pending merges'
+            ' may have been lost and cannot be recovered from the journal;'
+            ' scheduler will rediscover/redispatch affected tasks'
+        )
+
     records = store.load()
     recovered = 0
     dropped = 0
@@ -340,4 +350,9 @@ async def recover_pending_merges(
                 exc_info=True,
             )
 
-    return {'recovered': recovered, 'dropped': dropped, 'requests': recovered_requests}
+    return {
+        'recovered': recovered,
+        'dropped': dropped,
+        'requests': recovered_requests,
+        'journal_corrupt': store.journal_corrupt,
+    }
