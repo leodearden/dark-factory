@@ -4863,6 +4863,139 @@ class TestMultiProjectRoutingWiring:
         fake_adj.adjudicate.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_stage2_hit_reject_returns_error_with_llm_reason(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """HIT + REJECT: adjudicator confirms misroute → error dict returned,
+        escalator called once carrying the adjudicator's llm_reason."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        reject_verdict = AdjudicationVerdict(
+            verdict='reject',
+            reason='genuine misroute — task edits orchestrator/harness.py',
+            llm_used=True,
+        )
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock(return_value=reject_verdict)
+        interceptor._path_scope_adjudicator = fake_adj
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='reify',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'Edit fused-memory/X'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Rejection error dict returned.
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        # Escalator called exactly once with the LLM reason.
+        assert len(escalator_calls) == 1
+        call = escalator_calls[0]
+        assert call['llm_reason'] == 'genuine misroute — task edits orchestrator/harness.py'
+
+    @pytest.mark.asyncio
+    async def test_stage2_hit_failsafe_rejects_and_escalates_with_reason(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """HIT + FAIL-SAFE (uncertain/failed): LLM outage never lets misroute through;
+        escalator is called with llm_reason from the fail-safe verdict."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        # Fail-safe verdict (uncertain + failed — simulates breaker-open / hang).
+        failsafe_verdict = AdjudicationVerdict(
+            verdict='uncertain',
+            reason='breaker-open',
+            failed=True,
+            llm_used=False,
+        )
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock(return_value=failsafe_verdict)
+        interceptor._path_scope_adjudicator = fake_adj
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='other',
+            matched_paths=('crates/',),
+            suggested_project='reify',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'crates/widget'},
+            '/foo',
+            'other',
+        )
+        # Guard preserved — misroute rejected even with LLM outage.
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        # Escalated once, carrying the fail-safe reason.
+        assert len(escalator_calls) == 1
+        assert escalator_calls[0]['llm_reason'] == 'breaker-open'
+
+    @pytest.mark.asyncio
     async def test_stage2_hit_allow_permits_creation_no_escalation(
         self,
         interceptor,
