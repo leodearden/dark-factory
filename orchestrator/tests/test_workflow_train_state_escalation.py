@@ -16,6 +16,7 @@ get_tasks returns a list[dict] — mocks return a plain list.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -337,3 +338,39 @@ async def test_build_train_state_fallback_fetches_active_statuses():
     assert '101' in result['parked_members'], (
         f"merge-deferred sibling '101' must be in parked_members, got {result}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-7 RED: _build_train_state binds err + WARNING
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_train_state_emits_warning_on_get_statuses_error(caplog):
+    """_build_train_state with get_statuses error → still returns TrainState + WARNING.
+
+    Pre-fix: err is discarded (statuses, _ = ...), no WARNING fires → RED.
+    After fix: WARNING at 'orchestrator.workflow' + TrainState with parked_members==[].
+    """
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': 'T1', 'order': 1, 'members': ['101', '102']}},
+        get_statuses_return=({}, RuntimeError('mcp down')),
+    )
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+        result = await f.wf._build_train_state()
+
+    # Must still return a valid TrainState dict (fail-safe-DEGRADE)
+    assert result is not None, 'Expected TrainState dict, got None'
+    assert result['id'] == 'T1'
+    assert result['order'] == 1
+    assert result['failing_member'] == '103'
+    assert result['parked_members'] == [], (
+        f'Expected empty parked_members on error, got {result["parked_members"]!r}'
+    )
+    # Must have emitted a WARNING naming the error
+    assert any(
+        r.levelno >= logging.WARNING
+        for r in caplog.records
+    ), f'Expected WARNING; got: {[r.message for r in caplog.records]!r}'
