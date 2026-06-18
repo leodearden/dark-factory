@@ -1941,3 +1941,52 @@ async def test_remove_dependency_qualified_warns_and_does_not_falsely_claim_remo
     assert row['metadata'] == _CORRUPT_BLOB, (
         f'Expected metadata unchanged; got: {row["metadata"]!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
+    backend, project_root, caplog,
+):
+    """The shared _warned_malformed_task_ids set deduplicates across the read
+    and write paths: a read via get_task followed by a write via update_task
+    on the SAME (project_root, tag='master', id=1) produces exactly ONE
+    malformed-metadata WARNING total.
+
+    Locks the 'unify onto the extracted handler, don't duplicate' directive:
+    a regression that gave the write path a separate dedup set would yield
+    2 WARNING records and fail this assertion.
+
+    Behavior delivered by steps 2+4; this step adds no production code.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        # Read path warns once via _row_to_task → _warn_malformed_metadata_once.
+        await backend.get_task('1', project_root=project_root)
+
+        # Write path on the same (project_root, master, 1) — the dedup key
+        # was already added above, so the shared gate skips the second WARN.
+        with pytest.raises(TaskmasterError):
+            await backend.update_task(
+                '1', project_root=project_root,
+                metadata=json.dumps({'x': 1}),
+                append=True,
+            )
+
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly 1 malformed-metadata WARNING (deduped across '
+        f'read+write paths on same key); got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
