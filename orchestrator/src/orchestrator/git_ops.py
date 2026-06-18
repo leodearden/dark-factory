@@ -485,7 +485,7 @@ class GitOps:
         self._warm_lane_pool_size = warm_lane_pool_size
         if warm_lane_pool_size > 0 and config.warm_lane_pool:
             from orchestrator.warm_lane_pool import WarmLanePool
-            self.warm_lane_pool: 'WarmLanePool | None' = WarmLanePool(
+            self.warm_lane_pool: WarmLanePool | None = WarmLanePool(
                 worktree_base=self.worktree_base,
                 size=warm_lane_pool_size,
             )

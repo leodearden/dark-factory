@@ -6028,6 +6028,7 @@ class TestCleanupWorktreePoolAware:
         )
         git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
         info = await git_ops.create_worktree('A')
+        assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
 
         await git_ops.cleanup_worktree(info.path, 'A')
@@ -6065,7 +6066,7 @@ class TestCleanupWorktreePoolAware:
         git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
 
         # Exhaust the pool so Z goes to cold path
-        info_A = await git_ops.create_worktree('A')  # -> _lane-0
+        _info_A = await git_ops.create_worktree('A')  # -> _lane-0
         info_Z = await git_ops.create_worktree('Z')  # -> cold <base>/Z
         cold_path = git_ops.worktree_base / 'Z'
         assert info_Z.path == cold_path

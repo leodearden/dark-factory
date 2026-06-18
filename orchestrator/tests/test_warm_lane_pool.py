@@ -13,9 +13,8 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, WorktreeInfo, _run
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
-
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -42,7 +41,7 @@ class TestWarmLanePoolConstruction:
         pool = _make_pool(tmp_path, size=3)
         base = tmp_path / 'worktrees'
         expected = [base / '_lane-0', base / '_lane-1', base / '_lane-2']
-        for k, expected_path in enumerate(expected):
+        for k, _expected_path in enumerate(expected):
             lane = base / f'_lane-{k}'
             assert pool.state(lane) == LaneState.FREE
 
@@ -75,6 +74,7 @@ class TestTryAcquire:
     def test_acquire_flips_to_assigned(self, tmp_path: Path):
         pool = _make_pool(tmp_path, size=3)
         lane = asyncio.run(pool.try_acquire())
+        assert lane is not None
         assert pool.state(lane) == LaneState.ASSIGNED
 
     def test_acquire_all_then_exhaustion(self, tmp_path: Path):
@@ -112,6 +112,7 @@ class TestRelease:
     def test_release_flips_assigned_to_free(self, tmp_path: Path):
         pool = _make_pool(tmp_path, size=3)
         lane = asyncio.run(pool.try_acquire())
+        assert lane is not None
         asyncio.run(pool.release(lane))
         assert pool.state(lane) == LaneState.FREE
 
@@ -659,6 +660,7 @@ class TestAcquireWarmLaneCreateOnce:
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
         assert info is not None
+        assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
 
     async def test_acquire_exhausted_returns_none(
@@ -749,6 +751,7 @@ class TestAcquireWarmLaneResetInPlace:
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
         assert info_a is not None
+        assert git_ops.warm_lane_pool is not None
         # Release the lane (mark FREE directly — release_warm_lane comes in step-12)
         await git_ops.warm_lane_pool.release(info_a.path)
 
@@ -765,6 +768,7 @@ class TestAcquireWarmLaneResetInPlace:
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
         assert info_a is not None
+        assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
 
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
@@ -790,6 +794,7 @@ class TestAcquireWarmLaneResetInPlace:
         (info_a.path / 'target').mkdir(exist_ok=True)
         (info_a.path / 'target' / 'cache.bin').write_bytes(b'\x00' * 128)
 
+        assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
         assert info_b is not None
@@ -823,6 +828,7 @@ class TestAcquireWarmLaneResetInPlace:
         cache_file = info_a.path / 'target' / 'cache.bin'
         cache_file.write_bytes(b'\x00' * 128)
 
+        assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
         assert info_b is not None
@@ -844,6 +850,7 @@ class TestAcquireWarmLaneResetInPlace:
         # Record marker state after first (create-once) acquire
         calls_after_first = seed_marker.read_text() if seed_marker.exists() else ''
 
+        assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
         assert info_b is not None
@@ -862,6 +869,7 @@ class TestAcquireWarmLaneResetInPlace:
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
         assert info_a is not None
+        assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
 
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
@@ -888,9 +896,8 @@ class TestReleaseWarmLane:
 
     async def _acquire_lane_a(
         self, repo: Path, config: GitConfig,
-    ) -> tuple['GitOps', 'WorktreeInfo']:
+    ) -> tuple[GitOps, WorktreeInfo]:
         """Acquire _lane-0 for task-A; return (git_ops, info)."""
-        from orchestrator.git_ops import WorktreeInfo
         scripts_dir = repo / 'scripts'
         scripts_dir.mkdir(parents=True, exist_ok=True)
         seed_script = scripts_dir / 'seed-warm-lane.sh'
@@ -918,6 +925,7 @@ class TestReleaseWarmLane:
         """After release_warm_lane, pool state for _lane-0 is FREE."""
         from orchestrator.warm_lane_pool import LaneState
         git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
+        assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
 
         await git_ops.release_warm_lane(info.path, 'task-A')

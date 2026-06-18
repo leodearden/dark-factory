@@ -13,12 +13,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.warm_lane_pool import WarmLanePool
-
 
 # ---------------------------------------------------------------------------
 # Helpers
