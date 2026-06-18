@@ -184,3 +184,121 @@ def _patch_cold_shadow_verify(monkeypatch, return_value: dict[str, str]) -> None
         'orchestrator.merge_queue._run_cold_shadow_verify',
         mock,
     )
+
+
+# ===========================================================================
+# Step-7: RED — GitOps.acquire_spec_lane (create-once path, seed invoked)
+# ===========================================================================
+
+
+async def _add_recording_seed_to_repo(repo: Path) -> None:
+    """Commit a recording seed-warm-lane.sh into the repo at HEAD.
+
+    The script appends its argv (space-joined) to
+    ``<lane_dir>/scripts/seed-warm-lane.sh.argv`` so tests can assert the
+    argv without filesystem side-effects on the base directory.
+
+    Mirrors the fake-script pattern from TestSeedWarmLane in
+    test_warm_lane_pool.py, but committed to the repo so the script is
+    available inside the worktree that acquire_spec_lane creates on the
+    create-once path.
+    """
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'seed-warm-lane.sh'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        '# argv: <base_target> <lane_dir> <mode>\n'
+        'ARGV_FILE="$2/scripts/seed-warm-lane.sh.argv"\n'
+        'echo "$@" >> "$ARGV_FILE"\n'
+    )
+    script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add recording seed-warm-lane.sh'], cwd=repo)
+
+
+@pytest.mark.asyncio
+class TestAcquireSpecLane:
+    """GitOps.acquire_spec_lane: create-once path seeds lane with '--reset-in-place'."""
+
+    async def test_acquire_spec_lane_returns_warm_tuple(self, spec_git_repo: Path):
+        """acquire_spec_lane returns (lane_path, warm=True) for the assigned _spec- lane."""
+        await _add_recording_seed_to_repo(spec_git_repo)
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=2)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        result = await git_ops.acquire_spec_lane(merge_commit)
+
+        lane_path, warm = result
+        assert warm is True, f'Expected warm=True, got {warm!r}'
+        expected_lane = git_ops.worktree_base / '_spec-0'
+        assert lane_path == expected_lane, (
+            f'Expected lane {expected_lane}, got {lane_path!r}'
+        )
+
+    async def test_acquire_spec_lane_marks_lane_assigned(self, spec_git_repo: Path):
+        """After acquire_spec_lane, the _spec-0 lane is ASSIGNED in spec_warm_lane_pool."""
+        await _add_recording_seed_to_repo(spec_git_repo)
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=2)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        lane_path, _ = await git_ops.acquire_spec_lane(merge_commit)
+
+        assert git_ops.spec_warm_lane_pool is not None
+        assert git_ops.spec_warm_lane_pool._lanes[lane_path] == LaneState.ASSIGNED
+
+    async def test_acquire_spec_lane_invokes_seed_reset_in_place(
+        self, spec_git_repo: Path,
+    ):
+        """acquire_spec_lane invokes seed-warm-lane.sh with base_target + '--reset-in-place'."""
+        await _add_recording_seed_to_repo(spec_git_repo)
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        lane_path, warm = await git_ops.acquire_spec_lane(merge_commit)
+
+        assert warm is True
+        argv_file = lane_path / 'scripts' / 'seed-warm-lane.sh.argv'
+        assert argv_file.exists(), (
+            f'seed-warm-lane.sh was not invoked (argv file missing at {argv_file})'
+        )
+        recorded = argv_file.read_text().strip()
+        base_target = str(git_ops.warm_lane_base_target_path)
+        expected = f'{base_target} {lane_path} --reset-in-place'
+        assert recorded == expected, (
+            f'Wrong seed argv: got {recorded!r}, expected {expected!r}'
+        )
+
+    async def test_acquire_spec_lane_creates_registered_worktree(
+        self, spec_git_repo: Path,
+    ):
+        """The _spec- lane is a registered git worktree after acquire_spec_lane."""
+        await _add_recording_seed_to_repo(spec_git_repo)
+        cfg = _make_spec_git_config(on=True)
+        git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=spec_git_repo,
+        )
+        merge_commit = merge_commit.strip()
+
+        lane_path, _ = await git_ops.acquire_spec_lane(merge_commit)
+
+        assert await git_ops._is_registered_worktree(lane_path), (
+            f'Lane {lane_path} is not a registered git worktree'
+        )
