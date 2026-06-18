@@ -7248,12 +7248,12 @@ class TestHarnessFetchTaskCountCensus:
     async def test_fetches_statuses_from_taskmaster(self, journal, event_buffer, mock_memory_service):
         """_fetch_task_count_census calls taskmaster.get_statuses and returns the map."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.taskmaster.get_statuses = AsyncMock(return_value={'1': 'done', '2': 'pending'})
+        harness.taskmaster.get_statuses = AsyncMock(return_value={'1': 'done', '2': 'pending'})  # type: ignore[union-attr,attr-defined]
 
         result = await harness._fetch_task_count_census('/abs/project')
 
         assert result == {'1': 'done', '2': 'pending'}
-        harness.taskmaster.get_statuses.assert_called_once_with(project_root='/abs/project')
+        harness.taskmaster.get_statuses.assert_called_once_with(project_root='/abs/project')  # type: ignore[union-attr,attr-defined]
 
     @pytest.mark.asyncio
     async def test_degrades_when_taskmaster_is_none(self, journal, event_buffer, mock_memory_service):
@@ -7285,7 +7285,7 @@ class TestHarnessFetchTaskCountCensus:
     async def test_degrades_on_get_statuses_exception(self, journal, event_buffer, mock_memory_service):
         """_fetch_task_count_census returns {} when get_statuses raises — no exception propagated."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('connection refused'))
+        harness.taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('connection refused'))  # type: ignore[union-attr,attr-defined]
 
         result = await harness._fetch_task_count_census('/abs/project')
 
@@ -7368,12 +7368,9 @@ class TestConfigureConsolidatorNewKwargs:
 
     def test_sets_task_count_verification_on_stage(self):
         """_configure_consolidator sets stage.task_count_verification from kwarg."""
-        from fused_memory.config.schema import ReconciliationConfig
-        from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.harness import ReconciliationHarness
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        config = ReconciliationConfig()
         stage = MagicMock(spec=MemoryConsolidator)
         tier = MagicMock()
         tier.episode_limit = 5

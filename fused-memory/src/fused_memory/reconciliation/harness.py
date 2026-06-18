@@ -35,16 +35,15 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
 )
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
-from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
-    cross_verify_task_counts,
     filter_task_tree,
 )
 from fused_memory.services.live_workflow_detector import is_workflow_live_for_task

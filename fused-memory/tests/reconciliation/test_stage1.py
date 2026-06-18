@@ -1098,8 +1098,6 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
     @pytest.mark.asyncio
     async def test_task_count_verification_stat_set_when_inconsistent(self):
         """When task_count_verification has consistent=False, report.stats is set and WARNING logged."""
-        import logging
-
         stage = _make_consolidator(project_root='/tmp/reify')
         stage.project_id = 'test_project'
 
