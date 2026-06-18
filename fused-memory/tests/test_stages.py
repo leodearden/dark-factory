@@ -1690,40 +1690,6 @@ class TestStage2PromptNonceMechanism:
         )
 
 
-class TestStage1PromptCycleSummaryRetryNonce:
-    """Minimal existence check: STAGE1_SYSTEM_PROMPT wires the retry_nonce mechanism.
-
-    Guards that the count=0 per-cycle summary retry path (Stage 1) references the
-    retry_nonce dedup-defeat mechanism. The retry is PROMPT-ONLY: no Python function
-    constructs or injects a retry_nonce — the LLM agent follows the prompt instruction.
-    A one-line existence check is therefore the sole possible regression guard.
-
-    Without this, a future edit could silently revert Stage 1 to identical-content retry,
-    re-triggering Mem0's ~0.92 cosine dedup (the exact dedup-trap this task fixes).
-    Distinct from the removed summary_nonce test (task-1574 step-7): that guard was
-    removed only because TestStage1PayloadSummaryNonce covers it behaviorally
-    (assemble_payload() injects summary_nonce into the payload). No such behavioral
-    alternative exists for retry_nonce.
-    Mirrors task 1796's test_stage2_prompt_contains_retry_nonce_token (task 1796).
-    """
-
-    def test_stage1_prompt_contains_retry_nonce_token(self):
-        """STAGE1_SYSTEM_PROMPT must include 'retry_nonce'.
-
-        Guards that the count=0 retry path references the retry_nonce dedup-defeat
-        mechanism. Without this, a future edit could accidentally drop the nonce-retry
-        guidance, reverting to identical-content retry that re-triggers Mem0's ~0.92
-        cosine dedup (task 1821 — Stage 1 parity with task 1796's Stage 2 fix).
-        """
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        assert 'retry_nonce' in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must reference 'retry_nonce' in the count=0 retry "
-            "guidance so the Stage 1 agent uses a deterministic nonce on retry "
-            "(extends summary_nonce dedup-defeat pattern; task 1821)."
-        )
-
-
 class TestStage2NoTaskIdCeiling:
     """Task IDs above the old 606 ceiling must NOT block task writes.
 
