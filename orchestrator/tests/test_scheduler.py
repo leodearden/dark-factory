@@ -6894,6 +6894,144 @@ class TestExternalDepGateHeld_ResolverDegraded:
 
 
 # ---------------------------------------------------------------------------
+# TestExternalDepGateHeld_DepsLive (task 1799 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestExternalDepGateHeld_DepsLive:
+    """_apply_external_dep_policy emits external_dep_gate_held when deps are live (not done).
+
+    When the resolver is OK (``external_err is None``) but a dep's status is a live
+    status (e.g. 'pending', 'in-progress') — NOT a sentinel — the task stays held.
+
+    After ``threshold`` consecutive held ticks:
+    - Exactly ONE ``EventType.external_dep_gate_held`` event must be recorded with
+      ``cause='deps_live'``, ``task_id='T'``, ``ticks==threshold``.
+    - ``_external_unresolved_counts`` must NOT have a ``('T','upstream_proj:1')`` entry
+      (live statuses are NOT sentinels; the sentinel counter stays clean).
+    - After the hold resolves (dep becomes 'done') the hold streak is reset:
+      NO additional gate_held event; ``_external_hold_streak`` has no 'T' entry.
+
+    Fails today because the live-status else-branch does not set any ``held_live``
+    flag, so ``_note_external_hold`` is never called for live-status holds.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config, event_store=_RecordingEventStore())
+
+    def _pending_task_with_ext(self, task_id: str = 'T') -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['upstream_proj:1']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_live_deps_emits_gate_held_at_threshold(
+        self, scheduler: Scheduler
+    ):
+        """After threshold live-dep ticks → one external_dep_gate_held(cause='deps_live')."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        # Resolver OK; dep is live (pending) — not done, not a sentinel.
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {'upstream_proj:1': 'pending'},
+                None,
+            )
+
+        gate_held_events = [
+            (evt, data)
+            for evt, data in scheduler.event_store.events
+            if evt == str(EventType.external_dep_gate_held)
+        ]
+        assert len(gate_held_events) == 1, (
+            f'Expected exactly 1 external_dep_gate_held event after {threshold} '
+            f'live-dep ticks; got {len(gate_held_events)}: {gate_held_events!r}'
+        )
+        _evt_type, evt_data = gate_held_events[0]
+        assert evt_data['task_id'] == 'T', (
+            f'Expected task_id="T"; got {evt_data["task_id"]!r}'
+        )
+        assert evt_data['data'].get('cause') == 'deps_live', (
+            f'Expected cause="deps_live"; got {evt_data["data"]!r}'
+        )
+        assert evt_data['data'].get('ticks') == threshold, (
+            f'Expected ticks={threshold}; got {evt_data["data"].get("ticks")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_deps_does_not_bump_sentinel_counter(
+        self, scheduler: Scheduler
+    ):
+        """Live-dep ticks must NOT touch _external_unresolved_counts (live ≠ sentinel)."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {'upstream_proj:1': 'in-progress'},
+                None,
+            )
+
+        assert scheduler._external_unresolved_counts == {}, (
+            f'Live-dep ticks must NOT bump sentinel counter; '
+            f'got {scheduler._external_unresolved_counts!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_hold_streak_resets_on_resolution(
+        self, scheduler: Scheduler
+    ):
+        """When dep becomes 'done', streak is cleared and no additional event is emitted."""
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        task = self._pending_task_with_ext()
+
+        # Build up a streak of threshold ticks.
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {'upstream_proj:1': 'pending'},
+                None,
+            )
+
+        # Count events so far.
+        events_before = [
+            e for e in scheduler.event_store.events
+            if e[0] == str(EventType.external_dep_gate_held)
+        ]
+        assert len(events_before) == 1, 'Setup: expected 1 gate_held event after threshold ticks'
+
+        # Now dep resolves to 'done'.
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'upstream_proj:1': 'done'},
+            None,
+        )
+
+        # No additional event.
+        events_after = [
+            e for e in scheduler.event_store.events
+            if e[0] == str(EventType.external_dep_gate_held)
+        ]
+        assert len(events_after) == 1, (
+            f'After resolution: no additional gate_held event expected; '
+            f'got {events_after!r}'
+        )
+
+        # Streak cleared.
+        assert 'T' not in scheduler._external_hold_streak, (
+            f'After dep done: _external_hold_streak must have no "T" entry; '
+            f'got {scheduler._external_hold_streak!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestAcquireNextExternalDepGate (task 1580 — step-11 RED / step-12 GREEN)
 # ---------------------------------------------------------------------------
 
