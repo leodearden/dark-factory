@@ -11241,21 +11241,36 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
 
     @pytest.mark.asyncio
     async def test_new_summary_not_evicted_by_pretrim(self, mock_deps):
-        """Pre-trim only sees prior pool members; the new run's summary is never deleted."""
+        """Pre-trim keeps the newest pool member; oldest two are deleted.
+
+        Simulates the edge case where new_summary_id is already present in the
+        enumerated pool (e.g. a reconstruction write from a prior step) and
+        verifies that trim-then-write ordering preserves it because it has the
+        newest created_at.  Cap=2, pre-trim to cap-1=1: 3 members → delete 2
+        oldest (summary-0, summary-1); new_summary_id (newest) survives.
+        """
         from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.stages.base import BaseStage
 
-        # 2 prior members in pool before this cycle
+        new_run_id = 'run-new'
+        new_summary_id = f'new-summary-{new_run_id}'
+
+        # Pool contains 2 prior members + new_summary_id with newest created_at.
+        # This makes the assertion non-trivial: if sort/trim logic were reversed,
+        # new_summary_id would be the one deleted.
+        prior_members = self._pool_members(2)  # summary-0 (2026-01), summary-1 (2026-02)
+        new_member = {
+            'id': new_summary_id,
+            'created_at': '2026-12-01T00:00:00+00:00',
+            'metadata': {'recon_pool': 'stage2_cycle_summary'},
+        }
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(2)
+            return_value=prior_members + [new_member]
         )
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'dark_factory'
         stage.project_root = '/tmp/test'
-
-        new_run_id = 'run-new'
-        new_summary_id = f'new-summary-{new_run_id}'
 
         with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
             await stage.run(
@@ -11268,11 +11283,12 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
             for c in mock_deps['memory_service'].delete_memory.call_args_list
         }
         assert new_summary_id not in deleted_ids, (
-            f'the new run summary {new_summary_id!r} must not be evicted by pre-trim; '
+            f'the newest member {new_summary_id!r} must survive pre-trim; '
             f'deleted={deleted_ids!r}'
         )
-        # The oldest prior member was the one deleted
-        assert 'summary-0' in deleted_ids
+        # Both older prior members were deleted (trim to 1 from 3)
+        assert 'summary-0' in deleted_ids, f'oldest member must be deleted; deleted={deleted_ids!r}'
+        assert 'summary-1' in deleted_ids, f'second member must be deleted; deleted={deleted_ids!r}'
 
     @pytest.mark.asyncio
     async def test_verified_count_stat_set_when_summary_found(self, mock_deps):

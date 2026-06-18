@@ -1221,8 +1221,12 @@ async def _verify_stage2_summary_written(
     Counts memories matching the triple filter
     ``{'kind':'cycle_summary','stage':'task_knowledge_sync','run_id':run_id}``
     via ``count_memories_by_metadata`` (deterministic Qdrant count, NOT semantic
-    search).  Logs a WARNING when count==0 (the agent may not have written its
-    summary yet) or when the count call raises (transient failure).
+    search).  Logs a WARNING when count==0 or when the count call raises.
+
+    The Stage 2 prompt mandates the cycle_summary write unconditionally on every
+    cycle path (full and remediation); there is no legitimate skip path.
+    count==0 is always unexpected and indicates a genuine agent failure or
+    write loss — the WARNING is intentional and not a false-positive alarm.
 
     Best-effort: never raises, never retries.  The LLM agent owns its own
     count-verify-and-retry path; Python's verify is a redundant observability
