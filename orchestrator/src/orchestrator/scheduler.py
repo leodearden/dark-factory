@@ -832,6 +832,11 @@ class Scheduler:
         # Process-local — a scheduler restart is an acceptable implicit reset,
         # matching _requeue_counts/_skip_count idioms above.
         self._external_unresolved_counts: dict[tuple[str, str], int] = {}
+        # Per-(task_id, dep_id) count of consecutive ticks where the LOCAL dep
+        # backfill get_statuses call degraded (parse failure or empty result).
+        # Mirrors _external_unresolved_counts for local deps.  GC'd in the
+        # per-tick stale-id sweep alongside _external_unresolved_counts.
+        self._local_backfill_unresolved_counts: dict[tuple[str, str], int] = {}
         # Per-task_id count of consecutive ticks where the external-dep gate
         # held dispatch (either because the resolver was degraded, or because
         # all deps returned live non-done statuses).  Keyed by task_id (str).
@@ -2586,7 +2591,39 @@ class Scheduler:
             _backfilled, _backfill_err = await self.get_statuses(
                 ids=_missing_dep_ids
             )
-            if _backfilled:
+            if resolver_failed(_backfilled, _backfill_err):
+                logger.warning(
+                    'acquire_next: dep-status backfill degraded '
+                    '(err=%r, missing_dep_ids=%r) — affected pending tasks '
+                    'held fail-safe-wait',
+                    _backfill_err,
+                    _missing_dep_ids,
+                )
+                for _t in tasks:
+                    _tid = str(_t.get('id', ''))
+                    if _t.get('status') != 'pending' or not _tid:
+                        continue
+                    for _d in (_t.get('dependencies') or []):
+                        _dep_id = str(
+                            _d.get('id', _d) if isinstance(_d, dict) else _d
+                        )
+                        if _dep_id in _missing_dep_ids:
+                            _key = (_tid, _dep_id)
+                            self._local_backfill_unresolved_counts[_key] = (
+                                self._local_backfill_unresolved_counts.get(_key, 0) + 1
+                            )
+                            _cnt = self._local_backfill_unresolved_counts[_key]
+                            if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                                logger.warning(
+                                    'acquire_next: local dep backfill unresolved '
+                                    'for %d consecutive ticks '
+                                    '(task=%s, dep=%s) — possible scheduler '
+                                    'degradation',
+                                    _cnt,
+                                    _tid,
+                                    _dep_id,
+                                )
+            else:
                 status_map.update(_backfilled)
 
         # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
@@ -2666,6 +2703,13 @@ class Scheduler:
             ]
             for k in _stale_ext_keys:
                 del self._external_unresolved_counts[k]
+        if _stale_ids and self._local_backfill_unresolved_counts:
+            _stale_local_keys = [
+                k for k in self._local_backfill_unresolved_counts
+                if k[0] in _stale_ids
+            ]
+            for k in _stale_local_keys:
+                del self._local_backfill_unresolved_counts[k]
         # _external_hold_streak and _external_hold_cause are keyed by task_id
         # (str); GC alongside _external_unresolved_counts so they stay bounded.
         if _stale_ids and (self._external_hold_streak or self._external_hold_cause):
