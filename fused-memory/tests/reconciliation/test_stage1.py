@@ -1575,10 +1575,14 @@ class TestConsolidatorFetchDegradedSources:
         with caplog.at_level(logging.WARNING, logger='fused_memory'):
             await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
 
-        # Must emit a WARNING for the episodes fetch failure
+        # Must emit a WARNING for the episodes fetch failure, with the specific event key
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings, (
-            'Expected a WARNING log when get_episodes raises, got none. '
+        assert any(
+            'reconciliation.stage1_episodes_fetch_failed' in r.getMessage()
+            for r in warnings
+        ), (
+            "Expected a WARNING log containing 'reconciliation.stage1_episodes_fetch_failed' "
+            'when get_episodes raises, got none. '
             'RED: the episodes except is a bare `except Exception: episodes=[]` with no log.'
         )
 
@@ -1631,10 +1635,14 @@ class TestConsolidatorFetchDegradedSources:
         with caplog.at_level(logging.WARNING, logger='fused_memory'):
             await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
 
-        # Must emit a WARNING for the status fetch failure
+        # Must emit a WARNING for the status fetch failure, with the specific event key
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings, (
-            'Expected a WARNING log when get_status raises, got none. '
+        assert any(
+            'reconciliation.stage1_status_fetch_failed' in r.getMessage()
+            for r in warnings
+        ), (
+            "Expected a WARNING log containing 'reconciliation.stage1_status_fetch_failed' "
+            'when get_status raises, got none. '
             'RED: the store-stats except is a bare `except Exception: status={}` with no log.'
         )
 
