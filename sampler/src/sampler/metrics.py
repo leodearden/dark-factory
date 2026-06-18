@@ -31,11 +31,14 @@ refactored to use a different FD number.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'parse_pressure_file',
@@ -111,6 +114,14 @@ def collect_psi(
     for file_name, key_prefix in sources:
         text = read(file_name)
         parsed = parse_pressure_file(text)
+        if parsed is None:
+            logger.warning(
+                'PSI parse miss for %s (no avg10 lines in %d bytes); '
+                'emitting no row instead of a fabricated 0.0',
+                file_name,
+                len(text),
+            )
+            continue
         out[f'psi_{key_prefix}_some_avg10'] = parsed['some_avg10']
         out[f'psi_{key_prefix}_full_avg10'] = parsed['full_avg10']
     return out
