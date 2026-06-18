@@ -89,6 +89,7 @@ class ScopeViolationEscalator:
         matched_paths: tuple[str, ...],
         suggested_project: str | None,
         suggested_root: str | None = None,
+        llm_reason: str | None = None,
     ) -> str | None:
         """File a ``scope_violation`` escalation for a guard rejection.
 
@@ -103,6 +104,14 @@ class ScopeViolationEscalator:
         and keeping this sync lets the existing sync ``_path_guard_or_skip``
         in :class:`fused_memory.middleware.task_interceptor.TaskInterceptor`
         call it without changing the call-site signature.
+
+        Args:
+            llm_reason: When set (Stage-2 adjudicator returned reject/uncertain
+                or failed), this string is the LLM's stated reason (or a
+                fail-safe marker).  Appended to the escalation detail so the
+                operator can see why the LLM judged this a genuine/uncertain
+                misroute.  None (default) preserves the existing detail format
+                for callers that don't use the Stage-2 adjudicator.
         """
         queue = self._queue_for(project_root)
         if queue is None:
@@ -128,6 +137,8 @@ class ScopeViolationEscalator:
         ]
         if suggested_root:
             detail_lines.append(f'suggested_project_root={suggested_root!r}')
+        if llm_reason is not None:
+            detail_lines.append(f'llm_adjudicator_reason={llm_reason!r}')
         detail_lines.append('')
         detail_lines.append(
             'A task creation request was rejected because its text or files '
