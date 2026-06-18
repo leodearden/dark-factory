@@ -2777,23 +2777,24 @@ class TestReconcileStrandedResolverGuard:
             for r in caplog.records
         ), f'Expected WARNING naming error; got: {[r.message for r in caplog.records]!r}'
 
-    async def test_case_b_genuine_empty_returns_zero_with_warning(
+    async def test_case_b_genuine_empty_returns_zero_with_debug(
         self, harness: Harness, caplog
     ):
-        """CASE B: get_statuses returns ({}, None) → returns 0 + WARNING naming 'empty'.
+        """CASE B: get_statuses returns ({}, None) → returns 0 + DEBUG naming 'empty'.
 
-        Pre-fix: returns 0 but no WARNING fires (empty dict → loop body never runs,
-        no guard exists).  After fix: WARNING at 'orchestrator.harness' naming 'empty'.
+        An empty task tree is a normal idle state (no tasks yet), so we log at
+        DEBUG (not WARNING) to avoid recurring noise.  This is different from
+        CASE A where an error forces a WARNING.
         """
         harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
             return_value=({}, None)
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.harness'):
             result = await harness._reconcile_stranded_in_progress()
 
         assert result == 0, f'Expected 0, got {result!r}'
         assert any(
-            r.levelno >= logging.WARNING and 'empty' in r.message.lower()
+            r.levelno == logging.DEBUG and 'empty' in r.message.lower()
             for r in caplog.records
-        ), f'Expected WARNING naming empty; got: {[r.message for r in caplog.records]!r}'
+        ), f'Expected DEBUG naming empty; got: {[r.message for r in caplog.records]!r}'

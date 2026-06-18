@@ -1827,11 +1827,18 @@ Output JSON matching the schema. Every task must appear in the output.
         marked_done = 0
         log_prefix = 'Reconcile (mid-run)' if mid_run else 'Reconcile'
         if resolver_failed(statuses, err):
-            logger.warning(
-                '%s: get_statuses() returned %s — aborting sweep (fail-safe)',
-                log_prefix,
-                'error' if err is not None else 'empty',
-            )
+            if err is not None:
+                logger.warning(
+                    '%s: get_statuses() returned error — aborting sweep (fail-safe)',
+                    log_prefix,
+                )
+            else:
+                # Empty-but-no-error is a normal idle state (no tasks yet);
+                # DEBUG to avoid recurring noise during early/idle periods.
+                logger.debug(
+                    '%s: get_statuses() returned empty — aborting sweep (no tasks)',
+                    log_prefix,
+                )
             return 0
 
         # R4: sweep both 'in-progress' AND 'blocked' so out-of-band-merged
@@ -3556,6 +3563,13 @@ Output JSON matching the schema. Every task must appear in the output.
             self.report.review_findings += review_report.findings_count
             self.report.review_tasks_created += len(review_report.tasks_created)
             self.report.review_cost_usd += review_report.cost_usd
+            if review_report.parse_failed:
+                logger.warning(
+                    'Full review %s: reviewer output was unparseable — review '
+                    'inconclusive (findings_count=%d is not a clean pass)',
+                    review_report.review_id,
+                    review_report.findings_count,
+                )
             logger.info(
                 'Full review complete: %d findings, %d tasks created',
                 review_report.findings_count,
@@ -3599,6 +3613,13 @@ Output JSON matching the schema. Every task must appear in the output.
             self.report.review_findings += review_report.findings_count
             self.report.review_tasks_created += len(review_report.tasks_created)
             self.report.review_cost_usd += review_report.cost_usd
+            if review_report.parse_failed:
+                logger.warning(
+                    'Review checkpoint %s: reviewer output was unparseable — '
+                    'review inconclusive (findings_count=%d is not a clean pass)',
+                    review_report.review_id,
+                    review_report.findings_count,
+                )
             logger.info(
                 'Review checkpoint complete: %d findings, %d tasks created, '
                 'cost=$%.2f',

@@ -7445,6 +7445,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     '(parked-member list may be incomplete): %s',
                     self.task_id, train_id, err,
                 )
+                # DEGRADE-intentional: an empty parked_members under-reports
+                # siblings in the escalation payload but does not suppress the
+                # escalation itself.  Prefer DEGRADE over ABORT — the L1
+                # escalation must still fire even with partial context.
+                # statuses falls through to the parked_members comprehension
+                # below, which safely yields [] on an empty dict.
         else:
             # Fallback scan — discover siblings via get_tasks() filtered to the
             # active set (ACTIVE_TASK_STATUSES).  Done siblings are not parked

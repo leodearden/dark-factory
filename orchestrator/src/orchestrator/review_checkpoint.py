@@ -511,6 +511,7 @@ violations are always bugs. Pay special attention to `stability_concerns`.
             'phase1_passed': report.phase1.passed,
             'phase1_summary': report.phase1.summary,
             'findings_count': report.findings_count,
+            'parse_failed': report.parse_failed,
             'tasks_created': report.tasks_created,
             'escalated_findings': report.escalated_findings,
             'cost_usd': report.cost_usd,
