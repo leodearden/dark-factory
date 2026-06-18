@@ -470,3 +470,222 @@ class TestSeedWarmLane:
         assert result is True
         recorded = marker.read_text().strip()
         assert recorded.endswith('--reset-in-place')
+
+
+# ===========================================================================
+# Step-7: RED — GitOps.acquire_warm_lane (create-once / first-time)
+# ===========================================================================
+
+
+async def _add_seed_and_debug_port_scripts(repo: Path, port: int = 39411) -> Path:
+    """Commit stub seed-warm-lane.sh + setup-worktree-debug-port.sh into repo main.
+
+    The seed script creates <lane>/target/seeded.bin (simulating a CoW copy)
+    and the debug-port script just echoes <port>.
+    """
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    seed_script = scripts_dir / 'seed-warm-lane.sh'
+    seed_script.write_text(
+        '#!/usr/bin/env bash\n'
+        '# argv: <base_target> <lane_dir> <mode>\n'
+        'LANE_DIR="$2"\n'
+        'mkdir -p "$LANE_DIR/target"\n'
+        'echo "seeded" > "$LANE_DIR/target/seeded.bin"\n'
+    )
+    seed_script.chmod(0o755)
+
+    debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+    debug_script.write_text(f'#!/usr/bin/env bash\necho {port}\n')
+    debug_script.chmod(0o755)
+
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add stub seed + debug-port scripts'], cwd=repo)
+    return scripts_dir
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneCreateOnce:
+    """acquire_warm_lane creates a new worktree+branch and seeds it on first call."""
+
+    async def test_acquire_returns_worktree_info(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """acquire_warm_lane returns WorktreeInfo with lane path, base_commit, debug port."""
+        from orchestrator.git_ops import WorktreeInfo
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+
+        # Get start_ref (main HEAD)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+
+        assert info is not None
+        assert isinstance(info, WorktreeInfo)
+
+    async def test_acquire_lane_path_is_pool_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Returned WorktreeInfo.path is _lane-0 (first free lane), not a branch-named dir."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+
+        assert info is not None
+        expected_lane = git_ops.worktree_base / '_lane-0'
+        assert info.path == expected_lane
+
+    async def test_acquire_lane_is_registered_worktree(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """The lane is a registered git worktree after acquire."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info is not None
+        assert await git_ops._is_registered_worktree(info.path)
+
+    async def test_acquire_lane_on_correct_branch(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """The lane's HEAD is on task/task-A at the start_ref SHA."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info is not None
+
+        # Check HEAD SHA matches start_ref
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info.path)
+        assert head_sha.strip() == start_ref
+
+        # Check branch name
+        _, branch, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=info.path,
+        )
+        assert branch.strip() == 'task/task-A'
+
+    async def test_acquire_lane_has_base_commit(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """WorktreeInfo.base_commit is set (40-char SHA)."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info is not None
+        assert len(info.base_commit) == 40
+
+    async def test_acquire_provides_debug_port(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Debug-port re-provision ran: WorktreeInfo.reify_debug_port == 39411."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo, port=39411)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info is not None
+        assert info.reify_debug_port == 39411
+
+    async def test_acquire_seed_invoked_with_fresh_checkout(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """seed-warm-lane.sh is called with --fresh-checkout on first acquire."""
+        # Replace seed script with one that logs its mode arg
+        scripts_dir = wl_git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        mode_log = wl_git_repo / 'seed_mode.txt'
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(
+            f'#!/usr/bin/env bash\n'
+            f'echo "$3" >> {mode_log}\n'
+            f'mkdir -p "$2/target"\n'
+            f'echo seeded > "$2/target/seeded.bin"\n'
+        )
+        seed_script.chmod(0o755)
+        # Add debug-port script
+        debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+        debug_script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        debug_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=wl_git_repo)
+        await _run(['git', 'commit', '-m', 'add mode-logging scripts'], cwd=wl_git_repo)
+
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info is not None
+        assert mode_log.exists(), 'seed script was not called'
+        assert mode_log.read_text().strip() == '--fresh-checkout'
+
+    async def test_acquire_target_dir_is_warm(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """The lane's target/seeded.bin exists (CoW seed ran)."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info is not None
+        assert (info.path / 'target' / 'seeded.bin').exists()
+
+    async def test_acquire_marks_pool_lane_assigned(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """After acquire, the pool marks _lane-0 ASSIGNED."""
+        from orchestrator.warm_lane_pool import LaneState
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info is not None
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
+
+    async def test_acquire_exhausted_returns_none(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Pool exhaustion: acquire returns None (caller should cold-fallback)."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        # Exhaust the pool
+        info1 = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info1 is not None
+
+        # Next acquire should return None (exhausted)
+        info2 = await git_ops.acquire_warm_lane('task-B', start_ref)
+        assert info2 is None
+
+    async def test_acquire_absent_seed_returns_none(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """No seed-warm-lane.sh → acquire returns None (cold-fallback signal)."""
+        # No scripts committed — seed will fail → acquire returns None
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        info = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert info is None
