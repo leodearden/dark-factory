@@ -265,6 +265,43 @@ class TestDbPool:
         finally:
             await pool.close_all()
 
+    async def test_get_warns_on_corrupt_or_locked_db(self, tmp_path, caplog):
+        """DbPool.get must emit a WARNING when the file exists but connect fails.
+
+        The benign 'not resolved.exists()' early-return stays silent; only a genuine
+        OperationalError (corrupt file / exclusive lock) should produce a WARNING.
+        """
+        import logging
+
+        db_path = tmp_path / 'corrupt.db'
+        db_path.write_bytes(b'not a sqlite db')  # file exists, but corrupt
+
+        pool = DbPool()
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.db'):
+            with patch('aiosqlite.connect', side_effect=sqlite3.OperationalError('file is not a database')):
+                result = await pool.get(db_path)
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'dashboard.data.db']
+        assert warnings, 'expected a WARNING from dashboard.data.db, got none'
+
+    async def test_get_no_warning_on_benign_missing_file(self, tmp_path, caplog):
+        """DbPool.get must NOT emit a WARNING for a benign first-run absent file.
+
+        The 'if not resolved.exists(): return None' early-return is silent by design.
+        """
+        import logging
+
+        db_path = tmp_path / 'nonexistent' / 'missing.db'
+
+        pool = DbPool()
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.db'):
+            result = await pool.get(db_path)
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'dashboard.data.db']
+        assert not warnings, f'expected no WARNING for benign missing file, got: {warnings}'
+
     async def test_close_all_clears_open_locks(self, tmp_path):
         """close_all() must drain _open_locks to prevent unbounded lock growth.
 
