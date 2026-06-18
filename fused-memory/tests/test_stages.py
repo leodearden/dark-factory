@@ -11084,6 +11084,7 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
 
     def _base_report(self):
         from datetime import UTC, datetime
+
         from fused_memory.models.reconciliation import StageId, StageReport
         return StageReport(
             stage=StageId.task_knowledge_sync,
