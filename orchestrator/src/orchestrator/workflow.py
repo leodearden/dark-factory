@@ -467,6 +467,40 @@ def _select_train_members(
     return selected
 
 
+def classify_rebase_cohort(
+    distance_commits: int,
+    is_first_rebase: bool,
+    threshold: int,
+) -> str:
+    """Label a rebase event into one of four cohorts.
+
+    Args:
+        distance_commits: Commit count in old_base..new_base (from
+            ``get_rebase_distance``).  -1 means the distance could not be
+            measured.
+        is_first_rebase: True when this is the first rebase of the current
+            per-dispatch WorkflowMetrics instance (i.e.
+            ``metrics.inter_iteration_rebases == 0`` captured BEFORE the
+            counter is incremented).
+        threshold: ``config.rebase_reseed_distance_threshold`` — the labelling
+            boundary between 'continuous' and large-jump cohorts.
+
+    Returns:
+        'unknown'      — distance < 0 (measurement failed; fail-safe)
+        'continuous'   — 0 <= distance < threshold (normal orchestrator cadence)
+        'post-unblock' — distance >= threshold AND is_first_rebase (first
+                         rebase of a fresh instance; likely long-idle gap /
+                         post-unblock resume)
+        'big-jump'     — distance >= threshold AND NOT is_first_rebase
+                         (large mid-run jump; hypothesis-refuting outlier)
+    """
+    if distance_commits < 0:
+        return 'unknown'
+    if distance_commits < threshold:
+        return 'continuous'
+    return 'post-unblock' if is_first_rebase else 'big-jump'
+
+
 @dataclass
 class WorkflowMetrics:
     total_cost_usd: float = 0.0
@@ -4187,7 +4221,16 @@ class TaskWorkflow:
             return None
 
         self.artifacts.update_base_commit(current_main)
+
+        # Capture is_first BEFORE incrementing the counter (0 == this is the
+        # first rebase of a fresh per-dispatch WorkflowMetrics instance).
+        is_first = self.metrics.inter_iteration_rebases == 0
         self.metrics.inter_iteration_rebases += 1
+
+        distance = await self.git_ops.get_rebase_distance(old_base, current_main)
+        cohort = classify_rebase_cohort(
+            distance, is_first, self.config.rebase_reseed_distance_threshold,
+        )
 
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
@@ -4196,6 +4239,8 @@ class TaskWorkflow:
             'old_base': old_base,
             'new_base': current_main,
             'files_changed_on_main': changed_files[:50],
+            'distance_commits': distance,
+            'cohort': cohort,
             'source': 'orchestrator',
             'summary': (
                 f'Rebased onto main ({old_base[:8]} -> {current_main[:8]}), '
@@ -4213,7 +4258,42 @@ class TaskWorkflow:
             'old_base': old_base,
             'new_base': current_main,
             'changed_files': changed_files,
+            'distance_commits': distance,
+            'cohort': cohort,
+            'is_first_rebase': is_first,
         }
+
+    def _emit_rebase_verify_cost(
+        self,
+        rebase_notice: dict,
+        verify_result: VerifyResult,
+    ) -> None:
+        """Emit one rebase_verify_cost event pairing a real rebase with its next verify.
+
+        No-op when self.event_store is None (fire-and-forget; never raises).
+        Called only when rebase_notice is not None (i.e. a real rebase happened).
+        """
+        if self.event_store is None:
+            return
+        self.event_store.emit(
+            EventType.rebase_verify_cost,
+            task_id=self.task_id,
+            phase='verify',
+            duration_ms=int(verify_result.duration_secs * 1000),
+            data={
+                'old_base': rebase_notice['old_base'],
+                'new_base': rebase_notice['new_base'],
+                'distance_commits': rebase_notice['distance_commits'],
+                'files_changed_on_main': len(rebase_notice['changed_files']),
+                'next_verify_wall_secs': verify_result.duration_secs,
+                'verify_scope': {
+                    'n_task_files': len(self._task_files or []),
+                    'n_modules': len(self._module_configs or []),
+                    'workspace': self._train is not None,
+                },
+                'cohort': rebase_notice['cohort'],
+            },
+        )
 
     async def _verify_debugfix_loop(self) -> WorkflowOutcome:
         """Run verification, invoke debugger on failures."""
@@ -4229,8 +4309,9 @@ class TaskWorkflow:
             # commits while we're cycling verify ↔ debugger.  The helper
             # short-circuits cheaply when current_main == old_base, so
             # firing on every retry costs at most one ``git rev-parse``.
+            rebase_notice: dict | None = None
             if self.config.rebase_before_verify:
-                await self._inter_iteration_rebase(
+                rebase_notice = await self._inter_iteration_rebase(
                     event_label='verify_phase_rebase',
                 )
 
@@ -4242,6 +4323,8 @@ class TaskWorkflow:
                 force_workspace=self._train is not None,
                 role='task',
             )
+            if rebase_notice is not None:
+                self._emit_rebase_verify_cost(rebase_notice, result)
             if not result.passed:
                 self._last_verify_result = result
             if result.passed:
