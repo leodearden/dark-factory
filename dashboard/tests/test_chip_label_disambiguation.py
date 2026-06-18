@@ -222,3 +222,33 @@ class TestTabsJsxLockChipWiring:
         assert re.search(r'title=\{[^}]*path', tabs_jsx_body), (
             'LockChip title={...path...} hover attribute not found in tabs.jsx'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-5: Source-structure tests for tab_tasks.jsx (Module-locks panel)
+# (RED because tab_tasks.jsx still renders modPath.split('/').pop())
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def tab_tasks_jsx_body(_client):
+    return _client.get('/static/redux/tab_tasks.jsx').text
+
+
+class TestTabTasksJsxModuleLocksWiring:
+    def test_modpath_basename_removed(self, tab_tasks_jsx_body):
+        # The naive basename for modPath must be gone.
+        # Guard: we target modPath.split only, not the task-id split('/T-').pop().
+        assert "modPath.split('/').pop()" not in tab_tasks_jsx_body, (
+            "modPath.split('/').pop() still present in tab_tasks.jsx — should be replaced"
+        )
+
+    def test_disambiguate_labels_routed(self, tab_tasks_jsx_body):
+        assert 'disambiguateLabels(' in tab_tasks_jsx_body, (
+            'disambiguateLabels( not found in tab_tasks.jsx — wiring missing'
+        )
+
+    def test_full_key_title_preserved(self, tab_tasks_jsx_body):
+        # The chip must still have title={modPath}
+        assert 'title={modPath}' in tab_tasks_jsx_body, (
+            'title={modPath} not found in tab_tasks.jsx — full key hover removed'
+        )
