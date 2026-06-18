@@ -8083,11 +8083,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # ── (a) FAIL / skip ──────────────────────────────────────────────
             if vr is not None and vr.outcome is not None:
                 fail_merge_wt = vr.merge_wt
-                if fail_merge_wt is not None:
-                    if vr.spec_warm:
-                        await self._git_ops.release_spec_lane(fail_merge_wt, warm=True)
-                    else:
-                        await self._cleanup_owned_merge_worktree(fail_merge_wt)
+                await self._release_or_cleanup(fail_merge_wt, spec_warm=vr.spec_warm)
                 self._resolve_or_drop_abandoned(req, vr.outcome)
                 _n_failed_val = True
                 return False
@@ -8114,10 +8110,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Short-circuit: if abandonment landed while verify completed,
             # skip the expensive CAS loop (mirrors _verify_and_advance :6934).
             if self._request_abandoned(req):
-                if _vr_spec_warm:
-                    await self._git_ops.release_spec_lane(merge_wt, warm=True)
-                else:
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                 return False
 
             # ── Step 5: CAS advance_main ──────────────────────────────────
@@ -8135,10 +8128,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 if result == 'advanced':
                     self._gate_retries.pop(req.task_id, None)
-                    if _vr_spec_warm:
-                        await self._git_ops.release_spec_lane(merge_wt, warm=True)
-                    else:
-                        await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                     outcome = await _finalize_advanced_merge(
                         self._git_ops, req, self._event_store,
                         merge_commit_fallback=merge_commit,
@@ -8240,7 +8230,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             attempt=gate_total,
                             duration_ms=_elapsed_ms(item.started_monotonic),
                         )
-                        await self._cleanup_owned_merge_worktree(merge_wt)
+                        await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                         if not req.result.done():
                             req.result.set_result(MergeOutcome(
                                 'blocked',
@@ -8277,14 +8267,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     continue
 
                 if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                     if result in ('unmerged_state', 'pop_conflict_no_advance'):
                         self._cas_retries.pop(req.task_id, None)
                         self._gate_retries.pop(req.task_id, None)
                     return False
                 if result != 'cas_failed':
                     self._gate_retries.pop(req.task_id, None)
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                     outcome = await _map_advance_failure(
                         self._git_ops, result,
                         task_id=req.task_id,
@@ -8308,7 +8298,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         f'({self.MAX_CAS_RETRIES} attempts)'
                     )
                     _emit_merge_attempt(self._event_store, req.task_id, 'cas_exhausted', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                     if not req.result.done():
                         req.result.set_result(MergeOutcome(
                             'blocked',
