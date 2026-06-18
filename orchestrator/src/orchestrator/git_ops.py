@@ -1064,15 +1064,10 @@ class GitOps:
             return False
 
         try:
-            artifact_dir = (
-                self.config.reap_build_artifact_dirs[0]
-                if self.config.reap_build_artifact_dirs
-                else 'target'
-            )
-            advancing = self.persistent_merge_worktree_path / artifact_dir
+            advancing = self._merge_verify_artifact_path
             base = self.warm_lane_base_target_path
 
-            if advancing == base:
+            if advancing.resolve() == base.resolve():
                 logger.debug(
                     'refresh_warm_base: advancing == base (%s) — no separate rolling '
                     'base configured, skipping degenerate self-copy', advancing,
@@ -2344,23 +2339,36 @@ class GitOps:
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
 
     @property
-    def warm_lane_base_target_path(self) -> Path:
-        """Absolute path of the warm BASE target/ to CoW-seed lane target/ from.
+    def _merge_verify_artifact_path(self) -> Path:
+        """Path of the build-artifact directory inside the persistent _merge-verify worktree.
 
-        Resolution order:
-        1. ``config.warm_lane_base_target_dir`` when explicitly set (override).
-        2. ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
-           (derived default: ``<worktree_base>/_merge-verify/target``).
-        3. Fallback to ``'target'`` when ``reap_build_artifact_dirs`` is empty.
+        ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
+        (``<worktree_base>/_merge-verify/target`` by default when
+        ``reap_build_artifact_dirs`` is empty).
+
+        This is the single canonical spelling used as the *advancing* side in
+        :meth:`refresh_warm_base` and as the derived default in
+        :attr:`warm_lane_base_target_path`, so both stay in sync automatically.
         """
-        if self.config.warm_lane_base_target_dir is not None:
-            return Path(self.config.warm_lane_base_target_dir)
         artifact_dir = (
             self.config.reap_build_artifact_dirs[0]
             if self.config.reap_build_artifact_dirs
             else 'target'
         )
         return self.persistent_merge_worktree_path / artifact_dir
+
+    @property
+    def warm_lane_base_target_path(self) -> Path:
+        """Absolute path of the warm BASE target/ to CoW-seed lane target/ from.
+
+        Resolution order:
+        1. ``config.warm_lane_base_target_dir`` when explicitly set (override).
+        2. :attr:`_merge_verify_artifact_path`
+           (derived default: ``<worktree_base>/_merge-verify/target``).
+        """
+        if self.config.warm_lane_base_target_dir is not None:
+            return Path(self.config.warm_lane_base_target_dir)
+        return self._merge_verify_artifact_path
 
     #: Name of the counter file used to persist the verify attempt count across
     #: stateless CLI invocations.  Scope is **per-project-worktree** — the file
