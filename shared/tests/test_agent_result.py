@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
-
 from shared.agent_result import AgentVerdict, extract_agent_verdict
 
 

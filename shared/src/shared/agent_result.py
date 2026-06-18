@@ -64,10 +64,7 @@ def extract_agent_verdict(
     # Determine the token: use the 'warning' key when present (matches the shapes
     # emitted by AgentLoop.run(): {'warning': 'no_tool_calls'} / {'warning':
     # 'max_steps_reached'}), otherwise fall back to the caller-supplied error_summary.
-    if isinstance(result, dict) and 'warning' in result:
-        token = result['warning']
-    else:
-        token = error_summary
+    token = result['warning'] if isinstance(result, dict) and 'warning' in result else error_summary
 
     output_prefix = str(result)[:200]
     logger.warning(
