@@ -3667,7 +3667,7 @@ Output JSON matching the schema. Every task must appear in the output.
             self._merge_queue,
             speculation_depth=_k,
             event_store=self.event_store,
-            on_merge_landed=self._service_restart_coordinators[0].note_merge,
+            on_merge_landed=self._note_merge_all,
             escalation_queue=self._escalation_queue,
             train_callback_factory=train_callback_factory,
             merge_store=self._merge_store,
@@ -3686,6 +3686,28 @@ Output JSON matching the schema. Every task must appear in the output.
                 await self._merge_worker_task
             self._merge_worker_task = None
             logger.info('Merge worker stopped')
+
+    async def _note_merge_all(
+        self, task_id: str, base_sha: str, head_sha: str
+    ) -> None:
+        """Fan out a merge-landed notification to every service-restart coordinator.
+
+        Passed as the SpeculativeMergeWorker's ``on_merge_landed`` callback.
+        Each coordinator is notified independently inside its own try/except so
+        that a git/IO error in one coordinator (e.g. fused-memory) cannot prevent
+        the remaining coordinators from being armed.  Errors are logged at WARNING
+        level and re-execution continues (fail-open).
+        """
+        for coord in self._service_restart_coordinators:
+            try:
+                await coord.note_merge(task_id, base_sha, head_sha)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    '_note_merge_all: coordinator %s note_merge failed: %s',
+                    getattr(coord, '_service_name', repr(coord)),
+                    exc,
+                    exc_info=True,
+                )
 
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.

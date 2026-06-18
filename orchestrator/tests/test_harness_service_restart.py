@@ -332,11 +332,16 @@ class TestStartMergeWorkerOnMergeLandedWiring:
     """After _start_merge_worker, SpeculativeMergeWorker receives on_merge_landed=harness._note_merge_all."""
 
     async def test_worker_wired_with_note_merge_all(self, harness: Harness):
-        """_start_merge_worker passes harness._note_merge_all as on_merge_landed."""
+        """_start_merge_worker passes harness._note_merge_all as on_merge_landed.
+
+        Bound-method equality uses __self__ identity + __func__ identity; that
+        is what == checks (is would fail because each attribute access creates a
+        fresh wrapper object).
+        """
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_queue.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         call_kwargs = mock_smw.call_args.kwargs
-        assert call_kwargs['on_merge_landed'] is harness._note_merge_all
+        assert call_kwargs['on_merge_landed'] == harness._note_merge_all
