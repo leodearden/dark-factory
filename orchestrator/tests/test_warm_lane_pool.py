@@ -1098,15 +1098,22 @@ class TestReleaseWarmLane:
     async def test_release_retains_target_dir(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """target/ (including seeded.bin) is retained after release."""
+        """target/ is NOT deleted by release (incidental; next acquire re-seeds).
+
+        D10: release leaves target/ in place incidentally (CoW-cheap, harmless).
+        target/ retention is no longer a warmth-contract promise — the next
+        acquire_warm_lane always re-seeds from the current base, so the
+        released lane's target/ drift is irrelevant.  This test is a regression
+        guard: release must not actively delete target/.
+        """
         git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
         target_file = info.path / 'target' / 'seeded.bin'
         assert target_file.exists(), 'prerequisite: seed.bin should exist after acquire'
 
         await git_ops.release_warm_lane(info.path, 'task-A')
 
-        assert (info.path / 'target').exists(), 'target/ must be retained after release'
-        assert target_file.exists(), 'target/seeded.bin must be retained'
+        assert (info.path / 'target').exists(), 'target/ must not be deleted by release'
+        assert target_file.exists(), 'target/seeded.bin must not be deleted by release'
 
     async def test_release_makes_lane_reacquirable(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,

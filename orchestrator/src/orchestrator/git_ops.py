@@ -1319,18 +1319,21 @@ class GitOps:
             )
 
     async def release_warm_lane(self, lane_dir: Path, branch_name: str) -> None:
-        """Release a warm lane back to the FREE pool, retaining warmth.
+        """Release a warm lane back to the FREE pool.
 
         Steps:
         1. ``git -C <lane> checkout --detach`` — detach HEAD so the just-used
-           branch is deletable while the lane stays checked-out warm.
+           branch is deletable while the lane directory stays in place.
         2. ``git branch -D task/<branch_name>`` — best-effort; logs on failure.
         3. ``await self.warm_lane_pool.release(lane_dir)`` — flip ASSIGNED→FREE.
 
-        Never removes the worktree; ``target/`` is retained for the next
-        assignment.  Fully best-effort / never-raise (mirrors
-        ``cleanup_merge_worktree`` contract) so a hiccup cannot strand the
-        scheduler.
+        Never removes the worktree; ``target/`` is left in place incidentally
+        (CoW-cheap, harmless).  The *next* :meth:`acquire_warm_lane` always
+        re-seeds from the current base (D10), so a released lane's target/
+        drift is irrelevant — retention is no longer a contract promise.
+
+        Fully best-effort / never-raise (mirrors ``cleanup_merge_worktree``
+        contract) so a hiccup cannot strand the scheduler.
         """
         if self.warm_lane_pool is None:
             return
