@@ -95,22 +95,22 @@ async def test_update_task_metadata_none_passed_through(
     [
         pytest.param(
             {'id': '1', 'project_root': '/project', 'prompt': 'Update the description'},
-            {'prompt': 'Update the description', 'append': False, 'tag': None},
+            {'prompt': 'Update the description', 'append': None, 'metadata_mode': None, 'tag': None},
             id='prompt-forwarded',
         ),
         pytest.param(
             {'id': '1', 'project_root': '/project', 'prompt': 'Extra info', 'append': True},
-            {'prompt': 'Extra info', 'append': True, 'tag': None},
+            {'prompt': 'Extra info', 'append': True, 'metadata_mode': None, 'tag': None},
             id='append-true',
         ),
         pytest.param(
             {'id': '1', 'project_root': '/project', 'tag': 'v2'},
-            {'prompt': None, 'append': False, 'tag': 'v2'},
+            {'prompt': None, 'append': None, 'metadata_mode': None, 'tag': 'v2'},
             id='tag-forwarded',
         ),
         pytest.param(
             {'id': '1', 'project_root': '/project'},
-            {'prompt': None, 'append': False, 'tag': None},
+            {'prompt': None, 'append': None, 'metadata_mode': None, 'tag': None},
             id='tag-none',
         ),
     ],
@@ -134,6 +134,65 @@ async def test_update_task_param_forwarding(
     }
     expected_kwargs = {**base_kwargs, **expected_overrides}
     task_interceptor.update_task.assert_called_once_with(**expected_kwargs)
+
+
+# ------------------------------------------------------------------
+# update_task metadata_mode wire-forwarding (step-7 RED / step-8 GREEN)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_metadata_mode_replace_forwarded(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """metadata_mode='replace' is forwarded raw to the interceptor."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project', 'metadata_mode': 'replace'},
+    )
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['metadata_mode'] == 'replace', (
+        f"Expected metadata_mode='replace'; got {kwargs.get('metadata_mode')!r}"
+    )
+    assert kwargs['append'] is None, (
+        f"Expected append=None (unresolved); got {kwargs.get('append')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_append_true_forwarded_raw(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """append=True is forwarded raw (unresolved) alongside metadata_mode=None."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project', 'append': True},
+    )
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['append'] is True, (
+        f"Expected append=True; got {kwargs.get('append')!r}"
+    )
+    assert kwargs['metadata_mode'] is None, (
+        f"Expected metadata_mode=None; got {kwargs.get('metadata_mode')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_no_arg_default_forwards_none_none(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """No-arg default: both append=None and metadata_mode=None forwarded (backend resolves)."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project'},
+    )
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['append'] is None, (
+        f"Expected append=None; got {kwargs.get('append')!r}"
+    )
+    assert kwargs['metadata_mode'] is None, (
+        f"Expected metadata_mode=None; got {kwargs.get('metadata_mode')!r}"
+    )
 
 
 # ------------------------------------------------------------------
