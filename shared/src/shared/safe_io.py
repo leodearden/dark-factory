@@ -49,7 +49,15 @@ def load_json_or_warn(
     on_corrupt:
         One of ``'warn'`` (default), ``'fail_closed'``, or ``'quarantine'``.
         Controls what happens when a present-but-corrupt file is found;
-        see return values below.
+        see return values below.  Validated eagerly — an unrecognised value
+        raises ``ValueError`` before any I/O is attempted.
+
+        .. note::
+            The per-process dedup set gates the WARNING only (once per path
+            per process); the corrective action (quarantine rename) always
+            runs.  A path that corrupts, gets quarantined, is re-created, and
+            corrupts again will be silently quarantined without a second
+            WARNING.  On process restart the WARNING re-fires.
 
     Returns
     -------
@@ -70,6 +78,9 @@ def load_json_or_warn(
     OSError
         When any OS error other than ``FileNotFoundError`` occurs.
     """
+    if on_corrupt not in ('warn', 'fail_closed', 'quarantine'):
+        raise ValueError(f'unknown on_corrupt={on_corrupt!r}')
+
     p = Path(path)
 
     # --- read phase ---
@@ -81,20 +92,17 @@ def load_json_or_warn(
     # Other OSErrors propagate uncaught (PermissionError, IsADirectoryError, …).
 
     # --- parse phase ---
+    # json.JSONDecodeError is a ValueError subclass, so `except ValueError`
+    # covers both malformed JSON and non-UTF-8 content detected post-read.
     try:
         parsed = json.loads(text)
-    except (json.JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         # Corrupt branch: dispatch on on_corrupt.
         #
         # fail_closed: the exception IS the loud channel — re-raise BEFORE
         # any WARNING to avoid double-signalling.
         if on_corrupt == 'fail_closed':
             raise
-
-        # Validate mode early so an unknown value raises rather than silently
-        # behaving like 'warn'.
-        if on_corrupt not in ('warn', 'quarantine'):
-            raise ValueError(f'unknown on_corrupt={on_corrupt!r}') from None
 
         # warn / quarantine both emit the deduped WARNING — once per path per
         # process (mirrors sqlite_task_backend._warned_malformed_task_ids:51).
