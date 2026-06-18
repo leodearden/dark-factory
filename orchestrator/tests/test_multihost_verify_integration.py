@@ -43,6 +43,7 @@ import contextlib
 import logging
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1301,7 +1302,7 @@ class TestUnreachableHostCapstone:
         def _make_entry(host_name: str, reason: str):
             loop = asyncio.get_event_loop()
             config = OrchestratorConfig(
-                project_root='/tmp/fake',
+                project_root=Path('/tmp/fake'),
             )
             req = MergeRequest(
                 task_id='task-cap',
