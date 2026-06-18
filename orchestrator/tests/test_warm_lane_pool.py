@@ -1531,3 +1531,95 @@ class TestAcquireFor:
         lanes = [r[0] for r in results if r is not None]
         assert len(lanes) == 5
         assert len(set(lanes)) == 5  # all distinct
+
+
+# ===========================================================================
+# Step-1 RED: WarmLanePool.restore_assignment
+# Sets BOTH the assignment map AND lane state to ASSIGNED — the startup
+# recovery rebuild that prevents a freed lane from being grabbed by a
+# concurrent fresh dispatch before the original task is re-dispatched.
+# ===========================================================================
+
+
+class TestRestoreAssignment:
+    def test_restore_sets_lane_assigned(self, tmp_path: Path):
+        """After restore_assignment, state(_lane-0) == ASSIGNED."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        lane = base / '_lane-0'
+
+        pool.restore_assignment('42', lane)
+
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+    def test_restore_records_assignment_map(self, tmp_path: Path):
+        """After restore_assignment, assignment_for('42') == _lane-0."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        lane = base / '_lane-0'
+
+        pool.restore_assignment('42', lane)
+
+        assert pool.assignment_for('42') == lane
+
+    def test_restore_reserved_lane_skipped_by_try_acquire(self, tmp_path: Path):
+        """try_acquire() skips the restored (ASSIGNED) lane and returns _lane-1."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        lane_0 = base / '_lane-0'
+        lane_1 = base / '_lane-1'
+
+        pool.restore_assignment('42', lane_0)
+
+        # try_acquire should give lane-1 (lane-0 is reserved ASSIGNED)
+        acquired = asyncio.run(pool.try_acquire())
+        assert acquired == lane_1
+
+    def test_restore_acquire_for_returns_reused(self, tmp_path: Path):
+        """acquire_for('42') after restore returns (lane, reused=True)."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        lane = base / '_lane-0'
+
+        pool.restore_assignment('42', lane)
+
+        result = asyncio.run(pool.acquire_for('42'))
+        assert result is not None
+        returned_lane, reused = result
+        assert returned_lane == lane
+        assert reused is True
+
+    def test_restore_idempotent(self, tmp_path: Path):
+        """Calling restore_assignment twice is idempotent (no state corruption)."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        lane = base / '_lane-0'
+
+        pool.restore_assignment('42', lane)
+        pool.restore_assignment('42', lane)  # second call must not raise or corrupt
+
+        assert pool.state(lane) == LaneState.ASSIGNED
+        assert pool.assignment_for('42') == lane
+
+    def test_restore_unknown_lane_is_noop(self, tmp_path: Path):
+        """Unknown lane path is silently ignored (never raises)."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        unknown = base / '_lane-99'
+
+        # Must not raise
+        pool.restore_assignment('42', unknown)
+
+        # No side effects
+        assert pool.assignment_for('42') is None
+
+    def test_restore_does_not_affect_other_lanes(self, tmp_path: Path):
+        """restore_assignment for _lane-0 leaves _lane-1 FREE."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        lane_0 = base / '_lane-0'
+        lane_1 = base / '_lane-1'
+
+        pool.restore_assignment('42', lane_0)
+
+        assert pool.state(lane_1) == LaneState.FREE

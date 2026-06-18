@@ -1382,6 +1382,8 @@ Output JSON matching the schema. Every task must appear in the output.
         for entry in worktree_base.iterdir():
             if not entry.is_dir():
                 continue
+            pool = self.git_ops.warm_lane_pool
+            is_lane = pool is not None and pool.is_lane(entry)
             task_id = entry.name
             plan_path = entry / '.task' / 'plan.json'
 
@@ -1391,6 +1393,24 @@ Output JSON matching the schema. Every task must appear in the output.
                 # sidecar pins the Claude session UUID so the next workflow
                 # can --resume it with a "continue" prompt instead of spawning
                 # a fresh agent.
+                #
+                # For lanes: the sidecar (agent_session.json) carries
+                # session_id/role/owner_pid but NO task_id.  The in-memory
+                # assignment map is empty after a restart, so there is no way
+                # to map a sidecar-only lane back to its real task.  Storing
+                # _recovered_sessions['_lane-k'] would be dead state (dispatch
+                # keys off the real task_id) and would also wrongly shield the
+                # lane from the orphan reaper.  Release it back to the pool
+                # (cleanup_worktree routes lanes to release_warm_lane).
+                if is_lane:
+                    logger.info(
+                        f'Recovery: lane {task_id} has no plan — '
+                        f'releasing back to pool'
+                    )
+                    await self.git_ops.cleanup_worktree(entry, task_id)
+                    cleaned += 1
+                    continue
+
                 sidecar_path = entry / '.task' / 'agent_session.json'
                 if sidecar_path.exists():
                     try:
@@ -1428,16 +1448,44 @@ Output JSON matching the schema. Every task must appear in the output.
                 cleaned += 1
                 continue
 
-            # Validate plan belongs to this task
-            plan_task_id = plan.get('task_id')
-            if plan_task_id and plan_task_id != task_id:
+            # For lanes, derive the real task id from plan.json.  A lane dir
+            # name (e.g. '_lane-0') never equals the real task_id by design —
+            # the lane dir is named after the pool slot, not the task.
+            # Cold path: recovery_id == task_id (entry.name) — byte-identical.
+            # Normalize to str: plan.json could store task_id as int; dispatch
+            # and restore_assignment key off str (mirroring the str() coercion
+            # in the orphan-reaper live_ids set).
+            recovery_id = (
+                str(plan.get('task_id'))
+                if (is_lane and plan.get('task_id') is not None)
+                else task_id
+            )
+
+            # For lanes: if plan.json has no task_id there is no recoverable
+            # identity — release the lane back to the pool.
+            if is_lane and not recovery_id:
                 logger.warning(
-                    f'Recovery: worktree {task_id} has plan for task '
-                    f'{plan_task_id} — task_id mismatch, cleaning up'
+                    'Recovery: lane %s plan.json has no task_id — '
+                    'releasing back to pool',
+                    task_id,
                 )
                 await self.git_ops.cleanup_worktree(entry, task_id)
                 cleaned += 1
                 continue
+
+            # Validate plan belongs to this task (cold path only).
+            # Lanes skip this check: lane name != task_id is expected by
+            # design, so the cold numeric-mismatch cleanup must not fire.
+            if not is_lane:
+                plan_task_id = plan.get('task_id')
+                if plan_task_id and plan_task_id != task_id:
+                    logger.warning(
+                        f'Recovery: worktree {task_id} has plan for task '
+                        f'{plan_task_id} — task_id mismatch, cleaning up'
+                    )
+                    await self.git_ops.cleanup_worktree(entry, task_id)
+                    cleaned += 1
+                    continue
 
             # ── Semantic identity guard (Fix C) ───────────────────────
             # The numeric guard above only proves plan.task_id == dirname.
@@ -1447,8 +1495,9 @@ Output JSON matching the schema. Every task must appear in the output.
             # task).  Compare the worktree's stored title to the LIVE DB
             # task's title and quarantine on a provable mismatch — this is the
             # exact line that would have caught 3770.
+            # For lanes, recovery_id is the real task id read from plan.json.
             if self.config.worktree_identity_guard_enabled:
-                live = await self.scheduler.get_task(task_id)
+                live = await self.scheduler.get_task(recovery_id)
                 if live is None:
                     # get_task returns None for BOTH "deleted" and transient
                     # error — both safely handled by deferring: do not adopt,
@@ -1456,7 +1505,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     # an empty task list) handles a genuinely-deleted task.
                     logger.warning(
                         'Recovery: worktree %s has no live DB task — deferring '
-                        '(no adopt, no destroy)', task_id,
+                        '(no adopt, no destroy)', recovery_id,
                     )
                     continue
                 stored_title = read_worktree_title(entry)
@@ -1464,19 +1513,26 @@ Output JSON matching the schema. Every task must appear in the output.
                     logger.warning(
                         'Recovery: worktree %s identity MISMATCH — stored title '
                         '%r != live %r; quarantining',
-                        task_id, stored_title, live.get('title'),
+                        recovery_id, stored_title, live.get('title'),
                     )
                     await self.git_ops.quarantine_worktree(
-                        entry, task_id, 'recovery-identity-mismatch',
+                        entry, recovery_id, 'recovery-identity-mismatch',
                     )
                     if self.event_store:
                         self.event_store.emit(
                             EventType.worktree_quarantined,
-                            task_id=task_id,
+                            task_id=recovery_id,
                             data={'reason': 'recovery-identity-mismatch'},
                         )
                     cleaned += 1
                     continue
+
+            # For lanes: restore the in-memory pool assignment so the lane is
+            # reserved ASSIGNED before re-dispatch.  Both sets the map AND
+            # flips the lane FREE→ASSIGNED, preventing a concurrent fresh
+            # acquire from stealing the lane while the original task is queued.
+            if pool is not None and is_lane and recovery_id:
+                pool.restore_assignment(recovery_id, entry)
 
             # Check if plan has any completed steps
             # Note: some plans have prerequisites as plain strings (not dicts)
@@ -1501,7 +1557,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 # _plan() entirely.
                 if plan.get('_session_id'):
                     logger.info(
-                        f'Recovery: worktree {task_id} has stamped plan with '
+                        f'Recovery: worktree {recovery_id} has stamped plan with '
                         f'no completed steps — preserving for revalidation'
                     )
                     lock_path = entry / '.task' / 'plan.lock'
@@ -1509,35 +1565,41 @@ Output JSON matching the schema. Every task must appear in the output.
                         lock_path.unlink()
                         logger.info(
                             f'Recovery: cleared stale plan.lock for '
-                            f'preserved task {task_id}'
+                            f'preserved task {recovery_id}'
                         )
                     # The architect already produced a stamped plan; any
                     # sidecar present is from a later (post-plan) invocation
                     # that crashed and isn't meaningful here — clear it to
                     # avoid confusing the next workflow on this task.
                     (entry / '.task' / 'agent_session.json').unlink(missing_ok=True)
-                    self._preserved_worktrees.add(task_id)
+                    self._preserved_worktrees.add(recovery_id)
                     recovered += 1
                     continue
                 logger.info(
                     f'Recovery: worktree {task_id} has unstamped plan with no '
                     f'completed steps — cleaning up'
                 )
-                await self.git_ops.cleanup_worktree(entry, task_id)
+                # For lanes, pass recovery_id (the real task branch name) so
+                # release_warm_lane deletes the actual task branch (e.g.
+                # 'task/42') rather than the nonexistent 'task/_lane-0'.
+                # Cold path: recovery_id == task_id, so behavior is unchanged.
+                await self.git_ops.cleanup_worktree(
+                    entry, recovery_id if is_lane else task_id
+                )
                 cleaned += 1
                 continue
 
             total = sum(len(plan.get(col, [])) for col in ('prerequisites', 'steps'))
             logger.info(
-                f'Recovery: worktree {task_id} has plan with '
+                f'Recovery: worktree {recovery_id} has plan with '
                 f'{len(completed)}/{total} steps done — storing for resumption'
             )
-            self._recovered_plans[task_id] = plan
+            self._recovered_plans[recovery_id] = plan
             # Clear stale plan.lock so the new session doesn't immediately requeue
             lock_path = entry / '.task' / 'plan.lock'
             if lock_path.exists():
                 lock_path.unlink()
-                logger.info(f'Recovery: cleared stale plan.lock for task {task_id}')
+                logger.info(f'Recovery: cleared stale plan.lock for task {recovery_id}')
             recovered += 1
 
         if recovered or cleaned:
@@ -1592,6 +1654,15 @@ Output JSON matching the schema. Every task must appear in the output.
             name = entry.name
             # Skip reserved (merge / auto-eval skip-attempt) worktrees.
             if name.startswith('_merge-') or name.endswith('-skip-attempt'):
+                continue
+            # Skip warm pool lanes.  quarantine_worktree is NOT pool-aware
+            # (it moves the dir), so moving a lane would leave the pool's
+            # registered path dangling.  Crash-recovery already handles
+            # lanes; the reaper must not undo a just-recovered lane.
+            if (
+                self.git_ops.warm_lane_pool is not None
+                and self.git_ops.warm_lane_pool.is_lane(entry)
+            ):
                 continue
             # Skip live, recovered, preserved, and in-flight worktrees.
             if (
@@ -1819,6 +1890,23 @@ Output JSON matching the schema. Every task must appear in the output.
                 log_prefix, reverted, marked_done,
             )
         return reverted + marked_done
+
+    def _resolve_task_worktree(self, tid: str) -> Path:
+        """Return the on-disk worktree path for *tid*.
+
+        When a WarmLanePool is active and has an assignment for *tid*, returns
+        the assigned lane path (e.g. ``worktree_base/_lane-0``).  Otherwise
+        falls back to the cold convention ``worktree_base/<tid>``.
+
+        Pool-absent or unmapped tid → identical cold behaviour (byte-compatible
+        with pre-pool code).
+        """
+        pool = self.git_ops.warm_lane_pool
+        if pool is not None:
+            assigned = pool.assignment_for(tid)
+            if assigned is not None:
+                return assigned
+        return self.git_ops.worktree_base / tid
 
     async def _reconcile_one_stranded(
         self, tid: str, status: str, *, mid_run: bool,
@@ -2104,7 +2192,9 @@ Output JSON matching the schema. Every task must appear in the output.
             return None
 
         # 'in-progress' and not on main: classify by lock state.
-        worktree_path = self.git_ops.worktree_base / tid
+        # For warm tasks the real worktree is the assigned pool lane, not
+        # worktree_base/<tid>.  _resolve_task_worktree handles both cases.
+        worktree_path = self._resolve_task_worktree(tid)
         lock_path = worktree_path / '.task' / 'plan.lock'
 
         if not lock_path.exists():
@@ -2216,7 +2306,10 @@ Output JSON matching the schema. Every task must appear in the output.
                 tid, reason,
             )
             return
-        worktree_path = self.git_ops.worktree_base / tid
+        # For warm tasks the real worktree is the assigned pool lane.
+        # _resolve_task_worktree falls back to the cold worktree_base/tid
+        # convention when the pool is absent or has no assignment for tid.
+        worktree_path = self._resolve_task_worktree(tid)
         self._recovered_plans.pop(tid, None)
         self._recovered_sessions.pop(tid, None)
         if worktree_path.exists():
