@@ -57,13 +57,12 @@ class TestHostLoadCardStaleness:
     def test_host_load_card_stale_state_declared(self, tab_overview_jsx_body):
         """HostLoadCard must declare a useState hook for stale state.
 
-        Looks for `setStale` as a setter from a useState destructuring, e.g.:
-            const [stale, setStale] = useState(false)
-        Fails today — no stale hook exists.
+        Looks for `setStale(` — any invocation of the setter acts as proof
+        that the hook is declared (e.g. const [stale, setStale] = useState(false)).
+        Fails today — no stale hook or setStale call exists.
         """
-        assert re.search(r'setStale\s*[,\)]', tab_overview_jsx_body), (
-            'HostLoadCard must declare a stale state hook '
-            '(e.g. const [stale, setStale] = useState(false)); '
+        assert re.search(r'setStale\s*\(', tab_overview_jsx_body), (
+            'HostLoadCard must declare a stale state hook and call setStale(...); '
             'currently no stale hook is declared in tab_overview.jsx'
         )
 

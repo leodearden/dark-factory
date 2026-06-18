@@ -31,6 +31,7 @@ function formatLoadValue(type, v) {
 
 function HostLoadCard({ paused }) {
   const [load, setLoad] = useState(null);
+  const [stale, setStale] = useState(false);
 
   useEffect(() => {
     if (paused) return;
@@ -38,10 +39,10 @@ function HostLoadCard({ paused }) {
     async function fetchLoad() {
       try {
         const resp = await fetch('/api/load', { credentials: 'same-origin' });
-        if (!resp.ok) return;
+        if (!resp.ok) { if (alive) setStale(true); return; }
         const body = await resp.json();
-        if (alive) setLoad(body);
-      } catch (_) { /* keep prior values on network blip */ }
+        if (alive) { setLoad(body); setStale(false); }
+      } catch (_) { if (alive) setStale(true); }
     }
     fetchLoad();
     const id = setInterval(fetchLoad, 5000);
@@ -52,6 +53,7 @@ function HostLoadCard({ paused }) {
     <div className="panel">
       <div className="panel-head">
         <span className="title">Host load</span>
+        {stale && <span className="badge stale">stale</span>}
         <span className="meta">5-min window · 5s poll</span>
       </div>
       <div className="panel-body">
