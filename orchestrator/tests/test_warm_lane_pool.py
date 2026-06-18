@@ -1781,3 +1781,82 @@ class TestRestoreAssignment:
         pool.restore_assignment('42', lane_0)
 
         assert pool.state(lane_1) == LaneState.FREE
+
+
+# ===========================================================================
+# Step-6: RED — GitOps.refresh_warm_base unit + inv.9 promote-provenance
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRefreshWarmBase:
+    """GitOps.refresh_warm_base: invoke <_merge-verify>/scripts/refresh-warm-base.sh."""
+
+    async def _setup_merge_verify(
+        self,
+        repo: Path,
+        recorder_file: Path,
+    ) -> Path:
+        """Create _merge-verify/target/ and install the recorder script."""
+        worktree_base = repo / '.worktrees'
+        merge_verify = worktree_base / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir(exist_ok=True)
+        _install_refresh_recorder(merge_verify / 'scripts', recorder_file)
+        return merge_verify
+
+    async def test_refresh_invokes_script_with_correct_args(
+        self,
+        wl_git_repo: Path,
+        wl_git_config_rolling_base: GitConfig,
+        tmp_path: Path,
+    ):
+        """refresh_warm_base() invokes the script with <advancing> <base> args."""
+        recorder = tmp_path / 'refresh_args.txt'
+        await self._setup_merge_verify(wl_git_repo, recorder)
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops.refresh_warm_base()
+
+        assert result is True, 'refresh_warm_base must return True on success'
+        assert recorder.exists(), 'refresh-warm-base.sh was not called (recorder missing)'
+        recorded = recorder.read_text().strip()
+
+        advancing = str(git_ops.persistent_merge_worktree_path / 'target')
+        base = str(git_ops.warm_lane_base_target_path)
+        expected = f'{advancing} {base}'
+        assert recorded == expected, (
+            f'Wrong args: got {recorded!r}, expected {expected!r}'
+        )
+
+    async def test_refresh_advancing_is_merge_verify_not_lane(
+        self,
+        wl_git_repo: Path,
+        wl_git_config_rolling_base: GitConfig,
+        tmp_path: Path,
+    ):
+        """inv.9 promote-provenance: advancing arg is always _merge-verify/target,
+        never a task-lane path (_lane-K).
+
+        refresh_warm_base() hardcodes the advancing dir to
+        persistent_merge_worktree_path/<artifact_dir> and exposes no caller-
+        supplied advancing parameter, so DF can never source un-landed WIP.
+        """
+        recorder = tmp_path / 'refresh_args.txt'
+        await self._setup_merge_verify(wl_git_repo, recorder)
+        git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
+
+        await git_ops.refresh_warm_base()
+
+        assert recorder.exists(), 'refresh-warm-base.sh was not called'
+        recorded = recorder.read_text().strip()
+        advancing_arg = recorded.split(' ')[0]  # first positional arg
+
+        # inv.9: advancing must include '_merge-verify' in the path
+        assert '_merge-verify' in advancing_arg, (
+            f'Advancing arg must reference _merge-verify, got: {advancing_arg!r}'
+        )
+        # inv.9: advancing must NEVER be a pool lane path
+        assert '_lane-' not in advancing_arg, (
+            f'Advancing arg must NOT be a task-lane path, got: {advancing_arg!r}'
+        )
