@@ -2,4 +2,4 @@
 # Scopes verification to tests/scripts/ — the Python test suite for this module.
 # Bash scripts (verify-migration.sh, migrate.sh, etc.) are not linted here.
 
-test_command: "uv run pytest scripts/tests/ --tb=short -q"
+test_command: "uv run pytest tests/scripts/ --tb=short -q"
