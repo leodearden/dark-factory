@@ -1063,13 +1063,19 @@ class GitOps:
         if self.warm_lane_pool is None:
             return None
 
-        lane = await self.warm_lane_pool.try_acquire()
-        if lane is None:
+        acq = await self.warm_lane_pool.acquire_for(branch_name)
+        if acq is None:
             return None  # Pool exhausted → caller cold-fallback (inv.6)
+        lane, reused = acq
 
         full_branch = f'{self.config.branch_prefix}{branch_name}'
 
         try:
+            if reused:
+                # ── Reuse path: live requeue of same task on same lane ────
+                # .task/plan.json is preserved; WIP is committed + rebased.
+                return await self._reuse_warm_lane(lane, full_branch)
+
             if not await self._is_registered_worktree(lane):
                 # ── Create-once branch ────────────────────────────────────
                 # Self-heal: remove a stale unregistered directory so
@@ -1107,7 +1113,7 @@ class GitOps:
                     await self.warm_lane_pool.release(lane)
                     return None
             else:
-                # ── Reset-in-place branch (added in step-10) ─────────────
+                # ── Reset-in-place branch (fresh task on registered lane) ─
                 await self._reset_warm_lane(lane, full_branch, start_ref)
 
             # ── Shared tail: gitignore, scrub, base, debug-port ──────────
@@ -1134,6 +1140,56 @@ class GitOps:
             )
             await self.warm_lane_pool.release(lane)
             return None
+
+    async def _reuse_warm_lane(
+        self, lane_dir: Path, full_branch: str,
+    ) -> 'WorktreeInfo':
+        """Handle a live-requeue: same task on the same lane (in-memory map hit).
+
+        Mirrors the cold-requeue reuse block (git_ops.py ~806-858):
+        1. Commit any uncommitted WIP so it is preserved across the rebase.
+        2. Rebase onto main (best-effort; log failure and continue on old base).
+        3. Re-ensure the task .gitignore.
+        4. Recompute ``base_commit`` as ``merge-base main HEAD``.
+        5. Re-provision the debug port (inv.7).
+
+        ``.task/plan.json`` is NOT committed by ``commit()`` (the
+        ``:!.task`` pathspec excludes it) and survives the rebase intact
+        because git rebase only touches tracked files.
+
+        Returns:
+            WorktreeInfo for the reused lane.  Never raises — exceptions
+            propagate to the caller's try/except-release wrapper.
+        """
+        # 1. Commit WIP (returns None if nothing to commit — that's fine)
+        await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
+
+        # 2. Rebase onto main (best-effort; failure leaves the branch on old base)
+        rebased = await self.rebase_onto_main(lane_dir)
+        if not rebased:
+            logger.info(
+                '_reuse_warm_lane: rebase failed for %s; continuing on old base', lane_dir,
+            )
+
+        # 3. Re-ensure task .gitignore (idempotent)
+        _ensure_task_gitignore(lane_dir)
+
+        # 4. Recompute base: merge-base between main_branch and HEAD
+        _, mb_out, _ = await _run(
+            ['git', 'merge-base', self.config.main_branch, 'HEAD'],
+            cwd=lane_dir,
+        )
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane_dir)
+        base_commit = mb_out.strip() or head_sha.strip()
+
+        # 5. Re-provision debug port (inv.7)
+        port = await self._provision_reify_debug_port(lane_dir)
+
+        logger.info(
+            '_reuse_warm_lane: reused %s on branch %s (base=%s, port=%s)',
+            lane_dir, full_branch, base_commit[:8] if base_commit else '?', port,
+        )
+        return WorktreeInfo(path=lane_dir, base_commit=base_commit, reify_debug_port=port)
 
     async def _reset_warm_lane(
         self, lane_dir: Path, full_branch: str, target_commit: str,
