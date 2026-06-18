@@ -25,7 +25,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.models import Escalation
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -869,4 +871,83 @@ class TestCorruptMetadataRobustness:
         )
         assert 'pending' in set_status_calls, (
             'Flip should proceed when guard was a plain integer (treated as absent)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-6 (1828): _check_reblock_guard wire-mode assertion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReblockGuardWireMode:
+    """Guard update_task wire call must forward metadata_mode='merge'.
+
+    The guard writes {'reblock_guard': {count, signature}}, a full sub-dict.
+    Under additive (_merge_values: recursive, scalar OLD-wins), the count
+    collision across incarnations would keep the OLD count — freezing the
+    counter so the re-block threshold never trips.  Shallow merge overwrites
+    the whole reblock_guard key wholesale (new count wins) while preserving
+    sibling metadata keys.
+
+    RED today: _check_reblock_guard calls update_task(append=True) →
+    after step-5, wrapper maps that to metadata_mode='additive', not 'merge'.
+    GREEN after step-7 impl (switch append=True → metadata_mode='merge').
+    """
+
+    async def test_reblock_guard_increment_forwards_merge_mode(
+        self, harness: Harness, monkeypatch
+    ):
+        """Guard increment path must forward metadata_mode='merge' on the wire."""
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+        )
+
+        # Seed get_task to return an existing guard + sibling keys so the
+        # increment path (prev_count + 1) is exercised.
+        existing_guard = {'count': 1, 'signature': Harness._reblock_signature(esc)}
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': task_id,
+            'metadata': {
+                'reblock_guard': existing_guard,
+                'files': ['foo.py'],
+                'memory_hints': ['hint1'],
+            },
+        })
+
+        # Capture update_task wire calls via a REAL Scheduler + monkeypatched mcp_call.
+        captured_payloads: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_payloads.append(payload)
+            return {}
+
+        real_scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        # Replace only update_task; get_task/get_status/set_task_status stay on mock.
+        harness.scheduler.update_task = real_scheduler.update_task
+
+        result = await harness._check_reblock_guard(esc, task_id)
+
+        assert result is True, 'Guard should allow the flip (count=2 < threshold=3)'
+
+        update_wire_calls = [
+            p for p in captured_payloads if p.get('name') == 'update_task'
+        ]
+        assert len(update_wire_calls) == 1, (
+            f'Expected 1 update_task wire call; got {len(update_wire_calls)} '
+            f'(all: {[p.get("name") for p in captured_payloads]})'
+        )
+        arguments = update_wire_calls[0]['arguments']
+        assert arguments.get('metadata_mode') == 'merge', (
+            f"_check_reblock_guard must forward metadata_mode='merge' so the "
+            f"whole reblock_guard sub-dict is overwritten wholesale (new count "
+            f"wins) and sibling keys are preserved; got: {arguments}"
+        )
+        assert 'append' not in arguments, (
+            f"'append' key must not appear on the wire; got: {arguments}"
         )
