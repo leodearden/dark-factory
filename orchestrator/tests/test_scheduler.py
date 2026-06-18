@@ -3986,6 +3986,7 @@ class TestGetStatusesFailsLoud:
         Fails today: get_statuses falls through to ``return {}, None`` on non-dict.
         """
         import logging
+
         from shared.mcp_envelope import EnvelopeParseError as _EnvelopeParseError
 
         # Response whose 'statuses' is a list, not a dict → wrong type.
@@ -4020,6 +4021,7 @@ class TestGetStatusesFailsLoud:
         not silently returned as ``({}, None)``.
         """
         import logging
+
         from shared.mcp_envelope import EnvelopeParseError as _EnvelopeParseError
 
         # Response with no 'statuses' key at all.
@@ -4042,7 +4044,6 @@ class TestGetStatusesFailsLoud:
         self, scheduler: Scheduler, monkeypatch
     ):
         """Non-dict error leaves no persistent state; next call still works correctly."""
-        import json as _json
         from shared.mcp_envelope import EnvelopeParseError as _EnvelopeParseError
 
         # First call: non-dict response.

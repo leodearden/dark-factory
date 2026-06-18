@@ -1208,7 +1208,7 @@ class Scheduler:
                 timeout=15,
             )
             tasks, tasks_err = parse_tool_result(result, 'tasks', list)
-            if tasks_err is None:
+            if tasks_err is None and tasks is not None:
                 for t in tasks:
                     if isinstance(t, dict):
                         self._normalize_task_metadata(t)
@@ -1501,7 +1501,10 @@ class Scheduler:
                 arguments['ids'] = list(ids)
             result = await self.dispatch_tool('get_statuses', arguments, timeout=15)
             statuses, err = parse_tool_result(result, 'statuses', dict)
-            return ({}, err) if err is not None else (statuses, None)
+            if err is not None:
+                return {}, err
+            assert statuses is not None  # invariant: parse_tool_result → (None, err) | (value, None)
+            return statuses, None
         except Exception as e:
             logger.exception(
                 'Failed to fetch task statuses: %s: %s', type(e).__name__, e,
@@ -1540,6 +1543,7 @@ class Scheduler:
             if parse_err is not None:
                 # primitive already emitted the WARNING; preserve ExternalResolverError type.
                 return {}, ExternalResolverError(str(parse_err))
+            assert statuses is not None  # invariant: parse_tool_result → (None, err) | (value, None)
             # Guard: the real tool always keys its response by the verbatim
             # dep string and always sets a value (real status or a sentinel).
             # A missing dep key is a genuine contract violation, not normal
