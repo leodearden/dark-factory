@@ -7454,6 +7454,7 @@ class TestFullCycleWiringDiagnostics:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
         # Wire taskmaster with real task and status data so census fetch returns non-empty
+        assert harness.taskmaster is not None
         harness.taskmaster.get_tasks = AsyncMock(
             return_value={
                 'tasks': [
