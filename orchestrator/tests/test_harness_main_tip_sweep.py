@@ -23,12 +23,16 @@ This file covers:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import _init_harness_state_for_test
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.harness import Harness
+from orchestrator.verify import VerifyResult
 
 
 # ---------------------------------------------------------------------------
@@ -42,3 +46,81 @@ def test_config_defaults_main_tip_sweep() -> None:
     config = OrchestratorConfig()
     assert config.main_tip_sweep_enabled is True
     assert config.main_tip_sweep_interval_secs == 1800.0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+MAIN_SHA = 'b' * 40
+
+FAILING_RESULT = VerifyResult(
+    passed=False,
+    test_output='FAILED test_x',
+    lint_output='',
+    type_output='',
+    summary='test_failure',
+    cause_hint='FAILED test_x',
+    category='test_failure',
+)
+
+PASSING_RESULT = VerifyResult(
+    passed=True,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='all checks passed',
+)
+
+
+def _make_sweep_harness(*, main_sha: str = MAIN_SHA) -> Harness:
+    """Build a minimal bare Harness for single-pass sweep tests."""
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    h.config = OrchestratorConfig()
+    h.git_ops = MagicMock()
+    h.git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+    h._escalation_queue = MagicMock()
+    h._escalation_queue.make_id = MagicMock(return_value='esc-sweep-1')
+    h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._main_tip_sweep_task = None
+    h._last_swept_main_sha = None
+    return h
+
+
+# ---------------------------------------------------------------------------
+# step-7: _run_main_tip_sweep single-pass — drift escalation
+# ---------------------------------------------------------------------------
+
+
+class TestRunMainTipSweepHarness:
+    """step-7: _run_main_tip_sweep files a level-1 infra_issue escalation on drift."""
+
+    @pytest.mark.asyncio
+    async def test_run_main_tip_sweep_escalates_on_drift(self) -> None:
+        """When run_main_tip_sweep returns a failing VerifyResult, the harness
+        calls _escalation_queue.submit with a blocking L1 infra_issue escalation
+        whose summary contains the SHA prefix and failure category."""
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+
+        with patch.object(
+            verify_module,
+            'run_main_tip_sweep',
+            new=AsyncMock(return_value=(MAIN_SHA, FAILING_RESULT)),
+        ):
+            await h._run_main_tip_sweep()
+
+        h._escalation_queue.submit.assert_called_once()
+        submitted_esc = h._escalation_queue.submit.call_args[0][0]
+        assert submitted_esc.level == 1
+        assert submitted_esc.category == 'infra_issue'
+        assert submitted_esc.severity == 'blocking'
+        sha_prefix = MAIN_SHA[:12]
+        assert sha_prefix in submitted_esc.summary, (
+            f'Expected SHA prefix {sha_prefix!r} in summary: {submitted_esc.summary!r}'
+        )
+        assert 'test_failure' in submitted_esc.summary, (
+            f'Expected failure category in summary: {submitted_esc.summary!r}'
+        )
