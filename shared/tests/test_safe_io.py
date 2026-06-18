@@ -178,6 +178,36 @@ class TestDedup:
         )
 
 
+class TestNonUtf8Corruption:
+    """Non-UTF-8 / binary garbage bytes are routed to the corrupt branch."""
+
+    def test_non_utf8_bytes_returns_default_false_and_warns(self, tmp_path, caplog):
+        """Binary garbage (non-UTF-8) returns (SENTINEL, False) with exactly one WARNING.
+
+        The four bytes written are 0xFF, 0xFE, 0x00, followed by ASCII 'bad' — a
+        UTF-16-LE BOM then junk — which is not valid UTF-8.
+
+        RED: the current read phase calls p.read_text(encoding='utf-8'), which raises
+        UnicodeDecodeError (a ValueError subclass, NOT an OSError) on these bytes.
+        Because UnicodeDecodeError is only caught in the parse phase and the read
+        phase only catches FileNotFoundError, the exception propagates uncaught.
+        """
+        from shared.safe_io import load_json_or_warn
+
+        p = tmp_path / 'state.json'
+        p.write_bytes(b'\xff\xfe\x00bad')  # UTF-16-LE BOM + junk — invalid UTF-8
+
+        with caplog.at_level(logging.WARNING):
+            result, ok = load_json_or_warn(p, default=SENTINEL)
+
+        assert ok is False
+        assert result is SENTINEL
+        assert len(caplog.records) == 1, (
+            f'Expected exactly one WARNING for non-UTF-8 bytes, got: {caplog.records}'
+        )
+        assert str(p) in caplog.records[0].message
+
+
 class TestOSErrorPropagation:
     """Non-FileNotFoundError OS errors propagate uncaught (stay loud)."""
 
