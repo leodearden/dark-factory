@@ -6252,14 +6252,13 @@ class TestCreateWorktreeRequeueAndRecycledId:
 
 @pytest.mark.asyncio
 class TestGetMergeDiffFilesWarning:
-    """Step-13 (RED): get_merge_diff_files must emit a WARNING when git diff
-    exits non-zero (e.g. non-existent base SHA), while still returning [].
+    """Task 1826: get_merge_diff_files returns (files, error) tuple contract.
 
-    Before step-14 impl: rc!=0 path is silent → RED (no WARNING).
-    After step-14 impl: WARNING captured at 'orchestrator.git_ops'.
+    Error path: rc!=0 (non-existent SHA) → ([], Exception), WARNING emitted.
+    Success path: valid base..head → (changed_files, None).
     """
 
-    async def test_nonexistent_sha_returns_empty_and_warns(
+    async def test_nonexistent_sha_returns_empty_tuple_and_warns(
         self, git_repo: Path, git_config: GitConfig, caplog,
     ) -> None:
         import logging
@@ -6268,10 +6267,16 @@ class TestGetMergeDiffFilesWarning:
         non_existent = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            result = await ops.get_merge_diff_files(non_existent, 'HEAD')
+            files, err = await ops.get_merge_diff_files(non_existent, 'HEAD')
 
-        assert result == [], (
-            f'Expected [] on git error; got {result!r}'
+        assert files == [], (
+            f'Expected [] on git error; got {files!r}'
+        )
+        assert err is not None, (
+            'Expected a non-None error on git diff rc!=0'
+        )
+        assert isinstance(err, Exception), (
+            f'Expected err to be an Exception; got {type(err)!r}'
         )
 
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
@@ -6283,6 +6288,34 @@ class TestGetMergeDiffFilesWarning:
             'get_merge_diff_files' in t.lower() or 'diff' in t.lower()
             for t in warning_texts
         ), f'Expected WARNING to mention diff failure; got: {warning_texts}'
+
+    async def test_success_returns_changed_files_and_no_error(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Success path: two files committed → (paths, None)."""
+        # Capture the base SHA (initial commit)
+        rc, base_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0
+        base_sha = base_sha.strip()
+
+        # Add two files and commit
+        (git_repo / 'alpha.py').write_text('# alpha\n')
+        (git_repo / 'beta.py').write_text('# beta\n')
+        await _run(['git', 'add', 'alpha.py', 'beta.py'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'add alpha and beta'], cwd=git_repo)
+
+        rc2, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc2 == 0
+        head_sha = head_sha.strip()
+
+        files, err = await git_ops.get_merge_diff_files(base_sha, head_sha)
+
+        assert err is None, (
+            f'Expected no error on successful diff; got {err!r}'
+        )
+        assert sorted(files) == ['alpha.py', 'beta.py'], (
+            f'Expected [alpha.py, beta.py]; got {files!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
