@@ -749,11 +749,15 @@ class TestResolveIssueActionEnum:
 
         assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
 
-    # --- (d) park / abandon / close_only → dismissed ---
+    # --- (d) park → kept OPEN at L2; abandon / close_only → dismissed ---
 
     @pytest.mark.asyncio
-    async def test_action_park_dismisses(self, tmp_path: Path):
-        """action='park' dismisses the escalation."""
+    async def test_action_park_keeps_open_l2(self, tmp_path: Path):
+        """action='park' keeps the escalation open (status='pending') at level=2 with resolution_action='park'.
+
+        Version-a: park does NOT dismiss; the open L2 is the mechanism for sweep-quiescence.
+        Fails: park currently calls queue.resolve(dismiss=True) → status='dismissed'.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         esc = self._seed_pending(queue)
@@ -762,7 +766,9 @@ class TestResolveIssueActionEnum:
             server, escalation_id=esc.id, resolution='parked', action='park',
         )
 
-        assert result.get('status') == 'dismissed', f"Expected dismissed; got: {result}"
+        assert result.get('status') == 'pending', f"Expected pending (kept open); got: {result}"
+        assert result.get('level') == 2, f"Expected level=2 (promoted); got: {result}"
+        assert result.get('resolution_action') == 'park', f"Expected resolution_action='park'; got: {result}"
 
     @pytest.mark.asyncio
     async def test_action_abandon_dismisses(self, tmp_path: Path):
@@ -831,20 +837,29 @@ class TestResolveIssueResolutionActionPersisted:
 
     @pytest.mark.asyncio
     async def test_park_resolution_action_persisted(self, tmp_path: Path):
-        """action='park' → queue.get(id).resolution_action == 'park' with status 'dismissed'."""
+        """action='park' → queue.get(id) has status='pending', level=2, resolution_action='park'.
+
+        Version-a: the parked record stays live (not archived), resolution text is persisted,
+        and the escalation remains open at L2.
+        Fails: park currently resolves with dismiss=True → status='dismissed'.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
         await _resolve_issue(
-            server, escalation_id=esc.id, resolution='parked', action='park',
+            server, escalation_id=esc.id, resolution='parked for human review', action='park',
         )
 
         record = queue.get(esc.id)
         assert record is not None
-        assert record.status == 'dismissed', f"Expected dismissed; got {record.status!r}"
+        assert record.status == 'pending', f"Expected pending (kept open); got {record.status!r}"
+        assert record.level == 2, f"Expected level=2 (promoted); got {record.level!r}"
         assert record.resolution_action == 'park', (
             f"Expected resolution_action='park'; got {record.resolution_action!r}"
+        )
+        assert record.resolution == 'parked for human review', (
+            f"Expected resolution text persisted; got {record.resolution!r}"
         )
 
     @pytest.mark.asyncio
