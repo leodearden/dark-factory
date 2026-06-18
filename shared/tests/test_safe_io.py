@@ -95,12 +95,14 @@ class TestOnCorruptDispatch:
             f'got: {caplog.records}'
         )
 
-    def test_unknown_on_corrupt_raises_value_error(self, tmp_path, caplog):
-        """Unknown on_corrupt value raises ValueError (unknown-mode guard)."""
+    def test_unknown_on_corrupt_raises_value_error(self, tmp_path):
+        """Unknown on_corrupt value raises ValueError eagerly, before any I/O."""
         from shared.safe_io import load_json_or_warn
 
+        # File is valid JSON — the guard fires before reading so file state
+        # is irrelevant.
         p = tmp_path / 'state.json'
-        p.write_bytes(b'{not json')
+        p.write_text(json.dumps({'ok': True}))
 
         with pytest.raises(ValueError, match='unknown on_corrupt'):
             load_json_or_warn(p, default=SENTINEL, on_corrupt='bogus')
@@ -174,3 +176,41 @@ class TestDedup:
         assert len(caplog.records) == 2, (
             f'Two distinct paths should each emit one WARNING, got: {len(caplog.records)}'
         )
+
+
+class TestOSErrorPropagation:
+    """Non-FileNotFoundError OS errors propagate uncaught (stay loud)."""
+
+    def test_directory_path_raises_is_a_directory_error(self, tmp_path):
+        """Passing a directory path raises IsADirectoryError — not laundered into a default.
+
+        This locks in the three-way split: absent=benign, corrupt=warn, other-OS-error=propagate.
+        """
+        from shared.safe_io import load_json_or_warn
+
+        # tmp_path itself is a directory; read_text on a directory raises IsADirectoryError.
+        with pytest.raises(IsADirectoryError):
+            load_json_or_warn(tmp_path, default=SENTINEL)
+
+
+class TestEdgeCases:
+    """Edge JSON values: empty file and whitespace are treated as corrupt (not absent)."""
+
+    def test_empty_file_is_treated_as_corrupt(self, tmp_path, caplog):
+        """Empty file returns (default, False) with a WARNING.
+
+        json.loads('') raises ValueError, so an empty file lands in the corrupt
+        branch — not the benign-absent branch.
+        """
+        from shared.safe_io import load_json_or_warn
+
+        p = tmp_path / 'empty.json'
+        p.write_text('')
+
+        with caplog.at_level(logging.WARNING):
+            result, ok = load_json_or_warn(p, default=SENTINEL)
+
+        assert ok is False
+        assert result is SENTINEL
+        assert len(caplog.records) == 1, f'Expected one WARNING for empty file, got: {caplog.records}'
+        assert str(p) in caplog.records[0].message
