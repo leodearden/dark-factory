@@ -1372,6 +1372,20 @@ class OrchestratorConfig(BaseSettings):
         default='scripts/restart-fused-memory.sh'
     )
 
+    # Post-merge staleness hook — restarts dark-factory-dashboard.service after a
+    # merge whose diff touches dashboard/src/.  The dashboard is a LEAF service
+    # (nothing depends on it), so its restart fires regardless of idle state —
+    # even while agents are dispatching.
+    # See orchestrator/src/orchestrator/service_restart.py for policy details.
+    dashboard_restart_on_merge_enabled: bool = Field(default=True)
+    dashboard_restart_debounce_secs: float = Field(default=20.0)
+    dashboard_restart_watch_prefixes: list[str] = Field(
+        default_factory=lambda: ['dashboard/src/']
+    )
+    dashboard_restart_script: str = Field(
+        default='scripts/restart-dashboard.sh'
+    )
+
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
     # against a synthetic ``review-*`` task_id).  Without this, such

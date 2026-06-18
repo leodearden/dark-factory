@@ -579,11 +579,12 @@ class Harness:
             config.project_root / 'data' / 'orchestrator' / 'merge_queue.json'
         )
 
-        # Post-merge staleness hook — restart fused-memory.service when a
-        # landed diff touches fused-memory/src/.  Built in _start_merge_worker
-        # (where git_ops/event_store/config are all live) and fired from the
-        # run-forever idle branch (a verified no-dispatched-agents quiet window).
-        self._service_restart_coordinator: StaleServiceRestartCoordinator | None = None
+        # Post-merge staleness hook — restart services when a landed diff
+        # touches their watched paths.  Built in _start_merge_worker (where
+        # git_ops/event_store/config are all live).  The list holds two entries:
+        #   [0] fused-memory (require_idle=True — idle quiet window only)
+        #   [1] dashboard    (require_idle=False — fires even during dispatch)
+        self._service_restart_coordinators: list[StaleServiceRestartCoordinator] = []
 
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
@@ -1029,6 +1030,13 @@ class Harness:
                         timeout=15,
                     )
                     self._collect_done_reports(done, task_reports)
+                    # Leaf services (dashboard, require_idle=False) restart
+                    # promptly after their diff lands even while agents are
+                    # dispatching.  fused-memory (require_idle=True) no-ops here
+                    # and is reserved for the idle branch above — the two
+                    # branches are mutually exclusive per tick and maybe_restart
+                    # clears pending on fire, so there is no double-fire.
+                    await self._maybe_restart_stale_service(agents_idle=False)
                     continue
 
                 await sem.acquire()
@@ -3650,7 +3658,10 @@ Output JSON matching the schema. Every task must appear in the output.
             self.config, merge_ahead_bound=_k, num_hosts=_k,
         )
 
-        self._service_restart_coordinator = self._build_service_restart_coordinator()
+        self._service_restart_coordinators = [
+            self._build_service_restart_coordinator(),
+            self._build_dashboard_restart_coordinator(),
+        ]
 
         # Build the callback factory here (where self.scheduler is live) and
         # inject it opaquely into the worker so task γ can construct
@@ -3663,7 +3674,7 @@ Output JSON matching the schema. Every task must appear in the output.
             self._merge_queue,
             speculation_depth=_k,
             event_store=self.event_store,
-            on_merge_landed=self._service_restart_coordinator.note_merge,
+            on_merge_landed=self._note_merge_all,
             escalation_queue=self._escalation_queue,
             train_callback_factory=train_callback_factory,
             merge_store=self._merge_store,
@@ -3683,6 +3694,43 @@ Output JSON matching the schema. Every task must appear in the output.
             self._merge_worker_task = None
             logger.info('Merge worker stopped')
 
+    async def _note_merge_all(
+        self, task_id: str, base_sha: str, head_sha: str
+    ) -> None:
+        """Fan out a merge-landed notification to every service-restart coordinator.
+
+        Passed as the SpeculativeMergeWorker's ``on_merge_landed`` callback.
+        The changed-file list is fetched once (shared across all coordinators) to
+        avoid redundant git diff invocations — each coordinator applies its own
+        prefix filter against the pre-fetched list.
+
+        Each coordinator is notified independently inside its own try/except so
+        that an error in one coordinator cannot prevent the remaining coordinators
+        from being armed.  Errors are logged at WARNING level and execution
+        continues (fail-open).
+        """
+        try:
+            prefetched_diff = await self.git_ops.get_merge_diff_files(base_sha, head_sha)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                '_note_merge_all: git diff fetch failed for %s..%s; skipping all coordinators',
+                base_sha[:12],
+                head_sha[:12],
+                exc_info=True,
+            )
+            return
+
+        for coord in self._service_restart_coordinators:
+            try:
+                await coord.note_merge(task_id, base_sha, head_sha, prefetched_diff=prefetched_diff)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    '_note_merge_all: coordinator %s note_merge failed: %s',
+                    getattr(coord, '_service_name', repr(coord)),
+                    exc,
+                    exc_info=True,
+                )
+
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.
 
@@ -3700,18 +3748,44 @@ Output JSON matching the schema. Every task must appear in the output.
             project_root=self.config.project_root,
         )
 
-    async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
-        """Delegate to the service-restart coordinator, if one is wired.
+    def _build_dashboard_restart_coordinator(self) -> StaleServiceRestartCoordinator:
+        """Construct a StaleServiceRestartCoordinator for the dashboard (leaf service).
 
-        Called from the run-forever idle branch (active is empty — a verified
-        quiet window).  No-op when the coordinator is None or disabled.
-        Returns True when the restart was fired, False otherwise.
+        The dashboard is a leaf node — nothing depends on it — so its restart
+        must NOT wait for the orchestrator to be idle.  require_idle=False means
+        the coordinator fires as soon as the debounce window elapses, even while
+        agents are dispatching.  script_args=[] omits --drain (no recon to drain).
+
+        Called once from _start_merge_worker alongside
+        _build_service_restart_coordinator.
         """
-        if self._service_restart_coordinator is None:
-            return False
-        return await self._service_restart_coordinator.maybe_restart(
-            agents_idle=agents_idle
+        return StaleServiceRestartCoordinator(
+            git_ops=self.git_ops,
+            event_store=self.event_store,
+            watch_prefixes=self.config.dashboard_restart_watch_prefixes,
+            debounce_secs=self.config.dashboard_restart_debounce_secs,
+            enabled=self.config.dashboard_restart_on_merge_enabled,
+            script_path=self.config.dashboard_restart_script,
+            project_root=self.config.project_root,
+            service_name='dashboard',
+            require_idle=False,
+            script_args=[],
         )
+
+    async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
+        """Delegate to all service-restart coordinators in the list.
+
+        Called from the run-forever idle branch (agents_idle=True) and the
+        busy-wait branch (agents_idle=False).  Iterates every coordinator in
+        self._service_restart_coordinators and fires each whose gate conditions
+        are satisfied.  Returns True if at least one coordinator fired a restart,
+        False otherwise.  No-op (returns False) when the list is empty.
+        """
+        any_fired = False
+        for coord in self._service_restart_coordinators:
+            if await coord.maybe_restart(agents_idle=agents_idle):
+                any_fired = True
+        return any_fired
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.

@@ -214,6 +214,49 @@ async def test_note_merge_disabled_short_circuits() -> None:
     mock_diff.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_note_merge_uses_prefetched_diff_and_skips_git_call() -> None:
+    """When prefetched_diff is provided, get_merge_diff_files is NOT called.
+
+    This is the hot-path used by _note_merge_all to avoid redundant git diff
+    invocations when multiple coordinators are notified for the same merge.
+    The coordinator applies its own prefix filter against the supplied list.
+    """
+    # git_ops would return unrelated files, but we supply a watched-path diff
+    coord, mock_diff = _make_coordinator(
+        ['some-unrelated/file.py'],
+        watch_prefixes=['fused-memory/src/'],
+        clock_values=[1000.0],
+    )
+    prefetched = ['fused-memory/src/server/main.py', 'fused-memory/docs/overview.md']
+    result = await coord.note_merge(
+        'task-42', 'base_sha', 'head_sha', prefetched_diff=prefetched
+    )
+
+    assert result is True
+    assert coord.is_pending is True
+    # git_ops must NOT be consulted when the caller already supplied the diff
+    mock_diff.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_note_merge_prefetched_diff_no_match_returns_false() -> None:
+    """prefetched_diff that doesn't touch watched paths returns False without arming."""
+    coord, mock_diff = _make_coordinator(
+        ['fused-memory/src/server/main.py'],  # git_ops value (not used)
+        watch_prefixes=['fused-memory/src/'],
+        clock_values=[1000.0],
+    )
+    prefetched = ['fused-memory/docs/overview.md', 'orchestrator/src/harness.py']
+    result = await coord.note_merge(
+        'task-99', 'base_sha', 'head_sha', prefetched_diff=prefetched
+    )
+
+    assert result is False
+    assert coord.is_pending is False
+    mock_diff.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # maybe_restart tests
 # ---------------------------------------------------------------------------
@@ -526,5 +569,201 @@ async def test_default_executor_spawns_script_detached() -> None:
     # Must be spawned detached (fire-and-forget, survives MCP reconnect)
     assert call_args.kwargs.get('start_new_session') is True
     # The process must NOT be awaited — fake_proc.wait/communicate not called
+    fake_proc.wait.assert_not_called()
+    fake_proc.communicate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# service_name parameterization tests (step-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_service_name_dashboard_emits_correct_event_data(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(a) Coordinator built with service_name='dashboard' emits correct event data and log."""
+    import logging
+
+    coord, current_time, executor, event_store_mock = _make_coordinator_with_mutable_clock(
+        ['dashboard/src/app.py'],
+    )
+    # Rebuild with dashboard prefixes and service_name
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=['dashboard/src/app.py'])
+    event_store = MagicMock()
+    current_time2: list[float] = [0.0]
+    exec2 = AsyncMock()
+
+    coord2 = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['dashboard/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=exec2,
+        clock=lambda: current_time2[0],
+        service_name='dashboard',
+    )
+
+    await coord2.note_merge('task-99', 'base_sha', 'head_sha')
+
+    current_time2[0] = 1.0  # past debounce (0)
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result = await coord2.maybe_restart(agents_idle=True)
+
+    assert result is True
+    exec2.assert_awaited_once()
+
+    # Event data must use service_name
+    event_store.emit.assert_called_once()
+    data = event_store.emit.call_args.kwargs['data']
+    assert data['service'] == 'dashboard'
+    assert data['reason'] == 'post_merge_dashboard_code_change'
+
+    # Log must mention 'dashboard'
+    assert any('Restarting dashboard' in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_service_name_default_fused_memory_byte_identical(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(b) Default service_name keeps data['service']=='fused-memory' and legacy reason — regression guard."""
+    import logging
+
+    coord, current_time, executor, event_store_mock = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'], debounce_secs=0.0
+    )
+    current_time[0] = 1000.0
+    await coord.note_merge('task-42', 'base_sha_abc', 'head_sha_xyz')
+    current_time[0] = 1001.0
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    event_store_mock.emit.assert_called_once()
+    data = event_store_mock.emit.call_args.kwargs['data']
+    assert data['service'] == 'fused-memory'
+    assert data['reason'] == 'post_merge_fused_memory_code_change'
+    assert any('Restarting fused-memory' in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# require_idle gate tests (step-5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_require_idle_false_fires_when_agents_not_idle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(a) require_idle=False: fires (returns True, clears pending) even when agents_idle=False."""
+    import logging
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=['dashboard/src/app.py'])
+    event_store = MagicMock()
+    executor = AsyncMock()
+    current_time: list[float] = [0.0]
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['dashboard/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+        service_name='dashboard',
+        require_idle=False,
+    )
+
+    await coord.note_merge('task-leaf', 'base_sha', 'head_sha')
+    assert coord.is_pending is True
+
+    # Advance time past debounce (debounce=0, so anything works)
+    current_time[0] = 1.0
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result = await coord.maybe_restart(agents_idle=False)
+
+    assert result is True
+    assert coord.is_pending is False
+    executor.assert_awaited_once()
+
+    # Event emitted
+    event_store.emit.assert_called_once()
+
+    # Log fired
+    assert any('Restarting dashboard' in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_require_idle_true_defers_when_agents_not_idle() -> None:
+    """(b) Default require_idle=True: defers (returns False, stays pending) when agents_idle=False — regression guard."""
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'], debounce_secs=0.0
+    )
+    current_time[0] = 1000.0
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # Advance well past debounce; agents_idle=False should still defer
+    current_time[0] = 2000.0
+    result = await coord.maybe_restart(agents_idle=False)
+
+    assert result is False
+    assert coord.is_pending is True
+    executor.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# script_args / default executor spawn tests (step-7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_executor_with_empty_script_args_omits_drain() -> None:
+    """Default executor with script_args=[] spawns script with NO --drain flag."""
+    from unittest.mock import MagicMock as MM
+    from unittest.mock import patch
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=['dashboard/src/app.py'])
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['dashboard/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        project_root='/fake/project',
+        script_path='scripts/restart-dashboard.sh',
+        clock=lambda: current_time[0],
+        service_name='dashboard',
+        require_idle=False,
+        script_args=[],
+    )
+
+    await coord.note_merge('task-leaf', 'base1', 'head1')
+
+    fake_proc = MM()
+    with patch(
+        'orchestrator.service_restart.asyncio.create_subprocess_exec',
+        new_callable=AsyncMock,
+        return_value=fake_proc,
+    ) as mock_exec:
+        r = await coord.maybe_restart(agents_idle=False)
+
+    assert r is True
+    mock_exec.assert_awaited_once()
+    call_args = mock_exec.call_args
+    pos_args = call_args.args if call_args.args else call_args[0]
+    # Only the script path — no '--drain'
+    assert str(pos_args[0]).endswith('scripts/restart-dashboard.sh')
+    assert len(pos_args) == 1  # script path only, no extra args
+    assert call_args.kwargs.get('start_new_session') is True
     fake_proc.wait.assert_not_called()
     fake_proc.communicate.assert_not_called()

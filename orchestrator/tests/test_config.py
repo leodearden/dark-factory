@@ -144,6 +144,16 @@ class TestDefaults:
         assert '../' not in config.fused_memory.config_path
         assert not any('../' in arg for arg in config.fused_memory.server_command)
 
+    def test_dashboard_restart_defaults(self, monkeypatch, tmp_path):
+        """Bare OrchestratorConfig() exposes dashboard_restart_* defaults for the leaf service."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        assert config.dashboard_restart_on_merge_enabled is True
+        assert config.dashboard_restart_debounce_secs == 20.0
+        assert config.dashboard_restart_watch_prefixes == ['dashboard/src/']
+        assert config.dashboard_restart_script == 'scripts/restart-dashboard.sh'
+
     def test_project_root_resolved_to_absolute(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
