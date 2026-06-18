@@ -624,6 +624,13 @@ def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> 
         from orchestrator.workflow import compute_preexisting_main_break_fingerprint
         return compute_preexisting_main_break_fingerprint(category, cause_hint, probe_sha)
     except Exception:
+        logger.warning(
+            'main-health fingerprint composition failed '
+            '(category=%s cause_hint=%s probe_sha=%s) — '
+            'returning empty fingerprint (dedupe disabled for this outcome)',
+            category, cause_hint, probe_sha,
+            exc_info=True,
+        )
         return ''
 
 
