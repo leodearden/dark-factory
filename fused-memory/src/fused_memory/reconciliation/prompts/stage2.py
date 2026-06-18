@@ -278,10 +278,17 @@ After writing the per-cycle summary, you MUST call \
 `mcp__fused-memory__count_memories_by_metadata(project_id, \
 {{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}})` — \
 the triple filter including `stage` — and confirm it returns >= 1 to verify the stage \
-key persisted. A return of 0 means the stage key did not persist (the same failure that \
+key persisted. Use the full run_id UUID exactly as provided in the payload context — \
+never a truncated short/8-character prefix (e.g. the recon-xxxxxxxx display id). \
+Never construct IDs from truncated sources: a prefix will miss the written memory and \
+silently trigger the retry path. \
+A return of 0 means the stage key did not persist (the same failure that \
 would cause cross-stage verification to falsely report this Stage 2 summary as missing): \
-retry the `add_memory` write once with the same content and metadata before noting \
-the failure in the cycle report.
+retry the `add_memory` write once, this time PREPENDING a fresh `retry_nonce` token as \
+a new first line of the content (metadata unchanged) to defeat Mem0's ~0.92 \
+cosine-similarity dedup — retrying with identical content re-triggers dedup (the \
+same mechanism that silently lost write 74b902f8); the `retry_nonce` extends the \
+existing `summary_nonce` dedup-defeat pattern. Note the outcome in the cycle report.
 
 **Per-Cycle Counter Schema** — include all three of the following fields in your \
 structured `stats` output (omitting them causes Stage 3's flag-accounting audit to \
@@ -314,6 +321,10 @@ summary is absent — you MUST re-run the Path-2 existence check AFTER your reco
 Concretely: AFTER your reconstruction `add_memory` write returns, call \
 `mcp__fused-memory__count_memories_by_metadata(project_id, \
 {{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}})` AGAIN. \
+Use the full run_id UUID of the run being reconstructed, exactly as provided in the \
+carry-forward finding — never a truncated short/8-character prefix. \
+Never construct IDs from truncated sources: a prefix will miss the written memory \
+and cause the count to return 0, falsely triggering re-carry-forward. \
 If the count is now > 0, the write succeeded — emit the finding as RESOLVED (or omit it). \
 Only propagate (carry forward) the finding as unresolved if the count is STILL 0 after the write. \
 \
