@@ -528,3 +528,80 @@ async def test_default_executor_spawns_script_detached() -> None:
     # The process must NOT be awaited — fake_proc.wait/communicate not called
     fake_proc.wait.assert_not_called()
     fake_proc.communicate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# service_name parameterization tests (step-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_service_name_dashboard_emits_correct_event_data(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(a) Coordinator built with service_name='dashboard' emits correct event data and log."""
+    import logging
+
+    coord, current_time, executor, event_store_mock = _make_coordinator_with_mutable_clock(
+        ['dashboard/src/app.py'],
+    )
+    # Rebuild with dashboard prefixes and service_name
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=['dashboard/src/app.py'])
+    event_store = MagicMock()
+    current_time2: list[float] = [0.0]
+    exec2 = AsyncMock()
+
+    coord2 = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['dashboard/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=exec2,
+        clock=lambda: current_time2[0],
+        service_name='dashboard',
+    )
+
+    await coord2.note_merge('task-99', 'base_sha', 'head_sha')
+
+    current_time2[0] = 1.0  # past debounce (0)
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result = await coord2.maybe_restart(agents_idle=True)
+
+    assert result is True
+    exec2.assert_awaited_once()
+
+    # Event data must use service_name
+    event_store.emit.assert_called_once()
+    data = event_store.emit.call_args.kwargs['data']
+    assert data['service'] == 'dashboard'
+    assert data['reason'] == 'post_merge_dashboard_code_change'
+
+    # Log must mention 'dashboard'
+    assert any('Restarting dashboard' in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_service_name_default_fused_memory_byte_identical(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(b) Default service_name keeps data['service']=='fused-memory' and legacy reason — regression guard."""
+    import logging
+
+    coord, current_time, executor, event_store_mock = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'], debounce_secs=0.0
+    )
+    current_time[0] = 1000.0
+    await coord.note_merge('task-42', 'base_sha_abc', 'head_sha_xyz')
+    current_time[0] = 1001.0
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    event_store_mock.emit.assert_called_once()
+    data = event_store_mock.emit.call_args.kwargs['data']
+    assert data['service'] == 'fused-memory'
+    assert data['reason'] == 'post_merge_fused_memory_code_change'
+    assert any('Restarting fused-memory' in r.message for r in caplog.records)
