@@ -6246,7 +6246,7 @@ class TestGetMergeDiffFilesWarning:
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_texts, (
             'Expected a WARNING at orchestrator.git_ops when git diff fails; '
-            f'got no warnings'
+            'got no warnings'
         )
         assert any(
             'get_merge_diff_files' in t.lower() or 'diff' in t.lower()

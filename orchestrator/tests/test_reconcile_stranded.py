@@ -2764,9 +2764,11 @@ class TestReconcileStrandedResolverGuard:
             return_value=({'5': 'in-progress'}, RuntimeError('mcp down'))
         )
 
-        with patch.object(harness, '_reconcile_one_stranded', new_callable=AsyncMock) as mock_one:
-            with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-                result = await harness._reconcile_stranded_in_progress()
+        with (
+            patch.object(harness, '_reconcile_one_stranded', new_callable=AsyncMock) as mock_one,
+            caplog.at_level(logging.WARNING, logger='orchestrator.harness'),
+        ):
+            result = await harness._reconcile_stranded_in_progress()
 
         assert result == 0, f'Expected 0, got {result!r}'
         mock_one.assert_not_awaited()  # pre-fix fails here (loop iterates '5')

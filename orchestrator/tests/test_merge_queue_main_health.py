@@ -710,7 +710,7 @@ class TestMainHealthFingerprintWarning:
             r.message for r in caplog.records if r.levelno >= logging.WARNING
         ]
         assert warning_texts, (
-            f'Expected a WARNING at orchestrator.merge_queue; got no warnings'
+            'Expected a WARNING at orchestrator.merge_queue; got no warnings'
         )
         assert any(
             'fingerprint' in t.lower() for t in warning_texts

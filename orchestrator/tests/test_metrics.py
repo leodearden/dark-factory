@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -186,12 +189,6 @@ class TestNullWorkGuard:
 # Task 1809 step-15: _git_diff_stats returncode check + (-1,-1) sentinel
 # ---------------------------------------------------------------------------
 
-import asyncio
-import logging
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
-
-
 def _make_fake_proc(returncode: int, stdout: bytes, stderr: bytes) -> MagicMock:
     """Build a minimal fake asyncio Process mock."""
     proc = MagicMock()
@@ -232,7 +229,7 @@ class TestGitDiffStatsReturncode:
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_texts, (
             'Expected a WARNING at orchestrator.evals.metrics on rc!=0; '
-            f'got no warnings'
+            'got no warnings'
         )
 
     async def test_create_subprocess_raises_returns_sentinel_and_warns(
@@ -255,7 +252,7 @@ class TestGitDiffStatsReturncode:
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_texts, (
             'Expected a WARNING at orchestrator.evals.metrics on OSError; '
-            f'got no warnings'
+            'got no warnings'
         )
 
     async def test_zero_returncode_valid_stat_output_parsed(
