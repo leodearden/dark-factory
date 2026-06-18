@@ -1049,6 +1049,7 @@ class SqliteTaskBackend:
                     row['metadata'],
                     json.dumps({'external_deps': [canonical]}),
                     append=True,
+                    project_root=project_root, tag=tag, task_id=tid,
                 )
                 await conn.execute(
                     'UPDATE tasks SET metadata = ?, updated_at = ? '
