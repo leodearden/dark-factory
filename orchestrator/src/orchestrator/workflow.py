@@ -4263,6 +4263,38 @@ class TaskWorkflow:
             'is_first_rebase': is_first,
         }
 
+    def _emit_rebase_verify_cost(
+        self,
+        rebase_notice: dict,
+        verify_result: 'VerifyResult',
+    ) -> None:
+        """Emit one rebase_verify_cost event pairing a real rebase with its next verify.
+
+        No-op when self.event_store is None (fire-and-forget; never raises).
+        Called only when rebase_notice is not None (i.e. a real rebase happened).
+        """
+        if self.event_store is None:
+            return
+        self.event_store.emit(
+            EventType.rebase_verify_cost,
+            task_id=self.task_id,
+            phase='verify',
+            duration_ms=int(verify_result.duration_secs * 1000),
+            data={
+                'old_base': rebase_notice['old_base'],
+                'new_base': rebase_notice['new_base'],
+                'distance_commits': rebase_notice['distance_commits'],
+                'files_changed_on_main': len(rebase_notice['changed_files']),
+                'next_verify_wall_secs': verify_result.duration_secs,
+                'verify_scope': {
+                    'n_task_files': len(self._task_files or []),
+                    'n_modules': len(self._module_configs or []),
+                    'workspace': self._train is not None,
+                },
+                'cohort': rebase_notice['cohort'],
+            },
+        )
+
     async def _verify_debugfix_loop(self) -> WorkflowOutcome:
         """Run verification, invoke debugger on failures."""
         assert self.worktree is not None and self.artifacts is not None
@@ -4277,8 +4309,9 @@ class TaskWorkflow:
             # commits while we're cycling verify ↔ debugger.  The helper
             # short-circuits cheaply when current_main == old_base, so
             # firing on every retry costs at most one ``git rev-parse``.
+            rebase_notice: dict | None = None
             if self.config.rebase_before_verify:
-                await self._inter_iteration_rebase(
+                rebase_notice = await self._inter_iteration_rebase(
                     event_label='verify_phase_rebase',
                 )
 
@@ -4290,6 +4323,8 @@ class TaskWorkflow:
                 force_workspace=self._train is not None,
                 role='task',
             )
+            if rebase_notice is not None:
+                self._emit_rebase_verify_cost(rebase_notice, result)
             if not result.passed:
                 self._last_verify_result = result
             if result.passed:
