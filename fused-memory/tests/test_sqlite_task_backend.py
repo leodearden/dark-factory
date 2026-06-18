@@ -1730,3 +1730,49 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
     assert result_c == {'tasks': []}, (
         f'Expected empty tasks list for statuses=[], got: {result_c}'
     )
+
+
+# ── Corrupt-blob refusal tests (task 1813) ──────────────────────────────
+
+
+# Shared corrupt blob constant: invalid JSON that still contains the
+# external_deps substring so tests can assert it survives unchanged.
+_CORRUPT_BLOB = '{"external_deps": ["dark_factory:42"], BROKEN'
+
+
+def test_merge_metadata_refuses_to_clobber_corrupt_existing_blob():
+    """_merge_metadata must raise TaskmasterError when the EXISTING blob is
+    corrupt JSON and append=True — it must NOT return incoming and clobber.
+
+    Also locks the two escape hatches:
+    - append=False always returns incoming (last-write-wins; the sanctioned
+      repair path — caller explicitly chose to replace the corrupt row).
+    - existing_raw=None + append=True returns incoming (no existing data to
+      preserve).
+
+    RED: current code's ``except (TypeError, ValueError): return incoming``
+    returns incoming on the append path instead of raising TaskmasterError.
+    After step-2 the kwargs ``project_root/tag/task_id`` are added to
+    ``_merge_metadata`` and the corrupt-existing branch raises.
+    """
+    incoming = json.dumps({"note": "x"})
+
+    # (a) Main assertion: corrupt existing + append=True must raise TaskmasterError.
+    with pytest.raises(TaskmasterError) as exc:
+        _merge_metadata(
+            _CORRUPT_BLOB, incoming, append=True,
+            project_root='/p', tag='master', task_id=1,
+        )
+    assert exc.value.raw == _CORRUPT_BLOB, (
+        f'Expected exc.value.raw == _CORRUPT_BLOB (original bytes preserved as '
+        f'distinguishable signal), got: {exc.value.raw!r}'
+    )
+
+    # (b) Escape hatch: append=False must return incoming (explicit replace —
+    #     the sanctioned path to repair a corrupt row).
+    result_replace = _merge_metadata(_CORRUPT_BLOB, incoming, append=False)
+    assert result_replace == incoming
+
+    # (c) No-op escape hatch: existing_raw=None + append=True returns incoming.
+    result_none = _merge_metadata(None, incoming, append=True)
+    assert result_none == incoming
