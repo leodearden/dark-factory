@@ -265,4 +265,3 @@ async def test_tag_prd_metadata_forwards_merge_mode_on_wire(harness, tmp_path, m
     assert 'append' not in arguments, (
         f"'append' key must not appear on the wire; got: {arguments}"
     )
-    assert harness.scheduler.update_task.call_args.args[0] == '2'

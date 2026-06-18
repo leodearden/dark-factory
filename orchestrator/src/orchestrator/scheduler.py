@@ -1799,6 +1799,7 @@ class Scheduler:
         metadata: str | dict,
         *,
         append: bool = False,
+        metadata_mode: str | None = None,
     ) -> bool:
         """Update task metadata via fused-memory. Returns True on success.
 
@@ -1808,14 +1809,28 @@ class Scheduler:
             The task whose metadata should be updated.
         metadata:
             New metadata as a dict or pre-serialised JSON string.
+        metadata_mode:
+            Explicit merge mode forwarded to fused-memory (#1827 contract).
+            ``'merge'`` (default): shallow last-write-wins — omitted keys are
+            preserved, supplied keys overwrite wholesale.  This is the #4271
+            fix: no-append callers (prd-tagger, module-tagger, auto-eval
+            back-link) now preserve sibling keys like _causation_id and
+            memory_hints instead of silently clobbering them.
+            ``'additive'``: recursive list-union, dict-recursive, scalar
+            OLD-wins.  Use for list-growth writes (e.g. dry_run_proposals).
+            ``'replace'``: whole-blob overwrite, delete-by-omission.
         append:
-            When ``True`` the fused-memory backend uses recursive-merge
-            semantics (``_merge_metadata(append=True)``) so only the supplied
-            keys are touched and the rest of the metadata blob is preserved.
-            When ``False`` (default) the backend replaces the whole blob —
-            existing callers that supply the full metadata dict can leave this
-            at the default without behaviour change.
+            Legacy shorthand kept for back-compat.  Resolved to
+            ``'additive'`` when ``True``.  Ignored when ``metadata_mode``
+            is set explicitly.  Precedence: metadata_mode > append > merge.
         """
+        # Resolve mode: explicit metadata_mode wins; append=True → additive;
+        # default → merge (the #4271 fix — NOT replace).
+        # NEVER forward 'append' on the wire: append=False resolves to REPLACE
+        # on the backend, which would re-introduce the sibling-clobber bug.
+        mode = metadata_mode if metadata_mode is not None else (
+            'additive' if append else 'merge'
+        )
         # fused-memory update_task expects metadata as a JSON string
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
@@ -1823,9 +1838,8 @@ class Scheduler:
             'id': task_id,
             'metadata': metadata,
             'project_root': self._project_root,
+            'metadata_mode': mode,
         }
-        if append:
-            arguments['append'] = True
         try:
             result = await self.dispatch_tool(
                 'update_task',
