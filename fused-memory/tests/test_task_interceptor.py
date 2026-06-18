@@ -5644,9 +5644,12 @@ class TestInterceptorWriteSucceeded:
         """{'success': True, 'id': '1.1'} → True (extra keys, no error key → success)."""
         assert self._fn()({'success': True, 'id': '1.1'}) is True
 
-    def test_empty_dict_is_success(self):
-        """{} → True (defaults: success=True, error=None — some fixtures use bare {})."""
-        assert self._fn()({}) is True
+    def test_empty_dict_is_failure(self):
+        """{} → False (bare {} carries no positive write signal).
+
+        Currently RED: {} returns True via the defaulted success=True branch.
+        """
+        assert self._fn()({}) is False
 
     def test_reject_status_via_update_task(self):
         """_reject_status_in_update_task shape → False."""
