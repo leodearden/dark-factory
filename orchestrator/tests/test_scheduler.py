@@ -3676,6 +3676,67 @@ class TestBlastRadiusRefinement:
             'files': ['crates/reify-compiler/src/conformance.rs'],
         }, f'Sibling keys from backend must survive blast-radius files write; got {persisted}'
 
+    @pytest.mark.asyncio
+    async def test_narrowing_persists_metadata_files(self, scheduler: Scheduler):
+        """Plan narrowing on the SUCCESS branch must persist metadata.files (set-to-plan).
+
+        Sibling keys (memory_hints, _causation_id) must survive the write so
+        Stage-2 reconciliation data is not clobbered — mirrors the requeue-branch
+        read-modify-write pattern (scheduler.py handle_blast_radius_expansion failure
+        branch) on the success path.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        backend_md = {
+            'memory_hints': {'entities': ['E1']},
+            '_causation_id': 'C1',
+        }
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': backend_md}
+        )
+        update_task = AsyncMock(return_value=True)
+        scheduler.update_task = update_task  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+        )
+
+        assert ok is True
+        assert update_task.await_args is not None, (
+            'update_task must be called to make the narrowed set durable'
+        )
+        persisted = update_task.await_args.args[1]
+        assert persisted == {
+            'memory_hints': {'entities': ['E1']},
+            '_causation_id': 'C1',
+            'files': ['crates/reify-compiler/src/conformance.rs'],
+        }, f'Sibling keys must survive; files narrowed to needed; got {persisted}'
+
+    @pytest.mark.asyncio
+    async def test_pure_expansion_does_not_persist(self, scheduler: Scheduler):
+        """Pure widening (needed ⊃ current) must NOT call update_task.
+
+        Widening self-heals on restart: the scheduler re-reads the smaller
+        metadata.files, re-acquires, then re-expands. Gating the persist on
+        stale being non-empty avoids unnecessary MCP round-trips on the
+        widening path and leaves test_pure_expansion_keeps_current green.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('T', ['a/lib.rs'])
+        update_task = AsyncMock()
+        scheduler.update_task = update_task  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            'T',
+            current=['a/lib.rs'],
+            needed=['a/lib.rs', 'a/other.rs'],
+        )
+
+        assert ok is True
+        update_task.assert_not_awaited()
+
 
 class TestSchedulerMcpSessionDI:
     """Tests for the optional mcp_session dependency-injection kwarg on Scheduler.
