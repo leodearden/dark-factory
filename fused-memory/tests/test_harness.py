@@ -7575,3 +7575,93 @@ class TestFullCycleWiringDiagnostics:
         assert gqh.get('healthy') is False, (
             f'Expected graphiti_queue_health["healthy"]==False, got {gqh.get("healthy")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-05 (RED) / step-06 (GREEN): fingerprint-compute failure → fail-toward-escalate
+# step-07 (RED) / step-08 (GREEN): journal-read failure → fail-toward-escalate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_finding_persistence_count_fingerprint_failure_fails_toward_escalate(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    caplog,
+):
+    """When compute_content_fingerprint raises, _finding_persistence_count must:
+
+    1. Return a value >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD (fail-toward-escalate,
+       so a degraded count escalates rather than silently suppressing as below-threshold).
+    2. Emit a WARNING log.
+
+    RED until step-06 adds the WARNING and changes `return 0` to the sentinel.
+    """
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    finding = _make_s3_findings()[0]  # actionable finding
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.compute_content_fingerprint',
+            side_effect=RuntimeError('fp boom'),
+        ),
+        patch(
+            'fused_memory.reconciliation.harness.HAS_ESCALATION',
+            True,
+        ),
+        caplog.at_level(logging.WARNING, logger='fused_memory'),
+    ):
+        result = await harness._finding_persistence_count('test-project', finding)
+
+    assert result >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, (
+        f'Expected result >= {_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} (fail-toward-escalate) '
+        f'when fingerprint compute raises, got {result!r}. '
+        'RED: current impl silently returns 0 (suppresses escalation).'
+    )
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, (
+        'Expected a WARNING log when fingerprint compute raises, got none. '
+        'RED: fingerprint-compute except has no log.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_finding_persistence_count_journal_failure_fails_toward_escalate(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    caplog,
+):
+    """When journal.get_recent_runs raises, _finding_persistence_count must return
+    a value >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD (fail-toward-escalate).
+
+    The journal-read except already emits a WARNING — only the return value is wrong.
+    RED until step-08 changes `return 0` to the sentinel.
+    """
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    finding = _make_s3_findings()[0]
+
+    harness.journal.get_recent_runs = AsyncMock(
+        side_effect=RuntimeError('journal down')
+    )
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.HAS_ESCALATION',
+            True,
+        ),
+        caplog.at_level(logging.WARNING, logger='fused_memory'),
+    ):
+        result = await harness._finding_persistence_count('test-project', finding)
+
+    assert result >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, (
+        f'Expected result >= {_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} (fail-toward-escalate) '
+        f'when journal.get_recent_runs raises, got {result!r}. '
+        'RED: current impl returns 0 (suppresses escalation).'
+    )

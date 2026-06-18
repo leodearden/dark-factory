@@ -1539,3 +1539,185 @@ class TestStaleCountSnapshotCorrectionWiring:
             f"got stats={report.stats!r}. "
             "RED: stat not yet surfaced."
         )
+
+
+# ---------------------------------------------------------------------------
+# step-01 (RED) / step-02 (GREEN): assemble_payload fetch degraded tracking
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidatorFetchDegradedSources:
+    """assemble_payload must track fetch failures in _fetch_degraded_sources.
+
+    Case A (episodes): when get_episodes raises, a WARNING must be emitted AND
+    'episodes' must appear in stage._fetch_degraded_sources.
+
+    Case B (mem0): when mem0.get_all raises, 'mem0' must appear in
+    stage._fetch_degraded_sources.
+
+    RED until step-02 wires the tracking and logging.
+    """
+
+    @pytest.mark.asyncio
+    async def test_episode_fetch_failure_logs_warning_and_tracks_degraded_source(
+        self, caplog
+    ):
+        """Case A: get_episodes raises → WARNING emitted AND 'episodes' in _fetch_degraded_sources."""
+        import logging
+
+        stage = _make_consolidator()
+        stage.memory.get_episodes = AsyncMock(side_effect=RuntimeError('graphiti down'))
+        watermark = Watermark(project_id='test_project')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory'):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        # Must emit a WARNING for the episodes fetch failure
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, (
+            'Expected a WARNING log when get_episodes raises, got none. '
+            'RED: the episodes except is a bare `except Exception: episodes=[]` with no log.'
+        )
+
+        # Must track the degraded source
+        degraded = getattr(stage, '_fetch_degraded_sources', None)
+        assert degraded is not None, (
+            '_fetch_degraded_sources attribute does not exist on MemoryConsolidator. '
+            'RED: attribute not yet declared.'
+        )
+        assert 'episodes' in degraded, (
+            f"Expected 'episodes' in _fetch_degraded_sources, got: {degraded!r}. "
+            "RED: episodes except does not append to _fetch_degraded_sources."
+        )
+
+    @pytest.mark.asyncio
+    async def test_mem0_fetch_failure_tracks_degraded_source(self):
+        """Case B: mem0.get_all raises → 'mem0' in _fetch_degraded_sources.
+
+        NOTE: the mem0 except already emits a WARNING on main (added by a sibling task),
+        so the RED driver is solely the missing _fetch_degraded_sources tracking
+        (AttributeError or missing 'mem0' entry), not a missing warning.
+        """
+        stage = _make_consolidator()
+        stage.memory.mem0.get_all = AsyncMock(side_effect=RuntimeError('mem0 down'))
+        watermark = Watermark(project_id='test_project')
+
+        await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        degraded = getattr(stage, '_fetch_degraded_sources', None)
+        assert degraded is not None, (
+            '_fetch_degraded_sources attribute does not exist on MemoryConsolidator. '
+            'RED: attribute not yet declared.'
+        )
+        assert 'mem0' in degraded, (
+            f"Expected 'mem0' in _fetch_degraded_sources, got: {degraded!r}. "
+            "RED: mem0 except does not append to _fetch_degraded_sources."
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_fetch_leaves_degraded_sources_empty(self):
+        """When no fetch fails, _fetch_degraded_sources is empty (genuine empty corpus)."""
+        stage = _make_consolidator()
+        watermark = Watermark(project_id='test_project')
+
+        await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        degraded = getattr(stage, '_fetch_degraded_sources', None)
+        assert degraded is not None, (
+            '_fetch_degraded_sources attribute does not exist on MemoryConsolidator.'
+        )
+        assert degraded == [], (
+            f"Expected empty _fetch_degraded_sources on clean fetch, got: {degraded!r}. "
+            "Empty list = genuine empty corpus (distinguishable from fetch failure)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-03 (RED) / step-04 (GREEN): run() surfacing stage1_fetch_degraded stat
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidatorRunFetchDegradedStat:
+    """MemoryConsolidator.run() must copy _fetch_degraded_sources to
+    report.stats['stage1_fetch_degraded'] (empty list = clean, non-empty = failure).
+
+    RED until step-04 adds the copy in run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_surfaces_degraded_episodes_in_stats(self):
+        """When episodes fetch fails, report.stats['stage1_fetch_degraded'] == ['episodes']."""
+        stage = _make_consolidator(project_root='/tmp/test_run_degraded')
+        stage.project_id = 'test_project'
+        stage.memory.get_episodes = AsyncMock(side_effect=RuntimeError('graphiti down'))
+
+        # Use real assemble_payload (no BaseStage.run mock) — let MemoryConsolidator.run
+        # call assemble_payload() internally, then check the stats it surfaces.
+        # We need to mock BaseStage.run to capture how run() populates report.stats.
+        # Strategy: let the real assemble_payload run (to populate _fetch_degraded_sources),
+        # then replace BaseStage.run with a minimal mock that returns a fresh StageReport,
+        # then check that MemoryConsolidator.run() copies _fetch_degraded_sources onto it.
+
+        # Pre-populate _fetch_degraded_sources by calling assemble_payload directly first.
+        # Then test the run() wiring via the BaseStage.run mock approach.
+        watermark = Watermark(project_id='test_project')
+        await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        # Now run() should copy _fetch_degraded_sources to report.stats
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='run-step03-degraded',
+            )
+
+        assert 'stage1_fetch_degraded' in report.stats, (
+            "run() must set report.stats['stage1_fetch_degraded']; key is missing. "
+            "RED: run() does not yet copy _fetch_degraded_sources to stats."
+        )
+        assert report.stats['stage1_fetch_degraded'] == ['episodes'], (
+            f"Expected report.stats['stage1_fetch_degraded'] == ['episodes'], "
+            f"got: {report.stats.get('stage1_fetch_degraded')!r}. "
+            "RED: run() does not yet copy _fetch_degraded_sources to stats."
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_surfaces_empty_degraded_on_clean_fetch(self):
+        """When no fetch fails, report.stats['stage1_fetch_degraded'] == []."""
+        stage = _make_consolidator(project_root='/tmp/test_run_clean')
+        stage.project_id = 'test_project'
+
+        watermark = Watermark(project_id='test_project')
+        # Clean fetch — no exceptions
+        await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='run-step03-clean',
+            )
+
+        assert report.stats.get('stage1_fetch_degraded') == [], (
+            f"Expected report.stats['stage1_fetch_degraded'] == [] on clean fetch, "
+            f"got: {report.stats.get('stage1_fetch_degraded')!r}. "
+            "RED: stat not yet surfaced by run()."
+        )

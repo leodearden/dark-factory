@@ -1637,10 +1637,11 @@ class ReconciliationHarness:
         The default lookback is ``max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)`` so
         that raising the threshold never silently caps the count below the gate value.
 
-        Returns 0 if HAS_ESCALATION is False, if the fingerprint call raises, or if any
-        other exception occurs (graceful degradation).  When the journal call itself
-        fails, a warning is logged so debugging a 'why didn't this escalate?' incident
-        is possible — the caller proceeds as if persistence is 0 (fail-closed).
+        Returns 0 if HAS_ESCALATION is False.  When the fingerprint call or the
+        journal call raises, a WARNING is logged and a sentinel >=
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD is returned so a degraded count
+        fails-toward-escalate rather than silently suppressing the escalation as a
+        benign below-threshold count.
 
         Task 1512 / plans/afk-A7-recon-closure.md.
         """
@@ -1653,11 +1654,20 @@ class ReconciliationHarness:
                 _derive_affected_ids(finding),
                 finding.get('description') or '',
             )
-        except Exception:
-            return 0
+        except Exception as exc:
+            logger.warning(
+                'reconciliation.persistence_fingerprint_failed',
+                extra={
+                    'project_id': project_id,
+                    'finding_category': finding.get('category', ''),
+                    'error': str(exc),
+                },
+            )
+            return max(lookback, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)
         try:
             recent = await self.journal.get_recent_runs(project_id, limit=lookback)
             count = 0
+            any_item_fp_failed = False
             for run in recent:
                 if run.status != 'completed':
                     continue
@@ -1678,10 +1688,20 @@ class ReconciliationHarness:
                             item.get('description') or '',
                         )
                     except Exception:
+                        any_item_fp_failed = True
                         continue
                     if fp == target_fp:
                         count += 1
                         break  # one match per run is enough
+            if any_item_fp_failed:
+                logger.warning(
+                    'reconciliation.persistence_item_fingerprint_failed',
+                    extra={
+                        'project_id': project_id,
+                        'finding_category': finding.get('category', ''),
+                    },
+                )
+                return max(count, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)
             return count
         except Exception as _e:
             logger.warning(
@@ -1692,7 +1712,7 @@ class ReconciliationHarness:
                     'error': str(_e),
                 },
             )
-            return 0
+            return max(lookback, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)
 
     def _log_non_actionable_finding(
         self,

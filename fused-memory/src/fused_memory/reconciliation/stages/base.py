@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared.safe_io import load_json_or_warn
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -325,37 +326,40 @@ class BaseStage:
         return {'mcpServers': servers}
 
 
-def _find_fused_memory_server() -> dict:
+def _find_fused_memory_server(candidates: list[Path] | None = None) -> dict:
     """Locate the fused-memory MCP server config.
 
     Reads from .mcp.json — supports both HTTP and stdio transport types.
     Returns dict with either ``{type, url}`` for HTTP or
     ``{command, args, env?}`` for stdio.
+
+    Args:
+        candidates: Ordered list of .mcp.json paths to try.  Defaults to the
+            production list [/home/leo/src/dark-factory/.mcp.json, cwd/.mcp.json].
+            Injectable for hermetic testing.
     """
-    for candidate in [
-        Path('/home/leo/src/dark-factory/.mcp.json'),
-        Path.cwd() / '.mcp.json',
-    ]:
-        if candidate.exists():
-            try:
-                mcp_data = json.loads(candidate.read_text())
-                fm_config = mcp_data.get('mcpServers', {}).get('fused-memory', {})
+    if candidates is None:
+        candidates = [
+            Path('/home/leo/src/dark-factory/.mcp.json'),
+            Path.cwd() / '.mcp.json',
+        ]
+    for candidate in candidates:
+        mcp_data, _ok = load_json_or_warn(candidate, default={}, on_corrupt='warn')
+        fm_config = mcp_data.get('mcpServers', {}).get('fused-memory', {})
 
-                # HTTP transport
-                if fm_config.get('type') == 'http' and fm_config.get('url'):
-                    return {'type': 'http', 'url': fm_config['url']}
+        # HTTP transport
+        if fm_config.get('type') == 'http' and fm_config.get('url'):
+            return {'type': 'http', 'url': fm_config['url']}
 
-                # Stdio transport
-                if fm_config.get('command'):
-                    result: dict = {
-                        'command': fm_config['command'],
-                        'args': fm_config.get('args', []),
-                    }
-                    if 'env' in fm_config:
-                        result['env'] = fm_config['env']
-                    return result
-            except (json.JSONDecodeError, KeyError):
-                pass
+        # Stdio transport
+        if fm_config.get('command'):
+            result: dict = {
+                'command': fm_config['command'],
+                'args': fm_config.get('args', []),
+            }
+            if 'env' in fm_config:
+                result['env'] = fm_config['env']
+            return result
 
     # Default: assume uv-managed fused-memory stdio
     return {
