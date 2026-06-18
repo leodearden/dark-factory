@@ -286,6 +286,58 @@ def wl_git_config_off() -> GitConfig:
     )
 
 
+@pytest.fixture
+def wl_git_config_rolling_base(tmp_path: Path) -> GitConfig:
+    """GitConfig with warm_lane_base_target_dir pointing to a SEPARATE rolling-base.
+
+    The rolling base dir is ``tmp_path/rolling_base``.  Since
+    ``advancing`` (= ``<worktree_base>/_merge-verify/target``) differs from
+    ``base`` (= ``tmp_path/rolling_base``), ``refresh_warm_base()`` will not
+    short-circuit the advancing == base guard and the refresh actually fires.
+
+    Tests that need the rolling-base path can compute it as
+    ``tmp_path / 'rolling_base'``.
+    """
+    rolling = tmp_path / 'rolling_base'
+    rolling.mkdir(parents=True, exist_ok=True)
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=True,
+        warm_lane_base_target_dir=str(rolling),
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1 helpers: fake refresh-warm-base.sh recorder scripts
+# ---------------------------------------------------------------------------
+
+
+def _install_refresh_recorder(scripts_dir: Path, recorder_file: Path) -> None:
+    """Install a refresh-warm-base.sh that records its args ($1 advancing, $2 base)
+    to *recorder_file* and exits 0.
+
+    Mirrors the fake seed-warm-lane.sh pattern used by TestSeedWarmLane.
+    """
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'refresh-warm-base.sh'
+    script.write_text(
+        f'#!/usr/bin/env bash\necho "$1 $2" >> {recorder_file}\n'
+    )
+    script.chmod(0o755)
+
+
+def _install_refresh_failing(scripts_dir: Path) -> None:
+    """Install a refresh-warm-base.sh that exits non-zero (fail-soft test variant)."""
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'refresh-warm-base.sh'
+    script.write_text('#!/usr/bin/env bash\necho "refresh failed" >&2\nexit 1\n')
+    script.chmod(0o755)
+
+
 class TestGitOpsPoolWiring:
     def test_pool_constructed_when_enabled_with_size(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
