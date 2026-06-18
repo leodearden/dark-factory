@@ -1403,7 +1403,17 @@ Output JSON matching the schema. Every task must appear in the output.
             if not entry.is_dir():
                 continue
             pool = self.git_ops.warm_lane_pool
-            is_lane = pool is not None and pool.is_lane(entry)
+            spec_pool = self.git_ops.spec_warm_lane_pool
+            # '_spec-' merge-speculation lanes are a SEPARATE pool: they have
+            # no '.task/plan.json' and their dir name is not a live task id,
+            # so without this they would hit the mid-crash cold cleanup branch
+            # and be removed.  Treat them as lanes too — they take the no-plan
+            # branch (no recoverable task identity) and route through
+            # cleanup_worktree, which now releases '_spec-' lanes back to the
+            # spec pool instead of removing them.
+            is_lane = (pool is not None and pool.is_lane(entry)) or (
+                spec_pool is not None and spec_pool.is_lane(entry)
+            )
             task_id = entry.name
             plan_path = entry / '.task' / 'plan.json'
 
@@ -1679,9 +1689,19 @@ Output JSON matching the schema. Every task must appear in the output.
             # (it moves the dir), so moving a lane would leave the pool's
             # registered path dangling.  Crash-recovery already handles
             # lanes; the reaper must not undo a just-recovered lane.
+            # The merge-speculation pool ('_spec-' lanes) is a SEPARATE
+            # WarmLanePool instance — its lanes are not '_merge-*', not
+            # members of warm_lane_pool, and their names are not live task
+            # ids, so they would otherwise fall through to the orphan branch
+            # and get moved/removed mid-verify.  Protect them identically.
             if (
                 self.git_ops.warm_lane_pool is not None
                 and self.git_ops.warm_lane_pool.is_lane(entry)
+            ):
+                continue
+            if (
+                self.git_ops.spec_warm_lane_pool is not None
+                and self.git_ops.spec_warm_lane_pool.is_lane(entry)
             ):
                 continue
             # Skip live, recovered, preserved, and in-flight worktrees.

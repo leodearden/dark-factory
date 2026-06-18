@@ -3765,6 +3765,19 @@ class GitOps:
             await self.release_warm_lane(worktree, branch)
             return
 
+        # Symmetric for the merge-speculation pool: a '_spec-' lane must be
+        # RELEASED back to its pool (retain worktree + target/, flip FREE),
+        # never removed.  Without this, a spec lane routed here (e.g. by the
+        # crash-recovery sweep) would be git-worktree-removed and lose its
+        # pool slot.  warm=True selects the pool-retain path in
+        # release_spec_lane.
+        if (
+            self.spec_warm_lane_pool is not None
+            and self.spec_warm_lane_pool.is_lane(worktree)
+        ):
+            await self.release_spec_lane(worktree, warm=True)
+            return
+
         full_branch = f'{self.config.branch_prefix}{branch}'
 
         # Remove worktree
