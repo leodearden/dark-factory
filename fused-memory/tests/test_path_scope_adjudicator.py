@@ -278,38 +278,48 @@ class TestZeroOutputBreakerCircuit:
         assert mock_probe.await_count == 0, 'Breaker must be open after threshold ZOTs'
 
     async def test_successful_call_resets_breaker(self, tmp_path):
-        """One successful LLM call resets the breaker so the next call reaches the LLM."""
+        """A successful LLM call resets the ZOT counter so a subsequent ZOT doesn't trip the breaker.
+
+        Test setup (threshold=2):
+          1. Drive ONE ZOT → counter becomes 1, breaker stays CLOSED.
+          2. Successful call → counter resets to 0  (the code path under test).
+          3. Drive ONE more ZOT → counter becomes 1 again, still < threshold.
+          4. Assert the mock was reached (breaker did NOT open), proving the
+             success in step 2 actually cleared the accumulated count.
+        """
+        threshold = 2
         cfg = PathScopeAdjudicatorConfig(
-            zero_output_breaker_threshold=1,
+            zero_output_breaker_threshold=threshold,
             zero_output_breaker_cooldown_seconds=9999,
         )
         adj = _make_adjudicator(config=cfg, tmp_path=tmp_path)
 
         zot_result = _agent_result(
-            success=False, output='', subtype='error_empty_output',
+            success=False, output='', timed_out=True, subtype='error',
         )
         ok_result = _agent_result(
             success=True, structured_output={'verdict': 'allow', 'reason': 'ok'},
         )
 
-        # Open the breaker.
+        # Step 1: one ZOT — counter=1, breaker CLOSED (threshold=2).
         with patch(_INVOKE_PATH, new=AsyncMock(return_value=zot_result)):
-            await _do_adjudicate(adj)
+            first = await _do_adjudicate(adj)
+        assert first.should_allow_creation is False
+        assert adj._consecutive_zero_output_timeouts == 1
 
-        # A successful call resets it (this fires because the mock always returns zot
-        # when breaker is open, but we need the breaker to be CLOSED for the call to go
-        # through — so we first simulate the cooldown expiring by directly resetting).
-        adj._reset_breaker()
-
-        # Now a successful call should reset the breaker.
+        # Step 2: successful call — should reset counter to 0.
         with patch(_INVOKE_PATH, new=AsyncMock(return_value=ok_result)):
             good = await _do_adjudicate(adj)
-
         assert good.should_allow_creation is True
-        assert good.verdict == 'allow'
+        assert adj._consecutive_zero_output_timeouts == 0, (
+            'Successful call must reset the ZOT counter'
+        )
 
-        # After reset, the NEXT call also reaches the LLM (breaker is closed).
-        with patch(_INVOKE_PATH, new=AsyncMock(return_value=ok_result)) as mock_after:
-            await _do_adjudicate(adj)
-
-        assert mock_after.await_count == 1
+        # Step 3 + 4: one more ZOT → counter=1, still < threshold; LLM IS reached.
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=zot_result)) as mock_probe:
+            after = await _do_adjudicate(adj)
+        assert after.should_allow_creation is False
+        assert mock_probe.await_count == 1, (
+            'Breaker must remain CLOSED after one ZOT when success reset the counter'
+        )
+        assert adj._consecutive_zero_output_timeouts == 1

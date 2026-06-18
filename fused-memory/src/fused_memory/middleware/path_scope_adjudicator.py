@@ -102,9 +102,14 @@ Respond ONLY with the JSON object specified in the output schema.
 Do not add explanatory text outside the JSON.
 """.strip()
 
-# Cap-wait sanity for the adjudicator (shorter than curator's default since
-# the adjudication prompt is tiny and we want fast rejection on cap exhaustion).
-_ADJUDICATOR_CAP_WAIT_SANITY_SECS: float = 300.0
+# Cap-wait sanity for the adjudicator.  The adjudication runs INLINE in
+# submit_task (before the ticket is persisted), so a stalled cap-wait stalls
+# the client-facing create call.  We keep this tight:
+#   timeout_seconds (default 60s) + cap_wait (60s) = ~120s worst-case latency
+# on a capped account before the call fails safe back to the heuristic reject.
+# The curator uses a longer cap-wait because it runs out-of-band; here speed
+# of failure matters more than exhausting wait-for-cap credit.
+_ADJUDICATOR_CAP_WAIT_SANITY_SECS: float = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +137,14 @@ class AdjudicationVerdict:
         return self.verdict == 'allow' and not self.failed
 
 
-_FAIL_SAFE = AdjudicationVerdict(verdict='uncertain', reason='fail-safe', failed=True)
-
 _VALID_VERDICTS = frozenset({'allow', 'reject', 'uncertain'})
+
+# Prompt input caps — description is user-supplied and unbounded; truncate to
+# keep the adjudication prompt tiny (matching the design intent) and prevent an
+# oversized prompt from exhausting the per-call budget or pushing toward the
+# timeout before the LLM can respond.
+_MAX_TITLE_CHARS: int = 512
+_MAX_DESCRIPTION_CHARS: int = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -216,14 +226,27 @@ class PathScopeAdjudicator:
     ) -> str:
         paths_str = ', '.join(matched_paths) if matched_paths else '<none>'
         target = suggested_project or '<unknown>'
+
+        # Truncate user-supplied text to keep the prompt bounded.  Very large
+        # descriptions can inflate tokens, latency, and cost, or push toward the
+        # timeout before a verdict is returned.
+        title_text = title[:_MAX_TITLE_CHARS]
+        if len(title) > _MAX_TITLE_CHARS:
+            title_text += '…'
+
+        desc_raw = description or '<no description provided>'
+        desc_text = desc_raw[:_MAX_DESCRIPTION_CHARS]
+        if len(desc_raw) > _MAX_DESCRIPTION_CHARS:
+            desc_text += '…'
+
         return (
             f'Task filed in project: {project_id!r}\n'
             f'Flagged matched path prefixes: {paths_str}\n'
             f'Suggested correct project: {target!r}\n'
             f'\n'
-            f'Task title:\n{title}\n'
+            f'Task title:\n{title_text}\n'
             f'\n'
-            f'Task description:\n{description or "<no description provided>"}\n'
+            f'Task description:\n{desc_text}\n'
         )
 
     # ------------------------------------------------------------------
@@ -311,7 +334,10 @@ class PathScopeAdjudicator:
         # --- Handle LLM failure ---
         if not agent_result.success:
             if is_zero_output_timeout(agent_result):
-                self._record_zero_output_timeout(now)
+                # Capture a fresh timestamp so the cooldown window is measured
+                # from when the failure was observed, not from before the
+                # (potentially 60s) hung LLM call started — mirrors task_curator.py:935-938.
+                self._record_zero_output_timeout(time.monotonic())
             reason = (
                 f'llm-failed: timed_out={agent_result.timed_out} '
                 f'subtype={agent_result.subtype!r}'
