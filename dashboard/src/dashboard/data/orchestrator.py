@@ -11,14 +11,13 @@ process-scanning and worktree-artifact helpers remain sync and run via
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import logging
 import re
 import subprocess
 from pathlib import Path
 
 import httpx
+from shared.safe_io import load_json_or_warn
 
 from dashboard.config import DashboardConfig
 from dashboard.data.tasks import fetch_tasks
@@ -181,22 +180,22 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     task_dir = worktree_path / '.task'
 
     # Metadata
-    metadata = None
-    with contextlib.suppress(FileNotFoundError, json.JSONDecodeError):
-        metadata = json.loads((task_dir / 'metadata.json').read_text())
+    metadata, _meta_ok = load_json_or_warn(task_dir / 'metadata.json', default=None)
+    if not isinstance(metadata, dict):
+        metadata = None
 
     # Plan progress, phase, and files
     done_count = 0
     total_count = 0
     files: list[str] = []
-    try:
-        plan_data = json.loads((task_dir / 'plan.json').read_text())
+    plan_data, _ok = load_json_or_warn(task_dir / 'plan.json', default=None)
+    if isinstance(plan_data, dict):
         steps = plan_data.get('steps', [])
-        total_count = len(steps)
-        done_count = sum(1 for s in steps if s.get('status') == 'done')
-        files = plan_data.get('files', [])
-    except (FileNotFoundError, json.JSONDecodeError, AttributeError, TypeError):
-        pass
+        if isinstance(steps, list):
+            total_count = len(steps)
+            done_count = sum(1 for s in steps if isinstance(s, dict) and s.get('status') == 'done')
+        raw_files = plan_data.get('files', [])
+        files = raw_files if isinstance(raw_files, list) else []
 
     if total_count == 0:
         phase = 'PLAN'
@@ -222,12 +221,9 @@ def read_task_artifacts(worktree_path: Path) -> dict:
             total_reviews = len(review_files)
             passed = 0
             for review_file in review_files:
-                try:
-                    review = json.loads(review_file.read_text())
-                    if review.get('verdict') == 'PASS':
-                        passed += 1
-                except (json.JSONDecodeError, FileNotFoundError):
-                    pass
+                review, _ok = load_json_or_warn(review_file, default=None)
+                if isinstance(review, dict) and review.get('verdict') == 'PASS':
+                    passed += 1
             review_summary = f'{passed}/{total_reviews} passed'
 
     return {
@@ -282,17 +278,26 @@ async def discover_orchestrators(
 
     # Cache per-project data so we don't re-fetch the same task list
     # when multiple processes share a project root.
-    project_cache: dict[Path, tuple[list[dict], dict[int, dict]]] = {}
+    # Cache tuple: (tasks, worktrees, offline, error)
+    project_cache: dict[Path, tuple[list[dict], dict[int, dict], bool, str | None]] = {}
 
     result: list[dict] = []
     for project_root, group in groups.items():
         if project_root not in project_cache:
             fetched = await fetch_tasks(client, config, project_root)
-            tasks = fetched if isinstance(fetched, list) else []
+            if isinstance(fetched, list):
+                tasks = fetched
+                offline = False
+                fetch_error: str | None = None
+            else:
+                # Offline marker: {'offline': True, 'error': ...}
+                tasks = []
+                offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
+                fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
             worktrees = await asyncio.to_thread(_scan_worktrees, project_root / '.worktrees')
-            project_cache[project_root] = (tasks, worktrees)
+            project_cache[project_root] = (tasks, worktrees, offline, fetch_error)
 
-        tasks, worktrees = project_cache[project_root]
+        tasks, worktrees, offline, fetch_error = project_cache[project_root]
         summary = {
             'total': len(tasks),
             'done': sum(1 for t in tasks if t.get('status') == 'done'),
@@ -315,7 +320,7 @@ async def discover_orchestrators(
         prd = next((p['prd'] for p in group if p.get('prd')), None)
         label = prd if prd else str(project_root)
 
-        result.append({
+        entry: dict = {
             'pids': [p['pid'] for p in group],
             'prd': prd,
             'label': label,
@@ -326,6 +331,10 @@ async def discover_orchestrators(
             'tasks': tasks,
             'worktrees': worktrees,
             'summary': summary,
-        })
+            'offline': offline,
+        }
+        if fetch_error:
+            entry['error'] = fetch_error
+        result.append(entry)
 
     return result

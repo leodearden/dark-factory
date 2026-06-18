@@ -274,12 +274,20 @@ def _split_queue_stats(qstats: dict) -> tuple[int | None, int | None, int | None
     """Extract pending/retry/dead from a get_queue_stats result.
 
     Returns (None, None, None) on offline / malformed payloads.
+    Emits a WARNING on shape drift (not-offline but counts missing or invalid).
     """
     if not isinstance(qstats, dict) or qstats.get('offline'):
         return None, None, None
     counts_raw = qstats.get('counts')
-    counts = counts_raw if isinstance(counts_raw, dict) else {}
-    return counts.get('pending'), counts.get('retry'), counts.get('dead')
+    if not isinstance(counts_raw, dict):
+        logger.warning('_split_queue_stats: missing/invalid counts: %r', qstats)
+        return None, None, None
+    missing = [k for k in ('pending', 'retry', 'dead') if k not in counts_raw]
+    if missing:
+        logger.warning(
+            '_split_queue_stats: counts missing keys %s: %r', missing, counts_raw
+        )
+    return counts_raw.get('pending'), counts_raw.get('retry'), counts_raw.get('dead')
 
 
 # ---------------------------------------------------------------------------

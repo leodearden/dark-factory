@@ -44,3 +44,28 @@ class TestOverviewTabCurrentTaskRemoved:
     def test_current_task_th_removed(self, tab_overview_jsx_body):
         """The <th>Current task</th> column header must NOT appear in tab_overview.jsx."""
         assert '<th>Current task</th>' not in tab_overview_jsx_body
+
+
+class TestHostLoadCardStaleness:
+    """HostLoadCard must surface a stale/offline badge when /api/load fails.
+
+    step-19 RED: The test below fails today because the panel-head renders no
+    badge.  After step-20 GREEN it passes.
+    """
+
+    def test_host_load_card_stale_badge_rendered(self, tab_overview_jsx_body):
+        """HostLoadCard panel-head must render a stale/offline badge element.
+
+        Accepts either a className containing 'stale' (e.g. className="badge stale")
+        or an element with visible text '>stale<' / '>offline<'.
+        This is the key behavioral contract: a failed /api/load must surface a
+        visible stale/offline marker rather than frozen/blank values.
+        """
+        jsx = tab_overview_jsx_body
+        has_stale_class = bool(re.search(r'className=["\'][^"\']*stale', jsx))
+        has_stale_text = bool(re.search(r'>stale<|>offline<', jsx))
+        assert has_stale_class or has_stale_text, (
+            'HostLoadCard panel-head must render a stale/offline badge '
+            '(e.g. <span className="badge stale">stale</span> or equivalent); '
+            'currently no stale badge is rendered in tab_overview.jsx'
+        )

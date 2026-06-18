@@ -13,6 +13,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from shared.timestamps import parse_timestamp_or_warn
+
 from dashboard.data.escalations import resolve_owning_project
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.stats_utils import percentile
@@ -52,7 +54,7 @@ def shape_orchestrators(
         primary_pid = pids[0] if pids else None
         project_root = o.get('project_root') or ''
         active_roots.add(str(project_root))
-        out_orchs.append({
+        orch_entry: dict = {
             'pid': primary_pid,
             'pids': list(pids),
             'label': o.get('label') or _project_label(project_root),
@@ -62,7 +64,11 @@ def shape_orchestrators(
             'started': o.get('started') or '',
             'last_update': o.get('last_update'),
             'summary': dict(o.get('summary') or {}),
-        })
+            'offline': bool(o.get('offline')),
+        }
+        if o.get('error') is not None:
+            orch_entry['error'] = o['error']
+        out_orchs.append(orch_entry)
 
     # PROJECTS: union of active roots + known roots.  ``active`` reflects
     # whether an orchestrator is currently running for that root.
@@ -238,13 +244,14 @@ def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
             if not isinstance(payload, Mapping):
                 continue
             ts_raw = payload.get('ts')
-            try:
-                ts_dt = (
-                    datetime.fromisoformat(ts_raw) if isinstance(ts_raw, str) else None
+            if ts_raw is None:
+                ts_dt, ts_ok = None, True  # missing ts is benign
+            else:
+                ts_dt, ts_ok = parse_timestamp_or_warn(
+                    ts_raw,
+                    context=f'wal_status {server_url}/{store_name}',
                 )
-            except ValueError:
-                ts_dt = None
-            age_s = (now - ts_dt).total_seconds() if ts_dt else None
+            age_s = (now - ts_dt).total_seconds() if ts_dt is not None and ts_ok else None
             busy = int(payload.get('busy') or 0)
             log_frames = int(payload.get('log') or 0)
 
@@ -256,6 +263,9 @@ def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
             elif busy > 0:
                 row_status = 'red'
                 row_reason = f'busy={busy}'
+            elif not ts_ok:
+                row_status = 'red'
+                row_reason = 'corrupt ts'
             elif age_s is not None and age_s > _WAL_STALE_SECONDS:
                 row_status = 'red'
                 row_reason = f'stale ({int(age_s)}s)'

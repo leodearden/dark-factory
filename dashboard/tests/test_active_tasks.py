@@ -1169,3 +1169,58 @@ async def test_collect_active_tasks_includes_deferred_via_active_path(
     assert 'completed' not in row, (
         "deferred row must NOT have 'completed' key (that is the bounded-bucket sentinel)"
     )
+
+
+# ---------------------------------------------------------------------------
+# resolve_external + offline marker (step-11 / step-12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_tasks_with_counts_resolve_external_offline_marker(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """When fetch_external_statuses returns the offline marker, each dep entry gets
+    status=='offline' (distinct from 'unknown'=task-not-found).
+
+    Fails today because status_map.get(id, 'unknown') yields 'unknown' for all deps
+    when the map is the offline marker {'offline':True,'error':...}.
+    """
+    from dashboard.config import DashboardConfig
+    from dashboard.data.active_tasks import collect_tasks_with_counts
+
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='offline_ext',
+        tasks=[
+            {
+                'id': 99,
+                'title': 'blocked on upstream',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'external_deps': ['dark_factory:42', 'reify:7']},
+            },
+        ],
+    )
+
+    async def _fake_fetch(client, config, project_root):
+        return list(shaped)
+
+    async def _offline_ext_statuses(client, config, deps):
+        return {'offline': True, 'error': 'down'}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _offline_ext_statuses)
+
+    cfg = DashboardConfig(project_root=root)
+    active, _, _ = await collect_tasks_with_counts(
+        client=dummy_client, config=cfg, resolve_external=True,
+    )
+
+    assert len(active) == 1
+    row = active[0]
+    for entry in row['external_deps']:
+        assert entry['status'] == 'offline', (
+            f"expected status='offline' for dep {entry['id']!r} when MCP is offline, "
+            f"got: {entry['status']!r}"
+        )

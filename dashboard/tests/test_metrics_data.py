@@ -81,6 +81,76 @@ def test_split_queue_stats_pulls_counts():
     assert (p, r, d) == (3, 1, 0)
 
 
+def test_split_queue_stats_warns_on_missing_counts_keys(caplog):
+    """counts present but missing some of pending/retry/dead -> returns partial values
+    AND emits a WARNING from dashboard.data.metrics (shape drift).
+
+    Fails today because the code silently uses counts.get(...) with no warning.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
+        p, r, d = _split_queue_stats({'counts': {'pending': 3}})
+
+    # Partial values are returned (pending was present).
+    assert p == 3
+    # Missing keys return None.
+    assert r is None
+    assert d is None
+    # A WARNING must have been emitted.
+    warning_records = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert warning_records, (
+        'expected a WARNING for counts missing retry/dead keys, but none was emitted'
+    )
+
+
+def test_split_queue_stats_warns_on_invalid_counts(caplog):
+    """counts not a dict (e.g. {'foo': 1} has no 'counts' key) -> (None, None, None)
+    AND emits a WARNING from dashboard.data.metrics.
+
+    Fails today because the code silently coerces missing/invalid counts to {} and
+    returns (None, None, None) without any warning.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
+        p, r, d = _split_queue_stats({'foo': 1})
+
+    assert (p, r, d) == (None, None, None)
+    warning_records = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert warning_records, (
+        'expected a WARNING for missing/invalid counts, but none was emitted'
+    )
+
+
+def test_split_queue_stats_offline_no_warning(caplog):
+    """Offline marker stays silent — no WARNING should be emitted for a known offline state."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
+        p, r, d = _split_queue_stats({'offline': True})
+
+    assert (p, r, d) == (None, None, None)
+    warning_records = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert not warning_records, (
+        f'expected no WARNINGs for offline marker, got: {[r.message for r in warning_records]}'
+    )
+
+
+def test_split_queue_stats_valid_full_counts_no_warning(caplog):
+    """Valid full counts dict -> values returned AND no WARNING emitted."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
+        p, r, d = _split_queue_stats({'counts': {'pending': 1, 'retry': 0, 'dead': 0}})
+
+    assert (p, r, d) == (1, 0, 0)
+    warning_records = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert not warning_records, (
+        f'expected no WARNINGs for valid counts, got: {[r.message for r in warning_records]}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Read aggregators
 # ---------------------------------------------------------------------------
