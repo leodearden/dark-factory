@@ -56,3 +56,41 @@ class TestExtractAgentVerdictHappyPath:
         assert warning_records == [], (
             f'success path must emit NO WARNING; got: {[r.message for r in warning_records]}'
         )
+
+
+class TestExtractAgentVerdictFallback:
+    """Fallback path: None / non-dict / dict-without-warning all use error_summary as token."""
+
+    def test_none_result_uses_error_summary_token(self, caplog):
+        """None input → agent-failed:<error_summary>, failed=True, WARNING emitted."""
+        with caplog.at_level(logging.WARNING):
+            result = extract_agent_verdict(
+                None,
+                default_verdict='inconclusive',
+                error_summary='unparseable_output',
+            )
+
+        assert isinstance(result, AgentVerdict)
+        assert result.summary == 'agent-failed:unparseable_output'
+        assert result.verdict == 'inconclusive'
+        assert result.failed is True
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'expected at least one WARNING log record on None input'
+
+    def test_dict_without_verdict_or_warning_uses_error_summary_token(self, caplog):
+        """Dict with neither 'verdict' nor 'warning' → agent-failed:<error_summary>."""
+        with caplog.at_level(logging.WARNING):
+            result = extract_agent_verdict(
+                {'text': 'oops'},
+                default_verdict='inconclusive',
+                error_summary='unparseable_output',
+            )
+
+        assert isinstance(result, AgentVerdict)
+        assert result.summary == 'agent-failed:unparseable_output'
+        assert result.verdict == 'inconclusive'
+        assert result.failed is True
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'expected at least one WARNING log record on warning-less dict'
