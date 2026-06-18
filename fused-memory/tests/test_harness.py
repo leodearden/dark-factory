@@ -7421,3 +7421,107 @@ class TestConfigureConsolidatorNewKwargs:
 
         assert stage.task_count_verification is None
         assert stage.graphiti_queue_health is None
+
+
+# ── Tests for task 1785: full-cycle wiring of diagnostics ─────────────────────
+
+
+class TestFullCycleWiringDiagnostics:
+    """_run_full_cycle fetches and threads task_count_verification + graphiti_queue_health.
+
+    step-19 (RED): dead-code detection — _configure_consolidator at the production
+        call site omits both kwargs, so the class-default None survives to run() time.
+    step-20 (GREEN): wire _fetch_task_count_census / cross_verify_task_counts /
+        _check_graphiti_queue_health into _run_full_cycle and pass kwargs to
+        _configure_consolidator.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_diagnostics_into_stage1(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """run_full_cycle fetches census + queue-health and threads them into Stage 1.
+
+        Proves that both _fetch_task_count_census + cross_verify_task_counts and
+        _check_graphiti_queue_health are called in the production _run_full_cycle
+        path and that their results reach MemoryConsolidator via _configure_consolidator.
+        """
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Wire taskmaster with real task and status data so census fetch returns non-empty
+        harness.taskmaster.get_tasks = AsyncMock(
+            return_value={
+                'tasks': [
+                    {'id': 1, 'status': 'done'},
+                    {'id': 2, 'status': 'pending'},
+                ]
+            }
+        )
+        harness.taskmaster.get_statuses = AsyncMock(
+            return_value={'1': 'done', '2': 'pending'}
+        )
+
+        # Wire durable_queue with dead-letter data so queue-health returns unhealthy
+        durable_queue_mock = AsyncMock()
+        durable_queue_mock.get_stats = AsyncMock(
+            return_value={
+                'counts': {'dead': 2, 'pending': 1},
+                'oldest_pending_age_seconds': 5.0,
+            }
+        )
+        harness.memory.durable_queue = durable_queue_mock
+
+        # Capture the diagnostics at the moment MemoryConsolidator.run() fires
+        captured: dict = {}
+
+        async def capture_diags(stage):
+            captured['task_count_verification'] = stage.task_count_verification
+            captured['graphiti_queue_health'] = stage.graphiti_queue_health
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_diags)
+            else:
+                _mock_stage_run(stage)
+
+        await harness.run_full_cycle(
+            'test-project',
+            'wiring-test',
+            events=[_make_event()],
+        )
+
+        assert captured, (
+            'MemoryConsolidator.run() was never invoked — '
+            'run_full_cycle skipped it or stage list changed'
+        )
+
+        tcv = captured.get('task_count_verification')
+        assert tcv is not None, (
+            'MemoryConsolidator.task_count_verification is None — '
+            'run_full_cycle must call _fetch_task_count_census + cross_verify_task_counts '
+            'and pass task_count_verification= to _configure_consolidator at the production '
+            'call site (harness.py:1451)'
+        )
+        assert tcv.get('available') is True, (
+            f'task_count_verification["available"] expected True, got {tcv.get("available")!r}; '
+            'get_statuses returned a non-empty map so census should be marked available'
+        )
+
+        gqh = captured.get('graphiti_queue_health')
+        assert gqh is not None, (
+            'MemoryConsolidator.graphiti_queue_health is None — '
+            'run_full_cycle must call _check_graphiti_queue_health '
+            'and pass graphiti_queue_health= to _configure_consolidator at the production '
+            'call site (harness.py:1451)'
+        )
+        assert gqh.get('dead_count') == 2, (
+            f'Expected graphiti_queue_health["dead_count"]==2, got {gqh.get("dead_count")!r}'
+        )
+        assert gqh.get('healthy') is False, (
+            f'Expected graphiti_queue_health["healthy"]==False, got {gqh.get("healthy")!r}'
+        )

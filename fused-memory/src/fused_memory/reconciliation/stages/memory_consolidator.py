@@ -307,6 +307,9 @@ class MemoryConsolidator(BaseStage):
         # 7. Active task tree (task 455)
         task_tree_section = self._build_task_tree_section()
 
+        # 7b. Task Count Census (task 1785)
+        task_count_census_section = self._build_task_count_census_section()
+
         # 8. Format
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
@@ -332,7 +335,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{summary_nonce_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -380,6 +383,9 @@ Review the above data and perform memory consolidation:
         # Active task tree (task 455)
         task_tree_section = self._build_task_tree_section()
 
+        # Task Count Census (task 1785)
+        task_count_census_section = self._build_task_count_census_section()
+
         # Per-cycle summary nonce (task 1574)
         summary_nonce_section = self._build_summary_nonce_section()
 
@@ -400,7 +406,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{summary_nonce_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -433,6 +439,37 @@ Review the above data and perform memory consolidation:
         if self.filtered_task_tree is None:
             return ''
         return '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
+
+    def _build_task_count_census_section(self) -> str:
+        """Return the Task Count Census payload section, or empty string if unavailable.
+
+        Mirrors _build_task_tree_section — inserted into both assemble_payload and
+        _format_assembled_payload alongside task_tree_section.  The authoritative
+        counts come from get_statuses (a deterministic compact read) rather than the
+        async-queued Graphiti snapshot edge that triggered the run-929b4135 incident.
+
+        Returns '' when task_count_verification is None so the payload is unchanged
+        for remediation passes and for cycles where get_statuses was unavailable.
+        """
+        if self.task_count_verification is None:
+            return ''
+        v = self.task_count_verification
+        if not v.get('available'):
+            return ''
+        auth = v.get('authoritative') or {}
+        auth_total = auth.get('total', 'unknown')
+        auth_done = auth.get('done', 'unknown')
+        divergence_note = ''
+        if not v.get('consistent', True):
+            tree = v.get('tree') or {}
+            divergence_note = (
+                f'\n⚠ Divergence detected: tree reports done={tree.get("done", "?")} '
+                f'vs authoritative done={auth_done}.'
+            )
+        return (
+            f'\n### Task Count Census (authoritative — from get_statuses)\n'
+            f'Total: {auth_total}, Done: {auth_done}{divergence_note}\n'
+        )
 
     def _build_summary_nonce_section(self) -> str:
         """Return the Per-Cycle Summary Nonce payload section with a fresh STAGE1-prefixed nonce.
