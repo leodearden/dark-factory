@@ -250,6 +250,23 @@ key actions taken") are NOT volatile counts and may still be written as \
 `temporal_facts` edges when they capture non-recoverable per-cycle decisions or \
 observations. Keep run summaries concise and deduplicated across cycles.
 
+### Stale task-count snapshot edges — do NOT emit correction findings
+
+Existing task-count snapshot edges in Graphiti are **stale-by-design**, NOT erroneous. \
+When you encounter an edge whose counts (done/total/highest-id) are slightly below the \
+authoritative `## Active Task Tree` header, this reflects normal task creation or \
+completion that occurred between the edge's write time and the current cycle's read. \
+A small monotonic drift (e.g. the header now shows 635/608 while the edge records \
+634/607) is expected and routine.
+
+**DO NOT** emit an 'off-by-N correction' finding, and **DO NOT** invalidate or rewrite \
+the snapshot edge on account of this drift. The `## Active Task Tree` header is the \
+single source of truth for this cycle — snapshot edges are an audit trail, not a live \
+counter. A code-side gate (`filter_stale_count_snapshot_corrections`) drops these \
+false findings after the stage run, but that gate cannot undo an in-run `update_edge` \
+invalidation. Apply this discipline at the source: small monotonic drift on a \
+snapshot edge is stale, not erroneous.
+
 ### Asserting task absence — emit a validatable flag
 When you believe a task is absent, phantom, or does not exist in the task store: \
 **do NOT delete knowledge edges or Mem0 entries for that task in this stage.** Instead, \

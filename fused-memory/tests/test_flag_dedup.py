@@ -5706,3 +5706,302 @@ class TestFilterTerminalMetadataFlags:
             'task_metadata_stale alias must also be dropped for cancelled tasks'
         )
 
+
+# ---------------------------------------------------------------------------
+# task-1786 step-1 — filter_stale_count_snapshot_corrections
+# ---------------------------------------------------------------------------
+
+
+class TestFilterStaleCountSnapshotCorrections:
+    """Tests for filter_stale_count_snapshot_corrections(flags) -> list[dict].
+
+    The function drops flags that represent false 'off-by-N correction' findings
+    on stale-by-design task-count snapshot edges.  A flag is dropped iff ALL THREE
+    conditions hold:
+      (a) correction language in description+suggested_action
+      (b) ≥2 count-groups of arity ≥2 extractable from the combined text
+      (c) first two groups (current, proposed) have equal arity, proposed ≥ current
+          componentwise, and max componentwise delta ≤ STALE_SNAPSHOT_CADENCE_DELTA
+
+    All other flags are returned unchanged (fail-open).
+
+    Tests are RED until step-2 adds the symbols to flag_dedup.py.
+    """
+
+    def _make_flag(self, description: str, suggested_action: str = '') -> dict:
+        return {
+            'task_id': '999',
+            'flag_type': 'count_snapshot_mismatch',
+            'description': description,
+            'suggested_action': suggested_action,
+        }
+
+    def test_drop_status_worded_incident(self):
+        """(DROP) Status-worded incident: 634 done / 607 total → 635 done / 608 total, delta=1."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description=(
+                'snapshot edge reports 634 done / 607 total but is off by 1; '
+                'should be 635 done / 608 total'
+            ),
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [], (
+            'Status-worded incident (634/607 → 635/608, delta=1) must be dropped '
+            f'but filter returned {result!r}'
+        )
+
+    def test_drop_bare_incident_with_stray_digit(self):
+        """(DROP) Bare incident: 634/607 → 635/608, stray '1' in 'off by 1' must not confuse parser."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description=(
+                'task count snapshot 634/607 is off by 1; should be 635/608'
+            ),
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [], (
+            "Bare incident (634/607 → 635/608) with stray '1' in 'off by 1' must be "
+            f'dropped but filter returned {result!r}'
+        )
+
+    def test_drop_correction_language_in_suggested_action(self):
+        """(DROP) Correction language in suggested_action (not description) triggers the gate."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='snapshot edge shows 634/607',
+            suggested_action='should be 635/608 to match current task tree',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [], (
+            'Correction language in suggested_action with delta=1 snapshot must be dropped '
+            f'but filter returned {result!r}'
+        )
+
+    def test_keep_large_delta(self):
+        """(KEEP) Large delta (634→800, delta=166) is not a stale snapshot — preserve as genuine."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='task count snapshot 634/607 is incorrect; should be 800/607',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Large delta (634→800) must be KEPT as a genuine integrity finding '
+            f'but filter returned {result!r}'
+        )
+
+    def test_keep_count_decrease(self):
+        """(KEEP) Count DECREASE (635→634) is a genuine integrity finding — preserve."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='task count snapshot 635/608 is wrong; should be 634/607',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Count DECREASE (635→634) must be KEPT (not stale drift, could be real error) '
+            f'but filter returned {result!r}'
+        )
+
+    def test_keep_arity_mismatch_single_proposed(self):
+        """(KEEP) Arity mismatch: current has arity-2 but proposed is single-number — fail-open."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='task count snapshot 634/607 is off by 1; should be 635',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Arity mismatch (634/607 → 635 alone) must be KEPT (fail-open) '
+            f'but filter returned {result!r}'
+        )
+
+    def test_keep_no_correction_language(self):
+        """(KEEP) No correction language — both snapshot groups present but no 'should be'."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='snapshot 634/607; next cycle shows 635/608',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            "No correction language → must be KEPT regardless of snapshots present "
+            f'but filter returned {result!r}'
+        )
+
+    def test_keep_no_arity2_snapshot(self):
+        """(KEEP) Single-number 'snapshot' — no arity≥2 count group extractable."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='task 634 is off by 1, should be 635',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Single-number count (no arity≥2 group) must be KEPT (fail-open) '
+            f'but filter returned {result!r}'
+        )
+
+    def test_keep_benign_is_correct(self):
+        """(KEEP) 'is correct' must NOT trigger the gate (it is not a correction finding)."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='snapshot 1505 done / 148 cancelled / 1653 total is correct',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            "'is correct' must not be treated as correction language; flag must be KEPT "
+            f'but filter returned {result!r}'
+        )
+
+    def test_keep_incorrect_substring_word_boundary(self):
+        """(KEEP / borderline) 'incorrect' is a trigger, but no arity≥2 snapshot present here."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        # 'incorrect' triggers language gate; but there is no arity≥2 snapshot → KEEP (fail-open)
+        flag = self._make_flag(
+            description='the edge count is incorrect',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            "'incorrect' triggers language gate but no snapshot pair → KEEP (fail-open) "
+            f'but filter returned {result!r}'
+        )
+
+    def test_drop_at_boundary_delta_equals_constant(self):
+        """(DROP) Delta exactly == STALE_SNAPSHOT_CADENCE_DELTA — must be dropped."""
+        from fused_memory.reconciliation.flag_dedup import (
+            STALE_SNAPSHOT_CADENCE_DELTA,
+            filter_stale_count_snapshot_corrections,
+        )
+        delta = STALE_SNAPSHOT_CADENCE_DELTA
+        current_a, current_b = 634, 607
+        proposed_a, proposed_b = current_a + delta, current_b + delta
+        flag = self._make_flag(
+            description=(
+                f'task count snapshot {current_a}/{current_b} is off by {delta}; '
+                f'should be {proposed_a}/{proposed_b}'
+            ),
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [], (
+            f'Delta == STALE_SNAPSHOT_CADENCE_DELTA ({delta}) must be dropped '
+            f'but filter returned {result!r}'
+        )
+
+    def test_keep_at_delta_above_constant(self):
+        """(KEEP) Delta == STALE_SNAPSHOT_CADENCE_DELTA + 100 — must be kept."""
+        from fused_memory.reconciliation.flag_dedup import (
+            STALE_SNAPSHOT_CADENCE_DELTA,
+            filter_stale_count_snapshot_corrections,
+        )
+        delta = STALE_SNAPSHOT_CADENCE_DELTA + 100
+        current_a, current_b = 634, 607
+        proposed_a, proposed_b = current_a + delta, current_b + delta
+        flag = self._make_flag(
+            description=(
+                f'task count snapshot {current_a}/{current_b} is off by {delta}; '
+                f'should be {proposed_a}/{proposed_b}'
+            ),
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            f'Delta == STALE_SNAPSHOT_CADENCE_DELTA + 100 ({delta}) must be KEPT '
+            f'but filter returned {result!r}'
+        )
+
+    def test_keep_reversed_order_phrasing(self):
+        """(KEEP) Corrected-value-first phrasing — proposed comes before current in text.
+
+        When the text reads 'should be 635/608 ... currently 634/607', groups[0] is the
+        proposed value and groups[1] is the current value, so the delta computation
+        (proposed - current) yields negative values.  The monotonic check rejects this
+        and keeps the flag (fail-open).  This test pins the positional contract so any
+        future re-ordering of group selection is caught.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='should be 635/608 but currently snapshot reads 634/607 — off by 1',
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Reversed-order phrasing (proposed before current) yields negative deltas '
+            'and must be KEPT (fail-open); '
+            f'filter returned {result!r}'
+        )
+
+    def test_keep_more_than_two_count_groups(self):
+        """(KEEP) Three or more arity-≥2 count-groups → bail to KEEP (ambiguous text).
+
+        A text with three or more count-pairs cannot be safely resolved via positional
+        current/proposed assignment — groups[0]/groups[1] might be an incidental near-
+        equal pair while the real discrepancy appears later.  The filter must KEEP the
+        flag rather than risk a false DROP.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        # Three count-groups: 634/607 (near-equal to 635/608) then 700/500 (large gap).
+        # Positional logic would compare 634/607 vs 635/608 (delta=1, would drop),
+        # but the 700/500 group hints at a real discrepancy — flag must be KEPT.
+        flag = self._make_flag(
+            description=(
+                'snapshot edge reports 634/607; should be 635/608; '
+                'however the authoritative tree actually shows 700/500 — investigate'
+            ),
+        )
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Three arity-≥2 count-groups must cause a KEEP (bail-to-KEEP for ambiguous text); '
+            f'filter returned {result!r}'
+        )
+
+    def test_non_matching_flags_pass_through_unchanged(self):
+        """Unrelated flags (not count_snapshot_mismatch) are returned unchanged."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        benign = {'task_id': '42', 'flag_type': 'missing_deliverable', 'description': 'no deliverable'}
+        result = filter_stale_count_snapshot_corrections([benign])
+        assert result == [benign], (
+            'Non-count-snapshot flag must pass through unchanged '
+            f'but filter returned {result!r}'
+        )
+
+    def test_empty_list_returns_empty(self):
+        """Empty input returns empty output."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        result = filter_stale_count_snapshot_corrections([])
+        assert result == []
+
+    def test_keep_collapsed_single_distinct_group(self):
+        """(KEEP) Proposed value restated in both description and suggested_action collapses
+        to one distinct group after dedup — must KEEP (fail-open) without raising IndexError.
+
+        When both description and suggested_action mention *only* the proposed value
+        (e.g. 'should be 635/608' appears in both fields), raw extraction yields
+        groups=[(635,608),(635,608)] (len 2, so the len(groups)<2 early-out does NOT fire).
+        After deduplication, unique_groups=[(635,608)] has len 1.  The pre-fix guard
+        ``if len(unique_groups) > 2`` does not trigger, so execution falls through to
+        ``current, proposed = unique_groups[0], unique_groups[1]`` → IndexError, which
+        would abort the entire Stage 1 run.  Post-fix: ``if len(unique_groups) != 2``
+        catches len==1 and bails to KEEP (fail-open).
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_stale_count_snapshot_corrections
+
+        flag = self._make_flag(
+            description='The snapshot should be 635/608; currently incorrect.',
+            suggested_action='Set it to 635/608.',
+        )
+        # Must not raise AND must return the flag unchanged (KEEP, fail-open)
+        result = filter_stale_count_snapshot_corrections([flag])
+        assert result == [flag], (
+            'Collapsed-to-one-distinct-group case must be KEPT (fail-open), not raise IndexError; '
+            f'filter returned {result!r}'
+        )
+
