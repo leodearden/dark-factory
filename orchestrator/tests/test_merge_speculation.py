@@ -52,10 +52,15 @@ from _orch_helpers import make_placeholder_future, pydantic_spec  # noqa: F401
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run  # noqa: F401
 from orchestrator.merge_queue import (  # noqa: F401
+    InflightEntry,
+    InflightVerifyResult,
+    MergeOutcome,
+    MergeRequest,
     SpeculativeMergeWorker,
     SpeculativeItem,
     _acquire_warm_verify_worktree,
     _maybe_schedule_shadow_compare,
+    _maybe_run_drift_check,
     _run_cold_shadow_verify,
     _submit_shadow_divergence_escalation,
 )
@@ -982,3 +987,321 @@ class TestSpecLaneDivergenceAlarm:
         # Unparseable warm output must trigger the fail-closed alarm
         # (κ invariant 6: never a silent pass)
         escalation_spy.submit.assert_called_once()
+
+
+# ===========================================================================
+# Step-19: RED — B9 capstone integration test
+# ===========================================================================
+
+
+def _make_b9_worker(tmp_path: Path) -> tuple[SpeculativeMergeWorker, MagicMock]:
+    """Build a SpeculativeMergeWorker with a spy git_ops for B9 integration tests.
+
+    The git_ops mock is pre-wired with:
+    - acquire_spec_lane: side_effect list of ``(fake_lane, True)`` tuples so
+      sequential calls return distinct lanes.
+    - release_spec_lane / cleanup_merge_worktree: AsyncMock spies.
+    - advance_main: returns 'advanced' immediately.
+
+    Returns ``(worker, mock_git_ops)`` so tests can inspect call counts.
+    """
+    mock_git_ops = MagicMock()
+    mock_git_ops.project_root = tmp_path
+
+    fake_lane_0 = tmp_path / '_spec-0'
+    fake_lane_1 = tmp_path / '_spec-1'
+    for lane in (fake_lane_0, fake_lane_1):
+        lane.mkdir(parents=True, exist_ok=True)
+
+    mock_git_ops.acquire_spec_lane = AsyncMock(
+        side_effect=[(fake_lane_0, True), (fake_lane_1, True)],
+    )
+    mock_git_ops.release_spec_lane = AsyncMock()
+    mock_git_ops.cleanup_merge_worktree = AsyncMock()
+    mock_git_ops.advance_main = AsyncMock(return_value='advanced')
+
+    worker = SpeculativeMergeWorker(mock_git_ops, asyncio.Queue())
+    worker._host_allocator = None  # skip lease release in finally
+    worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast poll for tests
+
+    return worker, mock_git_ops
+
+
+def _build_entry(
+    item: SpeculativeItem,
+    vr: InflightVerifyResult,
+    *,
+    merge_wt: Path,
+) -> InflightEntry:
+    """Wrap *vr* in an InflightEntry whose verify_task resolves to it immediately."""
+
+    async def _resolved() -> InflightVerifyResult:
+        return vr
+
+    return InflightEntry(
+        item=item,
+        lease=None,
+        verify_task=asyncio.ensure_future(_resolved()),
+        merge_wt=merge_wt,
+        was_speculative=True,
+        phase='verifying',
+    )
+
+
+@pytest.mark.asyncio
+class TestB9CapstoneIntegration:
+    """B9 capstone: K>1 spec verifies WARM + distinct lanes + serial CAS.
+
+    RED before step 20:
+    - ``InflightVerifyResult`` has no ``spec_warm`` field.
+    - ``_finalize_inflight`` calls ``cleanup_merge_worktree`` on the spec lane
+      path instead of ``release_spec_lane``; the lane is deleted rather than
+      retained for reuse.
+
+    After step 20 (GREEN):
+    - ``spec_warm`` threaded through ``InflightVerifyResult``.
+    - ``_finalize_inflight`` routes warm spec lanes to ``release_spec_lane``
+      (retaining target/) and leaves non-spec paths byte-identical.
+    """
+
+    async def test_spec_lanes_released_not_cleaned_after_pass(self, tmp_path: Path):
+        """After two spec verifies pass + finalize, release_spec_lane called for each.
+
+        RED: ``_finalize_inflight`` unconditionally calls ``cleanup_merge_worktree``
+        (which removes the lane from disk).  ``release_spec_lane`` is never called →
+        assertion fails.
+
+        GREEN (step 20): ``spec_warm=True`` threaded through ``InflightVerifyResult``;
+        ``_finalize_inflight`` routes to ``release_spec_lane(merge_wt, warm=True)``
+        so the lane is retained (target/ warmth preserved for the next candidate).
+        """
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            git=_make_spec_git_config(on=True),
+        )
+        worker, mock_git_ops = _make_b9_worker(tmp_path)
+
+        fake_lane_0 = tmp_path / '_spec-0'
+        fake_lane_1 = tmp_path / '_spec-1'
+
+        item0 = _make_spec_item(tmp_path, cfg, speculative=True)
+        item0.request.task_id = 'task-b9-0'
+        item1 = _make_spec_item(tmp_path, cfg, speculative=True)
+        item1.request.task_id = 'task-b9-1'
+
+        fake_vr = VerifyResult(
+            passed=True,
+            test_output='        PASS [0.01s] reify-spec test_b9\n',
+            lint_output='', type_output='', summary='',
+        )
+
+        async def _mock_verify(*args, **kwargs):
+            on_result = kwargs.get('on_result')
+            if on_result is not None:
+                on_result(fake_vr)
+            return None
+
+        lease = _make_local_lease()
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', side_effect=_mock_verify):
+            vr0 = await worker._run_inflight_verify(item0, lease)
+            vr1 = await worker._run_inflight_verify(item1, lease)
+
+        # Verify the acquire routing produced distinct lanes
+        assert vr0.merge_wt == fake_lane_0, (
+            f'Expected vr0.merge_wt={fake_lane_0!r}, got {vr0.merge_wt!r}; '
+            'acquire_spec_lane must return distinct lanes for each spec item'
+        )
+        assert vr1.merge_wt == fake_lane_1, (
+            f'Expected vr1.merge_wt={fake_lane_1!r}, got {vr1.merge_wt!r}'
+        )
+
+        # Build InflightEntry wrappers and finalize in submission order
+        entry0 = _build_entry(item0, vr0, merge_wt=fake_lane_0)
+        entry1 = _build_entry(item1, vr1, merge_wt=fake_lane_1)
+
+        done_outcome = MergeOutcome('done', merge_sha='newsha0000000000000a')
+        with (
+            patch(
+                'orchestrator.merge_queue._finalize_advanced_merge',
+                new=AsyncMock(return_value=done_outcome),
+            ),
+            patch('orchestrator.merge_queue._maybe_schedule_shadow_compare', new=AsyncMock()),
+            patch('orchestrator.merge_queue._maybe_run_drift_check', new=AsyncMock()),
+        ):
+            await worker._finalize_inflight(entry0)
+            await worker._finalize_inflight(entry1)
+
+        # RED: release_spec_lane not called (cleanup_merge_worktree called instead)
+        # GREEN: release_spec_lane called once per warm spec lane
+        assert mock_git_ops.release_spec_lane.call_count == 2, (
+            f'Expected release_spec_lane called 2 times (warm lane retained); '
+            f'got {mock_git_ops.release_spec_lane.call_count}. '
+            'After step 20, _finalize_inflight must route spec lanes to '
+            'release_spec_lane rather than cleanup_merge_worktree.'
+        )
+        # cleanup_merge_worktree must NOT have been called on spec lane paths
+        cleaned = [
+            c.args[0]
+            for c in mock_git_ops.cleanup_merge_worktree.call_args_list
+        ]
+        assert fake_lane_0 not in cleaned, (
+            f'cleanup_merge_worktree was called on spec lane {fake_lane_0} — '
+            'step 20 must route warm spec lanes to release_spec_lane instead'
+        )
+        assert fake_lane_1 not in cleaned, (
+            f'cleanup_merge_worktree was called on spec lane {fake_lane_1} — '
+            'step 20 must route warm spec lanes to release_spec_lane instead'
+        )
+
+    async def test_advance_main_submission_order_regression_guard(self, tmp_path: Path):
+        """advance_main called in submission order — CAS serial ordering preserved at K>1.
+
+        Regression guard: Lever C's single-Verifier serial finalize contract must
+        hold even when two speculative items verified warm concurrently.  Finalizing
+        entry0 then entry1 must call advance_main for item0 (expected_main=base_sha_0)
+        before item1 (expected_main=base_sha_1).
+        """
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            git=_make_spec_git_config(on=True),
+        )
+        worker, mock_git_ops = _make_b9_worker(tmp_path)
+
+        # Give items distinct base_shas so we can verify ordering
+        item0 = _make_spec_item(tmp_path, cfg, speculative=True)
+        item0.request.task_id = 'task-b9-order-0'
+        # Override base_sha to distinguish the two advance_main calls
+        from dataclasses import replace as _replace
+        item0 = _replace(item0, base_sha='aaaa000000000000aaaa')
+
+        item1 = _make_spec_item(tmp_path, cfg, speculative=True)
+        item1.request.task_id = 'task-b9-order-1'
+        item1 = _replace(item1, base_sha='bbbb000000000000bbbb')
+
+        fake_vr = VerifyResult(
+            passed=True,
+            test_output='        PASS [0.01s] reify-spec test_order\n',
+            lint_output='', type_output='', summary='',
+        )
+
+        async def _mock_verify(*args, **kwargs):
+            on_result = kwargs.get('on_result')
+            if on_result is not None:
+                on_result(fake_vr)
+            return None
+
+        lease = _make_local_lease()
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', side_effect=_mock_verify):
+            vr0 = await worker._run_inflight_verify(item0, lease)
+            vr1 = await worker._run_inflight_verify(item1, lease)
+
+        entry0 = _build_entry(item0, vr0, merge_wt=tmp_path / '_spec-0')
+        entry1 = _build_entry(item1, vr1, merge_wt=tmp_path / '_spec-1')
+
+        done_outcome = MergeOutcome('done', merge_sha='newsha0000000000000a')
+        with (
+            patch(
+                'orchestrator.merge_queue._finalize_advanced_merge',
+                new=AsyncMock(return_value=done_outcome),
+            ),
+            patch('orchestrator.merge_queue._maybe_schedule_shadow_compare', new=AsyncMock()),
+            patch('orchestrator.merge_queue._maybe_run_drift_check', new=AsyncMock()),
+        ):
+            # Submission order: entry0 first, entry1 second
+            await worker._finalize_inflight(entry0)
+            await worker._finalize_inflight(entry1)
+
+        advance_calls = mock_git_ops.advance_main.call_args_list
+        assert len(advance_calls) == 2, (
+            f'Expected 2 advance_main calls, got {len(advance_calls)}'
+        )
+        # First call must use item0's base_sha (submission order preserved)
+        expected_main_0 = advance_calls[0].kwargs.get(
+            'expected_main', advance_calls[0].args[4] if len(advance_calls[0].args) > 4 else None
+        )
+        # advance_main(current_sha, merge_wt, branch=..., max_attempts=..., expected_main=...)
+        # Use kwargs since it's called as a keyword argument
+        call0_kwargs = advance_calls[0].kwargs
+        call1_kwargs = advance_calls[1].kwargs
+        assert call0_kwargs.get('expected_main') == 'aaaa000000000000aaaa', (
+            f"First advance_main call must use item0.base_sha='aaaa000000000000aaaa'; "
+            f"got expected_main={call0_kwargs.get('expected_main')!r}"
+        )
+        assert call1_kwargs.get('expected_main') == 'bbbb000000000000bbbb', (
+            f"Second advance_main call must use item1.base_sha='bbbb000000000000bbbb'; "
+            f"got expected_main={call1_kwargs.get('expected_main')!r}"
+        )
+
+    async def test_warm_results_non_empty_feed_shadow_via_finalize(self, tmp_path: Path):
+        """_maybe_schedule_shadow_compare receives non-empty warm_results via finalize.
+
+        Confirms that the spec-lane warm verify populates warm_results (step 16
+        wired _is_warm_path for spec lanes) AND that _finalize_inflight threads
+        those results through to _maybe_schedule_shadow_compare (already wired
+        at merge_queue.py:8139) — completing the end-to-end shadow valve path
+        for speculative verifies.
+        """
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            git=_make_spec_git_config(
+                on=True,
+                warm_verify_shadow_compare=True,
+                warm_verify_shadow_compare_every_n_merges=1,
+            ),
+        )
+        worker, mock_git_ops = _make_b9_worker(tmp_path)
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        item.request.task_id = 'task-b9-shadow'
+
+        fake_vr = VerifyResult(
+            passed=True,
+            test_output='        PASS [0.01s] reify-spec test_b9_shadow\n',
+            lint_output='', type_output='', summary='',
+        )
+
+        async def _mock_verify(*args, **kwargs):
+            on_result = kwargs.get('on_result')
+            if on_result is not None:
+                on_result(fake_vr)
+            return None
+
+        lease = _make_local_lease()
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', side_effect=_mock_verify):
+            vr = await worker._run_inflight_verify(item, lease)
+
+        # warm_results must be non-empty (step 16 wired _is_warm_path for spec lanes)
+        assert vr.warm_results, (
+            f'warm_results must be non-empty for spec-lane warm verify; '
+            f'got {vr.warm_results!r}'
+        )
+
+        # Now confirm that _finalize_inflight threads warm_results to shadow valve
+        shadow_compare_spy = AsyncMock()
+        entry = _build_entry(item, vr, merge_wt=tmp_path / '_spec-0')
+
+        done_outcome = MergeOutcome('done', merge_sha='newsha0000000000000a')
+        with (
+            patch(
+                'orchestrator.merge_queue._finalize_advanced_merge',
+                new=AsyncMock(return_value=done_outcome),
+            ),
+            patch(
+                'orchestrator.merge_queue._maybe_schedule_shadow_compare',
+                new=shadow_compare_spy,
+            ),
+            patch('orchestrator.merge_queue._maybe_run_drift_check', new=AsyncMock()),
+        ):
+            await worker._finalize_inflight(entry)
+
+        # Shadow compare must have been called (outcome='done' triggers it)
+        shadow_compare_spy.assert_called_once()
+        # And the warm_results kwarg must match the non-empty results from the spec-lane verify
+        call_kwargs = shadow_compare_spy.call_args.kwargs
+        assert call_kwargs.get('warm_results'), (
+            f'_maybe_schedule_shadow_compare must receive non-empty warm_results; '
+            f'got warm_results={call_kwargs.get("warm_results")!r}'
+        )
