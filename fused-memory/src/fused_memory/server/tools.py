@@ -2707,8 +2707,9 @@ def create_mcp_server(
         project_root: str,
         prompt: str | None = None,
         metadata: str | dict | None = None,
-        append: bool = False,
+        append: bool | None = None,
         tag: str | None = None,
+        metadata_mode: str | None = None,
         title: str | None = None,
         description: str | None = None,
         details: str | None = None,
@@ -2731,8 +2732,25 @@ def create_mcp_server(
             id: Task ID to update
             project_root: Absolute path to project root
             prompt: DEPRECATED — pass structured fields instead.
-            metadata: JSON metadata to merge (object or JSON string)
-            append: Append instead of full update (applies to details + metadata)
+            metadata: JSON metadata (object or JSON string). Default behavior
+                is a shallow last-write-wins merge: ``{**existing, **incoming}``.
+                Omitted keys from ``metadata`` are preserved; every supplied key
+                (scalar or list) overwrites wholesale. Use ``metadata_mode`` to
+                change this behavior.
+            metadata_mode: Controls how ``metadata`` is merged with the existing
+                blob. One of:
+                - ``'merge'`` (default when omitted) — shallow last-write-wins.
+                  Omitted keys preserved; supplied keys overwrite wholesale.
+                - ``'additive'`` — recursive list union+dedup, scalar/type-collision
+                  OLD-wins. Use for list-append callers (dry_run_proposals, etc.).
+                - ``'replace'`` — whole-blob overwrite. Bypasses the corrupt-blob
+                  guard; the sanctioned repair path.
+            append: DEPRECATED shim. ``True`` → ``'additive'``, ``False`` →
+                ``'replace'``. **Also the only knob that governs ``details``/
+                ``prompt`` append** — ``metadata_mode`` does NOT affect the
+                details path, so callers that need details-append must still
+                pass ``append=True`` even after migrating metadata writes to
+                ``metadata_mode``. Resolution is single-sourced in the backend.
             tag: Tag context (optional)
             title: New title (overwrites)
             description: New description (overwrites)
@@ -2760,6 +2778,7 @@ def create_mcp_server(
                 prompt=prompt,
                 metadata=metadata,
                 append=append,
+                metadata_mode=metadata_mode,
                 tag=tag,
                 title=title,
                 description=description,

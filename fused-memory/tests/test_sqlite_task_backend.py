@@ -18,6 +18,7 @@ from fused_memory.backends.sqlite_task_backend import (
     _normalize_legacy_memory_hints_value,
     _parse_qualified_dep,
     _parse_task_id,
+    _resolve_metadata_mode,
 )
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import TaskmasterConfig
@@ -317,9 +318,11 @@ async def test_update_task_overwrites_metadata_without_append(backend, project_r
         project_root=project_root, title='x',
         metadata=json.dumps({'prd': 'old.md'}),
     )
+    # Default is now shallow-merge; use explicit replace to overwrite wholesale.
     await backend.update_task(
         '1', project_root=project_root,
         metadata=json.dumps({'prd': 'new.md'}),
+        metadata_mode='replace',
     )
     one = await backend.get_task('1', project_root=project_root)
     assert one['metadata'] == {'prd': 'new.md'}
@@ -330,14 +333,14 @@ async def test_update_task_overwrites_metadata_without_append(backend, project_r
 
 def test_merge_metadata_list_collision_appends():
     """(a) Top-level list collision under append=True concatenates."""
-    result = json.loads(_merge_metadata('{"tags":["a"]}', '{"tags":["b"]}', append=True))
+    result = json.loads(_merge_metadata('{"tags":["a"]}', '{"tags":["b"]}', mode='additive'))
     assert result == {"tags": ["a", "b"]}
 
 
 def test_merge_metadata_list_collision_dedupes_stable_order():
     """(b) Duplicate items are deduped in stable old-then-new order."""
     result = json.loads(
-        _merge_metadata('{"tags":["a","b"]}', '{"tags":["b","c"]}', append=True)
+        _merge_metadata('{"tags":["a","b"]}', '{"tags":["b","c"]}', mode='additive')
     )
     assert result == {"tags": ["a", "b", "c"]}
 
@@ -345,7 +348,7 @@ def test_merge_metadata_list_collision_dedupes_stable_order():
 def test_merge_metadata_scalar_collision_old_wins_under_append():
     """(c) Regression: scalar collision still resolves OLD-wins under append=True."""
     result = json.loads(
-        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', append=True)
+        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', mode='additive')
     )
     assert result == {"prd": "old.md"}
 
@@ -353,7 +356,7 @@ def test_merge_metadata_scalar_collision_old_wins_under_append():
 def test_merge_metadata_append_false_replaces_verbatim():
     """(d) Regression: append=False replaces the metadata verbatim."""
     result = json.loads(
-        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', append=False)
+        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', mode='replace')
     )
     assert result == {"prd": "new.md"}
 
@@ -365,7 +368,7 @@ def test_merge_metadata_nested_dict_lists_union():
     """(a) memory_hints dict shape: inner list values union additively."""
     old_raw = '{"memory_hints":{"entities":["A"],"queries":["q1"]}}'
     new_raw = '{"memory_hints":{"entities":["B"],"queries":["q2"]}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result == {"memory_hints": {"entities": ["A", "B"], "queries": ["q1", "q2"]}}
 
 
@@ -373,7 +376,7 @@ def test_merge_metadata_nested_dict_lists_dedup():
     """(b) Overlap within inner lists is deduped in stable order."""
     old_raw = '{"memory_hints":{"entities":["A","B"],"queries":[]}}'
     new_raw = '{"memory_hints":{"entities":["B","C"],"queries":[]}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result == {"memory_hints": {"entities": ["A", "B", "C"], "queries": []}}
 
 
@@ -381,7 +384,7 @@ def test_merge_metadata_nested_scalar_collision_old_wins():
     """(c) Nested scalar collision resolves OLD-wins."""
     old_raw = '{"audit":{"created_by":"x"}}'
     new_raw = '{"audit":{"created_by":"y","updated_by":"z"}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result == {"audit": {"created_by": "x", "updated_by": "z"}}
 
 
@@ -435,7 +438,7 @@ def test_merge_metadata_list_of_dicts_concatenates_without_dedup():
     """Unhashable list items (dicts) fall back to plain concatenation — no dedup."""
     old_raw = '{"x":[{"k":1}]}'
     new_raw = '{"x":[{"k":1}]}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     # Both dicts present; unhashable items are NOT deduped (plain concat).
     assert result == {"x": [{"k": 1}, {"k": 1}]}
 
@@ -454,7 +457,7 @@ def test_merge_metadata_type_mismatch_old_wins_for_non_hint_keys():
     """
     old_raw = '{"x":[1,2]}'
     new_raw = '{"x":{"a":1}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result["x"] == [1, 2]
 
 
@@ -480,19 +483,19 @@ def test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict():
     # Primary case: old=legacy list, new=canonical dict
     old_raw = '{"memory_hints":[{"entity":"E1","query":"q1"},{"entity":"E2","query":"q2"}]}'
     new_raw = '{"memory_hints":{"entities":["E3"],"queries":["q3"]}}'
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     assert result == {"memory_hints": {"entities": ["E1", "E2", "E3"], "queries": ["q1", "q2", "q3"]}}
 
     # Symmetric case 1: old=canonical dict, new=legacy list → union
     old_raw_sym = '{"memory_hints":{"entities":["E1"],"queries":["q1"]}}'
     new_raw_sym = '{"memory_hints":[{"entity":"E2","query":"q2"}]}'
-    result_sym = json.loads(_merge_metadata(old_raw_sym, new_raw_sym, append=True))
+    result_sym = json.loads(_merge_metadata(old_raw_sym, new_raw_sym, mode='additive'))
     assert result_sym == {"memory_hints": {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}}
 
     # Symmetric case 2: old=legacy list, new=legacy list → both coerced, then unioned
     old_raw_ll = '{"memory_hints":[{"entity":"E1","query":"q1"}]}'
     new_raw_ll = '{"memory_hints":[{"entity":"E2","query":"q2"}]}'
-    result_ll = json.loads(_merge_metadata(old_raw_ll, new_raw_ll, append=True))
+    result_ll = json.loads(_merge_metadata(old_raw_ll, new_raw_ll, mode='additive'))
     assert result_ll == {"memory_hints": {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}}
 
 
@@ -507,7 +510,7 @@ def test_merge_metadata_legacy_hints_not_normalized_on_one_sided_write():
     """
     old_raw = '{"tag":"old","memory_hints":[{"entity":"E1","query":"q1"}]}'
     new_raw = '{"tag":"new"}'  # does not carry memory_hints
-    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    result = json.loads(_merge_metadata(old_raw, new_raw, mode='additive'))
     # scalar collision on "tag" → OLD wins
     assert result["tag"] == "old"
     # memory_hints was NOT in the incoming write, so normalization does not fire;
@@ -1760,7 +1763,7 @@ def test_merge_metadata_refuses_to_clobber_corrupt_existing_blob():
     # (a) Main assertion: corrupt existing + append=True must raise TaskmasterError.
     with pytest.raises(TaskmasterError) as exc:
         _merge_metadata(
-            _CORRUPT_BLOB, incoming, append=True,
+            _CORRUPT_BLOB, incoming, mode='additive',
             project_root='/p', tag='master', task_id=1,
         )
     assert exc.value.raw == _CORRUPT_BLOB, (
@@ -1770,11 +1773,11 @@ def test_merge_metadata_refuses_to_clobber_corrupt_existing_blob():
 
     # (b) Escape hatch: append=False must return incoming (explicit replace —
     #     the sanctioned path to repair a corrupt row).
-    result_replace = _merge_metadata(_CORRUPT_BLOB, incoming, append=False)
+    result_replace = _merge_metadata(_CORRUPT_BLOB, incoming, mode='replace')
     assert result_replace == incoming
 
     # (c) No-op escape hatch: existing_raw=None + append=True returns incoming.
-    result_none = _merge_metadata(None, incoming, append=True)
+    result_none = _merge_metadata(None, incoming, mode='additive')
     assert result_none == incoming
 
 
@@ -1988,3 +1991,272 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
         f'read+write paths on same key); got {len(warn_records)}: '
         f'{[r.message for r in warn_records]}'
     )
+
+
+# ── _resolve_metadata_mode (step-1 RED / step-2 GREEN) ──────────────────────
+
+
+@pytest.mark.parametrize(
+    'metadata_mode, append, expected',
+    [
+        # (a) explicit metadata_mode returned verbatim regardless of append
+        ('merge',    None,  'merge'),
+        ('additive', None,  'additive'),
+        ('replace',  None,  'replace'),
+        # (b) metadata_mode=None + append=True -> 'additive'
+        (None, True,  'additive'),
+        # (c) metadata_mode=None + append=False -> 'replace'
+        (None, False, 'replace'),
+        # (d) metadata_mode=None + append=None -> 'merge' (new default)
+        (None, None,  'merge'),
+        # (f) explicit metadata_mode wins over conflicting append (distinct combos)
+        ('merge',    True,  'merge'),
+        ('additive', False, 'additive'),
+        ('replace',  True,  'replace'),
+    ],
+)
+def test_resolve_metadata_mode_mapping(metadata_mode, append, expected):
+    """_resolve_metadata_mode returns the correct mode for all precedence cases."""
+    result = _resolve_metadata_mode(metadata_mode, append)
+    assert result == expected, (
+        f'_resolve_metadata_mode({metadata_mode!r}, {append!r}) -> '
+        f'{result!r}, expected {expected!r}'
+    )
+
+
+def test_resolve_metadata_mode_invalid_raises():
+    """An invalid metadata_mode raises TaskmasterError(TASKMASTER_TOOL_ERROR)."""
+    with pytest.raises(TaskmasterError) as exc:
+        _resolve_metadata_mode('bogus', None)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+
+
+# ── _merge_metadata mode= API (step-3 RED / step-4 GREEN) ───────────────────
+
+
+def test_merge_metadata_mode_merge_shallow_last_write_wins():
+    """mode='merge': sibling key preserved, scalar collision overwrites (not OLD-wins),
+    list collision overwrites wholesale (can shrink)."""
+    existing = json.dumps({'_causation_id': 'abc', 'branch': 'old', 'files': [1, 2, 3]})
+    incoming = json.dumps({'branch': 'new', 'files': [4]})
+    result = json.loads(_merge_metadata(existing, incoming, mode='merge'))
+    # Sibling preserved
+    assert result['_causation_id'] == 'abc', f'sibling clobbered: {result}'
+    # Scalar overwritten (not old-wins)
+    assert result['branch'] == 'new', f'scalar not updated: {result}'
+    # List overwritten wholesale (can shrink)
+    assert result['files'] == [4], f'list not overwritten: {result}'
+
+
+def test_merge_metadata_mode_merge_corrupt_existing_raises():
+    """mode='merge' with a corrupt existing blob raises TaskmasterError and
+    exc.value.raw == the corrupt bytes."""
+    incoming = json.dumps({'note': 'x'})
+    with pytest.raises(TaskmasterError) as exc:
+        _merge_metadata(_CORRUPT_BLOB, incoming, mode='merge',
+                        project_root='/p', tag='master', task_id=1)
+    assert exc.value.raw == _CORRUPT_BLOB, (
+        f'Expected raw == corrupt bytes; got {exc.value.raw!r}'
+    )
+
+
+def test_merge_metadata_mode_replace_returns_incoming_verbatim():
+    """mode='replace' returns incoming verbatim and bypasses the corrupt guard."""
+    incoming = json.dumps({'new': 'val'})
+    # Non-corrupt existing: returns incoming
+    result = _merge_metadata(json.dumps({'old': 1}), incoming, mode='replace')
+    assert result == incoming
+    # Corrupt existing: replace bypasses the guard (no raise)
+    result_corrupt = _merge_metadata(_CORRUPT_BLOB, incoming, mode='replace')
+    assert result_corrupt == incoming
+
+
+def test_merge_metadata_mode_additive_unions_lists_and_old_wins_scalars():
+    """mode='additive': list union+dedup, scalar collisions OLD-wins."""
+    existing = json.dumps({'items': [1, 2], 'flag': 'original'})
+    incoming = json.dumps({'items': [2, 3], 'flag': 'updated'})
+    result = json.loads(_merge_metadata(existing, incoming, mode='additive'))
+    # List union+dedup stable order
+    assert result['items'] == [1, 2, 3], f'additive list wrong: {result}'
+    # Scalar OLD-wins
+    assert result['flag'] == 'original', f'additive scalar should be old-wins: {result}'
+
+
+def test_merge_metadata_mode_merge_existing_none_returns_incoming():
+    """mode='merge' with existing_raw=None returns incoming (no existing data)."""
+    incoming = json.dumps({'k': 'v'})
+    assert _merge_metadata(None, incoming, mode='merge') == incoming
+
+
+# ── update_task end-to-end: default-merge + metadata_mode (step-5 RED / step-6 GREEN) ──
+
+
+@pytest.mark.asyncio
+async def test_update_task_default_merge_regression_4271(backend, project_root):
+    """Regression #4271: default update_task merge preserves _causation_id+memory_hints
+    while adding files — no metadata_mode or append arg passed."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({
+            '_causation_id': 'caus-abc',
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['src/a.py']}),
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert meta.get('_causation_id') == 'caus-abc', f'_causation_id clobbered: {meta}'
+    assert meta.get('memory_hints') == {'entities': ['E1'], 'queries': ['q1']}, (
+        f'memory_hints clobbered: {meta}'
+    )
+    assert meta.get('files') == ['src/a.py'], f'files not written: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_default_merge_updates_existing_scalar(backend, project_root):
+    """Default merge updates an existing scalar key (not OLD-wins)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'branch_base_sha': 'aaa', '_causation_id': 'caus'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'branch_base_sha': 'bbb'}),
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert meta.get('branch_base_sha') == 'bbb', f'scalar not updated: {meta}'
+    assert meta.get('_causation_id') == 'caus', f'sibling clobbered: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_metadata_mode_additive_unions_list(backend, project_root):
+    """metadata_mode='additive' unions a list (dry_run_proposals-style append)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'dry_run_proposals': ['prop-1']}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'dry_run_proposals': ['prop-2']}),
+        metadata_mode='additive',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['dry_run_proposals'] == ['prop-1', 'prop-2'], (
+        f'additive union failed: {task["metadata"]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_metadata_mode_replace_overwrites(backend, project_root):
+    """metadata_mode='replace' overwrites the whole blob (siblings dropped)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'_causation_id': 'keep', 'extra': 'sibling'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['f.py']}),
+        metadata_mode='replace',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert list(meta.keys()) == ['files'], f'replace should drop siblings: {meta}'
+    assert meta['files'] == ['f.py']
+
+
+@pytest.mark.asyncio
+async def test_update_task_legacy_append_true_additive(backend, project_root):
+    """Legacy append=True -> additive union (shim end-to-end)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'items': [1]}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'items': [2]}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['items'] == [1, 2], (
+        f'legacy append=True should additive-union: {task["metadata"]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_legacy_append_false_replace(backend, project_root):
+    """Legacy append=False -> replace overwrite (shim end-to-end)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'_causation_id': 'keep', 'extra': 'gone'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['f.py']}),
+        append=False,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert 'extra' not in meta, f'legacy append=False should replace: {meta}'
+    assert meta['files'] == ['f.py']
+
+
+@pytest.mark.asyncio
+async def test_update_task_default_corrupt_blob_refused(backend, project_root, caplog):
+    """Default (no-arg) merge refuses a corrupt existing blob — raises TaskmasterError
+    and leaves stored bytes unchanged."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    conn = await backend._get_connection(project_root)
+    await conn.execute('UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,))
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ), pytest.raises(TaskmasterError):
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'note': 'x'}),
+        )
+
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute('SELECT metadata FROM tasks WHERE id = 1')
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'corrupt blob must be byte-for-byte unchanged; got: {row["metadata"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_invalid_metadata_mode_always_raises(
+    backend, project_root,
+):
+    """Invalid metadata_mode must raise immediately regardless of whether
+    ``metadata`` is supplied (regression guard for the unconditional validation
+    introduced in the amendment pass — previously the check only fired inside
+    the ``if metadata is not None:`` block)."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    # Without metadata — the original bug: bad mode was silently ignored.
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata_mode='bogus',
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+
+    # With metadata — should also raise (sanity check, same code path).
+    with pytest.raises(TaskmasterError) as exc2:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'k': 'v'}),
+            metadata_mode='bogus',
+        )
+    assert exc2.value.code == 'TASKMASTER_TOOL_ERROR'

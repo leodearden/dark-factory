@@ -119,9 +119,10 @@ class TaskBackendProtocol(Protocol):
         project_root: str,
         prompt: str | None = None,
         metadata: str | None = None,
-        append: bool = False,
+        append: bool | None = None,
         tag: str | None = None,
         *,
+        metadata_mode: str | None = None,
         title: str | None = None,
         description: str | None = None,
         details: str | None = None,
@@ -130,6 +131,20 @@ class TaskBackendProtocol(Protocol):
         dependencies: list[str] | None = None,
     ) -> UpdateTaskResult:
         """Update task metadata fields (title, description, details, priority, metadata, dependencies).
+
+        **metadata merge semantics** — resolved by ``_resolve_metadata_mode``
+        (precedence: ``metadata_mode`` > ``append`` legacy shim > default):
+
+        * ``metadata_mode='merge'`` (default when both omitted) — shallow
+          last-write-wins: ``{**existing, **incoming}``.  Omitted keys
+          preserved; every supplied key overwrites wholesale.
+        * ``metadata_mode='additive'`` — recursive list union+dedup,
+          scalar/type-collision OLD-wins.  Required by list-append callers.
+        * ``metadata_mode='replace'`` — whole-blob overwrite.  Bypasses the
+          corrupt-blob guard; the sanctioned repair path.
+        * ``append=True`` (legacy shim) → 'additive'; ``append=False`` → 'replace'.
+          Omit both to get the merge default.  ``append`` also governs
+          details-append when ``details``/``prompt`` is supplied.
 
         **Implementations MUST reject a non-None ``status`` by raising** (e.g.
         ``TaskmasterError('TASKMASTER_TOOL_ERROR', …)``).  ``set_task_status``

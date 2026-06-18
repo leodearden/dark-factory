@@ -3067,6 +3067,10 @@ class TaskInterceptor:
 
         Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
+
+        ``metadata_mode`` and ``append`` pass through unchanged via ``**kwargs`` to
+        the backend, which single-sources mode resolution via
+        :func:`~fused_memory.backends.sqlite_task_backend._resolve_metadata_mode`.
         """
         if err := _reject_status_in_update_task(task_id, kwargs.get('status')):
             return err
@@ -3696,10 +3700,10 @@ def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
 
     ``set_task_status`` writes audit fields (``reopen_reason`` /
     ``done_provenance``) via a separate ``tm.update_task(metadata=…)`` call.
-    The default Taskmaster path is ``append=False``, which would replace the
-    whole metadata blob — silently dropping ``memory_hints`` / ``files`` and
-    other sibling keys. Read-modify-write here so the audit write merges with
-    whatever was already on the row.
+    The default backend path is now shallow-merge (``metadata_mode=None``), so
+    this read-modify-write is belt-and-braces — the backend would also preserve
+    sibling keys.  The explicit merge is kept for clarity and defence-in-depth
+    (it is not safe to rely on the backend default never changing).
 
     Audit fields win on collision (a fresh ``reopen_reason`` should never be
     shadowed by a stale one from an earlier reopen).
