@@ -2314,6 +2314,75 @@ async def test_reconcile_persistent_citation_miss_escalates_l1(harness: Harness)
 
 
 @pytest.mark.asyncio
+async def test_degenerate_zero_commit_branch_suppresses_citation_missing(
+    harness: Harness,
+):
+    """Degenerate provisioning branch (tip == branch_base_sha) must NOT
+    escalate reconcile_citation_missing even after MAX_RECONCILE_FAILURES
+    consecutive citation-miss sweeps.
+
+    Repro: esc-4598-6 cluster (tasks 4598/4663/4664) — all in-progress,
+    ``git rev-list --count main..task/<id>`` == 0, tip == branch_base_sha,
+    fired 5x consecutive escalations that should have been suppressed.
+    Fix: #1823 adds a degenerate-branch guard at the top of Guard 2's
+    ``citation_sha is None`` block, before the skip-count increment.
+    """
+    from orchestrator.harness import MAX_RECONCILE_FAILURES
+
+    submissions = []
+
+    class _StubEscalationQueue:
+        def make_id(self, task_id):
+            return f'esc-{task_id}-{len(submissions)}'
+
+        def submit(self, esc):
+            submissions.append(esc)
+
+        def has_open_l1(self, task_id):  # noqa: ARG002
+            return False
+
+    harness._escalation_queue = _StubEscalationQueue()  # type: ignore[assignment]
+
+    tid = '4663'
+    base_sha = 'feedface' + '1' * 32  # valid 40-hex SHA, the degenerate signal
+
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+        return_value=None,  # citation MISS → enters Guard 2's None block
+    )
+    # Live branch tip == branch_base_sha → zero commits beyond creation point
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=base_sha)  # type: ignore[attr-defined]
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {'branch_base_sha': base_sha}},
+    )
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {tid: 'in-progress'}, None,
+    )
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    # (a) No reconcile_citation_missing escalation must be emitted.
+    #     Current code (pre-fix) FAILS here: Guard 2 accrues 5 strikes and
+    #     calls _escalate_reconcile_skip, so len(submissions) == 1.
+    assert len(submissions) == 0, (
+        f'degenerate provisioning branch must NOT emit any escalation after '
+        f'{MAX_RECONCILE_FAILURES} sweeps; got {len(submissions)}: '
+        f'{[getattr(s, "category", s) for s in submissions]}'
+    )
+
+    # (b) No auto-flip: status must be left intact.
+    harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    # (c) Skip counter must NOT accrue strikes for a degenerate branch.
+    assert tid not in harness._reconcile_skip_counts, (
+        f'degenerate branch must not accrue skip strikes; '
+        f'got count={harness._reconcile_skip_counts.get(tid)}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_failure_counter_resets_on_success(harness: Harness):
     """A successful mark_done clears the per-tid failure counter."""
     from orchestrator.scheduler import DoneGateRejection
