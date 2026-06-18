@@ -869,29 +869,52 @@ class TestAcquireWarmLaneResetInPlace:
     async def test_reacquire_retains_target_warmth(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """target/cache.bin survives the reset-in-place (warmth retention)."""
+        """Recycled lane's target/ is RE-SEEDED on the recycle path (D10).
+
+        Before D10 this test asserted silent retention of target/cache.bin.
+        D10 changes the contract: target/ is always re-seeded from the current
+        base on a fresh-recycle acquire, so the assertion is that seed WAS
+        invoked (seed_calls.txt gained a new entry), not just that a prior
+        artifact survived silently.
+        """
         sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        seed_marker = wl_git_repo / 'seed_calls.txt'
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
         assert info_a is not None
-        # Write a warm artifact into target/
-        (info_a.path / 'target').mkdir(exist_ok=True)
-        cache_file = info_a.path / 'target' / 'cache.bin'
-        cache_file.write_bytes(b'\x00' * 128)
+        calls_after_first = (
+            seed_marker.read_text() if seed_marker.exists() else ''
+        ).splitlines()
 
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
         assert info_b is not None
 
-        # Warm artifact must still be there
-        assert cache_file.exists(), 'target/cache.bin was removed (warmth lost)'
+        calls_after_second = (
+            seed_marker.read_text() if seed_marker.exists() else ''
+        ).splitlines()
+        # D10: seed MUST have been called on the recycle path
+        assert len(calls_after_second) > len(calls_after_first), (
+            'seed-warm-lane.sh was NOT called on recycle (D10 violation: no re-seed)'
+        )
+        # The recycle call must be with --fresh-checkout mode
+        assert any('--fresh-checkout' in ln for ln in calls_after_second), (
+            f'No --fresh-checkout call found in seed log: {calls_after_second}'
+        )
 
-    async def test_reacquire_does_not_call_seed(
+    async def test_reacquire_calls_seed_fresh_checkout(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """seed-warm-lane.sh is NOT called on warm reacquire (marker unchanged)."""
+        """Second acquire for a DIFFERENT task on a recycled FREE lane MUST invoke
+        _seed_warm_lane with mode '--fresh-checkout' (D10 always-re-seed-at-acquire).
+
+        Before D10 this test was named test_reacquire_does_not_call_seed and
+        asserted the opposite (no call on warm reacquire).  D10 inverts the
+        contract: the fresh-recycle path always re-seeds, so seed_calls.txt
+        must gain a new '--fresh-checkout' entry after the second acquire.
+        """
         sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
@@ -908,8 +931,14 @@ class TestAcquireWarmLaneResetInPlace:
         assert info_b is not None
 
         calls_after_second = seed_marker.read_text() if seed_marker.exists() else ''
-        assert calls_after_second == calls_after_first, (
-            'seed-warm-lane.sh was called on warm reacquire (should be skipped)'
+        # D10: seed MUST be called on the recycle path (new line in marker)
+        assert calls_after_second != calls_after_first, (
+            'seed-warm-lane.sh was NOT called on recycle (D10 violation: no re-seed)'
+        )
+        # The recycle call must use --fresh-checkout mode
+        new_calls = calls_after_second[len(calls_after_first):]
+        assert '--fresh-checkout' in new_calls, (
+            f'Recycle seed call did not use --fresh-checkout: {new_calls!r}'
         )
 
     async def test_reacquire_single_worktree_registration(
@@ -1395,16 +1424,24 @@ class TestAcquireWarmLaneOnDiskBackstop:
     async def test_different_task_retains_target_warmth(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Fresh acquire for different task keeps target/ warmth (reset-in-place)."""
-        sha_a, sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+        """Fresh acquire for a different task RE-SEEDS target/ (D10 always-re-seed).
+
+        Before D10 this asserted silent retention of target/cache.bin.  D10
+        changes the contract: the fresh-reset path for a new task always
+        re-seeds, so we verify that seed-warm-lane.sh was invoked on the
+        fresh-recycle acquire (seed_calls.txt must gain a new entry after the
+        task-Z acquire).
+        """
+        sha_a, sha_main, seed_marker = await _make_repo_for_reuse_test(wl_git_repo)
 
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert info1 is not None
         plan_file = info1.path / '.task' / 'plan.json'
         plan_file.write_text('{"task_id": "task-A"}')
-        cache_file = info1.path / 'target' / 'cache.bin'
-        cache_file.write_bytes(b'\xca\xfe' * 64)
+        calls_after_first = (
+            seed_marker.read_text() if seed_marker.exists() else ''
+        ).splitlines()
 
         await git_ops1.release_warm_lane(info1.path, 'task-A')
 
@@ -1412,7 +1449,13 @@ class TestAcquireWarmLaneOnDiskBackstop:
         info2 = await git_ops2.acquire_warm_lane('task-Z', sha_main)
         assert info2 is not None
 
-        assert cache_file.exists(), 'target/cache.bin must be retained on fresh reset'
+        calls_after_second = (
+            seed_marker.read_text() if seed_marker.exists() else ''
+        ).splitlines()
+        # D10: seed MUST be called on the fresh-recycle path for a new task
+        assert len(calls_after_second) > len(calls_after_first), (
+            'seed-warm-lane.sh was NOT called on fresh-recycle for new task (D10 violation)'
+        )
 
 
 # ===========================================================================
