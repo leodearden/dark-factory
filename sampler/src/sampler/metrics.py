@@ -53,13 +53,23 @@ __all__ = [
 _AVG10_RE = re.compile(r'avg10=([0-9]+(?:\.[0-9]+)?)')
 
 
-def parse_pressure_file(text: str) -> dict[str, float]:
+def parse_pressure_file(text: str) -> dict[str, float] | None:
     """Parse a /proc/pressure/<name> text and return {some_avg10, full_avg10}.
 
     If the ``full`` line is absent (e.g. CPU on some kernels), ``full_avg10``
     defaults to 0.0.
+
+    Returns:
+        A dict with ``some_avg10`` and ``full_avg10`` on success, or ``None``
+        if no some/full avg10 value could be extracted (empty text, garbage
+        content, or truncated read).  A *partial* miss where ``some`` is
+        present but ``full`` is absent still returns a dict — that is a
+        legitimate kernel behaviour, not a fault.  Only a *total* miss (neither
+        key extracted) returns ``None`` so ``collect_psi`` can distinguish a
+        read/parse fault from genuine zero pressure.
     """
     result: dict[str, float] = {'some_avg10': 0.0, 'full_avg10': 0.0}
+    found = False
     for line in text.splitlines():
         line = line.strip()
         m = _AVG10_RE.search(line)
@@ -68,8 +78,12 @@ def parse_pressure_file(text: str) -> dict[str, float]:
         value = float(m.group(1))
         if line.startswith('some'):
             result['some_avg10'] = value
+            found = True
         elif line.startswith('full'):
             result['full_avg10'] = value
+            found = True
+    if not found:
+        return None
     return result
 
 
