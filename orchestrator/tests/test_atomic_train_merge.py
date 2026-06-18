@@ -731,6 +731,7 @@ class TestScenario5GroupMergeVerify:
             f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
         )
 
+    @pytest.mark.exercise_merge_verify
     async def test_group_merge_workspace_verify_red(
         self,
         cargo_or_skip,  # noqa: ARG002
@@ -788,15 +789,10 @@ class TestScenario5GroupMergeVerify:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue)
 
-        # Override the autouse _mock_merge_queue_verification fixture (which
-        # forces passed=True) so the post-merge gate runs REAL cargo against the
-        # assembled tip — γ's broken edit must drive a blocked outcome.  Mirrors
-        # the GREEN sibling's spy (test_group_merge_workspace_verify_green).
-        async def _spy_verify(*args, **kwargs):
-            return await run_scoped_verification(*args, **kwargs)
-
-        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
-            outcome = await worker._do_merge(req)
+        # The @pytest.mark.exercise_merge_verify marker (above) makes the autouse
+        # fixture skip the passed=True stub; the real run_scoped_verification runs
+        # here automatically — no in-body patch needed or added.
+        outcome = await worker._do_merge(req)
 
         # (i) Outcome is blocked (not done).
         assert outcome is not None
