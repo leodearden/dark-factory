@@ -440,6 +440,113 @@ class EscalationQueue:
 
         return esc
 
+    def park(
+        self,
+        escalation_id: str,
+        resolution: str,
+        *,
+        resolved_by: str | None = None,
+        resolution_turns: int | None = None,
+    ) -> Escalation | None:
+        """Park an escalation: promote to level=2, stamp resolution_action='park',
+        persist resolution text, keep status='pending' (NOT archived).
+
+        Differs from resolve() in three ways:
+        - status stays 'pending' (escalation remains OPEN — sweep-quiescence mechanism)
+        - level is promoted to 2 (L2 = human-only consumer)
+        - _archive_resolved is NOT called (record stays live in queue_dir)
+        - resolved_at is NOT set (preserving the resolved_at=None ↔ status='pending' invariant)
+
+        After releasing the per-id lock, fires _resolve_callback(esc) to trigger the harness
+        teardown (kill workflow + set task 'blocked') — same callback, different escalation state.
+
+        For cluster L2s: fires _resolve_callback per member L1 with an in-memory
+        resolved_by='l2-cascade:<L2-id>' stamp (does NOT persist/archive member records —
+        members stay pending L1s covering their tasks).
+
+        Idempotent: returns existing record unchanged if either (a) status != 'pending'
+        (already resolved/dismissed) or (b) resolution_action == 'park' AND resolution
+        is not None (already parked — resolution text was written by a prior park() call).
+        The combined second guard prevents a re-park from re-firing teardown callbacks
+        without falsely short-circuiting a first-time park() on an L2 whose
+        resolution_action was pre-set to 'park' but resolution is still None.
+        The first guard matches the contract of resolve().
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self.get(escalation_id)
+            if esc is None:
+                return None
+
+            if esc.status != 'pending' or (
+                esc.resolution_action == 'park' and esc.resolution is not None
+            ):
+                logger.info(
+                    'Escalation %s already %s (resolution_action=%r); park() is a no-op',
+                    escalation_id, esc.status, esc.resolution_action,
+                )
+                return esc
+
+            # Promote to L2, stamp park metadata, keep status='pending'.
+            esc.level = 2
+            esc.resolution_action = 'park'
+            esc.resolution = resolution
+            if resolved_by is not None:
+                esc.resolved_by = resolved_by
+            if resolution_turns is not None:
+                esc.resolution_turns = resolution_turns
+            # resolved_at stays None — parked escalation is still open/pending.
+
+            # In-place rewrite (no archive — record stays live in queue_dir).
+            self._atomic_write(escalation_id, esc.to_json())
+
+        logger.info('Escalation %s parked (kept open at L2): %s', escalation_id, resolution[:100])
+
+        # Fire resolve callback for the L2 itself to trigger harness teardown.
+        if self._resolve_callback:
+            try:
+                self._resolve_callback(esc)
+            except Exception as e:
+                logger.warning('Park callback failed for %s: %s', escalation_id, e)
+
+        # Cluster L2: fire per-member callback with in-memory l2-cascade stamp.
+        # Do NOT persist or resolve member records — members stay pending L1s.
+        if esc.members:
+            for member_id in esc.members:
+                try:
+                    member = self.get(member_id)
+                    if member is None:
+                        logger.warning(
+                            'park cascade: member %s of L2 %s not found — skipping',
+                            member_id, escalation_id,
+                        )
+                        continue
+                    if member.status != 'pending':
+                        # Mirror resolve()'s idempotent-member contract: skip members
+                        # that are already resolved/dismissed so that a terminal member
+                        # does not have its task driven to 'blocked' after closure.
+                        logger.debug(
+                            'park cascade: member %s of L2 %s already %s — skipping',
+                            member_id, escalation_id, member.status,
+                        )
+                        continue
+                    # In-memory cascade signal only; no disk write.
+                    member.resolved_by = f'l2-cascade:{escalation_id}'
+                    if self._resolve_callback:
+                        try:
+                            self._resolve_callback(member)
+                        except Exception as e:
+                            logger.warning(
+                                'Park cascade callback failed for member %s of L2 %s: %s',
+                                member_id, escalation_id, e,
+                            )
+                except Exception as e:
+                    logger.warning(
+                        'park cascade: error processing member %s of L2 %s: %s',
+                        member_id, escalation_id, e,
+                    )
+
+        return esc
+
     def submit_resolved(
         self,
         escalation: Escalation,

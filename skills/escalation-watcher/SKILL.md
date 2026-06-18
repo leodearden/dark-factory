@@ -197,8 +197,9 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
    days helps no one. Where the decision can be safely *postponed* without baking anything in:
    - Queue a follow-up task capturing the decision to be made (two-phase `submit_task` →
      `resolve_ticket`), and
-   - `resolve_issue(..., action='park')` so the blocking task lands `deferred` (D2: invisible to the
-     scheduler and to the stranded-blocked sweep; never circularly re-asked).
+   - `resolve_issue(..., action='park')` so the blocking task lands `blocked`, held under an open L2
+     (no re-dispatch while the escalation is open; the stranded-blocked sweep skips a blocked task
+     that has an open escalation).
    This is parking a decision for later human review — NOT making it. Only park when the task has no
    half-merged or destructive state. The Priority Hierarchy bar still holds: better to defer than to
    bake in a bad decision — when in real doubt, fall back to "leave pending + digest."
@@ -592,14 +593,14 @@ mcp__escalation__resolve_issue(
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
 | `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
-| `park` | `dismissed` | killed | → `deferred` (from any non-terminal status) | "Stop; human decides later; machine must not touch." |
+| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." |
 | `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
 | `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
 
 **C1 notes:**
 - Terminal task statuses (`done`, `cancelled`) are never overwritten by any action.
 - The removed `terminate` parameter now raises a hard error naming the five actions above.
-- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API.
+- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1.
 - Legacy in-process callers with `resolution_action=None`: `dismiss=True` maps to `close_only`; `dismiss=False` maps to `resume`.
 
 **Where the `resolution` text actually goes.** It reaches the working agent **only** in the L0
@@ -617,7 +618,7 @@ steward-resolved path, where a workflow is still live and waiting (`_wait_for_re
   flip accepts any task-attached `level >= 1`. The resolution text is recorded for audit only and
   does not reach the agent (no live workflow); write durable guidance into fused-memory / task
   metadata instead. To re-run fresh use `action='restart'` (→ `pending` from scratch); to park for
-  later use `action='park'` (→ `deferred`); to abandon permanently use `action='abandon'`
+  later use `action='park'` (→ `blocked`, held under an open L2); to abandon permanently use `action='abandon'`
   (→ `cancelled`); to close the record without touching the task use `action='close_only'`.
 
 Either way, still write a clear, specific `resolution` (file paths, function names, the decision and

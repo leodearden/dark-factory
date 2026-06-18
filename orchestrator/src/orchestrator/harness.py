@@ -4790,7 +4790,9 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         # restart / park / abandon → teardown + status write.
-        _ACTION_TARGETS = {'restart': 'pending', 'park': 'deferred', 'abandon': 'cancelled'}
+        # park → 'blocked' (version-a): quiescence rests on the open L2 escalation
+        # suppressing Fix #1b stranded_blocked re-filing, not on the 'deferred' status.
+        _ACTION_TARGETS = {'restart': 'pending', 'park': 'blocked', 'abandon': 'cancelled'}
         target = _ACTION_TARGETS.get(action)
         if target is not None:
             self._schedule_coro_threadsafe(
@@ -4828,7 +4830,8 @@ Output JSON matching the schema. Every task must appear in the output.
             Any non-terminal current status is intentionally overwritten — restart is
             a forced re-pend.  SetTaskStatusRejected handles the terminal-exit gate
             if the task transitions terminally between the recheck and the write.
-          - park:    task must be non-terminal; target='deferred'.  Same TOCTOU note.
+          - park:    task must be non-terminal; target='blocked'.  Same TOCTOU note.
+            Quiescence from the open L2 escalation (Fix #1b skip gate), not from status.
           - abandon: task must be non-terminal; target='cancelled'.  SetTaskStatusRejected
             is redundant here (cancelled is terminal and the scheduler's terminal-exit
             gate would also catch it), but the recheck still avoids a no-op write.
@@ -4848,6 +4851,12 @@ Output JSON matching the schema. Every task must appear in the output.
         block whether the status write succeeded, was rejected, or the kill completed —
         ensuring a re-dispatched (restart→pending) workflow can write 'blocked'
         legitimately in its next incarnation rather than being permanently suppressed.
+
+        Suppression stamp is SKIPPED when target_status == 'blocked' (park, version-a):
+          For park, the target itself is 'blocked'.  Stamping would cause
+          _suppress_blocked_write to absorb park's own set_task_status('blocked') write
+          → silent no-op.  There is no clobber risk: a racing workflow _mark_blocked
+          writes the same value (idempotent), so no suppression is needed.
 
         Concurrency note: ``_action_teardown_tasks`` uses a Counter so that overlapping
         teardown coros for the same task_id (low probability — each L2 cascade member is
@@ -4871,7 +4880,24 @@ Output JSON matching the schema. Every task must appear in the output.
         # absorbed by the scheduler guard and cannot clobber the action's target status.
         # Counter increment (not set.add) so overlapping teardowns for the same task_id
         # don't prematurely clear each other's suppression window (step-12 amend).
-        self._action_teardown_tasks[task_id] += 1
+        #
+        # SKIP the stamp when target_status == 'blocked' (park, version-a):
+        # The scheduler's _suppress_blocked_write would absorb park's OWN write.
+        # A racing _mark_blocked writes the same 'blocked' value (idempotent) — no
+        # suppression is needed.  restart('pending') and abandon('cancelled') still stamp.
+        #
+        # Trade-off: because the stamp is the mechanism that absorbs the racing
+        # _mark_blocked write, that workflow-emitted write now reaches the scheduler
+        # unsuppressed.  A 'blocked' transition triggers reconciliation per the project
+        # contract, so park can produce up to two 'blocked' writes (teardown + workflow
+        # cleanup) and therefore up to two reconciliation passes for the same task.
+        # Both writes are idempotent and the reconciliation passes converge immediately
+        # (task is already blocked + open escalation → no stranded_blocked filed).
+        # The duplicate cost is accepted because the alternative (stamping to suppress
+        # the workflow write) would also suppress park's own write → silent no-op.
+        _should_stamp = target_status != 'blocked'
+        if _should_stamp:
+            self._action_teardown_tasks[task_id] += 1
         try:
             try:
                 await self.scheduler.set_task_status(task_id, target_status)
@@ -4909,13 +4935,14 @@ Output JSON matching the schema. Every task must appear in the output.
                     )
                     self.hard_cancel_workflow(task_id)
         finally:
-            # Decrement the suppression refcount once the kill window closes (step-12).
-            # Delete the key when it reaches zero so Counter.__contains__ returns False
-            # and a re-dispatched (restart→pending) workflow can write 'blocked'
-            # legitimately in its next incarnation.
-            self._action_teardown_tasks[task_id] -= 1
-            if self._action_teardown_tasks[task_id] <= 0:
-                del self._action_teardown_tasks[task_id]
+            if _should_stamp:
+                # Decrement the suppression refcount once the kill window closes (step-12).
+                # Delete the key when it reaches zero so Counter.__contains__ returns False
+                # and a re-dispatched (restart→pending) workflow can write 'blocked'
+                # legitimately in its next incarnation.
+                self._action_teardown_tasks[task_id] -= 1
+                if self._action_teardown_tasks[task_id] <= 0:
+                    del self._action_teardown_tasks[task_id]
 
     def _resolve_escalation_action(self, escalation) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.
