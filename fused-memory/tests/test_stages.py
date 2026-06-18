@@ -11523,3 +11523,88 @@ class TestMemoryConsolidatorMem0ResultsKeyWarns:
         assert not warns, (
             f"legit empty results must not emit WARNINGs; got {[r.message for r in warns]!r}"
         )
+
+
+class TestVerifyStage2SummaryWritten:
+    """_verify_stage2_summary_written: calls count_memories_by_metadata with
+    {'kind':'cycle_summary','stage':'task_knowledge_sync','run_id':run_id},
+    returns count, logs WARNING on count==0 or exception, never raises."""
+
+    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+    @pytest.mark.asyncio
+    async def test_calls_count_with_correct_filter(self):
+        """Calls count_memories_by_metadata once with project_id and correct triple filter."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _verify_stage2_summary_written,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 1
+
+        await _verify_stage2_summary_written(memory_service, 'dark_factory', 'run-abc')
+
+        memory_service.count_memories_by_metadata.assert_awaited_once_with(
+            project_id='dark_factory',
+            filters={
+                'kind': 'cycle_summary',
+                'stage': 'task_knowledge_sync',
+                'run_id': 'run-abc',
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_count_when_positive_no_warning(self, caplog):
+        """Returns count when >0 and logs no WARNING."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _verify_stage2_summary_written,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 2
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _verify_stage2_summary_written(
+                memory_service, 'dark_factory', 'run-found'
+            )
+
+        assert result == 2
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_and_logs_warning_when_count_is_zero(self, caplog):
+        """When count==0 returns 0 and logs a WARNING."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _verify_stage2_summary_written,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _verify_stage2_summary_written(
+                memory_service, 'dark_factory', 'run-missing'
+            )
+
+        assert result == 0
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_and_logs_warning_on_exception(self, caplog):
+        """When count_memories_by_metadata raises, returns 0, does NOT raise, logs WARNING."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _verify_stage2_summary_written,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant gone')
+        )
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _verify_stage2_summary_written(
+                memory_service, 'dark_factory', 'run-error'
+            )
+
+        assert result == 0
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]

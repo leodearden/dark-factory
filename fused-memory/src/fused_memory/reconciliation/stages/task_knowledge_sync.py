@@ -1178,6 +1178,58 @@ async def _enforce_stage2_summary_pool_cap(
     return success_count
 
 
+async def _verify_stage2_summary_written(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> int:
+    """Best-effort post-write check: count this run's cycle_summary in Mem0.
+
+    Counts memories matching the triple filter
+    ``{'kind':'cycle_summary','stage':'task_knowledge_sync','run_id':run_id}``
+    via ``count_memories_by_metadata`` (deterministic Qdrant count, NOT semantic
+    search).  Logs a WARNING when count==0 (the agent may not have written its
+    summary yet) or when the count call raises (transient failure).
+
+    Best-effort: never raises, never retries.  The LLM agent owns its own
+    count-verify-and-retry path; Python's verify is a redundant observability
+    signal surfaced via ``report.stats['stage2_cycle_summary_verified_count']``.
+
+    Args:
+        memory_service: Service with ``count_memories_by_metadata``.
+        project_id: Project scope for the count call.
+        run_id: Current reconciliation run identifier (used as filter key).
+
+    Returns:
+        Count returned by ``count_memories_by_metadata``, or 0 on failure.
+    """
+    try:
+        count = await memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters={
+                'kind': 'cycle_summary',
+                'stage': 'task_knowledge_sync',
+                'run_id': run_id,
+            },
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._verify_stage2_summary_written: '
+            'count_memories_by_metadata failed for run_id=%s; treating as 0',
+            run_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
+    if not count:
+        logger.warning(
+            'reconciliation._verify_stage2_summary_written: '
+            'no cycle_summary found for run_id=%s after agent write',
+            run_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+    return count
+
+
 async def _track_flag_persistence(
     memory_service,
     project_id: str,
