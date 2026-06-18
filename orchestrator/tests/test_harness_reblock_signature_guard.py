@@ -23,9 +23,8 @@ import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from escalation.models import Escalation
-
 from _orch_helpers import assert_update_wire_mode
+from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
