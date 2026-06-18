@@ -4266,7 +4266,7 @@ class TaskWorkflow:
     def _emit_rebase_verify_cost(
         self,
         rebase_notice: dict,
-        verify_result: 'VerifyResult',
+        verify_result: VerifyResult,
     ) -> None:
         """Emit one rebase_verify_cost event pairing a real rebase with its next verify.
 

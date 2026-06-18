@@ -23,8 +23,8 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
-
 
 # ---------------------------------------------------------------------------
 # Shared git repo fixtures (same pattern as test_verify_phase_rebase.py)
@@ -176,8 +176,7 @@ class TestGetRebaseDistance:
 # ---------------------------------------------------------------------------
 
 
-def _make_verify_result(passed: bool = True, duration_secs: float = 0.0) -> 'VerifyResult':
-    from orchestrator.verify import VerifyResult
+def _make_verify_result(passed: bool = True, duration_secs: float = 0.0) -> VerifyResult:
     return VerifyResult(
         passed=passed, test_output='', lint_output='', type_output='',
         summary='ok', duration_secs=duration_secs,

@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
 
 
-def load_rebase_verify_cost_rows(event_store: 'EventStore') -> list[dict]:
+def load_rebase_verify_cost_rows(event_store: EventStore) -> list[dict]:
     """Return all ``rebase_verify_cost`` events for the current run.
 
     Delegates to :meth:`EventStore.fetch_events_by_type`; each element is a

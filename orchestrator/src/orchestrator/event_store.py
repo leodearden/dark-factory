@@ -401,7 +401,7 @@ class EventStore:
             logger.warning('event_store.latest_merge_finalized failed', exc_info=True)
             return None
 
-    def fetch_events_by_type(self, event_type: 'str | EventType') -> 'list[dict]':
+    def fetch_events_by_type(self, event_type: str | EventType) -> list[dict]:
         """Return all events of *event_type* emitted in the current run, ordered by id.
 
         The ``data`` column of every returned row is parsed from JSON back to a
