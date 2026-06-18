@@ -73,6 +73,13 @@ def extract_agent_verdict(result, *, default_verdict, error_summary) -> AgentVer
     {'warning': ...} / unparseable case): logger.warning(warning, output_prefix) and return a verdict whose
     summary is a DISTINGUISHABLE sentinel (f'agent-failed:{warning}'), never a neutral default conflatable
     with a real result. Mirrors workflow._run_reviewer:4476 (ERROR verdict on unparseable output)."""
+
+# shared/timestamps.py
+def parse_timestamp_or_warn(raw, *, fallback=None, context="") -> tuple[datetime, bool]:
+    """Parse an ISO-8601 timestamp. Success → (dt, True). Malformed/None/non-str → logger.warning(context, raw)
+    and return (fallback or datetime.min(UTC), False) — a SORTABLE sentinel so the record is NEVER silently
+    dropped (mirrors escalation queue.py:636 / watcher.py:97). 'Oldest-first' callers get a deterministic fold
+    target; age-gating callers get a visible signal instead of a silent skip."""
 ```
 
 **Invariants:** (1) a non-raising malformed payload is NEVER collapsed to a bare `None`/`{}`/`[]` without a
@@ -83,8 +90,13 @@ sites are **WARNING-only**; (4) no degradation path may suppress an escalation i
 
 ## Resolved design decisions
 
-1. **Shared primitives live in `shared/`** (verified workspace dep of all Python consumers). Escalation (no
-   `shared` dep) fixes its one site in-package by mirroring its own `queue.py`/`watcher.py` twins.
+1. **Shared primitives live in `shared/`** (verified workspace dep of all Python consumers). **Escalation
+   ADOPTS `shared`** (new `dark-factory-shared = { workspace = true }` dep — escalation is already a uv
+   workspace member; `shared` is foundational with no first-party app deps, so no import cycle). Justified by
+   genuine cross-package duplication: the *parse-ISO-timestamp-or-fall-back-safely* logic exists in **4 copies** —
+   escalation `dedupe.py:291` (buggy silent drop), `queue.py:636` + `watcher.py:97` (correct, `datetime.min`
+   fallback), and dashboard `redux_api.py:243` (#39, also silent) — so a 4th shared primitive `shared.timestamps`
+   unifies all four and fixes the two buggy ones. (Reviewed + adopted 2026-06-18.)
 2. **One task per package** (cross-package scopes blow the architect budget — feedback memory). The shared
    primitives are foundation tasks; each package's migration depends on the primitive(s) it uses.
 3. **P1 depends on task 1799** and folds 1799's `get_external_statuses` fix onto the shared `parse_tool_result`
@@ -122,6 +134,8 @@ No other live PRDs touch these files. No reciprocal-ownership ambiguity.
   absent file → `(default, True)` silently; `fail_closed` raises. *Unlocks:* ε,κ,ν.
 - **γ** [shared] `agent_result.extract_agent_verdict`. *Signal:* unit test — `{'warning':...}` (no verdict) →
   WARNING + sentinel summary `agent-failed:*`. *Unlocks:* ζ,ι.
+- **φ** [shared] `timestamps.parse_timestamp_or_warn`. *Signal:* unit test — malformed/None ts → WARNING +
+  `(datetime.min, False)` sortable fallback; valid ts → `(dt, True)`. *Unlocks:* ξ, ν(#39).
 
 **Orchestrator:**
 - **δ** [orchestrator] dep **α, 1799**. Unify scheduler resolvers: migrate `_parse_tool_text_result`,
@@ -162,17 +176,19 @@ No other live PRDs touch these files. No reciprocal-ownership ambiguity.
   overwrite the blob.
 
 **Dashboard:**
-- **ν** [dashboard] dep **α, β**. Signal layer: `db.with_db`/`DbPool.get` (DEBUG→WARNING + red-badge error
+- **ν** [dashboard] dep **α, β, φ**. Signal layer: `db.with_db`/`DbPool.get` (DEBUG→WARNING + red-badge error
   sentinel), `discover_orchestrators`/`fetch_external_statuses` (propagate the existing `{'offline':True}`
-  marker), `read_task_artifacts` (load_json_or_warn + split corrupt from absent), `_shape_wal_status`,
-  `app.api_curator` accounts_summary (DEBUG→WARNING), `_split_queue_stats`, `tab_overview.jsx` HostLoadCard
-  (stale badge). *Signal:* a corrupt/locked DB or MCP-unreachable orchestrator renders a red/offline badge, not
-  a benign zero.
+  marker), `read_task_artifacts` (load_json_or_warn + split corrupt from absent), `_shape_wal_status` (#39 —
+  route ts parse through `parse_timestamp_or_warn`), `app.api_curator` accounts_summary (DEBUG→WARNING),
+  `_split_queue_stats`, `tab_overview.jsx` HostLoadCard (stale badge). *Signal:* a corrupt/locked DB or
+  MCP-unreachable orchestrator renders a red/offline badge, not a benign zero.
 
 **Tail (per-package):**
-- **ξ** [escalation] (indep). `dedupe.find_dedupe_parent` — mirror `queue.py`/`watcher.py` twins (datetime.min
-  fallback so a corrupt-ts parent is still the fold target) + WARNING. *Signal:* corrupt-ts parent → WARNING +
-  candidate folds, not silently re-filed as new.
+- **ξ** [escalation] dep **φ**. Add `dark-factory-shared` workspace dep (+ pyright extraPaths) to escalation,
+  then route ALL THREE escalation timestamp-parse copies — `dedupe.find_dedupe_parent:291` (the buggy silent
+  one), `queue.py:636`, `watcher.py:97` — through `shared.timestamps.parse_timestamp_or_warn`, deleting the two
+  hand-rolled `datetime.min` fallbacks. *Signal:* corrupt-ts parent → WARNING + candidate folds (not silently
+  re-filed as new); `import shared.timestamps` resolves in escalation; the 3 local copies are gone.
 - **ο** [shared] (indep). `pytest_jobserver.pytest_configure` — WARNING on the OSError/FIFO branch (mirror the
   timeout branch). *Signal:* broken FIFO → WARNING, distinguishable from intentional-off.
 - **π** [sampler] (indep). `metrics.collect_process_metrics` (let proc_iter failure propagate to `__main__`'s
@@ -195,6 +211,8 @@ No other live PRDs touch these files. No reciprocal-ownership ambiguity.
 | Producer: `parse_tool_result` on malformed envelope | success-status envelope, text parses to wrong type | returns `(None, EnvelopeParseError)`; a WARNING naming the shape is emitted |
 | Producer: `load_json_or_warn` on corrupt file | file present, non-JSON bytes | WARNING; `(default, False)`; `fail_closed` raises; absent file stays silent `(default, True)` |
 | Producer: `extract_agent_verdict` on `{'warning':...}` | agent ran, no verdict key | WARNING; summary == `agent-failed:<warning>` |
+| Producer: `parse_timestamp_or_warn` on malformed ts | raw is None / non-ISO string | WARNING; `(datetime.min(UTC), False)`; valid ts → `(dt, True)` silently |
+| Consumer ξ: dedupe parent with corrupt ts | a pending parent matches category+key, corrupt timestamp | parent still considered (sorted oldest); WARNING; candidate folds, not re-filed |
 | Consumer δ: scheduler tick, non-list `get_tasks` | resolver returns non-list, deps actually done | tick does NOT silently idle; WARNING; dependent fail-safe-wait, not dropped |
 | Consumer ε: orchestrator restart, corrupt merge journal | truncated journal on disk | recovery distinguishes corrupt from fresh; WARNING; pending merges not silently dropped |
 | Consumer λ: `update_task` over corrupt metadata row | row's metadata column is non-JSON | deduped WARNING; existing blob NOT overwritten |
