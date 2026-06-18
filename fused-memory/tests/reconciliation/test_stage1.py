@@ -1443,3 +1443,99 @@ class TestStage1PayloadTaskCountCensus:
             f"Census section must be absent when task_count_verification is None; "
             f"got:\n{result!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# task-1786 step-3 (RED) / step-4 (GREEN): stale snapshot correction wiring
+# ---------------------------------------------------------------------------
+
+
+class TestStaleCountSnapshotCorrectionWiring:
+    """MemoryConsolidator.run() must apply filter_stale_count_snapshot_corrections
+    as the FIRST post-processor in items_flagged (before filter_terminal_metadata_flags
+    and dedup_flags), and surface
+    report.stats['stale_count_snapshot_corrections_dropped'].
+
+    RED until step-4 wires filter_stale_count_snapshot_corrections into run()
+    and sets the stat.
+    """
+
+    @pytest.mark.asyncio
+    async def test_incident_finding_dropped_and_benign_survives(self):
+        """The incident snapshot-correction finding is dropped; benign finding survives.
+
+        Seeds base_report.items_flagged with:
+        - incident: flag_type='count_snapshot_mismatch', description containing
+          the 634/607 → 635/608 correction text (triggers the filter)
+        - benign: flag_type='missing_deliverable' (must pass through unchanged)
+
+        After stage.run():
+        - incident finding must be absent from report.items_flagged
+        - benign finding must be present
+        - report.stats['stale_count_snapshot_corrections_dropped'] == 1
+
+        RED: filter_stale_count_snapshot_corrections is not yet wired into
+        run() and the stat is unset.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+
+        incident_flag = {
+            'task_id': None,
+            'flag_type': 'count_snapshot_mismatch',
+            'description': (
+                'Snapshot edge for autopilot_video reports 634/607 but is off by 1; '
+                'should be 635/608 to match the Active Task Tree header.'
+            ),
+            'suggested_action': 'Correct the snapshot edge to 635/608.',
+        }
+        benign_flag = {
+            'task_id': '100',
+            'flag_type': 'missing_deliverable',
+            'description': 'Task 100 has no deliverable',
+        }
+        all_flags = [incident_flag, benign_flag]
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=list(all_flags),
+            stats={},
+        )
+        # dedup_flags passes all flags through unchanged so we can inspect
+        # the stale-snapshot filter's effect directly
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-1786-step3',
+            )
+
+        flag_types = [f.get('flag_type') for f in report.items_flagged]
+
+        assert 'count_snapshot_mismatch' not in flag_types, (
+            "filter_stale_count_snapshot_corrections must drop the incident "
+            "'count_snapshot_mismatch' finding (634/607→635/608, delta=1); "
+            f"got items_flagged={report.items_flagged!r}. "
+            "RED: filter_stale_count_snapshot_corrections is not yet wired into run()."
+        )
+        assert 'missing_deliverable' in flag_types, (
+            "Benign 'missing_deliverable' flag must survive the stale-snapshot filter; "
+            f"got items_flagged={report.items_flagged!r}"
+        )
+        assert report.stats.get('stale_count_snapshot_corrections_dropped') == 1, (
+            "run() must set report.stats['stale_count_snapshot_corrections_dropped'] = 1 "
+            "when one stale-snapshot-correction finding is dropped; "
+            f"got stats={report.stats!r}. "
+            "RED: stat not yet surfaced."
+        )
