@@ -2081,6 +2081,36 @@ class GitOps:
         )
         return [f for f in output.strip().splitlines() if f.strip()]
 
+    async def get_rebase_distance(self, old_base: str, new_base: str) -> int:
+        """Count commits in ``old_base..new_base`` (i.e. how far main advanced).
+
+        Returns the exact git rev-list count, or ``-1`` on any git error or
+        unparseable output.  -1 is a distinct sentinel so an unmeasurable
+        distance is never mistaken for a 0-commit (no-op) rebase.
+
+        Modelled on the ``rev-list --count`` + int-parse + fail-safe pattern
+        used in ``_freshen_main`` (line ~561) and
+        ``_branch_has_commits_beyond_main`` (line ~1508).
+        """
+        rc, out, _ = await _run(
+            ['git', 'rev-list', '--count', f'{old_base}..{new_base}'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.warning(
+                'get_rebase_distance: rev-list failed (rc=%d) for %s..%s',
+                rc, old_base, new_base,
+            )
+            return -1
+        try:
+            return int(out.strip())
+        except ValueError:
+            logger.warning(
+                'get_rebase_distance: unexpected output %r for %s..%s',
+                out, old_base, new_base,
+            )
+            return -1
+
     async def get_merge_diff_files(
         self, base_sha: str, head_sha: str,
     ) -> list[str]:
