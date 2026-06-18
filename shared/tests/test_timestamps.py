@@ -113,3 +113,34 @@ class TestFailureFallback:
         # The sentinel (datetime.min) must sort first — before the real timestamp
         assert mixed[0] == _DEFAULT_SENTINEL
         assert mixed[1] == dt_valid
+
+
+class TestCallerFallback:
+    """Caller-supplied ``fallback`` is returned on failure instead of the default sentinel."""
+
+    _CUSTOM_FB = datetime(2000, 1, 1, tzinfo=UTC)
+
+    def test_custom_fallback_returned_for_malformed_string(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            dt, ok = parse_timestamp_or_warn('bad', fallback=self._CUSTOM_FB)
+        assert ok is False
+        assert dt == self._CUSTOM_FB
+
+    def test_custom_fallback_returned_for_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            dt, ok = parse_timestamp_or_warn(None, fallback=self._CUSTOM_FB)
+        assert ok is False
+        assert dt == self._CUSTOM_FB
+
+    def test_custom_fallback_still_emits_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            parse_timestamp_or_warn('bad', fallback=self._CUSTOM_FB)
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+
+    def test_none_fallback_uses_default_sentinel(self, caplog):
+        """Explicit fallback=None → still use datetime.min sentinel (regression guard)."""
+        with caplog.at_level(logging.WARNING):
+            dt, ok = parse_timestamp_or_warn('bad', fallback=None)
+        assert ok is False
+        assert dt == _DEFAULT_SENTINEL
