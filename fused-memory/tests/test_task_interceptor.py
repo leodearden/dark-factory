@@ -4820,6 +4820,117 @@ class TestMultiProjectRoutingWiring:
         assert result is not None
         assert result['error_type'] == 'DarkFactoryPathScopeViolation'
 
+    @pytest.mark.asyncio
+    async def test_stage2_no_hit_adjudicator_not_called(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """NO-HIT hot path: when Stage-1 returns OK, the adjudicator is never called."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        # Fake adjudicator with a spy adjudicate method.
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock()
+        interceptor._path_scope_adjudicator = fake_adj
+
+        # Force OK verdict — no heuristic hit.
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: PathGuardVerdict(outcome='ok', project_id=p),
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'Normal task'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Allowed — no error dict.
+        assert result is None
+        # Adjudicator must NOT have been called on the no-hit path.
+        fake_adj.adjudicate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stage2_hit_allow_permits_creation_no_escalation(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """HIT + ALLOW: adjudicator confident allow → creation permitted, no escalation."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        # Adjudicator returns confident allow.
+        allow_verdict = AdjudicationVerdict(
+            verdict='allow',
+            reason='incidental example mention in description',
+            llm_used=True,
+        )
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock(return_value=allow_verdict)
+        interceptor._path_scope_adjudicator = fake_adj
+
+        # Spy escalator — must NOT be called on allow.
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        # Force Stage-1 rejection.
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='reify',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'Task mentioning fused-memory/ as example'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Adjudicator downgraded heuristic hit → creation permitted.
+        assert result is None
+        # Adjudicator was called exactly once.
+        fake_adj.adjudicate.assert_called_once()
+        # Escalator must NOT be called when adjudicator allows.
+        assert escalator_calls == []
+
 
 # ─────────────────────────────────────────────────────────────────────
 # planning_mode: synchronous, curator-bypassing submit_task path
