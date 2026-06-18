@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import types
 
 import pytest
 
@@ -245,6 +246,65 @@ class TestBrokenFifoFailOpen:
         )
         assert any('unthrottled' in m for m in msgs), (
             f"Expected 'unthrottled' in warning message, got: {msgs}"
+        )
+
+    def test_read_failure_after_open_closes_fd(self, fifo_path, monkeypatch, caplog):
+        """pytest_configure must close the opened fd when os.read raises OSError.
+
+        If os.open() succeeds (setting _fd) but os.read() raises OSError, the
+        except OSError branch must close the fd via _release() to prevent a
+        file descriptor leak.  Before the _release() fix, _release() only closed
+        _fd when _tok was also non-None; os.read() raises before _tok is assigned,
+        so the fd was silently leaked.
+
+        os.open is stubbed to return a sentinel fd without opening a real fd.
+        select.select is stubbed to report ready so execution proceeds to os.read.
+        os.close is stubbed to record calls so we can assert the fd was closed.
+        """
+        FAKE_FD = 99
+        closed_fds = []
+
+        monkeypatch.setenv('PYTEST_JOBSERVER_FIFO', fifo_path)
+        monkeypatch.setenv('PYTEST_JOBSERVER_TIMEOUT', '5.0')
+
+        # os.open succeeds and returns a fake fd (no real fd opened)
+        monkeypatch.setattr(_js.os, 'open', lambda path, flags: FAKE_FD)
+        # select.select reports the fd as ready so we reach os.read
+        fake_select = types.SimpleNamespace(
+            select=lambda r, w, x, t: (list(r), [], [])
+        )
+        monkeypatch.setattr(_js, 'select', fake_select)
+        # os.read raises OSError (simulates a corrupted or closed FIFO fd)
+        def _raise_read(fd, n):
+            raise OSError(9, 'Bad file descriptor')
+        monkeypatch.setattr(_js.os, 'read', _raise_read)
+        # Track os.close calls; do not delegate to avoid closing unrelated fds
+        monkeypatch.setattr(_js.os, 'close', lambda fd: closed_fds.append(fd))
+
+        with caplog.at_level(logging.WARNING, logger='shared.pytest_jobserver'):
+            _js.pytest_configure(config=None)
+
+        # Fail-open state: both globals must be None
+        assert _js._fd is None, 'Expected _fd to be None after OSError fail-open'
+        assert _js._tok is None, 'Expected _tok to be None after OSError fail-open'
+
+        # The fd that was opened must have been closed (no leak)
+        assert FAKE_FD in closed_fds, (
+            f'Expected fd {FAKE_FD} to be closed after OSError on os.read, '
+            f'but closed_fds={closed_fds}. _release() must close _fd regardless of _tok.'
+        )
+
+        # WARNING must still be emitted (same branch as test_broken_fifo_logs_warning)
+        jobserver_warnings = [
+            r for r in caplog.records
+            if r.name == 'shared.pytest_jobserver' and r.levelno >= logging.WARNING
+        ]
+        assert jobserver_warnings, (
+            'Expected at least one WARNING from shared.pytest_jobserver after OSError on read'
+        )
+        assert any('unthrottled' in r.getMessage() for r in jobserver_warnings), (
+            f"Expected 'unthrottled' in warning message, got: "
+            f"{[r.getMessage() for r in jobserver_warnings]}"
         )
 
 

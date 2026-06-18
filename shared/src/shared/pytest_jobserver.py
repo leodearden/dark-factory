@@ -68,6 +68,7 @@ def _release() -> None:
     if _tok is not None and _fd is not None:
         with contextlib.suppress(OSError):
             os.write(_fd, _tok)
+    if _fd is not None:
         with contextlib.suppress(OSError):
             os.close(_fd)
     _fd = None
