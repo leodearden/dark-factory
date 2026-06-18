@@ -3311,7 +3311,18 @@ class GitOps:
         )
 
     async def cleanup_worktree(self, worktree: Path, branch: str) -> None:
-        """Remove worktree and delete branch."""
+        """Remove worktree and delete branch.
+
+        **Pool-aware**: if *worktree* is a warm lane, routes to
+        :meth:`release_warm_lane` (retain worktree + ``target/``, flip FREE)
+        instead of removing.  Mirrors :meth:`cleanup_merge_worktree`'s
+        persistent-path no-op pattern.  Covers the workflow done-gate and all
+        harness reconcile call sites without touching each individually.
+        """
+        if self.warm_lane_pool is not None and self.warm_lane_pool.is_lane(worktree):
+            await self.release_warm_lane(worktree, branch)
+            return
+
         full_branch = f'{self.config.branch_prefix}{branch}'
 
         # Remove worktree
