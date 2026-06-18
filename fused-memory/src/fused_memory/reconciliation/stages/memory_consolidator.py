@@ -20,6 +20,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 from fused_memory.reconciliation.flag_dedup import (
     dedup_flags,
     filter_false_absence_flags,
+    filter_stale_count_snapshot_corrections,
     filter_terminal_metadata_flags,
 )
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
@@ -97,6 +98,18 @@ class MemoryConsolidator(BaseStage):
             return report
 
         if report.items_flagged:
+            # ── Stale count-snapshot correction filter (task-1786): drop false ────
+            # 'off-by-N correction' findings on stale-by-design task-count snapshot
+            # edges BEFORE dedup_flags so no stage1_flag_marker churn occurs.
+            # Pure, sync — no I/O needed (reads only the flag's own text fields).
+            # Surfaces dropped count as report.stats['stale_count_snapshot_corrections_dropped'].
+            _before_snapshot_filter = len(report.items_flagged)
+            report.items_flagged = filter_stale_count_snapshot_corrections(
+                report.items_flagged,
+            )
+            report.stats['stale_count_snapshot_corrections_dropped'] = (
+                _before_snapshot_filter - len(report.items_flagged)
+            )
             # ── Terminal-metadata guard (task-1725): drop stale_metadata flags for ──
             # cancelled/done tasks BEFORE dedup_flags so no marker write/delete churn
             # occurs.  Fail-safe: only drops on positively-confirmed terminal status.
