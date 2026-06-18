@@ -1442,3 +1442,207 @@ class TestSpecLaneAbortPathRelease:
             'REQUEUED abort path must route warm _spec- lanes to release_spec_lane '
             '(permanent pool leak otherwise)'
         )
+
+
+# ===========================================================================
+# Step-23: RED — _finalize_inflight terminal paths must RELEASE spec lanes
+# ===========================================================================
+
+
+def _make_finalize_test_worker(
+    tmp_path: Path,
+) -> tuple[SpeculativeMergeWorker, MagicMock]:
+    """Build a SpeculativeMergeWorker with async spies for finalize terminal-path tests.
+
+    Sets side-channel attributes needed by the rebased_pending_reverify path
+    (``_last_advanced_sha``, ``_rebased_from``, ``_rebased_onto``) so the gate-
+    retry test can trigger that path without real git I/O.
+    """
+    mock_git_ops = MagicMock()
+    mock_git_ops.project_root = tmp_path
+    mock_git_ops.release_spec_lane = AsyncMock()
+    mock_git_ops.cleanup_merge_worktree = AsyncMock()
+    mock_git_ops.advance_main = AsyncMock()
+    mock_git_ops.get_main_sha = AsyncMock(return_value='deadbeef' * 5)
+    # Side-channel attrs read by the rebased_pending_reverify path
+    mock_git_ops._last_advanced_sha = 'aa' * 20
+    mock_git_ops._rebased_from = 'bb' * 20
+    mock_git_ops._rebased_onto = 'cc' * 20
+    worker = SpeculativeMergeWorker(mock_git_ops, asyncio.Queue())
+    return worker, mock_git_ops
+
+
+@pytest.mark.asyncio
+class TestSpecLaneFinalizeTerminalRelease:
+    """_finalize_inflight non-advanced terminal paths must release spec lanes, not remove.
+
+    RED: all four terminal cleanup sites call
+    ``_cleanup_owned_merge_worktree(merge_wt)`` unconditionally:
+      (a) gate-retry-exhausted     ~8226
+      (b) HALT_ADVANCE_RESULTS + request-abandoned  ~8263
+      (c) advance-failure non-CAS  ~8270
+      (d) CAS-retry-exhausted      ~8294
+
+    When ``merge_wt`` is a warm _spec- lane (``_vr_spec_warm=True``),
+    ``cleanup_merge_worktree`` destroys the lane while WarmLanePool still has
+    it ASSIGNED → permanent pool leak.
+
+    GREEN (step-24): all four sites call
+    ``_release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)`` which routes
+    to ``release_spec_lane(lane, warm=True)`` for warm spec lanes.
+    """
+
+    async def test_gate_retry_exhausted_releases_spec_lane(self, tmp_path: Path):
+        """Gate-retry-exhausted path (~8226) must release_spec_lane for a warm lane.
+
+        Drive: advance_main returns 'rebased_pending_reverify' > MAX_CAS_RETRIES=5
+        times; _reverify_rebased_tree returns None (gate clears each iteration).
+        After the 6th gate attempt gate_total=6 > 5 → exhausted path fires.
+
+        RED: _cleanup_owned_merge_worktree(merge_wt) called → spec lane removed.
+        GREEN (step-24): _release_or_cleanup routes to release_spec_lane.
+        """
+        cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
+        worker, mock_git_ops = _make_finalize_test_worker(tmp_path)
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        item.request.task_id = 'task-gate-exhaust'
+
+        # vr with spec_warm=True so _vr_spec_warm is True in _finalize_inflight
+        vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
+        entry = _build_entry(item, vr, merge_wt=fake_lane)
+
+        # Always return 'rebased_pending_reverify' to spin the gate-retry loop
+        mock_git_ops.advance_main.return_value = 'rebased_pending_reverify'
+
+        with patch(
+            'orchestrator.merge_queue._reverify_rebased_tree',
+            new=AsyncMock(return_value=None),  # gate clears every iteration
+        ):
+            await worker._finalize_inflight(entry)
+
+        # After 6 gate-retry iterations (gate_total=6 > MAX_CAS_RETRIES=5):
+        # GREEN: release_spec_lane(fake_lane, warm=True) called once
+        mock_git_ops.release_spec_lane.assert_called_once_with(fake_lane, warm=True)
+        cleaned = [c.args[0] for c in mock_git_ops.cleanup_merge_worktree.call_args_list]
+        assert fake_lane not in cleaned, (
+            'gate-retry-exhausted path must call release_spec_lane, '
+            'not cleanup_merge_worktree on warm _spec- lane'
+        )
+
+    async def test_halt_abandoned_releases_spec_lane(self, tmp_path: Path):
+        """HALT_ADVANCE_RESULTS + request-abandoned path (~8263) must release_spec_lane.
+
+        Drive: advance_main side-effect cancels req.result then returns 'wip_overlap'
+        (in _HALT_ADVANCE_RESULTS) so the short-circuit check (8099) is bypassed
+        but the CAS-loop halt-abandoned branch fires.
+
+        RED: _cleanup_owned_merge_worktree called → spec lane removed.
+        GREEN (step-24): _release_or_cleanup routes to release_spec_lane.
+        """
+        cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
+        worker, mock_git_ops = _make_finalize_test_worker(tmp_path)
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        item.request.task_id = 'task-halt-abandoned'
+
+        vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
+        entry = _build_entry(item, vr, merge_wt=fake_lane)
+
+        req = item.request
+
+        async def _advance_and_cancel(*args, **kwargs):  # noqa: ARG001
+            # Cancel req.result DURING advance_main so _request_abandoned is
+            # True in the CAS loop but False at the pre-loop short-circuit (8099).
+            req.result.cancel()
+            return 'wip_overlap'
+
+        mock_git_ops.advance_main.side_effect = _advance_and_cancel
+
+        await worker._finalize_inflight(entry)
+
+        mock_git_ops.release_spec_lane.assert_called_once_with(fake_lane, warm=True)
+        cleaned = [c.args[0] for c in mock_git_ops.cleanup_merge_worktree.call_args_list]
+        assert fake_lane not in cleaned, (
+            'halt-abandoned path must call release_spec_lane, '
+            'not cleanup_merge_worktree on warm _spec- lane'
+        )
+
+    async def test_advance_failure_non_cas_releases_spec_lane(self, tmp_path: Path):
+        """Advance-failure non-CAS path (~8270) must release_spec_lane for a warm lane.
+
+        Drive: advance_main returns 'merge_conflict' (not in _HALT_ADVANCE_RESULTS,
+        not 'cas_failed', not 'advanced', not 'rebased_pending_reverify') so the
+        ``if result != 'cas_failed':`` branch fires; _map_advance_failure patched.
+
+        RED: _cleanup_owned_merge_worktree called → spec lane removed.
+        GREEN (step-24): _release_or_cleanup routes to release_spec_lane.
+        """
+        cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
+        worker, mock_git_ops = _make_finalize_test_worker(tmp_path)
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        item.request.task_id = 'task-advance-fail'
+
+        vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
+        entry = _build_entry(item, vr, merge_wt=fake_lane)
+
+        # 'merge_conflict' is not in _HALT_ADVANCE_RESULTS and not 'cas_failed'
+        mock_git_ops.advance_main.return_value = 'merge_conflict'
+
+        with patch(
+            'orchestrator.merge_queue._map_advance_failure',
+            new=AsyncMock(return_value=MergeOutcome('blocked', reason='conflict-test')),
+        ):
+            await worker._finalize_inflight(entry)
+
+        mock_git_ops.release_spec_lane.assert_called_once_with(fake_lane, warm=True)
+        cleaned = [c.args[0] for c in mock_git_ops.cleanup_merge_worktree.call_args_list]
+        assert fake_lane not in cleaned, (
+            'advance-failure non-CAS path must call release_spec_lane, '
+            'not cleanup_merge_worktree on warm _spec- lane'
+        )
+
+    async def test_cas_retry_exhausted_releases_spec_lane(self, tmp_path: Path):
+        """CAS-retry-exhausted path (~8294) must release_spec_lane for a warm lane.
+
+        Drive: advance_main returns 'cas_failed' > MAX_CAS_RETRIES=5 times
+        (total=6 > 5 → exhausted path fires).
+
+        RED: _cleanup_owned_merge_worktree called → spec lane removed.
+        GREEN (step-24): _release_or_cleanup routes to release_spec_lane.
+        """
+        cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
+        worker, mock_git_ops = _make_finalize_test_worker(tmp_path)
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        item.request.task_id = 'task-cas-exhaust'
+
+        vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
+        entry = _build_entry(item, vr, merge_wt=fake_lane)
+
+        # Always return 'cas_failed' to spin the CAS-retry loop
+        mock_git_ops.advance_main.return_value = 'cas_failed'
+
+        await worker._finalize_inflight(entry)
+
+        # After 6 cas_failed iterations (total=6 > MAX_CAS_RETRIES=5):
+        # GREEN: release_spec_lane(fake_lane, warm=True) called once
+        mock_git_ops.release_spec_lane.assert_called_once_with(fake_lane, warm=True)
+        cleaned = [c.args[0] for c in mock_git_ops.cleanup_merge_worktree.call_args_list]
+        assert fake_lane not in cleaned, (
+            'cas-retry-exhausted path must call release_spec_lane, '
+            'not cleanup_merge_worktree on warm _spec- lane'
+        )
