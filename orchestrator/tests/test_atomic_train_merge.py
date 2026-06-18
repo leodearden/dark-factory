@@ -787,7 +787,16 @@ class TestScenario5GroupMergeVerify:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue)
-        outcome = await worker._do_merge(req)
+
+        # Override the autouse _mock_merge_queue_verification fixture (which
+        # forces passed=True) so the post-merge gate runs REAL cargo against the
+        # assembled tip — γ's broken edit must drive a blocked outcome.  Mirrors
+        # the GREEN sibling's spy (test_group_merge_workspace_verify_green).
+        async def _spy_verify(*args, **kwargs):
+            return await run_scoped_verification(*args, **kwargs)
+
+        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
+            outcome = await worker._do_merge(req)
 
         # (i) Outcome is blocked (not done).
         assert outcome is not None
