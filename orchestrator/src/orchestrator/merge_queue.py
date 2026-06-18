@@ -9303,6 +9303,35 @@ async def _run_cold_shadow_verify(
         await git_ops.cleanup_merge_worktree(wt)
 
 
+def _persistent_alarm_tests(
+    diff1: ShadowCompareDiff,
+    diff2: ShadowCompareDiff,
+) -> set[str]:
+    """Return the alarm-worthy test ids that diverge in BOTH cold runs.
+
+    Used by the Option-B re-confirmation logic: only a test that is
+    alarm-worthy in *diff1* (first cold run) AND in *diff2* (second cold run)
+    is considered a genuine persistent divergence worthy of a born-at-L2 alarm.
+    Tests that appear alarm-worthy only in one run are treated as execution
+    flakiness and silently discarded.
+
+    An alarm-worthy test is one present in any of the three alarm-worthy
+    buckets: :attr:`~ShadowCompareDiff.diverging`,
+    :attr:`~ShadowCompareDiff.only_warm`, or
+    :attr:`~ShadowCompareDiff.only_cold`.
+
+    Args:
+        diff1: Diff between warm results and the first cold run.
+        diff2: Diff between warm results and the second (re-confirmation) cold run.
+
+    Returns:
+        The intersection of alarm-worthy test ids across both diffs.
+    """
+    alarm1: set[str] = set(diff1.diverging) | set(diff1.only_warm) | set(diff1.only_cold)
+    alarm2: set[str] = set(diff2.diverging) | set(diff2.only_warm) | set(diff2.only_cold)
+    return alarm1 & alarm2
+
+
 async def _run_shadow_compare(
     git_ops: GitOps,
     req: MergeRequest,
@@ -9318,13 +9347,18 @@ async def _run_shadow_compare(
     1. Runs a cold verify on *merge_commit* via :func:`_run_cold_shadow_verify`
        in a throwaway ``_merge-<uuid>`` worktree (off the serial lane).
     2. Diffs the cold results against *warm_results* via :func:`diff_per_test_results`.
-    3. On per-test divergence: submits a born-at-L2 critical escalation via
-       :func:`_submit_shadow_divergence_escalation` naming the diverging tests
-       and explicitly stating the warm merge has ALREADY LANDED.
-    4. On agreement (no divergence): emits an :attr:`~orchestrator.event_store.EventType.verdict_parity_ok`
-       event (mirrors :class:`~orchestrator.verify_runner.DriftDetector`).
+    3. **On alarm-worthy divergence (Option B re-confirmation)**: re-runs the cold
+       leg once and escalates via :func:`_submit_shadow_divergence_escalation` ONLY
+       when the same alarm-worthy tests persist across both cold runs.  A divergence
+       that clears on the second run is logged at WARNING as transient/flaky with no
+       alarm and no parity-ok event.  If the re-confirmation cold run itself returns
+       empty results (build/infra hiccup), the result is treated as inconclusive.
+    4. On agreement (no alarm-worthy divergence after the first run): emits an
+       :attr:`~orchestrator.event_store.EventType.verdict_parity_ok` event
+       (mirrors :class:`~orchestrator.verify_runner.DriftDetector`).  This path
+       also covers inconclusive-only diffs (``has_divergence`` is False by design).
 
-    **Exception handling**: any exception from the cold leg is logged at WARNING
+    **Exception handling**: any exception from either cold leg is logged at WARNING
     level and swallowed.  A shadow/detective control must never crash or stall
     the merge worker — it runs off the critical serial lane via
     ``asyncio.create_task`` (see :func:`_maybe_schedule_shadow_compare`).
@@ -9334,7 +9368,7 @@ async def _run_shadow_compare(
         req: The :class:`MergeRequest` that warm-landed (provides config +
              module_configs for the cold verify spec).
         merge_commit: The just-landed merge commit SHA.
-        warm_results: Per-test pass/fail map captured from the warm verify run.
+        warm_results: Per-test verdict map captured from the warm verify run.
         escalation_queue: Live escalation queue, or ``None`` (None-safe).
         event_store: Optional event store for parity-ok event emission.
     """
@@ -9368,12 +9402,58 @@ async def _run_shadow_compare(
         )
         return
 
-    diff = diff_per_test_results(warm_results, cold_results)
+    diff1 = diff_per_test_results(warm_results, cold_results)
 
-    if diff.has_divergence:
-        _submit_shadow_divergence_escalation(
-            escalation_queue, merge_commit, diff, warm_results, cold_results
-        )
+    if diff1.has_divergence:
+        # Option B: Re-confirm the divergence with a second independent cold run.
+        # Escalate only on the intersection of alarm-worthy tests that persist
+        # across both runs; a transient flip that clears on re-run is not alarmed.
+        try:
+            cold2 = await _run_cold_shadow_verify(
+                git_ops, req, merge_commit, event_store
+            )
+        except Exception:
+            logger.warning(
+                'Shadow compare re-confirmation cold leg failed for %s — '
+                'swallowing exception; treating divergence as inconclusive',
+                merge_commit[:8],
+                exc_info=True,
+            )
+            return
+
+        # Empty-cold inconclusive guard for the re-confirmation run
+        if not cold2 and warm_results:
+            logger.warning(
+                'Shadow compare re-confirmation inconclusive for %s: second cold '
+                'leg produced no parseable test results; not alarming',
+                merge_commit[:8],
+            )
+            return
+
+        diff2 = diff_per_test_results(warm_results, cold2)
+        persistent = _persistent_alarm_tests(diff1, diff2)
+
+        if persistent:
+            # Build a ShadowCompareDiff restricted to the persistently-diverging
+            # tests only; pass cold2 as the definitive cold result.
+            restricted_diff = ShadowCompareDiff(
+                diverging={t: v for t, v in diff2.diverging.items() if t in persistent},
+                warm_pass_cold_fail=[t for t in diff2.warm_pass_cold_fail if t in persistent],
+                warm_fail_cold_pass=[t for t in diff2.warm_fail_cold_pass if t in persistent],
+                only_warm=[t for t in diff2.only_warm if t in persistent],
+                only_cold=[t for t in diff2.only_cold if t in persistent],
+            )
+            _submit_shadow_divergence_escalation(
+                escalation_queue, merge_commit, restricted_diff, warm_results, cold2
+            )
+        else:
+            # Divergence cleared on re-confirmation — transient/flaky, not a real issue.
+            logger.warning(
+                'Shadow compare divergence on %s was transient/flaky (did not '
+                'persist across re-confirmation run); not alarming',
+                merge_commit[:8],
+            )
+        # No parity-ok event in either sub-case — result is uncertain
     else:
         # Parity OK — emit event (mirrors DriftDetector.check verdict_parity_ok)
         if event_store is not None:
