@@ -30,7 +30,10 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_REPORT_SCHEMA,
     build_summary_nonce_section,
 )
-from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+from fused_memory.reconciliation.flag_dedup import (
+    compute_flag_signature,
+    filter_blocked_snapshot_findings,
+)
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
     _STAGE3_PROJECT_ID_GUIDELINE,
@@ -2463,13 +2466,33 @@ class IntegrityCheck(BaseStage):
     ) -> StageReport:
         """Execute Stage 3 and post-process with task-dump spot-check.
 
-        Calls super().run() first (LLM agent + report extraction), then
-        record_task_dump_spot_check() to record a non-destructive observability
-        stat when the cached task tree contains contamination signals.
+        Calls super().run() first (LLM agent + report extraction), then:
+        1. Applies filter_blocked_snapshot_findings() to suppress false-positive
+           task-count snapshot findings for projects with blocked-by-design write
+           paths (e.g. autopilot_video).  Records
+           report.stats['blocked_snapshot_findings_dropped'] = before - after.
+        2. Calls record_task_dump_spot_check() to record a non-destructive
+           observability stat when the cached task tree contains contamination
+           signals.
 
         Mirrors MemoryConsolidator.run() override structure (Stage 1).
         """
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
+
+        # Layer 3 (finding-side) gate for blocked-snapshot false positives.
+        # Mirrors the filter_stale_count_snapshot_corrections idiom in
+        # MemoryConsolidator.run() (stages/memory_consolidator.py:115-150).
+        if report.items_flagged:
+            _before = len(report.items_flagged)
+            report.items_flagged = filter_blocked_snapshot_findings(
+                report.items_flagged, project_id=self.project_id
+            )
+            report.stats['blocked_snapshot_findings_dropped'] = (
+                _before - len(report.items_flagged)
+            )
+        else:
+            report.stats['blocked_snapshot_findings_dropped'] = 0
+
         self.record_task_dump_spot_check(report)
         return report
 
