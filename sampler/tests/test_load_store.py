@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Step-5 tests: schema creation, pragmas, insert, idempotent open
 # ---------------------------------------------------------------------------
