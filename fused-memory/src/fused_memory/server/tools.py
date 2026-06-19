@@ -2370,6 +2370,7 @@ def create_mcp_server(
         metadata: str | dict[str, Any] | None = None,
         tag: str | None = None,
         planning_mode: bool = False,
+        routing_override_reason: str = '',
     ) -> dict[str, Any]:
         """Phase-1 of two-phase task creation: persist a ticket and return its id immediately.
 
@@ -2407,6 +2408,12 @@ def create_mcp_server(
                 decomposition sessions where you do not want curator
                 deduplication to recombine sibling tasks.  Persists
                 ``human_decomposed=True`` in task metadata.
+            routing_override_reason: When set (non-empty), the path guards are
+                skipped and the task is filed in the submitting project.  The
+                reason is recorded on task metadata and emitted as a WARNING
+                audit log so a deliberate override is greppable.  Use only
+                when sure the task belongs to the submitting project.  If
+                unsure, escalate rather than risking a mis-filed task.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -2424,6 +2431,7 @@ def create_mcp_server(
                 metadata=metadata,
                 tag=tag,
                 planning_mode=planning_mode,
+                routing_override_reason=routing_override_reason,
             )
         except Exception as e:
             logger.error(f'submit_task error: {e}')
