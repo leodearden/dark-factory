@@ -4102,6 +4102,77 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         assert result.lint_command == 'uv run ruff check tests/scripts/test_spawn_claude.py'
 
 
+class TestBuildFallbackConfigDataModule:
+    """``_build_fallback_config`` must not pass non-test data modules to pytest.
+
+    A data module under tests/ (e.g. 'tests/some_data.py') satisfies
+    _is_test_file (path.startswith('tests/')) but is NOT pytest-collectable.
+    Passing it to pytest produces rc=5 ("no tests ran") → RED.
+    Task 1852 fixes this in the scoping layer; these tests guard the fix.
+    """
+
+    def test_lone_data_module_bare_pytest_yields_none(self):
+        """A lone data module under tests/ with no config must yield test_command=None.
+
+        Current (broken) code: 'pytest tests/some_data.py' → rc=5 → RED.
+        Fixed code: no collectable tests → test_command = None (skip, not false RED).
+        """
+        result = _build_fallback_config(['tests/some_data.py'])
+        assert result is not None, 'should return a config (py file present)'
+        assert result.test_command is None, (
+            f'Expected None (no collectable tests), got {result.test_command!r}'
+        )
+
+    def test_lone_data_module_with_nonconfigured_pytest_yields_none(self):
+        """A lone data module with config.test_command == 'pytest' (the default) → None.
+
+        The bare-pytest branch has no owning module suite; targeting the data
+        module's parent dir risks rc=5 too (a fixtures dir with no tests).
+        """
+        config = OrchestratorConfig(
+            project_root='/fake',
+            test_command='pytest',
+        )
+        result = _build_fallback_config(['tests/some_data.py'], config)
+        assert result is not None
+        assert result.test_command is None, (
+            f'Expected None (bare pytest, lone data module), got {result.test_command!r}'
+        )
+
+    def test_data_module_with_nonconfigured_pytest_uses_full_suite(self):
+        """A data module with a non-default config test_command → full suite (GREEN).
+
+        When a real configured suite exists, using it is strictly safer than
+        yielding None (still runs real tests; no rc=5).  This is the fail-safe
+        path for non-default test_command in the fallback builder.
+        """
+        config = OrchestratorConfig(
+            project_root='/fake',
+            test_command="uv run --extra dev pytest -m 'not slow'",
+        )
+        result = _build_fallback_config(['tests/some_data.py'], config)
+        assert result is not None
+        assert result.test_command == config.test_command, (
+            f'Expected full suite {config.test_command!r}, got {result.test_command!r}'
+        )
+
+    def test_data_module_plus_collectable_test_bare_pytest_scopes_to_test_only(self):
+        """Data module + collectable test on bare pytest → scoped to test file only.
+
+        Current (broken) code: 'pytest tests/some_data.py tests/test_x.py' (contains data file).
+        Fixed code: 'pytest tests/test_x.py' (data file excluded from pytest target).
+        """
+        result = _build_fallback_config(['tests/some_data.py', 'tests/test_x.py'])
+        assert result is not None
+        assert result.test_command is not None
+        assert 'some_data.py' not in (result.test_command or ''), (
+            f'Data file must not appear in pytest target, got {result.test_command!r}'
+        )
+        assert 'tests/test_x.py' in (result.test_command or ''), (
+            f'Expected test_x.py in scoped command, got {result.test_command!r}'
+        )
+
+
 class TestPruneArchiveDedupedAtAggregateSite:
     """Tests ensuring ``_prune_archive`` is called exactly once per
     ``run_scoped_verification``, not once-per-module inside
