@@ -11840,3 +11840,147 @@ class TestPretrimStage2SummaryPool:
         assert call_kwargs['store'] == 'mem0'
         assert call_kwargs['causation_id'] == 'run-check'
         assert call_kwargs['_source'] == 'stage2_cycle_summary_trim'
+
+
+# ---------------------------------------------------------------------------
+# step-5 (RED) / step-6 (GREEN): IntegrityCheck.run() blocked-snapshot wiring
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrityCheckBlockedSnapshotWiring:
+    """IntegrityCheck.run() must apply filter_blocked_snapshot_findings and
+    surface report.stats['blocked_snapshot_findings_dropped'].
+
+    Mirrors TestIntegrityCheckRecordTaskDumpSpotCheck's mock_deps fixture and
+    the test_stage1.py TestStaleCountSnapshotCorrectionWiring pattern.
+
+    RED until step-6 wires filter_blocked_snapshot_findings into run() and
+    sets the stat.
+    """
+
+    @pytest.fixture
+    def config(self):
+        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+
+    @pytest.fixture
+    def mock_deps(self, config):
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_snapshot_finding_dropped_and_benign_survives_for_blocked_project(
+        self, mock_deps
+    ):
+        """Snapshot missing_knowledge finding is DROPPED and benign finding SURVIVES
+        for project_id='autopilot_video'; stat is set to 1.
+
+        RED: run() does not yet apply the filter or set the stat.
+        """
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'autopilot_video'
+        stage.filtered_task_tree = None
+
+        snapshot_flag = {
+            'task_id': None,
+            'flag_type': 'missing_knowledge',
+            'category': 'missing_knowledge',
+            'description': 'autopilot_video has no task-count snapshot temporal_fact edge',
+            'suggested_action': 'Add a count snapshot temporal_fact for autopilot_video',
+            'actionable': False,
+        }
+        benign_flag = {
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'category': 'missing_deliverable',
+            'description': 'task 42 has no design doc',
+            'suggested_action': 'Add a design doc',
+            'actionable': True,
+        }
+
+        base_report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[snapshot_flag, benign_flag],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='autopilot_video'),
+                prior_reports=[],
+                run_id='run-1840',
+            )
+
+        categories = [f.get('category') for f in report.items_flagged]
+        assert 'missing_knowledge' not in categories, (
+            "Snapshot missing_knowledge finding must be DROPPED for autopilot_video; "
+            f"got items_flagged={report.items_flagged!r}"
+        )
+        assert 'missing_deliverable' in categories, (
+            "Benign missing_deliverable finding must SURVIVE the snapshot filter; "
+            f"got items_flagged={report.items_flagged!r}"
+        )
+        assert report.stats.get('blocked_snapshot_findings_dropped') == 1, (
+            "run() must set report.stats['blocked_snapshot_findings_dropped'] = 1; "
+            f"got stats={report.stats!r}. RED: stat not yet surfaced."
+        )
+
+    @pytest.mark.asyncio
+    async def test_both_findings_survive_for_non_blocked_project(self, mock_deps):
+        """For project_id='dark_factory' (not in blocked set), BOTH findings survive;
+        blocked_snapshot_findings_dropped == 0.
+
+        RED: run() does not yet apply the filter or set the stat.
+        """
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.filtered_task_tree = None
+
+        snapshot_flag = {
+            'task_id': None,
+            'flag_type': 'missing_knowledge',
+            'category': 'missing_knowledge',
+            'description': 'dark_factory has no task-count snapshot temporal_fact edge',
+            'suggested_action': 'Add a count snapshot',
+            'actionable': False,
+        }
+        benign_flag = {
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'category': 'missing_deliverable',
+            'description': 'task 42 has no design doc',
+            'suggested_action': 'Add a design doc',
+            'actionable': True,
+        }
+
+        base_report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[snapshot_flag, benign_flag],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='run-1840',
+            )
+
+        assert len(report.items_flagged) == 2, (
+            "Both findings must survive for non-blocked project 'dark_factory'; "
+            f"got items_flagged={report.items_flagged!r}"
+        )
+        assert report.stats.get('blocked_snapshot_findings_dropped') == 0, (
+            "run() must set report.stats['blocked_snapshot_findings_dropped'] = 0 "
+            "when no flags are dropped; "
+            f"got stats={report.stats!r}"
+        )
