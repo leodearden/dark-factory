@@ -6883,7 +6883,7 @@ class TestExternalDepFlatShapeSeam:
     production fail-safe-waited forever.
 
     The producer (fused-memory tools.py get_external_statuses) returns a BARE
-    flat {dep: status} dict — `return result` at tools.py:2231, NO 'statuses' wrapper.
+    flat {dep: status} dict — `return result` in fused-memory tools.py get_external_statuses, NO 'statuses' wrapper.
     Driving that REAL shape through scheduler.get_external_statuses AND into
     _deps_satisfied asserts the full dispatch gate (user-observable signal).
 

@@ -134,10 +134,11 @@ def parse_tool_result(
     **Whole-inner-dict mode** (``key=None``):
 
     Returns ``(inner, None)`` after the ``{data:{…}}`` unwrap step, provided
-    the inner payload is a dict (``expected_type=dict`` is implied by the
-    INNER_NOT_DICT guard).  ``KEY_ABSENT`` and ``WRONG_TYPE`` do not apply —
-    the entire inner dict is returned as-is.  ``NO_TEXT_BLOCK``,
-    ``JSON_DECODE_ERROR``, ``INNER_NOT_DICT``, and ``RAISED`` still fail loud.
+    the inner payload is a dict and ``isinstance(inner, expected_type)`` holds
+    (callers should pass ``expected_type=dict``; a mismatched type fails with
+    ``WRONG_TYPE``).  ``KEY_ABSENT`` does not apply — the entire inner dict is
+    returned as-is.  ``NO_TEXT_BLOCK``, ``JSON_DECODE_ERROR``,
+    ``INNER_NOT_DICT``, ``WRONG_TYPE``, and ``RAISED`` still fail loud.
 
     For **every** other outcome (including non-raising malformed payloads)
     exactly **one** ``logger.warning`` is emitted naming the shape, and the
@@ -188,6 +189,12 @@ def parse_tool_result(
 
         # --- whole-inner-dict mode: key=None returns the entire inner dict -----
         if key is None:
+            # Validate expected_type so the parameter retains meaning even when
+            # key=None.  inner is already guaranteed a dict by the INNER_NOT_DICT
+            # guard above, but an incorrect expected_type (e.g. list) would slip
+            # through silently without this check.
+            if not isinstance(inner, expected_type):
+                return _fail(EnvelopeShape.WRONG_TYPE, key, inner)
             return inner, None
 
         # --- key presence (membership test — NOT .get) -------------------------
