@@ -2851,6 +2851,18 @@ async def run_main_tip_sweep(
 
         # Run full (unscoped) verification — all discovered subprojects, no scope filter.
         result = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
+
+        # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
+        # xdist worker was killed by os._exit).  Treat it as an infra failure — return
+        # the None sentinel so the harness retries next tick and files no false-positive
+        # drift L1.  The finally block's worktree cleanup still runs.
+        if result.category == 'pytest_internalerror':
+            logger.warning(
+                'run_main_tip_sweep: pytest INTERNALERROR in sweep — '
+                'treating as infra crash, not drift (retrying next tick)'
+            )
+            return None
+
         return (main_sha, result)
 
     except Exception:
