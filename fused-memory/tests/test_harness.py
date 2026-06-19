@@ -865,6 +865,7 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
     )
 
     # Events must have been restored to the buffer
+    assert stats is not None
     assert stats['size'] == 2, (
         f'Expected buffer size=2 after timeout, got {stats["size"]}. '
         'Bug 5: restore_drained is not called on CancelledError.'
