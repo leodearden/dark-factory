@@ -1674,6 +1674,14 @@ class Scheduler:
             #   (_external_resolver_degraded_counts).  At threshold, escalate via
             #   _on_external_dep_block(category='infra_issue') — a PERMANENT
             #   resolver/parse/transport failure must reach a human (task 1855).
+            #
+            # NOTE — blast radius: a resolver outage that lasts N consecutive
+            # ticks (N = max_external_dep_unresolved_cycles) terminally blocks
+            # ALL pending tasks that have external_deps in the same tick.  Each
+            # requires manual re-pending after the resolver/dep is fixed.  This
+            # is intentional "prefer-loud" design: a silent, permanent outage is
+            # worse than noisy recovery work.  Operators who want a longer
+            # tolerance window should raise max_external_dep_unresolved_cycles.
             for task in pending_tasks:
                 task_id = str(task.get('id', '?'))
                 external_deps: list = (
