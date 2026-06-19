@@ -849,6 +849,16 @@ class Scheduler:
         # emitted external_dep_gate_held.cause always reflects the dominant
         # (consecutive-run) reason, not a mixed accumulation.
         self._external_hold_cause: dict[str, str] = {}
+        # Per-task_id count of CONSECUTIVE ticks where the resolver was degraded
+        # (external_err is not None).  Keyed by task_id (str) — whole-tick
+        # granularity (the resolver fails for every dep on a tick, so per-dep
+        # keying is unnecessary).  At threshold, the task is escalated via
+        # _on_external_dep_block(category='infra_issue') so a PERMANENT
+        # resolver/parse/transport failure reaches a human instead of waiting
+        # silently forever (prefer-loud backstop, task 1855).
+        # Process-local; GC'd in the per-tick stale-id sweep alongside
+        # _external_hold_streak / _external_hold_cause.
+        self._external_resolver_degraded_counts: dict[str, int] = {}
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -1658,21 +1668,67 @@ class Scheduler:
         if external_err is not None:
             # Resolver-degraded tick: fail-safe wait with visibility at threshold.
             # - NO sentinel-counter bumps (fail-safe invariant from task 1580).
-            # - NO escalation (may recover next tick).
             # - Bump hold streak for every pending task with external deps so the
             #   hold becomes dashboard-visible once it persists too long.
+            # - Also bump the per-task resolver-degraded consecutive-tick counter
+            #   (_external_resolver_degraded_counts).  At threshold, escalate via
+            #   _on_external_dep_block(category='infra_issue') — a PERMANENT
+            #   resolver/parse/transport failure must reach a human (task 1855).
             for task in pending_tasks:
                 task_id = str(task.get('id', '?'))
                 external_deps: list = (
                     (task.get('metadata') or {}).get('external_deps') or []
                 )
-                if external_deps:
-                    self._note_external_hold(
-                        task_id,
-                        cause='resolver_degraded',
-                        threshold=threshold,
-                        detail=str(external_err),
-                    )
+                if not external_deps:
+                    continue
+                count = self._external_resolver_degraded_counts.get(task_id, 0) + 1
+                self._external_resolver_degraded_counts[task_id] = count
+                if count >= threshold:
+                    # Pop so the next crossing (if it persists) fires again —
+                    # mirrors the sentinel re-fire pattern.
+                    self._external_resolver_degraded_counts.pop(task_id, None)
+                    if self._on_external_dep_block is not None:
+                        summary = (
+                            f'EXTERNAL_DEP_RESOLVER_DEGRADED: task {task_id} — '
+                            f'external-dep resolver degraded for {count} consecutive ticks'
+                        )
+                        detail = (
+                            f'The external-dep resolver failed for {count} consecutive '
+                            f'ticks (threshold={threshold}).  This indicates a persistent '
+                            f'resolver/parse/transport failure, not a transient blip.  '
+                            f'Task {task_id} is gated until the resolver recovers.  '
+                            f'Once the underlying issue is fixed, manually set task '
+                            f'{task_id} back to pending to reopen it — blocked tasks '
+                            f'are not re-evaluated automatically.  '
+                            f'(prefer-loud backstop, task 1855)'
+                        )
+                        await self._on_external_dep_block(
+                            task_id,
+                            summary=summary,
+                            detail=detail,
+                            category='infra_issue',
+                        )
+                        # Clear the hold streak so no spurious gate_held event fires
+                        # for a task being terminally blocked (mirrors blocked_this_tick
+                        # suppression in the non-degraded branch).
+                        self._external_hold_streak.pop(task_id, None)
+                        self._external_hold_cause.pop(task_id, None)
+                        continue
+                    else:
+                        logger.warning(
+                            'Task %s: external-dep resolver degraded for %d consecutive '
+                            'ticks (threshold=%d) — no _on_external_dep_block callback '
+                            'installed; falling through to visibility-only hold event',
+                            task_id,
+                            count,
+                            threshold,
+                        )
+                self._note_external_hold(
+                    task_id,
+                    cause='resolver_degraded',
+                    threshold=threshold,
+                    detail=str(external_err),
+                )
             return
 
         for task in pending_tasks:
@@ -2805,12 +2861,18 @@ class Scheduler:
             ]
             for k in _stale_local_keys:
                 del self._local_backfill_unresolved_counts[k]
-        # _external_hold_streak and _external_hold_cause are keyed by task_id
-        # (str); GC alongside _external_unresolved_counts so they stay bounded.
-        if _stale_ids and (self._external_hold_streak or self._external_hold_cause):
+        # _external_hold_streak, _external_hold_cause, and
+        # _external_resolver_degraded_counts are keyed by task_id (str); GC
+        # alongside _external_unresolved_counts so they stay bounded.
+        if _stale_ids and (
+            self._external_hold_streak
+            or self._external_hold_cause
+            or self._external_resolver_degraded_counts
+        ):
             for tid in _stale_ids:
                 self._external_hold_streak.pop(tid, None)
                 self._external_hold_cause.pop(tid, None)
+                self._external_resolver_degraded_counts.pop(tid, None)
 
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
