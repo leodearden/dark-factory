@@ -51,6 +51,19 @@ FAILING_RESULT = VerifyResult(
     category='test_failure',
 )
 
+INTERNALERROR_RESULT = VerifyResult(
+    passed=False,
+    test_output=(
+        'INTERNALERROR> Traceback (most recent call last):\n'
+        'INTERNALERROR>   KeyError: <WorkerController gw3>\n'
+    ),
+    lint_output='',
+    type_output='',
+    summary='pytest_internalerror',
+    cause_hint='INTERNALERROR> KeyError: <WorkerController gw3>',
+    category='pytest_internalerror',
+)
+
 
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
     return OrchestratorConfig(
@@ -231,3 +244,51 @@ class TestRunMainTipSweepFailSafes:
         # Cleanup must run even when verify fails
         remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
         assert remove_calls, 'git worktree remove should run even when verify fails (cleanup-on-failure)'
+
+    def test_run_main_tip_sweep_internalerror_returns_none(self, tmp_path: Path) -> None:
+        """When run_full_verification returns category='pytest_internalerror',
+        run_main_tip_sweep returns None (the infra sentinel) and the git worktree
+        remove cleanup still ran.
+
+        Rationale: a pytest INTERNALERROR means the xdist test infrastructure
+        itself crashed (e.g. a worker process was killed by os._exit). Returning
+        None routes the tick into the harness's ``outcome is None`` path — retry
+        next tick, no L1 drift escalation filed, SHA not marked swept — which is
+        the correct behaviour for an infra crash.
+
+        RED today: run_main_tip_sweep returns (sha, result) for any non-None
+        result regardless of category; no special-case for pytest_internalerror.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return (0, '', '')
+
+        async def _fake_full_verify(*args, **kwargs):
+            return INTERNALERROR_RESULT
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is None, (
+            f'Expected None (infra sentinel) when category=pytest_internalerror, '
+            f'got {result!r}'
+        )
+
+        # Cleanup must still run even when we return None early (finally block)
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, (
+            'git worktree remove --force must run even when returning None for '
+            'pytest_internalerror (cleanup-in-finally guarantee)'
+        )
