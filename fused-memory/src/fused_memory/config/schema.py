@@ -659,9 +659,14 @@ class CuratorConfig(BaseModel):
 class PathScopeAdjudicatorConfig(BaseModel):
     """LLM adjudicator config for Stage-2 path-scope guard filtering.
 
-    Fires only on a Stage-1 heuristic HIT (rare). The prompt is tiny
-    (title + description + matched prefixes) so timeout/budget are much
-    smaller than the curator's 30-entry pool.
+    Fires only on a Stage-1 heuristic HIT (rare).
+
+    Cost is dominated by FIXED overhead — Sonnet + 3-turn json-schema flow +
+    CLI base-context cache-creation (~13k tokens) + the filing project's
+    CLAUDE.md/memory auto-loaded from cwd — NOT by the prompt size
+    (title + description + matched prefixes).  Measured true cost is ~0.105 USD
+    regardless of task size.  max_budget_usd must comfortably exceed that floor
+    or every call returns error_max_budget_usd before any verdict (silent no-op).
 
     Fail-safe asymmetry: only a clean LLM success with verdict=='allow'
     downgrades the heuristic hit; every other outcome preserves the guard.
@@ -669,11 +674,12 @@ class PathScopeAdjudicatorConfig(BaseModel):
 
     enabled: bool = Field(default=True)
     model: str = Field(default='sonnet')
-    # 60s bounds a silent Anthropic-API hang for this much smaller prompt;
-    # the curator uses 180s for a 30-entry pool, but title+description+prefixes
-    # is far smaller so ~1/3 of that budget is sufficient.
+    # 60s bounds a silent Anthropic-API hang; independent of prompt/cost size.
     timeout_seconds: float = Field(default=60.0)
-    max_budget_usd: float = Field(default=0.10)
+    # True cost floor is ~0.105 USD (fixed CLI/base-context overhead dominates).
+    # 0.30 gives ~2.85x margin and matches CuratorConfig.max_budget_usd.
+    # Do NOT lower below 0.25 — the adjudicator becomes a silent no-op.
+    max_budget_usd: float = Field(default=0.30)
     # Per-call turn cap. Must be ≥ 3: schema burns one tool-use turn,
     # an optional reasoning turn may precede it, and the final assistant
     # response is the third. Matches the json-schema turn floor noted in

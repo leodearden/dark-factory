@@ -17,6 +17,7 @@ from fused_memory.config.schema import (
     FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
+    PathScopeAdjudicatorConfig,
     ReconciliationConfig,
     ServerConfig,
     YamlSettingsSource,
@@ -692,3 +693,54 @@ class TestReconciliationConfigBacklogHardLimitOverrides:
         """A map with one valid and one zero entry must be rejected (not partially accepted)."""
         with pytest.raises(ValidationError):
             ReconciliationConfig(backlog_hard_limit_overrides={'reify': 1500, 'bad': 0})
+
+
+class TestPathScopeAdjudicatorConfigBudget:
+    """Regression guard: max_budget_usd must clear the adjudicator's own call cost (task 1849).
+
+    The adjudicator's true cost is ~0.105 USD — dominated by FIXED overhead:
+    Sonnet + 3-turn json-schema flow + CLI base-context cache-creation (~13k tokens)
+    + the filing project's CLAUDE.md/memory auto-loaded from cwd.
+    The original 0.10 default was BELOW this cost, so every call returned
+    error_max_budget_usd — a silent no-op that prevented any verdict=='allow'.
+    The 0.25 floor is ~2.4x above the true cost; the chosen default (0.30) gives ~2.85x margin.
+    """
+
+    def test_default_max_budget_usd_above_cost_floor(self):
+        """PathScopeAdjudicatorConfig default must clear the 0.25 cost floor.
+
+        The adjudicator's true cost is ~0.105 USD (fixed CLI/base-context overhead +
+        3-turn json-schema flow + filing project CLAUDE.md/memory auto-loaded from cwd);
+        a budget at or below cost means error_max_budget_usd before any verdict —
+        a silent no-op.  0.25 is the minimum safe floor (~2.4x above cost).
+        """
+        # 0.10 < 0.25 is False — RED before the fix; 0.30 >= 0.25 is True — GREEN after
+        assert PathScopeAdjudicatorConfig().max_budget_usd >= 0.25, (
+            'PathScopeAdjudicatorConfig.max_budget_usd must be >= 0.25 '
+            '(the adjudicator true cost is ~0.105 USD; anything at or below cost '
+            'returns error_max_budget_usd before any verdict, making it a silent no-op). '
+            'Raise the default — see task 1849.'
+        )
+
+    def test_deployed_config_max_budget_usd_above_floor(self, monkeypatch):
+        """Effective deployed value (schema default layered with config.yaml) must also clear the floor.
+
+        Mirrors TestConfigYamlBacklogHardLimitOverrides: loads the real config.yaml via
+        CONFIG_PATH, constructs FusedMemoryConfig(), and asserts the effective value.
+        This catches a future YAML edit that re-pins max_budget_usd below cost — the
+        exact 'silent no-op via config layering' failure class that task 1849 fixes.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        # config.yaml currently has no path_scope_adjudicator section, so today
+        # this test exercises the default-fallback path (schema default = 0.30).
+        # It will catch a future YAML edit that explicitly pins the budget below cost.
+        cfg = FusedMemoryConfig()
+        assert cfg.path_scope_adjudicator.max_budget_usd >= 0.25, (
+            f'Effective path_scope_adjudicator.max_budget_usd (got '
+            f'{cfg.path_scope_adjudicator.max_budget_usd!r}) must be >= 0.25 — '
+            f'the adjudicator true cost is ~0.105 USD; a budget at or below cost '
+            f'returns error_max_budget_usd before any verdict (silent no-op). '
+            f'Check config.yaml for an override that pins the budget below cost.'
+        )
