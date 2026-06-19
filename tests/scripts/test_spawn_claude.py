@@ -49,6 +49,15 @@ _FOREGROUND_TERM_SCRIPT = textwrap.dedent("""\
 # Detaching fake terminal: runs the payload in a new session (setsid), records
 # the session-leader pid to a file, then exits 0 (konsole-like).  The test
 # sends SIGHUP to the leader's pgid to simulate window-close.
+#
+# Real terminal emulators (konsole, gnome-terminal, xterm, kitty, macOS
+# Terminal) reset child signal dispositions to SIG_DFL before launching the
+# child shell.  This fake terminal must do the same: `env --default-signal=HUP,TERM`
+# un-ignores HUP and TERM across the exec boundary so the payload bash's
+# `trap 'exit 129' HUP` (and `trap 'exit 143' TERM`) can actually install and
+# fire.  Without this reset, an inherited SIGHUP=SIG_IGN (from a detached CI
+# harness or a preexec_fn in tests) silently makes the trap a POSIX no-op —
+# a non-interactive bash cannot trap a signal that was SIG_IGN on entry.
 _DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     #!/usr/bin/env bash
     # Find 'bash' in argv, then run that payload as a detached session leader.
@@ -60,7 +69,9 @@ _DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     done
     # $@ is now: bash -c "$inner"
     # Run it in a new session so it gets its own pgid.
-    setsid "$@" &
+    # env --default-signal=HUP,TERM resets those dispositions to SIG_DFL,
+    # mirroring what a real terminal emulator does for its child shell.
+    setsid env --default-signal=HUP,TERM "$@" &
     leader_pid=$!
     # Write the pid so the test can signal the group.
     echo "$leader_pid" > {pidfile}
@@ -200,12 +211,23 @@ def test_window_close_yields_129_not_hang(
 
     # Launch spawn-claude.sh in its OWN session so signaling the payload group
     # can't reach the pytest process.
+    #
+    # preexec_fn forces SIGHUP=SIG_IGN on the spawned process (and its whole
+    # descendant chain) BEFORE exec.  This reproduces the detached-harness
+    # condition deterministically: SIG_IGN is inherited across fork+exec, and
+    # a non-interactive bash cannot trap a signal that was SIG_IGN on entry
+    # (POSIX), so the payload's `trap 'exit 129' HUP` becomes a silent no-op
+    # unless the fake terminal resets the disposition — exactly what a real
+    # terminal emulator does for its child shell.  With this preexec the test
+    # is hermetic: it hangs on an unfixed _DETACHING_TERM_TEMPLATE and yields
+    # 129 once the template uses `env --default-signal=HUP,TERM`.
     proc = subprocess.Popen(
         [str(SPAWN_SCRIPT), str(tmp_path), "false", "", "test prompt"],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN),
     )
 
     # Wait for the fake terminal to write the leader pid (max 5 s).
@@ -222,14 +244,13 @@ def test_window_close_yields_129_not_hang(
     os.killpg(leader_pid, signal.SIGHUP)
 
     # Must-not-hang guard — NOT a latency SLA.
-    # 10s flaked under full-suite CPU contention: SIGHUP->exit-129 can exceed 10s
-    # because spawn-claude.sh's await_sentinel polls at 2s granularity (line 68).
-    # 30s gives load headroom while staying below the global 60s pytest-timeout
-    # (shared/pyproject.toml, timeout_method=signal), so this descriptive
-    # pytest.fail still fires before the blunt signal-kill on a genuine hang.
-    # De-flake precedent: task 1335, commit 36cd05094b.
+    # The success path takes ~2-4s (await_sentinel 2s poll + pidfile handshake).
+    # A genuine hang is infinite (no sentinel ever written), so 15s cleanly
+    # separates pass from hang while staying well under the global 60s
+    # pytest-timeout (shared/pyproject.toml, timeout_method=signal), so this
+    # descriptive pytest.fail still fires before the blunt signal-kill.
     try:
-        rc = proc.wait(timeout=30)
+        rc = proc.wait(timeout=15)
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(

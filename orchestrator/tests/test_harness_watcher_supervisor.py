@@ -1871,6 +1871,7 @@ def _make_run_wired_harness(tmp_path: Path) -> tuple:
     h._tag_prd_metadata = AsyncMock()
     h._start_orphan_l0_reaper = MagicMock()
     h._start_stranded_reconcile = MagicMock()
+    h._start_main_tip_sweep = MagicMock()
 
     # Scheduler: one pending task so run() proceeds to the acquire_next loop,
     # which then raises RuntimeError('stop') to halt immediately after startup.
