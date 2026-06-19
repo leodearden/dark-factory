@@ -1157,6 +1157,77 @@ class TestScopeModuleConfigReturnsNone:
         assert '--directory orchestrator' not in (result.type_check_command or '')
 
 
+class TestScopeModuleConfigDataModuleFallback:
+    """scope_module_config falls back to the full suite for non-test data modules under tests/.
+
+    A data module under tests/ (e.g. shared/tests/silent_fallthrough_allowlist.py)
+    satisfies _is_test_file (test-tree membership) but NOT _is_collectable_test_file
+    (pytest would collect zero tests → rc=5 → RED).  The fix mirrors has_conftest:
+    set test_cmd = mc.test_command (full owning-package suite).
+    """
+
+    def test_data_module_alone_uses_full_suite(self):
+        """A lone data module under tests/ must yield the full mc.test_command.
+
+        Before the fix, the scoped command was
+        'pytest shared/tests/silent_fallthrough_allowlist.py' → rc=5 → RED.
+        After the fix it must be mc.test_command (GREEN full suite).
+        """
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        result = scope_module_config(mc, ['shared/tests/silent_fallthrough_allowlist.py'])
+        assert result is not None
+        assert result.test_command == mc.test_command, (
+            f'Expected full suite {mc.test_command!r}, got {result.test_command!r}'
+        )
+        assert 'silent_fallthrough_allowlist.py' not in (result.test_command or ''), (
+            'Data file must not appear in the pytest target'
+        )
+
+    def test_data_module_plus_real_test_file_uses_full_suite(self):
+        """A data module mixed with a real test file must still use the full suite.
+
+        Conftest-style precedence: has_test_data triggers the full suite
+        regardless of whether collectable tests are also present.
+        """
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        result = scope_module_config(
+            mc,
+            ['shared/tests/silent_fallthrough_allowlist.py', 'shared/tests/test_x.py'],
+        )
+        assert result is not None
+        assert result.test_command == mc.test_command, (
+            f'Expected full suite {mc.test_command!r}, got {result.test_command!r}'
+        )
+
+    def test_real_test_file_alone_still_scopes(self):
+        """Control: a real test file alone must still produce a scoped pytest target.
+
+        The fix must not over-broaden scope for genuine test files — they should
+        still be targeted directly rather than triggering the full suite.
+        """
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        result = scope_module_config(mc, ['shared/tests/test_x.py'])
+        assert result is not None
+        assert result.test_command != mc.test_command, (
+            'A real test file alone must produce a scoped command, not the full suite'
+        )
+        assert 'shared/tests/test_x.py' in (result.test_command or ''), (
+            f'Expected test_x.py in scoped command, got {result.test_command!r}'
+        )
+
+
 class TestRunScopedVerificationSkipsUntouched:
     """End-to-end: run_scoped_verification skips subprojects with no matching files."""
 
