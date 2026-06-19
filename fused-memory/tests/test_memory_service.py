@@ -3338,3 +3338,111 @@ class TestGetStatusUptime:
             f'uptime_seconds must be non-decreasing; '
             f'first={result1["uptime_seconds"]}, second={result2["uptime_seconds"]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-11 (RED) / step-12 (GREEN): SearchResults in-band degrade marker
+# step-13 (RED) / step-14 (GREEN): journal logs success=False when degraded
+# ---------------------------------------------------------------------------
+
+
+class TestSearchResultsDegradeMarker:
+    """search() must return a SearchResults list-subclass carrying .degraded/.failed_stores.
+
+    When a selected store raises, results are still returned (best-effort) but
+    .degraded is True and the failing store name appears in .failed_stores.
+
+    RED until step-12 defines SearchResults and wires it into search().
+    """
+
+    @pytest.mark.asyncio
+    async def test_store_raise_sets_degraded_true(self, service):
+        """When mem0.search raises, results.degraded is True and 'mem0' in results.failed_stores."""
+        service.mem0.search = AsyncMock(side_effect=RuntimeError('mem0 boom'))
+
+        results = await service.search(
+            query='x', project_id='test', stores=['mem0']
+        )
+
+        # Must still be list-like
+        assert hasattr(results, '__len__'), 'results must be list-like'
+
+        degraded = getattr(results, 'degraded', None)
+        assert degraded is True, (
+            f'Expected results.degraded is True when store raises, got {degraded!r}. '
+            'RED: search() returns a plain list with no .degraded attribute.'
+        )
+
+        failed = getattr(results, 'failed_stores', None)
+        assert failed is not None, (
+            'Expected results.failed_stores to exist, got None. '
+            'RED: search() returns a plain list with no .failed_stores attribute.'
+        )
+        assert 'mem0' in failed, (
+            f"Expected 'mem0' in results.failed_stores, got {failed!r}."
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_search_sets_degraded_false(self, service):
+        """When all stores succeed, results.degraded is False and failed_stores == []."""
+        results = await service.search(
+            query='x', project_id='test', stores=['mem0']
+        )
+
+        degraded = getattr(results, 'degraded', None)
+        assert degraded is False, (
+            f'Expected results.degraded is False on clean search, got {degraded!r}. '
+            'RED: search() returns a plain list with no .degraded attribute.'
+        )
+
+        failed = getattr(results, 'failed_stores', None)
+        assert failed == [], (
+            f'Expected results.failed_stores == [] on clean search, got {failed!r}.'
+        )
+
+
+class TestSearchJournalSuccessFlagOnDegrade:
+    """search() must log success=False to the journal when a store fails.
+
+    RED until step-14 changes the hardcoded success=True to success=not degraded.
+    """
+
+    @pytest.mark.asyncio
+    async def test_journal_logs_failure_when_store_raises(self, service):
+        """When mem0 raises, journal.log_write_op is called with success=False."""
+        service.mem0.search = AsyncMock(side_effect=RuntimeError('mem0 boom'))
+
+        mock_journal = AsyncMock()
+        mock_journal.log_write_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        await service.search(
+            query='x', project_id='test', stores=['mem0'],
+            causation_id='run-123',
+        )
+
+        mock_journal.log_write_op.assert_called_once()
+        call_kwargs = mock_journal.log_write_op.call_args.kwargs
+        assert call_kwargs.get('success') is False, (
+            f"Expected journal.log_write_op called with success=False when store raises, "
+            f"got success={call_kwargs.get('success')!r}. "
+            "RED: success is hardcoded to True."
+        )
+
+    @pytest.mark.asyncio
+    async def test_journal_logs_success_true_on_clean_search(self, service):
+        """When all stores succeed, journal.log_write_op is called with success=True."""
+        mock_journal = AsyncMock()
+        mock_journal.log_write_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        await service.search(
+            query='x', project_id='test', stores=['mem0'],
+            causation_id='run-456',
+        )
+
+        mock_journal.log_write_op.assert_called_once()
+        call_kwargs = mock_journal.log_write_op.call_args.kwargs
+        assert call_kwargs.get('success') is True, (
+            f"Expected success=True on clean search, got {call_kwargs.get('success')!r}."
+        )

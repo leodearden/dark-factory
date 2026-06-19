@@ -92,3 +92,119 @@ class TestReviewCheckpointCapHandling:
         assert any(
             'all accounts capped' in t.lower() for t in warning_texts
         ), f'Expected warning with "all accounts capped", got: {warning_texts}'
+
+
+@pytest.mark.asyncio
+class TestReviewCheckpointParseFailure:
+    """Tests for ReviewCheckpoint._run_review parse-failure sentinel.
+
+    RED tests for step-9: ReviewReport.parse_failed field does not yet exist,
+    so accessing it raises AttributeError — confirming the test is RED.
+    """
+
+    async def test_run_review_parse_failed_warning_and_sentinel(
+        self, monkeypatch, caplog
+    ):
+        """When reviewer returns unparseable output, parse_failed=True and WARNING fires.
+
+        Before step-10 impl: parse_failed attribute does not exist on ReviewReport
+        → AttributeError (RED).  Also no WARNING is emitted.
+        After step-10 impl: attribute exists = True, WARNING captured.
+        """
+        checkpoint = _make_checkpoint()
+
+        mock_result = MagicMock()
+        mock_result.structured_output = None
+        mock_result.output = 'this is not json at all'
+        mock_result.success = True
+        mock_result.cost_usd = 0.0
+
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.invoke_with_cap_retry',
+            AsyncMock(return_value=mock_result),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.run_full_verification',
+            AsyncMock(return_value=_PHASE1_RESULT),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.ReviewCheckpoint._save_report',
+            lambda *a, **kw: None,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.review_checkpoint'):
+            report = await checkpoint.run_focused()
+
+        # Must have the parse_failed sentinel set
+        assert report.parse_failed is True, (
+            f'Expected parse_failed=True; report={report!r}'
+        )
+        assert report.findings_count == 0
+        assert report.tasks_created == []
+
+        # Must emit a WARNING mentioning unparseable output
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'unparseable' in t.lower() for t in warning_texts
+        ), f'Expected WARNING about unparseable output, got: {warning_texts}'
+
+    async def test_run_review_wellformed_structured_output_no_parse_warning(
+        self, monkeypatch, caplog
+    ):
+        """When reviewer returns well-formed structured_output, parse_failed=False.
+
+        Contrast case: structured_output is a valid findings dict → parse_failed
+        must be False and no unparseable-output WARNING must be emitted.
+
+        Before step-10 impl: parse_failed attribute does not exist → AttributeError
+        (RED).
+        After step-10 impl: attribute exists = False, findings_count=1.
+        """
+        checkpoint = _make_checkpoint()
+
+        mock_result = MagicMock()
+        mock_result.structured_output = {
+            'findings': [
+                {
+                    'severity': 'minor',
+                    'category': 'stub',
+                    'location': 'foo.py:1',
+                    'description': 'test finding',
+                    'triage': 'dismiss',
+                }
+            ],
+            'summary': 'all good',
+        }
+        mock_result.output = ''
+        mock_result.success = True
+        mock_result.cost_usd = 0.0
+
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.invoke_with_cap_retry',
+            AsyncMock(return_value=mock_result),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.run_full_verification',
+            AsyncMock(return_value=_PHASE1_RESULT),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.ReviewCheckpoint._save_report',
+            lambda *a, **kw: None,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.review_checkpoint'):
+            report = await checkpoint.run_focused()
+
+        assert report.parse_failed is False, (
+            f'Expected parse_failed=False for well-formed output; report={report!r}'
+        )
+        assert report.findings_count == 1
+
+        parse_warnings = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.WARNING and 'unparseable' in r.message.lower()
+        ]
+        assert not parse_warnings, (
+            f'No unparseable-output WARNING expected for well-formed output; '
+            f'got: {parse_warnings}'
+        )

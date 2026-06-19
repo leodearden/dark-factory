@@ -960,7 +960,7 @@ async def api_curator(request: Request) -> JSONResponse:
     try:
         accounts_summary: AccountsSummary = summarize_accounts(intervals, total_accounts=account_count)
     except Exception:
-        logger.debug('curator/accounts_summary computation failed', exc_info=True)
+        logger.warning('curator/accounts_summary computation failed', exc_info=True)
         accounts_summary = _empty_summary
 
     if 'paused' in curator_state:

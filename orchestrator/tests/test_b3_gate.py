@@ -276,6 +276,115 @@ class TestCharge:
 
 
 # ---------------------------------------------------------------------------
+# task-1808 step-5: corrupt b3-state.json → cap-bearing paths fail CLOSED
+# ---------------------------------------------------------------------------
+
+class TestCorruptStateFailsClosed:
+    """Corrupt b3-state.json → cap-bearing paths must fail CLOSED (cap exhausted).
+
+    All three cap-bearing callers (charge, run_check, record_launch) must
+    treat a corrupt state as fully exhausted and must NOT overwrite the file
+    (preserves the corrupt bytes for forensics; prevents silent cap-reset).
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def _make_corrupt_state(self, tmp_path):
+        """Write a corrupt JSON state file and return its Path."""
+        from orchestrator.b3_gate import _state_path
+        sp = _state_path(tmp_path)
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text('not valid json {{{{', encoding='utf-8')
+        return sp
+
+    def test_charge_on_corrupt_returns_exhausted(self, tmp_path):
+        """charge() on corrupt state → charged=False, remaining=0 (NOT a full-cap reset)."""
+        from orchestrator.b3_gate import charge
+        sp = self._make_corrupt_state(tmp_path)
+        result = charge('t', state_path=sp, cap=6, now=self._NOW)
+        assert result['charged'] is False, (
+            f'Expected charged=False for corrupt state; got {result}'
+        )
+        assert result['remaining'] == 0, (
+            f'Expected remaining=0 for corrupt state; got {result}'
+        )
+
+    def test_charge_on_corrupt_does_not_overwrite(self, tmp_path):
+        """charge() on corrupt state must NOT overwrite the file."""
+        from orchestrator.b3_gate import charge
+        sp = self._make_corrupt_state(tmp_path)
+        original = sp.read_text(encoding='utf-8')
+        charge('t', state_path=sp, cap=6, now=self._NOW)
+        assert sp.read_text(encoding='utf-8') == original, (
+            'charge() must not overwrite a corrupt state file'
+        )
+
+    def test_run_check_cap_remaining_zero_on_corrupt(self, tmp_path):
+        """run_check with a corrupt state file reports cap_remaining==0 and already_attempted==False."""
+        import argparse
+        import contextlib
+        import io as _io
+        import json as _json
+
+        from orchestrator.b3_gate import run_check
+        self._make_corrupt_state(tmp_path)
+
+        args = argparse.Namespace(
+            task_id='42',
+            worktree=str(tmp_path),
+            project_root=str(tmp_path),
+            config=None,
+            now=self._NOW.isoformat(),
+            tag='master',
+            category=None,
+            verb='check',
+        )
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_check(args)
+        result = _json.loads(buf.getvalue())
+        assert result['cap_remaining'] == 0, (
+            f'Expected cap_remaining=0 for corrupt state; got {result}'
+        )
+        # Both state-derived fields must reflect the fail-closed contract.
+        # already_attempted=False is the *permissive* value, but it is correct
+        # here because we cannot read prior records — consumers must gate on
+        # cap_remaining (or charge()), not already_attempted.
+        assert result['already_attempted'] is False, (
+            f'Expected already_attempted=False for corrupt state; got {result}'
+        )
+
+    def test_record_launch_on_corrupt_fails_closed(self, tmp_path):
+        """record_launch() on corrupt state → recorded=False without overwriting."""
+        from orchestrator.b3_gate import record_launch
+        sp = self._make_corrupt_state(tmp_path)
+        original = sp.read_text(encoding='utf-8')
+        result = record_launch(
+            '42', 'deadbeef', '2026-06-04T09:00:00+00:00',
+            state_path=sp, now=self._NOW,
+        )
+        assert result['recorded'] is False, (
+            f'Expected recorded=False for corrupt state; got {result}'
+        )
+        assert sp.read_text(encoding='utf-8') == original, (
+            'record_launch() must not overwrite a corrupt state file'
+        )
+
+    def test_missing_state_still_yields_full_cap(self, tmp_path):
+        """MISSING state → fresh (benign), charge() succeeds at full cap."""
+        from orchestrator.b3_gate import _state_path, charge
+        sp = _state_path(tmp_path)
+        # File does not exist → benign fresh state
+        result = charge('t', state_path=sp, cap=6, now=self._NOW)
+        assert result['charged'] is True, (
+            f'Expected charged=True for missing (fresh) state; got {result}'
+        )
+        assert result['remaining'] == 5, (
+            f'Expected remaining=5 for fresh state with cap=6; got {result}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-7: concurrency — two concurrent charge calls must serialize
 # ---------------------------------------------------------------------------
 
@@ -655,6 +764,57 @@ class TestResolveCap:
         cfg_file = tmp_path / 'config.yaml'
         cfg_file.write_text('unblock_auto:\n  b3_merge_cap_per_24h: 10\n')
         assert _resolve_cap(str(cfg_file)) == 10
+
+    # task-1808 step-7: bad config → DEFAULT_CAP + WARNING under orchestrator.b3_gate
+
+    def test_bad_config_returns_default_and_warns(self, tmp_path, caplog):
+        """Malformed config YAML → DEFAULT_CAP returned AND WARNING logged.
+
+        Config corruption is NOT cap-exhausting (§4.5 — a bad/foreign config
+        legitimately falls back to DEFAULT_CAP).  But the fallback must be VISIBLE.
+        Fails today: b3_gate has no module logger → zero WARNING records.
+        """
+        import logging as _logging
+
+        from orchestrator.b3_gate import DEFAULT_CAP, _resolve_cap
+
+        cfg_file = tmp_path / 'bad_config.yaml'
+        # Write a YAML string that's structurally invalid / causes load_config to raise
+        cfg_file.write_text('unblock_auto: [unterminated\n', encoding='utf-8')
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            result = _resolve_cap(str(cfg_file))
+
+        assert result == DEFAULT_CAP, (
+            f'Expected DEFAULT_CAP={DEFAULT_CAP} for bad config; got {result}'
+        )
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING
+            and r.name == 'orchestrator.b3_gate'
+        ]
+        assert len(warn_records) >= 1, (
+            f'Expected WARNING under orchestrator.b3_gate for bad config; '
+            f'got records: {[(r.name, r.message) for r in caplog.records]}'
+        )
+
+    def test_none_config_stays_silent(self, caplog):
+        """_resolve_cap(None) must NOT emit any WARNING (benign no-config path)."""
+        import logging as _logging
+
+        from orchestrator.b3_gate import _resolve_cap
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
+            _resolve_cap(None)
+
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING
+            and r.name == 'orchestrator.b3_gate'
+        ]
+        assert len(warn_records) == 0, (
+            f'_resolve_cap(None) must not emit warnings; got: {[r.message for r in warn_records]}'
+        )
 
 
 # ---------------------------------------------------------------------------

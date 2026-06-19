@@ -380,6 +380,90 @@ class TestFindDedupeParent:
         result = find_dedupe_parent(queue, candidate, config, now=now)
         assert result == 'esc-1-1'
 
+    def test_corrupt_timestamp_parent_folds_with_warning(self, tmp_path, caplog):
+        """(i) Corrupt-ts parent + matching candidate → candidate FOLDS (result == parent id).
+
+        Bug in current code: corrupt parent hits `except: continue` → matches empty
+        → returns None → candidate is re-filed as a new escalation.
+
+        Fix: parse_timestamp_or_warn with fallback=datetime.max → parent retained;
+        a WARNING is emitted (loud-over-silent contract).
+        """
+        import logging
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1', task_id='42')
+        parent.timestamp = 'not-a-timestamp'
+        queue.submit(parent)
+
+        candidate = self._make_infra_esc(
+            'esc-1-2',
+            task_id='43',
+            summary='fused-memory connection timeout on port 9999',
+        )
+        now = datetime.now(UTC) + timedelta(seconds=5)
+
+        with caplog.at_level(logging.WARNING, logger='shared.timestamps'):
+            result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+
+        # (a) Candidate must fold into the corrupt-ts parent (not re-filed as None)
+        assert result == 'esc-1-1', (
+            f'Expected corrupt-ts parent to be retained and candidate to fold; got result={result!r}'
+        )
+
+        # (b) At least one WARNING must mention the dedupe context
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'dedupe.find_dedupe_parent' in r.message
+        ]
+        assert warning_records, (
+            f"Expected >=1 WARNING mentioning 'dedupe.find_dedupe_parent'; "
+            f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
+        )
+
+    def test_corrupt_parent_does_not_displace_valid_parent(self, tmp_path):
+        """(j) Corrupt-ts parent + valid older parent (both matching) → valid older wins.
+
+        Pins datetime.max for corrupt: corrupt sorts LAST, valid older sorts FIRST.
+        If fallback were datetime.min instead, corrupt would sort FIRST and displace
+        the valid parent — which is the doc-mandated error for oldest-as-canonical sites.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        # Valid older parent
+        valid_older = self._make_infra_esc('esc-valid-1', task_id='10')
+        valid_older.timestamp = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+        queue.submit(valid_older)
+
+        # Corrupt-ts parent (same category+key match)
+        corrupt = self._make_infra_esc('esc-corrupt-1', task_id='11')
+        corrupt.timestamp = 'not-a-timestamp'
+        queue.submit(corrupt)
+
+        candidate = self._make_infra_esc(
+            'esc-candidate-1',
+            task_id='12',
+            summary='fused-memory connection timeout on port 9999',
+        )
+        now = datetime.now(UTC) + timedelta(seconds=5)
+
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+
+        # Valid older parent must win; corrupt must sort LAST (datetime.max)
+        assert result == 'esc-valid-1', (
+            f'Expected valid older parent to win; got result={result!r}. '
+            f'If corrupt won, fallback is datetime.min (wrong) — must be datetime.max.'
+        )
+
 
 class TestComputeContentFingerprint:
     """compute_content_fingerprint() — pure deterministic fingerprint for recon dedup."""

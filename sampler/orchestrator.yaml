@@ -1,0 +1,12 @@
+# Sampler orchestrator configuration
+# Scopes verification to sampler's own venv (src-layout member package). Without this
+# file, sampler is the only subproject the orchestrator never discovers, so its verify
+# falls back to a root-cwd __fallback__ config whose pyright cannot resolve sampler's
+# src-layout editable install (false reportMissingImports). Mirrors the sibling
+# subprojects' --project <member> --directory <member> convention.
+
+# Verification commands
+test_command: "uv run --project sampler --directory sampler pytest tests/ --tb=short -q"
+# bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
+lint_command: "uv run --project sampler --directory sampler ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py sampler/tests"
+type_check_command: "uv run --project sampler --directory sampler pyright src/ tests/"

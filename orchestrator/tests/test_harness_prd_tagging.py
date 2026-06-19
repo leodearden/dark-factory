@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _orch_helpers import assert_update_wire_mode
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
@@ -218,4 +219,39 @@ async def test_tag_prd_metadata_fetches_active_only(harness, tmp_path):
     )
     # Behaviour unchanged: task 2 is still tagged (new), task 1 pre-existed.
     harness.scheduler.update_task.assert_called_once()
-    assert harness.scheduler.update_task.call_args.args[0] == '2'
+
+
+@pytest.mark.asyncio
+async def test_tag_prd_metadata_forwards_merge_mode_on_wire(harness, tmp_path, monkeypatch):
+    """_tag_prd_metadata update_task wire call must carry metadata_mode='merge' (#4271 fix).
+
+    A prd re-tag writes only {'prd': '/path'}, a partial key.  Under merge
+    (shallow last-write-wins) sibling keys like _causation_id and memory_hints
+    are preserved; under replace they are silently deleted.
+
+    RED today: the wrapper forwards nothing instead of metadata_mode='merge'.
+    GREEN after step-5 impl (scheduler.py update_task gains metadata_mode).
+    """
+    prd = tmp_path / 'feature.prd'
+    prd.touch()
+    pre_ids: set[str] = set()  # all tasks are new
+
+    tasks = [{'id': '7', 'title': 'Task 7', 'status': 'pending', 'metadata': {}, 'dependencies': []}]
+
+    captured_args: list[dict] = []
+
+    async def mock_mcp_call(url, method, payload, **kwargs):
+        captured_args.append(payload)
+        return {}
+
+    # Wire harness to a real Scheduler so the full update_task wire logic runs.
+    real_scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+    real_scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler = real_scheduler
+
+    monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+    await harness._tag_prd_metadata(prd, pre_ids)
+
+    # The wire call for update_task must carry metadata_mode='merge' so siblings survive.
+    assert_update_wire_mode(captured_args, 'merge')

@@ -624,6 +624,13 @@ def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> 
         from orchestrator.workflow import compute_preexisting_main_break_fingerprint
         return compute_preexisting_main_break_fingerprint(category, cause_hint, probe_sha)
     except Exception:
+        logger.warning(
+            'main-health fingerprint composition failed '
+            '(category=%s cause_hint=%s probe_sha=%s) — '
+            'returning empty fingerprint (dedupe disabled for this outcome)',
+            category, cause_hint, probe_sha,
+            exc_info=True,
+        )
         return ''
 
 
@@ -3675,6 +3682,7 @@ class InflightVerifyResult:
     warm_results: dict[str, str] = dataclasses.field(default_factory=dict)
     status: str | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
     reason: str | None = None  # str(RunnerUnavailable exc) when status='RUNNER_UNAVAILABLE'
+    spec_warm: bool = False   # True when merge_wt is a warm _spec- lane (not an ephemeral wt)
 
 
 class _TrainMergeHost(Protocol):
@@ -4793,10 +4801,11 @@ class MergeWorker(_WipHaltMixin):
             self._verify_attempt_count,
             req.config.git.persistent_merge_worktree_safety_valve_every_n,
         )
-        merge_wt = await _acquire_warm_verify_worktree(
+        merge_wt, _ = await _acquire_warm_verify_worktree(
             self._git_ops, req, merge_wt,
             merge_result.merge_commit,  # non-None; assert at 4044 above
             safety_valve_due=_due,
+            speculative=False,  # MergeWorker always handles non-speculative items
         )
         assert merge_wt is not None  # input was non-None; warm or unchanged
         out = await _run_post_merge_verify(
@@ -5387,6 +5396,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._deregister_owned_merge_worktree(wt)
         if wt is not None:
             await self._git_ops.cleanup_merge_worktree(wt)
+
+    async def _release_or_cleanup(
+        self, merge_wt: Path | None, *, spec_warm: bool
+    ) -> None:
+        """Route worktree cleanup: release a warm _spec- lane or run cold cleanup.
+
+        A single shared helper for every cleanup site that may hold a warm
+        spec lane, preventing drift.
+
+        When ``spec_warm=True`` and ``merge_wt`` is not None, the lane is a
+        member of ``spec_warm_lane_pool`` and must be RELEASED back to FREE
+        (retaining target/ for the next assignment) rather than removed from
+        disk.  Cold/ephemeral fallback paths (``spec_warm=False``) delegate to
+        ``_cleanup_owned_merge_worktree`` which deregisters the ledger entry
+        and calls ``git worktree remove``.
+        """
+        if spec_warm and merge_wt is not None:
+            await self._git_ops.release_spec_lane(merge_wt, warm=True)
+        else:
+            await self._cleanup_owned_merge_worktree(merge_wt)
 
     def _touch_owned_merge_worktrees(self) -> int:
         """Touch (os.utime) every ledger path to refresh its mtime.
@@ -7749,6 +7778,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _warm_results: dict[str, str] = {}
         _is_warm_path = False
         _warm_capture: list[VerifyResult] = []
+        _spec_warm: bool = False  # set when acquire_spec_lane returns warm=True
 
         try:
             if lease.is_local:
@@ -7770,16 +7800,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._verify_attempt_count,
                     req.config.git.persistent_merge_worktree_safety_valve_every_n,
                 )
-                merge_wt = await _acquire_warm_verify_worktree(
+                merge_wt, _spec_warm = await _acquire_warm_verify_worktree(
                     self._git_ops, req, merge_wt, merge_commit,
                     safety_valve_due=_due,
+                    speculative=item.speculative,
                 )
                 assert merge_wt is not None
                 if merge_wt is not item.merge_wt:
                     self._deregister_owned_merge_worktree(item.merge_wt)
                 _is_warm_path = (
-                    req.config.git.persistent_merge_worktree
-                    and not _due
+                    (req.config.git.persistent_merge_worktree and not _due)
+                    or (req.config.git.merge_spec_warm_lane_pool and _spec_warm)
                 )
 
             # NOTE: _verify_item/_verify_phase/_verify_started_at are vestigial
@@ -7824,7 +7855,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     verify_task.cancel()
                     with contextlib.suppress(BaseException):
                         await verify_task
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -7843,7 +7874,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     verify_task.cancel()
                     with contextlib.suppress(BaseException):
                         await verify_task
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                     self._queue.put_nowait(req)
                     return InflightVerifyResult(
                         outcome=None,
@@ -7871,7 +7902,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: verify end '
                 f'(merge={merge_commit[:8]}, error)'
             )
-            await self._cleanup_owned_merge_worktree(merge_wt)
+            await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
             err_outcome = MergeOutcome('blocked', reason=f'Verification error: {exc}')
             if not req.result.done():
                 req.result.set_result(err_outcome)
@@ -7890,7 +7921,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merge_commit,
                         _warm_capture[0].test_output or '',
                     )
-            return InflightVerifyResult(outcome=None, merge_wt=merge_wt, warm_results=_warm_results)
+            return InflightVerifyResult(outcome=None, merge_wt=merge_wt, warm_results=_warm_results, spec_warm=_spec_warm)
 
         if out.verify_skipped:
             logger.info(
@@ -7902,7 +7933,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
                 f'passed=False)'
             )
-        return InflightVerifyResult(outcome=out, merge_wt=merge_wt)
+        return InflightVerifyResult(outcome=out, merge_wt=merge_wt, spec_warm=_spec_warm)
 
     async def _finalize_inflight(self, entry: InflightEntry) -> bool:
         """Run the CAS advance_main + post-advance work for one in-flight item.
@@ -8052,8 +8083,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # ── (a) FAIL / skip ──────────────────────────────────────────────
             if vr is not None and vr.outcome is not None:
                 fail_merge_wt = vr.merge_wt
-                if fail_merge_wt is not None:
-                    await self._cleanup_owned_merge_worktree(fail_merge_wt)
+                await self._release_or_cleanup(fail_merge_wt, spec_warm=vr.spec_warm)
                 self._resolve_or_drop_abandoned(req, vr.outcome)
                 _n_failed_val = True
                 return False
@@ -8073,10 +8103,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # warm run, so default to {} — matching pre-refactor behaviour.
             _warm_results: dict[str, str] = vr.warm_results if vr is not None else {}
 
+            # Precompute spec_warm for cleanup routing — True when the verify ran
+            # in a warm _spec- lane (not an ephemeral throwaway worktree).
+            _vr_spec_warm = (vr is not None and vr.spec_warm)
+
             # Short-circuit: if abandonment landed while verify completed,
             # skip the expensive CAS loop (mirrors _verify_and_advance :6934).
             if self._request_abandoned(req):
-                await self._cleanup_owned_merge_worktree(merge_wt)
+                await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                 return False
 
             # ── Step 5: CAS advance_main ──────────────────────────────────
@@ -8094,7 +8128,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 if result == 'advanced':
                     self._gate_retries.pop(req.task_id, None)
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                     outcome = await _finalize_advanced_merge(
                         self._git_ops, req, self._event_store,
                         merge_commit_fallback=merge_commit,
@@ -8136,6 +8170,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await _maybe_run_drift_check(
                             self, self._git_ops, req, merge_commit,
                         )
+                        # D10 promote-provenance: advance the rolling warm base
+                        # from the _merge-verify lane's target (the just-landed
+                        # commit's warm build).  Gated on the warm worktree name
+                        # so the refresh only fires when the verify ran in the
+                        # persistent _merge-verify lane (knob on, safety-valve
+                        # not due) — i.e. the source is the post-CAS confirmed
+                        # head.  On the cold/ephemeral round the base stays at
+                        # H-1 (benign-degrading, never blocks dispatch).
+                        # refresh_warm_base is best-effort and never raises.
+                        if merge_wt.name == PERSISTENT_MERGE_WORKTREE_NAME:
+                            await self._git_ops.refresh_warm_base()
                     advanced = True
                     return True
 
@@ -8185,7 +8230,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             attempt=gate_total,
                             duration_ms=_elapsed_ms(item.started_monotonic),
                         )
-                        await self._cleanup_owned_merge_worktree(merge_wt)
+                        await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                         if not req.result.done():
                             req.result.set_result(MergeOutcome(
                                 'blocked',
@@ -8222,14 +8267,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     continue
 
                 if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                     if result in ('unmerged_state', 'pop_conflict_no_advance'):
                         self._cas_retries.pop(req.task_id, None)
                         self._gate_retries.pop(req.task_id, None)
                     return False
                 if result != 'cas_failed':
                     self._gate_retries.pop(req.task_id, None)
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                     outcome = await _map_advance_failure(
                         self._git_ops, result,
                         task_id=req.task_id,
@@ -8253,7 +8298,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         f'({self.MAX_CAS_RETRIES} attempts)'
                     )
                     _emit_merge_attempt(self._event_store, req.task_id, 'cas_exhausted', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
-                    await self._cleanup_owned_merge_worktree(merge_wt)
+                    await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                     if not req.result.done():
                         req.result.set_result(MergeOutcome(
                             'blocked',
@@ -10233,7 +10278,8 @@ async def _acquire_warm_verify_worktree(
     merge_commit: str,
     *,
     safety_valve_due: bool,
-) -> Path | None:
+    speculative: bool = False,
+) -> tuple[Path | None, bool]:
     """Swap the ephemeral merge worktree for the persistent warm worktree.
 
     Called at the top of ``_verify_and_advance`` (and ``MergeWorker._process``)
@@ -10256,20 +10302,56 @@ async def _acquire_warm_verify_worktree(
         safety_valve_due: ``True`` on the Nth verifying attempt (PRD §10
             invariant 6): bypass the swap and run a cold verify in the
             throwaway ephemeral worktree instead.
+        speculative: ``True`` when the item being verified is a speculative
+            merge (merged against a pending SHA, not the current main HEAD).
+            When ``True`` and ``merge_spec_warm_lane_pool`` is enabled, routes
+            to a ``_spec-`` warm lane instead of the serial ``_merge-verify``
+            lane (reify §9.5 B9, task η/1789).
 
     Returns:
-        The warm ``_merge-verify`` path when the swap is performed, or the
-        original *merge_wt* when the knob is off / safety valve is due.
-    """
-    if not req.config.git.persistent_merge_worktree or safety_valve_due:
-        return merge_wt
+        A ``(path, warm)`` tuple:
+        - *path*: the warm or ephemeral worktree to use for the verify;
+          ``None`` only if *merge_wt* was ``None`` and no swap occurred.
+        - *warm*: ``True`` when the path is a warm-seeded worktree (the
+          shadow safety valve uses this to decide whether to run a cold
+          shadow compare); ``False`` for cold/ephemeral paths.
 
-    warm = await git_ops.reset_persistent_merge_worktree(merge_commit)
+        Callers route worktree release based on *warm*:
+        ``warm=True`` → ``release_spec_lane`` (retains target/) for spec lanes
+        or ``reset_persistent_merge_worktree`` already handled the swap;
+        ``warm=False`` → ``cleanup_merge_worktree`` (ephemeral).
+    """
+    # ── Speculative branch: route LOCAL spec items to the _spec- warm pool ──
+    # Preconditions (all must hold to use the spec pool):
+    #   1. merge_spec_warm_lane_pool knob on
+    #   2. item is a speculative merge (speculative=True)
+    #   3. safety valve not due (inv.6: cold from-scratch on every Nth attempt)
+    # On pool exhaustion or seed failure, acquire_spec_lane falls back to a
+    # cold ephemeral worktree and returns warm=False (inv.6 preserved).
+    if (
+        req.config.git.merge_spec_warm_lane_pool
+        and speculative
+        and not safety_valve_due
+    ):
+        lane_path, warm = await git_ops.acquire_spec_lane(merge_commit)
+        # Drop the ephemeral merge_wt now that the spec lane holds the commit.
+        # If acquire_spec_lane returned the same path (should not happen in
+        # practice) skip the cleanup to avoid removing the lane itself.
+        if merge_wt is not None and merge_wt.resolve() != lane_path.resolve():
+            await git_ops.cleanup_merge_worktree(merge_wt)
+        return lane_path, warm
+
+    # ── Existing serial-head path (persistent _merge-verify worktree) ──
+    # Serial-head path and knob-off path remain byte-identical to pre-η.
+    if not req.config.git.persistent_merge_worktree or safety_valve_due:
+        return merge_wt, False
+
+    warm_path = await git_ops.reset_persistent_merge_worktree(merge_commit)
     # The merge commit is already a reachable git object; the ephemeral worktree
     # is no longer needed — drop it immediately to free the worktree slot.
-    if merge_wt is not None and merge_wt.resolve() != warm.resolve():
+    if merge_wt is not None and merge_wt.resolve() != warm_path.resolve():
         await git_ops.cleanup_merge_worktree(merge_wt)
-    return warm
+    return warm_path, True
 
 
 def enforce_persistent_worktree_serial_lane(

@@ -10,11 +10,13 @@ Covers:
            correct identity.
   step-11: recover_pending_merges() selects survivors and drops already-landed
            / branch-gone records.
+  task-1808: journal_corrupt flag and corrupt-signal propagation into recover report.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -419,3 +421,169 @@ class TestRecoverPendingMerges:
         assert report['dropped'] == 2
         assert len(report['requests']) == 1
         assert report['requests'][0].request_id == req_a.request_id
+
+
+# ---------------------------------------------------------------------------
+# task-1808 step-1 — MergeQueueStore.journal_corrupt flag
+# ---------------------------------------------------------------------------
+
+
+class TestMergeQueueStoreCorruptSignal:
+    """MergeQueueStore.journal_corrupt is set (and WARNING emitted) on a corrupt
+    journal; stays clear (and silent) on absent or valid-empty-dict journal."""
+
+    def test_corrupt_journal_sets_flag_and_warns(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Constructing on a corrupt file sets journal_corrupt=True + emits WARNING."""
+        p = tmp_path / 'merge_queue.json'
+        p.write_text('not json {{{{', encoding='utf-8')
+
+        with caplog.at_level(logging.WARNING):
+            store = MergeQueueStore(p)
+
+        assert store.journal_corrupt is True, (
+            'Expected journal_corrupt=True for a corrupt JSON file'
+        )
+        warn_records = [
+            r for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert len(warn_records) >= 1, (
+            f'Expected at least one WARNING; got: {[r.message for r in caplog.records]}'
+        )
+        # The WARNING must mention the path
+        path_str = str(p)
+        assert any(path_str in r.message for r in warn_records), (
+            f'Expected WARNING to name the path {path_str!r}; '
+            f'got: {[r.message for r in warn_records]}'
+        )
+
+    def test_nonexistent_journal_no_flag_no_warn(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Constructing on a nonexistent path leaves journal_corrupt=False, no WARNING."""
+        p = tmp_path / 'nonexistent' / 'merge_queue.json'
+
+        with caplog.at_level(logging.WARNING):
+            store = MergeQueueStore(p)
+
+        assert store.journal_corrupt is False, (
+            'Expected journal_corrupt=False for a nonexistent file'
+        )
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'corrupt' in r.message.lower()
+        ]
+        assert len(warn_records) == 0, (
+            f'Expected no corrupt WARNING for missing file; '
+            f'got: {[r.message for r in warn_records]}'
+        )
+
+    def test_valid_empty_dict_journal_no_flag(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Constructing on a valid empty-dict journal leaves journal_corrupt=False."""
+        import json as _json
+        p = tmp_path / 'merge_queue.json'
+        p.write_text(_json.dumps({}), encoding='utf-8')
+
+        with caplog.at_level(logging.WARNING):
+            store = MergeQueueStore(p)
+
+        assert store.journal_corrupt is False, (
+            'Expected journal_corrupt=False for a valid empty-dict journal'
+        )
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'corrupt' in r.message.lower()
+        ]
+        assert len(warn_records) == 0, (
+            f'Expected no corrupt WARNING for valid journal; '
+            f'got: {[r.message for r in warn_records]}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task-1808 step-3 — recover_pending_merges journal_corrupt propagation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoverPendingMergesCorruptSignal:
+    """recover_pending_merges propagates journal_corrupt into the report dict
+    and emits a distinct WARNING when the journal was corrupt."""
+
+    async def test_corrupt_journal_report_flag_and_warn(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Corrupt journal → report['journal_corrupt']=True + WARNING about pending merges."""
+        p = tmp_path / 'merge_queue.json'
+        p.write_text('not json {{{{', encoding='utf-8')
+        store = MergeQueueStore(p)
+
+        # Minimal fake git_ops that never gets called (journal is corrupt → no records)
+        fake_git_ops = MagicMock()
+
+        queue: asyncio.Queue = asyncio.Queue()  # type: ignore[type-arg]
+        config = _real_config(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            report = await recover_pending_merges(
+                store,
+                queue,
+                fake_git_ops,
+                config,
+                event_store=None,
+                main_branch='main',
+                branch_prefix='task/',
+            )
+
+        assert report.get('journal_corrupt') is True, (
+            f'Expected report["journal_corrupt"]=True; got report={report}'
+        )
+        # A distinct WARNING about pending merges being lost must be emitted
+        corrupt_warns = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'journal' in r.message.lower()
+            and ('corrupt' in r.message.lower() or 'pending' in r.message.lower())
+        ]
+        assert len(corrupt_warns) >= 1, (
+            f'Expected a WARNING about corrupt journal / pending merges; '
+            f'got: {[r.message for r in caplog.records]}'
+        )
+
+    async def test_fresh_journal_no_corrupt_flag(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Nonexistent/fresh journal → report['journal_corrupt']=False, no corrupt WARNING."""
+        p = tmp_path / 'nonexistent' / 'merge_queue.json'
+        store = MergeQueueStore(p)
+
+        fake_git_ops = MagicMock()
+        queue: asyncio.Queue = asyncio.Queue()  # type: ignore[type-arg]
+        config = _real_config(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            report = await recover_pending_merges(
+                store,
+                queue,
+                fake_git_ops,
+                config,
+                event_store=None,
+                main_branch='main',
+                branch_prefix='task/',
+            )
+
+        assert report.get('journal_corrupt') is False, (
+            f'Expected report["journal_corrupt"]=False for fresh journal; got {report}'
+        )
+        corrupt_warns = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'corrupt' in r.message.lower()
+            and 'journal' in r.message.lower()
+        ]
+        assert len(corrupt_warns) == 0, (
+            f'Expected no corrupt-journal WARNING for fresh journal; '
+            f'got: {[r.message for r in corrupt_warns]}'
+        )

@@ -74,6 +74,20 @@ class MemoryConsolidator(BaseStage):
     # Count of snapshot lines stripped from the payload in the current cycle (task 1547)
     _entity_summary_snapshot_lines_stripped: int = 0
 
+    # Fetch degraded sources for the current run — reset at the top of assemble_payload
+    # and _format_assembled_payload; copied to report.stats['stage1_fetch_degraded'] in run()
+    # (task 1812). Empty list = genuine empty corpus; non-empty = fetch failure on that source.
+    # Initialized per-instance in __init__ to avoid the shared-mutable-default hazard.
+    _fetch_degraded_sources: list
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-instance initialisation: avoids shared-mutable-default hazard.
+        # A class-level [] would be mutated in-place by any append() that ran before
+        # the run-local reset in assemble_payload / _format_assembled_payload, leaking
+        # state across all instances (and across reused-instance runs).
+        self._fetch_degraded_sources: list = []
+
     async def run(
         self,
         events: list[ReconciliationEvent],
@@ -92,6 +106,7 @@ class MemoryConsolidator(BaseStage):
         report.stats['entity_summary_snapshot_lines_stripped'] = (
             self._entity_summary_snapshot_lines_stripped
         )
+        report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
 
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
@@ -251,6 +266,10 @@ class MemoryConsolidator(BaseStage):
                 f'got episode_limit={self.episode_limit}, memory_limit={self.memory_limit}'
             )
 
+        # Reset run-local degraded list before fetches (must precede every early-return so
+        # reused instances never leak a stale list into a subsequent remediation run's stats)
+        self._fetch_degraded_sources = []
+
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
             return self._assemble_remediation_payload()
@@ -260,8 +279,13 @@ class MemoryConsolidator(BaseStage):
             episodes = await self.memory.get_episodes(
                 project_id=self.project_id, last_n=self.episode_limit
             )
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                'reconciliation.stage1_episodes_fetch_failed',
+                extra={'project_id': self.project_id, 'error': str(e)},
+            )
             episodes = []
+            self._fetch_degraded_sources.append('episodes')
         new_episodes = episodes
         if watermark.last_episode_timestamp:
             wm_str = str(watermark.last_episode_timestamp)
@@ -275,9 +299,22 @@ class MemoryConsolidator(BaseStage):
         scope = Scope(project_id=self.project_id)
         try:
             all_memories = await self.memory.mem0.get_all(scope, limit=self.memory_limit)
-            mem0_memories = all_memories.get('results', [])
+            results = all_memories.get('results') if isinstance(all_memories, dict) else None
+            if not isinstance(results, list):
+                logger.warning(
+                    "mem0.get_all returned malformed/absent 'results' key; "
+                    "treating as empty. got: %s",
+                    repr(all_memories)[:200],
+                )
+                results = []
+            mem0_memories = results
         except Exception:
+            logger.warning(
+                "mem0.get_all raised an exception; treating as empty memories.",
+                exc_info=True,
+            )
             mem0_memories = []
+            self._fetch_degraded_sources.append('mem0')
 
         new_memories = mem0_memories
         if watermark.last_memory_timestamp:
@@ -288,10 +325,7 @@ class MemoryConsolidator(BaseStage):
             ]
 
         # 3. Store stats
-        try:
-            status = await self.memory.get_status(project_id=self.project_id)
-        except Exception:
-            status = {}
+        status = await self._fetch_status()
 
         # 4. Events summary
         event_summary = _format_events(events)
@@ -359,18 +393,37 @@ Review the above data and perform memory consolidation:
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
+    async def _fetch_status(self) -> dict:
+        """Fetch store status, logging a WARNING and tracking degradation on failure.
+
+        Single source of truth for the status-fetch try/except that both
+        assemble_payload (legacy time-windowed path) and _format_assembled_payload
+        (assembled/token-budget path) share.  The caller is responsible for resetting
+        self._fetch_degraded_sources before calling this method.
+        """
+        try:
+            return await self.memory.get_status(project_id=self.project_id)
+        except Exception as e:
+            logger.warning(
+                'reconciliation.stage1_status_fetch_failed',
+                extra={'project_id': self.project_id, 'error': str(e)},
+            )
+            self._fetch_degraded_sources.append('status')
+            return {}
+
     async def _format_assembled_payload(self, watermark: Watermark) -> str:
         """Format a payload from ContextAssembler output — event-driven context."""
         ap = self.assembled_payload
         assert ap is not None
 
+        # assemble_payload's line-262 reset is bypassed by the early return at lines 250-251.
+        # Reset here so each assembled-path call starts clean (no leak from a prior run).
+        self._fetch_degraded_sources = []
+
         event_summary = _format_events(ap.events)
 
         # Store status (cheap fetch, always useful)
-        try:
-            status = await self.memory.get_status(project_id=self.project_id)
-        except Exception:
-            status = {}
+        status = await self._fetch_status()
 
         # Prior S3 findings
         prior_s3_section = ''

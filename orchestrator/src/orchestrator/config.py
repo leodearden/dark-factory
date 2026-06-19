@@ -837,6 +837,24 @@ class GitConfig(BaseModel):
             'Set only when the seed base lives at a non-default location.'
         ),
     )
+    merge_spec_warm_lane_pool: bool = Field(
+        default=False,
+        description=(
+            'When True, LOCAL speculative merge-verify slots allocate from a '
+            'per-box pool of K CoW-seeded warm lanes (_spec-0 .. _spec-{K-1}), '
+            'one per speculation depth, instead of using the single serial '
+            '_merge-verify worktree.  K = 1 + len(enabled_verify_runners) '
+            '(same expression as speculation_depth).  Each acquire re-seeds '
+            'target/ from the CURRENT warm base (inv.8 always-re-seed-at-acquire). '
+            'On pool exhaustion or seed failure, falls back to a cold ephemeral '
+            'worktree — never blocks the scheduler (inv.6).  The existing '
+            'warm/cold SHADOW safety valve (warm_verify_shadow_compare) covers '
+            'spec-lane warm verifies automatically (steps 15-18).  '
+            'Default False → byte-identical to today (trivially revertible, '
+            'mirrors warm_lane_pool convention).  Requires reify §9.5 '
+            'seed-warm-lane.sh and a CoW-capable XFS volume.'
+        ),
+    )
 
 
 class VerifyRunnerConfig(BaseModel):
@@ -1106,6 +1124,15 @@ class OrchestratorConfig(BaseSettings):
     # not advanced; default True closes the demonstrated bug, ops can opt
     # out if it surprises us.
     rebase_before_verify: bool = Field(default=True)
+    # Cohort-labelling boundary for post-rebase cost instrumentation.
+    # Commits in old_base..new_base below this threshold are labelled
+    # 'continuous' (normal orchestrator cadence); at-or-above with
+    # is_first_rebase=True → 'post-unblock', otherwise → 'big-jump'.
+    # LABELLING ONLY — does NOT trigger any re-seed behaviour ("wear the
+    # cost for now").  25 cleanly separates the continuous single-/low-
+    # double-digit orchestrator rebases from the 100s-of-commits
+    # accumulated drift the /unblock path pays on resume.
+    rebase_reseed_distance_threshold: int = Field(default=25, ge=1)
     # Fix 2 — thrash threshold for repeated infra-issue resumes on the
     # same root cause.  Counter increments when an L0 (category=
     # infra_issue) is resolved without iteration-log growth, resets to 1
@@ -1372,6 +1399,20 @@ class OrchestratorConfig(BaseSettings):
         default='scripts/restart-fused-memory.sh'
     )
 
+    # Post-merge staleness hook — restarts dark-factory-dashboard.service after a
+    # merge whose diff touches dashboard/src/.  The dashboard is a LEAF service
+    # (nothing depends on it), so its restart fires regardless of idle state —
+    # even while agents are dispatching.
+    # See orchestrator/src/orchestrator/service_restart.py for policy details.
+    dashboard_restart_on_merge_enabled: bool = Field(default=True)
+    dashboard_restart_debounce_secs: float = Field(default=20.0)
+    dashboard_restart_watch_prefixes: list[str] = Field(
+        default_factory=lambda: ['dashboard/src/']
+    )
+    dashboard_restart_script: str = Field(
+        default='scripts/restart-dashboard.sh'
+    )
+
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
     # against a synthetic ``review-*`` task_id).  Without this, such
@@ -1413,6 +1454,17 @@ class OrchestratorConfig(BaseSettings):
     # (no acquirable assignment, no active workflows) — see Fix 4.
     stranded_reconcile_enabled: bool = Field(default=True)
     stranded_reconcile_interval_secs: float = Field(default=900.0)
+
+    # Periodic full-suite + lint + typecheck sweep of the current main tip in
+    # a throwaway detached worktree, completely off the merge hot-path so
+    # per-merge latency is untouched.  When main has advanced since the last
+    # sweep, runs run_full_verification (all subprojects in parallel) against a
+    # _mainsweep-<hex> worktree pinned at that SHA and escalates (L1,
+    # infra_issue) on drift.  Catches test-suite drift that scoped per-merge
+    # verify misses (tasks 1829 / esc-1749-16).  SHA dedup avoids redundant
+    # full builds when main hasn't advanced within the interval.
+    main_tip_sweep_enabled: bool = Field(default=True)
+    main_tip_sweep_interval_secs: float = Field(default=1800.0)
 
     # Backstop for the stranded-`blocked` gap: a task left `blocked` with no
     # open escalation AND no active workflow is an orphaned recovery (its

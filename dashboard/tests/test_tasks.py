@@ -131,7 +131,7 @@ async def test_fetch_external_statuses_returns_bare_status_map(dummy_config):
 
 @pytest.mark.asyncio
 async def test_fetch_external_statuses_returns_empty_on_connect_error(dummy_config):
-    """fetch_external_statuses returns {} (fail-safe) on ConnectError."""
+    """fetch_external_statuses returns the offline marker on ConnectError (all URLs exhausted)."""
     from dashboard.data.tasks import fetch_external_statuses
 
     async def _raise_connect(*args, **kwargs):
@@ -141,12 +141,13 @@ async def test_fetch_external_statuses_returns_empty_on_connect_error(dummy_conf
         async with httpx.AsyncClient() as client:
             result = await fetch_external_statuses(client, dummy_config, ['dark_factory:13'])
 
-    assert result == {}
+    assert result.get('offline') is True
+    assert result.get('error')
 
 
 @pytest.mark.asyncio
 async def test_fetch_external_statuses_returns_empty_on_non_dict_result(dummy_config):
-    """fetch_external_statuses returns {} if MCP returns a non-dict (guards shape drift)."""
+    """fetch_external_statuses returns the offline marker if MCP returns a non-dict (all URLs exhausted)."""
     from dashboard.data.tasks import fetch_external_statuses
 
     async def _bad_result(*args, **kwargs):
@@ -156,7 +157,8 @@ async def test_fetch_external_statuses_returns_empty_on_non_dict_result(dummy_co
         async with httpx.AsyncClient() as client:
             result = await fetch_external_statuses(client, dummy_config, ['dark_factory:13'])
 
-    assert result == {}
+    assert result.get('offline') is True
+    assert result.get('error')
 
 
 @pytest.mark.asyncio
@@ -210,6 +212,56 @@ async def test_fetch_external_statuses_failover_on_empty_dict(two_url_config):
 
     assert result == good_map, 'should fall through to second URL on empty dict'
     assert len(calls) == 2, 'both URLs should have been tried'
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_returns_offline_marker_on_connect_error(dummy_config):
+    """fetch_external_statuses must return {'offline':True,'error':...} when ALL URLs fail.
+
+    Fails today because the all-fail path returns {}, indistinguishable from empty deps.
+    """
+    from dashboard.data.tasks import fetch_external_statuses
+
+    async def _raise_connect(*args, **kwargs):
+        raise httpx.ConnectError('refused')
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_raise_connect):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, dummy_config, ['dark_factory:13'])
+
+    assert result.get('offline') is True, f'expected offline=True, got: {result}'
+    assert result.get('error'), f'expected non-empty error string, got: {result}'
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_returns_offline_marker_on_all_non_dict(dummy_config):
+    """fetch_external_statuses must return offline marker when all URLs return non-dicts.
+
+    Fails today because non-dict results just continue to the empty {} fallback.
+    """
+    from dashboard.data.tasks import fetch_external_statuses
+
+    async def _bad_result(*args, **kwargs):
+        return ['not', 'a', 'dict']
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=_bad_result):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, dummy_config, ['dark_factory:13'])
+
+    assert result.get('offline') is True, f'expected offline=True, got: {result}'
+    assert result.get('error'), f'expected non-empty error string, got: {result}'
+
+
+@pytest.mark.asyncio
+async def test_fetch_external_statuses_empty_deps_still_returns_empty_dict(dummy_config):
+    """Empty deps must still return {} (benign short-circuit), NOT the offline marker."""
+    from dashboard.data.tasks import fetch_external_statuses
+
+    with patch('dashboard.data.tasks.mcp_tool_call', side_effect=AssertionError('should not be called')):
+        async with httpx.AsyncClient() as client:
+            result = await fetch_external_statuses(client, dummy_config, [])
+
+    assert result == {}, f'empty deps must return {{}}, got: {result}'
 
 
 # ---------------------------------------------------------------------------

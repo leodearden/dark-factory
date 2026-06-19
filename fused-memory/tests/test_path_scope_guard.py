@@ -16,6 +16,7 @@ from fused_memory.middleware.path_scope_guard import (
     check_candidate_for_scope,
     check_text_for_scope,
     find_paths,
+    is_routing_override,
 )
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
 from fused_memory.middleware.task_curator import CandidateTask
@@ -320,3 +321,35 @@ class TestVerdictErrorDict:
         assert d['suggested_project'] is None
         # Error message should hint at manual routing.
         assert 'manually' in d['error'] or 'manual' in d['error']
+
+
+# ---------------------------------------------------------------------------
+# is_routing_override
+# ---------------------------------------------------------------------------
+
+
+class TestIsRoutingOverride:
+    """Unit tests for the is_routing_override(reason) predicate.
+
+    Pins the strip-semantics: whitespace-only is NOT a valid override.
+    """
+
+    def test_non_empty_reason_returns_true(self):
+        assert is_routing_override('owner asserted ownership') is True
+
+    def test_single_word_reason_returns_true(self):
+        assert is_routing_override('cross-cutting') is True
+
+    def test_empty_string_returns_false(self):
+        assert is_routing_override('') is False
+
+    def test_none_returns_false(self):
+        assert is_routing_override(None) is False
+
+    def test_whitespace_only_returns_false(self):
+        """Whitespace-only reason must NOT count as an override (strip semantics)."""
+        assert is_routing_override('   ') is False
+
+    def test_reason_with_leading_trailing_whitespace_is_true(self):
+        """A reason that is non-empty after stripping is valid."""
+        assert is_routing_override('  owner confirmed  ') is True

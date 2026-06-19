@@ -7291,6 +7291,55 @@ class TestHarnessFetchTaskCountCensus:
 
         assert result == {}
 
+    # --- Step-3 (task 1810): non-dict get_statuses emits WARNING ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_return", [["list", "not", "dict"], None])
+    async def test_non_dict_statuses_returns_empty_and_warns(
+        self, bad_return, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """get_statuses returning a non-dict (without raising) => {} + WARNING.
+
+        Currently RED: the non-dict branch returns {} silently (no logger call).
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_statuses = AsyncMock(return_value=bad_return)  # type: ignore[union-attr,attr-defined]
+
+        _HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
+        with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
+            result = await harness._fetch_task_count_census('/abs/project')
+
+        assert result == {}
+        warns = [
+            r for r in caplog.records
+            if r.name == _HARNESS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            f"expected a WARNING on {_HARNESS_LOGGER!r} for non-dict statuses "
+            f"({bad_return!r}), got none"
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_dict_statuses_returns_empty_no_warning(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """REGRESSION: legit-empty {} from get_statuses => {} with ZERO warnings."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_statuses = AsyncMock(return_value={})  # type: ignore[union-attr,attr-defined]
+
+        _HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
+        with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
+            result = await harness._fetch_task_count_census('/abs/project')
+
+        assert result == {}
+        warns = [
+            r for r in caplog.records
+            if r.name == _HARNESS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f"legit-empty {{}} statuses must not emit WARNINGs; got {warns!r}"
+        )
+
 
 # ── Tests for task 1785: harness._check_graphiti_queue_health ──────────────────
 
@@ -7526,3 +7575,93 @@ class TestFullCycleWiringDiagnostics:
         assert gqh.get('healthy') is False, (
             f'Expected graphiti_queue_health["healthy"]==False, got {gqh.get("healthy")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-05 (RED) / step-06 (GREEN): fingerprint-compute failure → fail-toward-escalate
+# step-07 (RED) / step-08 (GREEN): journal-read failure → fail-toward-escalate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_finding_persistence_count_fingerprint_failure_fails_toward_escalate(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    caplog,
+):
+    """When compute_content_fingerprint raises, _finding_persistence_count must:
+
+    1. Return a value >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD (fail-toward-escalate,
+       so a degraded count escalates rather than silently suppressing as below-threshold).
+    2. Emit a WARNING log.
+
+    RED until step-06 adds the WARNING and changes `return 0` to the sentinel.
+    """
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    finding = _make_s3_findings()[0]  # actionable finding
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.compute_content_fingerprint',
+            side_effect=RuntimeError('fp boom'),
+        ),
+        patch(
+            'fused_memory.reconciliation.harness.HAS_ESCALATION',
+            True,
+        ),
+        caplog.at_level(logging.WARNING, logger='fused_memory'),
+    ):
+        result = await harness._finding_persistence_count('test-project', finding)
+
+    assert result >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, (
+        f'Expected result >= {_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} (fail-toward-escalate) '
+        f'when fingerprint compute raises, got {result!r}. '
+        'RED: current impl silently returns 0 (suppresses escalation).'
+    )
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, (
+        'Expected a WARNING log when fingerprint compute raises, got none. '
+        'RED: fingerprint-compute except has no log.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_finding_persistence_count_journal_failure_fails_toward_escalate(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    caplog,
+):
+    """When journal.get_recent_runs raises, _finding_persistence_count must return
+    a value >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD (fail-toward-escalate).
+
+    The journal-read except already emits a WARNING — only the return value is wrong.
+    RED until step-08 changes `return 0` to the sentinel.
+    """
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    finding = _make_s3_findings()[0]
+
+    harness.journal.get_recent_runs = AsyncMock(
+        side_effect=RuntimeError('journal down')
+    )
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.HAS_ESCALATION',
+            True,
+        ),
+        caplog.at_level(logging.WARNING, logger='fused_memory'),
+    ):
+        result = await harness._finding_persistence_count('test-project', finding)
+
+    assert result >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, (
+        f'Expected result >= {_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} (fail-toward-escalate) '
+        f'when journal.get_recent_runs raises, got {result!r}. '
+        'RED: current impl returns 0 (suppresses escalation).'
+    )

@@ -40,6 +40,7 @@ from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
     check_candidate_for_scope,
     check_text_for_scope,
+    is_routing_override,
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
 
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
+    from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
@@ -220,6 +222,7 @@ class TaskInterceptor:
         bulk_reset_guard: 'BulkResetGuard | None' = None,
         prefix_registry: ProjectPrefixRegistry | None = None,
         scope_violation_escalator: ScopeViolationEscalator | None = None,
+        path_scope_adjudicator: 'PathScopeAdjudicator | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -322,6 +325,10 @@ class TaskInterceptor:
         # and fires a scope_violation escalation alongside any rejection.
         self._prefix_registry = prefix_registry
         self._scope_violation_escalator = scope_violation_escalator
+        # Stage-2 LLM adjudicator (task 1822): runs only on Stage-1 heuristic hit
+        # to distinguish real misroutes from incidental-mention false positives.
+        # None (default) → exact current behavior (guard not weakened).
+        self._path_scope_adjudicator = path_scope_adjudicator
 
         # Task write-journal (Commit 7): mirrors MemoryService's
         # ``set_write_journal`` pattern. When wired by the bootstrap, every
@@ -1102,12 +1109,64 @@ class TaskInterceptor:
         v = self._path_guard_check(candidate, kwargs, project_id)
         return v.to_error_dict() if v.is_rejection else None
 
-    def _path_guard_or_skip(
+    def _emit_scope_violation_escalation(
+        self,
+        verdict: PathGuardVerdict,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_root: str,
+        project_id: str,
+        *,
+        llm_reason: str | None = None,
+    ) -> None:
+        """Fire the scope_violation escalation on a rejection verdict.
+
+        Pure side-effect helper: resolves the suggested root, builds the
+        candidate title, and delegates to :attr:`_scope_violation_escalator`.
+        Errors are logged and swallowed so a queue failure can never convert
+        a rejection into an exception (matches the never-raise convention).
+        No-ops when no escalator is configured.
+
+        The optional *llm_reason* is forwarded to ``report_rejection``
+        (task 1822) so genuine-misroute / fail-safe cases carry the LLM
+        adjudicator's reason in the escalation detail.
+        """
+        if self._scope_violation_escalator is None:
+            return
+        registry = self._prefix_registry
+        suggested_root: str | None = None
+        if verdict.suggested_project and registry is not None:
+            suggested_root = registry.root_for_project(verdict.suggested_project)
+        candidate_title = (candidate.title if candidate else '') or str(
+            kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
+        )[:200]
+        try:
+            self._scope_violation_escalator.report_rejection(
+                project_root=project_root,
+                project_id=project_id,
+                candidate_title=candidate_title,
+                matched_paths=verdict.matched_paths,
+                suggested_project=verdict.suggested_project,
+                suggested_root=suggested_root,
+                llm_reason=llm_reason,
+            )
+        except Exception:  # pragma: no cover — defensive only
+            # Escalator is built to never raise (queue failures are
+            # logged), but if a future change regresses we must not
+            # turn a rejection into an exception.
+            logger.exception(
+                'task_interceptor: scope_violation_escalator raised; '
+                'continuing with rejection error',
+            )
+
+    async def _path_guard_or_skip(
         self,
         kwargs: dict[str, Any],
         project_root: str,
         project_id: str,
         candidate: CandidateTask | None = None,
+        *,
+        routing_override_reason: str = '',
     ) -> dict | None:
         """Run the path-scope guard, escalate on rejection, return error dict.
 
@@ -1138,9 +1197,29 @@ class TaskInterceptor:
         that skips the build entirely for dark_factory still applies in
         back-compat mode.
 
+        Stage-2 LLM adjudication (task 1822): when
+        :attr:`_path_scope_adjudicator` is wired and the heuristic fires,
+        the adjudicator runs inline.  A confident ``allow`` verdict permits
+        the submission without escalation; all other outcomes (reject /
+        uncertain / fail-safe) preserve the existing reject+escalate
+        behaviour.  When no adjudicator is wired the method behaves exactly
+        as before (guard not weakened).
+
         Call-site pattern:
-            ``if err := self._path_guard_or_skip(kwargs, project_root, project_id): return err``
+            ``if err := await self._path_guard_or_skip(kwargs, project_root, project_id): return err``
         """
+        # Routing override: deliberate bypass of BOTH Stage-1 heuristic and
+        # Stage-2 LLM adjudicator.  Must be the FIRST action so no verdict
+        # computation or escalation fires.
+        if is_routing_override(routing_override_reason):
+            logger.warning(
+                'path-guard ROUTING OVERRIDE: skipping path guards for '
+                'project_id=%s reason=%r',
+                project_id,
+                routing_override_reason.strip(),
+            )
+            return None
+
         registry = self._prefix_registry
         # Back-compat fast path: no registry + dark_factory → guard is a no-op.
         if (registry is None or not registry) and project_id == DARK_FACTORY_PROJECT_ID:
@@ -1150,31 +1229,38 @@ class TaskInterceptor:
         verdict = self._path_guard_check(candidate, kwargs, project_id)
         if not verdict.is_rejection:
             return None
-        # Fire the scope_violation escalation alongside the rejection.
-        if self._scope_violation_escalator is not None:
-            suggested_root: str | None = None
-            if verdict.suggested_project and registry is not None:
-                suggested_root = registry.root_for_project(verdict.suggested_project)
-            candidate_title = (candidate.title if candidate else '') or str(
-                kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
-            )[:200]
-            try:
-                self._scope_violation_escalator.report_rejection(
-                    project_root=project_root,
-                    project_id=project_id,
-                    candidate_title=candidate_title,
-                    matched_paths=verdict.matched_paths,
-                    suggested_project=verdict.suggested_project,
-                    suggested_root=suggested_root,
+        # Stage-1 heuristic hit — run Stage-2 LLM adjudicator when wired.
+        if self._path_scope_adjudicator is not None:
+            title = (candidate.title if candidate else '') or str(
+                kwargs.get('title') or kwargs.get('prompt') or '',
+            )
+            description = str(kwargs.get('description') or '')
+            adj = await self._path_scope_adjudicator.adjudicate(
+                title=title,
+                description=description,
+                matched_paths=verdict.matched_paths,
+                project_id=project_id,
+                suggested_project=verdict.suggested_project or '',
+                project_root=project_root,
+            )
+            if adj.should_allow_creation:
+                logger.debug(
+                    'path-guard: LLM adjudicator downgraded heuristic hit to allow '
+                    'for %r (matched=%s)',
+                    title,
+                    verdict.matched_paths,
                 )
-            except Exception:  # pragma: no cover — defensive only
-                # Escalator is built to never raise (queue failures are
-                # logged), but if a future change regresses we must not
-                # turn a rejection into an exception.
-                logger.exception(
-                    'task_interceptor: scope_violation_escalator raised; '
-                    'continuing with rejection error',
-                )
+                return None
+            # Reject / uncertain / fail-safe: escalate carrying the LLM reason.
+            self._emit_scope_violation_escalation(
+                verdict, candidate, kwargs, project_root, project_id,
+                llm_reason=adj.reason or None,
+            )
+            return verdict.to_error_dict()
+        # No adjudicator wired → identical to pre-task-1822 behavior.
+        self._emit_scope_violation_escalation(
+            verdict, candidate, kwargs, project_root, project_id, llm_reason=None,
+        )
         return verdict.to_error_dict()
 
     async def _execute_combine(
@@ -1348,14 +1434,49 @@ class TaskInterceptor:
             return parsed if isinstance(parsed, dict) else None
         return None
 
+    @staticmethod
+    def _inject_routing_override(metadata: Any, reason: str) -> dict:
+        """Return a metadata dict with ``routing_override_reason`` set to *reason*.
+
+        Builds on :meth:`_extract_metadata_dict` to normalise the incoming
+        shape (None / JSON-string / dict / unparseable → fresh dict when None
+        or unparseable) before writing the key, so the result is always a
+        plain dict ready for JSON serialisation.
+
+        **Data loss note**: when *metadata* is non-None but cannot be parsed
+        as a JSON-object (e.g. a bare list, an unparseable string), the
+        original value is discarded and a fresh dict is used.  A WARNING is
+        emitted in that case so the loss is visible in logs and greppable.
+        Without an override the same malformed metadata is stored as-is in
+        the ticket blob, so enabling an override would otherwise silently
+        change behaviour for such inputs.
+        """
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if meta is None:
+            if metadata is not None:
+                logger.warning(
+                    'routing-override: non-dict metadata discarded (type=%s); '
+                    'using fresh dict. Original value: %r',
+                    type(metadata).__name__,
+                    metadata,
+                )
+            meta = {}
+        else:
+            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta['routing_override_reason'] = reason
+        return meta
+
     async def _check_escalation_idempotency(
         self,
         *,
         project_root: str,
         metadata,
-    ) -> dict | None:
-        """Return an existing task's identity if ``(escalation_id,
-        suggestion_hash)`` in ``metadata`` matches a non-cancelled task.
+    ) -> tuple[dict | None, bool]:
+        """Return ``(hit, check_failed)`` where ``hit`` is an existing task's
+        identity if ``(escalation_id, suggestion_hash)`` in ``metadata``
+        matches a non-cancelled task, and ``check_failed`` is ``True`` when
+        ``get_tasks`` raised (so callers can fall through to CREATE rather than
+        treating a failure as a clean no-hit).
 
         R4: authoritative and cheap — no LLM, no embedding lookup.
         Works even when the curator is disabled or broken, which is
@@ -1364,24 +1485,24 @@ class TaskInterceptor:
         """
         meta = self._extract_metadata_dict(metadata)
         if not meta:
-            return None
+            return (None, False)
         esc_id = meta.get('escalation_id')
         sug_hash = meta.get('suggestion_hash')
         if not isinstance(esc_id, str) or not isinstance(sug_hash, str):
-            return None
+            return (None, False)
         if not esc_id or not sug_hash:
-            return None
+            return (None, False)
 
         if self.taskmaster is None:
-            return None
+            return (None, False)
         try:
             tasks_result = await self.taskmaster.get_tasks(project_root)
         except Exception:
-            logger.debug(
+            logger.warning(
                 'r4: get_tasks failed during idempotency check',
                 exc_info=True,
             )
-            return None
+            return (None, True)
         for task in flatten_task_tree(tasks_result):
             tmeta = task.get('metadata')
             if not isinstance(tmeta, dict):
@@ -1402,14 +1523,17 @@ class TaskInterceptor:
                 esc_id,
                 sug_hash,
             )
-            return {
-                'id': tid,
-                'title': str(task.get('title', '')),
-                'deduplicated': True,
-                'action': 'idempotency_hit',
-                'reason': 'escalation+suggestion matched',
-            }
-        return None
+            return (
+                {
+                    'id': tid,
+                    'title': str(task.get('title', '')),
+                    'deduplicated': True,
+                    'action': 'idempotency_hit',
+                    'reason': 'escalation+suggestion matched',
+                },
+                False,
+            )
+        return (None, False)
 
     async def submit_task(self, project_root: str, **kwargs: Any) -> dict:
         """Phase-1 of the two-phase add: persist a ticket and return its id immediately.
@@ -1450,6 +1574,13 @@ class TaskInterceptor:
 
         project_id = resolve_project_id(project_root)
 
+        # Pop and normalise routing_override_reason BEFORE the guard so it
+        # never leaks into the ticket-blob kwargs or tm.add_task.  Stripping
+        # ensures whitespace-only values are treated as absent.
+        routing_override_reason = str(
+            kwargs.pop('routing_override_reason', '') or ''
+        ).strip()
+
         # Path-scope guard: reject before persisting if the candidate references
         # paths owned by another project.  When a multi-project registry is
         # configured the guard runs for every project (including dark_factory);
@@ -1457,10 +1588,20 @@ class TaskInterceptor:
         # _build_candidate is skipped on the hot path.  Rejections also fire a
         # scope_violation escalation when the escalator is configured.
         # Must run before kwargs.pop('metadata') below so the helper can read metadata.
-        if err := self._path_guard_or_skip(kwargs, project_root, project_id):
+        if err := await self._path_guard_or_skip(
+            kwargs, project_root, project_id,
+            routing_override_reason=routing_override_reason,
+        ):
             return err
 
         metadata = kwargs.pop('metadata', None)
+
+        # Inject the override reason into task metadata (both the normal ticket
+        # path and the planning_mode path benefit from this placement).  When no
+        # override was supplied the metadata dict is left untouched.
+        if routing_override_reason:
+            metadata = self._inject_routing_override(metadata, routing_override_reason)
+
         planning_mode = bool(kwargs.pop('planning_mode', False))
         if planning_mode:
             return await self._submit_task_planning_mode(
@@ -2411,9 +2552,14 @@ class TaskInterceptor:
                 # Short-circuits curator when (escalation_id, suggestion_hash) in
                 # metadata matches a non-cancelled existing task — avoids duplicate
                 # tasks when reconciliation retries an escalation suggestion.
-                idempotency_hit = await self._check_escalation_idempotency(
-                    project_root=project_root,
-                    metadata=metadata,
+                # _idem_check_failed is intentionally unused today: both hit=None,
+                # check_failed=True and hit=None, check_failed=False fall through to
+                # the curator gate — the tuple is retained for future observability/metrics.
+                idempotency_hit, _idem_check_failed = (
+                    await self._check_escalation_idempotency(
+                        project_root=project_root,
+                        metadata=metadata,
+                    )
                 )
                 if idempotency_hit is not None:
                     existing_task_id = str(idempotency_hit.get('id', ''))
@@ -2426,6 +2572,9 @@ class TaskInterceptor:
                     )
                     self._signal_ticket_event(ticket_id)
                     return
+                # check_failed=True means get_tasks raised; fall through to
+                # the curator gate so the ticket is not lost (loud bypass —
+                # WARNING already emitted inside _check_escalation_idempotency).
 
                 # ── Curator gate ─────────────────────────────────────────────
                 curator = await self._get_curator()
@@ -2621,9 +2770,14 @@ class TaskInterceptor:
             # 'combined' immediately and excluded from the curate call.
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
-                idempotency_hit = await self._check_escalation_idempotency(
-                    project_root=t.project_root,
-                    metadata=t.metadata,
+                # _idem_check_failed is intentionally unused today: both
+                # check_failed=True and check_failed=False with hit=None fall
+                # through to CREATE — retained for future observability/metrics.
+                idempotency_hit, _idem_check_failed = (
+                    await self._check_escalation_idempotency(
+                        project_root=t.project_root,
+                        metadata=t.metadata,
+                    )
                 )
                 if idempotency_hit is not None:
                     existing_id = str(idempotency_hit.get('id', ''))
@@ -2636,6 +2790,8 @@ class TaskInterceptor:
                     )
                     self._signal_ticket_event(t.ticket_id)
                 else:
+                    # check_failed=True (get_tasks raised) → fall through to
+                    # CREATE; WARNING already emitted at source.
                     active_ticket_data.append(t)
             ticket_data = active_ticket_data
 
@@ -2975,6 +3131,10 @@ class TaskInterceptor:
 
         Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
+
+        ``metadata_mode`` and ``append`` pass through unchanged via ``**kwargs`` to
+        the backend, which single-sources mode resolution via
+        :func:`~fused_memory.backends.sqlite_task_backend._resolve_metadata_mode`.
         """
         if err := _reject_status_in_update_task(task_id, kwargs.get('status')):
             return err
@@ -3291,9 +3451,13 @@ def _extract_status(task_data: dict) -> str:
 def _extract_metadata_files(task_data: Any) -> list[str]:
     """Return ``metadata.files`` as a list[str] from a Taskmaster task dict.
 
-    Silently returns ``[]`` when the field is absent, empty, or malformed —
-    the phantom-done gate only fires when files is a non-empty list of
-    strings, so defensive behaviour here means "do not gate".
+    Silently returns ``[]`` when the field is absent, empty, or the task_data /
+    metadata are not dicts — these are benign-absent paths and the phantom-done
+    gate simply does not fire.
+
+    Emits a WARNING when ``metadata.files`` is *present* but not a list (the gate
+    would silently self-exempt), and when a non-empty files list yields dropped
+    non-str / empty entries (partial data loss is observable).
     """
     if not isinstance(task_data, dict):
         return []
@@ -3301,9 +3465,28 @@ def _extract_metadata_files(task_data: Any) -> list[str]:
     if not isinstance(metadata, dict):
         return []
     files = metadata.get('files')
-    if not isinstance(files, list):
+    if files is None:
+        # Benign absent — phantom-done gate simply does not fire.
         return []
-    return [f for f in files if isinstance(f, str) and f]
+    if not isinstance(files, list):
+        logger.warning(
+            "_extract_metadata_files: metadata.files is present but not a list "
+            "(type=%s); treating as empty. got: %s",
+            type(files).__name__,
+            repr(files)[:200],
+        )
+        return []
+    filtered = [f for f in files if isinstance(f, str) and f]
+    if files and len(filtered) < len(files):
+        dropped = len(files) - len(filtered)
+        logger.warning(
+            "_extract_metadata_files: dropped %d non-str/empty entr%s from metadata.files. "
+            "got: %s",
+            dropped,
+            'y' if dropped == 1 else 'ies',
+            repr(files)[:200],
+        )
+    return filtered
 
 
 def _missing_files(project_root: str, declared: list[str]) -> list[str]:
@@ -3581,10 +3764,10 @@ def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
 
     ``set_task_status`` writes audit fields (``reopen_reason`` /
     ``done_provenance``) via a separate ``tm.update_task(metadata=…)`` call.
-    The default Taskmaster path is ``append=False``, which would replace the
-    whole metadata blob — silently dropping ``memory_hints`` / ``files`` and
-    other sibling keys. Read-modify-write here so the audit write merges with
-    whatever was already on the row.
+    The default backend path is now shallow-merge (``metadata_mode=None``), so
+    this read-modify-write is belt-and-braces — the backend would also preserve
+    sibling keys.  The explicit merge is kept for clarity and defence-in-depth
+    (it is not safe to rely on the backend default never changing).
 
     Audit fields win on collision (a fresh ``reopen_reason`` should never be
     shadowed by a stale one from an earlier reopen).
@@ -3693,15 +3876,17 @@ def interceptor_write_succeeded(resp: object) -> bool:
     that does not include an explicit ``success`` field still classifies correctly.
     Non-dict responses (``None``, strings, lists) are always treated as failures.
 
-    .. warning::
-        An empty dict ``{}`` is treated as success (both ``success`` and ``error`` are
-        absent, so both default to their "no problem" values). This is intentional for
-        fixture compatibility, but it means a future upstream bug that returns ``{}``
-        instead of ``{'success': True, 'id': …}`` would be silently classified as a
-        successful write. Production Taskmaster responses always include at least one
-        of ``success`` or ``id``; if you see a ``{}`` in logs, investigate the caller.
+    An empty dict ``{}`` carries no positive write signal and is therefore treated as
+    **failure** (``bool({})`` is ``False``). Production Taskmaster responses always
+    include at least one of ``success`` or ``id``; if you see ``{}`` in logs,
+    investigate the caller.
     """
-    return isinstance(resp, dict) and bool(resp.get('success', True)) and not resp.get('error')
+    return (
+        isinstance(resp, dict)
+        and bool(resp)
+        and bool(resp.get('success', True))
+        and not resp.get('error')
+    )
 
 
 def _done_provenance_missing_error(task_id: str) -> dict:

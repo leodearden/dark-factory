@@ -18,6 +18,8 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
+from shared.mcp_envelope import resolver_failed
+from shared.safe_io import load_json_or_warn
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -411,6 +413,11 @@ class Harness:
             warm_lane_pool_size=(
                 config.max_concurrent_tasks if config.git.warm_lane_pool else 0
             ),
+            # Spec-pool size: K (same as speculation_depth) when knob on, else 0.
+            # self._speculation_k is safe here — self.config is already set above.
+            merge_spec_warm_lane_pool_size=(
+                self._speculation_k if config.git.merge_spec_warm_lane_pool else 0
+            ),
         )
         self.scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
         # Wire the park-stop trip callback: Scheduler trips → Harness.pause_scheduler.
@@ -547,6 +554,15 @@ class Harness:
         # without waiting for the next orchestrator restart.  See Fix 4.
         self._stranded_reconcile_task: asyncio.Task | None = None
 
+        # Main-tip integrity sweep — task 1832.
+        # Periodic full-suite sweep of the current main tip in a throwaway
+        # detached worktree; escalates L1 on drift.  Completely off the merge
+        # hot-path (per-merge latency untouched).
+        self._main_tip_sweep_task: asyncio.Task | None = None
+        # Last main SHA successfully swept; used to skip the expensive full
+        # verify when main has not advanced since the previous pass.
+        self._last_swept_main_sha: str | None = None
+
         # Per-task consecutive-failure counter for the reconcile sweep —
         # cleared on any successful mark_done, used to gate L1 escalation.
         self._reconcile_failure_counts: dict[str, int] = {}
@@ -579,11 +595,12 @@ class Harness:
             config.project_root / 'data' / 'orchestrator' / 'merge_queue.json'
         )
 
-        # Post-merge staleness hook — restart fused-memory.service when a
-        # landed diff touches fused-memory/src/.  Built in _start_merge_worker
-        # (where git_ops/event_store/config are all live) and fired from the
-        # run-forever idle branch (a verified no-dispatched-agents quiet window).
-        self._service_restart_coordinator: StaleServiceRestartCoordinator | None = None
+        # Post-merge staleness hook — restart services when a landed diff
+        # touches their watched paths.  Built in _start_merge_worker (where
+        # git_ops/event_store/config are all live).  The list holds two entries:
+        #   [0] fused-memory (require_idle=True — idle quiet window only)
+        #   [1] dashboard    (require_idle=False — fires even during dispatch)
+        self._service_restart_coordinators: list[StaleServiceRestartCoordinator] = []
 
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
@@ -601,6 +618,19 @@ class Harness:
 
         # Singleton lock — held for the duration of run()
         self._lock_file: IO | None = None
+
+    @property
+    def _speculation_k(self) -> int:
+        """Single shared K source: 1 + len(enabled_verify_runners).
+
+        Used by BOTH GitOps spec-pool sizing (harness.__init__) and
+        _start_merge_worker (speculation_depth + enforce_persistent_worktree_serial_lane)
+        so the spec pool size and the worker cap cannot drift as verify_runners grows.
+
+        Mirrors the invariant comment at _start_merge_worker: all three Lever-C knobs
+        derive from ONE expression.
+        """
+        return 1 + len(self.config.enabled_verify_runners)
 
     def _init_digest_state(self) -> None:
         """Initialise task-1327 AFK-hardening digest counters.
@@ -802,6 +832,10 @@ class Harness:
             # Catches tasks stranded by transient backend failures during a
             # long run so they don't accumulate until the next restart.
             self._start_stranded_reconcile()
+
+            # 1c1d. Start periodic main-tip integrity sweep (task 1832).
+            # Catches test-suite drift that scoped per-merge verify misses.
+            self._start_main_tip_sweep()
 
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
@@ -1029,6 +1063,13 @@ class Harness:
                         timeout=15,
                     )
                     self._collect_done_reports(done, task_reports)
+                    # Leaf services (dashboard, require_idle=False) restart
+                    # promptly after their diff lands even while agents are
+                    # dispatching.  fused-memory (require_idle=True) no-ops here
+                    # and is reserved for the idle branch above — the two
+                    # branches are mutually exclusive per tick and maybe_restart
+                    # clears pending on fire, so there is no double-fire.
+                    await self._maybe_restart_stale_service(agents_idle=False)
                     continue
 
                 await sem.acquire()
@@ -1151,6 +1192,10 @@ class Harness:
                 await self._stop_stranded_reconcile()
             except Exception as e:
                 logger.warning(f'_stop_stranded_reconcile() failed: {e}')
+            try:
+                await self._stop_main_tip_sweep()
+            except Exception as e:
+                logger.warning(f'_stop_main_tip_sweep() failed: {e}')
             try:
                 await self._stop_escalation_server()
             except Exception as e:
@@ -1374,6 +1419,18 @@ Output JSON matching the schema. Every task must appear in the output.
         for entry in worktree_base.iterdir():
             if not entry.is_dir():
                 continue
+            pool = self.git_ops.warm_lane_pool
+            spec_pool = self.git_ops.spec_warm_lane_pool
+            # '_spec-' merge-speculation lanes are a SEPARATE pool: they have
+            # no '.task/plan.json' and their dir name is not a live task id,
+            # so without this they would hit the mid-crash cold cleanup branch
+            # and be removed.  Treat them as lanes too — they take the no-plan
+            # branch (no recoverable task identity) and route through
+            # cleanup_worktree, which now releases '_spec-' lanes back to the
+            # spec pool instead of removing them.
+            is_lane = (pool is not None and pool.is_lane(entry)) or (
+                spec_pool is not None and spec_pool.is_lane(entry)
+            )
             task_id = entry.name
             plan_path = entry / '.task' / 'plan.json'
 
@@ -1383,6 +1440,24 @@ Output JSON matching the schema. Every task must appear in the output.
                 # sidecar pins the Claude session UUID so the next workflow
                 # can --resume it with a "continue" prompt instead of spawning
                 # a fresh agent.
+                #
+                # For lanes: the sidecar (agent_session.json) carries
+                # session_id/role/owner_pid but NO task_id.  The in-memory
+                # assignment map is empty after a restart, so there is no way
+                # to map a sidecar-only lane back to its real task.  Storing
+                # _recovered_sessions['_lane-k'] would be dead state (dispatch
+                # keys off the real task_id) and would also wrongly shield the
+                # lane from the orphan reaper.  Release it back to the pool
+                # (cleanup_worktree routes lanes to release_warm_lane).
+                if is_lane:
+                    logger.info(
+                        f'Recovery: lane {task_id} has no plan — '
+                        f'releasing back to pool'
+                    )
+                    await self.git_ops.cleanup_worktree(entry, task_id)
+                    cleaned += 1
+                    continue
+
                 sidecar_path = entry / '.task' / 'agent_session.json'
                 if sidecar_path.exists():
                     try:
@@ -1420,16 +1495,44 @@ Output JSON matching the schema. Every task must appear in the output.
                 cleaned += 1
                 continue
 
-            # Validate plan belongs to this task
-            plan_task_id = plan.get('task_id')
-            if plan_task_id and plan_task_id != task_id:
+            # For lanes, derive the real task id from plan.json.  A lane dir
+            # name (e.g. '_lane-0') never equals the real task_id by design —
+            # the lane dir is named after the pool slot, not the task.
+            # Cold path: recovery_id == task_id (entry.name) — byte-identical.
+            # Normalize to str: plan.json could store task_id as int; dispatch
+            # and restore_assignment key off str (mirroring the str() coercion
+            # in the orphan-reaper live_ids set).
+            recovery_id = (
+                str(plan.get('task_id'))
+                if (is_lane and plan.get('task_id') is not None)
+                else task_id
+            )
+
+            # For lanes: if plan.json has no task_id there is no recoverable
+            # identity — release the lane back to the pool.
+            if is_lane and not recovery_id:
                 logger.warning(
-                    f'Recovery: worktree {task_id} has plan for task '
-                    f'{plan_task_id} — task_id mismatch, cleaning up'
+                    'Recovery: lane %s plan.json has no task_id — '
+                    'releasing back to pool',
+                    task_id,
                 )
                 await self.git_ops.cleanup_worktree(entry, task_id)
                 cleaned += 1
                 continue
+
+            # Validate plan belongs to this task (cold path only).
+            # Lanes skip this check: lane name != task_id is expected by
+            # design, so the cold numeric-mismatch cleanup must not fire.
+            if not is_lane:
+                plan_task_id = plan.get('task_id')
+                if plan_task_id and plan_task_id != task_id:
+                    logger.warning(
+                        f'Recovery: worktree {task_id} has plan for task '
+                        f'{plan_task_id} — task_id mismatch, cleaning up'
+                    )
+                    await self.git_ops.cleanup_worktree(entry, task_id)
+                    cleaned += 1
+                    continue
 
             # ── Semantic identity guard (Fix C) ───────────────────────
             # The numeric guard above only proves plan.task_id == dirname.
@@ -1439,8 +1542,9 @@ Output JSON matching the schema. Every task must appear in the output.
             # task).  Compare the worktree's stored title to the LIVE DB
             # task's title and quarantine on a provable mismatch — this is the
             # exact line that would have caught 3770.
+            # For lanes, recovery_id is the real task id read from plan.json.
             if self.config.worktree_identity_guard_enabled:
-                live = await self.scheduler.get_task(task_id)
+                live = await self.scheduler.get_task(recovery_id)
                 if live is None:
                     # get_task returns None for BOTH "deleted" and transient
                     # error — both safely handled by deferring: do not adopt,
@@ -1448,7 +1552,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     # an empty task list) handles a genuinely-deleted task.
                     logger.warning(
                         'Recovery: worktree %s has no live DB task — deferring '
-                        '(no adopt, no destroy)', task_id,
+                        '(no adopt, no destroy)', recovery_id,
                     )
                     continue
                 stored_title = read_worktree_title(entry)
@@ -1456,19 +1560,26 @@ Output JSON matching the schema. Every task must appear in the output.
                     logger.warning(
                         'Recovery: worktree %s identity MISMATCH — stored title '
                         '%r != live %r; quarantining',
-                        task_id, stored_title, live.get('title'),
+                        recovery_id, stored_title, live.get('title'),
                     )
                     await self.git_ops.quarantine_worktree(
-                        entry, task_id, 'recovery-identity-mismatch',
+                        entry, recovery_id, 'recovery-identity-mismatch',
                     )
                     if self.event_store:
                         self.event_store.emit(
                             EventType.worktree_quarantined,
-                            task_id=task_id,
+                            task_id=recovery_id,
                             data={'reason': 'recovery-identity-mismatch'},
                         )
                     cleaned += 1
                     continue
+
+            # For lanes: restore the in-memory pool assignment so the lane is
+            # reserved ASSIGNED before re-dispatch.  Both sets the map AND
+            # flips the lane FREE→ASSIGNED, preventing a concurrent fresh
+            # acquire from stealing the lane while the original task is queued.
+            if pool is not None and is_lane and recovery_id:
+                pool.restore_assignment(recovery_id, entry)
 
             # Check if plan has any completed steps
             # Note: some plans have prerequisites as plain strings (not dicts)
@@ -1493,7 +1604,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 # _plan() entirely.
                 if plan.get('_session_id'):
                     logger.info(
-                        f'Recovery: worktree {task_id} has stamped plan with '
+                        f'Recovery: worktree {recovery_id} has stamped plan with '
                         f'no completed steps — preserving for revalidation'
                     )
                     lock_path = entry / '.task' / 'plan.lock'
@@ -1501,35 +1612,41 @@ Output JSON matching the schema. Every task must appear in the output.
                         lock_path.unlink()
                         logger.info(
                             f'Recovery: cleared stale plan.lock for '
-                            f'preserved task {task_id}'
+                            f'preserved task {recovery_id}'
                         )
                     # The architect already produced a stamped plan; any
                     # sidecar present is from a later (post-plan) invocation
                     # that crashed and isn't meaningful here — clear it to
                     # avoid confusing the next workflow on this task.
                     (entry / '.task' / 'agent_session.json').unlink(missing_ok=True)
-                    self._preserved_worktrees.add(task_id)
+                    self._preserved_worktrees.add(recovery_id)
                     recovered += 1
                     continue
                 logger.info(
                     f'Recovery: worktree {task_id} has unstamped plan with no '
                     f'completed steps — cleaning up'
                 )
-                await self.git_ops.cleanup_worktree(entry, task_id)
+                # For lanes, pass recovery_id (the real task branch name) so
+                # release_warm_lane deletes the actual task branch (e.g.
+                # 'task/42') rather than the nonexistent 'task/_lane-0'.
+                # Cold path: recovery_id == task_id, so behavior is unchanged.
+                await self.git_ops.cleanup_worktree(
+                    entry, recovery_id if is_lane else task_id
+                )
                 cleaned += 1
                 continue
 
             total = sum(len(plan.get(col, [])) for col in ('prerequisites', 'steps'))
             logger.info(
-                f'Recovery: worktree {task_id} has plan with '
+                f'Recovery: worktree {recovery_id} has plan with '
                 f'{len(completed)}/{total} steps done — storing for resumption'
             )
-            self._recovered_plans[task_id] = plan
+            self._recovered_plans[recovery_id] = plan
             # Clear stale plan.lock so the new session doesn't immediately requeue
             lock_path = entry / '.task' / 'plan.lock'
             if lock_path.exists():
                 lock_path.unlink()
-                logger.info(f'Recovery: cleared stale plan.lock for task {task_id}')
+                logger.info(f'Recovery: cleared stale plan.lock for task {recovery_id}')
             recovered += 1
 
         if recovered or cleaned:
@@ -1567,7 +1684,7 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         statuses, err = await self.scheduler.get_statuses()
-        if err is not None or not statuses:
+        if resolver_failed(statuses, err):
             logger.warning(
                 'Orphan reaper: get_statuses() returned %s — aborting sweep '
                 '(fail-safe against transient DB failure or empty task tree)',
@@ -1584,6 +1701,25 @@ Output JSON matching the schema. Every task must appear in the output.
             name = entry.name
             # Skip reserved (merge / auto-eval skip-attempt) worktrees.
             if name.startswith('_merge-') or name.endswith('-skip-attempt'):
+                continue
+            # Skip warm pool lanes.  quarantine_worktree is NOT pool-aware
+            # (it moves the dir), so moving a lane would leave the pool's
+            # registered path dangling.  Crash-recovery already handles
+            # lanes; the reaper must not undo a just-recovered lane.
+            # The merge-speculation pool ('_spec-' lanes) is a SEPARATE
+            # WarmLanePool instance — its lanes are not '_merge-*', not
+            # members of warm_lane_pool, and their names are not live task
+            # ids, so they would otherwise fall through to the orphan branch
+            # and get moved/removed mid-verify.  Protect them identically.
+            if (
+                self.git_ops.warm_lane_pool is not None
+                and self.git_ops.warm_lane_pool.is_lane(entry)
+            ):
+                continue
+            if (
+                self.git_ops.spec_warm_lane_pool is not None
+                and self.git_ops.spec_warm_lane_pool.is_lane(entry)
+            ):
                 continue
             # Skip live, recovered, preserved, and in-flight worktrees.
             if (
@@ -1742,10 +1878,24 @@ Output JSON matching the schema. Every task must appear in the output.
         ``cleanup_worktree`` (swallow errors), call
         ``set_task_status('done', done_provenance={'commit': marker_sha, ...})``.
         """
-        statuses, _ = await self.scheduler.get_statuses()
+        statuses, err = await self.scheduler.get_statuses()
         reverted = 0
         marked_done = 0
         log_prefix = 'Reconcile (mid-run)' if mid_run else 'Reconcile'
+        if resolver_failed(statuses, err):
+            if err is not None:
+                logger.warning(
+                    '%s: get_statuses() returned error — aborting sweep (fail-safe)',
+                    log_prefix,
+                )
+            else:
+                # Empty-but-no-error is a normal idle state (no tasks yet);
+                # DEBUG to avoid recurring noise during early/idle periods.
+                logger.debug(
+                    '%s: get_statuses() returned empty — aborting sweep (no tasks)',
+                    log_prefix,
+                )
+            return 0
 
         # R4: sweep both 'in-progress' AND 'blocked' so out-of-band-merged
         # blocked tasks (manual `git merge` while task was blocked) get
@@ -1811,6 +1961,47 @@ Output JSON matching the schema. Every task must appear in the output.
                 log_prefix, reverted, marked_done,
             )
         return reverted + marked_done
+
+    def _resolve_task_worktree(self, tid: str) -> Path:
+        """Return the on-disk worktree path for *tid*.
+
+        When a WarmLanePool is active and has an assignment for *tid*, returns
+        the assigned lane path (e.g. ``worktree_base/_lane-0``).  Otherwise
+        falls back to the cold convention ``worktree_base/<tid>``.
+
+        Pool-absent or unmapped tid → identical cold behaviour (byte-compatible
+        with pre-pool code).
+        """
+        pool = self.git_ops.warm_lane_pool
+        if pool is not None:
+            assigned = pool.assignment_for(tid)
+            if assigned is not None:
+                return assigned
+        return self.git_ops.worktree_base / tid
+
+    async def _branch_is_degenerate(
+        self, branch: str, metadata: dict[str, Any],
+    ) -> bool:
+        """Return True iff the branch is a provisioning-only degenerate branch.
+
+        A branch is degenerate when its live tip SHA equals the recorded
+        branch_base_sha (#1226), meaning zero commits were ever pushed beyond
+        the creation point.  Called from the Guard-2 citation-miss path and the
+        Guard-3 citation-hit path in _reconcile_one_stranded to share the same
+        degeneracy signal without duplicating the three-step check.
+
+        Returns False when:
+        - branch_base_sha is absent or not a valid 40-hex SHA (backward compat
+          for pre-#1226 tasks or tasks whose metadata write failed transiently);
+        - resolve_branch_sha returns None (branch ref vanished mid-sweep —
+          treat as non-degenerate so the caller falls through to escalate); or
+        - the live tip has advanced past the recorded base SHA.
+        """
+        branch_base_sha = metadata.get('branch_base_sha')
+        if not _is_valid_sha_40(branch_base_sha):
+            return False
+        branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
+        return branch_tip_sha is not None and branch_tip_sha == branch_base_sha
 
     async def _reconcile_one_stranded(
         self, tid: str, status: str, *, mid_run: bool,
@@ -1888,6 +2079,33 @@ Output JSON matching the schema. Every task must appear in the output.
                 pattern_template=self.git_ops.config.commit_citation_pattern,
             )
             if citation_sha is None:
+                # -------------------------------------------------------
+                # #1823 degenerate-provisioning-branch guard.
+                #
+                # Guard 3 (below) recognises the degenerate shape on the
+                # citation-HIT path but is unreachable here — this Guard-2
+                # block bails before Guard 3 ever runs.  Each bail
+                # increments the skip counter, so after MAX_RECONCILE_FAILURES
+                # sweeps the reconciler incorrectly escalates
+                # reconcile_citation_missing for a branch that is simply
+                # provisioning-only (no work ever pushed).
+                # Repro: esc-4598-6 cluster (tasks in-progress, tip ==
+                # branch_base_sha, zero commits).
+                # _branch_is_degenerate implements the precise degeneracy
+                # test (tip == branch_base_sha, NOT rev-list==0 — see its
+                # docstring) and is shared with Guard 3 below.
+                if await self._branch_is_degenerate(branch, metadata):
+                    logger.info(
+                        'Reconcile: task %s branch is degenerate '
+                        '(zero commits beyond main; tip == branch_base_sha %s); '
+                        'skipping citation-missing escalation '
+                        '(provisioning-only branch)',
+                        tid, metadata.get('branch_base_sha'),
+                    )
+                    self._reconcile_skip_counts.pop(tid, None)
+                    return None
+                # -------------------------------------------------------
+
                 count = self._reconcile_skip_counts.get(tid, 0) + 1
                 self._reconcile_skip_counts[tid] = count
                 logger.info(
@@ -1903,29 +2121,22 @@ Output JSON matching the schema. Every task must appear in the output.
                     self._escalate_reconcile_skip(tid, status, count)
                 return None
 
-            # Guard 3 — branch-advanced structural check.
+            # Guard 3 — branch-advanced structural check (#1226).
             # Guards 1 (open L1) and 2 (citation grep) are content
             # heuristics.  This guard is structural: it rejects the
             # false-positive shape where a zero-commit branch sits on a
             # main ancestor (is_ancestor returns True trivially) even
-            # though no real implementation work was pushed.  We compare
-            # the live branch tip against the recorded branch_base_sha
-            # written by workflow._setup_worktree_and_artifacts at
-            # branch-creation time.
-            #
-            # Missing / malformed branch_base_sha → fall through (backward
-            # compat for tasks created before this guard was deployed, or
-            # if the metadata write failed transiently at creation time).
-            branch_base_sha = metadata.get('branch_base_sha')
-            if _is_valid_sha_40(branch_base_sha):
-                branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
-                if branch_tip_sha == branch_base_sha:
-                    logger.info(
-                        'Reconcile: task %s branch tip == branch_base_sha (%s); '
-                        'branch never advanced past creation — vetoing auto-flip',
-                        tid, branch_base_sha,
-                    )
-                    return None
+            # though no real implementation work was pushed.
+            # _branch_is_degenerate encapsulates the tip==branch_base_sha
+            # check (missing / malformed base SHA → returns False →
+            # fall through to flip, preserving backward compat).
+            if await self._branch_is_degenerate(branch, metadata):
+                logger.info(
+                    'Reconcile: task %s branch tip == branch_base_sha (%s); '
+                    'branch never advanced past creation — vetoing auto-flip',
+                    tid, metadata.get('branch_base_sha'),
+                )
+                return None
 
             # All guards passed — clear the skip counter and flip.
             self._reconcile_skip_counts.pop(tid, None)
@@ -2096,7 +2307,9 @@ Output JSON matching the schema. Every task must appear in the output.
             return None
 
         # 'in-progress' and not on main: classify by lock state.
-        worktree_path = self.git_ops.worktree_base / tid
+        # For warm tasks the real worktree is the assigned pool lane, not
+        # worktree_base/<tid>.  _resolve_task_worktree handles both cases.
+        worktree_path = self._resolve_task_worktree(tid)
         lock_path = worktree_path / '.task' / 'plan.lock'
 
         if not lock_path.exists():
@@ -2120,13 +2333,42 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return 'reverted'
 
-        # Lock exists — check whether the owner is still alive.
-        owner_alive = False
-        try:
-            lock_data = json.loads(lock_path.read_text())
-            if not isinstance(lock_data, dict):
-                raise ValueError('plan.lock is not a JSON object')
-            owner_pid = lock_data.get('owner_pid')
+        # Lock exists — parse it via the shared safe reader, then classify.
+        lock_data, lock_ok = load_json_or_warn(lock_path, default=None, on_corrupt='warn')
+        lock_usable = lock_ok and isinstance(lock_data, dict)
+
+        if not lock_usable:
+            # Unreadable or non-dict lock: we cannot read owner_pid, so we cannot
+            # confirm the owner is dead.  On the STARTUP sweep fail CLOSED — leave
+            # the worktree intact rather than risk reaping a live owner.  On a
+            # MID-RUN sweep the dispatch-table filter already excluded
+            # actively-held tasks, so a task that reached here has an exited
+            # owner; reaping is safe.
+            if not mid_run:
+                # Use ERROR (not WARNING) because the task is now stranded
+                # in-progress indefinitely and requires operator intervention:
+                # the lock cannot be read, so automated reconcile cannot
+                # determine liveness and will skip the task every cycle.
+                logger.error(
+                    'Reconcile: task %s plan.lock unreadable/corrupt'
+                    ' — cannot confirm owner is dead;'
+                    ' leaving worktree intact (fail-closed).'
+                    ' OPERATOR ACTION REQUIRED: inspect worktree and lock'
+                    ' to determine whether to reap or allow task to continue.',
+                    tid,
+                )
+                return None  # do NOT reap a possibly-live owner's worktree
+            else:
+                logger.warning(
+                    'Reconcile: task %s plan.lock unreadable/corrupt'
+                    ' during mid-run sweep; treating as stale and reaping',
+                    tid,
+                )
+                owner_alive = False  # fall through to stale-lock cleanup below
+        else:
+            # Valid dict — use the existing owner_pid liveness logic.
+            owner_alive = False
+            owner_pid = lock_data.get('owner_pid')  # type: ignore[union-attr]
             if owner_pid is None:
                 logger.warning(
                     'Reconcile: plan.lock for task %s has no owner_pid;'
@@ -2138,8 +2380,6 @@ Output JSON matching the schema. Every task must appear in the output.
                     owner_alive = _pid_alive(int(owner_pid))
                 except (TypeError, ValueError):
                     owner_alive = False
-        except (OSError, json.JSONDecodeError, ValueError):
-            owner_alive = False
 
         # R3: during a mid_run sweep, owner_pid is almost always the harness
         # PID (which IS alive by definition).  The dispatch-table filter at
@@ -2208,7 +2448,10 @@ Output JSON matching the schema. Every task must appear in the output.
                 tid, reason,
             )
             return
-        worktree_path = self.git_ops.worktree_base / tid
+        # For warm tasks the real worktree is the assigned pool lane.
+        # _resolve_task_worktree falls back to the cold worktree_base/tid
+        # convention when the pool is absent or has no assignment for tid.
+        worktree_path = self._resolve_task_worktree(tid)
         self._recovered_plans.pop(tid, None)
         self._recovered_sessions.pop(tid, None)
         if worktree_path.exists():
@@ -3447,6 +3690,13 @@ Output JSON matching the schema. Every task must appear in the output.
             self.report.review_findings += review_report.findings_count
             self.report.review_tasks_created += len(review_report.tasks_created)
             self.report.review_cost_usd += review_report.cost_usd
+            if review_report.parse_failed:
+                logger.warning(
+                    'Full review %s: reviewer output was unparseable — review '
+                    'inconclusive (findings_count=%d is not a clean pass)',
+                    review_report.review_id,
+                    review_report.findings_count,
+                )
             logger.info(
                 'Full review complete: %d findings, %d tasks created',
                 review_report.findings_count,
@@ -3490,6 +3740,13 @@ Output JSON matching the schema. Every task must appear in the output.
             self.report.review_findings += review_report.findings_count
             self.report.review_tasks_created += len(review_report.tasks_created)
             self.report.review_cost_usd += review_report.cost_usd
+            if review_report.parse_failed:
+                logger.warning(
+                    'Review checkpoint %s: reviewer output was unparseable — '
+                    'review inconclusive (findings_count=%d is not a clean pass)',
+                    review_report.review_id,
+                    review_report.findings_count,
+                )
             logger.info(
                 'Review checkpoint complete: %d findings, %d tasks created, '
                 'cost=$%.2f',
@@ -3612,7 +3869,9 @@ Output JSON matching the schema. Every task must appear in the output.
         # config.verify_runners by task 1716 (Lever C operator-enable path).
         # DO NOT flip reify's orchestrator.yaml verify_runners on until the
         # verdict-parity report is green (PRD D6 gate; see task 1716 analysis).
-        _k: int = 1 + len(self.config.enabled_verify_runners)
+        # NOTE: use self._speculation_k — single shared source so GitOps spec-pool
+        # size (set at __init__) and speculation_depth here cannot drift apart.
+        _k: int = self._speculation_k
 
         # Fail-CLOSED on an over-budget liveness verdict: refuse to start the merge
         # worker and propagate MergeLivenessConfigError to the caller.
@@ -3650,7 +3909,10 @@ Output JSON matching the schema. Every task must appear in the output.
             self.config, merge_ahead_bound=_k, num_hosts=_k,
         )
 
-        self._service_restart_coordinator = self._build_service_restart_coordinator()
+        self._service_restart_coordinators = [
+            self._build_service_restart_coordinator(),
+            self._build_dashboard_restart_coordinator(),
+        ]
 
         # Build the callback factory here (where self.scheduler is live) and
         # inject it opaquely into the worker so task γ can construct
@@ -3663,7 +3925,7 @@ Output JSON matching the schema. Every task must appear in the output.
             self._merge_queue,
             speculation_depth=_k,
             event_store=self.event_store,
-            on_merge_landed=self._service_restart_coordinator.note_merge,
+            on_merge_landed=self._note_merge_all,
             escalation_queue=self._escalation_queue,
             train_callback_factory=train_callback_factory,
             merge_store=self._merge_store,
@@ -3683,6 +3945,47 @@ Output JSON matching the schema. Every task must appear in the output.
             self._merge_worker_task = None
             logger.info('Merge worker stopped')
 
+    async def _note_merge_all(
+        self, task_id: str, base_sha: str, head_sha: str
+    ) -> None:
+        """Fan out a merge-landed notification to every service-restart coordinator.
+
+        Passed as the SpeculativeMergeWorker's ``on_merge_landed`` callback.
+        The changed-file list is fetched once (shared across all coordinators) to
+        avoid redundant git diff invocations — each coordinator applies its own
+        prefix filter against the pre-fetched list.
+
+        Each coordinator is notified independently inside its own try/except so
+        that an error in one coordinator cannot prevent the remaining coordinators
+        from being armed.  Errors are logged at WARNING level and execution
+        continues (fail-open).
+
+        A non-zero git diff exit code is surfaced via the error slot and skips
+        all coordinators with a WARNING (fail-open); a legitimately empty diff
+        (revert merges, ``.task/``-only merges) calls all coordinators with an
+        empty file list — no restart is armed, but no coordinators are skipped.
+        """
+        prefetched_diff, err = await self.git_ops.get_merge_diff_files(base_sha, head_sha)
+        if err is not None:
+            logger.warning(
+                '_note_merge_all: git diff fetch failed for %s..%s; skipping all coordinators',
+                base_sha[:12],
+                head_sha[:12],
+                exc_info=True,
+            )
+            return
+
+        for coord in self._service_restart_coordinators:
+            try:
+                await coord.note_merge(task_id, base_sha, head_sha, prefetched_diff=prefetched_diff)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    '_note_merge_all: coordinator %s note_merge failed: %s',
+                    getattr(coord, '_service_name', repr(coord)),
+                    exc,
+                    exc_info=True,
+                )
+
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.
 
@@ -3700,18 +4003,44 @@ Output JSON matching the schema. Every task must appear in the output.
             project_root=self.config.project_root,
         )
 
-    async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
-        """Delegate to the service-restart coordinator, if one is wired.
+    def _build_dashboard_restart_coordinator(self) -> StaleServiceRestartCoordinator:
+        """Construct a StaleServiceRestartCoordinator for the dashboard (leaf service).
 
-        Called from the run-forever idle branch (active is empty — a verified
-        quiet window).  No-op when the coordinator is None or disabled.
-        Returns True when the restart was fired, False otherwise.
+        The dashboard is a leaf node — nothing depends on it — so its restart
+        must NOT wait for the orchestrator to be idle.  require_idle=False means
+        the coordinator fires as soon as the debounce window elapses, even while
+        agents are dispatching.  script_args=[] omits --drain (no recon to drain).
+
+        Called once from _start_merge_worker alongside
+        _build_service_restart_coordinator.
         """
-        if self._service_restart_coordinator is None:
-            return False
-        return await self._service_restart_coordinator.maybe_restart(
-            agents_idle=agents_idle
+        return StaleServiceRestartCoordinator(
+            git_ops=self.git_ops,
+            event_store=self.event_store,
+            watch_prefixes=self.config.dashboard_restart_watch_prefixes,
+            debounce_secs=self.config.dashboard_restart_debounce_secs,
+            enabled=self.config.dashboard_restart_on_merge_enabled,
+            script_path=self.config.dashboard_restart_script,
+            project_root=self.config.project_root,
+            service_name='dashboard',
+            require_idle=False,
+            script_args=[],
         )
+
+    async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
+        """Delegate to all service-restart coordinators in the list.
+
+        Called from the run-forever idle branch (agents_idle=True) and the
+        busy-wait branch (agents_idle=False).  Iterates every coordinator in
+        self._service_restart_coordinators and fires each whose gate conditions
+        are satisfied.  Returns True if at least one coordinator fired a restart,
+        False otherwise.  No-op (returns False) when the list is empty.
+        """
+        any_fired = False
+        for coord in self._service_restart_coordinators:
+            if await coord.maybe_restart(agents_idle=agents_idle):
+                any_fired = True
+        return any_fired
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.
@@ -3871,9 +4200,10 @@ Output JSON matching the schema. Every task must appear in the output.
             branch_prefix=self.config.git.branch_prefix,
         )
         logger.info(
-            '_recover_pending_merges: recovered=%d dropped=%d',
+            '_recover_pending_merges: recovered=%d dropped=%d journal_corrupt=%s',
             report.get('recovered', 0),
             report.get('dropped', 0),
+            report.get('journal_corrupt', False),
         )
 
     async def _stop_escalation_server(self) -> None:
@@ -4505,6 +4835,12 @@ Output JSON matching the schema. Every task must appear in the output.
             return 0
         statuses, error = await self.scheduler.get_statuses(active_ids)
         if error is not None:
+            logger.warning(
+                'Terminal-status watcher: get_statuses(%d active) failed: %s'
+                ' — skipping scan this cycle',
+                len(active_ids),
+                error,
+            )
             return 0
 
         threshold = self.config.terminal_status_hard_cancel_polls
@@ -4605,6 +4941,134 @@ Output JSON matching the schema. Every task must appear in the output.
                 raise
             except Exception:
                 logger.exception('Stranded-in-progress reconcile pass failed')
+
+    def _start_main_tip_sweep(self) -> None:
+        """Start the periodic main-tip integrity sweep.
+
+        Mirrors _start_stranded_reconcile: a long-lived asyncio.Task wakes every
+        ``main_tip_sweep_interval_secs``, resolves the current main SHA, and runs
+        a FULL unscoped verification in a throwaway detached worktree.  The sweep
+        is completely off the serial merge lane — per-merge latency is untouched.
+        """
+        if not self.config.main_tip_sweep_enabled:
+            return
+        if (
+            self._main_tip_sweep_task is not None
+            and not self._main_tip_sweep_task.done()
+        ):
+            return
+        self._main_tip_sweep_task = asyncio.create_task(
+            self._main_tip_sweep_loop(),
+            name='main-tip-sweep',
+        )
+        logger.info(
+            'Main-tip integrity sweep started (interval=%.0fs)',
+            self.config.main_tip_sweep_interval_secs,
+        )
+
+    async def _stop_main_tip_sweep(self) -> None:
+        """Cancel the main-tip integrity sweep loop."""
+        if self._main_tip_sweep_task is not None:
+            self._main_tip_sweep_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._main_tip_sweep_task
+            self._main_tip_sweep_task = None
+            logger.info('Main-tip integrity sweep stopped')
+
+    async def _main_tip_sweep_loop(self) -> None:
+        """Wake periodically and run the main-tip sweep pass."""
+        interval = self.config.main_tip_sweep_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._run_main_tip_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('Main-tip integrity sweep pass failed')
+
+    async def _run_main_tip_sweep(self) -> None:
+        """Single testable pass of the main-tip integrity sweep.
+
+        Resolves the current main SHA, runs a full unscoped verification against
+        a throwaway detached worktree at that SHA, and files a level-1 infra_issue
+        escalation when the sweep finds a failure on main.
+
+        SHA dedup (``_last_swept_main_sha``) skips the expensive full verify
+        when main has not advanced — N merges within one interval cost one sweep.
+        When ``_escalation_queue`` is None the drift is logged but not submitted.
+        See ``_start_main_tip_sweep`` / ``_main_tip_sweep_loop`` for the periodic
+        invocation context.
+        """
+        from orchestrator import verify as verify_mod  # noqa: PLC0415
+
+        main_sha: str = await self.git_ops.get_main_sha()  # type: ignore[union-attr]
+        if not main_sha:
+            return
+
+        # SHA dedup: skip the expensive full verify when main has not advanced.
+        # This is the batching gate — N merges within one interval cost one sweep.
+        if main_sha == self._last_swept_main_sha:
+            return
+
+        # Pass the already-resolved SHA so verify skips a second git rev-parse
+        # and both the dedup gate and the worktree pin use the same value
+        # (closes the TOCTOU window — suggestion 2 from the code review).
+        outcome = await verify_mod.run_main_tip_sweep(
+            self.config, self.git_ops, main_sha=main_sha
+        )
+        if outcome is None:
+            # Infra failure in the sweep itself — retry next tick, don't mark swept.
+            return
+
+        swept_sha, vr = outcome
+        self._last_swept_main_sha = swept_sha
+
+        if vr.passed:
+            return
+
+        # Drift detected: file one L1 escalation per distinct bad SHA.
+        if not self._escalation_queue:
+            logger.warning(
+                'Main-tip integrity sweep: drift detected at %s (%s) but no escalation '
+                'queue attached — skipping L1 file',
+                swept_sha[:12], vr.category,
+            )
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        task_id = f'main-sweep-{swept_sha[:12]}'
+        # Dedup against a surviving L1 from a prior run: _last_swept_main_sha
+        # resets to None on every restart, so without this guard a main that
+        # stays broken would re-file a fresh duplicate each boot.  Matches the
+        # convention in every other L1-filing path in this file
+        # (_file_restored_pause_escalation, _mark_blocked, scheduler-pause, etc.).
+        if self._escalation_queue.has_open_l1(task_id):
+            return
+        summary = f'Main-tip integrity sweep failed at {swept_sha[:12]}: {vr.category}'[:200]
+        detail = (
+            f'Full verification of main at {swept_sha} failed.\n'
+            f'Category: {vr.category}\n'
+            f'Cause: {vr.cause_hint or "(no hint)"}\n'
+            f'Summary: {vr.summary}'
+        )
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-main-sweep',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning(
+            'Main-tip integrity sweep: filed L1 escalation %s for SHA %s (%s)',
+            esc.id, swept_sha[:12], vr.category,
+        )
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
@@ -5045,14 +5509,15 @@ Output JSON matching the schema. Every task must appear in the output.
         new_count = prev_count + 1 if same_sig else 1
 
         # Persist BEFORE the flip (crash-safe: over-count, never under-count — C5).
-        # append=True → recursive-merge: only the 'reblock_guard' key is written;
-        # sibling metadata keys (files, memory_hints, …) are preserved, and the
-        # flip's own set_task_status reopen_reason audit-merge cannot clobber the
-        # counter (C3.4 hazard).
+        # metadata_mode='merge': shallow last-write-wins — the whole reblock_guard
+        # key is overwritten wholesale (new count/signature win), while sibling
+        # metadata keys (files, memory_hints, …) are preserved.  'additive' would
+        # use scalar OLD-wins under #1827's _merge_values, freezing the counter
+        # across incarnations when the guard key already exists.
         await self.scheduler.update_task(
             task_id,
             {'reblock_guard': {'count': new_count, 'signature': new_sig}},
-            append=True,
+            metadata_mode='merge',
         )
 
         return True

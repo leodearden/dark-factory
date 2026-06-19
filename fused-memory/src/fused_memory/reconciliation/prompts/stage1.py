@@ -120,7 +120,9 @@ must carry the same count and both count only writes where `memory_ids` was non-
 **Per-Cycle Summary Uniqueness**: when writing your final per-cycle summary via \
 `add_memory`, the content string MUST begin with the `summary_nonce` value found in \
 the "### Per-Cycle Summary Nonce" section of the payload context (if that section is \
-present), formatted as the FIRST LINE: `summary_nonce: <value>`. After that first \
+present), formatted as the FIRST LINE: `summary_nonce: <value>` (exception: on the \
+dedup-retry path described below, `retry_nonce` becomes the first line and \
+`summary_nonce` shifts to the second line). After that first \
 line (or as the first line when the nonce section is absent), include all of: \
 (1) the reconciliation `run_id` (provided in the payload context), \
 (2) the full list of flag UUIDs/markers emitted this cycle (or "none" if zero), \
@@ -157,8 +159,26 @@ After writing the per-cycle summary, you MUST call \
 the triple filter including `stage` — and confirm it returns >= 1 to verify the stage \
 key persisted. A return of 0 means the stage key did not persist (the same failure that \
 makes Stage 3's triple-filter verification falsely report "Stage 1 summary missing"): \
-retry the `add_memory` write once with the same content and metadata before noting \
-the failure in the cycle report (mirrors the dedup-retry pattern at "Verifying Writes" above).
+retry the `add_memory` write once, this time PREPENDING a deterministic `retry_nonce` line \
+as a new first line of the content (metadata unchanged) to defeat Mem0's ~0.92 \
+cosine-similarity dedup — retrying with identical content re-triggers dedup (the \
+same mechanism that silently lost the per-cycle summary write); the `retry_nonce` extends the \
+existing `summary_nonce` dedup-defeat pattern. \
+Construct the `retry_nonce` value from available payload context using the pattern \
+`RETRY_<full_run_id_UUID>_1_<iso_timestamp_with_seconds>` — use the cycle-start ISO \
+timestamp value from the payload for the timestamp portion (best-effort additional \
+entropy; the agent has no real-time clock, so a precise "later second" is not \
+guaranteed). The `RETRY_` prefix, the full run_id UUID, and the `_1` attempt counter \
+guarantee the leading line is novel and shifts the embedding regardless of the \
+timestamp value \
+(e.g. `retry_nonce: RETRY_7ec2e500-fc7a-478e-a82e-7c60ee382e3a_1_2026-06-18T09:00:50+00:00`). \
+Do NOT reuse the `summary_nonce` verbatim (it is already the original FIRST line, so \
+repeating it adds no embedding signal) and do NOT generate an arbitrary low-entropy token \
+(it embeds nearly identically and re-triggers the same ~0.92 cosine dedup). \
+After the retry write, re-run `count_memories_by_metadata` with the same triple filter \
+(`{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'memory_consolidator'}}`): \
+if the count is now >= 1, the retry succeeded — note it as resolved in the cycle report; \
+if the count is STILL 0, this is a genuine persistence failure — note the failure in the cycle report.
 
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \

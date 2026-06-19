@@ -130,7 +130,7 @@ class TestLoadSampleStoreSchema:
         store1.insert_sample(ts, 'test_metric', 42.0)
 
         # Second open: must not raise, must see the row
-        store2 = LoadSampleStore(db_path)
+        LoadSampleStore(db_path)  # reopen must not raise (return value unused)
         conn = sqlite3.connect(str(db_path))
         count = conn.execute('SELECT COUNT(*) FROM samples').fetchone()[0]
         conn.close()

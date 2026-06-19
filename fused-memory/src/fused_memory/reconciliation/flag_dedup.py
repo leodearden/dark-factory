@@ -1657,3 +1657,118 @@ def confirm_task_absent(get_task_result: object) -> bool:
         return False
     error_type = get_task_result.get('error_type', '')
     return error_type == 'TaskmasterError' and _NOT_FOUND_PHRASE in error.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Blocked-snapshot finding filter for Stage 3 (task-1840)
+# --------------------------------------------------------------------------- #
+
+#: Categories that are subject to blocked-snapshot suppression.  Only flags
+#: in these categories whose text matches the task-count-snapshot signature are
+#: dropped; all other categories pass through unchanged (fail-open).
+_SUPPRESSED_SNAPSHOT_CATEGORIES: frozenset[str] = frozenset({
+    'missing_knowledge',
+    'memory_stale',
+})
+
+#: Case-insensitive marker substrings that identify a finding as being about a
+#: task-count snapshot temporal_fact edge.  The list targets the absence-wording
+#: shape used by Stage-3 LLM findings (no raw numbers) — catching both
+#: 'task-count snapshot' phrasings and the temporal_fact category reference.
+#:
+#: The numeric-signal branch (is_count_snapshot) handles memory_stale findings
+#: that quote raw paired count strings; these markers handle the missing_knowledge
+#: 'absence' shape that carries no numbers.
+#:
+#: NOTE: bare 'count snapshot' / 'count-snapshot' are intentionally excluded —
+#: they are substrings of unrelated phrases such as 'account snapshot', which
+#: could cause legitimate findings to be silently suppressed.  The more specific
+#: 'task-count snapshot' and 'task count snapshot' already subsume all intended
+#: phrasings produced by the Stage-3 LLM.
+_TASK_COUNT_SNAPSHOT_MARKERS: tuple[str, ...] = (
+    'task-count snapshot',
+    'task count snapshot',
+    'snapshot temporal_fact',
+    'snapshot temporal fact',
+    'task-count temporal',
+)
+
+
+def _is_task_count_snapshot_finding(flag: dict[str, Any]) -> bool:
+    """Return True iff *flag* is about a task-count snapshot temporal_fact edge.
+
+    Combines two detection strategies:
+    1. Marker-phrase scan (catches missing_knowledge 'absence' findings that
+       carry no raw count numbers): the combined description + suggested_action
+       text contains any substring from :data:`_TASK_COUNT_SNAPSHOT_MARKERS`
+       (case-insensitive).
+    2. ``is_count_snapshot`` from task_filter (catches memory_stale findings
+       that quote raw paired count strings like '607 done / 148 cancelled').
+
+    Pure, sync, no I/O.
+    """
+    from fused_memory.reconciliation.task_filter import is_count_snapshot
+
+    description = flag.get('description') or ''
+    suggested_action = flag.get('suggested_action') or ''
+    combined = f'{description} {suggested_action}'.lower()
+
+    # Branch 1: marker-phrase scan
+    if any(marker in combined for marker in _TASK_COUNT_SNAPSHOT_MARKERS):
+        return True
+
+    # Branch 2: raw count-string detection (handles numeric memory_stale shape)
+    return is_count_snapshot(f'{description} {suggested_action}')
+
+
+def filter_blocked_snapshot_findings(
+    flags: list[dict[str, Any]],
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Drop Stage-3 false-positive findings about blocked task-count snapshot edges.
+
+    For projects in :data:`SNAPSHOT_WRITE_BLOCKED_PROJECTS`, the ABSENCE or
+    staleness of a task-count snapshot temporal_fact edge is the CORRECT state
+    (both write paths are blocked-by-design).  Stage 3 findings asserting the
+    edge is missing or stale are false positives and must be suppressed.
+
+    A flag is DROPPED iff **all three** conditions hold:
+    1. ``project_id`` is in :data:`SNAPSHOT_WRITE_BLOCKED_PROJECTS`.
+    2. ``flag['category']`` is in :data:`_SUPPRESSED_SNAPSHOT_CATEGORIES`
+       (``missing_knowledge`` or ``memory_stale``).
+    3. :func:`_is_task_count_snapshot_finding` returns ``True`` for the flag.
+
+    All other flags pass through unchanged (fail-open).  The blast radius is
+    tight: only registered projects × two categories × matching signature.
+
+    A ``logger.debug`` line is emitted per dropped flag for observability.
+
+    Args:
+        flags: List of flag dicts from Stage 3 ``items_flagged``.
+        project_id: The project being reconciled.
+
+    Returns:
+        Filtered list with false-positive blocked-snapshot findings removed.
+    """
+    from fused_memory.reconciliation.policies import is_snapshot_write_blocked
+
+    if not is_snapshot_write_blocked(project_id):
+        # Fail-open: project is not in the blocked set; return all flags unchanged.
+        return list(flags)
+
+    kept: list[dict[str, Any]] = []
+    for flag in flags:
+        category = flag.get('category') or ''
+        if category in _SUPPRESSED_SNAPSHOT_CATEGORIES and _is_task_count_snapshot_finding(flag):
+            logger.debug(
+                'filter_blocked_snapshot_findings: dropping %s finding for task_id=%s '
+                '(snapshot writes blocked-by-design for project %s)',
+                category,
+                flag.get('task_id'),
+                project_id,
+            )
+            # do NOT append — flag is dropped
+        else:
+            kept.append(flag)
+
+    return kept

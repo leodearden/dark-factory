@@ -219,6 +219,20 @@ def check_candidate_for_scope(
     return PathGuardVerdict(outcome='ok', project_id=project_id)
 
 
+def is_routing_override(routing_override_reason: str | None) -> bool:
+    """Return True when *routing_override_reason* constitutes a deliberate bypass.
+
+    A reason is considered present (and the path guards should be skipped) when
+    it is a non-empty string after stripping leading/trailing whitespace.
+    Empty strings, None, and whitespace-only strings all return False —
+    preserving the default no-override semantics.
+
+    Use only when sure the task belongs to the submitting project.
+    If unsure, escalate rather than risking a mis-filed task.
+    """
+    return bool((routing_override_reason or '').strip())
+
+
 def check_text_for_scope(
     text: str | None,
     project_id: str,

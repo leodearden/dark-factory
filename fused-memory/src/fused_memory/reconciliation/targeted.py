@@ -561,8 +561,32 @@ class TargetedReconciler:
             )
             return actions
 
-        all_tasks = tasks_data.get('tasks', []) if isinstance(tasks_data, dict) else []
+        # Detect malformed tasks_data; either not a dict, or 'tasks' present but not a list.
+        if not isinstance(tasks_data, dict):
+            logger.warning(
+                'sweep: get_tasks returned a non-dict for cancelled parent %s'
+                ' (type=%s, repr=%s); sweep aborted',
+                parent_id, type(tasks_data).__name__, repr(tasks_data)[:200],
+            )
+            actions.append({
+                'type': 'sweep_aborted',
+                'reason': 'malformed_get_tasks',
+                'parent_id': str(parent_id),
+            })
+            return actions
+
+        all_tasks = tasks_data.get('tasks', [])
         if not isinstance(all_tasks, list):
+            logger.warning(
+                'sweep: get_tasks returned a non-list tasks key for cancelled parent %s'
+                ' (type=%s, repr=%s); sweep aborted',
+                parent_id, type(all_tasks).__name__, repr(all_tasks)[:200],
+            )
+            actions.append({
+                'type': 'sweep_aborted',
+                'reason': 'malformed_get_tasks',
+                'parent_id': str(parent_id),
+            })
             return actions
 
         orchestrator_live = is_orchestrator_live_for(project_root)

@@ -787,7 +787,13 @@ def create_mcp_server(
                 session_id=session_id,
                 include_planned=include_planned,
             )
-            response = {'results': [r.model_dump() for r in results]}
+            response: dict[str, Any] = {'results': [r.model_dump() for r in results]}
+            # Fault-only loudness: surface degraded/failed_stores only when the
+            # search was degraded (a selected store timed out or raised).  Uses
+            # getattr so a plain list return (back-compat callers) is harmless.
+            if getattr(results, 'degraded', False):
+                response['degraded'] = True
+                response['failed_stores'] = getattr(results, 'failed_stores', [])
             await _log_read(
                 operation='search',
                 project_id=project_id,
@@ -2364,6 +2370,7 @@ def create_mcp_server(
         metadata: str | dict[str, Any] | None = None,
         tag: str | None = None,
         planning_mode: bool = False,
+        routing_override_reason: str = '',
     ) -> dict[str, Any]:
         """Phase-1 of two-phase task creation: persist a ticket and return its id immediately.
 
@@ -2401,6 +2408,12 @@ def create_mcp_server(
                 decomposition sessions where you do not want curator
                 deduplication to recombine sibling tasks.  Persists
                 ``human_decomposed=True`` in task metadata.
+            routing_override_reason: When set (non-empty), the path guards are
+                skipped and the task is filed in the submitting project.  The
+                reason is recorded on task metadata and emitted as a WARNING
+                audit log so a deliberate override is greppable.  Use only
+                when sure the task belongs to the submitting project.  If
+                unsure, escalate rather than risking a mis-filed task.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -2418,6 +2431,7 @@ def create_mcp_server(
                 metadata=metadata,
                 tag=tag,
                 planning_mode=planning_mode,
+                routing_override_reason=routing_override_reason,
             )
         except Exception as e:
             logger.error(f'submit_task error: {e}')
@@ -2707,8 +2721,9 @@ def create_mcp_server(
         project_root: str,
         prompt: str | None = None,
         metadata: str | dict | None = None,
-        append: bool = False,
+        append: bool | None = None,
         tag: str | None = None,
+        metadata_mode: str | None = None,
         title: str | None = None,
         description: str | None = None,
         details: str | None = None,
@@ -2731,8 +2746,25 @@ def create_mcp_server(
             id: Task ID to update
             project_root: Absolute path to project root
             prompt: DEPRECATED — pass structured fields instead.
-            metadata: JSON metadata to merge (object or JSON string)
-            append: Append instead of full update (applies to details + metadata)
+            metadata: JSON metadata (object or JSON string). Default behavior
+                is a shallow last-write-wins merge: ``{**existing, **incoming}``.
+                Omitted keys from ``metadata`` are preserved; every supplied key
+                (scalar or list) overwrites wholesale. Use ``metadata_mode`` to
+                change this behavior.
+            metadata_mode: Controls how ``metadata`` is merged with the existing
+                blob. One of:
+                - ``'merge'`` (default when omitted) — shallow last-write-wins.
+                  Omitted keys preserved; supplied keys overwrite wholesale.
+                - ``'additive'`` — recursive list union+dedup, scalar/type-collision
+                  OLD-wins. Use for list-append callers (dry_run_proposals, etc.).
+                - ``'replace'`` — whole-blob overwrite. Bypasses the corrupt-blob
+                  guard; the sanctioned repair path.
+            append: DEPRECATED shim. ``True`` → ``'additive'``, ``False`` →
+                ``'replace'``. **Also the only knob that governs ``details``/
+                ``prompt`` append** — ``metadata_mode`` does NOT affect the
+                details path, so callers that need details-append must still
+                pass ``append=True`` even after migrating metadata writes to
+                ``metadata_mode``. Resolution is single-sourced in the backend.
             tag: Tag context (optional)
             title: New title (overwrites)
             description: New description (overwrites)
@@ -2760,6 +2792,7 @@ def create_mcp_server(
                 prompt=prompt,
                 metadata=metadata,
                 append=append,
+                metadata_mode=metadata_mode,
                 tag=tag,
                 title=title,
                 description=description,

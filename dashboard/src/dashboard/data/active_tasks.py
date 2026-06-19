@@ -303,11 +303,15 @@ async def collect_tasks_with_counts(
             status_map = await fetch_external_statuses(
                 client, config, sorted(dep_ids),
             )
+            map_offline = bool(status_map.get('offline'))
             for row in all_active:
                 if 'completed' in row:
                     continue  # skip bounded done rows
                 for entry in row.get('external_deps') or []:
-                    entry['status'] = status_map.get(entry['id'], 'unknown')
+                    if map_offline:
+                        entry['status'] = 'offline'
+                    else:
+                        entry['status'] = status_map.get(entry['id'], 'unknown')
 
     return all_active, offline_projects, done_counts
 

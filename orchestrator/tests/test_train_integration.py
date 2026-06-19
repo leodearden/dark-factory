@@ -410,6 +410,7 @@ class TestTrainIntegrationB2:
     a regression in the former's post-merge verify→block path.
     """
 
+    @pytest.mark.exercise_merge_verify
     async def test_lower_member_break_blocks_train(
         self,
         cargo_or_skip,  # noqa: ARG002
@@ -461,6 +462,9 @@ class TestTrainIntegrationB2:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue, event_store=spy)
 
+        # The @pytest.mark.exercise_merge_verify marker (above) makes the autouse
+        # fixture skip the passed=True stub; the real run_scoped_verification runs
+        # here automatically — no in-body patch needed or added.
         outcome = await worker._do_merge(req)
 
         # (1) Outcome is NOT done — compile break blocked the train.

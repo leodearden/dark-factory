@@ -18,6 +18,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.harness import Harness, _pid_alive
+from orchestrator.warm_lane_pool import WarmLanePool
 
 # ---------------------------------------------------------------------------
 # _pid_alive helper tests
@@ -320,9 +321,14 @@ class TestReconcileStrandedInProgress:
     @pytest.mark.parametrize(
         'lock_contents,task_id,expect_reverted,expect_lock_exists,warn_pattern',
         [
-            # (a) Corrupt JSON → revert + unlink (JSONDecodeError still caught)
+            # (a) Corrupt JSON → fail-closed: do NOT revert, leave lock intact + ERROR.
+            #     An unreadable lock means we cannot confirm the owner is dead; fail-closed
+            #     = assume possibly-live and don't reap (task-1808 step-9).
+            #     ERROR (not WARNING) because the task is now stranded indefinitely
+            #     and requires operator intervention (task-1808 amend).
             pytest.param(
-                'not-valid-json', 9, True, False, None,
+                'not-valid-json', 9, False, True,
+                r'(unreadable|corrupt).*leaving worktree intact',
                 id='corrupt-json',
             ),
             # (b) Missing owner_pid key → owner_pid=None via .get() → owner_alive=False
@@ -349,9 +355,12 @@ class TestReconcileStrandedInProgress:
                 42, True, False, None,
                 id='non-numeric-owner-pid',
             ),
-            # (e) Non-dict JSON (list) → treated as corruption → revert + unlink
+            # (e) Non-dict JSON (list) → fail-closed: do NOT revert, leave lock intact + ERROR.
+            #     Same semantics as (a): unreadable/non-dict lock cannot confirm owner is dead
+            #     (task-1808 step-9). ERROR level because task stranded indefinitely (amend).
             pytest.param(
-                '["not", "an", "object"]', 14, True, False, None,
+                '["not", "an", "object"]', 14, False, True,
+                r'(unreadable|corrupt).*leaving worktree intact',
                 id='non-dict-json',
             ),
             # (c) Numeric-string owner_pid of a live process → task NOT reverted
@@ -420,11 +429,20 @@ class TestReconcileStrandedInProgress:
                 if re.search(warn_pattern, r.message, re.IGNORECASE)
             ]
             assert len(matching) >= 1, (
-                f'Expected WARNING matching {warn_pattern!r} in orchestrator.harness logs, '
+                f'Expected log record matching {warn_pattern!r} in orchestrator.harness logs, '
                 f'got: {[r.message for r in caplog.records]}'
             )
-            assert matching[0].levelno == logging.WARNING, (
-                f'Expected WARNING level, got {logging.getLevelName(matching[0].levelno)}'
+            # Corrupt/unreadable lock on startup → ERROR (task stranded indefinitely,
+            # operator action required). Other warn_pattern cases (missing/null owner_pid)
+            # remain at WARNING level.
+            expected_level = (
+                logging.ERROR
+                if re.search(r'(unreadable|corrupt).*leaving worktree intact', warn_pattern)
+                else logging.WARNING
+            )
+            assert matching[0].levelno == expected_level, (
+                f'Expected {logging.getLevelName(expected_level)} level, '
+                f'got {logging.getLevelName(matching[0].levelno)}'
             )
 
         # Verify cleanup_worktree call behavior.
@@ -439,6 +457,57 @@ class TestReconcileStrandedInProgress:
             )
         else:
             harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_corrupt_plan_lock_not_reaped_on_startup(
+        self, harness: Harness, caplog
+    ):
+        """Corrupt plan.lock on startup sweep (mid_run=False) → fail-closed: do NOT reap.
+
+        An unreadable lock means we cannot confirm the owner is dead.  Reaping a
+        possibly-live owner's worktree is the safety-bearing failure mode; fail-closed
+        means leave the worktree intact + emit an ERROR so an operator can intervene.
+        ERROR (not WARNING) because the task is now stranded in-progress indefinitely
+        and requires manual inspection — automated reconcile will skip it every cycle.
+
+        CRITICAL: get_statuses must return a NON-EMPTY dict so the resolver_failed guard
+        in _reconcile_stranded_in_progress does not abort the sweep before the lock branch.
+        """
+        import logging
+
+        tid = '200'
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        lock_dir = harness.git_ops.worktree_base / tid / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text('not-valid-json')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
+
+        # Must NOT revert — cannot confirm owner is dead
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        # Must NOT clean up the worktree
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        # Lock file must still exist
+        assert lock_path.exists(), 'corrupt lock must be left intact (fail-closed)'
+        # An ERROR under orchestrator.harness must be emitted (task stranded indefinitely,
+        # operator action required — ERROR level signals this needs human attention).
+        import re
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR
+            and r.name == 'orchestrator.harness'
+        ]
+        assert len(error_records) >= 1, (
+            f'Expected ERROR under orchestrator.harness for corrupt plan.lock; '
+            f'got: {[(r.name, r.levelname, r.message) for r in caplog.records]}'
+        )
+        pattern = r'(unreadable|corrupt).*leaving worktree intact'
+        matching = [r for r in error_records if re.search(pattern, r.message, re.IGNORECASE)]
+        assert len(matching) >= 1, (
+            f'Expected ERROR matching {pattern!r}; got: {[r.message for r in error_records]}'
+        )
 
     async def test_no_lock_worktree_cleaned_when_not_recovered(
         self, harness: Harness, tmp_path: Path
@@ -1919,6 +1988,7 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h._start_orphan_l0_reaper = MagicMock()
     h._start_terminal_status_watcher = MagicMock()
     h._start_stranded_reconcile = MagicMock()
+    h._start_main_tip_sweep = MagicMock()
     h._tag_task_modules = AsyncMock()
 
     # Provide one pending task so the "no pending tasks" check passes.
@@ -2242,6 +2312,217 @@ async def test_reconcile_persistent_citation_miss_escalates_l1(harness: Harness)
     )
     await harness._reconcile_stranded_in_progress()
     assert '400' not in harness._reconcile_skip_counts
+
+
+@pytest.mark.asyncio
+async def test_degenerate_zero_commit_branch_suppresses_citation_missing(
+    harness: Harness,
+):
+    """Degenerate provisioning branch (tip == branch_base_sha) must NOT
+    escalate reconcile_citation_missing even after MAX_RECONCILE_FAILURES
+    consecutive citation-miss sweeps.
+
+    Repro: esc-4598-6 cluster (tasks 4598/4663/4664) — all in-progress,
+    ``git rev-list --count main..task/<id>`` == 0, tip == branch_base_sha,
+    fired 5x consecutive escalations that should have been suppressed.
+    Fix: #1823 adds a degenerate-branch guard at the top of Guard 2's
+    ``citation_sha is None`` block, before the skip-count increment.
+    """
+    from orchestrator.harness import MAX_RECONCILE_FAILURES
+
+    submissions = []
+
+    class _StubEscalationQueue:
+        def make_id(self, task_id):
+            return f'esc-{task_id}-{len(submissions)}'
+
+        def submit(self, esc):
+            submissions.append(esc)
+
+        def has_open_l1(self, task_id):  # noqa: ARG002
+            return False
+
+    harness._escalation_queue = _StubEscalationQueue()  # type: ignore[assignment]
+
+    tid = '4663'
+    base_sha = 'feedface' + '1' * 32  # valid 40-hex SHA, the degenerate signal
+
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+        return_value=None,  # citation MISS → enters Guard 2's None block
+    )
+    # Live branch tip == branch_base_sha → zero commits beyond creation point
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=base_sha)  # type: ignore[attr-defined]
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {'branch_base_sha': base_sha}},
+    )
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {tid: 'in-progress'}, None,
+    )
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    # (a) No reconcile_citation_missing escalation must be emitted.
+    #     Current code (pre-fix) FAILS here: Guard 2 accrues 5 strikes and
+    #     calls _escalate_reconcile_skip, so len(submissions) == 1.
+    assert len(submissions) == 0, (
+        f'degenerate provisioning branch must NOT emit any escalation after '
+        f'{MAX_RECONCILE_FAILURES} sweeps; got {len(submissions)}: '
+        f'{[getattr(s, "category", s) for s in submissions]}'
+    )
+
+    # (b) No auto-flip: status must be left intact.
+    harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    # (c) Skip counter must NOT accrue strikes for a degenerate branch.
+    assert tid not in harness._reconcile_skip_counts, (
+        f'degenerate branch must not accrue skip strikes; '
+        f'got count={harness._reconcile_skip_counts.get(tid)}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_citation_missing_still_escalates_when_branch_advanced(
+    harness: Harness,
+):
+    """Precision lock: the #1823 guard suppresses ONLY the degenerate case.
+
+    Case A — branch advanced (tip != branch_base_sha): legitimate citation-
+    miss escalation must still fire after MAX_RECONCILE_FAILURES sweeps.
+
+    Case B — backward-compat, missing branch_base_sha: the guard's
+    ``_is_valid_sha_40`` gate falls through cleanly and escalation fires.
+
+    Both cases prove the new guard does not over-suppress.
+    This test is GREEN both before and after the #1823 fix.
+    """
+    from orchestrator.harness import MAX_RECONCILE_FAILURES
+
+    class _StubEscalationQueue:
+        def __init__(self):
+            self.submissions = []
+
+        def make_id(self, task_id):
+            return f'esc-{task_id}-{len(self.submissions)}'
+
+        def submit(self, esc):
+            self.submissions.append(esc)
+
+        def has_open_l1(self, task_id):  # noqa: ARG002
+            return False
+
+    tid = '4598'
+
+    # ------------------------------------------------------------------
+    # Case A: branch advanced (tip != branch_base_sha) — escalation fires.
+    # ------------------------------------------------------------------
+    q_a = _StubEscalationQueue()
+    harness._escalation_queue = q_a  # type: ignore[assignment]
+
+    branch_base = 'aaaa' * 10  # 40 hex, valid
+    branch_tip = 'deadbeef' + 'a' * 32  # different SHA → branch advanced
+
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.git_ops.find_task_citation_commit = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)  # type: ignore[attr-defined]
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}},
+    )
+    harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(q_a.submissions) == 1, (
+        f'branch-advanced + citation-miss must still escalate after '
+        f'{MAX_RECONCILE_FAILURES} sweeps; got {len(q_a.submissions)}'
+    )
+    esc_a = q_a.submissions[0]
+    assert esc_a.task_id == tid
+    assert esc_a.category == 'reconcile_citation_missing'
+    assert esc_a.level == 1
+    assert esc_a.severity == 'blocking'
+    # Counter reset by _escalate_reconcile_skip.
+    assert tid not in harness._reconcile_skip_counts
+
+    # ------------------------------------------------------------------
+    # Case B: missing branch_base_sha — _is_valid_sha_40 falls through,
+    # escalation fires (backward-compat for pre-#1226 tasks).
+    # ------------------------------------------------------------------
+    q_b = _StubEscalationQueue()
+    harness._escalation_queue = q_b  # type: ignore[assignment]
+    harness._reconcile_skip_counts.pop(tid, None)  # reset counter
+
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {}},  # no branch_base_sha
+    )
+    harness.scheduler.mark_done.reset_mock()  # type: ignore[attr-defined]
+    harness.scheduler.set_task_status.reset_mock()  # type: ignore[attr-defined]
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(q_b.submissions) == 1, (
+        f'missing branch_base_sha + citation-miss must still escalate; '
+        f'got {len(q_b.submissions)}'
+    )
+    esc_b = q_b.submissions[0]
+    assert esc_b.task_id == tid
+    assert esc_b.category == 'reconcile_citation_missing'
+    assert esc_b.level == 1
+    assert tid not in harness._reconcile_skip_counts
+
+    # ------------------------------------------------------------------
+    # Case C: valid branch_base_sha but resolve_branch_sha returns None
+    # (branch ref vanished mid-sweep).  _branch_is_degenerate returns
+    # False → escalation must still fire.
+    # ------------------------------------------------------------------
+    q_c = _StubEscalationQueue()
+    harness._escalation_queue = q_c  # type: ignore[assignment]
+    harness._reconcile_skip_counts.pop(tid, None)
+
+    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}},
+    )
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(q_c.submissions) == 1, (
+        f'valid base_sha + resolve_branch_sha=None + citation-miss must '
+        f'still escalate; got {len(q_c.submissions)}'
+    )
+    assert q_c.submissions[0].category == 'reconcile_citation_missing'
+    assert tid not in harness._reconcile_skip_counts
+
+    # ------------------------------------------------------------------
+    # Case D: malformed branch_base_sha (non-40-hex string).
+    # _is_valid_sha_40 rejects it → _branch_is_degenerate returns False
+    # → escalation fires (distinct from Case B which tests absent key).
+    # ------------------------------------------------------------------
+    q_d = _StubEscalationQueue()
+    harness._escalation_queue = q_d  # type: ignore[assignment]
+    harness._reconcile_skip_counts.pop(tid, None)
+
+    harness.git_ops.resolve_branch_sha = AsyncMock(  # type: ignore[attr-defined]
+        return_value='deadbeef' + 'a' * 32,
+    )
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {'branch_base_sha': 'not-a-sha'}},
+    )
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(q_d.submissions) == 1, (
+        f'malformed branch_base_sha + citation-miss must still escalate; '
+        f'got {len(q_d.submissions)}'
+    )
+    assert q_d.submissions[0].category == 'reconcile_citation_missing'
+    assert tid not in harness._reconcile_skip_counts
 
 
 @pytest.mark.asyncio
@@ -2625,3 +2906,175 @@ async def test_sweep_excludes_merge_deferred(harness: Harness):
         assert tid_arg != '77', (
             f'_reconcile_one_stranded was called for merge-deferred task 77: {call}'
         )
+
+
+# ===========================================================================
+# Step-9 RED: warm-lane resolution in _reconcile_one_stranded /
+#             _mark_in_progress_done
+# ===========================================================================
+
+
+def _attach_reconcile_pool(harness: Harness, size: int = 2) -> WarmLanePool:
+    """Attach a WarmLanePool to harness.git_ops.warm_lane_pool.
+
+    Must be constructed against the same worktree_base as the fixture assigns
+    (h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()) so that
+    is_lane/assignment_for path comparisons match.
+    """
+    base = harness.git_ops.worktree_base
+    base.mkdir(parents=True, exist_ok=True)
+    pool = WarmLanePool(worktree_base=base, size=size)
+    harness.git_ops.warm_lane_pool = pool
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_reconcile_stale_lock_uses_lane_path(harness: Harness, monkeypatch):
+    """_reconcile_one_stranded resolves the worktree via the pool assignment.
+
+    When a WarmLanePool is attached and task '42' is assigned to '_lane-0',
+    the lock-state classification must inspect base/'_lane-0'/.task/plan.lock
+    (not the non-existent base/'42'/.task/plan.lock).  After clearing the stale
+    lock, cleanup_worktree must be called with (base/'_lane-0', '42').
+
+    Fails today because worktree_path = worktree_base / tid computes base/'42'.
+    """
+    pool = _attach_reconcile_pool(harness, size=2)
+    base = harness.git_ops.worktree_base
+    lane_path = base / '_lane-0'
+    cold_path = base / '42'
+
+    # Create the lane dir with a stale plan.lock (dead PID)
+    lock_dir = lane_path / '.task'
+    lock_dir.mkdir(parents=True)
+    lock_path = lock_dir / 'plan.lock'
+    lock_path.write_text(json.dumps({
+        'session_id': '42-dead',
+        'locked_at': datetime.now(UTC).isoformat(),
+        'owner_pid': 99999,
+    }))
+
+    # Restore the assignment so the pool knows '42' lives in '_lane-0'
+    pool.restore_assignment('42', lane_path)
+
+    monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+    # is_ancestor False → skip the found-on-main path, go to lock-state branch
+    harness.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+
+    await harness._reconcile_one_stranded('42', 'in-progress', mid_run=False)
+
+    # Task must be reverted to pending
+    harness.scheduler.set_task_status.assert_called_once_with('42', 'pending')  # type: ignore[attr-defined]
+    # cleanup_worktree must have been called with the LANE path, not base/'42'
+    cleanup_calls = harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
+    cleanup_paths = [c.args[0] for c in cleanup_calls]
+    assert lane_path in cleanup_paths, (
+        f'cleanup_worktree must be called with lane path {lane_path}; '
+        f'actual calls: {cleanup_paths}'
+    )
+    assert cold_path not in cleanup_paths, (
+        f'cleanup_worktree must NOT be called with cold path {cold_path}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_mark_in_progress_done_uses_lane_path(harness: Harness):
+    """_mark_in_progress_done resolves the worktree via the pool assignment.
+
+    When task '42' is assigned to '_lane-0', the done path must call
+    cleanup_worktree with (base/'_lane-0', '42'), not (base/'42', '42').
+
+    Setup: force the found-on-main flip (is_ancestor→True, valid citation,
+    no branch_base_sha guard), and create the lane dir so cleanup fires.
+
+    Fails today because worktree_path = worktree_base / tid computes base/'42'.
+    """
+    pool = _attach_reconcile_pool(harness, size=2)
+    base = harness.git_ops.worktree_base
+    lane_path = base / '_lane-0'
+    cold_path = base / '42'
+
+    # Create the lane dir on disk so cleanup_worktree has something to act on
+    lane_path.mkdir(parents=True, exist_ok=True)
+
+    # Restore the assignment so the pool maps '42' → '_lane-0'
+    pool.restore_assignment('42', lane_path)
+
+    # Force the found-on-main path: is_ancestor→True, citation found,
+    # no branch_base_sha in metadata → Guard 3 skips
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    citation_sha = 'cafebabe' + 'b' * 32
+    harness.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)  # type: ignore[attr-defined]
+    harness.scheduler.get_task = AsyncMock(return_value=None)  # no metadata → Guard 3 skips  # type: ignore[attr-defined]
+
+    result = await harness._reconcile_one_stranded('42', 'in-progress', mid_run=False)
+
+    assert result == 'marked_done', f'Expected marked_done, got {result!r}'
+
+    # cleanup_worktree must have been called with the LANE path
+    cleanup_calls = harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
+    cleanup_paths = [c.args[0] for c in cleanup_calls]
+    assert lane_path in cleanup_paths, (
+        f'cleanup_worktree must be called with lane path {lane_path}; '
+        f'actual calls: {cleanup_paths}'
+    )
+    assert cold_path not in cleanup_paths, (
+        f'cleanup_worktree must NOT be called with cold path {cold_path}'
+    )
+
+# ---------------------------------------------------------------------------
+# Step-3 RED: _reconcile_stranded_in_progress err/empty guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileStrandedResolverGuard:
+    """RED tests: _reconcile_stranded_in_progress must guard on resolver errors."""
+
+    async def test_case_a_transient_error_with_data_aborts_sweep_warning(
+        self, harness: Harness, caplog
+    ):
+        """CASE A: get_statuses returns error tuple → sweep aborted, WARNING emitted.
+
+        Pre-fix: err is discarded (statuses, _ = ...), loop iterates {'5': 'in-progress'}
+        and calls _reconcile_one_stranded('5', ...).  After fix: returns 0 without
+        calling _reconcile_one_stranded, and emits WARNING naming 'error'.
+        """
+        harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+            return_value=({'5': 'in-progress'}, RuntimeError('mcp down'))
+        )
+
+        with (
+            patch.object(harness, '_reconcile_one_stranded', new_callable=AsyncMock) as mock_one,
+            caplog.at_level(logging.WARNING, logger='orchestrator.harness'),
+        ):
+            result = await harness._reconcile_stranded_in_progress()
+
+        assert result == 0, f'Expected 0, got {result!r}'
+        mock_one.assert_not_awaited()  # pre-fix fails here (loop iterates '5')
+        assert any(
+            r.levelno >= logging.WARNING and 'error' in r.message.lower()
+            for r in caplog.records
+        ), f'Expected WARNING naming error; got: {[r.message for r in caplog.records]!r}'
+
+    async def test_case_b_genuine_empty_returns_zero_with_debug(
+        self, harness: Harness, caplog
+    ):
+        """CASE B: get_statuses returns ({}, None) → returns 0 + DEBUG naming 'empty'.
+
+        An empty task tree is a normal idle state (no tasks yet), so we log at
+        DEBUG (not WARNING) to avoid recurring noise.  This is different from
+        CASE A where an error forces a WARNING.
+        """
+        harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+            return_value=({}, None)
+        )
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress()
+
+        assert result == 0, f'Expected 0, got {result!r}'
+        assert any(
+            r.levelno == logging.DEBUG and 'empty' in r.message.lower()
+            for r in caplog.records
+        ), f'Expected DEBUG naming empty; got: {[r.message for r in caplog.records]!r}'

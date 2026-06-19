@@ -1,0 +1,127 @@
+"""Safe JSON I/O with explicit benign-absent vs corrupt-present handling.
+
+Provides :func:`load_json_or_warn` which splits the common "read optional
+JSON state file" pattern into two clearly-separated branches:
+
+* **FileNotFoundError** — first-run / file absent; silently returns the
+  caller-supplied ``default``.
+* **JSONDecodeError / ValueError** — file present but corrupt (includes
+  non-UTF-8 / binary garbage); emits a deduped WARNING and dispatches on
+  *on_corrupt*.
+
+Other OSErrors (PermissionError, IsADirectoryError, …) propagate uncaught
+so the caller sees genuinely unexpected environmental failures.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Per-process dedup set for corrupt-path warnings.
+# Bounded by the number of distinct paths that go corrupt in a process lifetime.
+# A restart re-enables the warning (mirrors sqlite_task_backend._warned_malformed_task_ids:51).
+_warned_corrupt_paths: set[str] = set()
+
+__all__ = ['load_json_or_warn']
+
+
+def load_json_or_warn(
+    path: str | os.PathLike[str],
+    *,
+    default: Any,
+    on_corrupt: str = 'warn',
+) -> tuple[Any, bool]:
+    """Load *path* as JSON and return ``(parsed, True)`` on success.
+
+    Parameters
+    ----------
+    path:
+        File to read.  Accepts any ``os.PathLike`` or ``str``.
+    default:
+        Required keyword-only.  Returned as the value component whenever the
+        file is absent or corrupt — forces callers to state their benign
+        fallback explicitly.
+    on_corrupt:
+        One of ``'warn'`` (default), ``'fail_closed'``, or ``'quarantine'``.
+        Controls what happens when a present-but-corrupt file is found;
+        see return values below.  Validated eagerly — an unrecognised value
+        raises ``ValueError`` before any I/O is attempted.
+
+        .. note::
+            The per-process dedup set gates the WARNING only (once per path
+            per process); the corrective action (quarantine rename) always
+            runs.  A path that corrupts, gets quarantined, is re-created, and
+            corrupts again will be silently quarantined without a second
+            WARNING.  On process restart the WARNING re-fires.
+
+    Returns
+    -------
+    tuple[Any, bool]
+        ``(parsed, True)`` — valid JSON was read.
+
+        ``(default, True)`` — file did not exist (benign, no log emitted).
+
+        ``(default, False)`` — file was corrupt; a WARNING was emitted and
+        the corrective action was taken.
+
+    Raises
+    ------
+    json.JSONDecodeError / ValueError
+        When *on_corrupt='fail_closed'*.
+    ValueError
+        When *on_corrupt* is an unrecognised value.
+    OSError
+        When any OS error other than ``FileNotFoundError`` occurs.
+    """
+    if on_corrupt not in ('warn', 'fail_closed', 'quarantine'):
+        raise ValueError(f'unknown on_corrupt={on_corrupt!r}')
+
+    p = Path(path)
+
+    # --- read phase ---
+    # Read raw bytes — no decode here (only FileNotFoundError is benign;
+    # other OSErrors such as PermissionError/IsADirectoryError propagate).
+    try:
+        raw = p.read_bytes()
+    except FileNotFoundError:
+        # Benign first-run absence — caller's default, no log.
+        return (default, True)
+
+    # --- parse phase ---
+    # json.loads accepts bytes (since 3.6) and auto-detects the encoding.
+    # Both malformed JSON and non-UTF-8/binary garbage surface here as a
+    # ValueError (JSONDecodeError/UnicodeDecodeError respectively).
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        # Corrupt branch: dispatch on on_corrupt.
+        #
+        # fail_closed: the exception IS the loud channel — re-raise BEFORE
+        # any WARNING to avoid double-signalling.
+        if on_corrupt == 'fail_closed':
+            raise
+
+        # warn / quarantine both emit the deduped WARNING — once per path per
+        # process (mirrors sqlite_task_backend._warned_malformed_task_ids:51).
+        # The corrective action (return / quarantine rename) always runs.
+        key = str(p)
+        if key not in _warned_corrupt_paths:
+            _warned_corrupt_paths.add(key)
+            logger.warning('safe_io: corrupt JSON at %s: %s', p, exc)
+
+        if on_corrupt == 'warn':
+            return (default, False)
+
+        # quarantine: atomic rename to <name>.corrupt (os.replace overwrites any
+        # prior quarantine slot, keeping disk growth bounded to one file per path).
+        dest = p.with_name(p.name + '.corrupt')
+        os.replace(p, dest)
+        return (default, False)
+
+    return (parsed, True)

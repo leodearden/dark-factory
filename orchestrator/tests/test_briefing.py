@@ -35,6 +35,22 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
     return BriefingAssembler(config)
 
 
+@pytest.fixture
+def anti_anchor_task() -> dict:
+    """Shared task fixture with metadata.files for anti-anchor tests.
+
+    Used by both TestFormatTaskIncludeFiles (unit) and
+    TestAntiAnchorFirstDerivation (integration) to keep the sample task
+    definition in one place.
+    """
+    return {
+        'id': '1835',
+        'title': 'Anti-anchor title',
+        'description': 'Derive files independently',
+        'metadata': {'files': ['orchestrator', 'shared']},
+    }
+
+
 class TestFormatTaskMetadataInvariant:
     def test_dict_metadata_with_files(self, briefing: BriefingAssembler):
         task = {
@@ -72,6 +88,37 @@ class TestFormatTaskMetadataInvariant:
         out = briefing._format_task(task)
         assert '**ID:** 3' in out
         assert 'Modules' not in out
+
+
+class TestFormatTaskIncludeFiles:
+    """Unit tests for the include_files parameter on _format_task.
+
+    Locks in the anti-anchor mechanic introduced for C-A1: when
+    include_files=False the Files line must be absent so the first architect
+    derivation cannot rubber-stamp the queue-time metadata.files guess.
+    """
+
+    def test_include_files_false_omits_files_line(
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
+    ):
+        """include_files=False must hide the Files line."""
+        out = briefing._format_task(anti_anchor_task, include_files=False)
+        assert '**Files:**' not in out
+
+    def test_include_files_false_keeps_description(
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
+    ):
+        """include_files=False must not suppress Description or other fields."""
+        out = briefing._format_task(anti_anchor_task, include_files=False)
+        assert '**Description:**' in out
+        assert '**Title:**' in out
+
+    def test_include_files_default_still_shows_files(
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
+    ):
+        """Default call (no flag) must still render the Files line."""
+        out = briefing._format_task(anti_anchor_task)
+        assert '**Files:** orchestrator, shared' in out
 
 
 @pytest.mark.asyncio
@@ -189,3 +236,46 @@ class TestBuildPlanCompletionPrompt:
     async def test_includes_agent_identity(self, briefing: BriefingAssembler):
         prompt = await self._build(briefing)
         assert 'claude-task-3822-architect' in prompt
+
+
+@pytest.mark.asyncio
+class TestAntiAnchorFirstDerivation:
+    """C-A1 / C-A2 integration tests.
+
+    C-A1: build_architect_prompt (first/fresh derivation) must EXCLUDE the
+          **Files:** label so the architect cannot rubber-stamp metadata.files.
+    C-A2: build_revalidation_prompt (revalidation pass) must STILL INCLUDE
+          the **Files:** label — the revalidation path is explicitly exempt.
+    """
+
+    async def test_architect_prompt_excludes_files(
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
+    ):
+        """C-A1: build_architect_prompt must not expose metadata.files."""
+        prompt = await briefing.build_architect_prompt(
+            anti_anchor_task, worktree=None, context='',
+        )
+        assert '**Files:**' not in prompt
+
+    async def test_architect_prompt_keeps_description(
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
+    ):
+        """C-A1: description and title must survive the files suppression."""
+        prompt = await briefing.build_architect_prompt(
+            anti_anchor_task, worktree=None, context='',
+        )
+        assert 'Derive files independently' in prompt
+        assert 'Anti-anchor title' in prompt
+
+    async def test_revalidation_prompt_includes_files(
+        self, briefing: BriefingAssembler, anti_anchor_task: dict,
+    ):
+        """C-A2 exemption: build_revalidation_prompt must still show Files."""
+        prompt = await briefing.build_revalidation_prompt(
+            anti_anchor_task,
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert '**Files:** orchestrator, shared' in prompt

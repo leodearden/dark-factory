@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -4256,6 +4257,143 @@ class TestSubmitTaskGuardrail:
 
         taskmaster.add_task.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_submit_task_routing_override_bypasses_guard_and_records_reason(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+    ):
+        """With routing_override_reason set, a task that would otherwise be rejected
+        (references orchestrator/ under a non-dark-factory project) is accepted and
+        the reason is recorded in the blob metadata.
+
+        Asserts:
+        - Returns {'ticket': 'tkt_...'} (no error_type)
+        - Persisted row has project_id == 'some_other_project' (submitting project)
+        - blob['metadata']['routing_override_reason'] == the supplied reason
+        """
+        REASON = 'owner confirmed this is cross-cutting'
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock',
+                routing_override_reason=REASON,
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, (
+            f'Expected no error on routing override, got: {result}'
+        )
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Expected tkt_-prefixed ticket, got: {result}'
+        )
+
+        # Verify the row was persisted for the submitting project
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT project_id, candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+        assert row['project_id'] == 'some_other_project', (
+            f'Expected project_id=some_other_project, got: {row["project_id"]!r}'
+        )
+
+        # Verify the reason is recorded in blob metadata
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        assert meta.get('routing_override_reason') == REASON, (
+            f'Expected routing_override_reason in metadata, got: {meta!r}'
+        )
+
+        # Pin the no-leak invariant: routing_override_reason must NEVER appear
+        # in blob['kwargs'] (it must be popped from kwargs before serialisation
+        # so it never reaches tm.add_task as an unknown argument).
+        blob_kwargs = blob.get('kwargs', {})
+        assert 'routing_override_reason' not in blob_kwargs, (
+            f'routing_override_reason must not leak into blob kwargs, got: {blob_kwargs!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_task_routing_override_absent_still_rejects(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+    ):
+        """Without routing_override_reason the guard still fires: the same task
+        content is rejected with DarkFactoryPathScopeViolation and persists
+        zero tickets (regression guard for the override path).
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock',
+                # routing_override_reason intentionally omitted
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected rejection without override, got: {result}'
+        )
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_routing_override_with_planning_mode_records_reason(
+        self,
+        interceptor_with_store,
+        taskmaster,
+    ):
+        """routing_override_reason + planning_mode=True: guard is bypassed and
+        the reason is persisted in the planning-mode task metadata.
+
+        The planning_mode branch re-normalises metadata via
+        _submit_task_planning_mode, so this test exercises the
+        override+planning interaction that is otherwise unverified.
+
+        Asserts:
+        - Returns planning_mode=True dict (no error_type)
+        - taskmaster.add_task was called with routing_override_reason in metadata
+        """
+        REASON = 'owner confirmed this is cross-cutting'
+        result = await interceptor_with_store.submit_task(
+            project_root='/some-other-project',
+            title='Investigate orchestrator/harness.py deadlock',
+            description='harness deadlock',
+            planning_mode=True,
+            routing_override_reason=REASON,
+        )
+
+        assert 'error_type' not in result, (
+            f'Expected no error with routing override + planning_mode, got: {result}'
+        )
+        assert result.get('planning_mode') is True, (
+            f'Expected planning_mode=True in result, got: {result}'
+        )
+
+        # Verify reason is in the metadata passed to taskmaster.add_task
+        taskmaster.add_task.assert_called_once()
+        metadata_arg = taskmaster.add_task.call_args.kwargs.get('metadata')
+        assert metadata_arg is not None, 'add_task must be called with metadata'
+        decoded = json.loads(metadata_arg)
+        assert decoded.get('routing_override_reason') == REASON, (
+            f'Expected routing_override_reason in planning-mode metadata, got: {decoded!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Unit tests for TaskInterceptor._extract_meta_files
@@ -4471,15 +4609,17 @@ class TestPathGuardFallbackMetadataFilesNegativeControl:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestPathGuardOrSkip:
-    """Unit tests for TaskInterceptor._path_guard_or_skip.
+    """Unit tests for TaskInterceptor._path_guard_or_skip (now async).
 
     Verifies the helper's contract: dark_factory short-circuit, lazy-build
     of candidate, pass-through of a pre-built candidate, and error propagation.
+    No adjudicator wired — behaviour is identical to the previous sync version.
     """
 
     # -- Case 1 -----------------------------------------------------------
-    def test_path_guard_or_skip_returns_none_for_dark_factory_project(
+    async def test_path_guard_or_skip_returns_none_for_dark_factory_project(
         self,
         interceptor,
         monkeypatch,
@@ -4503,7 +4643,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'Edit orchestrator/harness.py'},
             '/home/leo/src/dark-factory',
             'dark_factory',
@@ -4514,7 +4654,7 @@ class TestPathGuardOrSkip:
         assert guard_calls == [], '_path_guard_check must NOT be called for dark_factory'
 
     # -- Case 2 -----------------------------------------------------------
-    def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
+    async def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
         self,
         interceptor,
         monkeypatch,
@@ -4548,7 +4688,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         kwargs = {'title': 'Generic refactor'}
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             kwargs,
             '/some/project_root',
             'some_other_project',
@@ -4565,7 +4705,7 @@ class TestPathGuardOrSkip:
         assert guard_calls[0][0] is built
 
     # -- Case 3 -----------------------------------------------------------
-    def test_path_guard_or_skip_uses_provided_candidate(
+    async def test_path_guard_or_skip_uses_provided_candidate(
         self,
         interceptor,
         monkeypatch,
@@ -4598,7 +4738,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         kwargs = {'title': 'Generic refactor'}
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             kwargs,
             '/some/project_root',
             'some_other_project',
@@ -4613,7 +4753,7 @@ class TestPathGuardOrSkip:
         assert guard_calls[0][0] is sentinel
 
     # -- Case 4 -----------------------------------------------------------
-    def test_path_guard_or_skip_propagates_rejection(
+    async def test_path_guard_or_skip_propagates_rejection(
         self,
         interceptor,
         monkeypatch,
@@ -4639,7 +4779,7 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'prompt': 'something'},
             '/some/project_root',
             'some_other_project',
@@ -4649,19 +4789,102 @@ class TestPathGuardOrSkip:
         assert result.get('matched_paths') == ['orchestrator/']
         assert result.get('suggested_project') == 'dark_factory'
 
+    # -- Case 5: routing override skips both guards -----------------------
+    async def test_routing_override_skips_heuristic_and_adjudicator(
+        self,
+        interceptor,
+        monkeypatch,
+        caplog,
+    ):
+        """When routing_override_reason is set (non-empty), _path_guard_or_skip
+        returns None immediately without calling _path_guard_check or the
+        adjudicator — and emits a WARNING audit log containing the reason.
+        """
+        # Monkeypatch _path_guard_check to track calls (should not be called)
+        guard_calls: list = []
+
+        def failing_check(self, candidate, kwargs, project_id):
+            guard_calls.append((candidate, kwargs, project_id))
+            raise AssertionError('_path_guard_check must NOT be called on override')
+
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', failing_check)
+
+        # Wire a fake adjudicator so we can assert it's not called
+        fake_adjudicator = AsyncMock()
+        fake_adjudicator.adjudicate = AsyncMock()
+        interceptor._path_scope_adjudicator = fake_adjudicator
+
+        with caplog.at_level(logging.WARNING):
+            result = await interceptor._path_guard_or_skip(
+                {'title': 'Investigate orchestrator/harness.py deadlock'},
+                '/some-other-project',
+                'some_other_project',
+                routing_override_reason='owner asserted ownership',
+            )
+
+        assert result is None, f'Expected None on override, got: {result!r}'
+        assert guard_calls == [], '_path_guard_check must NOT be called'
+        fake_adjudicator.adjudicate.assert_not_called()
+
+        # Must emit a WARNING containing the reason
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'ROUTING OVERRIDE' in r.message and 'owner asserted ownership' in r.message
+            for r in warning_records
+        ), f'Expected WARNING with reason in log, got: {[r.message for r in warning_records]}'
+
+    # -- Case 6: empty routing_override_reason → behavior unchanged -------
+    async def test_empty_routing_override_reason_does_not_skip_guards(
+        self,
+        interceptor,
+        monkeypatch,
+    ):
+        """With routing_override_reason='' (default), a rejecting _path_guard_check
+        still returns the error dict — behavior is unchanged.
+        """
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='some_other_project',
+            matched_paths=('orchestrator/',),
+            suggested_project='dark_factory',
+        )
+
+        def fake_build(kwargs):
+            return None
+
+        def fake_check(self, candidate, kwargs, project_id):
+            return verdict
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
+
+        result = await interceptor._path_guard_or_skip(
+            {'prompt': 'something'},
+            '/some/project_root',
+            'some_other_project',
+            routing_override_reason='',
+        )
+        assert result is not None, 'Empty override must NOT skip the guard'
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation'
+
 
 # ---------------------------------------------------------------------------
 # Multi-project routing — registry + escalator wiring
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestMultiProjectRoutingWiring:
     """Verify that when prefix_registry + scope_violation_escalator are wired,
     the path guard runs for every project (including dark_factory) and a
     rejection fires the escalator with the expected payload.
+
+    All tests are async (no adjudicator wired — behaviour identical to before).
     """
 
-    def test_registry_supersedes_dark_factory_short_circuit(
+    async def test_registry_supersedes_dark_factory_short_circuit(
         self,
         interceptor,
         monkeypatch,
@@ -4695,7 +4918,7 @@ class TestMultiProjectRoutingWiring:
 
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'Edit something'},
             str(tmp_path / 'dark-factory'),
             'dark_factory',
@@ -4704,7 +4927,7 @@ class TestMultiProjectRoutingWiring:
         assert result is None
         assert check_calls == ['dark_factory']
 
-    def test_rejection_fires_scope_violation_escalator(
+    async def test_rejection_fires_scope_violation_escalator(
         self,
         interceptor,
         monkeypatch,
@@ -4754,7 +4977,7 @@ class TestMultiProjectRoutingWiring:
             lambda self, c, k, p: verdict,
         )
 
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'Edit fused-memory/X'},
             str(tmp_path / 'reify'),
             'reify',
@@ -4772,7 +4995,7 @@ class TestMultiProjectRoutingWiring:
         # suggested_root resolved from registry.
         assert call['suggested_root'] == str((tmp_path / 'dark-factory').resolve())
 
-    def test_escalator_failure_swallowed(
+    async def test_escalator_failure_swallowed(
         self,
         interceptor,
         monkeypatch,
@@ -4807,13 +5030,257 @@ class TestMultiProjectRoutingWiring:
         )
 
         # Must not raise.
-        result = interceptor._path_guard_or_skip(
+        result = await interceptor._path_guard_or_skip(
             {'title': 'crates/widget'},
             '/foo',
             'other',
         )
         assert result is not None
         assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+
+    @pytest.mark.asyncio
+    async def test_stage2_no_hit_adjudicator_not_called(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """NO-HIT hot path: when Stage-1 returns OK, the adjudicator is never called."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        # Fake adjudicator with a spy adjudicate method.
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock()
+        interceptor._path_scope_adjudicator = fake_adj
+
+        # Force OK verdict — no heuristic hit.
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: PathGuardVerdict(outcome='ok', project_id=p),
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'Normal task'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Allowed — no error dict.
+        assert result is None
+        # Adjudicator must NOT have been called on the no-hit path.
+        fake_adj.adjudicate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stage2_hit_reject_returns_error_with_llm_reason(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """HIT + REJECT: adjudicator confirms misroute → error dict returned,
+        escalator called once carrying the adjudicator's llm_reason."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        reject_verdict = AdjudicationVerdict(
+            verdict='reject',
+            reason='genuine misroute — task edits orchestrator/harness.py',
+            llm_used=True,
+        )
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock(return_value=reject_verdict)
+        interceptor._path_scope_adjudicator = fake_adj
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='reify',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'Edit fused-memory/X'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Rejection error dict returned.
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        # Escalator called exactly once with the LLM reason.
+        assert len(escalator_calls) == 1
+        call = escalator_calls[0]
+        assert call['llm_reason'] == 'genuine misroute — task edits orchestrator/harness.py'
+
+    @pytest.mark.asyncio
+    async def test_stage2_hit_failsafe_rejects_and_escalates_with_reason(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """HIT + FAIL-SAFE (uncertain/failed): LLM outage never lets misroute through;
+        escalator is called with llm_reason from the fail-safe verdict."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        # Fail-safe verdict (uncertain + failed — simulates breaker-open / hang).
+        failsafe_verdict = AdjudicationVerdict(
+            verdict='uncertain',
+            reason='breaker-open',
+            failed=True,
+            llm_used=False,
+        )
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock(return_value=failsafe_verdict)
+        interceptor._path_scope_adjudicator = fake_adj
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='other',
+            matched_paths=('crates/',),
+            suggested_project='reify',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'crates/widget'},
+            '/foo',
+            'other',
+        )
+        # Guard preserved — misroute rejected even with LLM outage.
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        # Escalated once, carrying the fail-safe reason.
+        assert len(escalator_calls) == 1
+        assert escalator_calls[0]['llm_reason'] == 'breaker-open'
+
+    @pytest.mark.asyncio
+    async def test_stage2_hit_allow_permits_creation_no_escalation(
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
+    ):
+        """HIT + ALLOW: adjudicator confident allow → creation permitted, no escalation."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        # Adjudicator returns confident allow.
+        allow_verdict = AdjudicationVerdict(
+            verdict='allow',
+            reason='incidental example mention in description',
+            llm_used=True,
+        )
+        fake_adj = AsyncMock()
+        fake_adj.adjudicate = AsyncMock(return_value=allow_verdict)
+        interceptor._path_scope_adjudicator = fake_adj
+
+        # Spy escalator — must NOT be called on allow.
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        # Force Stage-1 rejection.
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='reify',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor,
+            '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'Task mentioning fused-memory/ as example'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Adjudicator downgraded heuristic hit → creation permitted.
+        assert result is None
+        # Adjudicator was called exactly once.
+        fake_adj.adjudicate.assert_called_once()
+        # Escalator must NOT be called when adjudicator allows.
+        assert escalator_calls == []
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -5395,9 +5862,12 @@ class TestInterceptorWriteSucceeded:
         """{'success': True, 'id': '1.1'} → True (extra keys, no error key → success)."""
         assert self._fn()({'success': True, 'id': '1.1'}) is True
 
-    def test_empty_dict_is_success(self):
-        """{} → True (defaults: success=True, error=None — some fixtures use bare {})."""
-        assert self._fn()({}) is True
+    def test_empty_dict_is_failure(self):
+        """{} → False (bare {} carries no positive write signal).
+
+        Currently RED: {} returns True via the defaulted success=True branch.
+        """
+        assert self._fn()({}) is False
 
     def test_reject_status_via_update_task(self):
         """_reject_status_in_update_task shape → False."""
@@ -6220,3 +6690,249 @@ async def test_get_tasks_threads_statuses(interceptor, taskmaster):
     assert kwargs2.get('statuses') is None, (
         f'Expected statuses=None when omitted, call_args: {taskmaster.get_tasks.call_args}'
     )
+
+
+# ── task-1810 step-11/12: _extract_metadata_files WARNING on present-but-malformed ──
+
+_TI_LOGGER = 'fused_memory.middleware.task_interceptor'
+
+
+class TestExtractMetadataFilesWarns:
+    """Module-level _extract_metadata_files emits WARNING when metadata.files is
+    present-but-malformed.
+
+    Step-11 (RED): all malformed paths return silently.
+    Step-12 (GREEN): WARNING when files present-but-not-a-list, and when non-str/empty entries
+    are dropped from a non-empty list.
+    """
+
+    def _fn(self):
+        from fused_memory.middleware.task_interceptor import _extract_metadata_files
+        return _extract_metadata_files
+
+    def test_files_not_a_list_returns_empty_and_warns(self, caplog):
+        """{'metadata':{'files':'a.py'}} => [] AND a WARNING.
+
+        Currently RED: isinstance-guard returns [] silently.
+        """
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': 'a.py'}})
+        assert result == [], f"expected [], got {result!r}"
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING when metadata.files is present but not a list; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    def test_list_with_dropped_entries_warns(self, caplog):
+        """{'metadata':{'files':['ok.py', 123, '']}} => ['ok.py'] AND a WARNING noting drops.
+
+        Currently RED: filter runs silently, no WARNING emitted.
+        """
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': ['ok.py', 123, '']}})
+        assert result == ['ok.py'], f"expected ['ok.py'], got {result!r}"
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING noting dropped non-str/empty entries; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    def test_absent_files_key_no_warning(self, caplog):
+        """REGRESSION: metadata dict with no 'files' key => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {}})
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"absent files must not emit WARNINGs; got {warns!r}"
+
+    def test_absent_metadata_no_warning(self, caplog):
+        """REGRESSION: task dict with no 'metadata' key => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'id': '1', 'title': 'task'})
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"absent metadata must not emit WARNINGs; got {warns!r}"
+
+    def test_non_dict_task_data_no_warning(self, caplog):
+        """REGRESSION: non-dict task_data => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn('not-a-dict')
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"non-dict task_data must not emit WARNINGs; got {warns!r}"
+
+    def test_empty_files_list_no_warning(self, caplog):
+        """REGRESSION: metadata.files=[] => [] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': []}})
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"empty files list must not emit WARNINGs; got {warns!r}"
+
+    def test_valid_files_list_no_warning(self, caplog):
+        """REGRESSION: metadata.files=['a.py','b.py'] => ['a.py','b.py'] with ZERO warnings."""
+        import logging
+        fn = self._fn()
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = fn({'metadata': {'files': ['a.py', 'b.py']}})
+        assert result == ['a.py', 'b.py']
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, f"valid files list must not emit WARNINGs; got {warns!r}"
+
+
+# ── task-1810 step-15/16: _check_escalation_idempotency tuple sentinel ──
+
+
+class TestCheckEscalationIdempotencyTuple:
+    """_check_escalation_idempotency returns (hit, check_failed) tuple.
+
+    Step-15 (RED): function returns dict|None (no tuple) and logs DEBUG on get_tasks raise.
+    Step-16 (GREEN): return type changed to tuple[dict|None, bool]; get_tasks raise =>
+      WARNING + (None, True); happy paths => (result, False).
+    """
+
+    def _make_interceptor(self, taskmaster_mock, reconciler_mock=None, event_buffer_mock=None):
+        """Build a minimal TaskInterceptor for direct method testing."""
+        from fused_memory.reconciliation.event_buffer import EventBuffer
+        if reconciler_mock is None:
+            reconciler_mock = AsyncMock()
+        if event_buffer_mock is None:
+            event_buffer_mock = AsyncMock(spec=EventBuffer)
+        return TaskInterceptor(taskmaster_mock, reconciler_mock, event_buffer_mock)
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_raise_returns_tuple_none_true_and_warns(self, caplog):
+        """taskmaster.get_tasks raises => (None, True) AND a WARNING.
+
+        Currently RED: returns bare None (not tuple) and logs DEBUG.
+        """
+        import logging
+        tm = AsyncMock()
+        tm.get_tasks = AsyncMock(side_effect=RuntimeError('db unavailable'))
+        interceptor = self._make_interceptor(tm)
+
+        metadata = {
+            'escalation_id': 'esc-r4-test',
+            'suggestion_hash': 'abc123abc123',
+        }
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = await interceptor._check_escalation_idempotency(
+                project_root='/project',
+                metadata=metadata,
+            )
+
+        # Must return a 2-tuple
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"expected (None, True) tuple; got {result!r}"
+        )
+        hit, check_failed = result
+        assert hit is None, f"expected hit=None; got {hit!r}"
+        assert check_failed is True, f"expected check_failed=True; got {check_failed!r}"
+
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING on get_tasks raise; "
+            f"got records={[(r.levelno, r.message) for r in caplog.records]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_happy_no_match_returns_none_false(self):
+        """No match in task list => (None, False).
+
+        Currently RED: returns bare None (not tuple).
+        """
+        tm = AsyncMock()
+        tm.get_tasks = AsyncMock(return_value={'tasks': []})
+        interceptor = self._make_interceptor(tm)
+
+        metadata = {
+            'escalation_id': 'esc-nomatch',
+            'suggestion_hash': 'nomatch_hash',
+        }
+        result = await interceptor._check_escalation_idempotency(
+            project_root='/project',
+            metadata=metadata,
+        )
+
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"expected (None, False) tuple; got {result!r}"
+        )
+        hit, check_failed = result
+        assert hit is None, f"expected hit=None; got {hit!r}"
+        assert check_failed is False, f"expected check_failed=False; got {check_failed!r}"
+
+    @pytest.mark.asyncio
+    async def test_happy_match_returns_dict_false(self):
+        """Match on non-cancelled task => (dict_with_id, False).
+
+        Currently RED: returns bare dict (not tuple).
+        """
+        tm = AsyncMock()
+        tm.get_tasks = AsyncMock(return_value={
+            'tasks': [{
+                'id': '42',
+                'title': 'Existing escalation task',
+                'status': 'in-progress',
+                'metadata': {
+                    'escalation_id': 'esc-r4-match',
+                    'suggestion_hash': 'match_hash_xyz',
+                },
+            }],
+        })
+        interceptor = self._make_interceptor(tm)
+
+        metadata = {
+            'escalation_id': 'esc-r4-match',
+            'suggestion_hash': 'match_hash_xyz',
+        }
+        result = await interceptor._check_escalation_idempotency(
+            project_root='/project',
+            metadata=metadata,
+        )
+
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"expected (dict, False) tuple; got {result!r}"
+        )
+        hit, check_failed = result
+        assert hit is not None and isinstance(hit, dict), (
+            f"expected hit dict; got {hit!r}"
+        )
+        assert hit.get('id') == '42', f"expected hit id='42'; got {hit!r}"
+        assert check_failed is False, f"expected check_failed=False; got {check_failed!r}"

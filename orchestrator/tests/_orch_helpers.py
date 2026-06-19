@@ -430,3 +430,42 @@ def build_usage_gate(
         for cfg, tok in zip(account_configs, tokens, strict=True)
     ]
     return gate
+
+
+def assert_update_wire_mode(
+    captured_payloads: list[dict],
+    expected_mode: str,
+) -> dict:
+    """Assert exactly one update_task wire call with the expected metadata_mode.
+
+    Shared by wire-mode tests across test_harness_prd_tagging,
+    test_harness_module_tagging, test_auto_eval, and
+    test_harness_reblock_signature_guard — each exercises a distinct caller
+    path but asserts the same two invariants:
+
+    1. Exactly one ``update_task`` call was captured.
+    2. Its ``arguments`` carry ``metadata_mode == expected_mode`` and
+       the legacy ``'append'`` key is absent (the wrapper must never
+       forward ``append`` on the wire).
+
+    Returns the ``arguments`` dict so callers can add further assertions
+    (e.g. inspecting the serialised metadata blob).
+
+    For tests that expect *two* update_task calls (e.g. the dry-run
+    proposal-persist + trim test) use the raw filter idiom directly, since
+    each call asserts a *different* expected_mode.
+    """
+    update_calls = [p for p in captured_payloads if p.get('name') == 'update_task']
+    assert len(update_calls) == 1, (
+        f'Expected exactly 1 update_task wire call; got {len(update_calls)} '
+        f'(all calls: {[p.get("name") for p in captured_payloads]})'
+    )
+    arguments = update_calls[0]['arguments']
+    assert arguments.get('metadata_mode') == expected_mode, (
+        f'update_task wire call must forward metadata_mode={expected_mode!r}; '
+        f'got: {arguments}'
+    )
+    assert 'append' not in arguments, (
+        f"'append' key must not appear on the wire; got: {arguments}"
+    )
+    return arguments

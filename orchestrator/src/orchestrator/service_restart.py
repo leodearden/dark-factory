@@ -1,20 +1,27 @@
-"""Post-merge staleness hook: restart fused-memory.service after code-touching merges.
+"""Post-merge staleness hook: restart a service after code-touching merges.
 
 Design
 ------
 Detection happens in the ``SpeculativeMergeWorker`` 'done' path (the
 chokepoint) via an injected ``on_merge_landed`` callback.  Execution is
 decoupled and deferred: the ``StaleServiceRestartCoordinator`` arms a pending
-flag on detection and fires the restart only when the orchestrator's run-loop
-idle branch (no dispatched agents) calls ``maybe_restart(agents_idle=True)``
-AND the debounce window has elapsed since the last fused-memory merge.
+flag on detection and fires the restart only when the gate conditions are met
+(see ``maybe_restart``).
 
 This guarantees:
-- No dispatched agent races with the restart.
-- A burst of fused-memory merges coalesces into exactly ONE restart.
-- The restart script (``scripts/restart-fused-memory.sh --drain``) runs
-  detached / fire-and-forget so the ~150 s drain+health never blocks the
+- Burst of merges coalesces into exactly ONE restart.
+- The restart script runs detached / fire-and-forget so it never blocks the
   orchestrator event loop.
+
+Two instances are used in production:
+
+* **fused-memory** (``service_name='fused-memory'``, ``require_idle=True``):
+  fires only at the run-loop's idle quiet-window (no dispatched agents).
+  Script: ``scripts/restart-fused-memory.sh --drain``.
+
+* **dashboard** (``service_name='dashboard'``, ``require_idle=False``):
+  leaf service — fires even while agents are dispatching (promptly on the
+  busy-wait branch).  Script: ``scripts/restart-dashboard.sh`` (no drain).
 """
 
 from __future__ import annotations
@@ -69,7 +76,7 @@ def diff_touches_watched_paths(
 
 
 class StaleServiceRestartCoordinator:
-    """Arms and fires a debounced restart of fused-memory.service.
+    """Arms and fires a debounced restart of a service after code-touching merges.
 
     Parameters
     ----------
@@ -84,7 +91,7 @@ class StaleServiceRestartCoordinator:
         Default: ``['fused-memory/src/']``.
     debounce_secs:
         Minimum quiet-time (seconds, monotonic) since the LAST
-        fused-memory-touching merge before the restart fires.
+        watched-path merge before the restart fires.
         Default: 120 s.
     enabled:
         Global on/off switch.  When False, ``note_merge`` short-circuits
@@ -97,10 +104,20 @@ class StaleServiceRestartCoordinator:
         Optional injectable async callable (no args, no return value) that
         performs the actual restart.  When None (the default) a fire-and-forget
         ``asyncio.create_subprocess_exec`` of ``<project_root>/<script_path>
-        --drain`` is used.
+        [*script_args]`` is used.
     clock:
         Injectable callable returning a monotonic float (default:
         ``time.monotonic``).  Override in tests for determinism.
+    service_name:
+        Human-readable service identifier injected into log strings and event
+        data (``data['service']``, ``data['reason']``).  Default: ``'fused-memory'``
+        so the existing fused-memory instance renders byte-identical text.
+    require_idle:
+        When True (default), ``maybe_restart`` only fires when ``agents_idle``
+        is True — the orchestrator's idle quiet-window.  When False (leaf
+        services such as the dashboard), the gate becomes
+        ``(agents_idle or not require_idle)`` so the restart fires even while
+        agents are dispatching.
     """
 
     def __init__(
@@ -115,6 +132,9 @@ class StaleServiceRestartCoordinator:
         project_root: str | Path = '.',
         restart_executor: Callable[[], Awaitable[object]] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        service_name: str = 'fused-memory',
+        require_idle: bool = True,
+        script_args: list[str] | None = None,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -127,6 +147,15 @@ class StaleServiceRestartCoordinator:
         self._project_root = Path(project_root)
         self._restart_executor = restart_executor
         self._clock = clock
+        self._service_name = service_name
+        # When False (leaf services), the restart fires even while agents are
+        # dispatching — agents_idle is not required in the gate.  Default True
+        # preserves the existing fused-memory behaviour (idle-only).
+        self._require_idle = require_idle
+        # script_args are unpacked as positional args after the script path in
+        # _default_restart_executor.  None → ['--drain'] to preserve the
+        # existing fused-memory spawn signature exactly.
+        self._script_args: list[str] = script_args if script_args is not None else ['--drain']
 
         # State
         self._pending: bool = False
@@ -158,16 +187,31 @@ class StaleServiceRestartCoordinator:
         task_id: str,
         base_sha: str,
         head_sha: str,
+        *,
+        prefetched_diff: list[str] | None = None,
     ) -> bool:
         """Called by ``SpeculativeMergeWorker`` when a merge lands on main.
 
         Returns True when this merge armed (or re-armed) the pending-restart
         flag; False when it was ignored (disabled, no watched files, git error).
+
+        Parameters
+        ----------
+        prefetched_diff:
+            Optional pre-computed list of changed file paths (base_sha..head_sha).
+            When provided, the git diff invocation is skipped and this list is used
+            directly, which avoids redundant git calls when multiple coordinators
+            are notified for the same merge (see ``Harness._note_merge_all``).
         """
         if not self._enabled:
             return False
 
-        changed = await self._git_ops.get_merge_diff_files(base_sha, head_sha)
+        if prefetched_diff is not None:
+            changed = prefetched_diff
+        else:
+            changed, err = await self._git_ops.get_merge_diff_files(base_sha, head_sha)
+            if err is not None:
+                return False
         # Compute the matched subset once — used for both the gate decision and
         # the log count, avoiding a redundant O(files × prefixes) re-scan.
         watched_changed = [
@@ -182,7 +226,7 @@ class StaleServiceRestartCoordinator:
         self._trigger_task_ids.append(task_id)
         self._trigger_merge_shas.append(head_sha)
         logger.info(
-            'fused-memory restart pending: merge %s for task %s touched %d'
+            f'{self._service_name} restart pending: merge %s for task %s touched %d'
             ' watched file(s)',
             head_sha[:12],
             task_id,
@@ -201,7 +245,7 @@ class StaleServiceRestartCoordinator:
         if not (
             self._enabled
             and self._pending
-            and agents_idle
+            and (agents_idle or not self._require_idle)
             and (self._clock() - self._last_request_monotonic >= self._debounce_secs)
         ):
             return False
@@ -215,7 +259,7 @@ class StaleServiceRestartCoordinator:
             await executor()
         except Exception:
             logger.warning(
-                'fused-memory restart executor failed; clearing pending to avoid'
+                f'{self._service_name} restart executor failed; clearing pending to avoid'
                 ' a crash-loop on a permanently-missing or non-executable script.'
                 ' A new note_merge will re-arm.',
                 exc_info=True,
@@ -234,16 +278,16 @@ class StaleServiceRestartCoordinator:
                 task_id=trigger_task_ids[0] if trigger_task_ids else 'unknown',
                 phase='service_restart',
                 data={
-                    'service': 'fused-memory',
+                    'service': self._service_name,
                     'script': str(self._script_path),
                     'trigger_task_ids': trigger_task_ids,
                     'merge_shas': trigger_merge_shas,
-                    'reason': 'post_merge_fused_memory_code_change',
+                    'reason': f"post_merge_{self._service_name.replace('-', '_')}_code_change",
                 },
             )
 
         logger.warning(
-            'Restarting fused-memory.service (post-merge staleness hook):'
+            f'Restarting {self._service_name}.service (post-merge staleness hook):'
             ' triggered by tasks %s, merges %s',
             trigger_task_ids,
             [s[:12] for s in trigger_merge_shas],
@@ -257,12 +301,16 @@ class StaleServiceRestartCoordinator:
         return True
 
     async def _default_restart_executor(self) -> None:
-        """Fire-and-forget: spawn the restart script detached."""
+        """Fire-and-forget: spawn the restart script detached.
+
+        Positional args after the script path are taken from ``self._script_args``
+        (e.g. ``['--drain']`` for fused-memory, ``[]`` for the dashboard).
+        """
         script = self._project_root / self._script_path
         await asyncio.create_subprocess_exec(
             str(script),
-            '--drain',
+            *self._script_args,
             start_new_session=True,
         )
-        # Intentionally NOT awaiting the process exit — the ~150 s
-        # drain+health must not block the orchestrator event loop.
+        # Intentionally NOT awaiting the process exit — the script runs
+        # detached so its health-poll never blocks the orchestrator event loop.

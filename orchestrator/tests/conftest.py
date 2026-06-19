@@ -166,7 +166,7 @@ def _clear_probe_cache():
 
 
 @pytest.fixture(autouse=True)
-def _mock_merge_queue_verification(monkeypatch):
+def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
     MergeWorker hardcodes orchestrator.merge_queue.run_scoped_verification in its
@@ -174,7 +174,34 @@ def _mock_merge_queue_verification(monkeypatch):
     pytest/ruff/pyright (not in PATH in test environments) cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
+
+    **Opt-out via ``exercise_merge_verify`` marker** (task 1829):
+    Tests whose purpose IS to assert that a compile-broken member is CAUGHT by the
+    post-merge verify gate must run the REAL ``run_scoped_verification`` (e.g. real
+    cargo), not the passed=True stub — otherwise the gate always returns 'done' and
+    the correctness-invariant assertion ``outcome.status != 'done'`` fails
+    immediately without cargo ever running.  Marking such a test with
+    ``@pytest.mark.exercise_merge_verify`` causes this fixture to return early
+    (skip the monkeypatch), restoring the real binding.
+
+    An Explore audit (task 1829) confirmed that only two tests are in this at-risk
+    category — tests whose correctness assertion requires the blocked outcome and
+    which use the marker as the SOLE restore mechanism (no in-body patch):
+      - test_train_integration.py::TestTrainIntegrationB2::test_lower_member_break_blocks_train
+      - test_atomic_train_merge.py::TestScenario5GroupMergeVerify::test_group_merge_workspace_verify_red
+    Do NOT add a redundant in-body ``patch('orchestrator.merge_queue.run_scoped_verification',
+    ...)`` to these tests — the marker is sufficient and is the authoritative mechanism
+    (pinned by test_merge_verify_mock_autouse.py).
+    Every other test that drives the real merge path either overrides
+    run_scoped_verification itself, injects verify via a different seam
+    (run_scoped= param / workflow-layer patch), tests a failure that occurs BEFORE
+    verify (rebase conflict / incomplete-train), or expects the passed/happy path.
+
+    Mirrors ``_no_dry_run_unblock`` (conftest.py:102-118) exactly.
     """
+    if request.node.get_closest_marker('exercise_merge_verify'):
+        return
+
     from orchestrator.verify import VerifyResult
     monkeypatch.setattr(
         'orchestrator.merge_queue.run_scoped_verification',

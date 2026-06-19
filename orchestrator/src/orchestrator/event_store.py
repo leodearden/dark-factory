@@ -62,6 +62,12 @@ class EventType(StrEnum):
     cap_hit = 'cap_hit'
     lock_acquired = 'lock_acquired'
     lock_released = 'lock_released'
+    # Durable persist of the plan-tightened lock set on the success branch of
+    # handle_blast_radius_expansion. Payload: {files, released, acquired,
+    # persisted: bool}. Complements lock_released (reason='plan_refinement')
+    # by evidencing the DURABLE write; persisted=False means the in-memory
+    # narrowing applied but the metadata write failed (non-critical).
+    set_to_plan = 'set_to_plan'
     merge_attempt = 'merge_attempt'
     merge_verify = 'merge_verify'
     verdict_parity_ok = 'verdict_parity_ok'
@@ -208,6 +214,32 @@ class EventType(StrEnum):
     # a restart of a backing service (e.g. fused-memory.service after a merge
     # whose landed diff touched fused-memory/src/).
     service_restart = 'service_restart'
+
+    # Cross-project external-dep gate held — emitted when a pending task's
+    # external deps have been holding dispatch for ``threshold`` consecutive
+    # ticks.  Makes the hold DASHBOARD-VISIBLE (telemetry) without escalating
+    # (which would be premature for a legitimately-slow upstream).
+    # cause values: 'resolver_degraded' (MCP resolver returned an unusable
+    #   result) or 'deps_live' (deps returned a live non-done status).
+    # data keys: {cause, ticks, detail}.
+    external_dep_gate_held = 'external_dep_gate_held'
+
+    # Paired (rebase → immediately-following verify) cost record.
+    # Emitted once per real rebase (not short-circuit) in _verify_debugfix_loop.
+    # Data payload: {
+    #   old_base: str,           # SHA before rebase
+    #   new_base: str,           # SHA after rebase (current main)
+    #   distance_commits: int,   # git rev-list --count old_base..new_base (-1 = unknown)
+    #   files_changed_on_main: int,  # len(changed_files) from the rebase return
+    #   next_verify_wall_secs: float,  # VerifyResult.duration_secs of the following verify
+    #   verify_scope: {          # context for cost normalisation
+    #     n_task_files: int,
+    #     n_modules: int,
+    #     workspace: bool,       # True when self._train is not None
+    #   },
+    #   cohort: str,             # 'continuous' | 'post-unblock' | 'big-jump' | 'unknown'
+    # }
+    rebase_verify_cost = 'rebase_verify_cost'
 
 
 class EventStore:
@@ -368,3 +400,45 @@ class EventStore:
         except Exception:
             logger.warning('event_store.latest_merge_finalized failed', exc_info=True)
             return None
+
+    def fetch_events_by_type(self, event_type: str | EventType) -> list[dict]:
+        """Return all events of *event_type* emitted in the current run, ordered by id.
+
+        The ``data`` column of every returned row is parsed from JSON back to a
+        dict.  Returns an empty list when no rows match.  Errors are logged and
+        return [] (read path is fire-safe).
+        """
+        try:
+            type_str = event_type.value if isinstance(event_type, EventType) else str(event_type)
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    'SELECT id, timestamp, run_id, task_id, event_type, phase, role, '
+                    '       data, cost_usd, duration_ms '
+                    'FROM events '
+                    'WHERE event_type = ? AND run_id = ? '
+                    'ORDER BY id',
+                    (type_str, self.run_id),
+                ).fetchall()
+            finally:
+                conn.close()
+            result = []
+            for row in rows:
+                (row_id, timestamp, run_id, task_id, evt_type, phase,
+                 role, raw_data, cost_usd, duration_ms) = row
+                result.append({
+                    'id': row_id,
+                    'timestamp': timestamp,
+                    'run_id': run_id,
+                    'task_id': task_id,
+                    'event_type': evt_type,
+                    'phase': phase,
+                    'role': role,
+                    'data': json.loads(raw_data) if raw_data else {},
+                    'cost_usd': cost_usd,
+                    'duration_ms': duration_ms,
+                })
+            return result
+        except Exception:
+            logger.warning('event_store.fetch_events_by_type failed', exc_info=True)
+            return []

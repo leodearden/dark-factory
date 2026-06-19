@@ -32,6 +32,10 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     # background task is spawned inside a unit test.  Mirrors the _neutralise
     # idiom in test_harness_park_stop.py.
     h._start_merge_worker = AsyncMock()
+    # Likewise neutralise the periodic main-tip sweep (added in task 1832);
+    # otherwise run() spawns a real asyncio.Task that sleeps 1800s and leaks
+    # past the unit test, hanging/crashing the worker.
+    h._start_main_tip_sweep = MagicMock()
 
     return h
 

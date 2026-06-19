@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from shared.locking import files_to_modules, modules_conflict, normalize_lock
+from shared.mcp_envelope import parse_tool_result, resolver_failed
 
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -58,6 +59,7 @@ __all__ = [
     'TerminalExitRejection',
     'DoneGateRejection',
     'ProvenanceValidationRejection',
+    'ExternalResolverError',
     'extract_rejection',
     'extract_structured_rejection',
     'is_transient_rejection',
@@ -157,6 +159,26 @@ class ProvenanceValidationRejection(SetTaskStatusRejected):
                 f'{error_code} — {raw}'
             ),
         )
+
+class ExternalResolverError(RuntimeError):
+    """Synthesised error: ``get_external_statuses`` returned an unusable result.
+
+    Raised (into the error slot of the ``(statuses, error)`` tuple) in two cases:
+
+    1. **Non-dict / unparseable result** — ``parse_tool_result`` returned an
+       error (missing 'statuses' key, wrong type, or JSON parse failure).
+       The returned statuses dict is ``{}``.
+
+    2. **Partial-result (missing keys)** — the 'statuses' dict was present but did
+       not contain a key for every requested dep string.  The returned statuses dict
+       is the partial dict (not ``{}``) so callers can log what was received, but
+       the error flag forces a fail-safe wait (do not silently treat missing keys
+       as non-done statuses).
+
+    In both cases ``_external_resolver_failed`` becomes ``True`` via the existing
+    ``external_err is not None`` plumbing — no gate-logic changes needed.
+    """
+
 
 # Error-type names that indicate a transient backend failure (taskmaster
 # child reconnecting, fused-memory crashed mid-call, network blip).  Matches
@@ -810,6 +832,23 @@ class Scheduler:
         # Process-local — a scheduler restart is an acceptable implicit reset,
         # matching _requeue_counts/_skip_count idioms above.
         self._external_unresolved_counts: dict[tuple[str, str], int] = {}
+        # Per-(task_id, dep_id) count of consecutive ticks where the LOCAL dep
+        # backfill get_statuses call degraded (parse failure or empty result).
+        # Mirrors _external_unresolved_counts for local deps.  GC'd in the
+        # per-tick stale-id sweep alongside _external_unresolved_counts.
+        self._local_backfill_unresolved_counts: dict[tuple[str, str], int] = {}
+        # Per-task_id count of consecutive ticks where the external-dep gate
+        # held dispatch (either because the resolver was degraded, or because
+        # all deps returned live non-done statuses).  Keyed by task_id (str).
+        # Process-local — same rationale as _external_unresolved_counts.
+        # GC'd alongside _external_unresolved_counts in the per-tick stale-id sweep.
+        self._external_hold_streak: dict[str, int] = {}
+        # Tracks the most-recent cause for _external_hold_streak[task_id].
+        # Reset alongside the streak.  When the cause changes tick-over-tick
+        # (e.g. resolver degraded → dep live) the streak resets to zero so the
+        # emitted external_dep_gate_held.cause always reflects the dominant
+        # (consecutive-run) reason, not a mixed accumulation.
+        self._external_hold_cause: dict[str, str] = {}
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -1087,40 +1126,6 @@ class Scheduler:
         from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
         return extract_probe_set(task) is not None
 
-    @staticmethod
-    def _parse_tool_text_result(result: dict, key: str) -> Any:
-        """Parse a text-content MCP result block and return ``inner[key]``.
-
-        Handles the ``{data: {...}}`` envelope that taskmaster sometimes wraps
-        responses in.  Returns ``None`` if no text block is found, JSON cannot
-        be parsed, or the key is absent.
-
-        Args:
-            result: Raw response from ``dispatch_tool``.
-            key: The key to retrieve from the (optionally unwrapped) payload.
-        """
-        content = result.get('result', {}).get('content', [])
-        for block in content:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                try:
-                    data = json.loads(block['text'])
-                except (ValueError, TypeError):
-                    logger.warning(
-                        'Failed to parse MCP tool text block as JSON '
-                        '(key=%r, text_prefix=%r)',
-                        key,
-                        block.get('text', '')[:200],
-                    )
-                    return None
-                # Unwrap taskmaster's {data: {...}} envelope when present.
-                inner = (
-                    data.get('data')
-                    if isinstance(data.get('data'), dict)
-                    else data
-                )
-                return inner.get(key) if isinstance(inner, dict) else None
-        return None
-
     async def tasks_by_train(self, train_id: str) -> list[dict]:
         """Return tasks belonging to ``train_id``, sorted ascending by train.order (root→tip).
 
@@ -1202,8 +1207,8 @@ class Scheduler:
                 arguments,
                 timeout=15,
             )
-            tasks = self._parse_tool_text_result(result, 'tasks')
-            if isinstance(tasks, list):
+            tasks, tasks_err = parse_tool_result(result, 'tasks', list)
+            if tasks_err is None and tasks is not None:
                 for t in tasks:
                     if isinstance(t, dict):
                         self._normalize_task_metadata(t)
@@ -1424,10 +1429,8 @@ class Scheduler:
                 task_id, type(e).__name__, e,
             )
             return None
-        status = self._parse_tool_text_result(result, 'status')
-        if isinstance(status, str):
-            return status
-        return None
+        status, status_err = parse_tool_result(result, 'status', str)
+        return status if status_err is None else None
 
     async def get_task(self, task_id: str) -> dict | None:
         """Fetch the full task dict (including metadata) from fused-memory.
@@ -1497,15 +1500,16 @@ class Scheduler:
             if ids is not None:
                 arguments['ids'] = list(ids)
             result = await self.dispatch_tool('get_statuses', arguments, timeout=15)
-            statuses = self._parse_tool_text_result(result, 'statuses')
-            if isinstance(statuses, dict):
-                return statuses, None
+            statuses, err = parse_tool_result(result, 'statuses', dict)
+            if err is not None:
+                return {}, err
+            assert statuses is not None  # invariant: parse_tool_result → (None, err) | (value, None)
+            return statuses, None
         except Exception as e:
             logger.exception(
                 'Failed to fetch task statuses: %s: %s', type(e).__name__, e,
             )
             return {}, e
-        return {}, None
 
     async def get_external_statuses(
         self, deps: list[str]
@@ -1520,18 +1524,41 @@ class Scheduler:
         ``malformed``) are surfaced as-is — the caller decides policy.
 
         Returns:
-            ``({dep: status}, None)`` on success.
-            ``({}, exception)`` on any failure — transient raises are swallowed
-            into the error slot (fail-safe; caller should skip policy effects).
+            ``({dep: status}, None)`` on success (all requested dep keys present).
+            ``(partial_dict, ExternalResolverError)`` when the response dict is
+            missing one or more requested dep keys (resolver-degraded; partial
+            dict preserved for logging but error slot forces fail-safe wait).
+            ``({}, ExternalResolverError)`` when ``parse_tool_result``
+            returns a parse error (unparseable JSON or missing 'statuses' key).
+            ``({}, exception)`` on any raised exception — transient raises are
+            swallowed into the error slot (fail-safe; caller should skip policy
+            effects).
         """
         try:
             arguments: dict = {'deps': list(deps)}
             result = await self.dispatch_tool(
                 'get_external_statuses', arguments, timeout=15
             )
-            statuses = self._parse_tool_text_result(result, 'statuses')
-            if isinstance(statuses, dict):
-                return statuses, None
+            statuses, parse_err = parse_tool_result(result, 'statuses', dict)
+            if parse_err is not None:
+                # primitive already emitted the WARNING; preserve ExternalResolverError type.
+                return {}, ExternalResolverError(str(parse_err))
+            assert statuses is not None  # invariant: parse_tool_result → (None, err) | (value, None)
+            # Guard: the real tool always keys its response by the verbatim
+            # dep string and always sets a value (real status or a sentinel).
+            # A missing dep key is a genuine contract violation, not normal
+            # operation, so treat it as resolver-degraded (fail-safe wait).
+            missing = [d for d in deps if d not in statuses]
+            if missing:
+                msg = (
+                    f'get_external_statuses: response missing {len(missing)}'
+                    f' of {len(deps)} requested dep keys '
+                    f'(sample: {missing[:3]!r}) — resolver-degraded; '
+                    'fail-safe wait this tick'
+                )
+                logger.warning(msg)
+                return statuses, ExternalResolverError(msg)
+            return statuses, None
         except Exception as e:
             logger.exception(
                 'Failed to fetch external dep statuses: %s: %s',
@@ -1539,11 +1566,51 @@ class Scheduler:
                 e,
             )
             return {}, e
-        return {}, None
 
     _EXTERNAL_SENTINEL_STATUSES: frozenset[str] = frozenset(
         {'unknown_project', 'unknown_task', 'malformed'}
     )
+
+    def _note_external_hold(
+        self,
+        task_id: str,
+        *,
+        cause: str,
+        threshold: int,
+        detail: str | None = None,
+    ) -> None:
+        """Bump the hold-streak for ``task_id`` and emit an event at the threshold.
+
+        Called once per held tick (either ``'resolver_degraded'`` or
+        ``'deps_live'``).  Emits ``EventType.external_dep_gate_held`` the
+        first time the streak reaches ``threshold`` and on each subsequent
+        ``threshold``-multiple tick, so the event is durable and bounded.
+
+        Does NOT touch ``_external_unresolved_counts`` (sentinel-counter)
+        — that counter is owned by the sentinel-escalation path.
+        """
+        # Reset when the cause changes so emitted events always reflect a
+        # single consecutive-run cause, not a mixed accumulation.
+        if self._external_hold_cause.get(task_id) != cause:
+            self._external_hold_streak[task_id] = 0
+        self._external_hold_cause[task_id] = cause
+        streak = self._external_hold_streak.get(task_id, 0) + 1
+        self._external_hold_streak[task_id] = streak
+        if streak >= threshold and streak % threshold == 0:
+            logger.warning(
+                'Task %s: external-dep gate has held dispatch for %d consecutive '
+                'ticks (cause=%r, threshold=%d)',
+                task_id,
+                streak,
+                cause,
+                threshold,
+            )
+            if self.event_store is not None:
+                self.event_store.emit(
+                    EventType.external_dep_gate_held,
+                    task_id=task_id,
+                    data={'cause': cause, 'ticks': streak, 'detail': detail},
+                )
 
     async def _apply_external_dep_policy(
         self,
@@ -1581,16 +1648,41 @@ class Scheduler:
         ``_eligible_for_dispatch``.  Those are pure predicates called per-candidate;
         side effects here would N-fire per tick.
         """
-        if external_err is not None:
-            return  # transient resolver failure — fail-safe wait
-
         threshold = self.config.max_external_dep_unresolved_cycles
+
+        if external_err is not None:
+            # Resolver-degraded tick: fail-safe wait with visibility at threshold.
+            # - NO sentinel-counter bumps (fail-safe invariant from task 1580).
+            # - NO escalation (may recover next tick).
+            # - Bump hold streak for every pending task with external deps so the
+            #   hold becomes dashboard-visible once it persists too long.
+            for task in pending_tasks:
+                task_id = str(task.get('id', '?'))
+                external_deps: list = (
+                    (task.get('metadata') or {}).get('external_deps') or []
+                )
+                if external_deps:
+                    self._note_external_hold(
+                        task_id,
+                        cause='resolver_degraded',
+                        threshold=threshold,
+                        detail=str(external_err),
+                    )
+            return
 
         for task in pending_tasks:
             task_id = str(task.get('id', '?'))
             external_deps: list = (
                 (task.get('metadata') or {}).get('external_deps') or []
             )
+            # Track whether any dep left this task held in a live (non-done,
+            # non-sentinel) status this tick — used to drive hold-streak
+            # visibility after the dep loop.
+            held_live = False
+            # Set True in the cancelled / threshold-crossing-sentinel branches
+            # so the post-loop hold-streak code knows not to emit a spurious
+            # 'deps_live' gate-held event for a task being terminally blocked.
+            blocked_this_tick = False
             for dep in external_deps:
                 status = external_cache.get(dep)
 
@@ -1624,6 +1716,7 @@ class Scheduler:
                             dep,
                             task_id,
                         )
+                    blocked_this_tick = True
 
                 elif status in self._EXTERNAL_SENTINEL_STATUSES:
                     # Unknown/malformed — grace-then-escalate counter.
@@ -1664,6 +1757,7 @@ class Scheduler:
                                 count,
                                 task_id,
                             )
+                        blocked_this_tick = True
                     else:
                         logger.debug(
                             'Task %s: external dep %r status=%r (%d/%d ticks) — '
@@ -1678,8 +1772,26 @@ class Scheduler:
                 else:
                     # Any other live status (pending, in-progress, blocked, …):
                     # wait silently and reset the sentinel counter so transient
-                    # blips don't accumulate.
+                    # blips don't accumulate.  Mark this task as held by a live
+                    # dep so we can emit a visibility event if this persists.
                     self._external_unresolved_counts.pop((task_id, dep), None)
+                    held_live = True
+
+            # After the dep loop: drive the hold-streak for live-status holds.
+            # - If any dep held the task live AND no terminal action fired this
+            #   tick: bump+emit streak (genuinely waiting).
+            # - Otherwise (all deps done, OR task was blocked via
+            #   cancelled/threshold-sentinel): pop the streak.  A blocked task
+            #   is not "still waiting" so gate_held must not fire for it.
+            if held_live and not blocked_this_tick:
+                self._note_external_hold(
+                    task_id,
+                    cause='deps_live',
+                    threshold=threshold,
+                )
+            else:
+                self._external_hold_streak.pop(task_id, None)
+                self._external_hold_cause.pop(task_id, None)
 
     async def update_task(
         self,
@@ -1687,6 +1799,7 @@ class Scheduler:
         metadata: str | dict,
         *,
         append: bool = False,
+        metadata_mode: str | None = None,
     ) -> bool:
         """Update task metadata via fused-memory. Returns True on success.
 
@@ -1696,14 +1809,33 @@ class Scheduler:
             The task whose metadata should be updated.
         metadata:
             New metadata as a dict or pre-serialised JSON string.
+        metadata_mode:
+            Explicit merge mode forwarded to fused-memory (#1827 contract).
+            ``'merge'`` (default): shallow last-write-wins — omitted keys are
+            preserved, supplied keys overwrite wholesale.  This is the #4271
+            fix: no-append callers (prd-tagger, module-tagger, auto-eval
+            back-link) now preserve sibling keys like _causation_id and
+            memory_hints instead of silently clobbering them.
+            ``'additive'``: recursive list-union, dict-recursive, scalar
+            OLD-wins.  Use for list-growth writes (e.g. dry_run_proposals).
+            ``'replace'``: whole-blob overwrite, delete-by-omission.  Also
+            the sanctioned repair path if a task's persisted metadata is
+            corrupt (non-dict): under ``'merge'`` or ``'additive'``, the
+            backend will raise the corrupt-blob guard rather than silently
+            overwriting, so a corrupted blob requires an explicit
+            ``metadata_mode='replace'`` call to repair.
         append:
-            When ``True`` the fused-memory backend uses recursive-merge
-            semantics (``_merge_metadata(append=True)``) so only the supplied
-            keys are touched and the rest of the metadata blob is preserved.
-            When ``False`` (default) the backend replaces the whole blob —
-            existing callers that supply the full metadata dict can leave this
-            at the default without behaviour change.
+            Legacy shorthand kept for back-compat.  Resolved to
+            ``'additive'`` when ``True``.  Ignored when ``metadata_mode``
+            is set explicitly.  Precedence: metadata_mode > append > merge.
         """
+        # Resolve mode: explicit metadata_mode wins; append=True → additive;
+        # default → merge (the #4271 fix — NOT replace).
+        # NEVER forward 'append' on the wire: append=False resolves to REPLACE
+        # on the backend, which would re-introduce the sibling-clobber bug.
+        mode = metadata_mode if metadata_mode is not None else (
+            'additive' if append else 'merge'
+        )
         # fused-memory update_task expects metadata as a JSON string
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
@@ -1711,9 +1843,8 @@ class Scheduler:
             'id': task_id,
             'metadata': metadata,
             'project_root': self._project_root,
+            'metadata_mode': mode,
         }
-        if append:
-            arguments['append'] = True
         try:
             result = await self.dispatch_tool(
                 'update_task',
@@ -2483,8 +2614,107 @@ class Scheduler:
             _backfilled, _backfill_err = await self.get_statuses(
                 ids=_missing_dep_ids
             )
-            if _backfilled:
+            if resolver_failed(_backfilled, _backfill_err):
+                logger.warning(
+                    'acquire_next: dep-status backfill degraded '
+                    '(err=%r, missing_dep_ids=%r) — affected pending tasks '
+                    'held fail-safe-wait',
+                    _backfill_err,
+                    _missing_dep_ids,
+                )
+                for _t in tasks:
+                    _tid = str(_t.get('id', ''))
+                    if _t.get('status') != 'pending' or not _tid:
+                        continue
+                    for _d in (_t.get('dependencies') or []):
+                        _dep_id = str(
+                            _d.get('id', _d) if isinstance(_d, dict) else _d
+                        )
+                        if _dep_id in _missing_dep_ids:
+                            _key = (_tid, _dep_id)
+                            self._local_backfill_unresolved_counts[_key] = (
+                                self._local_backfill_unresolved_counts.get(_key, 0) + 1
+                            )
+                            _cnt = self._local_backfill_unresolved_counts[_key]
+                            # Reuse max_external_dep_unresolved_cycles as the
+                            # grace threshold — same "consecutive ticks before
+                            # loud escalation" semantics as the external-dep
+                            # resolver-degraded path being mirrored here.
+                            # A dedicated max_local_backfill_unresolved_cycles
+                            # field is deferred (config.py is out of scope).
+                            if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                                logger.warning(
+                                    'acquire_next: local dep backfill unresolved '
+                                    'for %d consecutive ticks '
+                                    '(task=%s, dep=%s) — possible scheduler '
+                                    'degradation',
+                                    _cnt,
+                                    _tid,
+                                    _dep_id,
+                                )
+            else:
                 status_map.update(_backfilled)
+                # Reset the consecutive-tick counters for deps that resolved
+                # successfully in this backfill — mirrors the
+                # _external_unresolved_counts.pop(...) on the 'done' branch in
+                # _apply_external_dep_policy.  Without this reset, a dep that
+                # degrades → recovers → degrades again accumulates across the
+                # gap, making the "consecutive" counters and warning messages
+                # misreport the streak length.
+                for _t in tasks:
+                    _tid = str(_t.get('id', ''))
+                    if _t.get('status') != 'pending' or not _tid:
+                        continue
+                    for _d in (_t.get('dependencies') or []):
+                        _dep_id = str(
+                            _d.get('id', _d) if isinstance(_d, dict) else _d
+                        )
+                        if _dep_id in _backfilled:
+                            self._local_backfill_unresolved_counts.pop(
+                                (_tid, _dep_id), None
+                            )
+                # Partial-response guard: get_statuses returned a valid
+                # (non-error) dict that is still missing some of the requested
+                # dep ids.  Treat those still-missing ids as degraded — warn +
+                # bump counter — mirroring the missing-key guard in
+                # get_external_statuses (~1545).  The absent ids stay out of
+                # status_map so _deps_satisfied returns False → fail-safe-wait,
+                # now VISIBLE rather than a silent idle.
+                _still_missing = set(_missing_dep_ids) - set(_backfilled)
+                if _still_missing:
+                    logger.warning(
+                        'acquire_next: dep-status backfill returned partial '
+                        'result (missing %d/%d dep ids: %r) — affected '
+                        'pending tasks held fail-safe-wait',
+                        len(_still_missing),
+                        len(_missing_dep_ids),
+                        sorted(_still_missing),
+                    )
+                    for _t in tasks:
+                        _tid = str(_t.get('id', ''))
+                        if _t.get('status') != 'pending' or not _tid:
+                            continue
+                        for _d in (_t.get('dependencies') or []):
+                            _dep_id = str(
+                                _d.get('id', _d) if isinstance(_d, dict) else _d
+                            )
+                            if _dep_id in _still_missing:
+                                _key = (_tid, _dep_id)
+                                self._local_backfill_unresolved_counts[_key] = (
+                                    self._local_backfill_unresolved_counts.get(_key, 0) + 1
+                                )
+                                _cnt = self._local_backfill_unresolved_counts[_key]
+                                # Same threshold as the degraded path above.
+                                if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                                    logger.warning(
+                                        'acquire_next: local dep absent from '
+                                        'backfill for %d consecutive ticks '
+                                        '(task=%s, dep=%s) — possible '
+                                        'scheduler degradation',
+                                        _cnt,
+                                        _tid,
+                                        _dep_id,
+                                    )
 
         # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
         # a park whose owner is terminal / missing / deps-unsatisfied has no
@@ -2563,6 +2793,19 @@ class Scheduler:
             ]
             for k in _stale_ext_keys:
                 del self._external_unresolved_counts[k]
+        if _stale_ids and self._local_backfill_unresolved_counts:
+            _stale_local_keys = [
+                k for k in self._local_backfill_unresolved_counts
+                if k[0] in _stale_ids
+            ]
+            for k in _stale_local_keys:
+                del self._local_backfill_unresolved_counts[k]
+        # _external_hold_streak and _external_hold_cause are keyed by task_id
+        # (str); GC alongside _external_unresolved_counts so they stay bounded.
+        if _stale_ids and (self._external_hold_streak or self._external_hold_cause):
+            for tid in _stale_ids:
+                self._external_hold_streak.pop(tid, None)
+                self._external_hold_cause.pop(tid, None)
 
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
@@ -3191,6 +3434,37 @@ class Scheduler:
         """
         await self._write_snapshot_best_effort(force=True)
 
+    async def _persist_files_metadata(self, task_id: str, needed: list[str]) -> bool:
+        """Persist ``needed`` as ``metadata['files']`` via a Stage-2-preserving
+        read-modify-write.
+
+        Sibling keys attached by Stage-2 reconciliation (``memory_hints``,
+        ``_causation_id``) survive because the merge policy is
+        ``{**fresh_md, 'files': needed}`` — existing keys win except ``files``.
+
+        ``needed`` is module-granularity (the output of ``files_to_modules``),
+        not raw file paths.  Writing module paths to ``metadata.files`` is
+        idempotent on restart because ``normalize_lock`` on an
+        already-depth-normalized path is identity, so the derived lock set is
+        unchanged after a reload.  This mirrors the failure-branch convention.
+
+        Returns ``True`` when ``update_task`` reports success, ``False``
+        otherwise.  Logs a warning on failure but never raises — callers that
+        have already applied the in-memory narrowing should continue even when
+        the durable write fails (reconcile/next-plan will retry).
+        """
+        fresh = await self.get_task(task_id)
+        fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
+        merged = {**fresh_md, 'files': needed}
+        updated = bool(await self.update_task(task_id, merged))
+        if not updated:
+            logger.warning(
+                'Task %s: metadata.files persist failed (non-critical — '
+                'in-memory state already applied; reconcile/next-plan will retry).',
+                task_id,
+            )
+        return updated
+
     async def handle_blast_radius_expansion(
         self,
         task_id: str,
@@ -3213,6 +3487,7 @@ class Scheduler:
         if not additional and not stale:
             return True
 
+        released: list[str] = []
         if not additional or self.lock_table.try_acquire_additional(task_id, additional):
             if stale:
                 released = self.lock_table.release_subset(task_id, stale)
@@ -3221,6 +3496,29 @@ class Scheduler:
                         EventType.lock_released,
                         task_id=task_id,
                         data={'modules': released, 'reason': 'plan_refinement'},
+                    )
+                # Persist the narrowed set so it survives a restart.  Without
+                # this, the scheduler re-reads the over-declared metadata.files
+                # on startup and re-acquires the released modules, re-introducing
+                # the over-claim (δ bug).  Best-effort: in-memory narrowing already
+                # applied via release_subset; return True even on update failure.
+                # Shares the same read-modify-write logic as the requeue branch
+                # (see _persist_files_metadata below).
+                updated = await self._persist_files_metadata(task_id, needed)
+                # Emit set_to_plan to signal the DURABLE persist (lock_released
+                # above signals the in-memory release; this signals durability).
+                # persisted=False lets the reify ζ gate distinguish a failed
+                # write from a successful one without a separate metadata read.
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.set_to_plan,
+                        task_id=task_id,
+                        data={
+                            'files': needed,
+                            'released': released,
+                            'acquired': additional,
+                            'persisted': bool(updated),
+                        },
                     )
             logger.info(f'Task {task_id} expanded to modules: {needed}')
             return True
@@ -3234,20 +3532,12 @@ class Scheduler:
         # Read-modify-write so memory_hints / _causation_id attached by Stage-2
         # reconciliation survive the blast-radius-failure files write (task 1511).
         # get_task already swallows MCP errors → None, so the isinstance guard
-        # degrades gracefully to the prior {'files': needed} write.
-        # Note: this is intentionally backend-only — the scheduler holds no per-task
-        # in-memory metadata to merge with (unlike workflow._reconcile_metadata_files_for_done,
-        # which overlays backend onto in-memory via _merge_fresh_metadata). The merge policy
-        # is {**fresh_md, 'files': needed}: Stage-2 sibling keys survive, 'files' wins.
-        fresh = await self.get_task(task_id)
-        fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
-        merged = {**fresh_md, 'files': needed}
-        updated = await self.update_task(task_id, merged)
-        if not updated:
-            logger.warning(
-                f'Task {task_id}: metadata update failed (non-critical — '
-                f'using in-memory module cache for scheduling).'
-            )
+        # degrades gracefully to the prior {'files': needed} write (see
+        # _persist_files_metadata).  This is intentionally backend-only — the
+        # scheduler holds no per-task in-memory metadata to merge with (unlike
+        # workflow._reconcile_metadata_files_for_done which uses _merge_fresh_metadata).
+        # Merge policy: {**fresh_md, 'files': needed} — Stage-2 sibling keys survive.
+        await self._persist_files_metadata(task_id, needed)
         try:
             await self.set_task_status(task_id, 'pending')
         except RuntimeError as e:

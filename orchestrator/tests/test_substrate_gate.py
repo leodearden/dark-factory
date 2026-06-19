@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -205,6 +206,112 @@ class TestBuildCheckerArgv:
     def test_returns_none_when_descriptor_not_dict(self):
         from orchestrator.substrate_gate import build_checker_argv
         assert build_checker_argv('not-a-dict') is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Step-1 RED: carries_substrate_probe + fail-closed malformed-present cases
+# ---------------------------------------------------------------------------
+
+
+class TestCarriesSubstrateProbe:
+    """Tests for ``orchestrator.substrate_gate.carries_substrate_probe``."""
+
+    def test_returns_true_when_substrate_probe_present_as_dict(self):
+        from orchestrator.substrate_gate import carries_substrate_probe
+        task = {'id': '1', 'metadata': {'substrate_probe': {'probe_set': 'foo.json', 'checker': ['py']}}}
+        assert carries_substrate_probe(task) is True
+
+    def test_returns_true_when_metadata_is_json_string_with_substrate_probe(self):
+        from orchestrator.substrate_gate import carries_substrate_probe
+        meta = {'substrate_probe': {'probe_set': 'foo.json', 'checker': ['py']}}
+        task = {'id': '1', 'metadata': json.dumps(meta)}
+        assert carries_substrate_probe(task) is True
+
+    def test_returns_false_when_metadata_absent(self):
+        from orchestrator.substrate_gate import carries_substrate_probe
+        task = {'id': '1', 'title': 'Plain task'}
+        assert carries_substrate_probe(task) is False
+
+    def test_returns_false_when_metadata_is_none(self):
+        from orchestrator.substrate_gate import carries_substrate_probe
+        task = {'id': '1', 'metadata': None}
+        assert carries_substrate_probe(task) is False
+
+    def test_returns_false_when_metadata_not_dict_and_not_str(self):
+        from orchestrator.substrate_gate import carries_substrate_probe
+        task = {'id': '1', 'metadata': 42}
+        assert carries_substrate_probe(task) is False
+
+    def test_returns_false_when_corrupt_json_string_metadata(self):
+        from orchestrator.substrate_gate import carries_substrate_probe
+        task = {'id': '1', 'metadata': '{not valid json'}
+        assert carries_substrate_probe(task) is False
+
+    def test_returns_false_when_substrate_probe_key_absent(self):
+        from orchestrator.substrate_gate import carries_substrate_probe
+        task = {'id': '1', 'metadata': {'other_key': 'value'}}
+        assert carries_substrate_probe(task) is False
+
+    def test_returns_true_when_substrate_probe_value_is_malformed(self):
+        """Key 'substrate_probe' present even if its value is malformed → True."""
+        from orchestrator.substrate_gate import carries_substrate_probe
+        task = {'id': '1', 'metadata': {'substrate_probe': 'oops'}}
+        assert carries_substrate_probe(task) is True
+
+    def test_returns_true_when_substrate_probe_has_empty_probe_set(self):
+        """substrate_probe dict present but probe_set empty → still carries it."""
+        from orchestrator.substrate_gate import carries_substrate_probe
+        task = {'id': '1', 'metadata': {'substrate_probe': {'probe_set': '', 'checker': ['py']}}}
+        assert carries_substrate_probe(task) is True
+
+
+class TestRunSubstrateRecheckFailClosed:
+    """RED tests: malformed-present substrate_probe → FLIP + WARNING (fail-closed)."""
+
+    def test_malformed_substrate_probe_not_dict_returns_flip_with_warning(self, caplog):
+        """substrate_probe present but NOT a dict → FLIP + WARNING (fail-closed)."""
+        from orchestrator.substrate_gate import FLIP, run_substrate_recheck
+        task = {'id': '42', 'metadata': {'substrate_probe': 'oops'}}
+        checker = fake_checker(rc=0)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.substrate_gate'):
+            verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == FLIP, f'Expected FLIP, got {verdict.verdict!r}'
+        assert verdict.flipped is True
+        # Checker must NOT have been invoked
+        assert checker.calls == []
+        # A WARNING must have been emitted
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            f'Expected a WARNING; got: {[r.message for r in caplog.records]!r}'
+        )
+
+    def test_substrate_probe_dict_with_empty_probe_set_returns_flip_with_warning(self, caplog):
+        """substrate_probe is a dict but probe_set empty → FLIP + WARNING (fail-closed)."""
+        from orchestrator.substrate_gate import FLIP, run_substrate_recheck
+        task = {'id': '42', 'metadata': {'substrate_probe': {'probe_set': '', 'checker': ['py']}}}
+        checker = fake_checker(rc=0)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.substrate_gate'):
+            verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == FLIP, f'Expected FLIP, got {verdict.verdict!r}'
+        assert verdict.flipped is True
+        assert checker.calls == []
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            f'Expected a WARNING; got: {[r.message for r in caplog.records]!r}'
+        )
+
+    def test_no_substrate_probe_key_returns_skip_no_warning(self, caplog):
+        """Task with NO substrate_probe key → SKIP, no WARNING (regression guard)."""
+        from orchestrator.substrate_gate import SKIP, run_substrate_recheck
+        task = {'id': '42', 'metadata': {'other': 'value'}}
+        checker = fake_checker(rc=0)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.substrate_gate'):
+            verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
+        assert verdict.verdict == SKIP, f'Expected SKIP, got {verdict.verdict!r}'
+        assert verdict.flipped is False
+        assert checker.calls == []
+        # No WARNING for a genuinely-absent probe
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records), (
+            f'Expected no WARNING for genuinely-absent probe; got: {[r.message for r in caplog.records]!r}'
+        )
 
 
 # ---------------------------------------------------------------------------

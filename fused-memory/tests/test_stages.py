@@ -884,7 +884,10 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
         assert result.items_flagged == []
-        assert result.stats == {'entity_summary_snapshot_lines_stripped': 0}
+        assert result.stats == {
+            'entity_summary_snapshot_lines_stripped': 0,
+            'stage1_fetch_degraded': [],
+        }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
 
@@ -972,7 +975,10 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
         assert result.items_flagged == []
-        assert result.stats == {'entity_summary_snapshot_lines_stripped': 0}
+        assert result.stats == {
+            'entity_summary_snapshot_lines_stripped': 0,
+            'stage1_fetch_degraded': [],
+        }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
         assert any(
@@ -10465,6 +10471,132 @@ class TestApplyPostFlightGuardsLiveWorkflow:
         )
 
 
+# ── Tests for task 1810 step-7: _apply_post_flight_guards status_cache build warnings ──────────
+
+
+_TKS_LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+
+class TestApplyPostFlightGuardsStatusCacheBuildWarns:
+    """_apply_post_flight_guards emits WARNINGs when get_task returns non-dict or unknown-status.
+
+    Step-7 (RED): both branches `continue` silently — no WARNING is emitted.
+    Step-8 (GREEN): add WARNING on both branches naming task_id.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_dict_get_task_result_emits_warning(
+        self, stage2_guard_mock_deps, caplog
+    ):
+        """get_task returning a non-dict => WARNING naming task_id.
+
+        Currently RED: non-dict result continues silently.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/project'
+
+        op = _make_sts_op(op_id='op-non-dict', task_id='9901')
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [op]
+        # get_task returns a non-dict (plain string)
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = 'not-a-dict'
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result([], stats={})),
+            ),
+            caplog.at_level(logging.WARNING, logger=_TKS_LOGGER),
+        ):
+            from fused_memory.models.reconciliation import Watermark
+            wm = Watermark(project_id='dark_factory')
+            await stage.run([], wm, [], 'test-run-non-dict')
+
+        warns = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('9901' in r.getMessage() for r in warns), (
+            f"expected a WARNING mentioning task_id='9901' for non-dict get_task result; "
+            f"got warns={[r.getMessage() for r in warns]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_status_get_task_result_emits_warning(
+        self, stage2_guard_mock_deps, caplog
+    ):
+        """get_task returning a dict that resolves to 'unknown' status => WARNING naming task_id.
+
+        Currently RED: 'unknown' status continues silently.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/project'
+
+        op = _make_sts_op(op_id='op-unknown', task_id='9902')
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [op]
+        # get_task returns a dict with no 'status' key => _extract_status => 'unknown'
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'id': '9902', 'title': 'x'}
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result([], stats={})),
+            ),
+            caplog.at_level(logging.WARNING, logger=_TKS_LOGGER),
+        ):
+            from fused_memory.models.reconciliation import Watermark
+            wm = Watermark(project_id='dark_factory')
+            await stage.run([], wm, [], 'test-run-unknown')
+
+        warns = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('9902' in r.getMessage() for r in warns), (
+            f"expected a WARNING mentioning task_id='9902' for unknown-status result; "
+            f"got warns={[r.getMessage() for r in warns]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_healthy_get_task_no_warning(self, stage2_guard_mock_deps, caplog):
+        """REGRESSION: healthy get_task with resolvable status => cache populated, ZERO new warnings."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/project'
+
+        op = _make_sts_op(op_id='op-healthy', task_id='9903')
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [op]
+        # get_task returns a healthy dict with a known status
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {
+            'id': '9903', 'status': 'in-progress',
+        }
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result([], stats={})),
+            ),
+            caplog.at_level(logging.WARNING, logger=_TKS_LOGGER),
+        ):
+            from fused_memory.models.reconciliation import Watermark
+            wm = Watermark(project_id='dark_factory')
+            await stage.run([], wm, [], 'test-run-healthy')
+
+        warns = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
+            # exclude the already-loud BaseException branch (it can warn on other task_ids)
+            and '9903' in r.message
+        ]
+        assert not warns, (
+            f"healthy get_task must not emit WARNINGs for task_id='9903'; got {warns!r}"
+        )
+
+
 # ── Tests for Task 1655 step-9: assemble_payload renders '### Live-Workflow Signals' ──────────
 
 
@@ -10923,8 +11055,12 @@ class TestEnforceStage2SummaryPoolCapResilience:
 
 
 class TestTaskKnowledgeSyncCycleSummaryPoolCap:
-    """TaskKnowledgeSync.run() calls _enforce_stage2_summary_pool_cap and sets
-    report.stats['stage2_cycle_summary_pool_trimmed'] after super().run()."""
+    """TaskKnowledgeSync.run() pre-trims the pool to cap-1 BEFORE super().run()
+    (trim-then-write ordering, task 1831) and sets report.stats for both
+    'stage2_cycle_summary_pool_trimmed' (pre-trim count) and
+    'stage2_cycle_summary_verified_count' (post-write verify)."""
+
+    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
 
     @pytest.fixture
     def mock_deps(self):
@@ -10952,15 +11088,28 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
             for i in range(count)
         ]
 
-    @pytest.mark.asyncio
-    async def test_stat_set_to_trimmed_count_when_pool_over_cap(self, mock_deps):
-        """run() injects stage2_cycle_summary_pool_trimmed into report.stats.
-
-        3 pool members (one over cap=2) → 1 trimmed.
-        """
+    def _base_report(self):
         from datetime import UTC, datetime
 
         from fused_memory.models.reconciliation import StageId, StageReport
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stat_set_to_trimmed_count_when_pool_over_cap(self, mock_deps):
+        """Pre-trim with 3 pool members trims to cap-1=1 → pool_trimmed==2.
+
+        Updated for trim-then-write semantics (task 1831): pre-trim targets
+        cap-1 not cap, so 3 members → 2 deleted (was 1 under post-write trim).
+        """
+        from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
@@ -10971,31 +11120,46 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
             return_value=self._pool_members(3)
         )
 
-        base_report = StageReport(
-            stage=StageId.task_knowledge_sync,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-        watermark = Watermark(project_id='dark_factory')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
             report = await stage.run(
-                events=[], watermark=watermark, prior_reports=[], run_id='run-cap'
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-cap',
             )
 
         assert 'stage2_cycle_summary_pool_trimmed' in report.stats
-        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 1
+        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 2
 
     @pytest.mark.asyncio
-    async def test_stat_is_zero_when_pool_at_or_below_cap(self, mock_deps):
-        """When pool has <= 2 members, stat is 0 (explicitly set, not absent)."""
-        from datetime import UTC, datetime
+    async def test_stat_is_zero_when_pool_at_cap_minus_one(self, mock_deps):
+        """1 member (already at cap-1=1) → no trim, pool_trimmed==0.
 
-        from fused_memory.models.reconciliation import StageId, StageReport
+        Updated for trim-then-write semantics: the at-or-below threshold is
+        cap-1=1 (not cap=2).
+        """
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=self._pool_members(1)
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-at-cap',
+            )
+
+        assert 'stage2_cycle_summary_pool_trimmed' in report.stats
+        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 0
+
+    @pytest.mark.asyncio
+    async def test_stat_is_one_when_pool_has_two_prior_members(self, mock_deps):
+        """2 prior members → pre-trim to cap-1=1 → pool_trimmed==1."""
+        from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
@@ -11006,31 +11170,21 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
             return_value=self._pool_members(2)
         )
 
-        base_report = StageReport(
-            stage=StageId.task_knowledge_sync,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-        watermark = Watermark(project_id='dark_factory')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
             report = await stage.run(
-                events=[], watermark=watermark, prior_reports=[], run_id='run-cap'
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-two',
             )
 
-        assert 'stage2_cycle_summary_pool_trimmed' in report.stats
-        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 0
+        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 1
 
     @pytest.mark.asyncio
     async def test_trim_runs_in_remediation_mode(self, mock_deps):
-        """Trim runs and stat is set even when remediation_mode=True."""
-        from datetime import UTC, datetime
+        """Pre-trim runs and stat is set even when remediation_mode=True.
 
-        from fused_memory.models.reconciliation import StageId, StageReport
+        Updated: 3 members → trimmed==2 (pre-trim to cap-1, not cap).
+        """
+        from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
@@ -11042,27 +11196,147 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
             return_value=self._pool_members(3)
         )
 
-        base_report = StageReport(
-            stage=StageId.task_knowledge_sync,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-        watermark = Watermark(project_id='dark_factory')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
             report = await stage.run(
-                events=[], watermark=watermark, prior_reports=[], run_id='run-remediation'
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-remediation',
             )
 
-        # Trim must run in remediation mode too
         assert 'stage2_cycle_summary_pool_trimmed' in report.stats
-        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 1
-        # delete_memory was called (oldest trimmed)
+        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 2
         mock_deps['memory_service'].delete_memory.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_trim_precedes_agent_write_ordering(self, mock_deps):
+        """Pre-trim (get_memories_by_metadata) fires BEFORE super().run() (agent write)."""
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        order = []
+
+        async def record_trim(*args, **kwargs):
+            order.append('trim')
+            return []
+
+        async def record_agent(*args, **kwargs):
+            order.append('agent_run')
+            return self._base_report()
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=record_trim
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(side_effect=record_agent)):
+            await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-order',
+            )
+
+        trim_indices = [i for i, x in enumerate(order) if x == 'trim']
+        agent_indices = [i for i, x in enumerate(order) if x == 'agent_run']
+        assert trim_indices, 'pre-trim must call get_memories_by_metadata'
+        assert agent_indices, 'super().run() must be called'
+        assert max(trim_indices) < min(agent_indices), (
+            'all trim calls must precede agent_run; '
+            f'got order={order!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_new_summary_not_evicted_by_pretrim(self, mock_deps):
+        """Pre-trim keeps the newest pool member; oldest two are deleted.
+
+        Simulates the edge case where new_summary_id is already present in the
+        enumerated pool (e.g. a reconstruction write from a prior step) and
+        verifies that trim-then-write ordering preserves it because it has the
+        newest created_at.  Cap=2, pre-trim to cap-1=1: 3 members → delete 2
+        oldest (summary-0, summary-1); new_summary_id (newest) survives.
+        """
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        new_run_id = 'run-new'
+        new_summary_id = f'new-summary-{new_run_id}'
+
+        # Pool contains 2 prior members + new_summary_id with newest created_at.
+        # This makes the assertion non-trivial: if sort/trim logic were reversed,
+        # new_summary_id would be the one deleted.
+        prior_members = self._pool_members(2)  # summary-0 (2026-01), summary-1 (2026-02)
+        new_member = {
+            'id': new_summary_id,
+            'created_at': '2026-12-01T00:00:00+00:00',
+            'metadata': {'recon_pool': 'stage2_cycle_summary'},
+        }
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=prior_members + [new_member]
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id=new_run_id,
+            )
+
+        deleted_ids = {
+            c.kwargs['memory_id']
+            for c in mock_deps['memory_service'].delete_memory.call_args_list
+        }
+        assert new_summary_id not in deleted_ids, (
+            f'the newest member {new_summary_id!r} must survive pre-trim; '
+            f'deleted={deleted_ids!r}'
+        )
+        # Both older prior members were deleted (trim to 1 from 3)
+        assert 'summary-0' in deleted_ids, f'oldest member must be deleted; deleted={deleted_ids!r}'
+        assert 'summary-1' in deleted_ids, f'second member must be deleted; deleted={deleted_ids!r}'
+
+    @pytest.mark.asyncio
+    async def test_verified_count_stat_set_when_summary_found(self, mock_deps):
+        """stage2_cycle_summary_verified_count==1 when count_memories_by_metadata returns 1."""
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-verify',
+            )
+
+        assert report.stats['stage2_cycle_summary_verified_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_verified_count_zero_and_warns_when_no_summary(self, mock_deps, caplog):
+        """stage2_cycle_summary_verified_count==0 and WARNING when count returns 0."""
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        mock_deps['memory_service'].count_memories_by_metadata.return_value = 0
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())), \
+             caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-verify-miss',
+            )
+
+        assert report.stats['stage2_cycle_summary_verified_count'] == 0
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 class TestStage2PromptCycleSummaryPoolTag:
@@ -11316,3 +11590,397 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
         report = self._fresh_report()
         stage.record_task_dump_spot_check(report)
         assert 'task_dump_spot_check' not in report.stats
+
+
+_MC_LOGGER = 'fused_memory.reconciliation.stages.memory_consolidator'
+
+
+class TestMemoryConsolidatorMem0ResultsKeyWarns:
+    """MemoryConsolidator.assemble_payload emits WARNING when mem0.get_all returns malformed 'results'.
+
+    Step-9 (RED): `all_memories.get('results', [])` defaults silently — no WARNING emitted.
+    Step-10 (GREEN): guard + logger.warning when 'results' is absent/non-list.
+    """
+
+    def _make_stage(self, get_all_return):
+        """Build a MemoryConsolidator with mem0.get_all returning the given value."""
+        config = ReconciliationConfig()
+        mem_svc = AsyncMock()
+        mem_svc.get_episodes = AsyncMock(return_value=[])
+        mem_svc.get_status = AsyncMock(return_value={})
+        mem_svc.mem0 = AsyncMock()
+        mem_svc.mem0.get_all = AsyncMock(return_value=get_all_return)
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            mem_svc, AsyncMock(), AsyncMock(), config,
+        )
+        stage.project_id = 'dark_factory'
+        stage.episode_limit = 100
+        stage.memory_limit = 200
+        return stage
+
+    @pytest.mark.asyncio
+    async def test_missing_results_key_emits_warning(self, caplog):
+        """mem0.get_all returning dict without 'results' key => [] AND a WARNING.
+
+        Currently RED: .get('results', []) defaults silently.
+        """
+        stage = self._make_stage({'other_key': 'data'})
+        watermark = Watermark(project_id='dark_factory')
+        with caplog.at_level(logging.WARNING, logger=_MC_LOGGER):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        warns = [
+            r for r in caplog.records
+            if r.name == _MC_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING when mem0.get_all returns a dict with no 'results' key; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_list_results_emits_warning(self, caplog):
+        """mem0.get_all returning {'results': 'not-a-list'} => [] AND a WARNING.
+
+        Currently RED: .get('results', []) returns 'not-a-list', no warning emitted.
+        """
+        stage = self._make_stage({'results': 'not-a-list'})
+        watermark = Watermark(project_id='dark_factory')
+        with caplog.at_level(logging.WARNING, logger=_MC_LOGGER):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        warns = [
+            r for r in caplog.records
+            if r.name == _MC_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            "expected a WARNING when mem0.get_all returns {'results': 'not-a-list'}; "
+            f"got warns={[r.message for r in warns]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_list_results_no_warning(self, caplog):
+        """REGRESSION: mem0.get_all returns {'results': []} => [] with ZERO warnings."""
+        stage = self._make_stage({'results': []})
+        watermark = Watermark(project_id='dark_factory')
+        with caplog.at_level(logging.WARNING, logger=_MC_LOGGER):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        warns = [
+            r for r in caplog.records
+            if r.name == _MC_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f"legit empty results must not emit WARNINGs; got {[r.message for r in warns]!r}"
+        )
+
+
+class TestVerifyStage2SummaryWritten:
+    """_verify_stage2_summary_written: calls count_memories_by_metadata with
+    {'kind':'cycle_summary','stage':'task_knowledge_sync','run_id':run_id},
+    returns count, logs WARNING on count==0 or exception, never raises."""
+
+    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+    @pytest.mark.asyncio
+    async def test_calls_count_with_correct_filter(self):
+        """Calls count_memories_by_metadata once with project_id and correct triple filter."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _verify_stage2_summary_written,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 1
+
+        await _verify_stage2_summary_written(memory_service, 'dark_factory', 'run-abc')
+
+        memory_service.count_memories_by_metadata.assert_awaited_once_with(
+            project_id='dark_factory',
+            filters={
+                'kind': 'cycle_summary',
+                'stage': 'task_knowledge_sync',
+                'run_id': 'run-abc',
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_count_when_positive_no_warning(self, caplog):
+        """Returns count when >0 and logs no WARNING."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _verify_stage2_summary_written,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 2
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _verify_stage2_summary_written(
+                memory_service, 'dark_factory', 'run-found'
+            )
+
+        assert result == 2
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_and_logs_warning_when_count_is_zero(self, caplog):
+        """When count==0 returns 0 and logs a WARNING."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _verify_stage2_summary_written,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _verify_stage2_summary_written(
+                memory_service, 'dark_factory', 'run-missing'
+            )
+
+        assert result == 0
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_and_logs_warning_on_exception(self, caplog):
+        """When count_memories_by_metadata raises, returns 0, does NOT raise, logs WARNING."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _verify_stage2_summary_written,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant gone')
+        )
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _verify_stage2_summary_written(
+                memory_service, 'dark_factory', 'run-error'
+            )
+
+        assert result == 0
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestPretrimStage2SummaryPool:
+    """_pretrim_stage2_summary_pool delegates to _enforce_stage2_summary_pool_cap
+    with cap=max(STAGE2_CYCLE_SUMMARY_POOL_CAP-1, 0) == 1, reserving one slot
+    for the imminent agent write."""
+
+    def _pool_members(self, count: int) -> list:
+        return [
+            {
+                'id': f'summary-{i}',
+                'created_at': f'2026-0{i+1}-01T00:00:00+00:00',
+                'metadata': {'recon_pool': 'stage2_cycle_summary'},
+            }
+            for i in range(count)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_two_members_deletes_one_oldest_returns_one(self):
+        """2 pool members → trim to cap-1=1 → delete 1 oldest, returns 1."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _pretrim_stage2_summary_pool,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(2))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-pre')
+
+        assert result == 1
+        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
+        assert deleted_ids == {'summary-0'}
+
+    @pytest.mark.asyncio
+    async def test_three_members_deletes_two_oldest_returns_two(self):
+        """3 pool members → trim to cap-1=1 → delete 2 oldest, returns 2."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _pretrim_stage2_summary_pool,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(3))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-pre')
+
+        assert result == 2
+        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
+        assert deleted_ids == {'summary-0', 'summary-1'}
+
+    @pytest.mark.asyncio
+    async def test_one_member_deletes_nothing_returns_zero(self):
+        """1 pool member (already at cap-1=1) → deletes nothing, returns 0."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _pretrim_stage2_summary_pool,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(1))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-pre')
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_called_with_correct_audit_kwargs(self):
+        """delete_memory called with store='mem0', causation_id=run_id, _source='stage2_cycle_summary_trim'."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _pretrim_stage2_summary_pool,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(2))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-check')
+
+        call_kwargs = memory_service.delete_memory.call_args.kwargs
+        assert call_kwargs['store'] == 'mem0'
+        assert call_kwargs['causation_id'] == 'run-check'
+        assert call_kwargs['_source'] == 'stage2_cycle_summary_trim'
+
+
+# ---------------------------------------------------------------------------
+# step-5 (RED) / step-6 (GREEN): IntegrityCheck.run() blocked-snapshot wiring
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrityCheckBlockedSnapshotWiring:
+    """IntegrityCheck.run() must apply filter_blocked_snapshot_findings and
+    surface report.stats['blocked_snapshot_findings_dropped'].
+
+    Mirrors TestIntegrityCheckRecordTaskDumpSpotCheck's mock_deps fixture and
+    the test_stage1.py TestStaleCountSnapshotCorrectionWiring pattern.
+
+    RED until step-6 wires filter_blocked_snapshot_findings into run() and
+    sets the stat.
+    """
+
+    @pytest.fixture
+    def config(self):
+        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+
+    @pytest.fixture
+    def mock_deps(self, config):
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_snapshot_finding_dropped_and_benign_survives_for_blocked_project(
+        self, mock_deps
+    ):
+        """Snapshot missing_knowledge finding is DROPPED and benign finding SURVIVES
+        for project_id='autopilot_video'; stat is set to 1.
+
+        RED: run() does not yet apply the filter or set the stat.
+        """
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'autopilot_video'
+        stage.filtered_task_tree = None
+
+        snapshot_flag = {
+            'task_id': None,
+            'flag_type': 'missing_knowledge',
+            'category': 'missing_knowledge',
+            'description': 'autopilot_video has no task-count snapshot temporal_fact edge',
+            'suggested_action': 'Add a count snapshot temporal_fact for autopilot_video',
+            'actionable': False,
+        }
+        benign_flag = {
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'category': 'missing_deliverable',
+            'description': 'task 42 has no design doc',
+            'suggested_action': 'Add a design doc',
+            'actionable': True,
+        }
+
+        base_report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[snapshot_flag, benign_flag],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='autopilot_video'),
+                prior_reports=[],
+                run_id='run-1840',
+            )
+
+        categories = [f.get('category') for f in report.items_flagged]
+        assert 'missing_knowledge' not in categories, (
+            "Snapshot missing_knowledge finding must be DROPPED for autopilot_video; "
+            f"got items_flagged={report.items_flagged!r}"
+        )
+        assert 'missing_deliverable' in categories, (
+            "Benign missing_deliverable finding must SURVIVE the snapshot filter; "
+            f"got items_flagged={report.items_flagged!r}"
+        )
+        assert report.stats.get('blocked_snapshot_findings_dropped') == 1, (
+            "run() must set report.stats['blocked_snapshot_findings_dropped'] = 1; "
+            f"got stats={report.stats!r}. RED: stat not yet surfaced."
+        )
+
+    @pytest.mark.asyncio
+    async def test_both_findings_survive_for_non_blocked_project(self, mock_deps):
+        """For project_id='dark_factory' (not in blocked set), BOTH findings survive;
+        blocked_snapshot_findings_dropped == 0.
+
+        RED: run() does not yet apply the filter or set the stat.
+        """
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.filtered_task_tree = None
+
+        snapshot_flag = {
+            'task_id': None,
+            'flag_type': 'missing_knowledge',
+            'category': 'missing_knowledge',
+            'description': 'dark_factory has no task-count snapshot temporal_fact edge',
+            'suggested_action': 'Add a count snapshot',
+            'actionable': False,
+        }
+        benign_flag = {
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'category': 'missing_deliverable',
+            'description': 'task 42 has no design doc',
+            'suggested_action': 'Add a design doc',
+            'actionable': True,
+        }
+
+        base_report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[snapshot_flag, benign_flag],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='run-1840',
+            )
+
+        assert len(report.items_flagged) == 2, (
+            "Both findings must survive for non-blocked project 'dark_factory'; "
+            f"got items_flagged={report.items_flagged!r}"
+        )
+        assert report.stats.get('blocked_snapshot_findings_dropped') == 0, (
+            "run() must set report.stats['blocked_snapshot_findings_dropped'] = 0 "
+            "when no flags are dropped; "
+            f"got stats={report.stats!r}"
+        )

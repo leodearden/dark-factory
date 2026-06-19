@@ -116,6 +116,7 @@ def create_server(
     task_status_lookup: Callable[[str], Awaitable[str | None]] | None = None,
     merge_inflight_registry: Any = None,
     startup_sweep: bool = True,
+    startup_sweep_now: datetime | None = None,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
@@ -151,6 +152,12 @@ def create_server(
     any exception is logged at WARNING level and the server continues binding.
     Pass False in tests that pre-populate the queue and do not want the sweep
     to run.
+
+    *startup_sweep_now* (default None) — injectable reference datetime forwarded
+    to ``run_startup_sweep(now=...)`` which in turn forwards it to
+    ``archive.prune_archive(now=...)``.  When None, live UTC is used (production
+    default).  Pass a fixed datetime in tests to make the prune cutoff
+    deterministic and wall-clock-independent.
     """
     mcp = FastMCP('escalation')
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
@@ -158,7 +165,7 @@ def create_server(
     # --- Startup sweep (pre-serving single-writer window) ---
     if startup_sweep:
         try:
-            _sweep.run_startup_sweep(queue.queue_dir)
+            _sweep.run_startup_sweep(queue.queue_dir, now=startup_sweep_now)
         except Exception as _e:
             logger.warning('startup queue sweep failed (non-fatal): %s', _e)
 

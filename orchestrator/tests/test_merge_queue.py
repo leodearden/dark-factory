@@ -19103,8 +19103,8 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         task = asyncio.create_task(worker._heartbeat_loop())
         try:
             # Poll up to 1 s for mtime to advance
-            deadline = asyncio.get_event_loop().time() + 1.0
-            while asyncio.get_event_loop().time() < deadline:
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while asyncio.get_running_loop().time() < deadline:
                 if merge_wt.stat().st_mtime > time.time() - 5:
                     break
                 await asyncio.sleep(0.05)
@@ -19833,4 +19833,107 @@ class TestEntryPhaseDuringFinalize:
         assert len(captured_phase) >= 1, 'advance_main must have been called at least once'
         assert captured_phase[0] == 'finalizing', (
             f"entry.phase at advance_main must be 'finalizing'; got: {captured_phase[0]!r}"
+        )
+
+
+# ===========================================================================
+# Step-10: RED — merge-queue wiring of refresh_warm_base
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRefreshWarmBaseWiring:
+    """SpeculativeMergeWorker wires refresh_warm_base at the post-advance seam.
+
+    Tests fail against the current impl (no call site in merge_queue.py).
+    """
+
+    async def test_warm_path_calls_refresh_warm_base(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """When verify ran in the persistent _merge-verify worktree AND the merge
+        advances as 'done', git_ops.refresh_warm_base must be awaited exactly once.
+
+        Warm path: persistent_merge_worktree=True + safety-valve NOT due
+        → _acquire_warm_verify_worktree swaps to _merge-verify
+        → merge_wt.name == '_merge-verify'
+        → refresh_warm_base called once after advance.
+
+        Fails against current impl (no call site in merge_queue.py).
+        """
+        # Build a warm config (persistent_merge_worktree=True)
+        warm_git_config = GitConfig(
+            main_branch=config.git.main_branch,
+            branch_prefix=config.git.branch_prefix,
+            remote=config.git.remote,
+            worktree_dir=config.git.worktree_dir,
+            push_after_advance=False,
+            persistent_merge_worktree=True,
+        )
+        warm_config = OrchestratorConfig(
+            project_root=config.project_root,
+            git=warm_git_config,
+        )
+
+        wt = await _make_branch_with_file(git_ops, 'rwb-warm', 'rwb_w.py', 'x = 1\n')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Spy on refresh_warm_base — must be awaited exactly once on the warm path
+        refresh_spy = AsyncMock(return_value=True)
+        git_ops.refresh_warm_base = refresh_spy  # type: ignore[method-assign]
+
+        worker_task = asyncio.create_task(worker.run())
+        try:
+            with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+                req = _make_request('rwb-warm', 'rwb-warm', wt, warm_config)
+                await queue.put(req)
+                outcome = await asyncio.wait_for(req.result, timeout=30)
+        finally:
+            await worker.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+        assert outcome.status == 'done', f'Expected done; got {outcome}'
+        # Verify the warm worktree was actually used (confirming the warm path ran)
+        assert refresh_spy.await_count == 1, (
+            f'refresh_warm_base must be awaited exactly once on the warm path; '
+            f'got {refresh_spy.await_count} calls'
+        )
+
+    async def test_cold_path_skips_refresh_warm_base(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """When verify ran in an ephemeral _merge-<uuid> worktree (knob off),
+        refresh_warm_base must NOT be called.
+
+        Cold path: persistent_merge_worktree=False (default config)
+        → merge_wt.name == '_merge-<uuid>' (NOT '_merge-verify')
+        → refresh_warm_base is skipped.
+
+        Regression guard: fails if the call site omits the merge_wt.name gate.
+        """
+        wt = await _make_branch_with_file(git_ops, 'rwb-cold', 'rwb_c.py', 'y = 2\n')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Spy on refresh_warm_base — must NOT be called on the cold path
+        refresh_spy = AsyncMock(return_value=False)
+        git_ops.refresh_warm_base = refresh_spy  # type: ignore[method-assign]
+
+        worker_task = asyncio.create_task(worker.run())
+        try:
+            with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+                req = _make_request('rwb-cold', 'rwb-cold', wt, config)
+                await queue.put(req)
+                outcome = await asyncio.wait_for(req.result, timeout=30)
+        finally:
+            await worker.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+        assert outcome.status == 'done', f'Expected done; got {outcome}'
+        assert refresh_spy.await_count == 0, (
+            f'refresh_warm_base must NOT be called on the cold/ephemeral path; '
+            f'got {refresh_spy.await_count} calls'
         )

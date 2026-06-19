@@ -731,6 +731,7 @@ class TestScenario5GroupMergeVerify:
             f"expected 3 mark_member_done calls, got {req.mark_member_done.call_count}"  # type: ignore[union-attr]
         )
 
+    @pytest.mark.exercise_merge_verify
     async def test_group_merge_workspace_verify_red(
         self,
         cargo_or_skip,  # noqa: ARG002
@@ -787,6 +788,10 @@ class TestScenario5GroupMergeVerify:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = MergeWorker(git_ops, queue)
+
+        # The @pytest.mark.exercise_merge_verify marker (above) makes the autouse
+        # fixture skip the passed=True stub; the real run_scoped_verification runs
+        # here automatically — no in-body patch needed or added.
         outcome = await worker._do_merge(req)
 
         # (i) Outcome is blocked (not done).
@@ -1101,7 +1106,7 @@ class TestScenario6ParkPrefixDerail:
         harness.git_ops.prune_worktrees = AsyncMock()
         harness.config.worktree_orphan_reaper_enabled = True
 
-        # α/β are live (in get_tasks) with merge-deferred status.
+        # α/β are live (in get_statuses) with merge-deferred status.
         harness.scheduler = MagicMock()
         harness.scheduler._dispatched = set()
         harness.scheduler.get_tasks = AsyncMock(return_value=[
@@ -1109,6 +1114,12 @@ class TestScenario6ParkPrefixDerail:
             {"id": "beta6", "status": "merge-deferred"},
             {"id": "gamma6", "status": "blocked"},
         ])
+        # _reap_orphan_worktrees now uses get_statuses() (async) to build live_ids.
+        # Provide a non-empty dict so resolver_failed() does not abort the sweep.
+        harness.scheduler.get_statuses = AsyncMock(return_value=(
+            {"alpha6": "merge-deferred", "beta6": "merge-deferred", "gamma6": "blocked"},
+            None,
+        ))
         harness._recovered_plans = {}
         harness._preserved_worktrees = set()
         harness._recovered_sessions = {}

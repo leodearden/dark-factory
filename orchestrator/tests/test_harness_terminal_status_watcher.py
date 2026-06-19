@@ -276,3 +276,31 @@ async def test_terminal_cancel_count_cleared_on_non_terminal_status(
         f"Expected count cleared on non-terminal status, got "
         f"{harness_low_threshold._terminal_cancel_counts.get('10')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-5 RED: _scan_for_terminal_active_tasks WARNING on get_statuses error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scan_emits_warning_when_get_statuses_fails(harness, caplog):
+    """get_statuses error → returns 0 AND WARNING emitted at 'orchestrator.harness'.
+
+    Pre-fix: `if error is not None: return 0` is SILENT — no WARNING fires.
+    After fix: WARNING at 'orchestrator.harness' naming the failure.
+    """
+    ev = asyncio.Event()
+    harness._workflow_cancel_events['7'] = ev
+    harness.scheduler.get_statuses = AsyncMock(
+        return_value=({}, RuntimeError('mcp down')),
+    )
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+        result = await harness._scan_for_terminal_active_tasks()
+
+    assert result == 0, f'Expected 0, got {result!r}'
+    assert any(
+        r.levelno >= logging.WARNING
+        for r in caplog.records
+    ), f'Expected WARNING; got: {[r.message for r in caplog.records]!r}'

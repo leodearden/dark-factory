@@ -1319,6 +1319,21 @@ def _build_fallback_config(
     )
 
 
+def _verify_duration_secs(runs: list[dict]) -> float:
+    """Sum per-command ``duration_secs`` values from a verification runs list.
+
+    Each entry is expected to have a ``duration_secs`` key (float); entries
+    that are missing the key contribute 0.0.  Returns 0.0 for an empty list.
+
+    This is the correct wall-clock measure when commands were run **serially**
+    (sum of sequential durations).  For the **concurrent** branch (asyncio.gather
+    of test/lint/type) the caller should use ``max(...)`` of the individual
+    durations — mirroring the multi-module logic in ``_aggregate_results`` — to
+    avoid overstating wall-clock by ~3×.
+    """
+    return sum(r.get('duration_secs', 0.0) for r in runs)
+
+
 @dataclass
 class VerifyResult:
     passed: bool
@@ -1331,6 +1346,19 @@ class VerifyResult:
     category: str = ''
     worktree_log_paths: list[str] = field(default_factory=list)
     archive_log_paths: list[str] = field(default_factory=list)
+    # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
+    # when the three commands ran concurrently (asyncio.gather), or their sum
+    # when run serially.  For a multi-module run: max across child
+    # VerifyResults (set by _aggregate_results — modules run concurrently via
+    # asyncio.gather so max approximates wall-time).  Defaults to 0.0 for
+    # _trivial_pass and mocked results.
+    #
+    # compare=False: wall-clock duration differs between two independent runs of
+    # the same logical verification, so it must NOT participate in __eq__ (else
+    # cli_result == local can never hold — see test_cli
+    # test_verify_merge_cli_wrapper_transparency). Folded in here to clear a
+    # preexisting main red introduced by task 1802.
+    duration_secs: float = field(default=0.0, compare=False)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -2133,6 +2161,14 @@ async def run_verification(
         except Exception as exc:  # noqa: BLE001
             logger.warning('run_verification: persistence error (non-fatal): %s', exc)
 
+    # When the three verify commands ran concurrently (asyncio.gather) the
+    # true wall-clock cost is the longest single command, not their sum.
+    # Serial mode is rare (legacy / explicit opt-out) and sums correctly.
+    if concurrent:
+        _wall_secs = max(test_duration, lint_duration, type_duration)
+    else:
+        _wall_secs = _verify_duration_secs(runs)
+
     result = VerifyResult(
         passed=passed,
         test_output=test_out,
@@ -2144,6 +2180,7 @@ async def run_verification(
         category=category,
         worktree_log_paths=worktree_log_paths,
         archive_log_paths=archive_log_paths,
+        duration_secs=_wall_secs,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -2239,6 +2276,10 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         category=category,
         worktree_log_paths=worktree_log_paths,
         archive_log_paths=archive_log_paths,
+        # Wall-clock approximation: modules run concurrently via asyncio.gather
+        # so the slowest module dominates the total elapsed time.  Single-module
+        # tasks hit the len==1 fast path above and carry the exact value.
+        duration_secs=max((r.duration_secs for r in results), default=0.0),
     )
 
 
@@ -2711,4 +2752,114 @@ async def verify_failure_is_preexisting_on_main(
             with contextlib.suppress(Exception):
                 # Belt-and-suspenders: rmtree the probe dir in case git worktree
                 # remove left an empty skeleton, or the worktree add never ran.
+                shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+async def run_main_tip_sweep(
+    config: 'OrchestratorConfig',
+    git_ops: object,
+    *,
+    main_sha: str | None = None,
+) -> 'tuple[str, VerifyResult] | None':
+    """Run a full unscoped verification sweep against the current main-tip SHA.
+
+    Creates a throwaway detached worktree pinned at *main_sha* under
+    ``git_ops.worktree_base`` (``_mainsweep-<hex>`` prefix — distinct from
+    ``_merge-``/``_mainprobe-`` so the disk-pressure prune never reclaims it
+    mid-run).  Runs ``run_full_verification`` (all subprojects: test + lint +
+    typecheck in parallel) and returns ``(main_sha, result)``.
+
+    Args:
+        config: Orchestrator configuration.
+        git_ops: GitOps instance (needs ``get_main_sha``, ``worktree_base``).
+        main_sha: Optional pre-resolved SHA.  When provided the internal
+            ``git_ops.get_main_sha()`` call is skipped, eliminating a redundant
+            subprocess and closing the TOCTOU window between the harness
+            SHA-dedup gate and the worktree pin.  Callers that already resolved
+            the SHA (e.g. ``_run_main_tip_sweep`` in harness.py) should pass it.
+
+    Returns:
+        ``(main_sha, VerifyResult)`` on success (result.passed may be False).
+        ``None`` (fail-safe) when:
+          - ``get_main_sha()`` raises or returns an empty string.
+          - ``git worktree add --detach`` fails after retries.
+          - Any unexpected exception during sweep setup.
+        The harness treats ``None`` as "no signal — retry next tick" and does
+        NOT mark the SHA as swept, so the same tip is retried on the next interval.
+
+    Cleanup: scoped ``git worktree remove --force <tmp_path>`` + ``shutil.rmtree``
+    always runs in a ``finally`` block.  NO broad ``git worktree prune`` (DD5
+    guarantee: a broad prune would deregister concurrently-active sibling
+    probe/merge worktrees).
+    """
+    import uuid  # noqa: PLC0415, I001
+    from orchestrator.git_ops import _run  # noqa: PLC0415 — lazy, mirrors verify_failure_is_preexisting_on_main
+
+    # git worktree add CREATES tmp_path; do NOT pre-create or strict git rejects it.
+    tmp_path: Path | None = None
+    worktree_added: bool = False
+    try:
+        # Resolve the current main SHA unless the caller pre-resolved it.
+        # Accepting a pre-resolved value eliminates a redundant git rev-parse
+        # subprocess and closes the TOCTOU window between the harness SHA-dedup
+        # gate and the worktree pin (both now use the same resolved value).
+        if main_sha is None:
+            try:
+                main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
+            except Exception:
+                logger.debug('run_main_tip_sweep: get_main_sha failed', exc_info=True)
+                return None
+        if not main_sha:
+            return None
+
+        # Build the sweep worktree path under worktree_base.  The '_mainsweep-'
+        # prefix is distinct from '_merge-' and '_mainprobe-' so the disk-pressure
+        # prune (prune_stale_merge_worktrees, targeting '_merge-*' only) never
+        # reclaims the probe mid-run.  Same env-parity reasoning as mainprobe.
+        base: Path = git_ops.worktree_base  # type: ignore[union-attr]
+        base.mkdir(parents=True, exist_ok=True)
+        tmp_path = base / f'_mainsweep-{uuid.uuid4().hex[:8]}'
+
+        # Retry worktree add on transient git lock contention (serialised metadata
+        # writes mean concurrent sibling probes can hit LOCK_MAX).
+        _MAX_ADD_RETRIES = 3
+        rc, _, err = 1, '', 'not attempted'
+        for _attempt in range(_MAX_ADD_RETRIES):
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(tmp_path), main_sha],
+                cwd=config.project_root,  # type: ignore[union-attr]
+            )
+            if rc == 0:
+                worktree_added = True
+                break
+            if _attempt < _MAX_ADD_RETRIES - 1:
+                await asyncio.sleep(0.5 * (_attempt + 1))
+        if not worktree_added:
+            logger.warning(
+                'run_main_tip_sweep: worktree add failed after %d retries '
+                '(rc=%d): %s — sweep skipped for this tick',
+                _MAX_ADD_RETRIES, rc, err,
+            )
+            return None
+
+        # Run full (unscoped) verification — all discovered subprojects, no scope filter.
+        result = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
+        return (main_sha, result)
+
+    except Exception:
+        logger.debug('run_main_tip_sweep: unexpected error', exc_info=True)
+        return None
+    finally:
+        # Scoped cleanup: remove only this specific sweep worktree.
+        # INTENTIONALLY NO 'git worktree prune' (DD5 guarantee).
+        if worktree_added and tmp_path is not None:
+            try:
+                await _run(
+                    ['git', 'worktree', 'remove', '--force', str(tmp_path)],
+                    cwd=config.project_root,  # type: ignore[union-attr]
+                )
+            except Exception:
+                logger.debug('run_main_tip_sweep: worktree remove failed', exc_info=True)
+        if tmp_path is not None:
+            with contextlib.suppress(Exception):
                 shutil.rmtree(tmp_path, ignore_errors=True)

@@ -74,6 +74,31 @@ class WarmLanePool:
                     return lane
             return None
 
+    def _match_lane(self, path: Path) -> Path | None:
+        """Return the registered lane key matching *path*, or None.
+
+        Uses exact match first (fast path), then resolved-path comparison to
+        handle symlinks.  Never raises.
+
+        Callers that need concurrency safety must acquire ``self._lock``
+        before calling (the lane dict is not modified here, but read-only
+        access from an async context still races if the lock is not held).
+        """
+        if path in self._lanes:
+            return path
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        for known_lane in self._lanes:
+            try:
+                known_resolved = known_lane.resolve()
+            except OSError:
+                known_resolved = known_lane
+            if known_resolved == resolved:
+                return known_lane
+        return None
+
     async def release(self, lane: Path) -> None:
         """Mark *lane* as FREE.
 
@@ -81,25 +106,19 @@ class WarmLanePool:
         (never raises).  Also drops any ``_assignments`` entry whose value
         resolves to *lane* so the assignment map stays coherent.
         """
-        resolved = lane.resolve() if lane.exists() else lane
         async with self._lock:
-            # Match by resolved path to handle symlinks
-            matched: Path | None = None
-            for known_lane in self._lanes:
-                known_resolved = known_lane.resolve() if known_lane.exists() else known_lane
-                if known_resolved == resolved or known_lane == lane:
-                    self._lanes[known_lane] = LaneState.FREE
-                    matched = known_lane
-                    break
+            matched = self._match_lane(lane)
+            if matched is None:
+                # Unknown path — silently ignore (idempotent)
+                return
+            self._lanes[matched] = LaneState.FREE
             # Drop any assignment entry pointing at this lane
-            if matched is not None:
-                to_drop = [
-                    br for br, assigned in self._assignments.items()
-                    if assigned in (matched, lane)
-                ]
-                for br in to_drop:
-                    del self._assignments[br]
-            # Unknown path — silently ignore (idempotent)
+            to_drop = [
+                br for br, assigned in self._assignments.items()
+                if assigned in (matched, lane)
+            ]
+            for br in to_drop:
+                del self._assignments[br]
 
     async def acquire_for(self, branch_name: str) -> tuple[Path, bool] | None:
         """Acquire a lane for *branch_name*, reusing the existing one if mapped.
@@ -129,40 +148,12 @@ class WarmLanePool:
 
     def is_lane(self, path: Path) -> bool:
         """Return True if *path* (resolved) is a known pool lane."""
-        # Try exact match first (fast path)
-        if path in self._lanes:
-            return True
-        # Resolve both sides to handle symlinks
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
-        for known_lane in self._lanes:
-            try:
-                known_resolved = known_lane.resolve()
-            except OSError:
-                known_resolved = known_lane
-            if known_resolved == resolved:
-                return True
-        return False
+        return self._match_lane(path) is not None
 
     def state(self, lane: Path) -> LaneState | None:
         """Return the current LaneState for *lane*, or None if unknown."""
-        if lane in self._lanes:
-            return self._lanes[lane]
-        # Try resolved-path lookup
-        try:
-            resolved = lane.resolve()
-        except OSError:
-            return None
-        for known_lane, lane_state in self._lanes.items():
-            try:
-                known_resolved = known_lane.resolve()
-            except OSError:
-                known_resolved = known_lane
-            if known_resolved == resolved:
-                return lane_state
-        return None
+        matched = self._match_lane(lane)
+        return self._lanes[matched] if matched is not None else None
 
     def assignment_for(self, branch_name: str) -> Path | None:
         """Return the lane path currently assigned to *branch_name*, or None."""
@@ -187,3 +178,25 @@ class WarmLanePool:
         Idempotent: silently ignored if *branch_name* has no assignment.
         """
         self._assignments.pop(branch_name, None)
+
+    def restore_assignment(self, branch_name: str, lane: Path) -> None:
+        """Restore *branch_name* → *lane* and mark the lane ASSIGNED.
+
+        Used by the crash-recovery startup path to rebuild the in-memory
+        assignment map after a process restart.  Unlike ``note_assignment``
+        (which leaves lane state to the caller), this method atomically sets
+        *both* the assignment map AND the lane state to ASSIGNED so that a
+        concurrent fresh dispatch's ``try_acquire``/``acquire_for`` cannot grab
+        the lane before the original task is re-dispatched.
+
+        Startup is single-threaded, so no lock is needed (mirrors
+        ``note_assignment``/``drop_assignment``).
+
+        Unknown *lane* path → no-op (never raises).
+        """
+        matched = self._match_lane(lane)
+        if matched is None:
+            # Unknown lane path — silently ignore (idempotent).
+            return
+        self._lanes[matched] = LaneState.ASSIGNED
+        self._assignments[branch_name] = matched

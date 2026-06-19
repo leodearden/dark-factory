@@ -238,6 +238,39 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     """)
 
 
+def _warn_malformed_metadata_once(
+    project_root: str,
+    tag: str,
+    task_id: int,
+    metadata_raw: str,
+    *,
+    resolution: str,
+) -> None:
+    """Emit a deduped WARNING for a malformed metadata JSON blob.
+
+    Owned by the module-level ``_warned_malformed_task_ids`` set, keyed by
+    ``(project_root, tag, task_id)``.  Warns at most once per distinct triple
+    per process, regardless of whether the access came from the read path
+    (``_row_to_task``) or a write path (``_merge_metadata``).
+
+    ``resolution`` is appended after the semicolon; ``'coerced to {}'``
+    reproduces the pre-existing ``_row_to_task`` message verbatim so the
+    four covering WARNING-assertion tests remain green across the extraction.
+    """
+    dedup_key = (project_root, tag, task_id)
+    if dedup_key not in _warned_malformed_task_ids:
+        _warned_malformed_task_ids.add(dedup_key)
+        logger.warning(
+            'sqlite_task_backend: malformed metadata JSON — project_root=%s'
+            ' tag=%s id=%s metadata_raw=%s; %s',
+            project_root,
+            tag,
+            task_id,
+            repr(metadata_raw)[:80],
+            resolution,
+        )
+
+
 def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: str) -> dict[str, Any]:
     """Convert a tasks-table row into the get_tasks/get_task wire dict.
 
@@ -254,17 +287,10 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
             # `(task.get('metadata') or {}).get(...)` callers never see a str.
             # WARN once per (project_root, tag, id) per process so a corrupted-row
             # batch doesn't fan out to one log line per row per get_tasks call.
-            dedup_key = (project_root, row['tag'], row['id'])
-            if dedup_key not in _warned_malformed_task_ids:
-                _warned_malformed_task_ids.add(dedup_key)
-                logger.warning(
-                    'sqlite_task_backend: malformed metadata JSON — project_root=%s'
-                    ' tag=%s id=%s metadata_raw=%s; coerced to {}',
-                    project_root,
-                    row['tag'],
-                    row['id'],
-                    repr(metadata_raw)[:80],
-                )
+            _warn_malformed_metadata_once(
+                project_root, row['tag'], row['id'], metadata_raw,
+                resolution='coerced to {}',
+            )
             metadata = {}
 
     return {
@@ -758,9 +784,10 @@ class SqliteTaskBackend:
         project_root: str,
         prompt: str | None = None,
         metadata: str | None = None,
-        append: bool = False,
+        append: bool | None = None,
         tag: str | None = None,
         *,
+        metadata_mode: str | None = None,
         title: str | None = None,
         description: str | None = None,
         details: str | None = None,
@@ -787,6 +814,12 @@ class SqliteTaskBackend:
         # ``details`` is passed it feeds the details path (replace, or append
         # when ``append=True``). ``metadata`` retains the merge-or-replace
         # semantics keyed off ``append``.
+        # Validate metadata_mode unconditionally — a bad value should always
+        # raise immediately, even if no metadata is supplied in this call.
+        # Resolution is stored so the metadata block can reuse it without a
+        # second call (and to keep the single call-site clear).
+        resolved_mode = _resolve_metadata_mode(metadata_mode, append)
+
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
@@ -838,8 +871,15 @@ class SqliteTaskBackend:
                 set_values.append(new_details)
 
             if metadata is not None:
+                # Behavior note: on merge/additive, _merge_metadata RAISES
+                # TaskmasterError if the stored blob is corrupt — preventing a
+                # silent clobber.  The _txn wrapper rolls back, leaving the
+                # original bytes intact.  To repair a corrupt row, pass
+                # metadata_mode='replace' (bypasses the guard intentionally).
                 new_metadata = _merge_metadata(
-                    row['metadata'], metadata, append=append,
+                    row['metadata'], metadata,
+                    mode=resolved_mode,
+                    project_root=project_root, tag=tag, task_id=tid,
                 )
                 set_columns.append('metadata = ?')
                 set_values.append(new_metadata)
@@ -1018,10 +1058,19 @@ class SqliteTaskBackend:
                         'TASKMASTER_TOOL_ERROR',
                         f'No tasks found for ID(s): {tid}',
                     )
+                # If the stored blob is corrupt, _merge_metadata raises
+                # TaskmasterError (propagates through _txn → rollback → no
+                # write).  This is intentionally ASYMMETRIC with
+                # remove_dependency, which returns a non-removal message
+                # rather than raising: a merge into a corrupt blob would
+                # clobber (must refuse), while a remove is idempotent and
+                # the dep is provably absent in an unparseable blob (no
+                # write needed, accurate message suffices).
                 new_meta = _merge_metadata(
                     row['metadata'],
                     json.dumps({'external_deps': [canonical]}),
-                    append=True,
+                    mode='additive',
+                    project_root=project_root, tag=tag, task_id=tid,
                 )
                 await conn.execute(
                     'UPDATE tasks SET metadata = ?, updated_at = ? '
@@ -1103,7 +1152,29 @@ class SqliteTaskBackend:
                     try:
                         meta = json.loads(row['metadata'] or '{}')
                     except (TypeError, ValueError):
-                        meta = {}
+                        # Corrupt stored blob: warn once via the shared gate and
+                        # return an accurate message — do NOT claim removal, do
+                        # NOT write (blob left intact).
+                        #
+                        # Intentionally does NOT raise (contrast with
+                        # add_dependency, which raises on a corrupt blob):
+                        # remove is idempotent — the dep is provably absent
+                        # in an unparseable blob, so no write is needed and
+                        # an accurate return value is the right signal.
+                        # add_dependency must refuse because a merge into a
+                        # corrupt blob would clobber external_deps.
+                        _warn_malformed_metadata_once(
+                            project_root, tag, tid, row['metadata'] or '',
+                            resolution='remove_dependency skipped — corrupt blob left intact',
+                        )
+                        return {
+                            'id': str(tid),
+                            'dependency_id': canonical,
+                            'message': (
+                                f'Could not remove external dependency {canonical} from task {tid}:'
+                                f' metadata blob is corrupt and was left intact.'
+                            ),
+                        }
                     existing = meta.get('external_deps', [])
                     if canonical in existing:
                         updated = [e for e in existing if e != canonical]
@@ -1178,6 +1249,36 @@ def _parse_dependency_list(raw: str | None) -> list[int]:
     return out
 
 
+_METADATA_MODES: frozenset[str] = frozenset({'merge', 'additive', 'replace'})
+
+
+def _resolve_metadata_mode(
+    metadata_mode: str | None,
+    append: bool | None,
+) -> str:
+    """Resolve the effective metadata merge mode from the two input signals.
+
+    Precedence (high → low):
+    1. ``metadata_mode`` — explicit tri-state wins unconditionally.
+    2. ``append`` legacy shim — True → 'additive', False → 'replace'.
+    3. Default — 'merge' (shallow last-write-wins) when both are None.
+
+    Raises :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) for an
+    unrecognised ``metadata_mode`` value (loud over silent).
+    """
+    if metadata_mode is not None:
+        if metadata_mode not in _METADATA_MODES:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                f"Invalid metadata_mode {metadata_mode!r}; "
+                f"must be one of {sorted(_METADATA_MODES)}.",
+            )
+        return metadata_mode
+    if append is not None:
+        return 'additive' if append else 'replace'
+    return 'merge'
+
+
 def _merge_values(old: object, new: object) -> object:
     """Recursively merge *new* into *old* using additive semantics.
 
@@ -1250,40 +1351,71 @@ def _normalize_legacy_memory_hints_value(value: object) -> object:
     return {"entities": entities, "queries": queries}
 
 
-def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) -> str:
-    """Merge ``incoming`` metadata JSON into ``existing_raw``.
+def _merge_metadata(
+    existing_raw: str | None,
+    incoming: str,
+    *,
+    mode: str,
+    project_root: str | None = None,
+    tag: str | None = None,
+    task_id: int | None = None,
+) -> str:
+    """Merge ``incoming`` metadata JSON into ``existing_raw`` using ``mode``.
 
-    When ``append=True`` the merge is additive and recursive:
-    * List-valued keys are concatenated and deduplicated (hashable items only)
-      in stable old-then-new order.
-    * Dict-valued keys are merged recursively with the same rules.
-    * Scalar collisions and type-mismatched collisions resolve to OLD-wins,
-      preserving audit fields such as ``prd`` and ``spawned_from``.
+    ``mode`` must be one of the three values produced by
+    :func:`_resolve_metadata_mode`:
 
-    When ``append=False`` (or when ``existing_raw`` is ``None``) the incoming
-    value replaces whatever was there — last-write-wins.
+    * ``'replace'`` — return ``incoming`` verbatim; bypasses the corrupt-blob
+      guard (the sanctioned path to repair a corrupt row).
+    * ``'merge'`` — shallow last-write-wins: ``{**existing, **incoming}``.
+      Omitted keys are preserved; every supplied key (scalar **or** list)
+      overwrites wholesale.  Falls back to ``incoming`` when either side is
+      valid JSON but not a dict.
+    * ``'additive'`` — existing recursive ``_merge_values`` semantics: list
+      union+dedup, dict-recursive, scalar/type-collision OLD-wins.  Keeps the
+      legacy ``memory_hints`` list-shape normalisation before the dict union.
 
-    If either side fails to JSON-decode, the new value replaces the old
-    verbatim — matches Taskmaster's "last write wins" fallback.
+    For ``'merge'`` and ``'additive'``, a corrupt *existing* blob raises
+    :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) — refusing to clobber
+    it.  The ``_txn`` rollback leaves the original bytes intact.  Pass
+    ``project_root``/``tag``/``task_id`` to emit a deduplicated WARNING.
 
-    Special case — ``memory_hints``:  when **both** sides carry a
-    ``memory_hints`` key and either side's value is the legacy list-of-dicts
-    shape (``[{"entity": ..., "query": ...}, ...]``), that side is normalised to
-    the canonical dict shape before ``_merge_values`` runs, so the merge falls
-    into the dict-vs-dict recursive union path rather than the type-mismatch
-    OLD-wins path.  Normalization is scoped to the merge-collision path: a write
-    that does not include ``memory_hints`` leaves a stored legacy-shape value
-    unchanged.  All other keys are unaffected.
+    A ``None`` ``existing_raw`` is treated as empty: ``incoming`` is returned
+    for all three modes (nothing to preserve or merge into).
     """
-    if existing_raw is None or not append:
+    # replace (or no existing data): return incoming verbatim, no guard.
+    if existing_raw is None or mode == 'replace':
         return incoming
+    # merge and additive: parse the existing blob first so a corrupt EXISTING
+    # blob is distinguishable from a corrupt incoming blob.
     try:
         old = json.loads(existing_raw)
+    except (TypeError, ValueError) as err:
+        # Corrupt EXISTING blob: refuse to clobber on merge/additive.
+        # Warn once through the shared dedup gate when context is available.
+        if project_root is not None and tag is not None and task_id is not None:
+            _warn_malformed_metadata_once(
+                project_root, tag, task_id, existing_raw,
+                resolution='refused metadata merge — original bytes preserved',
+            )
+        raise TaskmasterError(
+            'TASKMASTER_TOOL_ERROR',
+            f'Task {task_id} has a corrupt metadata blob; refusing to overwrite it '
+            f'(original bytes preserved).',
+            raw=existing_raw,
+        ) from err
+    # Corrupt INCOMING blob: intentionally last-write-wins (pre-existing
+    # Taskmaster fallback behaviour).
+    try:
         new = json.loads(incoming)
     except (TypeError, ValueError):
         return incoming
     if not isinstance(old, dict) or not isinstance(new, dict):
         return incoming
+    if mode == 'merge':
+        # Shallow last-write-wins: every supplied key overwrites wholesale.
+        return json.dumps({**old, **new})
+    # mode == 'additive': recursive _merge_values with memory_hints normalization.
     # Normalize legacy memory_hints list shape on both sides before merging.
     # Only fires when BOTH sides carry memory_hints — i.e. on the merge collision
     # path — so a write that omits memory_hints does not silently migrate the

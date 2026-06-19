@@ -115,7 +115,7 @@ class DbPool:
                 self._conns[resolved] = conn
                 return conn
             except (FileNotFoundError, sqlite3.OperationalError, OSError):
-                logger.debug('DbPool: cannot open %s', resolved, exc_info=True)
+                logger.warning('DbPool: cannot open %s', resolved, exc_info=True)
                 return None
 
     @property
@@ -154,5 +154,5 @@ async def with_db(
     try:
         return await fn(db)
     except (sqlite3.OperationalError, OSError):
-        logger.debug('with_db: query failed', exc_info=True)
+        logger.warning('with_db: query failed', exc_info=True)
         return default

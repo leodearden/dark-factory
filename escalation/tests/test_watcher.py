@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -304,6 +305,49 @@ class TestInitialScan:
         _write_esc(queue_dir, esc2)
         result = _initial_scan(queue_dir, task_id=None, level=None, exclude_ids={'esc-9-1', 'esc-9-2'})
         assert result is None
+
+    def test_find_pending_corrupt_timestamp_warns(self, tmp_path, caplog):
+        """Corrupt timestamp on a matching pending escalation → still returned AND a WARNING emitted.
+
+        Bug in current code: silent datetime.min substitution produces no log output.
+        The entry is still considered (datetime.min sorts oldest, included), but
+        operators cannot see the data-quality issue.
+
+        Fix: parse_timestamp_or_warn emits a WARNING mentioning the context string.
+        RED assertion: zero warnings → assertion (b) fails.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+
+        esc = Escalation(
+            id='esc-corrupt-1',
+            task_id='99',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='corrupt timestamp test',
+        )
+        esc.timestamp = 'not-a-timestamp'
+        _write_esc(queue_dir, esc)
+
+        with caplog.at_level(logging.WARNING, logger='shared.timestamps'):
+            result = _initial_scan(queue_dir, task_id=None, level=None)
+
+        # (a) Entry still CONSIDERED — datetime.min sorts oldest, included in results
+        assert result is not None, 'Expected corrupt-ts escalation to still be returned'
+        assert result.id == 'esc-corrupt-1', (
+            f'Expected esc-corrupt-1; got result.id={result.id!r}'
+        )
+
+        # (b) A WARNING must be emitted mentioning the context tag
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'watcher._initial_scan' in r.message
+        ]
+        assert warning_records, (
+            f"Expected >=1 WARNING mentioning 'watcher._initial_scan'; "
+            f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
+        )
 
 
 class TestInitialScanMain:

@@ -28,6 +28,7 @@ import asyncio
 import logging
 import re
 import shutil
+import subprocess
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -475,7 +476,14 @@ def parse_diff_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
 class GitOps:
     """Git worktree and merge operations."""
 
-    def __init__(self, config: GitConfig, project_root: Path, *, warm_lane_pool_size: int = 0):
+    def __init__(
+        self,
+        config: GitConfig,
+        project_root: Path,
+        *,
+        warm_lane_pool_size: int = 0,
+        merge_spec_warm_lane_pool_size: int = 0,
+    ):
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
@@ -491,6 +499,27 @@ class GitOps:
             )
         else:
             self.warm_lane_pool = None
+        # Merge-speculation warm-lane pool — None when knob off or size=0.
+        # Second WarmLanePool instance with name_prefix='_spec-' for K>1 LOCAL
+        # speculative verify slots.  Size K = speculation_depth, sized from the
+        # SAME shared K source as the worker (steps 5-6, harness.py).
+        # Default-off, byte-identical at default, mirrors warm_lane_pool above.
+        self._merge_spec_warm_lane_pool_size = merge_spec_warm_lane_pool_size
+        if merge_spec_warm_lane_pool_size > 0 and config.merge_spec_warm_lane_pool:
+            from orchestrator.warm_lane_pool import WarmLanePool as _WLP
+            self.spec_warm_lane_pool: WarmLanePool | None = _WLP(
+                worktree_base=self.worktree_base,
+                size=merge_spec_warm_lane_pool_size,
+                name_prefix='_spec-',
+            )
+        else:
+            self.spec_warm_lane_pool = None
+        # Serialize first-time `git worktree add` for _spec- lanes.
+        # Git serializes worktree administration via a repo-level lock; concurrent
+        # adds from the same project_root can transiently fail during the initial
+        # K>1 warm-up burst.  Reset-in-place (already-registered) acquires are
+        # per-lane and don't contend, so this only guards the one-time create path.
+        self._spec_wt_create_lock: asyncio.Lock = asyncio.Lock()
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -1034,6 +1063,237 @@ class GitOps:
             )
             return False
 
+    async def refresh_warm_base(self) -> bool:
+        """Advance the rolling warm base by running the refresh script.
+
+        Invokes ``<_merge-verify>/scripts/refresh-warm-base.sh <advancing> <base>``
+        where:
+        - *advancing* = ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
+          (the _merge-verify lane's target — the warm build of the just-landed commit)
+        - *base* = ``warm_lane_base_target_path`` (the configured rolling base)
+
+        **inv.9 promote-provenance** is enforced STRUCTURALLY: the advancing dir
+        is hardcoded to the _merge-verify target and no caller-supplied advancing
+        parameter is exposed, so DF can never source a task lane (un-landed WIP).
+        The reify B12 guard inside refresh-warm-base.sh is defense-in-depth.
+
+        Self-guards (all return False, never raise):
+        - ``warm_lane_pool is None`` — pool knob off; refresh has no meaning.
+        - ``advancing == base`` — no separate rolling base configured; degenerate
+          self-copy skipped (default config has ``warm_lane_base_target_dir=None``
+          so base == ``_merge-verify/target`` == advancing).
+        - Script absent or non-zero exit — fail-soft.
+
+        Returns:
+            True  — script ran and exited 0 (base refreshed).
+            False — any guard triggered or the script absent/failed (fail-soft;
+                    never raises — a base-refresh hiccup cannot block merges).
+        """
+        if self.warm_lane_pool is None:
+            return False
+
+        try:
+            advancing = self._merge_verify_artifact_path
+            base = self.warm_lane_base_target_path
+
+            if advancing.resolve() == base.resolve():
+                logger.debug(
+                    'refresh_warm_base: advancing == base (%s) — no separate rolling '
+                    'base configured, skipping degenerate self-copy', advancing,
+                )
+                return False
+
+            script = self.persistent_merge_worktree_path / 'scripts' / 'refresh-warm-base.sh'
+            if not script.exists():
+                logger.debug(
+                    'refresh_warm_base: script absent at %s — no-op', script,
+                )
+                return False
+
+            rc, _, err = await _run(
+                [str(script), str(advancing), str(base)],
+                cwd=self.persistent_merge_worktree_path,
+            )
+            if rc != 0:
+                logger.warning(
+                    'refresh_warm_base: script exited %d (stderr=%r)', rc, err,
+                )
+                return False
+            return True
+        except Exception:
+            logger.warning('refresh_warm_base: unexpected error', exc_info=True)
+            return False
+
+    async def acquire_spec_lane(
+        self,
+        merge_commit: str,
+    ) -> tuple[Path, bool]:
+        """Acquire a warm ``_spec-`` lane for a speculative merge verify (inv.8).
+
+        **Create-once path** (lane not yet a registered worktree):
+            ``git worktree add --detach <lane> <merge_commit>``, then seed via
+            :meth:`_seed_warm_lane(lane, '--reset-in-place')`.
+
+        **Reset-in-place path** (lane already registered):
+            ``git reset --hard <merge_commit>`` + ONE ``git clean -xfd -e <dir>``
+            invocation (one -e per :attr:`~GitConfig.reap_build_artifact_dirs`
+            entry) mirroring :meth:`reset_persistent_merge_worktree`'s pattern,
+            then always re-seeded via :meth:`_seed_warm_lane(lane, '--reset-in-place')`.
+
+        **inv.8 always-re-seed-at-acquire**: target/ is re-CoW-seeded from the
+        current warm base on every acquire, so each speculative verify starts
+        from the latest base regardless of which lane it lands on.
+
+        **Cold-fallback path** (pool exhausted or seed failure — inv.6):
+            On any failure (pool exhausted, worktree creation failure, seed
+            failure) the partially-acquired lane (if any) is released back to
+            FREE and an ephemeral cold worktree is returned with warm=False.
+            Logs at DEBUG; never raises (a fallback cannot block the scheduler).
+
+        Args:
+            merge_commit: The merge commit SHA to check out in the spec lane.
+
+        Returns:
+            ``(lane_path, True)`` when the warm spec lane is ready;
+            ``(cold_path, False)`` on pool exhaustion or any failure (inv.6).
+        """
+        if self.spec_warm_lane_pool is None:
+            # Knob off or size=0 — always cold (byte-identical to default).
+            logger.debug(
+                'acquire_spec_lane: spec pool absent (knob off) — cold fallback '
+                'for %s', merge_commit[:8],
+            )
+            wt = await self.create_throwaway_verify_worktree(merge_commit)
+            return wt, False
+
+        lane = await self.spec_warm_lane_pool.try_acquire()
+        if lane is None:
+            # Pool exhausted — inv.6: cold ephemeral fallback, never block.
+            logger.debug(
+                'acquire_spec_lane: pool exhausted — cold fallback for %s',
+                merge_commit[:8],
+            )
+            wt = await self.create_throwaway_verify_worktree(merge_commit)
+            return wt, False
+
+        # ── Create-once or reset-in-place ────────────────────────────────────
+        if not await self._is_registered_worktree(lane):
+            # Create-once: serialized via _spec_wt_create_lock so that the K>1
+            # initial warm-up burst does not issue concurrent `git worktree add`
+            # calls against the same repo-level git lock (which would cause
+            # transient failures and a burst of cold fallbacks at warm-up time).
+            # Reset-in-place acquires (already-registered path below) are
+            # per-lane and don't contend, so no lock is needed there.
+            async with self._spec_wt_create_lock:
+                # Pool ownership is per-lane exclusive (try_acquire assigns a
+                # unique lane to exactly one caller), so no double-check is needed
+                # here — we're the only caller that can be creating this lane.
+                # The lock purely serializes the repo-level git worktree add
+                # against other lanes' concurrent first-time creates.
+                # Self-heal a stale unregistered directory first
+                # (mirrors reset_persistent_merge_worktree's self-heal pattern).
+                if lane.exists():
+                    import shutil as _shutil
+                    _shutil.rmtree(lane)
+                lane.parent.mkdir(parents=True, exist_ok=True)
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    logger.warning(
+                        'acquire_spec_lane: worktree add failed for %s (rc=%d,'
+                        ' err=%r) — releasing lane, cold fallback', lane, rc, err,
+                    )
+                    await self.spec_warm_lane_pool.release(lane)
+                    wt = await self.create_throwaway_verify_worktree(merge_commit)
+                    return wt, False
+                logger.info(
+                    'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
+                )
+        else:
+            # Reset-in-place: mirror reset_persistent_merge_worktree's exact sequence
+            # (git reset --hard + ONE git clean with all -e flags in a single pass).
+            rc, _, err = await _run(
+                ['git', 'reset', '--hard', merge_commit],
+                cwd=lane,
+            )
+            if rc != 0:
+                logger.debug(
+                    'acquire_spec_lane: reset --hard failed for %s (rc=%d, err=%r)'
+                    ' — releasing lane, cold fallback', lane, rc, err,
+                )
+                await self.spec_warm_lane_pool.release(lane)
+                wt = await self.create_throwaway_verify_worktree(merge_commit)
+                return wt, False
+            clean_cmd = ['git', 'clean', '-xfd']
+            for artifact_dir in self.config.reap_build_artifact_dirs:
+                clean_cmd += ['-e', artifact_dir]
+            rc, _, err = await _run(clean_cmd, cwd=lane)
+            if rc != 0:
+                logger.debug(
+                    'acquire_spec_lane: git clean failed for %s (rc=%d, err=%r)'
+                    ' — releasing lane, cold fallback', lane, rc, err,
+                )
+                await self.spec_warm_lane_pool.release(lane)
+                wt = await self.create_throwaway_verify_worktree(merge_commit)
+                return wt, False
+            logger.info(
+                'acquire_spec_lane: reset %s to HEAD=%s', lane, merge_commit[:8],
+            )
+
+        # ── inv.8: ALWAYS re-seed target/ from the current warm base ─────────
+        ok = await self._seed_warm_lane(lane, '--reset-in-place')
+        if not ok:
+            # Seed failed — release the partially-acquired lane back to FREE
+            # (inv.6: cold fallback on seed failure, never block scheduler).
+            logger.debug(
+                'acquire_spec_lane: seed failed for %s — releasing lane, cold fallback',
+                lane,
+            )
+            await self.spec_warm_lane_pool.release(lane)
+            wt = await self.create_throwaway_verify_worktree(merge_commit)
+            return wt, False
+
+        return lane, True
+
+    async def release_spec_lane(self, lane: Path, *, warm: bool) -> None:
+        """Release a ``_spec-`` lane after a speculative merge verify.
+
+        **Warm path** (``warm=True`` — pool lane):
+            ``await self.spec_warm_lane_pool.release(lane)`` — flips
+            ASSIGNED→FREE retaining the worktree and ``target/`` on disk so
+            the next :meth:`acquire_spec_lane` can re-seed from a warm base
+            (CoW-cheap, harmless to retain).  The worktree is never removed.
+
+        **Cold path** (``warm=False`` — ephemeral fallback worktree):
+            ``await self.cleanup_merge_worktree(lane)`` — removes the
+            throwaway ``_merge-<uuid>`` worktree created by
+            :meth:`create_throwaway_verify_worktree`.
+
+        **Idempotent**: releasing a FREE lane, an already-cleaned path, or an
+        unknown path is a no-op (never raises).  Mirrors the
+        ``release_warm_lane`` best-effort / never-raise contract so a hiccup
+        cannot strand the scheduler.
+
+        Args:
+            lane: Path returned by :meth:`acquire_spec_lane`.
+            warm: True when *lane* is a warm ``_spec-`` pool lane; False when
+                it is a cold ephemeral fallback worktree.
+        """
+        try:
+            if warm and self.spec_warm_lane_pool is not None:
+                await self.spec_warm_lane_pool.release(lane)
+                logger.debug('release_spec_lane: released warm lane %s', lane)
+            else:
+                await self.cleanup_merge_worktree(lane)
+                logger.debug('release_spec_lane: cleaned up cold lane %s', lane)
+        except Exception:
+            logger.warning(
+                'release_spec_lane: error releasing %s (warm=%s)',
+                lane, warm, exc_info=True,
+            )
+
     async def acquire_warm_lane(
         self,
         branch_name: str,
@@ -1050,8 +1310,11 @@ class GitOps:
             returned (caller falls through to the cold path — inv.6).
 
         **Reset-in-place path** (lane already registered — added in step-10):
-            Handled by :meth:`_reset_warm_lane`; skips re-seed (target/ already
-            warm from the previous assignment).
+            Handled by :meth:`_reset_warm_lane` then always re-seeded from the
+            current base via ``_seed_warm_lane(lane, '--fresh-checkout')`` (D10
+            always-re-seed-at-acquire).  The lane is the ``§9.5`` within-assignment
+            reset_lane primitive; the re-seed layers on top to deliver at-head
+            warmth for the NEW task.
 
         **Identity guard** (``expected_title``, step-26):
             When *expected_title* is supplied, any reuse candidate (in-memory
@@ -1099,6 +1362,16 @@ class GitOps:
                 )
                 self.warm_lane_pool.drop_assignment(branch_name)
                 await self._reset_warm_lane(lane, full_branch, start_ref)
+                # D10: always re-seed from current base after identity-mismatch reset.
+                # Fail-soft: a recycled lane already has a usable (if stale) target/,
+                # so a failed re-seed degrades to the prior warmth — never cold-fallback.
+                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if not ok:
+                    logger.warning(
+                        'acquire_warm_lane: re-seed failed for recycled lane %s; '
+                        'proceeding with retained target — degraded warmth',
+                        lane,
+                    )
                 # Falls through to shared tail
 
             elif not await self._is_registered_worktree(lane):
@@ -1179,6 +1452,17 @@ class GitOps:
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
                 await self._reset_warm_lane(lane, full_branch, start_ref)
+                # D10: always re-seed from current base after fresh reset.
+                # Fail-soft: a recycled lane already has a usable (if stale) target/,
+                # so a failed re-seed degrades to the prior warmth — never cold-fallback
+                # or block dispatch (D10 / inv.6).
+                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if not ok:
+                    logger.warning(
+                        'acquire_warm_lane: re-seed failed for recycled lane %s; '
+                        'proceeding with retained target — degraded warmth',
+                        lane,
+                    )
 
             # ── Shared tail: gitignore, scrub, base, debug-port ──────────
             _ensure_task_gitignore(lane)
@@ -1295,18 +1579,21 @@ class GitOps:
             )
 
     async def release_warm_lane(self, lane_dir: Path, branch_name: str) -> None:
-        """Release a warm lane back to the FREE pool, retaining warmth.
+        """Release a warm lane back to the FREE pool.
 
         Steps:
         1. ``git -C <lane> checkout --detach`` — detach HEAD so the just-used
-           branch is deletable while the lane stays checked-out warm.
+           branch is deletable while the lane directory stays in place.
         2. ``git branch -D task/<branch_name>`` — best-effort; logs on failure.
         3. ``await self.warm_lane_pool.release(lane_dir)`` — flip ASSIGNED→FREE.
 
-        Never removes the worktree; ``target/`` is retained for the next
-        assignment.  Fully best-effort / never-raise (mirrors
-        ``cleanup_merge_worktree`` contract) so a hiccup cannot strand the
-        scheduler.
+        Never removes the worktree; ``target/`` is left in place incidentally
+        (CoW-cheap, harmless).  The *next* :meth:`acquire_warm_lane` always
+        re-seeds from the current base (D10), so a released lane's target/
+        drift is irrelevant — retention is no longer a contract promise.
+
+        Fully best-effort / never-raise (mirrors ``cleanup_merge_worktree``
+        contract) so a hiccup cannot strand the scheduler.
         """
         if self.warm_lane_pool is None:
             return
@@ -1993,10 +2280,52 @@ class GitOps:
         )
         return [f for f in output.strip().splitlines() if f.strip()]
 
+    async def get_rebase_distance(self, old_base: str, new_base: str) -> int:
+        """Count commits in ``old_base..new_base`` (i.e. how far main advanced).
+
+        Returns the exact git rev-list count, or ``-1`` on any git error or
+        unparseable output.  -1 is a distinct sentinel so an unmeasurable
+        distance is never mistaken for a 0-commit (no-op) rebase.
+
+        Modelled on the ``rev-list --count`` + int-parse + fail-safe pattern
+        used in ``_freshen_main`` (line ~561) and
+        ``_branch_has_commits_beyond_main`` (line ~1508).
+        """
+        rc, out, _ = await _run(
+            ['git', 'rev-list', '--count', f'{old_base}..{new_base}'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.warning(
+                'get_rebase_distance: rev-list failed (rc=%d) for %s..%s',
+                rc, old_base, new_base,
+            )
+            return -1
+        try:
+            return int(out.strip())
+        except ValueError:
+            logger.warning(
+                'get_rebase_distance: unexpected output %r for %s..%s',
+                out, old_base, new_base,
+            )
+            return -1
+
     async def get_merge_diff_files(
         self, base_sha: str, head_sha: str,
-    ) -> list[str]:
+    ) -> tuple[list[str], Exception | None]:
         """Files changed by the merge ``base_sha..head_sha``, excluding ``.task/``.
+
+        Returns a ``(files, error)`` tuple — **total, never raises**:
+
+        * ``(files, None)`` on success.  An empty ``files`` list is a
+          legitimate outcome (revert merges, ``.task/``-only merges).
+        * ``([], exception)`` on any error: ``rc != 0`` from ``git diff``
+          (returns :class:`subprocess.CalledProcessError`) or an unexpected
+          raise from the subprocess helper (e.g. ``WorktreeMissing``,
+          ``FileNotFoundError``).
+
+        Callers should branch on ``err is not None`` (not ``resolver_failed``),
+        because an empty diff is a valid non-error outcome for this function.
 
         Used by ``TaskWorkflow._reconcile_metadata_files_for_done`` to write
         the actually-changed paths into ``metadata.files`` instead of the
@@ -2004,21 +2333,22 @@ class GitOps:
         refactored away).  Uses ``--no-renames`` so a rename surfaces as
         both add+delete; downstream consumers can decide whether to keep
         or drop the deleted path.
-
-        Returns ``[]`` on git error — the caller treats an empty list as
-        "no scope to record" (the gate-skip in fused-memory's
-        task_interceptor.py covers the missing-paths case anyway).
         """
-        rc, output, _ = await _run(
-            [
-                'git', 'diff', '--name-only', '--no-renames',
-                base_sha, head_sha, '--', ':!.task/',
-            ],
-            cwd=self.project_root,
-        )
+        cmd = [
+            'git', 'diff', '--name-only', '--no-renames',
+            base_sha, head_sha, '--', ':!.task/',
+        ]
+        try:
+            rc, output, stderr = await _run(cmd, cwd=self.project_root)
+        except Exception as exc:
+            return [], exc
         if rc != 0:
-            return []
-        return [f for f in output.strip().splitlines() if f.strip()]
+            logger.warning(
+                'get_merge_diff_files: git diff %s..%s failed (rc=%s): %s',
+                base_sha, head_sha, rc, (stderr or '').strip()[:200],
+            )
+            return [], subprocess.CalledProcessError(rc, cmd, output=output, stderr=stderr)
+        return [f for f in output.strip().splitlines() if f.strip()], None
 
     async def get_files_touched_in_branch(
         self, base_sha: str, branch_head: str,
@@ -2037,7 +2367,7 @@ class GitOps:
         consumer logs and proceeds rather than blocking the merge on
         a transient diff error.
         """
-        rc, output, _ = await _run(
+        rc, output, stderr = await _run(
             [
                 'git', 'log', '--name-only', '--no-renames',
                 '--pretty=format:', f'{base_sha}..{branch_head}',
@@ -2046,6 +2376,10 @@ class GitOps:
             cwd=self.project_root,
         )
         if rc != 0:
+            logger.warning(
+                'get_files_touched_in_branch: git log %s..%s failed (rc=%s): %s',
+                base_sha, branch_head, rc, (stderr or '').strip()[:200],
+            )
             return []
         seen: set[str] = set()
         for ln in output.splitlines():
@@ -2247,23 +2581,36 @@ class GitOps:
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
 
     @property
-    def warm_lane_base_target_path(self) -> Path:
-        """Absolute path of the warm BASE target/ to CoW-seed lane target/ from.
+    def _merge_verify_artifact_path(self) -> Path:
+        """Path of the build-artifact directory inside the persistent _merge-verify worktree.
 
-        Resolution order:
-        1. ``config.warm_lane_base_target_dir`` when explicitly set (override).
-        2. ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
-           (derived default: ``<worktree_base>/_merge-verify/target``).
-        3. Fallback to ``'target'`` when ``reap_build_artifact_dirs`` is empty.
+        ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
+        (``<worktree_base>/_merge-verify/target`` by default when
+        ``reap_build_artifact_dirs`` is empty).
+
+        This is the single canonical spelling used as the *advancing* side in
+        :meth:`refresh_warm_base` and as the derived default in
+        :attr:`warm_lane_base_target_path`, so both stay in sync automatically.
         """
-        if self.config.warm_lane_base_target_dir is not None:
-            return Path(self.config.warm_lane_base_target_dir)
         artifact_dir = (
             self.config.reap_build_artifact_dirs[0]
             if self.config.reap_build_artifact_dirs
             else 'target'
         )
         return self.persistent_merge_worktree_path / artifact_dir
+
+    @property
+    def warm_lane_base_target_path(self) -> Path:
+        """Absolute path of the warm BASE target/ to CoW-seed lane target/ from.
+
+        Resolution order:
+        1. ``config.warm_lane_base_target_dir`` when explicitly set (override).
+        2. :attr:`_merge_verify_artifact_path`
+           (derived default: ``<worktree_base>/_merge-verify/target``).
+        """
+        if self.config.warm_lane_base_target_dir is not None:
+            return Path(self.config.warm_lane_base_target_dir)
+        return self._merge_verify_artifact_path
 
     #: Name of the counter file used to persist the verify attempt count across
     #: stateless CLI invocations.  Scope is **per-project-worktree** — the file
@@ -3444,6 +3791,19 @@ class GitOps:
         """
         if self.warm_lane_pool is not None and self.warm_lane_pool.is_lane(worktree):
             await self.release_warm_lane(worktree, branch)
+            return
+
+        # Symmetric for the merge-speculation pool: a '_spec-' lane must be
+        # RELEASED back to its pool (retain worktree + target/, flip FREE),
+        # never removed.  Without this, a spec lane routed here (e.g. by the
+        # crash-recovery sweep) would be git-worktree-removed and lose its
+        # pool slot.  warm=True selects the pool-retain path in
+        # release_spec_lane.
+        if (
+            self.spec_warm_lane_pool is not None
+            and self.spec_warm_lane_pool.is_lane(worktree)
+        ):
+            await self.release_spec_lane(worktree, warm=True)
             return
 
         full_branch = f'{self.config.branch_prefix}{branch}'

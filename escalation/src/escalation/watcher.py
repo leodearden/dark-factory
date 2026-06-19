@@ -42,10 +42,11 @@ import signal
 import sys
 import time
 import urllib.request
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 from inotify_simple import INotify, flags
+from shared.timestamps import parse_timestamp_or_warn
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 
@@ -93,12 +94,9 @@ def _initial_scan(
         if not _matches(esc, task_id, level, exclude_ids):
             continue
 
-        try:
-            ts = datetime.fromisoformat(esc.timestamp)
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=UTC)
-        except (ValueError, TypeError):
-            ts = datetime.min.replace(tzinfo=UTC)
+        # Parse timestamp; emits a WARNING (loud-over-silent) when malformed.
+        # Default datetime.min fallback: malformed entry included and sorts oldest.
+        ts, _ = parse_timestamp_or_warn(esc.timestamp, context='watcher._initial_scan')
 
         if best_ts is None or ts < best_ts:
             best = esc
