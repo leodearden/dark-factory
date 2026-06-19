@@ -10,12 +10,15 @@ import pytest
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
+    _CATEGORY_PRIORITY,
     _PRUNE_THROTTLE_SECS,
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
     _build_fallback_config,
+    _classify_failure,
     _extract_cause_hint,
+    _is_collectable_test_file,
     _is_structural_python_file,
     _is_test_file,
     _maybe_prune_archive,
@@ -872,6 +875,45 @@ class TestIsTestFile:
     def test_returns_false_for_regular_source_file(self):
         """A regular source file must return False (negative baseline)."""
         assert _is_test_file('orchestrator/src/orchestrator/verify.py') is False
+
+
+class TestIsCollectableTestFile:
+    """`_is_collectable_test_file` — narrow: files pytest will collect when passed as a target.
+
+    Only ``test_*.py`` and ``*_test.py`` (minus conftest) count.
+    A data module under tests/ is in the test tree (_is_test_file) but NOT
+    collectable (_is_collectable_test_file) — passing it to pytest produces rc=5.
+    """
+
+    def test_returns_true_for_test_prefix_file(self):
+        """test_*.py at any depth must return True."""
+        assert _is_collectable_test_file('src/test_bar.py') is True
+
+    def test_returns_true_for_test_suffix_file(self):
+        """*_test.py at any depth must return True."""
+        assert _is_collectable_test_file('src/foo_test.py') is True
+
+    def test_returns_true_for_test_file_under_tests_dir(self):
+        """test_*.py under a tests/ dir must return True (both name and location match)."""
+        assert _is_collectable_test_file('orchestrator/tests/test_foo.py') is True
+
+    def test_returns_false_for_data_module_under_tests_dir(self):
+        """A non-test data module under tests/ must return False.
+
+        'shared/tests/silent_fallthrough_allowlist.py' has '/tests/' in path
+        so _is_test_file returns True, but the filename is not test_*.py or
+        *_test.py — passing it to pytest produces rc=5, so it must NOT be
+        treated as collectable.
+        """
+        assert _is_collectable_test_file('shared/tests/silent_fallthrough_allowlist.py') is False
+
+    def test_returns_false_for_conftest(self):
+        """conftest.py must return False even though it lives under tests/."""
+        assert _is_collectable_test_file('orchestrator/tests/conftest.py') is False
+
+    def test_returns_false_for_regular_source_file(self):
+        """A regular source file must return False."""
+        assert _is_collectable_test_file('orchestrator/src/orchestrator/verify.py') is False
 
 
 class TestIsStructuralPythonFile:
