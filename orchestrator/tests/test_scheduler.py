@@ -6452,6 +6452,8 @@ class TestGetExternalStatuses:
         """get_external_statuses parses the MCP response and returns (dict, None)."""
         import json
 
+        # Flat shape: producer returns a bare {dep: status} dict, no 'statuses' wrapper
+        # (mirrors fused-memory tools.py get_external_statuses: `return result`).
         response = {
             'result': {
                 'content': [
@@ -6459,10 +6461,8 @@ class TestGetExternalStatuses:
                         'type': 'text',
                         'text': json.dumps(
                             {
-                                'statuses': {
-                                    'dark_factory:5': 'done',
-                                    'other_proj:99': 'pending',
-                                }
+                                'dark_factory:5': 'done',
+                                'other_proj:99': 'pending',
                             }
                         ),
                     }
@@ -6486,13 +6486,14 @@ class TestGetExternalStatuses:
         """Exactly ONE dispatch_tool call with {'deps': [...]} — no project_root."""
         import json
 
+        # Flat shape (no 'statuses' wrapper — mirrors producer contract).
         mcp_mock = AsyncMock(
             return_value={
                 'result': {
                     'content': [
                         {
                             'type': 'text',
-                            'text': json.dumps({'statuses': {'dark_factory:5': 'done'}}),
+                            'text': json.dumps({'dark_factory:5': 'done'}),
                         }
                     ]
                 }
@@ -6548,12 +6549,13 @@ class TestGetExternalStatuses:
         assert result_fail == {}
         assert isinstance(err_fail, OSError)
 
+        # Flat shape (no 'statuses' wrapper — mirrors producer contract).
         success_response = {
             'result': {
                 'content': [
                     {
                         'type': 'text',
-                        'text': json.dumps({'statuses': {'dark_factory:5': 'done'}}),
+                        'text': json.dumps({'dark_factory:5': 'done'}),
                     }
                 ]
             }
@@ -6600,18 +6602,22 @@ class TestGetExternalStatusesFailsLoud:
     async def test_non_dict_statuses_returns_error(
         self, scheduler: Scheduler, monkeypatch, caplog
     ):
-        """Non-dict 'statuses' value (e.g. missing key) → ({}, ExternalResolverError).
+        """Non-dict inner (list) → ({}, ExternalResolverError) + WARNING from shared.mcp_envelope.
 
-        When ``_parse_tool_text_result(result, 'statuses')`` returns None (missing key
-        or unparseable JSON), the method must return an error, NOT ``({}, None)``.
-        A WARNING must be logged so the failure is visible in journalctl / caplog.
+        A non-dict inner (JSON list) trips INNER_NOT_DICT in parse_tool_result, which
+        emits a WARNING from shared.mcp_envelope and returns ({}, ExternalResolverError).
+        Under the key=None consumer a dict-but-missing-key payload would yield resolver-
+        degraded via the missing-dep guard instead; use a genuine non-dict inner here.
         """
+        import json as _json
         import logging
 
         import orchestrator.scheduler as _sched_module
 
-        # Response whose JSON has NO 'statuses' key → _parse_tool_text_result returns None.
-        response = self._envelope({'data': 'not-a-statuses-dict'})
+        # Non-dict inner: JSON list → INNER_NOT_DICT → ({}, ExternalResolverError) + WARNING.
+        response = {
+            'result': {'content': [{'type': 'text', 'text': _json.dumps(['not', 'a', 'dict'])}]}
+        }
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(return_value=response),
@@ -6637,10 +6643,14 @@ class TestGetExternalStatusesFailsLoud:
         self, scheduler: Scheduler, monkeypatch
     ):
         """Non-dict error leaves no persistent state; next call still works correctly."""
+        import json as _json
+
         import orchestrator.scheduler as _sched_module
 
-        # First call: non-dict response.
-        response_bad = self._envelope({'no_statuses_here': True})
+        # First call: non-dict inner (list) → INNER_NOT_DICT → ExternalResolverError.
+        response_bad = {
+            'result': {'content': [{'type': 'text', 'text': _json.dumps(['not', 'a', 'dict'])}]}
+        }
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(return_value=response_bad),
@@ -6649,8 +6659,8 @@ class TestGetExternalStatusesFailsLoud:
         assert err_bad is not None
         assert isinstance(err_bad, _sched_module.ExternalResolverError)
 
-        # Second call: correct response.
-        response_ok = self._envelope({'statuses': {'upstream_proj:1': 'done'}})
+        # Second call: correct flat-shape response (no 'statuses' wrapper).
+        response_ok = self._envelope({'upstream_proj:1': 'done'})
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(return_value=response_ok),
@@ -6701,16 +6711,23 @@ class TestGetExternalStatusesFoldRegression:
     async def test_non_dict_emits_warning_from_shared_mcp_envelope(
         self, scheduler: Scheduler, monkeypatch, caplog
     ):
-        """Non-dict 'statuses' returns ({}, ExternalResolverError) + WARNING from shared.mcp_envelope.
+        """Non-dict inner returns ({}, ExternalResolverError) + WARNING from shared.mcp_envelope.
 
-        Fails today: WARNING comes from orchestrator.scheduler (not shared.mcp_envelope).
+        A JSON list inner triggers INNER_NOT_DICT in parse_tool_result, which is the
+        shared.mcp_envelope primitive — proven by asserting the WARNING logger name.
+        Under key=None a dict-but-missing-key payload would be accepted by the primitive
+        (missing-dep guard warns from orchestrator.scheduler, not shared.mcp_envelope).
+        Using a genuine non-dict inner keeps the shared.mcp_envelope assertion valid.
         """
+        import json as _json
         import logging
 
         import orchestrator.scheduler as _sched_module
 
-        # Response whose JSON has no 'statuses' key → non-dict parse path.
-        response = self._envelope({'data': 'not-a-statuses-dict'})
+        # Non-dict inner (JSON list) → INNER_NOT_DICT in shared.mcp_envelope.
+        response = {
+            'result': {'content': [{'type': 'text', 'text': _json.dumps(['not', 'a', 'dict'])}]}
+        }
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(return_value=response),
@@ -6775,8 +6792,8 @@ class TestGetExternalStatusesPartialResult:
 
         import orchestrator.scheduler as _sched_module
 
-        # Request 2 deps; response only has 1.
-        response = self._envelope({'statuses': {'upstream_proj:1': 'done'}})
+        # Request 2 deps; response only has 1 (flat shape — no 'statuses' wrapper).
+        response = self._envelope({'upstream_proj:1': 'done'})
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(return_value=response),
@@ -6811,12 +6828,11 @@ class TestGetExternalStatusesPartialResult:
         Sentinels ('unknown_task', 'unknown_project', 'malformed') are PRESENT
         values — only MISSING keys trigger the partial-result guard.
         """
-        # Both requested dep keys present; one is a real status, one is a sentinel.
+        # Both requested dep keys present (flat shape — no 'statuses' wrapper).
+        # One is a real status, one is a sentinel — sentinels are valid values, not missing keys.
         response = self._envelope({
-            'statuses': {
-                'upstream_proj:1': 'done',
-                'upstream_proj:2': 'unknown_task',  # sentinel, but key IS present
-            }
+            'upstream_proj:1': 'done',
+            'upstream_proj:2': 'unknown_task',  # sentinel, but key IS present
         })
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
@@ -6840,7 +6856,8 @@ class TestGetExternalStatusesPartialResult:
         self, scheduler: Scheduler, monkeypatch
     ):
         """Empty deps list → no 'missing' keys → (empty_dict, None) success."""
-        response = self._envelope({'statuses': {}})
+        # Flat shape: producer returns a bare {} for zero deps (no 'statuses' wrapper).
+        response = self._envelope({})
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(return_value=response),
@@ -6852,6 +6869,122 @@ class TestGetExternalStatusesPartialResult:
             f'Empty deps should not trigger partial-result guard; got err={err!r}'
         )
         assert statuses == {}
+
+
+# ---------------------------------------------------------------------------
+# TestExternalDepFlatShapeSeam (task 1854 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestExternalDepFlatShapeSeam:
+    """Two-way seam test: producer's FLAT {dep:status} shape through the consumer gate.
+
+    Pins the producer<->consumer contract that prior tasks lacked: both sides
+    shared the wrong {'statuses':{...}} assumption, so suites stayed green while
+    production fail-safe-waited forever.
+
+    The producer (fused-memory tools.py get_external_statuses) returns a BARE
+    flat {dep: status} dict — `return result` in fused-memory tools.py get_external_statuses, NO 'statuses' wrapper.
+    Driving that REAL shape through scheduler.get_external_statuses AND into
+    _deps_satisfied asserts the full dispatch gate (user-observable signal).
+
+    RED today: flat {dep:'done'} -> current consumer keys 'statuses' -> KEY_ABSENT
+    -> ExternalResolverError -> external_resolver_failed -> not satisfied.
+    GREEN after step-4 consumer flip (key=None whole-inner-dict mode).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _flat_envelope(statuses: dict) -> dict:
+        """Wrap *statuses* in a minimal MCP envelope with NO 'statuses' key.
+
+        Mirrors the producer's canonical flat shape:
+            fused-memory/src/fused_memory/server/tools.py `return result`
+        The dep strings are the top-level keys; no wrapper dict.
+        """
+        import json as _json
+        return {
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(statuses)}]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_flat_done_dep_satisfies_gate(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """(Positive seam) Flat {dep:'done'} → get_external_statuses returns (dict, None)
+        and _deps_satisfied returns True for a task with that external dep.
+        """
+        dep = 'dark_factory:1846'
+        # Producer's REAL flat shape — no 'statuses' wrapper.
+        response = self._flat_envelope({dep: 'done'})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        statuses, err = await scheduler.get_external_statuses([dep])
+
+        assert err is None, (
+            f'Expected err=None for flat {dep!r}=done; got {err!r} — '
+            'consumer may still be keying on statuses instead of using key=None'
+        )
+        assert statuses == {dep: 'done'}, f'Expected flat dict; got {statuses!r}'
+
+        # Drive the gate decision: a task with this external dep should be dispatched.
+        task = {
+            'id': 'X',
+            'dependencies': [],
+            'metadata': {'external_deps': [dep]},
+        }
+        satisfied = scheduler._deps_satisfied(
+            task, {},
+            external_status_cache=statuses,
+            external_resolver_failed=(err is not None),
+        )
+        assert satisfied is True, (
+            f'Expected _deps_satisfied=True for done external dep; got {satisfied!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_flat_pending_dep_does_not_satisfy_gate(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """(Negative seam) Flat {dep:'pending'} → err is None, statuses correct,
+        but _deps_satisfied returns False (non-done status is not satisfied).
+        """
+        dep = 'dark_factory:1846'
+        response = self._flat_envelope({dep: 'pending'})
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+
+        statuses, err = await scheduler.get_external_statuses([dep])
+
+        # The PARSE itself must succeed (err is None) — only the gate status matters.
+        assert err is None, (
+            f'Expected err=None for flat {dep!r}=pending; got {err!r}'
+        )
+        assert statuses == {dep: 'pending'}, f'Expected flat dict; got {statuses!r}'
+
+        task = {
+            'id': 'Y',
+            'dependencies': [],
+            'metadata': {'external_deps': [dep]},
+        }
+        satisfied = scheduler._deps_satisfied(
+            task, {},
+            external_status_cache=statuses,
+            external_resolver_failed=(err is not None),
+        )
+        assert satisfied is False, (
+            f'Expected _deps_satisfied=False for pending external dep; got {satisfied!r}'
+        )
 
 
 # ---------------------------------------------------------------------------

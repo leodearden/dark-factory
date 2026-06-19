@@ -80,7 +80,7 @@ class EnvelopeParseError(Exception):
             fragment, suitable for log messages.
     """
 
-    def __init__(self, shape: EnvelopeShape, *, key: str, payload_prefix: str) -> None:
+    def __init__(self, shape: EnvelopeShape, *, key: str | None, payload_prefix: str) -> None:
         self.shape = shape
         self.key = key
         self.payload_prefix = payload_prefix
@@ -94,7 +94,7 @@ class EnvelopeParseError(Exception):
 
 def _fail(
     shape: EnvelopeShape,
-    key: str,
+    key: str | None,
     payload: Any,
 ) -> tuple[None, EnvelopeParseError]:
     """Emit ONE distinct WARNING and return ``(None, EnvelopeParseError(…))``."""
@@ -116,10 +116,12 @@ def _fail(
 
 def parse_tool_result(
     result: Any,
-    key: str,
+    key: str | None,
     expected_type: type | tuple[type, ...],
 ) -> tuple[Any | None, EnvelopeParseError | None]:
     """Extract *key* from a standard MCP tool-result envelope.
+
+    **Standard mode** (``key`` is a non-``None`` string):
 
     Returns ``(value, None)`` **only** when:
     - *result* is a dict with ``result.content`` containing at least one
@@ -128,6 +130,15 @@ def parse_tool_result(
     - the parsed payload (after optional ``{data:{…}}`` unwrap) is a dict,
     - *key* is present in that dict, and
     - ``isinstance(inner[key], expected_type)`` holds.
+
+    **Whole-inner-dict mode** (``key=None``):
+
+    Returns ``(inner, None)`` after the ``{data:{…}}`` unwrap step, provided
+    the inner payload is a dict and ``isinstance(inner, expected_type)`` holds
+    (callers should pass ``expected_type=dict``; a mismatched type fails with
+    ``WRONG_TYPE``).  ``KEY_ABSENT`` does not apply — the entire inner dict is
+    returned as-is.  ``NO_TEXT_BLOCK``, ``JSON_DECODE_ERROR``,
+    ``INNER_NOT_DICT``, ``WRONG_TYPE``, and ``RAISED`` still fail loud.
 
     For **every** other outcome (including non-raising malformed payloads)
     exactly **one** ``logger.warning`` is emitted naming the shape, and the
@@ -175,6 +186,16 @@ def parse_tool_result(
         # --- inner must be a dict ----------------------------------------------
         if not isinstance(inner, dict):
             return _fail(EnvelopeShape.INNER_NOT_DICT, key, inner)
+
+        # --- whole-inner-dict mode: key=None returns the entire inner dict -----
+        if key is None:
+            # Validate expected_type so the parameter retains meaning even when
+            # key=None.  inner is already guaranteed a dict by the INNER_NOT_DICT
+            # guard above, but an incorrect expected_type (e.g. list) would slip
+            # through silently without this check.
+            if not isinstance(inner, expected_type):
+                return _fail(EnvelopeShape.WRONG_TYPE, key, inner)
+            return inner, None
 
         # --- key presence (membership test — NOT .get) -------------------------
         if key not in inner:

@@ -339,3 +339,104 @@ class TestResolverFailed:
             resolver_failed({"x": 1}, err)
         records = [r for r in caplog.records if r.name == "shared.mcp_envelope"]
         assert records == [], f"resolver_failed emitted unexpected log records: {records}"
+
+
+# ---------------------------------------------------------------------------
+# TestWholeInnerDictMode — key=None whole-inner-dict mode
+# (step-1-test-shared-keynone RED / step-2-impl-shared-keynone GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestWholeInnerDictMode:
+    """Tests for the key=None whole-inner-dict mode of parse_tool_result.
+
+    When key is None, parse_tool_result returns the entire inner dict (after
+    optional {data:{...}} unwrap) rather than extracting a single keyed value.
+    NO_TEXT_BLOCK / JSON_DECODE_ERROR / INNER_NOT_DICT / RAISED still fail loud;
+    KEY_ABSENT and WRONG_TYPE do not apply in this mode.
+
+    Cases (a), (b), (d) are RED today: key=None falls into the
+    `None not in inner` membership check -> KEY_ABSENT -> (None, error) instead
+    of returning the whole inner dict.  Case (c) is green today (INNER_NOT_DICT
+    fires before the key check) and is included as a compatibility guard.
+    """
+
+    def test_flat_dict_returns_whole_inner_no_warning(self, caplog):
+        """(a) Happy path: flat {dep: status} map returns the whole dict, zero warnings.
+
+        Mirrors the canonical flat shape from fused-memory
+        get_external_statuses (tools.py: `return result`, no 'statuses' wrapper).
+        """
+        env = _env({"dark_factory:1846": "done"})
+        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
+            value, err = parse_tool_result(env, None, dict)
+        assert err is None, f"Expected err=None for flat dict; got {err!r}"
+        assert value == {"dark_factory:1846": "done"}, (
+            f"Expected whole inner dict; got {value!r}"
+        )
+        warn_records = [
+            r
+            for r in caplog.records
+            if r.name == "shared.mcp_envelope" and r.levelno >= logging.WARNING
+        ]
+        assert warn_records == [], "key=None success path must emit zero WARNING+ records"
+
+    def test_data_wrapped_envelope_unwraps_before_returning(self, caplog):
+        """(b) {data:{...}} unwrap still applies when key=None — returns unwrapped inner."""
+        env = _env({"data": {"a": "done"}})
+        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
+            value, err = parse_tool_result(env, None, dict)
+        assert err is None, (
+            f"Expected err=None after {{data:{{...}}}} unwrap; got {err!r}"
+        )
+        assert value == {"a": "done"}, (
+            f"Expected unwrapped inner dict; got {value!r}"
+        )
+        warn_records = [
+            r
+            for r in caplog.records
+            if r.name == "shared.mcp_envelope" and r.levelno >= logging.WARNING
+        ]
+        assert warn_records == [], "key=None success path after unwrap must emit zero warnings"
+
+    def test_non_dict_inner_fails_loud_inner_not_dict(self, caplog):
+        """(c) Non-dict inner (list) still fails LOUD with INNER_NOT_DICT shape.
+
+        This case is already green today (INNER_NOT_DICT fires before the key
+        check) and serves as a compatibility guard across the flip.
+        """
+        env = _env([1, 2, 3])
+        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
+            value, err = parse_tool_result(env, None, dict)
+        assert value is None, f"Expected value=None for non-dict inner; got {value!r}"
+        assert err is not None, "Expected EnvelopeParseError for non-dict inner; got None"
+        assert isinstance(err, EnvelopeParseError)
+        assert err.shape == EnvelopeShape.INNER_NOT_DICT, (
+            f"Expected INNER_NOT_DICT; got {err.shape!r}"
+        )
+        warn_records = [
+            r
+            for r in caplog.records
+            if r.name == "shared.mcp_envelope" and r.levelno >= logging.WARNING
+        ]
+        assert len(warn_records) == 1, (
+            f"Expected exactly one shared.mcp_envelope WARNING; got {warn_records!r}"
+        )
+
+    def test_empty_dict_inner_returns_empty_dict_no_error(self, caplog):
+        """(d) Empty dict is a valid whole-inner result — returns ({}, None), not an error.
+
+        Distinct from falsy/None failure: parse_tool_result succeeds; the
+        downstream resolver_failed() predicate is a separate semantic check.
+        """
+        env = _env({})
+        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
+            value, err = parse_tool_result(env, None, dict)
+        assert err is None, f"Expected err=None for empty dict; got {err!r}"
+        assert value == {}, f"Expected empty dict; got {value!r}"
+        warn_records = [
+            r
+            for r in caplog.records
+            if r.name == "shared.mcp_envelope" and r.levelno >= logging.WARNING
+        ]
+        assert warn_records == [], "Empty dict success path must emit zero warnings"

@@ -166,14 +166,14 @@ class ExternalResolverError(RuntimeError):
     Raised (into the error slot of the ``(statuses, error)`` tuple) in two cases:
 
     1. **Non-dict / unparseable result** — ``parse_tool_result`` returned an
-       error (missing 'statuses' key, wrong type, or JSON parse failure).
+       error (inner payload was not a dict, JSON parse failure, or no text block).
        The returned statuses dict is ``{}``.
 
-    2. **Partial-result (missing keys)** — the 'statuses' dict was present but did
-       not contain a key for every requested dep string.  The returned statuses dict
-       is the partial dict (not ``{}``) so callers can log what was received, but
-       the error flag forces a fail-safe wait (do not silently treat missing keys
-       as non-done statuses).
+    2. **Partial-result (missing keys)** — the flat statuses dict was present but
+       did not contain a key for every requested dep string.  The returned statuses
+       dict is the partial dict (not ``{}``) so callers can log what was received,
+       but the error flag forces a fail-safe wait (do not silently treat missing
+       keys as non-done statuses).
 
     In both cases ``_external_resolver_failed`` becomes ``True`` via the existing
     ``external_err is not None`` plumbing — no gate-logic changes needed.
@@ -1529,17 +1529,22 @@ class Scheduler:
             missing one or more requested dep keys (resolver-degraded; partial
             dict preserved for logging but error slot forces fail-safe wait).
             ``({}, ExternalResolverError)`` when ``parse_tool_result``
-            returns a parse error (unparseable JSON or missing 'statuses' key).
+            returns a parse error (inner payload not a dict, unparseable JSON,
+            or no text block).
             ``({}, exception)`` on any raised exception — transient raises are
             swallowed into the error slot (fail-safe; caller should skip policy
             effects).
+
+        The producer (``get_external_statuses`` in fused-memory) returns a FLAT
+        ``{dep: status}`` dict — no ``'statuses'`` wrapper.  Parsed via
+        ``parse_tool_result(result, None, dict)`` (whole-inner-dict mode).
         """
         try:
             arguments: dict = {'deps': list(deps)}
             result = await self.dispatch_tool(
                 'get_external_statuses', arguments, timeout=15
             )
-            statuses, parse_err = parse_tool_result(result, 'statuses', dict)
+            statuses, parse_err = parse_tool_result(result, None, dict)
             if parse_err is not None:
                 # primitive already emitted the WARNING; preserve ExternalResolverError type.
                 return {}, ExternalResolverError(str(parse_err))
