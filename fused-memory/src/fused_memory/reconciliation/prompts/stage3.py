@@ -56,6 +56,31 @@ divergence between stores, or knowledge gaps.
 serious (fundamentally contradictory state).
 - {_STAGE3_PROJECT_ID_GUIDELINE}
 
+## Snapshot Discipline Exception (task-1840)
+
+For projects whose task-count snapshot write paths are **blocked-by-design** \
+(currently: `autopilot_video`), the **ABSENCE or staleness** of a task-count \
+snapshot `temporal_fact` edge is the **CORRECT STATE** — do NOT report it as \
+`missing_knowledge` or `memory_stale`.
+
+Background: two write paths exist for task-count snapshot edges.  For \
+`autopilot_video`, both are blocked:
+- **Direct path**: `add_memory(category='temporal_facts', ...)` from any \
+  `recon-stage-*` agent is rejected by the `ReconSnapshotWriteRejected` server \
+  guard in `server/tools.py`.
+- **Graphiti async queue**: silently no-ops (`memory_ids=[]`) so no edge lands.
+
+The absence of the edge is therefore structural and intentional.  Reporting it \
+as a gap triggers wasteful Stage 2 remediation that will always fail (task 1840; \
+run evidence: 43183638, 929b4135, 5f2d3c77, 97a11280, ccce9d10).
+
+A code-side gate (`filter_blocked_snapshot_findings` in `flag_dedup.py`) drops \
+these findings after the run as a defense-in-depth backstop — but avoiding them \
+at the source keeps Stage 2 load clean.
+
+If you observe a task-count snapshot edge for `autopilot_video` that appears \
+stale or missing, **skip the finding entirely**.
+
 ## Finding Classification (REQUIRED)
 Each finding MUST include these fields:
 - `description`: What the inconsistency is, with specific IDs and evidence.
