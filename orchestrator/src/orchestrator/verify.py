@@ -311,6 +311,11 @@ _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         r'^error: (--|no such subcommand|failed to (parse|compile|read)|could not find)',
         re.MULTILINE,
     ), 'cargo_cli_error'),
+    # pytest INTERNALERROR — must be checked BEFORE the FAILED patterns so that
+    # a worker-death run (which has both INTERNALERROR> lines and collateral
+    # FAILED lines from the dead worker) classifies as pytest_internalerror
+    # rather than test_failure.  Reuses _PYTEST_INTERNALERROR_RE (hoisted above).
+    (_PYTEST_INTERNALERROR_RE, 'pytest_internalerror'),
     # Rust test runner / pytest FAILED lines
     (re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE), 'test_failure'),
     (re.compile(r'^FAILED\s', re.MULTILINE), 'test_failure'),
@@ -332,11 +337,12 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
     3. ``error[E\\d+]:``                        → ``'compile_error'``
     4. ``compile error``                         → ``'compile_error'``
     5. ``error: <cargo CLI prefix>``             → ``'cargo_cli_error'`` (allowlist of cargo CLI prefixes; rustc top-level ``error: aborting…`` / ``error: could not compile`` fall through)
-    6. ``… FAILED``                              → ``'test_failure'``
-    7. ``npm (ERR!|error)``                      → ``'npm_error'``
-    8. ``flock:``                                → ``'flock_error'``
-    9. ``tree-sitter generate``                  → ``'tree_sitter_generate_error'``
-    10. fallback (rc != 0)                       → ``'unknown_test_failure'``
+    6. ``INTERNALERROR>``                        → ``'pytest_internalerror'`` (checked BEFORE FAILED so a worker-death run with collateral FAILED lines classifies as infra, not drift)
+    7. ``… FAILED``                              → ``'test_failure'``
+    8. ``npm (ERR!|error)``                      → ``'npm_error'``
+    9. ``flock:``                                → ``'flock_error'``
+    10. ``tree-sitter generate``                 → ``'tree_sitter_generate_error'``
+    11. fallback (rc != 0)                       → ``'unknown_test_failure'``
 
     The ``timed_out`` flag wins over any output pattern because the root
     cause is the wall-clock limit, not the command output.
@@ -367,6 +373,7 @@ _CATEGORY_PRIORITY: list[str] = [
     'tree_sitter_generate_error',
     'flock_error',
     'npm_error',
+    'pytest_internalerror',   # above test_failure: an infra crash, not a test drift
     'test_failure',
     'unknown_test_failure',
     'passed',
