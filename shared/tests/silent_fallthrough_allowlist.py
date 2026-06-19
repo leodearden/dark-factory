@@ -169,11 +169,3 @@ ALLOWLIST_VIOLATIONS: frozenset[tuple[str, int]] = frozenset(
     (relpath, lineno)
     for relpath, lineno, _qualname, _reason in ALLOWLIST_ENTRIES
 )
-
-#: Legacy dict form for backward compatibility and step-7 integrity checks.
-#: Key: (relpath, qualname) — NOT unique if multiple violations share the same
-#: function; use ALLOWLIST_ENTRIES for the authoritative list.
-ALLOWLIST: dict[tuple[str, str], str] = {
-    (relpath, qualname): reason
-    for relpath, _lineno, qualname, reason in ALLOWLIST_ENTRIES
-}

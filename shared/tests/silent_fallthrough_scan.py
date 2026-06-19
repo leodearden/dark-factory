@@ -154,25 +154,6 @@ def _is_empty_literal(node: ast.expr) -> bool:
     return False
 
 
-def _handler_returns_empty(handler: ast.ExceptHandler) -> bool:
-    """Return True if any direct-child Return of the handler returns empty.
-
-    Does NOT descend into nested ``def`` or ``lambda`` bodies.
-    """
-    for node in handler.body:
-        for stmt in ast.walk(node):
-            # Do not descend into nested function/class definitions
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                # ast.walk already entered it; skip its children by not yielding
-                # We can't stop ast.walk from descending, so we use a manual DFS
-                # approach instead.  Actually ast.walk is a generator over a flat
-                # visit — we can't prune.  Use a targeted shallow check instead.
-                continue
-            if isinstance(stmt, ast.Return) and (stmt.value is None or _is_empty_literal(stmt.value)):
-                return True
-    return False
-
-
 def _handler_returns_empty_shallow(handler: ast.ExceptHandler) -> bool:
     """Return True if any top-level Return in handler body returns empty.
 
@@ -195,14 +176,37 @@ def _handler_returns_empty_shallow(handler: ast.ExceptHandler) -> bool:
     return _check_stmts(handler.body)
 
 
+def _shallow_nodes(handler: ast.ExceptHandler) -> Iterator[ast.AST]:
+    """Yield all AST nodes reachable from handler body, excluding nested scopes.
+
+    Stops descent at FunctionDef, AsyncFunctionDef, ClassDef, and Lambda nodes
+    so that warn-log and reraise detection are scope-consistent with
+    _handler_returns_empty_shallow (avoids false negatives from nested helpers
+    that happen to log or re-raise inside a handler that is itself silent).
+    """
+    _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+    def _walk(node: ast.AST) -> Iterator[ast.AST]:
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, _SCOPE_BOUNDARIES):
+                yield from _walk(child)
+
+    for stmt in handler.body:
+        if not isinstance(stmt, _SCOPE_BOUNDARIES):
+            yield from _walk(stmt)
+
+
 def _handler_has_warn_log(handler: ast.ExceptHandler) -> bool:
-    """Return True if the handler body contains a WARN+ logger call.
+    """Return True if the handler body (at handler scope) contains a WARN+ logger call.
 
     Matches calls of the form ``<any>.{warning,warn,error,exception,critical,fatal}(...)``
-    anywhere in the handler body (including nested blocks).
+    only within the handler's own scope; does NOT descend into nested
+    functions/lambdas/classes (scope-consistent with _handler_returns_empty_shallow
+    to avoid false negatives from nested helpers that happen to log).
     """
     WARN_METHODS = {"warning", "warn", "error", "exception", "critical", "fatal"}
-    for node in ast.walk(handler):
+    for node in _shallow_nodes(handler):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -213,8 +217,12 @@ def _handler_has_warn_log(handler: ast.ExceptHandler) -> bool:
 
 
 def _handler_reraises(handler: ast.ExceptHandler) -> bool:
-    """Return True if the handler body contains any ``raise`` statement."""
-    return any(isinstance(node, ast.Raise) for node in ast.walk(handler))
+    """Return True if the handler body (at handler scope) contains any ``raise`` statement.
+
+    Does not descend into nested functions/lambdas/classes (scope-consistent
+    with _handler_returns_empty_shallow).
+    """
+    return any(isinstance(node, ast.Raise) for node in _shallow_nodes(handler))
 
 
 # ---------------------------------------------------------------------------

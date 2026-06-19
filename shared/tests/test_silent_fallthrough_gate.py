@@ -21,8 +21,11 @@ References:
 """
 from __future__ import annotations
 
+import ast
 import textwrap
+from typing import NamedTuple
 
+import pytest
 from silent_fallthrough_scan import (
     KNOWN_VALUE_ERROR_RESOLVERS,
     Violation,
@@ -288,17 +291,22 @@ class TestSignatureBPositives:
         sig_b = [v for v in _violations(src) if _sig_b(v)]
         assert len(sig_b) == 1
 
-    def test_return_empty_set_literal_flagged(self):
-        """set() call is the only way to write an empty set literal."""
+    def test_nonempty_set_literal_not_flagged(self):
+        """except Exception: return {1} — non-empty set literal must NOT be flagged.
+
+        Coverage for the ast.Set branch: an empty set() call is already covered
+        by test_return_bare_set_call_flagged; this confirms the non-empty case
+        is excluded (distinct from the set() call path).
+        """
         src = """\
         def f():
             try:
                 pass
             except Exception:
-                return set()
+                return {1}
         """
         sig_b = [v for v in _violations(src) if _sig_b(v)]
-        assert len(sig_b) == 1
+        assert sig_b == []
 
 
 class TestSignatureBNegatives:
@@ -444,26 +452,64 @@ class TestSignatureBNegatives:
 
 from pathlib import Path  # noqa: E402
 
-from silent_fallthrough_allowlist import ALLOWLIST_ENTRIES  # noqa: E402
+from silent_fallthrough_allowlist import ALLOWLIST_ENTRIES, ALLOWLIST_VIOLATIONS  # noqa: E402
 from silent_fallthrough_scan import iter_first_party_files  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+class _TreeScanData(NamedTuple):
+    """Cached result of a full first-party tree scan (session-scoped)."""
+
+    files: list        # list[Path]
+    violations: list   # list[Violation]
+    violations_by_key: dict  # {(relpath, lineno): Violation}
+    parse_failures: list     # list[str]
+
+
+@pytest.fixture(scope="session")
+def tree_scan_data() -> _TreeScanData:
+    """Enumerate, read, parse, and scan the first-party tree once per test session.
+
+    All integration and integrity tests consume this fixture rather than
+    re-scanning ~215 files independently on each test invocation.
+    """
+    files = list(iter_first_party_files(_REPO_ROOT))
+    violations: list[Violation] = []
+    violations_by_key: dict[tuple[str, int], Violation] = {}
+    parse_failures: list[str] = []
+    for filepath in files:
+        source = filepath.read_text(encoding="utf-8", errors="replace")
+        rel = str(filepath.relative_to(_REPO_ROOT))
+        try:
+            ast.parse(source, filename=str(filepath))
+        except SyntaxError as e:
+            parse_failures.append(f"{filepath}: {e}")
+        for v in find_violations(source, rel):
+            violations.append(v)
+            violations_by_key[(v.filename, v.lineno)] = v
+    return _TreeScanData(
+        files=files,
+        violations=violations,
+        violations_by_key=violations_by_key,
+        parse_failures=parse_failures,
+    )
+
+
 class TestGateSelfIntegrity:
     """The gate must not silently scan 0 files (a mis-resolved root would pass trivially)."""
 
-    def test_scanned_file_count_exceeds_150(self):
+    def test_scanned_file_count_exceeds_150(self, tree_scan_data):
         """Expect 150+ first-party source files (215 today)."""
-        files = list(iter_first_party_files(_REPO_ROOT))
+        files = tree_scan_data.files
         assert len(files) > 150, (
             f"Only {len(files)} files found — is repo_root correct? "
             f"({_REPO_ROOT})"
         )
 
-    def test_known_first_party_files_are_included(self):
+    def test_known_first_party_files_are_included(self, tree_scan_data):
         """Known first-party files must be present in the scan set."""
-        files = {str(f) for f in iter_first_party_files(_REPO_ROOT)}
+        files = {str(f) for f in tree_scan_data.files}
         expected = [
             "orchestrator/src/orchestrator/scheduler.py",
             "orchestrator/src/orchestrator/harness.py",
@@ -473,10 +519,9 @@ class TestGateSelfIntegrity:
             candidate = str(_REPO_ROOT / rel)
             assert candidate in files, f"Expected file missing from scan: {rel}"
 
-    def test_excluded_paths_are_absent(self):
+    def test_excluded_paths_are_absent(self, tree_scan_data):
         """Submodule dirs (mem0/, graphiti/) and tests/ are excluded."""
-        files = list(iter_first_party_files(_REPO_ROOT))
-        for f in files:
+        for f in tree_scan_data.files:
             parts = Path(f).parts
             assert "mem0" not in parts, f"mem0 submodule should be excluded: {f}"
             assert "graphiti" not in parts, f"graphiti submodule should be excluded: {f}"
@@ -488,48 +533,23 @@ class TestGateSelfIntegrity:
 class TestWholeTreeGate:
     """Whole-tree gate: no non-allowlisted violations on the migrated tree."""
 
-    def test_no_unparseable_files(self):
+    def test_no_unparseable_files(self, tree_scan_data):
         """All first-party Python files must parse without SyntaxError."""
-        parse_failures: list[str] = []
-        for filepath in iter_first_party_files(_REPO_ROOT):
-            source = filepath.read_text(encoding="utf-8", errors="replace")
-            try:
-                import ast
-                ast.parse(source, filename=str(filepath))
-            except SyntaxError as e:
-                parse_failures.append(f"{filepath}: {e}")
-        if parse_failures:
+        if tree_scan_data.parse_failures:
             raise AssertionError(
                 "Files failed to parse (fix syntax errors or exclude them):\n"
-                + "\n".join(f"  {p}" for p in sorted(parse_failures))
+                + "\n".join(f"  {p}" for p in sorted(tree_scan_data.parse_failures))
             )
 
-    def test_no_violations_outside_allowlist(self):
+    def test_no_violations_outside_allowlist(self, tree_scan_data):
         """The set of violations across the first-party tree must be empty
         after subtracting the documented baseline ALLOWLIST.
 
         Any new violation means a silent-fallthrough-on-error was introduced.
         Either fix it (preferred) or add a documented entry to ALLOWLIST.
         """
-        # Collect all violations
-        all_violations: list[Violation] = []
-        for filepath in iter_first_party_files(_REPO_ROOT):
-            source = filepath.read_text(encoding="utf-8", errors="replace")
-            rel = str(filepath.relative_to(_REPO_ROOT))
-            violations = find_violations(source, rel)
-            all_violations.extend(violations)
-
-        # Build allowlist key set — keys are (relpath, qualname) or a frozenset
-        # of allowlist entries.  We check by (filename, lineno) pair since
-        # qualname computation requires the allowlist module's helper.
-        # The allowlist maps (relpath, qualname) → reason; we compare by
-        # (relpath, lineno) to avoid re-implementing qualname resolution here.
-        # The allowlist module exposes a ALLOWLIST_VIOLATIONS set of
-        # (relpath, lineno) pairs for gate-time matching.
-        from silent_fallthrough_allowlist import ALLOWLIST_VIOLATIONS
-
         non_baseline = [
-            v for v in all_violations
+            v for v in tree_scan_data.violations
             if (v.filename, v.lineno) not in ALLOWLIST_VIOLATIONS
         ]
 
@@ -557,16 +577,6 @@ class TestAllowlistIntegrity:
     These tests enforce the ratchet: as violations are fixed, stale allowlist
     entries cause a failure here, forcing the baseline to shrink.
     """
-
-    def _collect_tree_violations(self) -> dict[tuple[str, int], Violation]:
-        """Run the scanner over the first-party tree and index by (filename, lineno)."""
-        result: dict[tuple[str, int], Violation] = {}
-        for filepath in iter_first_party_files(_REPO_ROOT):
-            source = filepath.read_text(encoding="utf-8", errors="replace")
-            rel = str(filepath.relative_to(_REPO_ROOT))
-            for v in find_violations(source, rel):
-                result[(v.filename, v.lineno)] = v
-        return result
 
     def test_every_entry_has_nonempty_reason(self):
         """No allowlist entry may have a blank reason (that would be a silent exemption)."""
@@ -625,17 +635,16 @@ class TestAllowlistIntegrity:
                 + "\n".join(f"  {e}" for e in dupes)
             )
 
-    def test_no_stale_entries(self):
+    def test_no_stale_entries(self, tree_scan_data):
         """Every allowlist entry must correspond to a real violation in the current tree.
 
         If a violation is fixed, the allowlist entry becomes stale.  This test
         fails on stale entries, forcing the baseline to shrink as code improves.
         """
-        tree_violations = self._collect_tree_violations()
         stale = [
             f"{relpath}:{lineno} ({qualname}) — {reason[:60]}"
             for relpath, lineno, qualname, reason in ALLOWLIST_ENTRIES
-            if (relpath, lineno) not in tree_violations
+            if (relpath, lineno) not in tree_scan_data.violations_by_key
         ]
         if stale:
             raise AssertionError(
