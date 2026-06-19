@@ -1434,6 +1434,23 @@ class TaskInterceptor:
             return parsed if isinstance(parsed, dict) else None
         return None
 
+    @staticmethod
+    def _inject_routing_override(metadata: Any, reason: str) -> dict:
+        """Return a metadata dict with ``routing_override_reason`` set to *reason*.
+
+        Builds on :meth:`_extract_metadata_dict` to normalise the incoming
+        shape (None / JSON-string / dict / unparseable → fresh dict when None
+        or unparseable) before writing the key, so the result is always a
+        plain dict ready for JSON serialisation.
+        """
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if meta is None:
+            meta = {}
+        else:
+            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta['routing_override_reason'] = reason
+        return meta
+
     async def _check_escalation_idempotency(
         self,
         *,
@@ -1542,6 +1559,13 @@ class TaskInterceptor:
 
         project_id = resolve_project_id(project_root)
 
+        # Pop and normalise routing_override_reason BEFORE the guard so it
+        # never leaks into the ticket-blob kwargs or tm.add_task.  Stripping
+        # ensures whitespace-only values are treated as absent.
+        routing_override_reason = str(
+            kwargs.pop('routing_override_reason', '') or ''
+        ).strip()
+
         # Path-scope guard: reject before persisting if the candidate references
         # paths owned by another project.  When a multi-project registry is
         # configured the guard runs for every project (including dark_factory);
@@ -1549,10 +1573,20 @@ class TaskInterceptor:
         # _build_candidate is skipped on the hot path.  Rejections also fire a
         # scope_violation escalation when the escalator is configured.
         # Must run before kwargs.pop('metadata') below so the helper can read metadata.
-        if err := await self._path_guard_or_skip(kwargs, project_root, project_id):
+        if err := await self._path_guard_or_skip(
+            kwargs, project_root, project_id,
+            routing_override_reason=routing_override_reason,
+        ):
             return err
 
         metadata = kwargs.pop('metadata', None)
+
+        # Inject the override reason into task metadata (both the normal ticket
+        # path and the planning_mode path benefit from this placement).  When no
+        # override was supplied the metadata dict is left untouched.
+        if routing_override_reason:
+            metadata = self._inject_routing_override(metadata, routing_override_reason)
+
         planning_mode = bool(kwargs.pop('planning_mode', False))
         if planning_mode:
             return await self._submit_task_planning_mode(
