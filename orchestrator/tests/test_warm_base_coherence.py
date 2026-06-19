@@ -250,3 +250,173 @@ class TestSeedFlockLock:
         assert sentinel.read_text() == 'gen-dir-content\n', (
             f'Sentinel content mismatch: {sentinel.read_text()!r}'
         )
+
+
+# ===========================================================================
+# Step 5 (RED): refresh passes --landed-commit + inv.9 two-way seam
+# ===========================================================================
+
+
+def _setup_merge_verify_for_refresh(
+    repo: Path,
+    rolling_base: Path,
+) -> tuple[Path, GitConfig]:
+    """Create _merge-verify (inside a git repo dir) and a separate rolling base.
+
+    Returns (merge_verify path, GitConfig pointing base at rolling_base).
+    The merge_verify dir is inside *repo* so git rev-parse HEAD succeeds.
+    """
+    worktree_base = repo / '.worktrees'
+    merge_verify = worktree_base / '_merge-verify'
+    merge_verify.mkdir(parents=True, exist_ok=True)
+    (merge_verify / 'target').mkdir(exist_ok=True)
+    rolling_base.mkdir(parents=True, exist_ok=True)
+    config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=True,
+        warm_lane_base_target_dir=str(rolling_base),
+    )
+    return merge_verify, config
+
+
+def _install_all_args_recording_stub(scripts_dir_parent: Path, recorder: Path) -> None:
+    """Install a refresh-warm-base.sh that records all argv ($@) and exits 0."""
+    scripts_dir = scripts_dir_parent / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'refresh-warm-base.sh'
+    script.write_text(f'#!/usr/bin/env bash\necho "$@" >> {recorder}\n')
+    script.chmod(0o755)
+
+
+def _install_inv9_guard_stub(scripts_dir_parent: Path) -> None:
+    """Install a refresh-warm-base.sh emulating reify's inv.9 --landed-commit guard.
+
+    Exits 0 iff ``--landed-commit <non-empty-value>`` is present in argv;
+    otherwise writes a diagnostic to stderr and exits 1.
+    """
+    scripts_dir = scripts_dir_parent / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'refresh-warm-base.sh'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        '# Emulate reify inv.9: require --landed-commit <sha>\n'
+        'found=0\n'
+        'while [[ $# -gt 0 ]]; do\n'
+        '  if [[ "$1" == "--landed-commit" ]] && [[ -n "$2" ]]; then\n'
+        '    found=1\n'
+        '  fi\n'
+        '  shift\n'
+        'done\n'
+        'if [[ $found -eq 0 ]]; then\n'
+        '  echo "inv.9 REJECT: --landed-commit not provided or empty" >&2\n'
+        '  exit 1\n'
+        'fi\n'
+        'exit 0\n'
+    )
+    script.chmod(0o755)
+
+
+@pytest.mark.asyncio
+class TestRefreshLandedCommit:
+    """D10 — refresh_warm_base passes --landed-commit <sha> to satisfy reify's inv.9."""
+
+    async def test_refresh_passes_landed_commit(self, tmp_path: Path) -> None:
+        """refresh_warm_base() must invoke the script with ``--landed-commit <sha>``
+        appended after ``<advancing> <base>``, where <sha> == ``git rev-parse HEAD``
+        of the _merge-verify directory.
+
+        RED against today's 2-arg impl (no --landed-commit flag emitted).
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+
+        rolling_base = tmp_path / 'rolling'
+        merge_verify, config = _setup_merge_verify_for_refresh(repo, rolling_base)
+        git_ops = GitOps(config, repo, warm_lane_pool_size=1)
+
+        recorder = tmp_path / 'refresh_args.txt'
+        _install_all_args_recording_stub(merge_verify, recorder)
+
+        result = await git_ops.refresh_warm_base()
+
+        assert result is True, 'refresh_warm_base must return True on success'
+        assert recorder.exists(), 'refresh-warm-base.sh was not called'
+        recorded = recorder.read_text().strip()
+
+        # Derive the expected sha from _merge-verify (same as impl will derive)
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_verify)
+        assert rc == 0, f'Could not derive HEAD from _merge-verify: {head_out!r}'
+        head = head_out.strip()
+
+        advancing = str(git_ops.persistent_merge_worktree_path / 'target')
+        base = str(git_ops.warm_lane_base_target_path)
+        expected = f'{advancing} {base} --landed-commit {head}'
+        assert recorded == expected, (
+            f'Wrong args: got {recorded!r}, expected {expected!r}'
+        )
+
+    async def test_refresh_satisfies_inv9_guard(self, tmp_path: Path) -> None:
+        """With ``--landed-commit`` passed, the reify inv.9-emulating guard accepts
+        (exits 0) → refresh_warm_base() returns True.
+
+        RED against today's no-flag impl (guard exits 1 → returns False).
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+
+        rolling_base = tmp_path / 'rolling'
+        merge_verify, config = _setup_merge_verify_for_refresh(repo, rolling_base)
+        git_ops = GitOps(config, repo, warm_lane_pool_size=1)
+
+        _install_inv9_guard_stub(merge_verify)
+
+        result = await git_ops.refresh_warm_base()
+
+        assert result is True, (
+            'refresh_warm_base must return True when reify inv.9 guard accepts '
+            '(requires --landed-commit with non-empty value)'
+        )
+
+    async def test_refresh_rejected_without_landed_commit(self, tmp_path: Path) -> None:
+        """When HEAD derivation fails (non-repo persistent_merge_worktree path),
+        no ``--landed-commit`` flag is appended, and the inv.9 guard rejects
+        (exit 1) → refresh_warm_base returns False.
+
+        Documents the reify-facing 'exits non-zero without --landed-commit' direction.
+        """
+        # Use a non-git directory as the repo base — git rev-parse HEAD will fail there
+        non_repo = tmp_path / 'non_repo'
+        non_repo.mkdir()
+        rolling_base = tmp_path / 'rolling'
+        rolling_base.mkdir()
+
+        config = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+            warm_lane_base_target_dir=str(rolling_base),
+        )
+        git_ops = GitOps(config, non_repo, warm_lane_pool_size=1)
+
+        # Create _merge-verify inside the non-repo dir (git rev-parse HEAD will fail)
+        merge_verify = non_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
+        (merge_verify / 'target').mkdir()
+
+        _install_inv9_guard_stub(merge_verify)
+
+        result = await git_ops.refresh_warm_base()
+
+        assert result is False, (
+            'refresh_warm_base must return False when HEAD derivation fails and '
+            'the inv.9 guard rejects (no --landed-commit passed)'
+        )
