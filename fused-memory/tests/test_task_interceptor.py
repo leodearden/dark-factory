@@ -4651,6 +4651,90 @@ class TestPathGuardOrSkip:
         assert result.get('matched_paths') == ['orchestrator/']
         assert result.get('suggested_project') == 'dark_factory'
 
+    # -- Case 5: routing override skips both guards -----------------------
+    async def test_routing_override_skips_heuristic_and_adjudicator(
+        self,
+        interceptor,
+        monkeypatch,
+        caplog,
+    ):
+        """When routing_override_reason is set (non-empty), _path_guard_or_skip
+        returns None immediately without calling _path_guard_check or the
+        adjudicator — and emits a WARNING audit log containing the reason.
+        """
+        import logging
+
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        # Monkeypatch _path_guard_check to track calls (should not be called)
+        guard_calls: list = []
+
+        def failing_check(self, candidate, kwargs, project_id):
+            guard_calls.append((candidate, kwargs, project_id))
+            raise AssertionError('_path_guard_check must NOT be called on override')
+
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', failing_check)
+
+        # Wire a fake adjudicator so we can assert it's not called
+        fake_adjudicator = _AsyncMock()
+        fake_adjudicator.adjudicate = _AsyncMock()
+        interceptor._path_scope_adjudicator = fake_adjudicator
+
+        with caplog.at_level(logging.WARNING):
+            result = await interceptor._path_guard_or_skip(
+                {'title': 'Investigate orchestrator/harness.py deadlock'},
+                '/some-other-project',
+                'some_other_project',
+                routing_override_reason='owner asserted ownership',
+            )
+
+        assert result is None, f'Expected None on override, got: {result!r}'
+        assert guard_calls == [], '_path_guard_check must NOT be called'
+        fake_adjudicator.adjudicate.assert_not_called()
+
+        # Must emit a WARNING containing the reason
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'ROUTING OVERRIDE' in r.message and 'owner asserted ownership' in r.message
+            for r in warning_records
+        ), f'Expected WARNING with reason in log, got: {[r.message for r in warning_records]}'
+
+    # -- Case 6: empty routing_override_reason → behavior unchanged -------
+    async def test_empty_routing_override_reason_does_not_skip_guards(
+        self,
+        interceptor,
+        monkeypatch,
+    ):
+        """With routing_override_reason='' (default), a rejecting _path_guard_check
+        still returns the error dict — behavior is unchanged.
+        """
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='some_other_project',
+            matched_paths=('orchestrator/',),
+            suggested_project='dark_factory',
+        )
+
+        def fake_build(kwargs):
+            return None
+
+        def fake_check(self, candidate, kwargs, project_id):
+            return verdict
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
+
+        result = await interceptor._path_guard_or_skip(
+            {'prompt': 'something'},
+            '/some/project_root',
+            'some_other_project',
+            routing_override_reason='',
+        )
+        assert result is not None, 'Empty override must NOT skip the guard'
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation'
+
 
 # ---------------------------------------------------------------------------
 # Multi-project routing — registry + escalator wiring
