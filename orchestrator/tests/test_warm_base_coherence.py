@@ -169,3 +169,84 @@ class TestSeedSymlinkResolution:
         assert recorded_base_target == str(plain_dir), (
             f'Expected raw path {plain_dir!r}, got {recorded_base_target!r}'
         )
+
+
+# ===========================================================================
+# Step 3 (RED): seed holds flock -s on the gen lock during the cp
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestSeedFlockLock:
+    """D8 — _seed_warm_lane holds flock -s on .gen.N.lock for the duration of the cp."""
+
+    async def test_seed_holds_shared_flock_during_cp(self, tmp_path: Path) -> None:
+        """While seed-warm-lane.sh is running, _seed_warm_lane must hold a shared lock
+        on <base>/.gen.0.lock.  A concurrent non-blocking exclusive lock attempt from
+        within the script must FAIL (i.e. the probe reports BLOCKED), proving the
+        reader-refcount GC lock is held.  After the script exits the lane target must
+        contain the gen dir's sentinel content (warm, not torn/cold).
+
+        RED against today's impl: no flock is held, so the concurrent exclusive probe
+        SUCCEEDS (reports FREE).
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+
+        # Build reify-style gen-dir base
+        base_dir = tmp_path / 'bases'
+        _, gen_dir, target_symlink = _make_gendir_base(base_dir)
+        lock_path = base_dir / '.gen.0.lock'
+
+        config = _wl_config_with_base(str(target_symlink))
+        git_ops = GitOps(config, repo, warm_lane_pool_size=1)
+
+        lane = await _make_lane_dir(repo, '_lane-0')
+        (lane / 'target').mkdir(exist_ok=True)
+
+        # Install a stub seed-warm-lane.sh that:
+        # (a) records its $1 (base_target) arg
+        # (b) probes the lock with a non-blocking exclusive flock attempt from a subshell
+        #     — records BLOCKED if it fails, FREE if it succeeds
+        # (c) emulates a CoW seed: copies the gen-dir contents into lane/target/
+        lock_probe_marker = lane / 'lock_probe.txt'
+        seed_args_marker = lane / 'seed_args.txt'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            f'#!/usr/bin/env bash\n'
+            f'echo "$1" >> {seed_args_marker}\n'
+            # Probe: try a non-blocking exclusive lock; record BLOCKED on failure, FREE on success
+            f'if flock -n -x {lock_path} true 2>/dev/null; then\n'
+            f'  echo FREE >> {lock_probe_marker}\n'
+            f'else\n'
+            f'  echo BLOCKED >> {lock_probe_marker}\n'
+            f'fi\n'
+            # Emulate CoW seed: copy gen dir contents into lane/target/
+            f'cp -a "$1"/. "$2/target/"\n'
+        )
+        script.chmod(0o755)
+
+        result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+
+        assert result is True, 'seed script must exit 0'
+        assert lock_probe_marker.exists(), 'lock probe script section did not execute'
+        probe_result = lock_probe_marker.read_text().strip()
+
+        # The concurrent exclusive probe must have been BLOCKED (shared lock held by caller)
+        assert probe_result == 'BLOCKED', (
+            f'Expected lock probe BLOCKED (flock -s held during cp), got {probe_result!r}. '
+            'The reader-refcount GC lock was NOT held — concurrent base rewrite could '
+            'ENOENT the clone mid-walk (torn read).'
+        )
+
+        # The lane target must be warm (gen dir content copied, not torn/cold)
+        sentinel = lane / 'target' / 'sentinel'
+        assert sentinel.exists(), (
+            f'Lane target sentinel not found at {sentinel} — lane is cold/torn'
+        )
+        assert sentinel.read_text() == 'gen-dir-content\n', (
+            f'Sentinel content mismatch: {sentinel.read_text()!r}'
+        )
