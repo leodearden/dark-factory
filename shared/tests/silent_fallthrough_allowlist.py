@@ -131,14 +131,14 @@ ALLOWLIST_ENTRIES: list[tuple[str, int, str, str]] = [
     ),
     (
         "orchestrator/src/orchestrator/verify.py",
-        2809,
+        2901,
         "run_main_tip_sweep",
         "debug-logged fail-safe: get_main_sha failure returns None to skip "
         "sweep entirely (background probe, non-critical)",
     ),
     (
         "orchestrator/src/orchestrator/verify.py",
-        2849,
+        2955,
         "run_main_tip_sweep",
         "debug-logged fail-safe: unexpected error during main-tip sweep "
         "returns None; sweeps are background checks, not on critical path",
