@@ -26,7 +26,8 @@ References:
 from __future__ import annotations
 
 import ast
-from typing import NamedTuple
+from pathlib import Path
+from typing import Iterator, NamedTuple
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +42,7 @@ class Violation(NamedTuple):
     lineno: int
     signature: str   # "a" or "b"
     message: str
+    qualname: str = ""  # enclosing function qualname (e.g. "Harness.run")
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +224,39 @@ def _handler_reraises(handler: ast.ExceptHandler) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# AST parent-map helpers (for qualname computation)
+# ---------------------------------------------------------------------------
+
+
+def _build_parent_map(tree: ast.AST) -> dict[int, ast.AST]:
+    """Return {id(child): parent_node} for every node in *tree*."""
+    parent_map: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent_map[id(child)] = node
+    return parent_map
+
+
+def _compute_qualname(node: ast.AST, parent_map: dict[int, ast.AST]) -> str:
+    """Return the dotted qualname of the function/class scope enclosing *node*.
+
+    Walks upward through the parent map collecting FunctionDef / AsyncFunctionDef /
+    ClassDef names, then joins them in order.  Returns ``"<module>"`` if the
+    node is at module scope.
+
+    Example: a node inside ``class Harness: async def run(self): ...``
+    returns ``"Harness.run"``.
+    """
+    parts: list[str] = []
+    current = parent_map.get(id(node))
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            parts.append(current.name)
+        current = parent_map.get(id(current))
+    return ".".join(reversed(parts)) if parts else "<module>"
+
+
+# ---------------------------------------------------------------------------
 # Core scanner
 # ---------------------------------------------------------------------------
 
@@ -242,6 +277,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     except SyntaxError:
         return []
 
+    parent_map = _build_parent_map(tree)
     violations: list[Violation] = []
 
     for node in ast.walk(tree):
@@ -268,6 +304,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                                 f"bind the error to a named variable and "
                                 f"escalate via resolver_failed() or raise"
                             ),
+                            qualname=_compute_qualname(node, parent_map),
                         ))
 
         # ------------------------------------------------------------------ #
@@ -294,6 +331,66 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                         f"without logging WARN+ or re-raising — add "
                         f"logger.warning/error/exception(...) before the return"
                     ),
+                    qualname=_compute_qualname(node, parent_map),
                 ))
 
     return violations
+
+
+# ---------------------------------------------------------------------------
+# First-party file enumeration
+# ---------------------------------------------------------------------------
+
+#: The 7 scope roots searched for first-party source (relative to repo root).
+_SCOPE_ROOTS = [
+    "orchestrator/src",
+    "fused-memory/src",
+    "dashboard/src",
+    "escalation/src",
+    "shared/src",
+    "sampler/src",
+    "scripts",
+]
+
+#: Path components whose presence causes a file to be excluded from the scan.
+_EXCLUDED_PATH_PARTS: frozenset[str] = frozenset({"mem0", "graphiti", "tests"})
+
+#: File names that are always excluded regardless of location.
+_EXCLUDED_NAMES: frozenset[str] = frozenset({"conftest.py"})
+
+
+def iter_first_party_files(repo_root: Path) -> Iterator[Path]:
+    """Yield absolute paths to first-party Python source files.
+
+    Searches the 7 scope roots under *repo_root* and applies exclusions:
+      - Path components named ``mem0``, ``graphiti``, or ``tests``
+      - Files named ``test_*.py`` or ``conftest.py``
+
+    Args:
+        repo_root: Absolute path to the repository root.  Validated against
+            sentinel directories (``shared/src``, ``orchestrator/src``); raises
+            ``RuntimeError`` if they are absent (prevents a mis-resolved root
+            from producing a silently-empty scan).
+    """
+    # Sentinel validation: fail loudly if repo_root is wrong
+    for sentinel in ("shared/src", "orchestrator/src"):
+        if not (repo_root / sentinel).is_dir():
+            raise RuntimeError(
+                f"Repo root validation failed: {sentinel!r} not found under "
+                f"{repo_root!r}.  Ensure iter_first_party_files() receives the "
+                f"correct repository root (not a sub-directory)."
+            )
+
+    for root_rel in _SCOPE_ROOTS:
+        root_abs = repo_root / root_rel
+        if not root_abs.is_dir():
+            continue
+        for py_file in sorted(root_abs.rglob("*.py")):
+            # Exclude by path component
+            if any(part in _EXCLUDED_PATH_PARTS for part in py_file.parts):
+                continue
+            # Exclude test files and conftest
+            name = py_file.name
+            if name.startswith("test_") or name in _EXCLUDED_NAMES:
+                continue
+            yield py_file
