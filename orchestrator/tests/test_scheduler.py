@@ -8617,3 +8617,295 @@ class TestCarriesSubstrateProbe:
         assert assignment.task_id == '42'
         # The task dict is unchanged — acquire_next does not remove substrate_probe
         assert assignment.task['metadata']['substrate_probe']['probe_set'] == 'probes/suite.json'
+
+
+# ---------------------------------------------------------------------------
+# TestExternalDepResolverDegradedEscalation (task 1855 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestExternalDepResolverDegradedEscalation:
+    """Persistent resolver_degraded holds must escalate to a human after threshold ticks.
+
+    When external_err is not None for N consecutive ticks (where N >=
+    max_external_dep_unresolved_cycles), the scheduler must invoke
+    _on_external_dep_block with:
+    - summary containing the 'EXTERNAL_DEP_RESOLVER_DEGRADED' prefix
+    - category='infra_issue'
+
+    Below threshold → no callback. Escalation is guarded behind a non-None
+    callback (callback=None → visibility-only, no exception, existing tests
+    still green).
+
+    This is RED today because the degraded branch only calls _note_external_hold
+    and returns — it never touches _on_external_dep_block.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(
+            max_per_module=1,
+            max_external_dep_unresolved_cycles=2,
+        )
+        return Scheduler(config)
+
+    def _pending_task(self) -> dict:
+        return {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_no_escalation(self, scheduler: Scheduler):
+        """1 degraded tick (< threshold=2) must NOT invoke _on_external_dep_block."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_at_threshold_escalates(self, scheduler: Scheduler):
+        """2 consecutive degraded ticks (== threshold=2) must invoke callback exactly once.
+
+        The callback must be called with:
+        - summary containing 'EXTERNAL_DEP_RESOLVER_DEGRADED'
+        - category='infra_issue'
+        """
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # Tick 1 — below threshold
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+        callback.assert_not_called()
+
+        # Tick 2 — reaches threshold → must escalate
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+
+        callback.assert_called_once()
+        call_kwargs = callback.call_args
+        args = call_kwargs.args if call_kwargs.args else ()
+        kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
+
+        # task_id must be '10'
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == '10', (
+            f'Expected task_id="10"; got {task_id_arg!r}'
+        )
+
+        # summary must carry EXTERNAL_DEP_RESOLVER_DEGRADED prefix
+        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
+        assert 'EXTERNAL_DEP_RESOLVER_DEGRADED' in str(summary_arg), (
+            f'Expected EXTERNAL_DEP_RESOLVER_DEGRADED in summary; got {summary_arg!r}'
+        )
+
+        # category must be 'infra_issue'
+        category_arg = kwargs.get('category')
+        assert category_arg == 'infra_issue', (
+            f'Expected category="infra_issue"; got {category_arg!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_on_clean_tick(self, scheduler: Scheduler):
+        """A non-degraded tick between degraded ticks must reset the consecutive streak.
+
+        Drive: degraded tick 1, clean tick 2 (resolver OK), degraded tick 3.
+        Because the clean tick resets the streak, only 1 consecutive degraded tick
+        occurs after the reset — threshold=2 is never reached — so the callback
+        must NOT be called.
+        """
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # Tick 1 — degraded (streak=1, below threshold=2)
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+        callback.assert_not_called()
+
+        # Tick 2 — clean (resolver OK, dep live) → must reset the streak
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'dark_factory:5': 'pending'},
+            external_err=None,
+        )
+        callback.assert_not_called()
+
+        # Tick 3 — degraded again (streak restarts at 1, below threshold=2)
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+
+        # The clean tick reset the streak, so threshold was never reached
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_callback_none_falls_through_to_visibility_hold(
+        self, scheduler: Scheduler
+    ):
+        """callback=None at threshold: logs warning, no exception, falls through to _note_external_hold.
+
+        When _on_external_dep_block is None (the default) and count reaches
+        threshold, the implementation must NOT raise.  It must fall through to
+        _note_external_hold so the existing visibility-only (gate_held event)
+        path continues to fire — preserving the behaviour of the three existing
+        TestExternalDepGateHeld_ResolverDegraded tests.
+        """
+        # Leave _on_external_dep_block as None (default).
+        assert scheduler._on_external_dep_block is None
+        task = self._pending_task()
+
+        # Wire an event_store to verify the gate_held event is still emitted.
+        scheduler.event_store = _RecordingEventStore()  # type: ignore[assignment]
+
+        # Drive threshold ticks with callback=None — must not raise.
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {},
+                ExternalResolverError('persistent'),
+            )
+
+        # The gate_held event must have been emitted (visibility still works).
+        gate_held = [
+            (evt, data)
+            for evt, data in scheduler.event_store.events  # type: ignore[union-attr]
+            if evt == str(EventType.external_dep_gate_held)
+        ]
+        assert len(gate_held) == 1, (
+            f'Expected 1 gate_held event from callback=None fall-through; got {gate_held!r}'
+        )
+        assert gate_held[0][1]['data']['cause'] == 'resolver_degraded'
+
+    @pytest.mark.asyncio
+    async def test_counter_pops_on_escalation_so_persistent_outage_refiles(
+        self, scheduler: Scheduler
+    ):
+        """After escalation the counter is popped; next threshold crossing fires again.
+
+        A persistent (never-recovering) resolver outage must re-fire every
+        threshold ticks so the human is reminded if the first escalation is
+        dismissed without fixing the root cause.
+        """
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # First crossing (ticks 1-2 with threshold=2) → escalates once.
+        for _ in range(2):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {},
+                ExternalResolverError('persistent'),
+            )
+        callback.assert_called_once()
+        callback.reset_mock()
+
+        # Second crossing (ticks 3-4, counter was popped so restarts at 0) → fires again.
+        for _ in range(2):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {},
+                ExternalResolverError('persistent'),
+            )
+        callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_hold_streak_cleared_on_escalation(self, scheduler: Scheduler):
+        """Escalation must pop _external_hold_streak / _external_hold_cause.
+
+        After the threshold is reached and _on_external_dep_block is awaited,
+        the hold streak and cause entries for the task must be absent so that no
+        spurious external_dep_gate_held event fires for the now-blocked task.
+        """
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # Pre-populate a hold streak to make the assertion meaningful.
+        task_id = str(task['id'])
+        scheduler._external_hold_streak[task_id] = 5
+        scheduler._external_hold_cause[task_id] = 'resolver_degraded'
+
+        # Drive to threshold → escalation fires.
+        threshold = scheduler.config.max_external_dep_unresolved_cycles
+        for _ in range(threshold):
+            await scheduler._apply_external_dep_policy(
+                [task],
+                {},
+                ExternalResolverError('persistent'),
+            )
+
+        callback.assert_called_once()
+        assert task_id not in scheduler._external_hold_streak, (
+            f'_external_hold_streak must be cleared after escalation; '
+            f'got {scheduler._external_hold_streak!r}'
+        )
+        assert task_id not in scheduler._external_hold_cause, (
+            f'_external_hold_cause must be cleared after escalation; '
+            f'got {scheduler._external_hold_cause!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_multiple_tasks_escalate_in_one_tick(self, scheduler: Scheduler):
+        """A resolver outage affects all pending tasks with external_deps simultaneously.
+
+        When external_err is set for a tick that crosses the threshold for N
+        tasks, all N tasks must be escalated in that same tick — one callback
+        call per task.
+        """
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+
+        task_a = {
+            'id': 'A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['proj:1']},
+        }
+        task_b = {
+            'id': 'B',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['proj:2']},
+        }
+        tasks = [task_a, task_b]
+
+        # Drive both tasks to threshold (2 consecutive degraded ticks).
+        for _ in range(2):
+            await scheduler._apply_external_dep_policy(
+                tasks,
+                {},
+                ExternalResolverError('outage'),
+            )
+
+        # Both tasks must have been escalated.
+        assert callback.call_count == 2, (
+            f'Expected callback called once per task (2 total); got {callback.call_count}'
+        )
+        escalated_ids = {call.args[0] for call in callback.call_args_list}
+        assert escalated_ids == {'A', 'B'}, (
+            f'Expected both task ids escalated; got {escalated_ids!r}'
+        )
