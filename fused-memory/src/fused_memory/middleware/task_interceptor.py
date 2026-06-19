@@ -1442,9 +1442,27 @@ class TaskInterceptor:
         shape (None / JSON-string / dict / unparseable → fresh dict when None
         or unparseable) before writing the key, so the result is always a
         plain dict ready for JSON serialisation.
+
+        **Data loss note**: when *metadata* is non-None but cannot be parsed
+        as a JSON-object (e.g. a bare list, an unparseable string), the
+        original value is discarded and a fresh dict is used.  A WARNING is
+        emitted in that case so the loss is visible in logs and greppable.
+        Without an override the same malformed metadata is stored as-is in
+        the ticket blob, so enabling an override would otherwise silently
+        change behaviour for such inputs.
         """
         meta = TaskInterceptor._extract_metadata_dict(metadata)
-        meta = {} if meta is None else dict(meta)  # shallow copy — don't mutate the caller's dict
+        if meta is None:
+            if metadata is not None:
+                logger.warning(
+                    'routing-override: non-dict metadata discarded (type=%s); '
+                    'using fresh dict. Original value: %r',
+                    type(metadata).__name__,
+                    metadata,
+                )
+            meta = {}
+        else:
+            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
         meta['routing_override_reason'] = reason
         return meta
 

@@ -4313,6 +4313,14 @@ class TestSubmitTaskGuardrail:
             f'Expected routing_override_reason in metadata, got: {meta!r}'
         )
 
+        # Pin the no-leak invariant: routing_override_reason must NEVER appear
+        # in blob['kwargs'] (it must be popped from kwargs before serialisation
+        # so it never reaches tm.add_task as an unknown argument).
+        blob_kwargs = blob.get('kwargs', {})
+        assert 'routing_override_reason' not in blob_kwargs, (
+            f'routing_override_reason must not leak into blob kwargs, got: {blob_kwargs!r}'
+        )
+
     @pytest.mark.asyncio
     async def test_submit_task_routing_override_absent_still_rejects(
         self,
@@ -4343,6 +4351,48 @@ class TestSubmitTaskGuardrail:
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_routing_override_with_planning_mode_records_reason(
+        self,
+        interceptor_with_store,
+        taskmaster,
+    ):
+        """routing_override_reason + planning_mode=True: guard is bypassed and
+        the reason is persisted in the planning-mode task metadata.
+
+        The planning_mode branch re-normalises metadata via
+        _submit_task_planning_mode, so this test exercises the
+        override+planning interaction that is otherwise unverified.
+
+        Asserts:
+        - Returns planning_mode=True dict (no error_type)
+        - taskmaster.add_task was called with routing_override_reason in metadata
+        """
+        REASON = 'owner confirmed this is cross-cutting'
+        result = await interceptor_with_store.submit_task(
+            project_root='/some-other-project',
+            title='Investigate orchestrator/harness.py deadlock',
+            description='harness deadlock',
+            planning_mode=True,
+            routing_override_reason=REASON,
+        )
+
+        assert 'error_type' not in result, (
+            f'Expected no error with routing override + planning_mode, got: {result}'
+        )
+        assert result.get('planning_mode') is True, (
+            f'Expected planning_mode=True in result, got: {result}'
+        )
+
+        # Verify reason is in the metadata passed to taskmaster.add_task
+        taskmaster.add_task.assert_called_once()
+        metadata_arg = taskmaster.add_task.call_args.kwargs.get('metadata')
+        assert metadata_arg is not None, 'add_task must be called with metadata'
+        decoded = json.loads(metadata_arg)
+        assert decoded.get('routing_override_reason') == REASON, (
+            f'Expected routing_override_reason in planning-mode metadata, got: {decoded!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
