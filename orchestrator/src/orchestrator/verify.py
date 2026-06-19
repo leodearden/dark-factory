@@ -1193,9 +1193,17 @@ def scope_module_config(
     # mc.test_command.  Passing conftest.py directly to pytest finds 0 tests
     # (pytest >= 9 exits 1 with "no tests ran").
     has_conftest = any(_is_conftest(f) for f in scoped)
-    # conftest.py is already excluded by _is_test_file at any depth;
-    # conftest files are handled by the has_conftest branch above.
-    test_files = [f for f in scoped if _is_test_file(f)]
+    # Narrow: only test_*.py / *_test.py files pytest will actually collect.
+    # A data module under tests/ (e.g. silent_fallthrough_allowlist.py) is in
+    # the test tree (_is_test_file) but NOT collectable — passing it to pytest
+    # produces rc=5 ("no tests ran") → RED.  Task 1852 fixes this at the
+    # scoping layer; the classifier (_classify_failure) is left untouched.
+    collectable_tests = [f for f in scoped if _is_collectable_test_file(f)]
+    # has_test_data: in-tree (test-tree member) but not collectable — mirrors
+    # has_conftest: fall back to the full owning-package suite (mc.test_command).
+    has_test_data = any(
+        _is_test_file(f) and not _is_collectable_test_file(f) for f in scoped
+    )
 
     # Detect structural files (Protocol/TypedDict definitions) when we have a
     # worktree to read from.  File-scoped pyright misses cross-file invariance
@@ -1231,12 +1239,15 @@ def scope_module_config(
     else:
         type_cmd = _strip_directory_flag(
             _scope_command(mc.type_check_command, 'pyright', scoped), mc.prefix)
-    if has_conftest:
-        # Full unscoped suite: conftest changes affect everything it shadows.
+    if has_conftest or has_test_data:
+        # Full unscoped suite: conftest changes affect everything it shadows;
+        # data-module changes (e.g. a σ-allowlist re-baseline) are consumed by
+        # tests we cannot enumerate from the path alone, so the full suite is
+        # the only safe scope.  Both branches mirror each other (task 1852).
         test_cmd = mc.test_command
-    elif test_files:
+    elif collectable_tests:
         test_cmd = _strip_directory_flag(
-            _scope_command(mc.test_command, 'pytest', test_files), mc.prefix)
+            _scope_command(mc.test_command, 'pytest', collectable_tests), mc.prefix)
     else:
         test_cmd = None
 
