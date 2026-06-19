@@ -1085,14 +1085,23 @@ class GitOps:
             )
             return False
 
-    async def refresh_warm_base(self) -> bool:
+    async def refresh_warm_base(self, landed_commit: str | None = None) -> bool:
         """Advance the rolling warm base by running the refresh script.
 
-        Invokes ``<_merge-verify>/scripts/refresh-warm-base.sh <advancing> <base>``
-        where:
+        Invokes ``<_merge-verify>/scripts/refresh-warm-base.sh <advancing> <base>
+        [--landed-commit <sha>]`` where:
         - *advancing* = ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
           (the _merge-verify lane's target — the warm build of the just-landed commit)
         - *base* = ``warm_lane_base_target_path`` (the configured rolling base)
+        - ``--landed-commit <sha>`` (D10) — appended when *landed_commit* is truthy.
+
+        **D10 --landed-commit derivation**: when *landed_commit* is ``None`` (the
+        default), it is derived from ``git rev-parse HEAD`` in the _merge-verify
+        worktree (fail-soft: if rev-parse fails the flag is omitted).  The refresh
+        only fires for the _merge-verify lane (merge_queue.py gate), whose HEAD IS
+        the just-landed commit — the derived sha is exactly what reify's inv.9
+        HEAD-match guard expects.  The optional *landed_commit* parameter allows
+        deterministic test injection.
 
         **inv.9 promote-provenance** is enforced STRUCTURALLY: the advancing dir
         is hardcoded to the _merge-verify target and no caller-supplied advancing
@@ -1132,9 +1141,27 @@ class GitOps:
                 )
                 return False
 
-            rc, _, err = await _run(
-                [str(script), str(advancing), str(base)],
-                cwd=self.persistent_merge_worktree_path,
+            # D10: derive --landed-commit from HEAD of the _merge-verify worktree
+            # (fail-soft: rev-parse failure omits the flag rather than blocking).
+            if landed_commit is None:
+                rc_h, head_out, _ = await _run(
+                    ['git', 'rev-parse', 'HEAD'],
+                    cwd=self.persistent_merge_worktree_path,
+                )
+                if rc_h == 0 and head_out.strip():
+                    landed_commit = head_out.strip()
+                else:
+                    logger.debug(
+                        'refresh_warm_base: could not derive HEAD from %s (rc=%d) — '
+                        'omitting --landed-commit flag',
+                        self.persistent_merge_worktree_path, rc_h,
+                    )
+
+            argv = [str(script), str(advancing), str(base)]
+            if landed_commit:
+                argv += ['--landed-commit', landed_commit]
+
+            rc, _, err = await _run(argv, cwd=self.persistent_merge_worktree_path,
             )
             if rc != 0:
                 logger.warning(
