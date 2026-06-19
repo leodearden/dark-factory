@@ -84,13 +84,12 @@ class TestJcodemunchLaunchPinned:
 
         assert 'JCODEMUNCH_NO_VERSION_HINT' in JCODEMUNCH_ENV
 
-    def test_mcp_config_json_uses_constants(self):
+    def test_mcp_config_json_uses_constants(self, mock_orch_config):
         """mcp_config_json() jcodemunch entry matches constants (regression guard)."""
         from orchestrator.mcp_lifecycle import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV, McpLifecycle
 
-        cfg = MagicMock()
-        cfg.url = 'http://localhost:8000'
-        lifecycle = McpLifecycle(cfg)
+        mock_orch_config.fused_memory.url = 'http://localhost:8000'
+        lifecycle = McpLifecycle(mock_orch_config)
         out = lifecycle.mcp_config_json()
 
         jc = out['mcpServers']['jcodemunch']
