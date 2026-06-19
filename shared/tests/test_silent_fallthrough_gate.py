@@ -447,7 +447,7 @@ class TestSignatureBNegatives:
 from pathlib import Path
 
 from silent_fallthrough_scan import iter_first_party_files  # noqa: E402
-from silent_fallthrough_allowlist import ALLOWLIST  # noqa: E402
+from silent_fallthrough_allowlist import ALLOWLIST, ALLOWLIST_ENTRIES  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -545,4 +545,103 @@ class TestWholeTreeGate:
                 "Fix the violation (preferred) or add a documented entry to\n"
                 "shared/tests/silent_fallthrough_allowlist.py (non-silent, with reason).\n"
                 f"\nOffending sites ({len(non_baseline)}):\n{offender_list}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — Allowlist integrity tests
+# ---------------------------------------------------------------------------
+
+
+class TestAllowlistIntegrity:
+    """The allowlist baseline must be minimal, current, and fully documented.
+
+    These tests enforce the ratchet: as violations are fixed, stale allowlist
+    entries cause a failure here, forcing the baseline to shrink.
+    """
+
+    def _collect_tree_violations(self) -> dict[tuple[str, int], "Violation"]:
+        """Run the scanner over the first-party tree and index by (filename, lineno)."""
+        result: dict[tuple[str, int], Violation] = {}
+        for filepath in iter_first_party_files(_REPO_ROOT):
+            source = filepath.read_text(encoding="utf-8", errors="replace")
+            rel = str(filepath.relative_to(_REPO_ROOT))
+            for v in find_violations(source, rel):
+                result[(v.filename, v.lineno)] = v
+        return result
+
+    def test_every_entry_has_nonempty_reason(self):
+        """No allowlist entry may have a blank reason (that would be a silent exemption)."""
+        blank = [
+            f"{relpath}:{lineno} ({qualname})"
+            for relpath, lineno, qualname, reason in ALLOWLIST_ENTRIES
+            if not reason.strip()
+        ]
+        if blank:
+            raise AssertionError(
+                "Allowlist entries with blank reason strings — add a reason:\n"
+                + "\n".join(f"  {e}" for e in blank)
+            )
+
+    def test_every_entry_relpath_exists(self):
+        """Every allowlist relpath must point to an existing file under repo root."""
+        missing = [
+            f"{relpath}:{lineno}"
+            for relpath, lineno, _qualname, _reason in ALLOWLIST_ENTRIES
+            if not (_REPO_ROOT / relpath).is_file()
+        ]
+        if missing:
+            raise AssertionError(
+                "Allowlist entries referencing non-existent files:\n"
+                + "\n".join(f"  {e}" for e in missing)
+            )
+
+    def test_every_entry_qualname_is_parseable(self):
+        """Every qualname must be a valid dotted Python identifier or '<module>'."""
+        import re
+        # Valid: 'foo', 'Foo.bar', 'A.B.c._d', '<module>'
+        _DOTTED_IDENT = re.compile(r'^(?:<module>|[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)$')
+        invalid = [
+            f"{relpath}:{lineno} qualname={qualname!r}"
+            for relpath, lineno, qualname, _reason in ALLOWLIST_ENTRIES
+            if not _DOTTED_IDENT.match(qualname)
+        ]
+        if invalid:
+            raise AssertionError(
+                "Allowlist entries with unparseable qualnames:\n"
+                + "\n".join(f"  {e}" for e in invalid)
+            )
+
+    def test_no_duplicate_entries(self):
+        """No two allowlist entries should share the same (relpath, lineno)."""
+        seen: set[tuple[str, int]] = set()
+        dupes: list[str] = []
+        for relpath, lineno, qualname, _reason in ALLOWLIST_ENTRIES:
+            key = (relpath, lineno)
+            if key in seen:
+                dupes.append(f"{relpath}:{lineno} ({qualname})")
+            seen.add(key)
+        if dupes:
+            raise AssertionError(
+                "Duplicate allowlist entries (same relpath:lineno):\n"
+                + "\n".join(f"  {e}" for e in dupes)
+            )
+
+    def test_no_stale_entries(self):
+        """Every allowlist entry must correspond to a real violation in the current tree.
+
+        If a violation is fixed, the allowlist entry becomes stale.  This test
+        fails on stale entries, forcing the baseline to shrink as code improves.
+        """
+        tree_violations = self._collect_tree_violations()
+        stale = [
+            f"{relpath}:{lineno} ({qualname}) — {reason[:60]}"
+            for relpath, lineno, qualname, reason in ALLOWLIST_ENTRIES
+            if (relpath, lineno) not in tree_violations
+        ]
+        if stale:
+            raise AssertionError(
+                "Stale allowlist entries: the violation no longer exists in the source tree.\n"
+                "Remove these entries from shared/tests/silent_fallthrough_allowlist.py:\n"
+                + "\n".join(f"  {e}" for e in stale)
             )
