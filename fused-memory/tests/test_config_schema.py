@@ -733,6 +733,9 @@ class TestPathScopeAdjudicatorConfigBudget:
         yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
         assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
         monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        # config.yaml currently has no path_scope_adjudicator section, so today
+        # this test exercises the default-fallback path (schema default = 0.30).
+        # It will catch a future YAML edit that explicitly pins the budget below cost.
         cfg = FusedMemoryConfig()
         assert cfg.path_scope_adjudicator.max_budget_usd >= 0.25, (
             f'Effective path_scope_adjudicator.max_budget_usd (got '
