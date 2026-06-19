@@ -192,7 +192,9 @@ class TwoProjectMcpSession:
             else:
                 statuses[dep] = task_status
 
-        return self._envelope(json.dumps({'statuses': statuses}))
+        # Flat shape: producer returns a bare {dep: status} dict — no 'statuses' wrapper.
+        # Mirrors fused-memory tools.py get_external_statuses: `return result` (line 2231).
+        return self._envelope(json.dumps(statuses))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,17 +291,19 @@ def escalations_for(harness: Harness, task_id: str) -> list:
 async def _call_get_external_statuses(
     session: TwoProjectMcpSession, deps: list[str]
 ) -> dict:
-    """Call session.call_tool('get_external_statuses', ...) and extract statuses.
+    """Call session.call_tool('get_external_statuses', ...) and return the status dict.
 
-    Parses the JSON-RPC text-content envelope, returns the inner 'statuses' dict.
+    Parses the JSON-RPC text-content envelope.  The producer returns a FLAT
+    {dep: status} dict — no 'statuses' wrapper (mirrors the real tool contract;
+    see TwoProjectMcpSession._get_external_statuses).
     Raises NotImplementedError when the branch is not yet implemented (S1 RED phase).
     """
     result = await session.call_tool(
         'get_external_statuses', {'deps': deps}
     )
     text = result['result']['content'][0]['text']
-    payload = json.loads(text)
-    return payload['statuses']
+    # Flat shape: payload IS the {dep: status} dict (no 'statuses' wrapper).
+    return json.loads(text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
