@@ -1736,6 +1736,11 @@ class Scheduler:
             external_deps: list = (
                 (task.get('metadata') or {}).get('external_deps') or []
             )
+            # Resolver succeeded this tick → reset the resolver-degraded
+            # consecutive-tick streak so only CONSECUTIVE degraded ticks count
+            # toward escalation.  A transient blip that self-heals never
+            # escalates (task 1855 — prefer-loud backstop).
+            self._external_resolver_degraded_counts.pop(task_id, None)
             # Track whether any dep left this task held in a live (non-done,
             # non-sentinel) status this tick — used to drive hold-streak
             # visibility after the dep loop.
