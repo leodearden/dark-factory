@@ -4173,7 +4173,7 @@ class TestBuildFallbackConfigDataModule:
         module's parent dir risks rc=5 too (a fixtures dir with no tests).
         """
         config = OrchestratorConfig(
-            project_root='/fake',
+            project_root=Path('/fake'),
             test_command='pytest',
         )
         result = _build_fallback_config(['tests/some_data.py'], config)
@@ -4190,7 +4190,7 @@ class TestBuildFallbackConfigDataModule:
         path for non-default test_command in the fallback builder.
         """
         config = OrchestratorConfig(
-            project_root='/fake',
+            project_root=Path('/fake'),
             test_command="uv run --extra dev pytest -m 'not slow'",
         )
         result = _build_fallback_config(['tests/some_data.py'], config)
