@@ -3771,6 +3771,15 @@ class TestShouldArchiveCategory:
         """'' (empty) → False."""
         assert self._should_archive('') is False
 
+    def test_pytest_internalerror_not_archived(self):
+        """'pytest_internalerror' ends with '_error' but is in deny-list → False.
+
+        An xdist worker-kill INTERNALERROR is infra noise, not human-triage content.
+        The sweep already retries on this category (returns None sentinel); archiving
+        it would create spurious human-triage artifacts for transient crashes.
+        """
+        assert self._should_archive('pytest_internalerror') is False
+
 
 class TestBuildFallbackConfigConftest:
     """`_build_fallback_config` handles conftest.py correctly.

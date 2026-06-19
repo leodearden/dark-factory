@@ -362,7 +362,13 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
 # Categories that must NOT be auto-archived even though they end with '_error'.
 # compile_error is handled by the debugger (type annotations, missing imports);
 # the human triage criterion is "a human, not a debugger, has to look".
-_ARCHIVE_DENY_LIST = frozenset({'compile_error', 'test_failure', 'infra_timeout', 'passed', ''})
+# pytest_internalerror is an infra crash (xdist worker killed by os._exit); it is
+# non-deterministic and does NOT warrant human triage — the sweep already retries it.
+# test_failure is handled by the debugger (self-correcting); compile_error likewise.
+_ARCHIVE_DENY_LIST = frozenset({
+    'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
+    'pytest_internalerror',
+})
 
 # Ordered from highest to lowest severity; used by ``_worst_category``.
 # Categories absent from this list (e.g. custom ones) sort lower than all listed.
@@ -390,6 +396,9 @@ _CATEGORY_PRIORITY: list[str] = [
 PREEXISTING_BREAK_SKIP_CATEGORIES: frozenset[str] = frozenset({
     'infra_timeout',
     'flock_error',
+    # pytest_internalerror: xdist worker was killed by os._exit — non-deterministic,
+    # so re-probing main is not a reliable signal.  The sweep already retries it.
+    'pytest_internalerror',
 })
 
 # Process-wide cache for main-probe results: avoids redundant worktree-add +
@@ -2859,7 +2868,9 @@ async def run_main_tip_sweep(
         if result.category == 'pytest_internalerror':
             logger.warning(
                 'run_main_tip_sweep: pytest INTERNALERROR in sweep — '
-                'treating as infra crash, not drift (retrying next tick)'
+                'treating as infra crash, not drift (retrying next tick); '
+                'cause_hint=%r',
+                result.cause_hint,
             )
             return None
 
