@@ -8617,3 +8617,106 @@ class TestCarriesSubstrateProbe:
         assert assignment.task_id == '42'
         # The task dict is unchanged — acquire_next does not remove substrate_probe
         assert assignment.task['metadata']['substrate_probe']['probe_set'] == 'probes/suite.json'
+
+
+# ---------------------------------------------------------------------------
+# TestExternalDepResolverDegradedEscalation (task 1855 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+class TestExternalDepResolverDegradedEscalation:
+    """Persistent resolver_degraded holds must escalate to a human after threshold ticks.
+
+    When external_err is not None for N consecutive ticks (where N >=
+    max_external_dep_unresolved_cycles), the scheduler must invoke
+    _on_external_dep_block with:
+    - summary containing the 'EXTERNAL_DEP_RESOLVER_DEGRADED' prefix
+    - category='infra_issue'
+
+    Below threshold → no callback. Escalation is guarded behind a non-None
+    callback (callback=None → visibility-only, no exception, existing tests
+    still green).
+
+    This is RED today because the degraded branch only calls _note_external_hold
+    and returns — it never touches _on_external_dep_block.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(
+            max_per_module=1,
+            max_external_dep_unresolved_cycles=2,
+        )
+        return Scheduler(config)
+
+    def _pending_task(self) -> dict:
+        return {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'external_deps': ['dark_factory:5']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_no_escalation(self, scheduler: Scheduler):
+        """1 degraded tick (< threshold=2) must NOT invoke _on_external_dep_block."""
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_at_threshold_escalates(self, scheduler: Scheduler):
+        """2 consecutive degraded ticks (== threshold=2) must invoke callback exactly once.
+
+        The callback must be called with:
+        - summary containing 'EXTERNAL_DEP_RESOLVER_DEGRADED'
+        - category='infra_issue'
+        """
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # Tick 1 — below threshold
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+        callback.assert_not_called()
+
+        # Tick 2 — reaches threshold → must escalate
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+
+        callback.assert_called_once()
+        call_kwargs = callback.call_args
+        args = call_kwargs.args if call_kwargs.args else ()
+        kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
+
+        # task_id must be '10'
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == '10', (
+            f'Expected task_id="10"; got {task_id_arg!r}'
+        )
+
+        # summary must carry EXTERNAL_DEP_RESOLVER_DEGRADED prefix
+        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
+        assert 'EXTERNAL_DEP_RESOLVER_DEGRADED' in str(summary_arg), (
+            f'Expected EXTERNAL_DEP_RESOLVER_DEGRADED in summary; got {summary_arg!r}'
+        )
+
+        # category must be 'infra_issue'
+        category_arg = kwargs.get('category')
+        assert category_arg == 'infra_issue', (
+            f'Expected category="infra_issue"; got {category_arg!r}'
+        )
