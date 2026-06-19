@@ -71,6 +71,19 @@ def parse_pressure_file(text: str) -> dict[str, float] | None:
         legitimate kernel behaviour, not a fault.  Only a *total* miss (neither
         key extracted) returns ``None`` so ``collect_psi`` can distinguish a
         read/parse fault from genuine zero pressure.
+
+    Note on asymmetry:
+        The kernel **always** emits a ``some`` line for all PSI resources; the
+        ``full`` line is the one that may be omitted (e.g. CPU on some kernels).
+        Therefore the partial-miss case is always *some-present / full-absent*,
+        and a *full-present / some-absent* result is not a legitimate kernel
+        state.  If that impossible case were ever produced (e.g. by a
+        kernel change or filesystem stub), the current logic would fabricate
+        ``some_avg10=0.0``.  This is documented here as a known asymmetry; the
+        sentinel (``None``) is not triggered in that case because ``found``
+        becomes ``True`` via the ``full`` branch.  Should the kernel contract
+        shift, a separate ``found_some`` guard should be added mirroring the
+        ``full`` handling.
     """
     result: dict[str, float] = {'some_avg10': 0.0, 'full_avg10': 0.0}
     found = False
