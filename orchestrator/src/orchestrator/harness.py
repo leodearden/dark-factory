@@ -2095,14 +2095,40 @@ Output JSON matching the schema. Every task must appear in the output.
                 # test (tip == branch_base_sha, NOT rev-list==0 — see its
                 # docstring) and is shared with Guard 3 below.
                 if await self._branch_is_degenerate(branch, metadata):
+                    # A degenerate branch (tip == branch_base_sha) carries ZERO
+                    # task work, so is_ancestor==True is a false "already on
+                    # main" signal — nothing landed.  #1823 added this guard to
+                    # suppress a spurious reconcile_citation_missing escalation
+                    # for provisioning-only branches, but `return None` here
+                    # ALSO stranded any in-progress task whose agent died after
+                    # provisioning but before its first commit (the task-2992
+                    # incident: agent killed mid-execute by a restart, no
+                    # commit, branch base still on main → trapped here forever,
+                    # neither reverted nor escalated).  Recover it: an
+                    # in-progress incarnation with no live claimant is reverted
+                    # to pending so the scheduler re-dispatches it.  'blocked'
+                    # keeps the leave-alone behaviour (blocked discipline: never
+                    # blocked→pending; only →done on positive evidence, which a
+                    # degenerate branch is not).
+                    self._reconcile_skip_counts.pop(tid, None)
+                    if status == 'in-progress':
+                        logger.info(
+                            'Reconcile: task %s branch is degenerate (zero '
+                            'commits beyond main; tip == branch_base_sha %s); '
+                            'reverting stranded in-progress to pending '
+                            '(provisioning-only branch, no work landed)',
+                            tid, metadata.get('branch_base_sha'),
+                        )
+                        return await self._revert_in_progress_if_no_live_claimant(
+                            tid, mid_run=mid_run,
+                        )
                     logger.info(
                         'Reconcile: task %s branch is degenerate '
                         '(zero commits beyond main; tip == branch_base_sha %s); '
                         'skipping citation-missing escalation '
-                        '(provisioning-only branch)',
-                        tid, metadata.get('branch_base_sha'),
+                        '(provisioning-only branch, status=%s)',
+                        tid, metadata.get('branch_base_sha'), status,
                     )
-                    self._reconcile_skip_counts.pop(tid, None)
                     return None
                 # -------------------------------------------------------
 
@@ -2131,10 +2157,29 @@ Output JSON matching the schema. Every task must appear in the output.
             # check (missing / malformed base SHA → returns False →
             # fall through to flip, preserving backward compat).
             if await self._branch_is_degenerate(branch, metadata):
+                # Citation found but the branch is degenerate (tip ==
+                # branch_base_sha): the on-main citation belongs to a PRIOR
+                # incarnation under this task id — the current incarnation
+                # produced no commits.  Same recovery as the Guard-2 degenerate
+                # path: revert a live-claimant-less in-progress incarnation to
+                # pending; leave 'blocked' intact (blocked discipline).
+                if status == 'in-progress':
+                    self._reconcile_skip_counts.pop(tid, None)
+                    logger.info(
+                        'Reconcile: task %s branch tip == branch_base_sha (%s); '
+                        'branch never advanced past creation — reverting '
+                        'stranded in-progress to pending (on-main citation '
+                        'belongs to a prior incarnation)',
+                        tid, metadata.get('branch_base_sha'),
+                    )
+                    return await self._revert_in_progress_if_no_live_claimant(
+                        tid, mid_run=mid_run,
+                    )
                 logger.info(
                     'Reconcile: task %s branch tip == branch_base_sha (%s); '
-                    'branch never advanced past creation — vetoing auto-flip',
-                    tid, metadata.get('branch_base_sha'),
+                    'branch never advanced past creation — vetoing auto-flip '
+                    '(status=%s)',
+                    tid, metadata.get('branch_base_sha'), status,
                 )
                 return None
 
@@ -2306,9 +2351,34 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return None
 
-        # 'in-progress' and not on main: classify by lock state.
-        # For warm tasks the real worktree is the assigned pool lane, not
-        # worktree_base/<tid>.  _resolve_task_worktree handles both cases.
+        # 'in-progress' and not on main, no live-claimant signal yet: classify
+        # by lock state and revert to pending if no live owner.  Shared with the
+        # is_ancestor==True degenerate-provisioning-branch guards above so a
+        # never-advanced branch (the 2992 strand) is recovered, not left to sit.
+        return await self._revert_in_progress_if_no_live_claimant(
+            tid, mid_run=mid_run,
+        )
+
+    async def _revert_in_progress_if_no_live_claimant(
+        self, tid: str, *, mid_run: bool,
+    ) -> str | None:
+        """Revert a stranded in-progress task to pending when no live claimant.
+
+        Returns ``'reverted'`` (status flipped to pending) or ``None`` (left
+        intact — a live ``owner_pid`` on a startup sweep, or an unreadable lock
+        failing closed).
+
+        Extracted from ``_reconcile_one_stranded`` so the is_ancestor==True
+        degenerate-provisioning-branch guards (#1823 / the task-2992 strand)
+        can reuse the exact plan.lock liveness classification instead of
+        returning ``None`` and stranding the task in-progress forever.  Callers
+        guarantee ``status == 'in-progress'`` and that the open-L1 human-handoff
+        veto has already been checked (Guard 1 in the is_ancestor block; the
+        explicit in-progress L1 guard on the not-on-main path).
+
+        For warm tasks the real worktree is the assigned pool lane, not
+        ``worktree_base/<tid>``.  ``_resolve_task_worktree`` handles both cases.
+        """
         worktree_path = self._resolve_task_worktree(tid)
         lock_path = worktree_path / '.task' / 'plan.lock'
 

@@ -1158,6 +1158,107 @@ class TestReconcileStrandedInProgress:
             )
 
     # ------------------------------------------------------------------
+    # Degenerate-branch IN-PROGRESS recovery (#1823 follow-up / task-2992).
+    # is_ancestor==True + tip == branch_base_sha means the branch did ZERO
+    # work; an in-progress incarnation with no live claimant must be REVERTED
+    # to pending (re-dispatch), not left to sit in-progress forever.  'blocked'
+    # keeps the leave-alone discipline.
+    # ------------------------------------------------------------------
+
+    async def test_degenerate_in_progress_no_citation_reverted(
+        self, harness: Harness
+    ):
+        """Guard 2 path (the task-2992 strand): in-progress on a degenerate
+        provisioning branch (tip == branch_base_sha), no commit cites the task,
+        no live claimant → reverted to pending; NOT marked done."""
+        branch_tip = 'deadbeef' + 'a' * 32
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'id': '50', 'metadata': {'branch_base_sha': branch_tip}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'50': 'in-progress'}, None)  # type: ignore[attr-defined]
+        # No worktree dir for task 50 → no-lock orphan revert path.
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with('50', 'pending')  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        # Citation-missing escalation must NOT accrue — the task is recovered.
+        assert '50' not in harness._reconcile_skip_counts
+
+    async def test_degenerate_in_progress_no_citation_stale_lock_reverted(
+        self, harness: Harness, monkeypatch
+    ):
+        """Guard 2 path with a stale plan.lock (dead owner_pid): lock cleared and
+        in-progress task reverted to pending."""
+        branch_tip = 'deadbeef' + 'a' * 32
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'id': '8', 'metadata': {'branch_base_sha': branch_tip}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'8': 'in-progress'}, None)  # type: ignore[attr-defined]
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+        lock_dir = harness.git_ops.worktree_base / '8' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': '8-dead0001',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': 99999,
+        }))
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_called_once_with('8', 'pending')  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert not lock_path.exists()
+
+    async def test_degenerate_in_progress_with_citation_reverted(
+        self, harness: Harness
+    ):
+        """Guard 3 path: in-progress + a commit on main cites the task id BUT the
+        branch is degenerate (tip == branch_base_sha).  The citation belongs to a
+        prior incarnation; the current incarnation did no work → reverted to
+        pending, NOT marked done."""
+        branch_tip = 'deadbeef' + 'a' * 32
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+            return_value='cafefeed' + 'b' * 32
+        )
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'id': '50', 'metadata': {'branch_base_sha': branch_tip}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'50': 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with('50', 'pending')  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_degenerate_blocked_not_reverted(self, harness: Harness):
+        """Blocked discipline regression: a degenerate branch on a BLOCKED task is
+        left intact — never blocked→pending, never marked done.  Pins the revert
+        to in-progress only (the in-progress-vs-blocked branch in both guards)."""
+        branch_tip = 'deadbeef' + 'a' * 32
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'id': '50', 'metadata': {'branch_base_sha': branch_tip}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'50': 'blocked'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
     # find_merge_marker guard tests (deleted-branch fast-path)
     # ------------------------------------------------------------------
 
@@ -2372,9 +2473,22 @@ async def test_degenerate_zero_commit_branch_suppresses_citation_missing(
         f'{[getattr(s, "category", s) for s in submissions]}'
     )
 
-    # (b) No auto-flip: status must be left intact.
+    # (b) No auto-flip to done: a degenerate branch has no landed work.
     harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
-    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    # (b2) task-2992 recovery follow-up: an in-progress degenerate branch with
+    #      no live claimant must be REVERTED to pending (re-dispatch), not left
+    #      stranded in-progress forever (the pre-fix behaviour this assertion
+    #      used to lock).  The static get_statuses mock keeps returning
+    #      in-progress, so each sweep reverts — assert the action, not the count.
+    revert_calls = harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+    assert revert_calls, (
+        'degenerate in-progress task must be reverted to pending, not left stranded'
+    )
+    for call in revert_calls:
+        assert call.args == (tid, 'pending'), (
+            f'expected revert to pending, got {call.args}'
+        )
 
     # (c) Skip counter must NOT accrue strikes for a degenerate branch.
     assert tid not in harness._reconcile_skip_counts, (
