@@ -438,3 +438,111 @@ class TestSignatureBNegatives:
         """
         sig_b = [v for v in _violations(src) if _sig_b(v)]
         assert sig_b == []
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Whole-tree integration + gate self-integrity tests
+# ---------------------------------------------------------------------------
+
+from pathlib import Path
+
+from silent_fallthrough_scan import iter_first_party_files  # noqa: E402
+from silent_fallthrough_allowlist import ALLOWLIST  # noqa: E402
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+class TestGateSelfIntegrity:
+    """The gate must not silently scan 0 files (a mis-resolved root would pass trivially)."""
+
+    def test_scanned_file_count_exceeds_150(self):
+        """Expect 150+ first-party source files (215 today)."""
+        files = list(iter_first_party_files(_REPO_ROOT))
+        assert len(files) > 150, (
+            f"Only {len(files)} files found — is repo_root correct? "
+            f"({_REPO_ROOT})"
+        )
+
+    def test_known_first_party_files_are_included(self):
+        """Known first-party files must be present in the scan set."""
+        files = {str(f) for f in iter_first_party_files(_REPO_ROOT)}
+        expected = [
+            "orchestrator/src/orchestrator/scheduler.py",
+            "orchestrator/src/orchestrator/harness.py",
+            "fused-memory/src/fused_memory/services/memory_service.py",
+        ]
+        for rel in expected:
+            candidate = str(_REPO_ROOT / rel)
+            assert candidate in files, f"Expected file missing from scan: {rel}"
+
+    def test_excluded_paths_are_absent(self):
+        """Submodule dirs (mem0/, graphiti/) and tests/ are excluded."""
+        files = list(iter_first_party_files(_REPO_ROOT))
+        for f in files:
+            parts = Path(f).parts
+            assert "mem0" not in parts, f"mem0 submodule should be excluded: {f}"
+            assert "graphiti" not in parts, f"graphiti submodule should be excluded: {f}"
+            assert "tests" not in parts, f"tests/ dirs should be excluded: {f}"
+            assert not Path(f).name.startswith("test_"), f"test_ files should be excluded: {f}"
+            assert Path(f).name != "conftest.py", f"conftest.py should be excluded: {f}"
+
+
+class TestWholeTreeGate:
+    """Whole-tree gate: no non-allowlisted violations on the migrated tree."""
+
+    def test_no_unparseable_files(self):
+        """All first-party Python files must parse without SyntaxError."""
+        parse_failures: list[str] = []
+        for filepath in iter_first_party_files(_REPO_ROOT):
+            source = filepath.read_text(encoding="utf-8", errors="replace")
+            try:
+                import ast
+                ast.parse(source, filename=str(filepath))
+            except SyntaxError as e:
+                parse_failures.append(f"{filepath}: {e}")
+        if parse_failures:
+            raise AssertionError(
+                "Files failed to parse (fix syntax errors or exclude them):\n"
+                + "\n".join(f"  {p}" for p in sorted(parse_failures))
+            )
+
+    def test_no_violations_outside_allowlist(self):
+        """The set of violations across the first-party tree must be empty
+        after subtracting the documented baseline ALLOWLIST.
+
+        Any new violation means a silent-fallthrough-on-error was introduced.
+        Either fix it (preferred) or add a documented entry to ALLOWLIST.
+        """
+        # Collect all violations
+        all_violations: list[Violation] = []
+        for filepath in iter_first_party_files(_REPO_ROOT):
+            source = filepath.read_text(encoding="utf-8", errors="replace")
+            rel = str(filepath.relative_to(_REPO_ROOT))
+            violations = find_violations(source, rel)
+            all_violations.extend(violations)
+
+        # Build allowlist key set — keys are (relpath, qualname) or a frozenset
+        # of allowlist entries.  We check by (filename, lineno) pair since
+        # qualname computation requires the allowlist module's helper.
+        # The allowlist maps (relpath, qualname) → reason; we compare by
+        # (relpath, lineno) to avoid re-implementing qualname resolution here.
+        # The allowlist module exposes a ALLOWLIST_VIOLATIONS set of
+        # (relpath, lineno) pairs for gate-time matching.
+        from silent_fallthrough_allowlist import ALLOWLIST_VIOLATIONS
+
+        non_baseline = [
+            v for v in all_violations
+            if (v.filename, v.lineno) not in ALLOWLIST_VIOLATIONS
+        ]
+
+        if non_baseline:
+            offender_list = "\n".join(
+                f"  {v.filename}:{v.lineno} [sig-{v.signature}] {v.message}"
+                for v in sorted(non_baseline, key=lambda v: (v.filename, v.lineno))
+            )
+            raise AssertionError(
+                "Silent-fallthrough violations found outside the baseline allowlist.\n"
+                "Fix the violation (preferred) or add a documented entry to\n"
+                "shared/tests/silent_fallthrough_allowlist.py (non-silent, with reason).\n"
+                f"\nOffending sites ({len(non_baseline)}):\n{offender_list}"
+            )
