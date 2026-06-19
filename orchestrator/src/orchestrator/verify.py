@@ -57,7 +57,13 @@ def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str 
 
 
 def _is_test_file(path: str) -> bool:
-    """Return True for concrete test files (test_*.py, *_test.py, anything under tests/).
+    """Return True for test-tree members (test_*.py, *_test.py, anything under tests/).
+
+    This is the BROAD test-tree-membership predicate: a file that is True here
+    means the test tree was touched and tests should run.  It is distinct from
+    ``_is_collectable_test_file`` (the narrow pytest-collectability predicate):
+    a data module under tests/ is a test-tree member but NOT collectable (passing
+    it to pytest produces rc=5 "no tests ran").
 
     Returns False for conftest.py at any depth — conftest files are not directly
     runnable by pytest, so excluding them here means callers can pass the result
@@ -73,6 +79,22 @@ def _is_test_file(path: str) -> bool:
         )
         and not _is_conftest(path)
     )
+
+
+def _is_collectable_test_file(path: str) -> bool:
+    """Return True for files pytest will actually collect when passed as a target.
+
+    Narrow predicate: only ``test_*.py`` and ``*_test.py`` (minus conftest).
+    A data module under tests/ (e.g. ``shared/tests/silent_fallthrough_allowlist.py``)
+    satisfies ``_is_test_file`` (test-tree membership) but NOT this predicate
+    because its filename is not in the ``test_*`` / ``*_test`` convention —
+    passing it to pytest produces rc=5 ("no tests ran").
+
+    Distinct from ``_is_test_file`` (test-tree membership, broad).
+    Task 1852: scoping builders must use this predicate for pytest targets.
+    """
+    name = path.rsplit('/', 1)[-1]
+    return (name.startswith('test_') or name.endswith('_test.py')) and not _is_conftest(path)
 
 
 def _is_conftest(path: str) -> bool:
