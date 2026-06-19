@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -3593,7 +3594,9 @@ class TestCreateServerStartupSweep:
         (queue.queue_dir / 'esc-9-9.json').write_text(esc.to_json())
 
         with caplog.at_level(logging.INFO, logger='escalation.sweep'):
-            create_server(queue)  # default startup_sweep=True
+            # Pin now to 2026-06-04 (~15 days after resolved_at 2026-05-20).
+            # cutoff = 2026-06-04 - 30d = 2026-05-05; 2026-05-20 > cutoff → NOT pruned.
+            create_server(queue, startup_sweep_now=datetime(2026, 6, 4, tzinfo=UTC))
 
         # Orphan was archived
         archive_path = queue.queue_dir / 'archive' / '2026-05-20' / 'esc-9-9.json'
@@ -3608,6 +3611,41 @@ class TestCreateServerStartupSweep:
             r.name == 'escalation.sweep' and r.levelno == logging.INFO
             for r in caplog.records
         ), f'Expected INFO sweep report; got: {[r.getMessage() for r in caplog.records]}'
+
+    def test_startup_sweep_now_drives_prune(self, tmp_path: Path):
+        """(a-regression) startup_sweep_now far past retention → freshly-archived dir IS pruned.
+
+        Pins now to 2026-08-01 (73 days after resolved_at 2026-05-20).
+        cutoff = 2026-08-01 - 30d = 2026-07-02; 2026-05-20 < cutoff → pruned at construction.
+        Proves the injected now genuinely reaches prune_archive through create_server —
+        guards against a future refactor that accepts startup_sweep_now but drops the threading.
+        """
+        from escalation.models import Escalation
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = Escalation(
+            id='esc-9-9',
+            task_id='9',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='orphan',
+            status='resolved',
+            resolved_at='2026-05-20T10:00:00+00:00',
+        )
+        (queue.queue_dir / 'esc-9-9.json').write_text(esc.to_json())
+
+        # now far past 30-day retention window (cutoff = 2026-07-02 > 2026-05-20 → pruned)
+        create_server(queue, startup_sweep_now=datetime(2026, 8, 1, tzinfo=UTC))
+
+        # Freshly-archived dir was pruned in the same construction call
+        assert not (queue.queue_dir / 'archive' / '2026-05-20').exists(), (
+            'Expected archive/2026-05-20 to be pruned at construction '
+            '(now far past retention window)'
+        )
+        assert not (queue.queue_dir / 'esc-9-9.json').exists(), (
+            'Orphan was not swept from root (sweep should have run before prune)'
+        )
 
     def test_startup_sweep_false_leaves_orphan_untouched(self, tmp_path: Path):
         """(b) create_server(startup_sweep=False) leaves a pre-seeded orphan in root."""
