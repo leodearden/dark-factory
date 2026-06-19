@@ -23,8 +23,6 @@ from __future__ import annotations
 
 import textwrap
 
-import pytest
-
 from silent_fallthrough_scan import (
     KNOWN_VALUE_ERROR_RESOLVERS,
     Violation,
@@ -444,10 +442,10 @@ class TestSignatureBNegatives:
 # Step 5 — Whole-tree integration + gate self-integrity tests
 # ---------------------------------------------------------------------------
 
-from pathlib import Path
+from pathlib import Path  # noqa: E402
 
+from silent_fallthrough_allowlist import ALLOWLIST_ENTRIES  # noqa: E402
 from silent_fallthrough_scan import iter_first_party_files  # noqa: E402
-from silent_fallthrough_allowlist import ALLOWLIST, ALLOWLIST_ENTRIES  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -560,7 +558,7 @@ class TestAllowlistIntegrity:
     entries cause a failure here, forcing the baseline to shrink.
     """
 
-    def _collect_tree_violations(self) -> dict[tuple[str, int], "Violation"]:
+    def _collect_tree_violations(self) -> dict[tuple[str, int], Violation]:
         """Run the scanner over the first-party tree and index by (filename, lineno)."""
         result: dict[tuple[str, int], Violation] = {}
         for filepath in iter_first_party_files(_REPO_ROOT):

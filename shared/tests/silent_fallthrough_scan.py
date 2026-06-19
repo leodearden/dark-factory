@@ -26,9 +26,9 @@ References:
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator, NamedTuple
-
+from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -168,9 +168,8 @@ def _handler_returns_empty(handler: ast.ExceptHandler) -> bool:
                 # approach instead.  Actually ast.walk is a generator over a flat
                 # visit — we can't prune.  Use a targeted shallow check instead.
                 continue
-            if isinstance(stmt, ast.Return):
-                if stmt.value is None or _is_empty_literal(stmt.value):
-                    return True
+            if isinstance(stmt, ast.Return) and (stmt.value is None or _is_empty_literal(stmt.value)):
+                return True
     return False
 
 
@@ -185,14 +184,12 @@ def _handler_returns_empty_shallow(handler: ast.ExceptHandler) -> bool:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 # Do not descend into nested scopes
                 continue
-            if isinstance(stmt, ast.Return):
-                if stmt.value is None or _is_empty_literal(stmt.value):
-                    return True
+            if isinstance(stmt, ast.Return) and (stmt.value is None or _is_empty_literal(stmt.value)):
+                return True
             # Recurse into sub-statement bodies (if/else, with, try, etc.)
             for child in ast.iter_child_nodes(stmt):
-                if isinstance(child, ast.stmt):
-                    if _check_stmts([child]):
-                        return True
+                if isinstance(child, ast.stmt) and _check_stmts([child]):
+                    return True
         return False
 
     return _check_stmts(handler.body)
@@ -217,10 +214,7 @@ def _handler_has_warn_log(handler: ast.ExceptHandler) -> bool:
 
 def _handler_reraises(handler: ast.ExceptHandler) -> bool:
     """Return True if the handler body contains any ``raise`` statement."""
-    for node in ast.walk(handler):
-        if isinstance(node, ast.Raise):
-            return True
-    return False
+    return any(isinstance(node, ast.Raise) for node in ast.walk(handler))
 
 
 # ---------------------------------------------------------------------------
@@ -284,55 +278,53 @@ def find_violations(source: str, filename: str) -> list[Violation]:
         # ------------------------------------------------------------------ #
         # Signature (a): x, _ = [await] <resolver>(...)                      #
         # ------------------------------------------------------------------ #
-        if isinstance(node, ast.Assign):
-            if len(node.targets) == 1:
-                target = node.targets[0]
-                if (
-                    isinstance(target, ast.Tuple)
-                    and len(target.elts) == 2
-                    and isinstance(target.elts[1], ast.Name)
-                    and target.elts[1].id == "_"
-                ):
-                    callee = _callee_name(node.value)
-                    if callee in KNOWN_VALUE_ERROR_RESOLVERS:
-                        violations.append(Violation(
-                            filename=filename,
-                            lineno=node.lineno,
-                            signature="a",
-                            message=(
-                                f"discarded error slot from {callee}(...) — "
-                                f"bind the error to a named variable and "
-                                f"escalate via resolver_failed() or raise"
-                            ),
-                            qualname=_compute_qualname(node, parent_map),
-                        ))
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if (
+                isinstance(target, ast.Tuple)
+                and len(target.elts) == 2
+                and isinstance(target.elts[1], ast.Name)
+                and target.elts[1].id == "_"
+            ):
+                callee = _callee_name(node.value)
+                if callee in KNOWN_VALUE_ERROR_RESOLVERS:
+                    violations.append(Violation(
+                        filename=filename,
+                        lineno=node.lineno,
+                        signature="a",
+                        message=(
+                            f"discarded error slot from {callee}(...) — "
+                            f"bind the error to a named variable and "
+                            f"escalate via resolver_failed() or raise"
+                        ),
+                        qualname=_compute_qualname(node, parent_map),
+                    ))
 
         # ------------------------------------------------------------------ #
         # Signature (b): except (broad): return <empty>  (no warn, no raise) #
         # ------------------------------------------------------------------ #
-        if isinstance(node, ast.ExceptHandler):
-            if (
-                _is_broad_or_bare(node)
-                and _handler_returns_empty_shallow(node)
-                and not _handler_has_warn_log(node)
-                and not _handler_reraises(node)
-            ):
-                exc_desc = (
-                    "bare except"
-                    if node.type is None
-                    else ast.unparse(node.type)
-                )
-                violations.append(Violation(
-                    filename=filename,
-                    lineno=node.lineno,
-                    signature="b",
-                    message=(
-                        f"silent broad-except ({exc_desc}) returns empty literal "
-                        f"without logging WARN+ or re-raising — add "
-                        f"logger.warning/error/exception(...) before the return"
-                    ),
-                    qualname=_compute_qualname(node, parent_map),
-                ))
+        if isinstance(node, ast.ExceptHandler) and (
+            _is_broad_or_bare(node)
+            and _handler_returns_empty_shallow(node)
+            and not _handler_has_warn_log(node)
+            and not _handler_reraises(node)
+        ):
+            exc_desc = (
+                "bare except"
+                if node.type is None
+                else ast.unparse(node.type)
+            )
+            violations.append(Violation(
+                filename=filename,
+                lineno=node.lineno,
+                signature="b",
+                message=(
+                    f"silent broad-except ({exc_desc}) returns empty literal "
+                    f"without logging WARN+ or re-raising — add "
+                    f"logger.warning/error/exception(...) before the return"
+                ),
+                qualname=_compute_qualname(node, parent_map),
+            ))
 
     return violations
 
