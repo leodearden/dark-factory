@@ -1,5 +1,10 @@
 # Scripts orchestrator configuration
 # Scopes verification to tests/scripts/ — the Python test suite for this module.
 # Bash scripts (verify-migration.sh, migrate.sh, etc.) are not linted here.
-
-test_command: "uv run pytest tests/scripts/ --tb=short -q"
+#
+# Pin --project shared: tests/scripts/ has no scripts/ project, and a bare `uv run`
+# resolves against the workspace-root project (no pytest dep) → "Failed to spawn: pytest"
+# in a fresh _merge-* verify worktree. shared declares pytest and the scripts tests
+# import no first-party package, so its env suffices. Mirrors the other subprojects'
+# --project <member> convention.
+test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q"
