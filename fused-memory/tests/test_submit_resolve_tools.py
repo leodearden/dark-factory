@@ -73,6 +73,44 @@ async def test_submit_task_mcp_tool_signature_and_forwarding(mcp_server, task_in
     assert result == {'ticket': 'tkt_ABCDEFGHIJKLMNOPQRSTUVWXYZ'}
 
 
+@pytest.mark.asyncio
+async def test_submit_task_routing_override_reason_forwarded(mcp_server, task_interceptor):
+    """submit_task MCP tool forwards routing_override_reason to interceptor.submit_task.
+
+    Two cases:
+    - When supplied, the exact value is forwarded as a kwarg.
+    - When omitted, an empty string '' is forwarded (the declared default).
+    """
+    # Case 1: routing_override_reason supplied
+    task_interceptor.submit_task.reset_mock()
+    await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'My Task',
+            'routing_override_reason': 'owner asserted',
+        },
+    )
+    call_kwargs = task_interceptor.submit_task.call_args.kwargs
+    assert call_kwargs.get('routing_override_reason') == 'owner asserted', (
+        f"Expected routing_override_reason='owner asserted', got: {call_kwargs.get('routing_override_reason')!r}"
+    )
+
+    # Case 2: routing_override_reason omitted → default '' forwarded
+    task_interceptor.submit_task.reset_mock()
+    await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'My Task',
+        },
+    )
+    call_kwargs = task_interceptor.submit_task.call_args.kwargs
+    assert call_kwargs.get('routing_override_reason') == '', (
+        f"Expected routing_override_reason='' when omitted, got: {call_kwargs.get('routing_override_reason')!r}"
+    )
+
+
 # ------------------------------------------------------------------
 # resolve_ticket MCP tool
 # ------------------------------------------------------------------
