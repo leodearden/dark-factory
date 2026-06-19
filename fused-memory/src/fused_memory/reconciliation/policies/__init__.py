@@ -15,7 +15,9 @@ Stage 3 findings asserting the edge is missing or stale are false positives.
 should use it rather than querying the set directly.
 
 To register a new project: add a ``<PROJECT>_SNAPSHOT_WRITES_BLOCKED: bool = True``
-constant to its policy sub-module, then join it into the frozenset below.
+constant to its policy sub-module, import it in the ``_PROJECT_SNAPSHOT_FLAGS``
+list below, and append ``(<PROJECT_ID>, <PROJECT>_SNAPSHOT_WRITES_BLOCKED)`` to
+the list.  The frozenset is derived automatically — no other edits required.
 """
 
 from __future__ import annotations
@@ -31,12 +33,20 @@ from fused_memory.reconciliation.policies.autopilot_video import (
 # Snapshot-write-blocked registry
 # ---------------------------------------------------------------------------
 
+# Each entry is (project_id, blocked_flag).  The frozenset is derived from this
+# list so adding a new project requires only a single append here, not editing a
+# conditional expression.  The blocked_flag gate ensures that a project whose flag
+# is later set to False is automatically removed from the set.
+_PROJECT_SNAPSHOT_FLAGS: list[tuple[str, bool]] = [
+    (AUTOPILOT_VIDEO_PROJECT_ID, AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED),
+]
+
 #: frozenset of project_ids whose task-count snapshot write paths are
 #: blocked-by-design (see each project's policy module for the rationale).
-#: Built from per-project flag constants so the registry is always consistent
-#: with the project's own documented posture.
+#: Derived from :data:`_PROJECT_SNAPSHOT_FLAGS` so the registry is always
+#: consistent with each project's own documented posture.
 SNAPSHOT_WRITE_BLOCKED_PROJECTS: frozenset[str] = frozenset(
-    [AUTOPILOT_VIDEO_PROJECT_ID] if AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED else []
+    pid for pid, blocked in _PROJECT_SNAPSHOT_FLAGS if blocked
 )
 
 

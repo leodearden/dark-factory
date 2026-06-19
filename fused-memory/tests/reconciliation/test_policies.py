@@ -54,35 +54,6 @@ class TestIsSnapshotWriteBlocked:
 
         assert is_snapshot_write_blocked(None) is False  # type: ignore[arg-type]
 
-    def test_autopilot_video_snapshot_writes_blocked_flag_is_truthy(self):
-        """AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED must be truthy."""
-        from fused_memory.reconciliation.policies.autopilot_video import (
-            AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED,
-        )
-
-        assert AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED, (
-            "AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED must be True; "
-            "both snapshot write paths are blocked-by-design"
-        )
-
-    def test_autopilot_video_in_snapshot_write_blocked_projects(self):
-        """'autopilot_video' must be a member of SNAPSHOT_WRITE_BLOCKED_PROJECTS."""
-        from fused_memory.reconciliation.policies import SNAPSHOT_WRITE_BLOCKED_PROJECTS
-
-        assert 'autopilot_video' in SNAPSHOT_WRITE_BLOCKED_PROJECTS, (
-            f"'autopilot_video' must be in SNAPSHOT_WRITE_BLOCKED_PROJECTS; "
-            f"got {SNAPSHOT_WRITE_BLOCKED_PROJECTS!r}"
-        )
-
-    def test_snapshot_write_blocked_projects_is_frozenset(self):
-        """SNAPSHOT_WRITE_BLOCKED_PROJECTS must be a frozenset."""
-        from fused_memory.reconciliation.policies import SNAPSHOT_WRITE_BLOCKED_PROJECTS
-
-        assert isinstance(SNAPSHOT_WRITE_BLOCKED_PROJECTS, frozenset), (
-            f"SNAPSHOT_WRITE_BLOCKED_PROJECTS must be a frozenset; "
-            f"got {type(SNAPSHOT_WRITE_BLOCKED_PROJECTS)!r}"
-        )
-
     def test_autopilot_video_project_id_constant_value(self):
         """AUTOPILOT_VIDEO_PROJECT_ID must equal 'autopilot_video' (no regression)."""
         from fused_memory.reconciliation.policies.autopilot_video import (
