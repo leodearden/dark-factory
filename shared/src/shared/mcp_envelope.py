@@ -116,10 +116,12 @@ def _fail(
 
 def parse_tool_result(
     result: Any,
-    key: str,
+    key: str | None,
     expected_type: type | tuple[type, ...],
 ) -> tuple[Any | None, EnvelopeParseError | None]:
     """Extract *key* from a standard MCP tool-result envelope.
+
+    **Standard mode** (``key`` is a non-``None`` string):
 
     Returns ``(value, None)`` **only** when:
     - *result* is a dict with ``result.content`` containing at least one
@@ -128,6 +130,14 @@ def parse_tool_result(
     - the parsed payload (after optional ``{data:{…}}`` unwrap) is a dict,
     - *key* is present in that dict, and
     - ``isinstance(inner[key], expected_type)`` holds.
+
+    **Whole-inner-dict mode** (``key=None``):
+
+    Returns ``(inner, None)`` after the ``{data:{…}}`` unwrap step, provided
+    the inner payload is a dict (``expected_type=dict`` is implied by the
+    INNER_NOT_DICT guard).  ``KEY_ABSENT`` and ``WRONG_TYPE`` do not apply —
+    the entire inner dict is returned as-is.  ``NO_TEXT_BLOCK``,
+    ``JSON_DECODE_ERROR``, ``INNER_NOT_DICT``, and ``RAISED`` still fail loud.
 
     For **every** other outcome (including non-raising malformed payloads)
     exactly **one** ``logger.warning`` is emitted naming the shape, and the
@@ -175,6 +185,10 @@ def parse_tool_result(
         # --- inner must be a dict ----------------------------------------------
         if not isinstance(inner, dict):
             return _fail(EnvelopeShape.INNER_NOT_DICT, key, inner)
+
+        # --- whole-inner-dict mode: key=None returns the entire inner dict -----
+        if key is None:
+            return inner, None
 
         # --- key presence (membership test — NOT .get) -------------------------
         if key not in inner:
