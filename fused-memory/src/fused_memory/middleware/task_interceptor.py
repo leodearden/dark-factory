@@ -1444,10 +1444,7 @@ class TaskInterceptor:
         plain dict ready for JSON serialisation.
         """
         meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = {} if meta is None else dict(meta)  # shallow copy — don't mutate the caller's dict
         meta['routing_override_reason'] = reason
         return meta
 

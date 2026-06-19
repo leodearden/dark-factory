@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -4749,10 +4750,6 @@ class TestPathGuardOrSkip:
         returns None immediately without calling _path_guard_check or the
         adjudicator — and emits a WARNING audit log containing the reason.
         """
-        import logging
-
-        from unittest.mock import AsyncMock as _AsyncMock
-
         # Monkeypatch _path_guard_check to track calls (should not be called)
         guard_calls: list = []
 
@@ -4763,8 +4760,8 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', failing_check)
 
         # Wire a fake adjudicator so we can assert it's not called
-        fake_adjudicator = _AsyncMock()
-        fake_adjudicator.adjudicate = _AsyncMock()
+        fake_adjudicator = AsyncMock()
+        fake_adjudicator.adjudicate = AsyncMock()
         interceptor._path_scope_adjudicator = fake_adjudicator
 
         with caplog.at_level(logging.WARNING):
