@@ -9,14 +9,12 @@ This file is self-contained (no shared conftest fixtures beyond tmp_path).
 Scaffolding patterns mirror test_warm_lane_pool.py.
 """
 
-import asyncio
 from pathlib import Path
 
 import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
-
 
 # ---------------------------------------------------------------------------
 # Scaffolding helpers (module-local, mirrors test_warm_lane_pool.py patterns)
