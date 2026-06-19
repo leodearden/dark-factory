@@ -49,6 +49,15 @@ _FOREGROUND_TERM_SCRIPT = textwrap.dedent("""\
 # Detaching fake terminal: runs the payload in a new session (setsid), records
 # the session-leader pid to a file, then exits 0 (konsole-like).  The test
 # sends SIGHUP to the leader's pgid to simulate window-close.
+#
+# Real terminal emulators (konsole, gnome-terminal, xterm, kitty, macOS
+# Terminal) reset child signal dispositions to SIG_DFL before launching the
+# child shell.  This fake terminal must do the same: `env --default-signal=HUP,TERM`
+# un-ignores HUP and TERM across the exec boundary so the payload bash's
+# `trap 'exit 129' HUP` (and `trap 'exit 143' TERM`) can actually install and
+# fire.  Without this reset, an inherited SIGHUP=SIG_IGN (from a detached CI
+# harness or a preexec_fn in tests) silently makes the trap a POSIX no-op —
+# a non-interactive bash cannot trap a signal that was SIG_IGN on entry.
 _DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     #!/usr/bin/env bash
     # Find 'bash' in argv, then run that payload as a detached session leader.
@@ -60,7 +69,9 @@ _DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     done
     # $@ is now: bash -c "$inner"
     # Run it in a new session so it gets its own pgid.
-    setsid "$@" &
+    # env --default-signal=HUP,TERM resets those dispositions to SIG_DFL,
+    # mirroring what a real terminal emulator does for its child shell.
+    setsid env --default-signal=HUP,TERM "$@" &
     leader_pid=$!
     # Write the pid so the test can signal the group.
     echo "$leader_pid" > {pidfile}
