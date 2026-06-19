@@ -55,6 +55,17 @@ q_sentinel=$(printf %q "$sentinel")
 #   - TERM trap: converts SIGTERM into exit 143 (128+15).
 # ec is set only after claude returns so ${ec:-$?} captures the signal-path
 # default if claude is pre-empted before ec is assigned.
+#
+# CONTRACT: These HUP/TERM traps require the launching terminal to deliver the
+# payload shell with DEFAULT (non-ignored) signal dispositions for HUP and TERM.
+# Real terminal emulators (konsole, gnome-terminal, xterm, kitty, macOS Terminal)
+# guarantee this: they reset child signal dispositions to SIG_DFL before exec'ing
+# the child shell.  A launch context that inherits SIGHUP=SIG_IGN (e.g. a
+# nohup'd or fully-detached background process) would, absent the terminal's
+# reset, make `trap 'exit 129' HUP` a silent POSIX no-op: a non-interactive bash
+# cannot trap a signal that was SIG_IGN on entry.  If the window-close path ever
+# appears broken, verify the terminal's disposition reset — do NOT simply re-bump
+# the await_sentinel timeout (that symptom is a hang, not a latency issue).
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
