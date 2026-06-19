@@ -4215,6 +4215,30 @@ class TestBuildFallbackConfigDataModule:
             f'Expected test_x.py in scoped command, got {result.test_command!r}'
         )
 
+    def test_lone_data_module_bare_pytest_emits_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """A lone data module in the bare-pytest path must emit a logger.warning.
+
+        The skip is correct (avoids rc=5 false RED) but the change ships
+        unvalidated.  The warning makes the coverage gap observable so operators
+        know to configure a non-default test_command for data-module projects.
+        Guards Suggestion 1 from the task-1852 amendment pass.
+        """
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _build_fallback_config(['tests/some_data.py'])
+        assert result is not None
+        assert result.test_command is None, (
+            f'Expected None; got {result.test_command!r}'
+        )
+        assert any(
+            'test-tree data module' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), (
+            'Expected a WARNING about skipped test-tree data module; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
 
 class TestPruneArchiveDedupedAtAggregateSite:
     """Tests ensuring ``_prune_archive`` is called exactly once per

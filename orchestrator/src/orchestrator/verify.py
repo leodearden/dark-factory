@@ -1386,6 +1386,22 @@ def _build_fallback_config(
         test_cmd = 'pytest ' + ' '.join(collectable_tests)
     else:
         test_cmd = None
+        if has_test_data:
+            # A test-tree data module (e.g. tests/some_data.py) is being skipped:
+            # no collectable tests present and no configured suite to fall back
+            # to.  The skip avoids a false-RED rc=5, but this change ships
+            # UNVALIDATED.  Configure a non-default test_command for this project
+            # so data-module changes are validated by a real suite (task 1852).
+            _data_files = [
+                f for f in py_files
+                if _is_test_file(f) and not _is_collectable_test_file(f)
+            ]
+            logger.warning(
+                '_build_fallback_config: test-tree data module(s) %s skipped '
+                '— no tests will run for this change; configure a non-default '
+                'test_command to validate data-module changes (task 1852)',
+                _data_files,
+            )
 
     return ModuleConfig(
         prefix='__fallback__',
