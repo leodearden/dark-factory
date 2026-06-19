@@ -17,10 +17,13 @@ panel changes before we build the rest of the trial.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from collections import Counter, defaultdict
 from itertools import combinations
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 REPO = Path('/home/leo/src/dark-factory')
 SEARCH_ROOTS = [REPO / '.worktrees', REPO / '.eval-worktrees']
@@ -53,9 +56,18 @@ def task_label(reviews_dir: Path) -> str:
 
 
 def load_review(path: Path) -> dict | None:
+    """Load and parse a single reviewer JSON file.
+
+    Returns the parsed dict on success, or None if the file is present-but-
+    unreadable (JSONDecodeError or OSError).  The WARNING emitted here and the
+    ``skipped_unreadable`` counter incremented in main() are intentionally
+    coupled: this function is single-caller-only.  If load_review is ever
+    reused by another caller, that caller must also maintain its own counter.
+    """
     try:
         return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning('skipping unreadable review file %s: %s', path, exc)
         return None
 
 
@@ -85,6 +97,7 @@ def main() -> int:
     # Each task: {reviewer_name: [(location_normalized, category, severity), ...]}
     per_task: dict[str, dict[str, list[tuple[str, str, str]]]] = {}
     blocked_tasks: list[str] = []  # tasks where any reviewer flagged blocking
+    skipped_unreadable: int = 0   # present-but-unparseable reviewer files
 
     for d in review_dirs:
         label = task_label(d)
@@ -96,6 +109,7 @@ def main() -> int:
                 continue
             data = load_review(f)
             if data is None:
+                skipped_unreadable += 1
                 continue
 
             per_rev_present[name] += 1
@@ -129,6 +143,9 @@ def main() -> int:
             blocked_tasks.append(label)
 
     n_tasks = len(per_task)
+    if skipped_unreadable:
+        print(f'skipped {skipped_unreadable} unreadable review files')
+        print()
 
     # ── per-reviewer summary table ─────────────────────────────────────
     print('=' * 78)
@@ -288,4 +305,5 @@ def main() -> int:
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.WARNING)
     sys.exit(main())

@@ -2,9 +2,12 @@
 # Scopes verification to tests/scripts/ — the Python test suite for this module.
 # Bash scripts (verify-migration.sh, migrate.sh, etc.) are not linted here.
 #
-# Pin --project shared: tests/scripts/ has no scripts/ project, and a bare `uv run`
-# resolves against the workspace-root project (no pytest dep) → "Failed to spawn: pytest"
-# in a fresh _merge-* verify worktree. shared declares pytest and the scripts tests
-# import no first-party package, so its env suffices. Mirrors the other subprojects'
-# --project <member> convention.
+# Pin --project shared: tests/scripts/ lives at the repo root and is not itself a
+# workspace member, so a bare `uv run pytest` resolves against the workspace-ROOT
+# project (dark-factory), which declares no deps and no pytest -> verify dies with
+# "Failed to spawn: pytest" on a freshly-synced venv (e.g. a fresh _merge-* verify
+# worktree). shared is a member that declares pytest, and the scripts tests import
+# no first-party package, so its env suffices. No --directory, so cwd stays at the
+# worktree root and the tests/scripts/ path still resolves. Mirrors the other
+# subprojects' --project <member> convention.
 test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q"

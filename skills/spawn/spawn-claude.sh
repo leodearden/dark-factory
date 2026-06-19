@@ -202,7 +202,12 @@ case "$first_word" in
   *)
     # User-supplied launcher via $CLAUDE_TERMINAL_CMD. Assume `<cmd> -- bash -c '<payload>'`
     # and detaching semantics — wait on sentinel.
-    eval "$emulator -- bash -c \"\$inner\"" &
+    # Word-split $emulator into an array so multi-word commands like
+    # "some-term --opt" work.  Do NOT use eval: $inner contains literal double
+    # quotes which break the quoting when eval re-parses "bash -c \"$inner\"".
+    # shellcheck disable=SC2206
+    _emcmd=($emulator)
+    "${_emcmd[@]}" -- bash -c "$inner" &
     wait $!
     resolve_detached $?
     ;;
