@@ -40,6 +40,7 @@ from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
     check_candidate_for_scope,
     check_text_for_scope,
+    is_routing_override,
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
@@ -1164,6 +1165,8 @@ class TaskInterceptor:
         project_root: str,
         project_id: str,
         candidate: CandidateTask | None = None,
+        *,
+        routing_override_reason: str = '',
     ) -> dict | None:
         """Run the path-scope guard, escalate on rejection, return error dict.
 
@@ -1205,6 +1208,18 @@ class TaskInterceptor:
         Call-site pattern:
             ``if err := await self._path_guard_or_skip(kwargs, project_root, project_id): return err``
         """
+        # Routing override: deliberate bypass of BOTH Stage-1 heuristic and
+        # Stage-2 LLM adjudicator.  Must be the FIRST action so no verdict
+        # computation or escalation fires.
+        if is_routing_override(routing_override_reason):
+            logger.warning(
+                'path-guard ROUTING OVERRIDE: skipping path guards for '
+                'project_id=%s reason=%r',
+                project_id,
+                routing_override_reason.strip(),
+            )
+            return None
+
         registry = self._prefix_registry
         # Back-compat fast path: no registry + dark_factory → guard is a no-op.
         if (registry is None or not registry) and project_id == DARK_FACTORY_PROJECT_ID:
