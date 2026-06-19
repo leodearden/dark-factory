@@ -6,11 +6,9 @@ fd9-exists predicates) so they are fully deterministic and safe to run in pytest
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
+import logging
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -61,8 +59,26 @@ class TestParsePressureFile:
 
         text = 'some avg10=99.99 avg60=0.00 avg300=0.00 total=0\n'
         result = parse_pressure_file(text)
+        assert result is not None
         assert result['some_avg10'] == pytest.approx(99.99)
         assert result['full_avg10'] == 0.0
+
+    def test_total_parse_miss_returns_none(self):
+        """A total parse miss (no some/full avg10 line) must return None sentinel.
+
+        Current code pre-seeds {some_avg10:0.0, full_avg10:0.0} and always
+        returns that dict — these assertions FAIL (RED) until step-4 implements
+        the sentinel.  The partial-miss boundary pin (PSI_MEM_TEXT has only
+        'some') is included to verify None is NOT triggered for partial misses.
+        """
+        from sampler.metrics import parse_pressure_file
+
+        # Total miss — garbage text with no recognisable avg10 fields
+        assert parse_pressure_file('garbage line with no avg fields\n') is None
+        # Empty string — also a total miss
+        assert parse_pressure_file('') is None
+        # Partial miss (some present, full absent) — NOT a total miss, must not be None
+        assert parse_pressure_file(PSI_MEM_TEXT) is not None
 
 
 class TestCollectPsi:
@@ -105,6 +121,40 @@ class TestCollectPsi:
         for key, val in result.items():
             assert isinstance(val, float), f'{key} is not float: {val!r}'
 
+    def test_total_miss_skips_source_and_warns(self, caplog):
+        """collect_psi must skip a source whose parse returns None and emit WARNING.
+
+        Current code (before step-6) passes parsed['some_avg10'] etc. directly,
+        which would raise TypeError after step-4 changes parse to return None on
+        a total miss.  Against step-4 code this test FAILS with TypeError (not
+        the skip+warn behaviour) — confirming RED either way.
+        """
+        from sampler.metrics import collect_psi
+
+        # cpu gets garbage — total miss -> None from parse_pressure_file
+        # memory and io get valid text — should still appear in the result
+        mapping = {
+            'cpu': 'garbage no avg10\n',
+            'memory': PSI_MEM_TEXT,
+            'io': PSI_IO_TEXT,
+        }
+        with caplog.at_level(logging.WARNING):
+            result = collect_psi(read=self._fake_read(mapping))
+
+        # cpu keys must be absent — no fabricated 0.0
+        assert 'psi_cpu_some_avg10' not in result
+        assert 'psi_cpu_full_avg10' not in result
+        # memory and io keys must be present
+        assert set(result) == {
+            'psi_mem_some_avg10', 'psi_mem_full_avg10',
+            'psi_io_some_avg10', 'psi_io_full_avg10',
+        }
+        # At least one WARNING record must mention the skipped source name
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('cpu' in msg for msg in warning_messages), (
+            f'Expected a WARNING mentioning "cpu"; got: {warning_messages}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-3 tests: count_occt_queue_depth, count_verify_concurrency, sum_verify_rss
@@ -120,7 +170,7 @@ class FakeProc:
         name: str = 'bash',
         cmdline: list[str] | None = None,
         rss: int = 0,
-        children: list['FakeProc'] | None = None,
+        children: list[FakeProc] | None = None,
     ):
         self.pid = pid
         self._name = name
@@ -140,7 +190,7 @@ class FakeProc:
                 self.rss = rss
         return _MI(self._rss)
 
-    def children(self, recursive: bool = False) -> list['FakeProc']:
+    def children(self, recursive: bool = False) -> list[FakeProc]:
         if recursive:
             result = []
             for ch in self._children:
@@ -291,3 +341,25 @@ class TestSumVerifyRss:
         proc = FakeProc(1, 'bash', ['verify.sh'], rss=4096)
         result = sum_verify_rss([proc])
         assert result == 4096
+
+
+# ---------------------------------------------------------------------------
+# Step-1 (plan) tests: collect_process_metrics propagation on total failure
+# ---------------------------------------------------------------------------
+
+
+class TestCollectProcessMetricsDegrade:
+    def test_total_proc_iter_failure_propagates(self):
+        """A total proc_iter failure must propagate, not be swallowed into 0.0.
+
+        Current code wraps proc_iter in `except Exception: procs = []` which
+        converts a RuntimeError scan failure into a fabricated healthy-zero dict.
+        This test confirms the RED premise: the exception is NOT raised.
+        """
+        from sampler.metrics import collect_process_metrics
+
+        def raising(*_a, **_kw):
+            raise RuntimeError('psutil scan down')
+
+        with pytest.raises(RuntimeError):
+            collect_process_metrics(proc_iter=raising, fd9_exists=lambda _pid: False)

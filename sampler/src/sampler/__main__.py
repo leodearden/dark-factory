@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from sampler.metrics import collect_psi, collect_process_metrics
+from sampler.metrics import collect_process_metrics, collect_psi
 from sampler.sampler import run_tick
 from sampler.store import LoadSampleStore
 
@@ -62,6 +62,12 @@ def main() -> None:
     try:
         process_metrics = collect_process_metrics()
     except Exception:
+        # collect_process_metrics propagates a total proc_iter failure (no bare
+        # except inside metrics.py).  This handler is the SINGLE loud degrade
+        # point: log at exception level and fall back to an EMPTY dict so
+        # run_tick writes ZERO process rows — distinguishable from a fabricated
+        # healthy 0.0.  Per-process NoSuchProcess/AccessDenied are still
+        # silently skipped inside the counters (benign mid-scan deaths).
         logger.exception('Failed to collect process metrics; writing PSI metrics only')
         process_metrics = {}
 
