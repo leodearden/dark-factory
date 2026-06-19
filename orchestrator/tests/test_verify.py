@@ -877,6 +877,49 @@ class TestIsTestFile:
         assert _is_test_file('orchestrator/src/orchestrator/verify.py') is False
 
 
+class TestRc5NoTestsStaysRed:
+    """Invariant (b): pytest rc=5 ("no tests ran") from a real target must stay RED.
+
+    The false-RED for data modules is fixed in the scoping layer (task 1852),
+    NOT by mapping rc=5 → pass in _classify_failure.  A real test target that
+    unexpectedly collects zero tests must still be classified RED so the
+    merge gate catches "tests vanished" regressions.
+
+    This is a characterization / regression guard: it asserts the existing
+    (unchanged) behavior of _classify_failure, locking it against any future
+    blanket rc=5 → pass shortcut.
+    """
+
+    _NO_TESTS_OUTPUT = '===== no tests ran in 0.01s ====='
+
+    def test_rc5_no_tests_classifies_red(self):
+        """_classify_failure(rc=5, no-tests output) must return a non-passed category."""
+        result = _classify_failure(self._NO_TESTS_OUTPUT, 5, False)
+        assert result != 'passed', (
+            f'rc=5 "no tests ran" must NOT score passed, got {result!r} — '
+            'the data-module false-RED is fixed in scoping (task 1852), '
+            'not by mapping rc=5 to pass'
+        )
+
+    def test_rc5_category_ranks_above_passed_in_priority(self):
+        """The rc=5 category must rank strictly above 'passed' in _CATEGORY_PRIORITY.
+
+        _worst_category([rc5_category, 'passed']) must equal rc5_category,
+        proving a real zero-collect target can never be scored GREEN by mixing
+        it with a passed result.
+        """
+        rc5_category = _classify_failure(self._NO_TESTS_OUTPUT, 5, False)
+        assert rc5_category in _CATEGORY_PRIORITY, (
+            f'{rc5_category!r} not in _CATEGORY_PRIORITY — ranking is undefined'
+        )
+        passed_idx = _CATEGORY_PRIORITY.index('passed')
+        rc5_idx = _CATEGORY_PRIORITY.index(rc5_category)
+        assert rc5_idx < passed_idx, (
+            f'{rc5_category!r} at index {rc5_idx} must be ABOVE passed at {passed_idx} '
+            'so _worst_category ranks rc=5 above passed (lower index = higher severity)'
+        )
+
+
 class TestIsCollectableTestFile:
     """`_is_collectable_test_file` — narrow: files pytest will collect when passed as a target.
 
