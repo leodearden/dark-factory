@@ -1062,12 +1062,16 @@ class GitOps:
                 # concrete gen dir so the cp receives the directory, not the symlink.
                 gen_dir = base_path.parent / base_path.readlink()
                 base_target = str(gen_dir)
+                # D8 reader-refcount GC: hold a shared lock (flock -s) on the per-gen
+                # lock file for exactly the cp lifetime.  A concurrent reify GC rewrite
+                # (flock -n -x) is deferred while the shared lock is held, preventing a
+                # torn read (ENOENT mid-walk).  Lock auto-released on script exit.
+                lock_path = gen_dir.with_name(gen_dir.name + '.lock')
+                cmd = ['flock', '-s', str(lock_path), str(script), base_target, str(lane_dir), mode]
             else:
                 base_target = str(base_path)
-            rc, _, err = await _run(
-                [str(script), base_target, str(lane_dir), mode],
-                cwd=lane_dir,
-            )
+                cmd = [str(script), base_target, str(lane_dir), mode]
+            rc, _, err = await _run(cmd, cwd=lane_dir)
             if rc != 0:
                 logger.warning(
                     '_seed_warm_lane: script exited %d for %s (stderr=%r)',
