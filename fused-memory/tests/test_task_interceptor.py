@@ -4256,6 +4256,93 @@ class TestSubmitTaskGuardrail:
 
         taskmaster.add_task.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_submit_task_routing_override_bypasses_guard_and_records_reason(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+    ):
+        """With routing_override_reason set, a task that would otherwise be rejected
+        (references orchestrator/ under a non-dark-factory project) is accepted and
+        the reason is recorded in the blob metadata.
+
+        Asserts:
+        - Returns {'ticket': 'tkt_...'} (no error_type)
+        - Persisted row has project_id == 'some_other_project' (submitting project)
+        - blob['metadata']['routing_override_reason'] == the supplied reason
+        """
+        REASON = 'owner confirmed this is cross-cutting'
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock',
+                routing_override_reason=REASON,
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, (
+            f'Expected no error on routing override, got: {result}'
+        )
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Expected tkt_-prefixed ticket, got: {result}'
+        )
+
+        # Verify the row was persisted for the submitting project
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT project_id, candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+        assert row['project_id'] == 'some_other_project', (
+            f'Expected project_id=some_other_project, got: {row["project_id"]!r}'
+        )
+
+        # Verify the reason is recorded in blob metadata
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        assert meta.get('routing_override_reason') == REASON, (
+            f'Expected routing_override_reason in metadata, got: {meta!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_task_routing_override_absent_still_rejects(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+    ):
+        """Without routing_override_reason the guard still fires: the same task
+        content is rejected with DarkFactoryPathScopeViolation and persists
+        zero tickets (regression guard for the override path).
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock',
+                # routing_override_reason intentionally omitted
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected rejection without override, got: {result}'
+        )
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
+
 
 # ---------------------------------------------------------------------------
 # Unit tests for TaskInterceptor._extract_meta_files
