@@ -144,8 +144,7 @@ def main() -> int:
 
     n_tasks = len(per_task)
     if skipped_unreadable:
-        word = 'file' if skipped_unreadable == 1 else 'files'
-        print(f'skipped {skipped_unreadable} unreadable review {word}')
+        print(f'skipped {skipped_unreadable} unreadable review files')
         print()
 
     # ── per-reviewer summary table ─────────────────────────────────────

@@ -89,8 +89,8 @@ def test_corrupt_review_counted_and_reported(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
 
     assert ret == 0, f'main() returned {ret!r}, expected 0'
-    assert 'skipped 1 unreadable review file\n' in captured.out, (
-        f'Expected "skipped 1 unreadable review file" (singular) in stdout; got:\n{captured.out}'
+    assert 'skipped 1 unreadable review files\n' in captured.out, (
+        f'Expected "skipped 1 unreadable review files" in stdout; got:\n{captured.out}'
     )
     # Happy path still works: normal summary present
     assert 'PER-REVIEWER SUMMARY' in captured.out
