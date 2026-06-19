@@ -378,6 +378,17 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
         if pattern.search(output):
             return category
 
+    # Fallback — covers pytest rc=5 ("no tests ran") among other non-zero exits.
+    # INVARIANT (b, task 1852): pytest rc=5 is intentionally classified RED here
+    # ('unknown_test_failure', ranked above 'passed' in _CATEGORY_PRIORITY).
+    # A real test target that unexpectedly collects zero tests must stay RED so
+    # the merge gate catches "tests vanished" regressions.
+    #
+    # The data-module false-RED (e.g. shared/tests/silent_fallthrough_allowlist.py
+    # producing rc=5) is fixed in the SCOPING layer — scope_module_config and
+    # _build_fallback_config use _is_collectable_test_file to exclude non-test
+    # data files from pytest targets.  DO NOT map rc=5 → 'passed' here: that
+    # would silently green-light a real "tests vanished" regression.
     return 'unknown_test_failure'
 
 
