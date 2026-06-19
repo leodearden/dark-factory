@@ -1067,6 +1067,18 @@ class GitOps:
                 # (flock -n -x) is deferred while the shared lock is held, preventing a
                 # torn read (ENOENT mid-walk).  Lock auto-released on script exit.
                 lock_path = gen_dir.with_name(gen_dir.name + '.lock')
+                if not lock_path.exists():
+                    # The lock file should be pre-created by reify alongside the gen dir.
+                    # flock(1) creates it if absent, but the resulting inode is unshared
+                    # with reify's exclusive locker — the GC protocol is desynced.
+                    # Log at debug so a missing lock file surfaces rather than degrading
+                    # silently to an ineffective lock.
+                    logger.debug(
+                        '_seed_warm_lane: lock file %s does not pre-exist — '
+                        'flock will create a new inode unshared with reify GC; '
+                        'this indicates a reify/DF gen-dir protocol mismatch',
+                        lock_path,
+                    )
                 cmd = ['flock', '-s', str(lock_path), str(script), base_target, str(lane_dir), mode]
             else:
                 base_target = str(base_path)

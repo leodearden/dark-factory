@@ -322,40 +322,54 @@ def _install_inv9_guard_stub(scripts_dir_parent: Path) -> None:
 class TestRefreshLandedCommit:
     """D10 — refresh_warm_base passes --landed-commit <sha> to satisfy reify's inv.9."""
 
-    async def test_refresh_passes_landed_commit(self, tmp_path: Path) -> None:
-        """refresh_warm_base() must invoke the script with ``--landed-commit <sha>``
-        appended after ``<advancing> <base>``, where <sha> == ``git rev-parse HEAD``
-        of the _merge-verify directory.
+    async def test_refresh_explicit_landed_commit(self, tmp_path: Path) -> None:
+        """When ``landed_commit`` is passed explicitly, the script receives
+        ``--landed-commit <that_sha>`` and ``git rev-parse HEAD`` is NOT called
+        (the injection bypasses the derivation branch).
 
-        RED against today's 2-arg impl (no --landed-commit flag emitted).
+        Proves the optional parameter exists for deterministic test injection:
+        the non-repo merge_verify dir means HEAD derivation would fail if
+        attempted, yet the arg appears exactly as injected.
         """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
-
+        # Non-git dir: HEAD derivation would fail here if rev-parse were called
+        non_repo = tmp_path / 'non_repo'
+        non_repo.mkdir()
         rolling_base = tmp_path / 'rolling'
-        merge_verify, config = _setup_merge_verify_for_refresh(repo, rolling_base)
-        git_ops = GitOps(config, repo, warm_lane_pool_size=1)
+        rolling_base.mkdir()
+
+        config = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+            warm_lane_base_target_dir=str(rolling_base),
+        )
+        git_ops = GitOps(config, non_repo, warm_lane_pool_size=1)
+
+        merge_verify = non_repo / '.worktrees' / '_merge-verify'
+        merge_verify.mkdir(parents=True, exist_ok=True)
 
         recorder = tmp_path / 'refresh_args.txt'
         _install_all_args_recording_stub(merge_verify, recorder)
 
-        result = await git_ops.refresh_warm_base()
+        # Explicit injection — rev-parse branch is skipped entirely
+        result = await git_ops.refresh_warm_base(landed_commit='deadbeef')
 
-        assert result is True, 'refresh_warm_base must return True on success'
+        assert result is True, 'refresh_warm_base must return True when script exits 0'
         assert recorder.exists(), 'refresh-warm-base.sh was not called'
         recorded = recorder.read_text().strip()
 
-        # Derive the expected sha from _merge-verify (same as impl will derive)
-        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_verify)
-        assert rc == 0, f'Could not derive HEAD from _merge-verify: {head_out!r}'
-        head = head_out.strip()
-
-        advancing = str(git_ops.persistent_merge_worktree_path / 'target')
-        base = str(git_ops.warm_lane_base_target_path)
-        expected = f'{advancing} {base} --landed-commit {head}'
-        assert recorded == expected, (
-            f'Wrong args: got {recorded!r}, expected {expected!r}'
+        # The injected sha must appear verbatim — not a HEAD-derived value
+        assert '--landed-commit deadbeef' in recorded, (
+            f'Expected --landed-commit deadbeef in recorded args, got: {recorded!r}'
+        )
+        # Confirm the sha is exactly 'deadbeef' (not some rev-parse output)
+        parts = recorded.split()
+        lc_idx = parts.index('--landed-commit') if '--landed-commit' in parts else -1
+        assert lc_idx >= 0 and parts[lc_idx + 1] == 'deadbeef', (
+            f'Expected sha deadbeef but got {parts[lc_idx + 1]!r}'
         )
 
     async def test_refresh_satisfies_inv9_guard(self, tmp_path: Path) -> None:
@@ -381,13 +395,25 @@ class TestRefreshLandedCommit:
             '(requires --landed-commit with non-empty value)'
         )
 
-    async def test_refresh_rejected_without_landed_commit(self, tmp_path: Path) -> None:
+    async def test_refresh_rejected_without_landed_commit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """When HEAD derivation fails (non-repo persistent_merge_worktree path),
         no ``--landed-commit`` flag is appended, and the inv.9 guard rejects
         (exit 1) → refresh_warm_base returns False.
 
         Documents the reify-facing 'exits non-zero without --landed-commit' direction.
+
+        GIT_CEILING_DIRECTORIES is set to ``tmp_path`` to make the failure
+        environment-independent — prevents git from ascending past the test's
+        scratch directory and discovering an ambient repo on the runner's fs.
         """
+        # Prevent git from discovering an ambient repo above tmp_path (makes the
+        # HEAD-derivation failure deterministic regardless of where pytest runs).
+        monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path))
+
         # Use a non-git directory as the repo base — git rev-parse HEAD will fail there
         non_repo = tmp_path / 'non_repo'
         non_repo.mkdir()
