@@ -6188,3 +6188,47 @@ class TestFilterBlockedSnapshotFindings:
             f"Both findings must survive for non-blocked 'dark_factory'; got {result!r}"
         )
 
+    # -----------------------------------------------------------------------
+    # Coverage-gap tests: suggested_action-only path + 'account snapshot' negative
+    # -----------------------------------------------------------------------
+
+    def test_marker_in_suggested_action_only_is_dropped(self):
+        """_is_task_count_snapshot_finding detects via suggested_action when description is empty.
+
+        The combined text is f'{description} {suggested_action}', so a marker phrase
+        appearing only in suggested_action must still trigger suppression.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='',  # empty — marker only in suggested_action
+            suggested_action='Add a task-count snapshot temporal_fact edge for autopilot_video',
+        )
+        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
+        assert result == [], (
+            "missing_knowledge finding whose marker phrase appears only in suggested_action "
+            f"must be DROPPED for autopilot_video; got {result!r}"
+        )
+
+    def test_account_snapshot_phrase_not_dropped(self):
+        """'account snapshot' must NOT be mistaken for a task-count snapshot finding.
+
+        The bare substring 'count snapshot' was intentionally removed from the marker
+        list to avoid this false positive.  A finding mentioning 'account snapshot'
+        (with no task-count-snapshot marker and no raw count pairs) must be KEPT.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='autopilot_video account snapshot is missing from the knowledge graph',
+            suggested_action='Add the account snapshot edge for project tracking',
+        )
+        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
+        assert flag in result, (
+            "Finding about 'account snapshot' must NOT be suppressed — "
+            f"'count snapshot' is a substring of 'account snapshot' but must not match; "
+            f"got {result!r}"
+        )
+

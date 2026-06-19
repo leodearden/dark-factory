@@ -1679,11 +1679,15 @@ _SUPPRESSED_SNAPSHOT_CATEGORIES: frozenset[str] = frozenset({
 #: The numeric-signal branch (is_count_snapshot) handles memory_stale findings
 #: that quote raw paired count strings; these markers handle the missing_knowledge
 #: 'absence' shape that carries no numbers.
+#:
+#: NOTE: bare 'count snapshot' / 'count-snapshot' are intentionally excluded —
+#: they are substrings of unrelated phrases such as 'account snapshot', which
+#: could cause legitimate findings to be silently suppressed.  The more specific
+#: 'task-count snapshot' and 'task count snapshot' already subsume all intended
+#: phrasings produced by the Stage-3 LLM.
 _TASK_COUNT_SNAPSHOT_MARKERS: tuple[str, ...] = (
     'task-count snapshot',
     'task count snapshot',
-    'count snapshot',
-    'count-snapshot',
     'snapshot temporal_fact',
     'snapshot temporal fact',
     'task-count temporal',
