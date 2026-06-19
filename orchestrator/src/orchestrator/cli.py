@@ -46,6 +46,7 @@ def _force_exit_after_delay(
     exit_code: int = 137,
     *,
     stream=None,
+    _exit: 'Callable[[int], None] | None' = None,
 ) -> 'WatchdogHandle':
     """Arm a daemon-thread watchdog that force-exits if not disarmed in time.
 
@@ -53,7 +54,7 @@ def _force_exit_after_delay(
     ``timeout_secs`` seconds.  If the ``disarm`` callable returned by this
     function is NOT called before the timeout, the thread writes a diagnostic
     dump of live threads/frames to *stream* (defaulting to ``sys.stderr`` at
-    fire time) then calls ``os._exit(exit_code)``.
+    fire time) then calls ``_exit(exit_code)`` (defaulting to ``os._exit``).
 
     ``os._exit`` is used (not ``sys.exit``) so that ``threading._shutdown``
     and atexit callbacks are bypassed entirely — exactly the stuck path we
@@ -69,7 +70,18 @@ def _force_exit_after_delay(
     assertions to guarantee the watchdog thread has exited; the orchestrator
     intentionally never disarms so the watchdog guards interpreter shutdown
     (atexit callbacks + ``threading._shutdown()`` joining non-daemon threads).
+
+    The ``_exit`` parameter is an injectable exit callable (default
+    ``os._exit``). Injecting a stub in tests means a leaked/late-firing daemon
+    thread can NEVER reach the REAL global ``os._exit`` — so it cannot abruptly
+    kill an xdist worker process. The closure captures ``_exit`` at arm-time;
+    the production default keeps behaviour byte-identical.
     """
+    # Resolve the exit callable once at arm-time so the closure captures it.
+    # A late-firing thread calls the stub (or the real os._exit default) that
+    # was live when the watchdog was armed — no global lookup at fire-time.
+    _exit_fn: Callable[[int], None] = _exit if _exit is not None else os._exit
+
     _event = threading.Event()
 
     def _watchdog() -> None:
@@ -96,13 +108,13 @@ def _force_exit_after_delay(
             # torn down during interpreter shutdown). Emit a fallback sentinel
             # so operators still see a log line before exit 137. Wrapped in
             # its own try/except so a stream-write failure still falls through
-            # to os._exit — the force-exit guarantee must never be weakened.
+            # to _exit_fn — the force-exit guarantee must never be weakened.
             try:
                 out.write('SHUTDOWN WATCHDOG FIRED (diagnostic dump failed)\n')
                 out.flush()
             except Exception:
                 pass
-        os._exit(exit_code)
+        _exit_fn(exit_code)
 
     thread = threading.Thread(target=_watchdog, name='shutdown-watchdog', daemon=True)
     thread.start()

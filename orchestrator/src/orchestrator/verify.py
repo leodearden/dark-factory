@@ -311,6 +311,11 @@ _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         r'^error: (--|no such subcommand|failed to (parse|compile|read)|could not find)',
         re.MULTILINE,
     ), 'cargo_cli_error'),
+    # pytest INTERNALERROR — must be checked BEFORE the FAILED patterns so that
+    # a worker-death run (which has both INTERNALERROR> lines and collateral
+    # FAILED lines from the dead worker) classifies as pytest_internalerror
+    # rather than test_failure.  Reuses _PYTEST_INTERNALERROR_RE (hoisted above).
+    (_PYTEST_INTERNALERROR_RE, 'pytest_internalerror'),
     # Rust test runner / pytest FAILED lines
     (re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE), 'test_failure'),
     (re.compile(r'^FAILED\s', re.MULTILINE), 'test_failure'),
@@ -332,11 +337,12 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
     3. ``error[E\\d+]:``                        → ``'compile_error'``
     4. ``compile error``                         → ``'compile_error'``
     5. ``error: <cargo CLI prefix>``             → ``'cargo_cli_error'`` (allowlist of cargo CLI prefixes; rustc top-level ``error: aborting…`` / ``error: could not compile`` fall through)
-    6. ``… FAILED``                              → ``'test_failure'``
-    7. ``npm (ERR!|error)``                      → ``'npm_error'``
-    8. ``flock:``                                → ``'flock_error'``
-    9. ``tree-sitter generate``                  → ``'tree_sitter_generate_error'``
-    10. fallback (rc != 0)                       → ``'unknown_test_failure'``
+    6. ``INTERNALERROR>``                        → ``'pytest_internalerror'`` (checked BEFORE FAILED so a worker-death run with collateral FAILED lines classifies as infra, not drift)
+    7. ``… FAILED``                              → ``'test_failure'``
+    8. ``npm (ERR!|error)``                      → ``'npm_error'``
+    9. ``flock:``                                → ``'flock_error'``
+    10. ``tree-sitter generate``                 → ``'tree_sitter_generate_error'``
+    11. fallback (rc != 0)                       → ``'unknown_test_failure'``
 
     The ``timed_out`` flag wins over any output pattern because the root
     cause is the wall-clock limit, not the command output.
@@ -356,7 +362,13 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
 # Categories that must NOT be auto-archived even though they end with '_error'.
 # compile_error is handled by the debugger (type annotations, missing imports);
 # the human triage criterion is "a human, not a debugger, has to look".
-_ARCHIVE_DENY_LIST = frozenset({'compile_error', 'test_failure', 'infra_timeout', 'passed', ''})
+# pytest_internalerror is an infra crash (xdist worker killed by os._exit); it is
+# non-deterministic and does NOT warrant human triage — the sweep already retries it.
+# test_failure is handled by the debugger (self-correcting); compile_error likewise.
+_ARCHIVE_DENY_LIST = frozenset({
+    'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
+    'pytest_internalerror',
+})
 
 # Ordered from highest to lowest severity; used by ``_worst_category``.
 # Categories absent from this list (e.g. custom ones) sort lower than all listed.
@@ -367,6 +379,7 @@ _CATEGORY_PRIORITY: list[str] = [
     'tree_sitter_generate_error',
     'flock_error',
     'npm_error',
+    'pytest_internalerror',   # above test_failure: an infra crash, not a test drift
     'test_failure',
     'unknown_test_failure',
     'passed',
@@ -383,6 +396,9 @@ _CATEGORY_PRIORITY: list[str] = [
 PREEXISTING_BREAK_SKIP_CATEGORIES: frozenset[str] = frozenset({
     'infra_timeout',
     'flock_error',
+    # pytest_internalerror: xdist worker was killed by os._exit — non-deterministic,
+    # so re-probing main is not a reliable signal.  The sweep already retries it.
+    'pytest_internalerror',
 })
 
 # Process-wide cache for main-probe results: avoids redundant worktree-add +
@@ -2844,6 +2860,20 @@ async def run_main_tip_sweep(
 
         # Run full (unscoped) verification — all discovered subprojects, no scope filter.
         result = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
+
+        # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
+        # xdist worker was killed by os._exit).  Treat it as an infra failure — return
+        # the None sentinel so the harness retries next tick and files no false-positive
+        # drift L1.  The finally block's worktree cleanup still runs.
+        if result.category == 'pytest_internalerror':
+            logger.warning(
+                'run_main_tip_sweep: pytest INTERNALERROR in sweep — '
+                'treating as infra crash, not drift (retrying next tick); '
+                'cause_hint=%r',
+                result.cause_hint,
+            )
+            return None
+
         return (main_sha, result)
 
     except Exception:

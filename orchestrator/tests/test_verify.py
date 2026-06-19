@@ -2743,6 +2743,37 @@ class TestClassifyFailure:
         )
         assert self._classify(output, rc=1, timed_out=False) == 'tree_sitter_generate_error'
 
+    # (j) pytest_internalerror — new category added in task 1848
+    def test_classify_failure_pytest_internalerror(self):
+        """INTERNALERROR wins over collateral FAILED lines from a killed xdist worker.
+
+        When an xdist worker dies (os._exit kills the process), pytest emits:
+          - INTERNALERROR> ... (KeyError from the loadscope scheduler)
+          - FAILED test_x (collateral — the dead-worker test was not properly collected)
+
+        _classify_failure must return 'pytest_internalerror' (not 'test_failure')
+        so that run_main_tip_sweep treats the run as an infra crash, not drift.
+
+        RED today: _classify_failure has no INTERNALERROR branch; with the
+        collateral FAILED line present it currently returns 'test_failure'.
+        """
+        output = (
+            'FAILED orchestrator/tests/test_scheduler.py::TestScheduler::test_dispatch - '
+            'collected err\n'
+            'INTERNALERROR> Traceback (most recent call last):\n'
+            'INTERNALERROR>   File "site-packages/_pytest/main.py", line 318, in wrap_session\n'
+            'INTERNALERROR>     doit(config, args)\n'
+            'INTERNALERROR>   File "site-packages/xdist/scheduler/loadscope.py", line 97\n'
+            'INTERNALERROR>     KeyError: <WorkerController gw3>\n'
+            '=========================== short test summary info ===========================\n'
+            'FAILED orchestrator/tests/test_scheduler.py::TestScheduler::test_dispatch\n'
+            '!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!\n'
+        )
+        assert self._classify(output, rc=3, timed_out=False) == 'pytest_internalerror', (
+            'INTERNALERROR must be classified as pytest_internalerror even when '
+            'collateral FAILED lines are present from a killed xdist worker'
+        )
+
 
 class TestVerifyResultCategoryAndPaths:
     """Tests for the new ``category``, ``worktree_log_paths``, and
@@ -3739,6 +3770,15 @@ class TestShouldArchiveCategory:
     def test_empty_string_not_archived(self):
         """'' (empty) → False."""
         assert self._should_archive('') is False
+
+    def test_pytest_internalerror_not_archived(self):
+        """'pytest_internalerror' ends with '_error' but is in deny-list → False.
+
+        An xdist worker-kill INTERNALERROR is infra noise, not human-triage content.
+        The sweep already retries on this category (returns None sentinel); archiving
+        it would create spurious human-triage artifacts for transient crashes.
+        """
+        assert self._should_archive('pytest_internalerror') is False
 
 
 class TestBuildFallbackConfigConftest:

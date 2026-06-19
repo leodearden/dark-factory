@@ -103,12 +103,14 @@ class TestSignalHandlerIdempotence:
 class TestForceExitWatchdog:
     """Tests for _force_exit_after_delay shutdown watchdog helper."""
 
-    def test_fires_after_timeout(self, monkeypatch):
+    def test_fires_after_timeout(self):
         """Watchdog calls os._exit(137) after the timeout elapses."""
-        calls = []
-        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+        calls: list[int] = []
 
-        handle = _force_exit_after_delay(timeout_secs=0.05)
+        def stub(code: int) -> None:
+            calls.append(code)
+
+        handle = _force_exit_after_delay(timeout_secs=0.05, _exit=stub)
 
         # Poll with a deadline instead of a fixed sleep to avoid spurious
         # failures under CI scheduler stalls (GC, container contention, etc.).
@@ -122,7 +124,7 @@ class TestForceExitWatchdog:
             'watchdog thread did not exit after firing os._exit replacement'
         )
 
-    def test_does_not_fire_before_timeout(self, monkeypatch):
+    def test_does_not_fire_before_timeout(self):
         """Watchdog does not call os._exit before its timeout elapses.
 
         This pins the 'never fires on clean exit' guarantee at the unit layer —
@@ -138,10 +140,12 @@ class TestForceExitWatchdog:
         The subprocess-level counterpart (`test_shutdown_watchdog_force_exits_on_thread_leak`
         in test_shutdown.py) pins the opposite — fires when a non-daemon thread is leaked.
         """
-        calls = []
-        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+        calls: list[int] = []
 
-        handle = _force_exit_after_delay(timeout_secs=2.0)
+        def stub(code: int) -> None:
+            calls.append(code)
+
+        handle = _force_exit_after_delay(timeout_secs=2.0, _exit=stub)
 
         # Sleep well within the timeout — 0.2s is 10x margin under any scheduler load.
         time.sleep(0.2)
@@ -157,15 +161,17 @@ class TestForceExitWatchdog:
             'watchdog thread did not exit after disarm'
         )
 
-    def test_disarm_prevents_force_exit(self, monkeypatch):
+    def test_disarm_prevents_force_exit(self):
         """Calling disarm() before timeout prevents os._exit from being called."""
-        calls = []
-        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+        calls: list[int] = []
+
+        def stub(code: int) -> None:
+            calls.append(code)
 
         # Use 0.2s timeout and a 2.0s wait to give ample margin under CI load;
         # disarm() sets the event immediately so the watchdog thread returns
         # without calling os._exit even if the scheduler is delayed.
-        handle = _force_exit_after_delay(timeout_secs=0.2)
+        handle = _force_exit_after_delay(timeout_secs=0.2, _exit=stub)
         handle.disarm()
         time.sleep(2.0)
 
@@ -175,13 +181,15 @@ class TestForceExitWatchdog:
             'watchdog thread did not exit after disarm'
         )
 
-    def test_diagnostic_dump_lists_live_threads(self, monkeypatch):
+    def test_diagnostic_dump_lists_live_threads(self):
         """When the watchdog fires, it writes a diagnostic dump to the stream."""
-        calls = []
-        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+        calls: list[int] = []
+
+        def stub(code: int) -> None:
+            calls.append(code)
 
         stream = io.StringIO()
-        handle = _force_exit_after_delay(timeout_secs=0.05, stream=stream)
+        handle = _force_exit_after_delay(timeout_secs=0.05, stream=stream, _exit=stub)
 
         # Poll with a deadline — stream is written before os._exit is called,
         # so once calls is non-empty the output is already available.
@@ -216,12 +224,14 @@ class TestForceExitWatchdog:
 
         During interpreter shutdown, sys._current_frames, traceback internals,
         or sys.stderr may be partially torn down.  The outer try/except Exception
-        in the watchdog catches any failure and still reaches os._exit — so the
+        in the watchdog catches any failure and still reaches _exit_fn — so the
         process always escapes a hang even if the diagnostic output is lost.
         This test locks in the 'fail-open to force-exit' guarantee.
         """
-        calls = []
-        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+        calls: list[int] = []
+
+        def stub(code: int) -> None:
+            calls.append(code)
 
         # Simulate partial interpreter shutdown where traceback.format_stack is broken.
         def _raise_on_format(*args, **kwargs):
@@ -230,7 +240,7 @@ class TestForceExitWatchdog:
         monkeypatch.setattr(traceback_module, 'format_stack', _raise_on_format)
 
         stream = io.StringIO()
-        handle = _force_exit_after_delay(timeout_secs=0.05, stream=stream)
+        handle = _force_exit_after_delay(timeout_secs=0.05, stream=stream, _exit=stub)
 
         # Poll with deadline — os._exit must be called even though the dump failed.
         deadline = time.monotonic() + 5.0
@@ -250,7 +260,7 @@ class TestForceExitWatchdog:
             'watchdog thread did not exit after firing os._exit replacement'
         )
 
-    def test_force_exit_returns_handle_with_disarm_and_thread(self, monkeypatch):
+    def test_force_exit_returns_handle_with_disarm_and_thread(self):
         """_force_exit_after_delay returns a WatchdogHandle whose thread is a live daemon
         and whose disarm() stops the thread.
 
@@ -263,10 +273,12 @@ class TestForceExitWatchdog:
         by construction in cli.py and not re-asserted here. Thread name is cosmetic and
         intentionally unpinned — rename-friendly.
         """
-        calls = []
-        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+        calls: list[int] = []
 
-        handle = _force_exit_after_delay(timeout_secs=5.0)
+        def stub(code: int) -> None:
+            calls.append(code)
+
+        handle = _force_exit_after_delay(timeout_secs=5.0, _exit=stub)
 
         assert handle.thread.daemon is True, (
             'handle.thread must be a daemon thread'
@@ -284,7 +296,7 @@ class TestForceExitWatchdog:
         """os._exit(137) is called even when both the dump AND the fallback write fail.
 
         The watchdog comment explicitly promises: "Wrapped in its own try/except
-        so a stream-write failure still falls through to os._exit".  This test
+        so a stream-write failure still falls through to _exit_fn".  This test
         locks in that doubly-defensive contract by making traceback.format_stack
         *and* stream.write both raise unconditionally.  If the nested try/except
         is ever removed, this test fails before the force-exit guarantee is silently
@@ -297,8 +309,10 @@ class TestForceExitWatchdog:
         fallback also fails) is covered by test_outer_write_failure_still_fires_exit.
         Together the pair pins both entry points into the nested try/except.
         """
-        calls = []
-        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+        calls: list[int] = []
+
+        def stub(code: int) -> None:
+            calls.append(code)
 
         # Simulate partial interpreter shutdown where traceback internals are broken.
         def _raise_on_format(*args, **kwargs):
@@ -315,7 +329,7 @@ class TestForceExitWatchdog:
             def flush(self):
                 raise OSError('simulated torn-down stderr')
 
-        handle = _force_exit_after_delay(timeout_secs=0.05, stream=_BrokenStream())
+        handle = _force_exit_after_delay(timeout_secs=0.05, stream=_BrokenStream(), _exit=stub)
 
         # Poll with deadline — os._exit must fire even when the fallback write also fails.
         deadline = time.monotonic() + 5.0
@@ -330,7 +344,7 @@ class TestForceExitWatchdog:
             'watchdog thread did not exit after firing os._exit replacement'
         )
 
-    def test_outer_write_failure_still_fires_exit(self, monkeypatch):
+    def test_outer_write_failure_still_fires_exit(self):
         """os._exit(137) is called even when out.write(''.join(lines)) raises with format_stack intact.
 
         Closes the coverage gap in test_fallback_write_failure_still_fires_exit: that sibling
@@ -339,14 +353,16 @@ class TestForceExitWatchdog:
         format_stack succeeds, `lines` is populated with real frames, but out.write raises
         (outer except catches), then the inner fallback write also raises (_OuterBrokenStream
         makes every write raise), the inner except swallows, and execution falls through to
-        os._exit(137).
+        _exit_fn(137).
 
         If the outer try/except wrapping out.write is ever removed, this test will fail before
         the force-exit guarantee is silently dropped — mirroring the sibling test's contract
         for the nested try/except.
         """
-        calls = []
-        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+        calls: list[int] = []
+
+        def stub(code: int) -> None:
+            calls.append(code)
 
         # Does NOT mock traceback.format_stack — it runs normally, producing real frames.
         # Records every write attempt (payload captured before OSError is raised) so we
@@ -362,7 +378,7 @@ class TestForceExitWatchdog:
             def flush(self):
                 raise OSError('outer flush broken')
 
-        handle = _force_exit_after_delay(timeout_secs=0.05, stream=_OuterBrokenStream())
+        handle = _force_exit_after_delay(timeout_secs=0.05, stream=_OuterBrokenStream(), _exit=stub)
 
         # Poll with deadline — os._exit must fire even when the outer write fails.
         deadline = time.monotonic() + 5.0
@@ -390,6 +406,59 @@ class TestForceExitWatchdog:
         handle.thread.join(timeout=1.0)
         assert not handle.thread.is_alive(), (
             'watchdog thread did not exit after firing os._exit replacement'
+        )
+
+    def test_force_exit_watchdog_worker_safety_contract(self):
+        """Worker-safety contract: injected _exit is called; global os._exit is not.
+
+        xdist worker-safety regression: under CPU starvation a watchdog daemon
+        thread can fire LATE — after the test function's monkeypatch teardown
+        has restored the REAL global os._exit. If the watchdog then calls the
+        REAL os._exit(137), the xdist worker process is killed abruptly, causing
+        ``[gwN] node down: Not properly terminated`` and a KeyError INTERNALERROR.
+
+        With `_exit=stub` injection the closure captures the stub at arm-time.
+        Even if the thread fires after the test exits, it calls the stub — a
+        harmless no-op — not the REAL global os._exit.
+
+        This test does NOT monkeypatch os._exit at the global level.  The fact
+        that this function completes at all proves global os._exit was not called
+        (os._exit would have terminated the process).  Verified contract:
+
+        1. The injected stub receives [137] (watchdog fired via injection).
+        2. The thread exits after firing (no resource leak).
+        3. No 'shutdown-watchdog' thread remains alive (no thread leak).
+        """
+        calls: list[int] = []
+
+        def stub(code: int) -> None:
+            calls.append(code)
+
+        handle = _force_exit_after_delay(timeout_secs=0.05, _exit=stub)
+
+        # Poll with a deadline so spurious CI scheduler stalls don't cause
+        # false failures.
+        deadline = time.monotonic() + 5.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        # (1) Stub was called with 137 — watchdog fired via injection.
+        assert calls == [137], f'expected injected stub to receive [137], got {calls}'
+
+        # (2) Thread exits after firing.
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), (
+            'watchdog thread must exit after firing the injected _exit stub'
+        )
+
+        # (3) No 'shutdown-watchdog' thread may remain alive (no thread leak).
+        live_watchdog_threads = [
+            t for t in threading.enumerate()
+            if t.name == 'shutdown-watchdog' and t.is_alive()
+        ]
+        assert not live_watchdog_threads, (
+            f'shutdown-watchdog thread(s) still alive after firing and join: '
+            f'{live_watchdog_threads}'
         )
 
 
