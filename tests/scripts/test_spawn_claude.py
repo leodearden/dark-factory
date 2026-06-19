@@ -73,6 +73,13 @@ _DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     # mirroring what a real terminal emulator does for its child shell.
     setsid env --default-signal=HUP,TERM "$@" &
     leader_pid=$!
+    # Wait for the payload bash to start up and install its signal traps
+    # before advertising the leader pid.  The pidfile is the test handshake:
+    # the test sends SIGHUP as soon as it sees this file, so the HUP trap
+    # must be in place by then.  Bash startup + trap-install is ~5-20ms;
+    # 200ms provides a generous safety margin without slowing tests noticeably
+    # (the test's must-not-hang guard is 15s).
+    sleep 0.2
     # Write the pid so the test can signal the group.
     echo "$leader_pid" > {pidfile}
     exit 0
