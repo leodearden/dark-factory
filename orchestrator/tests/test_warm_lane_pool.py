@@ -317,15 +317,17 @@ def wl_git_config_rolling_base(tmp_path: Path) -> GitConfig:
 
 
 def _install_refresh_recorder(scripts_dir: Path, recorder_file: Path) -> None:
-    """Install a refresh-warm-base.sh that records its args ($1 advancing, $2 base)
-    to *recorder_file* and exits 0.
+    """Install a refresh-warm-base.sh that records all args ($@) to *recorder_file*
+    and exits 0.
 
+    Records all argv so tests can assert the full argument list including any
+    optional flags (e.g. --landed-commit <sha> added in task-1846).
     Mirrors the fake seed-warm-lane.sh pattern used by TestSeedWarmLane.
     """
     scripts_dir.mkdir(parents=True, exist_ok=True)
     script = scripts_dir / 'refresh-warm-base.sh'
     script.write_text(
-        f'#!/usr/bin/env bash\necho "$1 $2" >> {recorder_file}\n'
+        f'#!/usr/bin/env bash\necho "$@" >> {recorder_file}\n'
     )
     script.chmod(0o755)
 
@@ -1860,9 +1862,13 @@ class TestRefreshWarmBase:
         wl_git_config_rolling_base: GitConfig,
         tmp_path: Path,
     ):
-        """refresh_warm_base() invokes the script with <advancing> <base> args."""
+        """refresh_warm_base() invokes the script with <advancing> <base> --landed-commit <sha>.
+
+        The --landed-commit <sha> is derived from ``git rev-parse HEAD`` of the
+        _merge-verify worktree (task-1846 D10 contract).
+        """
         recorder = tmp_path / 'refresh_args.txt'
-        await self._setup_merge_verify(wl_git_repo, recorder)
+        merge_verify = await self._setup_merge_verify(wl_git_repo, recorder)
         git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
 
         result = await git_ops.refresh_warm_base()
@@ -1871,9 +1877,14 @@ class TestRefreshWarmBase:
         assert recorder.exists(), 'refresh-warm-base.sh was not called (recorder missing)'
         recorded = recorder.read_text().strip()
 
+        # Derive expected landed_commit the same way the impl does
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_verify)
+        assert rc == 0, f'Could not derive HEAD from _merge-verify: {head_out!r}'
+        head = head_out.strip()
+
         advancing = str(git_ops.persistent_merge_worktree_path / 'target')
         base = str(git_ops.warm_lane_base_target_path)
-        expected = f'{advancing} {base}'
+        expected = f'{advancing} {base} --landed-commit {head}'
         assert recorded == expected, (
             f'Wrong args: got {recorded!r}, expected {expected!r}'
         )

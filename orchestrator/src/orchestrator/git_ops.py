@@ -1029,8 +1029,19 @@ class GitOps:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
         Invokes ``<lane_dir>/scripts/seed-warm-lane.sh <base_target> <lane_dir> <mode>``
-        where *base_target* is :attr:`warm_lane_base_target_path` and *mode* is
-        either ``'--fresh-checkout'`` or ``'--reset-in-place'``.
+        where *base_target* is the resolved base path and *mode* is either
+        ``'--fresh-checkout'`` or ``'--reset-in-place'``.
+
+        **D8 gen-dir symlink resolution (reify activation-seam R1)**:
+        When :attr:`warm_lane_base_target_path` is a symlink (e.g. ``target`` →
+        ``.gen.N`` as created by ``ln -sfn .gen.N target`` in reify), the CONCRETE
+        gen dir is resolved via ``base.parent / base.readlink()`` (relative-sibling
+        join, NOT ``Path.resolve()``, to avoid tmp-prefix canonicalization drift).
+        The resolved path is what gets passed to the script so ``cp -a --reflink``
+        copies the gen dir contents rather than the symlink itself.
+
+        For a plain directory or nonexistent path the raw path is passed unchanged
+        (back-compat: default config where base == _merge-verify/target plain dir).
 
         The script lives in the LANE's own scripts dir (the lane's checked-out
         tree provides it, consistent with the debug-port script pattern).
@@ -1045,11 +1056,34 @@ class GitOps:
             if not script.exists():
                 logger.debug('_seed_warm_lane: seed script absent at %s', script)
                 return False
-            base_target = str(self.warm_lane_base_target_path)
-            rc, _, err = await _run(
-                [str(script), base_target, str(lane_dir), mode],
-                cwd=lane_dir,
-            )
+            base_path = self.warm_lane_base_target_path
+            if base_path.is_symlink():
+                # D8: resolve relative-sibling symlink (target -> .gen.N) to the
+                # concrete gen dir so the cp receives the directory, not the symlink.
+                gen_dir = base_path.parent / base_path.readlink()
+                base_target = str(gen_dir)
+                # D8 reader-refcount GC: hold a shared lock (flock -s) on the per-gen
+                # lock file for exactly the cp lifetime.  A concurrent reify GC rewrite
+                # (flock -n -x) is deferred while the shared lock is held, preventing a
+                # torn read (ENOENT mid-walk).  Lock auto-released on script exit.
+                lock_path = gen_dir.with_name(gen_dir.name + '.lock')
+                if not lock_path.exists():
+                    # The lock file should be pre-created by reify alongside the gen dir.
+                    # flock(1) creates it if absent, but the resulting inode is unshared
+                    # with reify's exclusive locker — the GC protocol is desynced.
+                    # Log at debug so a missing lock file surfaces rather than degrading
+                    # silently to an ineffective lock.
+                    logger.debug(
+                        '_seed_warm_lane: lock file %s does not pre-exist — '
+                        'flock will create a new inode unshared with reify GC; '
+                        'this indicates a reify/DF gen-dir protocol mismatch',
+                        lock_path,
+                    )
+                cmd = ['flock', '-s', str(lock_path), str(script), base_target, str(lane_dir), mode]
+            else:
+                base_target = str(base_path)
+                cmd = [str(script), base_target, str(lane_dir), mode]
+            rc, _, err = await _run(cmd, cwd=lane_dir)
             if rc != 0:
                 logger.warning(
                     '_seed_warm_lane: script exited %d for %s (stderr=%r)',
@@ -1063,14 +1097,23 @@ class GitOps:
             )
             return False
 
-    async def refresh_warm_base(self) -> bool:
+    async def refresh_warm_base(self, landed_commit: str | None = None) -> bool:
         """Advance the rolling warm base by running the refresh script.
 
-        Invokes ``<_merge-verify>/scripts/refresh-warm-base.sh <advancing> <base>``
-        where:
+        Invokes ``<_merge-verify>/scripts/refresh-warm-base.sh <advancing> <base>
+        [--landed-commit <sha>]`` where:
         - *advancing* = ``persistent_merge_worktree_path / reap_build_artifact_dirs[0]``
           (the _merge-verify lane's target — the warm build of the just-landed commit)
         - *base* = ``warm_lane_base_target_path`` (the configured rolling base)
+        - ``--landed-commit <sha>`` (D10) — appended when *landed_commit* is truthy.
+
+        **D10 --landed-commit derivation**: when *landed_commit* is ``None`` (the
+        default), it is derived from ``git rev-parse HEAD`` in the _merge-verify
+        worktree (fail-soft: if rev-parse fails the flag is omitted).  The refresh
+        only fires for the _merge-verify lane (merge_queue.py gate), whose HEAD IS
+        the just-landed commit — the derived sha is exactly what reify's inv.9
+        HEAD-match guard expects.  The optional *landed_commit* parameter allows
+        deterministic test injection.
 
         **inv.9 promote-provenance** is enforced STRUCTURALLY: the advancing dir
         is hardcoded to the _merge-verify target and no caller-supplied advancing
@@ -1110,9 +1153,27 @@ class GitOps:
                 )
                 return False
 
-            rc, _, err = await _run(
-                [str(script), str(advancing), str(base)],
-                cwd=self.persistent_merge_worktree_path,
+            # D10: derive --landed-commit from HEAD of the _merge-verify worktree
+            # (fail-soft: rev-parse failure omits the flag rather than blocking).
+            if landed_commit is None:
+                rc_h, head_out, _ = await _run(
+                    ['git', 'rev-parse', 'HEAD'],
+                    cwd=self.persistent_merge_worktree_path,
+                )
+                if rc_h == 0 and head_out.strip():
+                    landed_commit = head_out.strip()
+                else:
+                    logger.debug(
+                        'refresh_warm_base: could not derive HEAD from %s (rc=%d) — '
+                        'omitting --landed-commit flag',
+                        self.persistent_merge_worktree_path, rc_h,
+                    )
+
+            argv = [str(script), str(advancing), str(base)]
+            if landed_commit:
+                argv += ['--landed-commit', landed_commit]
+
+            rc, _, err = await _run(argv, cwd=self.persistent_merge_worktree_path,
             )
             if rc != 0:
                 logger.warning(
