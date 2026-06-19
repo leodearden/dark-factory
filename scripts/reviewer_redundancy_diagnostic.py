@@ -56,6 +56,14 @@ def task_label(reviews_dir: Path) -> str:
 
 
 def load_review(path: Path) -> dict | None:
+    """Load and parse a single reviewer JSON file.
+
+    Returns the parsed dict on success, or None if the file is present-but-
+    unreadable (JSONDecodeError or OSError).  The WARNING emitted here and the
+    ``skipped_unreadable`` counter incremented in main() are intentionally
+    coupled: this function is single-caller-only.  If load_review is ever
+    reused by another caller, that caller must also maintain its own counter.
+    """
     try:
         return json.loads(path.read_text())
     except (json.JSONDecodeError, OSError) as exc:
@@ -135,8 +143,10 @@ def main() -> int:
             blocked_tasks.append(label)
 
     n_tasks = len(per_task)
-    print(f"skipped {skipped_unreadable} unreadable review files")
-    print()
+    if skipped_unreadable:
+        word = 'file' if skipped_unreadable == 1 else 'files'
+        print(f'skipped {skipped_unreadable} unreadable review {word}')
+        print()
 
     # ── per-reviewer summary table ─────────────────────────────────────
     print('=' * 78)
