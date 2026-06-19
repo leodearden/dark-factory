@@ -1029,8 +1029,19 @@ class GitOps:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
         Invokes ``<lane_dir>/scripts/seed-warm-lane.sh <base_target> <lane_dir> <mode>``
-        where *base_target* is :attr:`warm_lane_base_target_path` and *mode* is
-        either ``'--fresh-checkout'`` or ``'--reset-in-place'``.
+        where *base_target* is the resolved base path and *mode* is either
+        ``'--fresh-checkout'`` or ``'--reset-in-place'``.
+
+        **D8 gen-dir symlink resolution (reify activation-seam R1)**:
+        When :attr:`warm_lane_base_target_path` is a symlink (e.g. ``target`` →
+        ``.gen.N`` as created by ``ln -sfn .gen.N target`` in reify), the CONCRETE
+        gen dir is resolved via ``base.parent / base.readlink()`` (relative-sibling
+        join, NOT ``Path.resolve()``, to avoid tmp-prefix canonicalization drift).
+        The resolved path is what gets passed to the script so ``cp -a --reflink``
+        copies the gen dir contents rather than the symlink itself.
+
+        For a plain directory or nonexistent path the raw path is passed unchanged
+        (back-compat: default config where base == _merge-verify/target plain dir).
 
         The script lives in the LANE's own scripts dir (the lane's checked-out
         tree provides it, consistent with the debug-port script pattern).
@@ -1045,7 +1056,14 @@ class GitOps:
             if not script.exists():
                 logger.debug('_seed_warm_lane: seed script absent at %s', script)
                 return False
-            base_target = str(self.warm_lane_base_target_path)
+            base_path = self.warm_lane_base_target_path
+            if base_path.is_symlink():
+                # D8: resolve relative-sibling symlink (target -> .gen.N) to the
+                # concrete gen dir so the cp receives the directory, not the symlink.
+                gen_dir = base_path.parent / base_path.readlink()
+                base_target = str(gen_dir)
+            else:
+                base_target = str(base_path)
             rc, _, err = await _run(
                 [str(script), base_target, str(lane_dir), mode],
                 cwd=lane_dir,
