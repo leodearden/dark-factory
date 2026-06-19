@@ -80,7 +80,7 @@ class EnvelopeParseError(Exception):
             fragment, suitable for log messages.
     """
 
-    def __init__(self, shape: EnvelopeShape, *, key: str, payload_prefix: str) -> None:
+    def __init__(self, shape: EnvelopeShape, *, key: str | None, payload_prefix: str) -> None:
         self.shape = shape
         self.key = key
         self.payload_prefix = payload_prefix
@@ -94,7 +94,7 @@ class EnvelopeParseError(Exception):
 
 def _fail(
     shape: EnvelopeShape,
-    key: str,
+    key: str | None,
     payload: Any,
 ) -> tuple[None, EnvelopeParseError]:
     """Emit ONE distinct WARNING and return ``(None, EnvelopeParseError(…))``."""
