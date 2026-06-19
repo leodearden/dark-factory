@@ -832,20 +832,39 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
             timeout=0.1,
         )
 
-    # Give the event loop a moment to process any cleanup
-    await asyncio.sleep(0.05)
+    # --- MUST-NOT-HANG COMPLETION GUARD — NOT a latency SLA ---
+    # cleanup (complete_run → 'failed', restore_drained) runs in asyncio.shield()-wrapped
+    # DETACHED inner Tasks spawned by run_full_cycle's CancelledError handler
+    # (harness.py ~lines 1556-1560), so it finishes ASYNCHRONOUSLY, AFTER wait_for
+    # re-raises TimeoutError.  A fixed sub-100ms sleep races those background writes and
+    # starves under full-suite CPU contention.  Polling returns as soon as cleanup lands
+    # (~ms in isolation) and only fails after a generous deadline — eliminating the race
+    # rather than widening it.  5s is ~100× the normal sub-50ms cleanup latency yet far
+    # below the 60s global thread-method pytest-timeout (pyproject.toml).
+    # De-flake precedent: task 1836 commit b12a5ffeb9.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    recent_runs = []
+    run = None
+    stats = None
+    while loop.time() < deadline:
+        recent_runs = await journal.get_recent_runs('test-project', limit=5)
+        stats = await event_buffer.get_buffer_stats('test-project')
+        if recent_runs and recent_runs[0].status == 'failed' and stats['size'] == 2:
+            run = recent_runs[0]
+            break
+        await asyncio.sleep(0.02)
 
     # The run must be marked 'failed', not stuck in 'running'
-    recent_runs = await journal.get_recent_runs('test-project', limit=5)
     assert len(recent_runs) >= 1
-    run = recent_runs[0]
+    if run is None:
+        run = recent_runs[0]
     assert run.status == 'failed', (
         f"Expected run.status='failed' after timeout, got '{run.status}'. "
         'Bug 5: CancelledError is not caught in run_full_cycle, so complete_run is never called.'
     )
 
     # Events must have been restored to the buffer
-    stats = await event_buffer.get_buffer_stats('test-project')
     assert stats['size'] == 2, (
         f'Expected buffer size=2 after timeout, got {stats["size"]}. '
         'Bug 5: restore_drained is not called on CancelledError.'
