@@ -1714,10 +1714,7 @@ def _is_task_count_snapshot_finding(flag: dict[str, Any]) -> bool:
         return True
 
     # Branch 2: raw count-string detection (handles numeric memory_stale shape)
-    if is_count_snapshot(f'{description} {suggested_action}'):
-        return True
-
-    return False
+    return is_count_snapshot(f'{description} {suggested_action}')
 
 
 def filter_blocked_snapshot_findings(

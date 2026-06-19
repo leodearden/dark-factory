@@ -36,7 +36,7 @@ from fused_memory.reconciliation.policies.autopilot_video import (
 #: Built from per-project flag constants so the registry is always consistent
 #: with the project's own documented posture.
 SNAPSHOT_WRITE_BLOCKED_PROJECTS: frozenset[str] = frozenset(
-    ([AUTOPILOT_VIDEO_PROJECT_ID] if AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED else [])
+    [AUTOPILOT_VIDEO_PROJECT_ID] if AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED else []
 )
 
 
