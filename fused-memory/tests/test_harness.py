@@ -834,8 +834,7 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
 
     # --- MUST-NOT-HANG COMPLETION GUARD — NOT a latency SLA ---
     # cleanup (complete_run → 'failed', restore_drained) runs in asyncio.shield()-wrapped
-    # DETACHED inner Tasks spawned by run_full_cycle's CancelledError handler
-    # (harness.py ~lines 1556-1560), so it finishes ASYNCHRONOUSLY, AFTER wait_for
+    # DETACHED inner Tasks spawned by run_full_cycle's CancelledError handler, so it finishes ASYNCHRONOUSLY, AFTER wait_for
     # re-raises TimeoutError.  A fixed sub-100ms sleep races those background writes and
     # starves under full-suite CPU contention.  Polling returns as soon as cleanup lands
     # (~ms in isolation) and only fails after a generous deadline — eliminating the race
