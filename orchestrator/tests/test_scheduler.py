@@ -8720,3 +8720,45 @@ class TestExternalDepResolverDegradedEscalation:
         assert category_arg == 'infra_issue', (
             f'Expected category="infra_issue"; got {category_arg!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_on_clean_tick(self, scheduler: Scheduler):
+        """A non-degraded tick between degraded ticks must reset the consecutive streak.
+
+        Drive: degraded tick 1, clean tick 2 (resolver OK), degraded tick 3.
+        Because the clean tick resets the streak, only 1 consecutive degraded tick
+        occurs after the reset — threshold=2 is never reached — so the callback
+        must NOT be called.
+
+        This is RED after step-2 because the counter persists across clean ticks:
+        tick1=1, clean tick doesn't reset, tick3=2 >= threshold → callback fires.
+        """
+        callback = AsyncMock()
+        scheduler._on_external_dep_block = callback
+        task = self._pending_task()
+
+        # Tick 1 — degraded (streak=1, below threshold=2)
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+        callback.assert_not_called()
+
+        # Tick 2 — clean (resolver OK, dep live) → must reset the streak
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {'dark_factory:5': 'pending'},
+            external_err=None,
+        )
+        callback.assert_not_called()
+
+        # Tick 3 — degraded again (streak restarts at 1, below threshold=2)
+        await scheduler._apply_external_dep_policy(
+            [task],
+            {},
+            ExternalResolverError('degraded'),
+        )
+
+        # The clean tick reset the streak, so threshold was never reached
+        callback.assert_not_called()
