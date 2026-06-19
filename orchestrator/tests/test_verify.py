@@ -10,12 +10,15 @@ import pytest
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
+    _CATEGORY_PRIORITY,
     _PRUNE_THROTTLE_SECS,
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
     _build_fallback_config,
+    _classify_failure,
     _extract_cause_hint,
+    _is_collectable_test_file,
     _is_structural_python_file,
     _is_test_file,
     _maybe_prune_archive,
@@ -874,6 +877,88 @@ class TestIsTestFile:
         assert _is_test_file('orchestrator/src/orchestrator/verify.py') is False
 
 
+class TestRc5NoTestsStaysRed:
+    """Invariant (b): pytest rc=5 ("no tests ran") from a real target must stay RED.
+
+    The false-RED for data modules is fixed in the scoping layer (task 1852),
+    NOT by mapping rc=5 → pass in _classify_failure.  A real test target that
+    unexpectedly collects zero tests must still be classified RED so the
+    merge gate catches "tests vanished" regressions.
+
+    This is a characterization / regression guard: it asserts the existing
+    (unchanged) behavior of _classify_failure, locking it against any future
+    blanket rc=5 → pass shortcut.
+    """
+
+    _NO_TESTS_OUTPUT = '===== no tests ran in 0.01s ====='
+
+    def test_rc5_no_tests_classifies_red(self):
+        """_classify_failure(rc=5, no-tests output) must return a non-passed category."""
+        result = _classify_failure(self._NO_TESTS_OUTPUT, 5, False)
+        assert result != 'passed', (
+            f'rc=5 "no tests ran" must NOT score passed, got {result!r} — '
+            'the data-module false-RED is fixed in scoping (task 1852), '
+            'not by mapping rc=5 to pass'
+        )
+
+    def test_rc5_category_ranks_above_passed_in_priority(self):
+        """The rc=5 category must rank strictly above 'passed' in _CATEGORY_PRIORITY.
+
+        _worst_category([rc5_category, 'passed']) must equal rc5_category,
+        proving a real zero-collect target can never be scored GREEN by mixing
+        it with a passed result.
+        """
+        rc5_category = _classify_failure(self._NO_TESTS_OUTPUT, 5, False)
+        assert rc5_category in _CATEGORY_PRIORITY, (
+            f'{rc5_category!r} not in _CATEGORY_PRIORITY — ranking is undefined'
+        )
+        passed_idx = _CATEGORY_PRIORITY.index('passed')
+        rc5_idx = _CATEGORY_PRIORITY.index(rc5_category)
+        assert rc5_idx < passed_idx, (
+            f'{rc5_category!r} at index {rc5_idx} must be ABOVE passed at {passed_idx} '
+            'so _worst_category ranks rc=5 above passed (lower index = higher severity)'
+        )
+
+
+class TestIsCollectableTestFile:
+    """`_is_collectable_test_file` — narrow: files pytest will collect when passed as a target.
+
+    Only ``test_*.py`` and ``*_test.py`` (minus conftest) count.
+    A data module under tests/ is in the test tree (_is_test_file) but NOT
+    collectable (_is_collectable_test_file) — passing it to pytest produces rc=5.
+    """
+
+    def test_returns_true_for_test_prefix_file(self):
+        """test_*.py at any depth must return True."""
+        assert _is_collectable_test_file('src/test_bar.py') is True
+
+    def test_returns_true_for_test_suffix_file(self):
+        """*_test.py at any depth must return True."""
+        assert _is_collectable_test_file('src/foo_test.py') is True
+
+    def test_returns_true_for_test_file_under_tests_dir(self):
+        """test_*.py under a tests/ dir must return True (both name and location match)."""
+        assert _is_collectable_test_file('orchestrator/tests/test_foo.py') is True
+
+    def test_returns_false_for_data_module_under_tests_dir(self):
+        """A non-test data module under tests/ must return False.
+
+        'shared/tests/silent_fallthrough_allowlist.py' has '/tests/' in path
+        so _is_test_file returns True, but the filename is not test_*.py or
+        *_test.py — passing it to pytest produces rc=5, so it must NOT be
+        treated as collectable.
+        """
+        assert _is_collectable_test_file('shared/tests/silent_fallthrough_allowlist.py') is False
+
+    def test_returns_false_for_conftest(self):
+        """conftest.py must return False even though it lives under tests/."""
+        assert _is_collectable_test_file('orchestrator/tests/conftest.py') is False
+
+    def test_returns_false_for_regular_source_file(self):
+        """A regular source file must return False."""
+        assert _is_collectable_test_file('orchestrator/src/orchestrator/verify.py') is False
+
+
 class TestIsStructuralPythonFile:
     """`_is_structural_python_file` detects Protocol/TypedDict base-class usage.
 
@@ -1113,6 +1198,77 @@ class TestScopeModuleConfigReturnsNone:
         # Must still be scoped (file not read, so structural check is skipped)
         assert rel_path in (result.type_check_command or '')
         assert '--directory orchestrator' not in (result.type_check_command or '')
+
+
+class TestScopeModuleConfigDataModuleFallback:
+    """scope_module_config falls back to the full suite for non-test data modules under tests/.
+
+    A data module under tests/ (e.g. shared/tests/silent_fallthrough_allowlist.py)
+    satisfies _is_test_file (test-tree membership) but NOT _is_collectable_test_file
+    (pytest would collect zero tests → rc=5 → RED).  The fix mirrors has_conftest:
+    set test_cmd = mc.test_command (full owning-package suite).
+    """
+
+    def test_data_module_alone_uses_full_suite(self):
+        """A lone data module under tests/ must yield the full mc.test_command.
+
+        Before the fix, the scoped command was
+        'pytest shared/tests/silent_fallthrough_allowlist.py' → rc=5 → RED.
+        After the fix it must be mc.test_command (GREEN full suite).
+        """
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        result = scope_module_config(mc, ['shared/tests/silent_fallthrough_allowlist.py'])
+        assert result is not None
+        assert result.test_command == mc.test_command, (
+            f'Expected full suite {mc.test_command!r}, got {result.test_command!r}'
+        )
+        assert 'silent_fallthrough_allowlist.py' not in (result.test_command or ''), (
+            'Data file must not appear in the pytest target'
+        )
+
+    def test_data_module_plus_real_test_file_uses_full_suite(self):
+        """A data module mixed with a real test file must still use the full suite.
+
+        Conftest-style precedence: has_test_data triggers the full suite
+        regardless of whether collectable tests are also present.
+        """
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        result = scope_module_config(
+            mc,
+            ['shared/tests/silent_fallthrough_allowlist.py', 'shared/tests/test_x.py'],
+        )
+        assert result is not None
+        assert result.test_command == mc.test_command, (
+            f'Expected full suite {mc.test_command!r}, got {result.test_command!r}'
+        )
+
+    def test_real_test_file_alone_still_scopes(self):
+        """Control: a real test file alone must still produce a scoped pytest target.
+
+        The fix must not over-broaden scope for genuine test files — they should
+        still be targeted directly rather than triggering the full suite.
+        """
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        result = scope_module_config(mc, ['shared/tests/test_x.py'])
+        assert result is not None
+        assert result.test_command != mc.test_command, (
+            'A real test file alone must produce a scoped command, not the full suite'
+        )
+        assert 'shared/tests/test_x.py' in (result.test_command or ''), (
+            f'Expected test_x.py in scoped command, got {result.test_command!r}'
+        )
 
 
 class TestRunScopedVerificationSkipsUntouched:
@@ -3987,6 +4143,101 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         result = _build_fallback_config(['tests/scripts/test_spawn_claude.py'], cfg)
         assert result is not None
         assert result.lint_command == 'uv run ruff check tests/scripts/test_spawn_claude.py'
+
+
+class TestBuildFallbackConfigDataModule:
+    """``_build_fallback_config`` must not pass non-test data modules to pytest.
+
+    A data module under tests/ (e.g. 'tests/some_data.py') satisfies
+    _is_test_file (path.startswith('tests/')) but is NOT pytest-collectable.
+    Passing it to pytest produces rc=5 ("no tests ran") → RED.
+    Task 1852 fixes this in the scoping layer; these tests guard the fix.
+    """
+
+    def test_lone_data_module_bare_pytest_yields_none(self):
+        """A lone data module under tests/ with no config must yield test_command=None.
+
+        Current (broken) code: 'pytest tests/some_data.py' → rc=5 → RED.
+        Fixed code: no collectable tests → test_command = None (skip, not false RED).
+        """
+        result = _build_fallback_config(['tests/some_data.py'])
+        assert result is not None, 'should return a config (py file present)'
+        assert result.test_command is None, (
+            f'Expected None (no collectable tests), got {result.test_command!r}'
+        )
+
+    def test_lone_data_module_with_nonconfigured_pytest_yields_none(self):
+        """A lone data module with config.test_command == 'pytest' (the default) → None.
+
+        The bare-pytest branch has no owning module suite; targeting the data
+        module's parent dir risks rc=5 too (a fixtures dir with no tests).
+        """
+        config = OrchestratorConfig(
+            project_root=Path('/fake'),
+            test_command='pytest',
+        )
+        result = _build_fallback_config(['tests/some_data.py'], config)
+        assert result is not None
+        assert result.test_command is None, (
+            f'Expected None (bare pytest, lone data module), got {result.test_command!r}'
+        )
+
+    def test_data_module_with_nonconfigured_pytest_uses_full_suite(self):
+        """A data module with a non-default config test_command → full suite (GREEN).
+
+        When a real configured suite exists, using it is strictly safer than
+        yielding None (still runs real tests; no rc=5).  This is the fail-safe
+        path for non-default test_command in the fallback builder.
+        """
+        config = OrchestratorConfig(
+            project_root=Path('/fake'),
+            test_command="uv run --extra dev pytest -m 'not slow'",
+        )
+        result = _build_fallback_config(['tests/some_data.py'], config)
+        assert result is not None
+        assert result.test_command == config.test_command, (
+            f'Expected full suite {config.test_command!r}, got {result.test_command!r}'
+        )
+
+    def test_data_module_plus_collectable_test_bare_pytest_scopes_to_test_only(self):
+        """Data module + collectable test on bare pytest → scoped to test file only.
+
+        Current (broken) code: 'pytest tests/some_data.py tests/test_x.py' (contains data file).
+        Fixed code: 'pytest tests/test_x.py' (data file excluded from pytest target).
+        """
+        result = _build_fallback_config(['tests/some_data.py', 'tests/test_x.py'])
+        assert result is not None
+        assert result.test_command is not None
+        assert 'some_data.py' not in (result.test_command or ''), (
+            f'Data file must not appear in pytest target, got {result.test_command!r}'
+        )
+        assert 'tests/test_x.py' in (result.test_command or ''), (
+            f'Expected test_x.py in scoped command, got {result.test_command!r}'
+        )
+
+    def test_lone_data_module_bare_pytest_emits_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """A lone data module in the bare-pytest path must emit a logger.warning.
+
+        The skip is correct (avoids rc=5 false RED) but the change ships
+        unvalidated.  The warning makes the coverage gap observable so operators
+        know to configure a non-default test_command for data-module projects.
+        Guards Suggestion 1 from the task-1852 amendment pass.
+        """
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _build_fallback_config(['tests/some_data.py'])
+        assert result is not None
+        assert result.test_command is None, (
+            f'Expected None; got {result.test_command!r}'
+        )
+        assert any(
+            'test-tree data module' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), (
+            'Expected a WARNING about skipped test-tree data module; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
 
 
 class TestPruneArchiveDedupedAtAggregateSite:

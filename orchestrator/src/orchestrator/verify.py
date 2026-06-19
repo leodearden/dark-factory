@@ -57,7 +57,13 @@ def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str 
 
 
 def _is_test_file(path: str) -> bool:
-    """Return True for concrete test files (test_*.py, *_test.py, anything under tests/).
+    """Return True for test-tree members (test_*.py, *_test.py, anything under tests/).
+
+    This is the BROAD test-tree-membership predicate: a file that is True here
+    means the test tree was touched and tests should run.  It is distinct from
+    ``_is_collectable_test_file`` (the narrow pytest-collectability predicate):
+    a data module under tests/ is a test-tree member but NOT collectable (passing
+    it to pytest produces rc=5 "no tests ran").
 
     Returns False for conftest.py at any depth — conftest files are not directly
     runnable by pytest, so excluding them here means callers can pass the result
@@ -73,6 +79,22 @@ def _is_test_file(path: str) -> bool:
         )
         and not _is_conftest(path)
     )
+
+
+def _is_collectable_test_file(path: str) -> bool:
+    """Return True for files pytest will actually collect when passed as a target.
+
+    Narrow predicate: only ``test_*.py`` and ``*_test.py`` (minus conftest).
+    A data module under tests/ (e.g. ``shared/tests/silent_fallthrough_allowlist.py``)
+    satisfies ``_is_test_file`` (test-tree membership) but NOT this predicate
+    because its filename is not in the ``test_*`` / ``*_test`` convention —
+    passing it to pytest produces rc=5 ("no tests ran").
+
+    Distinct from ``_is_test_file`` (test-tree membership, broad).
+    Task 1852: scoping builders must use this predicate for pytest targets.
+    """
+    name = path.rsplit('/', 1)[-1]
+    return (name.startswith('test_') or name.endswith('_test.py')) and not _is_conftest(path)
 
 
 def _is_conftest(path: str) -> bool:
@@ -356,6 +378,17 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
         if pattern.search(output):
             return category
 
+    # Fallback — covers pytest rc=5 ("no tests ran") among other non-zero exits.
+    # INVARIANT (b, task 1852): pytest rc=5 is intentionally classified RED here
+    # ('unknown_test_failure', ranked above 'passed' in _CATEGORY_PRIORITY).
+    # A real test target that unexpectedly collects zero tests must stay RED so
+    # the merge gate catches "tests vanished" regressions.
+    #
+    # The data-module false-RED (e.g. shared/tests/silent_fallthrough_allowlist.py
+    # producing rc=5) is fixed in the SCOPING layer — scope_module_config and
+    # _build_fallback_config use _is_collectable_test_file to exclude non-test
+    # data files from pytest targets.  DO NOT map rc=5 → 'passed' here: that
+    # would silently green-light a real "tests vanished" regression.
     return 'unknown_test_failure'
 
 
@@ -1171,9 +1204,17 @@ def scope_module_config(
     # mc.test_command.  Passing conftest.py directly to pytest finds 0 tests
     # (pytest >= 9 exits 1 with "no tests ran").
     has_conftest = any(_is_conftest(f) for f in scoped)
-    # conftest.py is already excluded by _is_test_file at any depth;
-    # conftest files are handled by the has_conftest branch above.
-    test_files = [f for f in scoped if _is_test_file(f)]
+    # Narrow: only test_*.py / *_test.py files pytest will actually collect.
+    # A data module under tests/ (e.g. silent_fallthrough_allowlist.py) is in
+    # the test tree (_is_test_file) but NOT collectable — passing it to pytest
+    # produces rc=5 ("no tests ran") → RED.  Task 1852 fixes this at the
+    # scoping layer; the classifier (_classify_failure) is left untouched.
+    collectable_tests = [f for f in scoped if _is_collectable_test_file(f)]
+    # has_test_data: in-tree (test-tree member) but not collectable — mirrors
+    # has_conftest: fall back to the full owning-package suite (mc.test_command).
+    has_test_data = any(
+        _is_test_file(f) and not _is_collectable_test_file(f) for f in scoped
+    )
 
     # Detect structural files (Protocol/TypedDict definitions) when we have a
     # worktree to read from.  File-scoped pyright misses cross-file invariance
@@ -1209,12 +1250,15 @@ def scope_module_config(
     else:
         type_cmd = _strip_directory_flag(
             _scope_command(mc.type_check_command, 'pyright', scoped), mc.prefix)
-    if has_conftest:
-        # Full unscoped suite: conftest changes affect everything it shadows.
+    if has_conftest or has_test_data:
+        # Full unscoped suite: conftest changes affect everything it shadows;
+        # data-module changes (e.g. a σ-allowlist re-baseline) are consumed by
+        # tests we cannot enumerate from the path alone, so the full suite is
+        # the only safe scope.  Both branches mirror each other (task 1852).
         test_cmd = mc.test_command
-    elif test_files:
+    elif collectable_tests:
         test_cmd = _strip_directory_flag(
-            _scope_command(mc.test_command, 'pytest', test_files), mc.prefix)
+            _scope_command(mc.test_command, 'pytest', collectable_tests), mc.prefix)
     else:
         test_cmd = None
 
@@ -1262,8 +1306,20 @@ def _build_fallback_config(
     # parent) maps to '.' so we never produce 'pytest conftest.py'.  Sorted
     # deduped set gives deterministic output.
     has_conftest = any(_is_conftest(f) for f in py_files)
-    # conftest.py is already excluded by _is_test_file at any depth.
-    test_files = [f for f in py_files if _is_test_file(f)]
+    # Narrow: only test_*.py / *_test.py that pytest will actually collect.
+    # A data module under tests/ (e.g. tests/some_data.py) satisfies
+    # _is_test_file but NOT _is_collectable_test_file — passing it to pytest
+    # produces rc=5 ("no tests ran") → RED.  Task 1852 fixes at scoping layer.
+    collectable_tests = [f for f in py_files if _is_collectable_test_file(f)]
+    # has_test_data: in-tree but not collectable (and not conftest).
+    # In _build_fallback_config there is no owning module suite to fall back to,
+    # so we only propagate has_test_data to the non-default configured command
+    # branch (where a real suite exists).  In the bare-pytest branch a lone data
+    # module yields test_cmd = None — targeting its parent dir risks rc=5 if
+    # that dir holds only fixtures/data with zero tests.
+    has_test_data = any(
+        _is_test_file(f) and not _is_collectable_test_file(f) for f in py_files
+    )
 
     # Lint and type commands: use configured commands when *config* is provided.
     # _scope_command narrows to the touched files when the standard tool keyword
@@ -1287,8 +1343,11 @@ def _build_fallback_config(
     # `uv run --extra dev --extra web pytest -m 'not slow' --ignore=tests/e2e`),
     # use it as-is to avoid mangling multi-token flags.  The configured command
     # already encodes which extras, markers, and ignores are required.
+    # has_test_data is included here: a data module (e.g. σ-allowlist) consumed
+    # by real tests warrants running the full suite when a real suite exists —
+    # the configured test_command has real tests, so rc≠5 (task 1852).
     if config is not None and config.test_command != 'pytest':
-        test_cmd: str | None = config.test_command if (test_files or has_conftest) else None
+        test_cmd: str | None = config.test_command if (collectable_tests or has_conftest or has_test_data) else None
         return ModuleConfig(
             prefix='__fallback__',
             lint_command=lint_cmd,
@@ -1307,25 +1366,42 @@ def _build_fallback_config(
         # tests in b/ are not silently skipped.  A root-level conftest ('.')
         # shadows everything, so in that case no files are "outside".
         #
-        # `test_files` always contains file paths (e.g. 'a/sub/test_x.py'),
-        # never bare directory paths — _is_test_file gates on filename
-        # suffixes/prefixes and a /tests/ substring, none of which match a
-        # directory entry.  That guarantees `t.startswith(d + '/')` reliably
-        # means "t is inside directory d" without false positives from a
-        # sibling directory like 'ab/' matching the prefix 'a'.
+        # `collectable_tests` always contains file paths (e.g. 'a/sub/test_x.py'),
+        # never bare directory paths — _is_collectable_test_file gates on filename
+        # prefixes/suffixes, none of which match a directory entry.  That
+        # guarantees `t.startswith(d + '/')` reliably means "t is inside
+        # directory d" without false positives from a sibling like 'ab/'.
         if '.' not in conftest_dirs:
             outside = [
-                t for t in test_files
+                t for t in collectable_tests
                 if not any(t.startswith(d + '/') for d in conftest_dirs)
             ]
         else:
             outside = []
         targets = conftest_dirs + outside
         test_cmd = 'pytest ' + ' '.join(targets)
-    elif test_files:
-        test_cmd = 'pytest ' + ' '.join(test_files)
+    elif collectable_tests:
+        # Only collectable (test_*.py / *_test.py) files are targeted.
+        # A lone data module under tests/ yields test_cmd = None (no rc=5).
+        test_cmd = 'pytest ' + ' '.join(collectable_tests)
     else:
         test_cmd = None
+        if has_test_data:
+            # A test-tree data module (e.g. tests/some_data.py) is being skipped:
+            # no collectable tests present and no configured suite to fall back
+            # to.  The skip avoids a false-RED rc=5, but this change ships
+            # UNVALIDATED.  Configure a non-default test_command for this project
+            # so data-module changes are validated by a real suite (task 1852).
+            _data_files = [
+                f for f in py_files
+                if _is_test_file(f) and not _is_collectable_test_file(f)
+            ]
+            logger.warning(
+                '_build_fallback_config: test-tree data module(s) %s skipped '
+                '— no tests will run for this change; configure a non-default '
+                'test_command to validate data-module changes (task 1852)',
+                _data_files,
+            )
 
     return ModuleConfig(
         prefix='__fallback__',
