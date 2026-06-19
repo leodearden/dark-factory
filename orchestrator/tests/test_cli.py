@@ -392,6 +392,86 @@ class TestForceExitWatchdog:
             'watchdog thread did not exit after firing os._exit replacement'
         )
 
+    def test_force_exit_watchdog_uses_injected_exit(self):
+        """Watchdog calls the injected _exit stub, NOT the global os._exit.
+
+        Worker-safety contract: when _exit is supplied as a keyword argument,
+        the watchdog closure captures the stub and calls it with the exit code
+        (137). The REAL global os._exit is never reached, so a leaked/late-firing
+        daemon thread can never abruptly kill an xdist worker process.
+
+        This test does NOT monkeypatch os._exit at the global level — the process
+        must remain alive after the watchdog fires, proving global os._exit was
+        bypassed.
+        """
+        calls: list[int] = []
+
+        def stub(code: int) -> None:
+            calls.append(code)
+
+        handle = _force_exit_after_delay(timeout_secs=0.05, _exit=stub)
+
+        # Poll with a deadline so spurious CI scheduler stalls don't cause
+        # false failures.
+        deadline = time.monotonic() + 5.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        assert calls == [137], f'expected injected stub to receive [137], got {calls}'
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), (
+            'watchdog thread must exit after firing the injected _exit stub'
+        )
+
+    def test_force_exit_watchdog_late_fire_never_calls_global_os_exit(self):
+        """A fired watchdog never reaches global os._exit when _exit is injected.
+
+        xdist worker-safety regression: under CPU starvation a watchdog daemon
+        thread can fire LATE — after the test function's monkeypatch teardown
+        has restored the REAL global os._exit. If the watchdog then calls the
+        REAL os._exit(137), the xdist worker process is killed abruptly, causing
+        ``[gwN] node down: Not properly terminated`` and a KeyError INTERNALERROR.
+
+        With `_exit=stub` injection the closure captures the stub at arm-time.
+        Even if the thread fires after the test exits, it calls the stub — a
+        harmless no-op — not the REAL global os._exit. This test verifies:
+
+        1. The stub receives [137] (watchdog fired via injection).
+        2. The process is still alive (REAL global os._exit was NOT called).
+        3. No 'shutdown-watchdog' thread remains alive after join (no thread leak).
+
+        This test does NOT use monkeypatch — there is no global os._exit patch
+        to restore, so there is no teardown window during which a late-firing
+        thread could reach the real os._exit.
+        """
+        calls: list[int] = []
+
+        def stub(code: int) -> None:
+            calls.append(code)
+
+        handle = _force_exit_after_delay(timeout_secs=0.05, _exit=stub)
+
+        # Poll until the watchdog fires (injected stub receives the call).
+        deadline = time.monotonic() + 5.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        # (1) Stub was called with 137 — watchdog fired via injection.
+        assert calls == [137], f'expected stub fired with [137], got {calls}'
+
+        # (2) Join with a short timeout; the thread must be gone.
+        handle.thread.join(timeout=1.0)
+
+        # (3) No 'shutdown-watchdog' thread may remain alive (no thread leak).
+        live_watchdog_threads = [
+            t for t in threading.enumerate()
+            if t.name == 'shutdown-watchdog' and t.is_alive()
+        ]
+        assert not live_watchdog_threads, (
+            f'shutdown-watchdog thread(s) still alive after firing and join: '
+            f'{live_watchdog_threads}'
+        )
+
 
 class TestRunUntilIdleFlag:
     """The --until-idle flag must thread through to harness.run(until_idle=...).
