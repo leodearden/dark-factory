@@ -41,6 +41,14 @@ from typing import Any
 # α/γ drift guard: tests/test_lock_charter_guard.py::test_extension_drift_guard
 # ---------------------------------------------------------------------------
 
+__all__ = [
+    'CODE_EXTENSIONS',
+    'is_file_path',
+    'directory_locks',
+    'extract_files',
+    'lock_charter_error',
+]
+
 CODE_EXTENSIONS: frozenset[str] = frozenset({
     'c', 'cc', 'cjs', 'cpp', 'css', 'cts', 'cxx', 'gcode',
     'h', 'hh', 'hpp', 'html',
