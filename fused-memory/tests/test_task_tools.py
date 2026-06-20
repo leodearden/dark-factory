@@ -1459,3 +1459,121 @@ async def test_get_tasks_status_filter_forwarded_and_composes(
         f'Error message should mention statuses: {result_f}'
     )
     task_interceptor.get_tasks.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Lock-charter guard γ — submit_task wiring tests (step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submit_task_rejects_directory_in_files_dict_metadata(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """submit_task rejects metadata.files containing a directory (dict form)."""
+    task_interceptor.submit_task = AsyncMock(return_value={'task_id': '1'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'X',
+            'metadata': {'files': ['orchestrator/']},
+        },
+    )
+    assert result.get('error_type') == 'LockCharterViolation'
+    assert 'orchestrator/' in result.get('directory_paths', [])
+    task_interceptor.submit_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_task_rejects_directory_in_files_json_string_metadata(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """submit_task rejects metadata.files containing a directory (JSON-string form)."""
+    task_interceptor.submit_task = AsyncMock(return_value={'task_id': '2'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'Y',
+            'metadata': '{"files": ["src"]}',
+        },
+    )
+    assert result.get('error_type') == 'LockCharterViolation'
+    assert 'src' in result.get('directory_paths', [])
+    task_interceptor.submit_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_task_planning_mode_rejects_directory_in_files(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """planning_mode=True submit_task is also guarded (catches #4552 human-decompose class)."""
+    task_interceptor.submit_task = AsyncMock(
+        return_value={'task_id': '3', 'status': 'deferred', 'planning_mode': True},
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'Z',
+            'planning_mode': True,
+            'metadata': {'files': ['crates/reify-eval/src']},
+        },
+    )
+    assert result.get('error_type') == 'LockCharterViolation'
+    assert 'crates/reify-eval/src' in result.get('directory_paths', [])
+    task_interceptor.submit_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_task_accepts_file_level_files(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """submit_task forwards when metadata.files contains only file-level paths."""
+    task_interceptor.submit_task = AsyncMock(return_value={'task_id': '10'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'A',
+            'metadata': {'files': ['pkg/mod/foo.py']},
+        },
+    )
+    assert result == {'task_id': '10'}
+    task_interceptor.submit_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_submit_task_accepts_empty_files_list(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """submit_task forwards when metadata.files is [] (defer-to-architect value)."""
+    task_interceptor.submit_task = AsyncMock(return_value={'task_id': '11'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'B',
+            'metadata': {'files': []},
+        },
+    )
+    assert result == {'task_id': '11'}
+    task_interceptor.submit_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_submit_task_accepts_none_metadata(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """submit_task forwards when metadata is None (no files declared)."""
+    task_interceptor.submit_task = AsyncMock(return_value={'task_id': '12'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'C',
+        },
+    )
+    assert result == {'task_id': '12'}
+    task_interceptor.submit_task.assert_called_once()
