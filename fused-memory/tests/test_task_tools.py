@@ -1577,3 +1577,107 @@ async def test_submit_task_accepts_none_metadata(
     )
     assert result == {'task_id': '12'}
     task_interceptor.submit_task.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Lock-charter guard γ — commit_planning wiring tests (step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_directory_in_task_files(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """commit_planning rejects atomically when any task has directory files."""
+    # Task 42 has file-level files; task 43 has a directory → whole batch rejected.
+    async def _get_task(tid, *args, **kwargs):
+        if tid == '43':
+            return {'id': '43', 'metadata': {'files': ['orchestrator/']}}
+        return {'id': tid, 'metadata': {'files': ['a/b.rs']}}
+
+    task_interceptor.get_task = AsyncMock(side_effect=_get_task)
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '42,43'},
+    )
+
+    assert result.get('error_type') == 'LockCharterViolation'
+    # The offending task id must appear in the error message.
+    assert '43' in result.get('error', '')
+    # The offending directory path must appear in directory_paths.
+    assert 'orchestrator/' in result.get('directory_paths', [])
+    # set_task_status must NOT have been called (whole-batch atomic reject).
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_accepts_all_file_level_tasks(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """commit_planning forwards when all tasks have file-level metadata.files."""
+    task_interceptor.get_task = AsyncMock(
+        return_value={'id': '7', 'metadata': {'files': ['src/main.py']}},
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '7'},
+    )
+
+    assert result == {'success': True}
+    task_interceptor.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_accepts_empty_files_list(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """commit_planning accepts tasks with files=[] (defer-to-architect value)."""
+    task_interceptor.get_task = AsyncMock(
+        return_value={'id': '8', 'metadata': {'files': []}},
+    )
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '8'},
+    )
+
+    assert result == {'success': True}
+    task_interceptor.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_early_rejection_paths_do_not_call_get_task(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Early-rejection paths (invalid target/empty ids/ticket) skip get_task and set_task_status."""
+    task_interceptor.get_task = AsyncMock()
+    task_interceptor.set_task_status = AsyncMock()
+
+    # Invalid target_status
+    r1 = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '7', 'target_status': 'in-progress'},
+    )
+    assert r1['error_type'] == 'ValidationError'
+
+    # Empty ids
+    r2 = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': ''},
+    )
+    assert r2['error_type'] == 'ValidationError'
+
+    # Ticket id in batch
+    r3 = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '42,tkt_abc'},
+    )
+    assert r3['error_type'] == 'ValidationError'
+
+    task_interceptor.get_task.assert_not_called()
+    task_interceptor.set_task_status.assert_not_called()
