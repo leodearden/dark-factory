@@ -2732,7 +2732,7 @@ def create_mcp_server(
             tasks_data = await asyncio.gather(
                 *[task_interceptor.get_task(tid, project_root) for tid in ids]
             )
-            for tid, task in zip(ids, tasks_data):
+            for tid, task in zip(ids, tasks_data, strict=False):
                 meta = task.get('metadata') if isinstance(task, dict) else None
                 dirs = directory_locks(extract_files(meta))
                 if dirs:

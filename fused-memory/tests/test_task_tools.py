@@ -1694,8 +1694,9 @@ async def test_commit_planning_bad_task_id_returns_structured_error(
     guard + set_task_status block is inside a single try/except, guaranteeing
     a consistent {'error', 'error_type'} response even for missing/invalid ids.
     """
-    from fused_memory.backends.task_backend_errors import TaskmasterError
     from unittest.mock import AsyncMock
+
+    from fused_memory.backends.task_backend_errors import TaskmasterError
 
     task_interceptor.get_task = AsyncMock(
         side_effect=TaskmasterError('INVALID_TASK_ID', 'task not found: 99999'),
