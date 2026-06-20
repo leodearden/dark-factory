@@ -6,6 +6,9 @@ Step 3 (RED → step-4 GREEN): list-gate helpers
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from fused_memory.middleware.lock_charter_guard import (
@@ -17,10 +20,22 @@ from fused_memory.middleware.lock_charter_guard import (
 )
 
 # ---------------------------------------------------------------------------
-# Drift guard — pins sorted(CODE_EXTENSIONS) to the shared α/γ test vector.
-# Any divergence from reify's --list-extensions output fails loudly here.
+# Drift guard — two tiers:
+#
+# Tier 1 (test_extension_drift_guard): same-file consistency check.
+#   Asserts sorted(CODE_EXTENSIONS) == _CANONICAL_EXTENSIONS, where both are
+#   defined in this file.  Catching that CODE_EXTENSIONS and _CANONICAL_EXTENSIONS
+#   stay in sync with each other.  Update BOTH lists together when the allowlist
+#   changes.  This does NOT catch cross-language α/γ drift on its own.
+#
+# Tier 2 (test_extension_drift_guard_vs_reify_script): cross-source guard.
+#   Invokes the real reify/scripts/lock-charter-guard.sh --list-extensions and
+#   compares its output to sorted(CODE_EXTENSIONS).  Skipped when the script
+#   is not present (e.g. in a standalone fused-memory checkout).  Run this in
+#   any environment that has both repos checked out side-by-side.
 # ---------------------------------------------------------------------------
 
+# The canonical α/γ vector — update this list AND CODE_EXTENSIONS together.
 _CANONICAL_EXTENSIONS = [
     'c', 'cc', 'cjs', 'cpp', 'css', 'cts', 'cxx', 'gcode',
     'h', 'hh', 'hpp', 'html',
@@ -31,10 +46,50 @@ _CANONICAL_EXTENSIONS = [
     'yaml', 'yml',
 ]
 
+# Path to the reify script (siblings repos under the same src/ directory).
+# Resolved from the test file location; works in the dark-factory worktree
+# layout: <src>/dark-factory/.worktrees/<n>/fused-memory/tests/ → <src>/reify/
+_REIFY_GUARD_SCRIPT = Path(__file__).parents[5] / 'reify' / 'scripts' / 'lock-charter-guard.sh'
+
 
 def test_extension_drift_guard():
-    """sorted(CODE_EXTENSIONS) must exactly match the shared α/γ test vector."""
+    """Tier-1 (same-file): sorted(CODE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
+
+    This is a same-file consistency check — CODE_EXTENSIONS and _CANONICAL_EXTENSIONS
+    must be updated together.  For cross-source α/γ drift detection see
+    test_extension_drift_guard_vs_reify_script.
+    """
     assert sorted(CODE_EXTENSIONS) == _CANONICAL_EXTENSIONS
+
+
+@pytest.mark.skipif(
+    not _REIFY_GUARD_SCRIPT.is_file(),
+    reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
+)
+def test_extension_drift_guard_vs_reify_script():
+    """Tier-2 (cross-source): sorted(CODE_EXTENSIONS) must match reify --list-extensions.
+
+    Invokes the real scripts/lock-charter-guard.sh --list-extensions and
+    compares its output to sorted(CODE_EXTENSIONS), catching any α/γ divergence
+    that the same-file Tier-1 guard would miss.
+    """
+    result = subprocess.run(
+        ['bash', str(_REIFY_GUARD_SCRIPT), '--list-extensions'],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(
+            f'reify script exited with code {result.returncode}; '
+            f'stderr: {result.stderr[:200]}'
+        )
+    script_exts = sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+    assert script_exts == sorted(CODE_EXTENSIONS), (
+        f'α/γ drift detected!\n'
+        f'  reify --list-extensions : {script_exts!r}\n'
+        f'  γ CODE_EXTENSIONS       : {sorted(CODE_EXTENSIONS)!r}\n'
+        f'Update CODE_EXTENSIONS (and _CANONICAL_EXTENSIONS) to match reify.'
+    )
 
 
 # ---------------------------------------------------------------------------
