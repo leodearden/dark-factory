@@ -2717,21 +2717,27 @@ def create_mcp_server(
                     'error_type': 'ValidationError',
                 }
 
-        # Lock-charter guard γ: check each task's metadata.files for directory
-        # entries before flipping status. Reads tasks individually (small batches,
-        # infrequent release event). Rejects the WHOLE batch atomically on first
-        # offending task, naming the task id + directory paths (mirrors the
-        # ticket-id-in-batch validation above: all-or-nothing commit gate).
-        # Non-dict / missing metadata → benign-absent ([] → ACCEPT); this also
-        # keeps the existing AsyncMock-fixture commit_planning tests green.
-        for tid in ids:
-            task = await task_interceptor.get_task(tid, project_root)
-            meta = task.get('metadata') if isinstance(task, dict) else None
-            dirs = directory_locks(extract_files(meta))
-            if dirs:
-                return lock_charter_error(dirs, task_id=tid)
-
         try:
+            # Lock-charter guard γ: batch-read all tasks concurrently, then
+            # scan for directory entries before flipping status.  asyncio.gather
+            # keeps latency proportional to the slowest single read rather than
+            # N × median.  Any TaskmasterError (e.g. unknown id) propagates
+            # through gather and is caught by the outer handler below, returning
+            # the standard structured error dict instead of raising.
+            # Rejects the WHOLE batch atomically on the first offending task,
+            # naming the task id + directory paths (mirrors the
+            # ticket-id-in-batch validation above: all-or-nothing commit gate).
+            # Non-dict / missing metadata → benign-absent ([] → ACCEPT); this
+            # also keeps the existing AsyncMock-fixture commit_planning tests green.
+            tasks_data = await asyncio.gather(
+                *[task_interceptor.get_task(tid, project_root) for tid in ids]
+            )
+            for tid, task in zip(ids, tasks_data):
+                meta = task.get('metadata') if isinstance(task, dict) else None
+                dirs = directory_locks(extract_files(meta))
+                if dirs:
+                    return lock_charter_error(dirs, task_id=tid)
+
             return await task_interceptor.set_task_status(
                 task_id=','.join(ids),
                 status=target_status,

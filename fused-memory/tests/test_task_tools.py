@@ -1681,3 +1681,32 @@ async def test_commit_planning_early_rejection_paths_do_not_call_get_task(
 
     task_interceptor.get_task.assert_not_called()
     task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_bad_task_id_returns_structured_error(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """commit_planning returns structured error dict when get_task raises (e.g. unknown id).
+
+    Previously the guard loop ran OUTSIDE the try/except, so a TaskmasterError
+    from get_task would escape and change the response shape.  Now the whole
+    guard + set_task_status block is inside a single try/except, guaranteeing
+    a consistent {'error', 'error_type'} response even for missing/invalid ids.
+    """
+    from fused_memory.backends.task_backend_errors import TaskmasterError
+    from unittest.mock import AsyncMock
+
+    task_interceptor.get_task = AsyncMock(
+        side_effect=TaskmasterError('INVALID_TASK_ID', 'task not found: 99999'),
+    )
+    task_interceptor.set_task_status = AsyncMock()
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '99999'},
+    )
+
+    assert 'error' in result
+    assert result.get('error_type') == 'TaskmasterError'
+    task_interceptor.set_task_status.assert_not_called()
