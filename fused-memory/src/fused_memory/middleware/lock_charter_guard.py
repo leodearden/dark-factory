@@ -131,6 +131,17 @@ def extract_files(metadata: str | dict[str, Any] | None) -> list[str]:
     ``task_interceptor.py``: malformed or absent metadata is treated as
     no-files (return []) rather than raising.
 
+    Relationship to ``_extract_metadata_files``:
+        ``_extract_metadata_files`` takes a full task dict (``{'metadata': {...}}``
+        shape) and emits logger.WARNING on unexpected shapes.  This function is
+        intentionally self-contained: it accepts the *metadata value* directly
+        (dict, JSON string, or None) so the guard can handle both the
+        submit_task path (inline metadata arg) and the commit_planning path
+        (get_task result's ``metadata`` value) without wrapping.  The JSON-string
+        and None normalization are the only genuinely new behaviours; the dict-path
+        logic is equivalent and kept local to avoid importing a private function
+        across module boundaries.
+
     Rules:
     - ``None`` → []
     - ``dict`` → use directly
@@ -192,6 +203,9 @@ def lock_charter_error(
             'or use files=[] (the defer-to-architect value) to leave scope '
             'unspecified. Directory strings in metadata.files are rejected '
             'because they create over-wide lock charters that block unrelated '
-            'work in the same directory.'
+            'work in the same directory. '
+            'Note: extension matching is case-sensitive against a lowercase '
+            'allowlist (e.g. "README.MD" or "config.YAML" is classified as a '
+            'directory — use lowercase extensions like "README.md" instead).'
         ),
     }
