@@ -19,6 +19,11 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.middleware.lock_charter_guard import (
+    directory_locks,
+    extract_files,
+    lock_charter_error,
+)
 from fused_memory.middleware.task_interceptor import (
     TERMINAL_STATUSES,
     _is_ticket_id,
@@ -2419,6 +2424,15 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+
+        # Lock-charter guard γ: reject directory strings in metadata.files
+        # before forwarding to the interceptor. Covers both the normal curator
+        # path and planning_mode=True (same tool function), catching the #4552
+        # human-decompose class at creation time.
+        _dirs = directory_locks(extract_files(metadata))
+        if _dirs:
+            return lock_charter_error(_dirs)
+
         try:
             return await task_interceptor.submit_task(
                 project_root=project_root,
