@@ -10,9 +10,11 @@ import pytest
 
 from fused_memory.middleware.lock_charter_guard import (
     CODE_EXTENSIONS,
+    directory_locks,
+    extract_files,
     is_file_path,
+    lock_charter_error,
 )
-
 
 # ---------------------------------------------------------------------------
 # Drift guard — pins sorted(CODE_EXTENSIONS) to the shared α/γ test vector.
@@ -128,13 +130,6 @@ def test_is_file_path_conservative_rejects(path):
 # ---------------------------------------------------------------------------
 # Step 3: list-gate helpers — directory_locks, extract_files, lock_charter_error
 # ---------------------------------------------------------------------------
-
-from fused_memory.middleware.lock_charter_guard import (  # noqa: E402
-    directory_locks,
-    extract_files,
-    lock_charter_error,
-)
-
 
 class TestDirectoryLocks:
     def test_empty_list_returns_empty(self):
