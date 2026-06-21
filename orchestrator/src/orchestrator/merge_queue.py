@@ -6814,6 +6814,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # (abandoned-at-top, except WorktreeMissing, except Exception, outer
         # finally) releases the permit and clears this flag.
         held_spec_permit: bool = False
+        # Set True when the loop exits cleanly via the None shutdown sentinel from
+        # _acquire_next_request().  Used in the finally to decide whether to forward
+        # the sentinel to the verifier: on the crash path (exception while _running is
+        # True) this is False, so the stray put(None) that would silently kill the
+        # surviving verifier is suppressed.
+        exited_via_sentinel: bool = False
 
         try:
             while self._running:
@@ -6847,6 +6853,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 else:
                     req = await self._acquire_next_request()
                     if req is None:
+                        exited_via_sentinel = True
                         break  # shutdown sentinel
                     spec_base = None  # fresh dequeue resets speculation chain
 
@@ -7323,9 +7330,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._inflight_req.result.set_result(
                     MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
                 )
-            # Always send shutdown sentinel so the verifier exits cleanly,
-            # even if an unexpected exception propagates from the loop body.
-            await self._verifier_queue.put(None)
+            # Send shutdown sentinel ONLY when the merger is genuinely shutting down:
+            # either (a) stop() set _running=False, or (b) the loop broke cleanly via
+            # the None shutdown sentinel from _acquire_next_request (exited_via_sentinel).
+            #
+            # On the crash path (unhandled exception with _running still True and
+            # exited_via_sentinel still False) the merger must NOT push a sentinel.  If
+            # it did, the still-healthy verifier would consume it, drain _inflight, and
+            # return cleanly — _on_loop_task_done would retire the verifier without
+            # restarting it, silently killing the verifier on exactly the crash scenario
+            # the supervisor exists to prevent: a restarted merger + a permanently-dead
+            # verifier, with all newly merged items piling on _verifier_queue and result
+            # Futures hanging forever.
+            #
+            # Guard semantics:
+            #   • `not self._running` — covers the "stop() was called" case; stop() sets
+            #     _running=False (:6246) BEFORE draining and itself pushes the verifier
+            #     sentinel at :6364, so the re-drain loop there catches any late items.
+            #   • `exited_via_sentinel` — covers the "got None from the input queue"
+            #     case, which includes direct _merger_loop() test calls that put a None
+            #     in the queue without going through stop().  In the real lifecycle both
+            #     are True simultaneously (stop() sets _running=False first, THEN puts
+            #     the None); here only one may be True, but either is sufficient.
+            if not self._running or exited_via_sentinel:
+                await self._verifier_queue.put(None)
 
     # ------------------------------------------------------------------
     # Verifier coroutine
