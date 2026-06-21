@@ -5957,14 +5957,142 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             except Exception:
                 logger.exception('reprobe_quarantined_hosts: unexpected error in loop')
 
+    # ── supervisor (task 1857) ───────────────────────────────────────────
+
+    def _spawn_loop(self, name: str) -> asyncio.Task:  # type: ignore[type-arg]
+        """Create (or re-create) the named loop task and register the supervisor callback.
+
+        Stores the new task in ``self._merger_task`` or ``self._verifier_task`` so the
+        current task reference is always up-to-date.  The done callback calls
+        ``_on_loop_task_done`` on every completion so the supervisor can detect
+        unexpected deaths and either restart or halt.
+
+        Args:
+            name: ``'merger'`` or ``'verifier'``.
+
+        Returns:
+            The newly-created ``asyncio.Task``.
+        """
+        if name == 'merger':
+            task: asyncio.Task = asyncio.create_task(self._merger_loop())  # type: ignore[type-arg]
+            self._merger_task = task
+        elif name == 'verifier':
+            task = asyncio.create_task(self._verifier_loop())  # type: ignore[type-arg]
+            self._verifier_task = task
+        else:
+            raise ValueError(f'Unknown loop name: {name!r}')
+        task.add_done_callback(lambda t: self._on_loop_task_done(name, t))
+        return task
+
+    def _retire_loop(self, name: str) -> None:
+        """Mark a loop as no longer live; set ``_loops_finished`` when all have retired.
+
+        Called by the supervisor on any completion path (normal shutdown, cancellation,
+        or terminal cap-exceeded halt).  Sets ``_loops_finished`` as soon as all loops
+        have retired OR the worker has been supervisor-halted so ``run()`` can return.
+        """
+        self._live_loops.discard(name)
+        if not self._live_loops or self._supervisor_halted:
+            self._loops_finished.set()
+
+    def _on_loop_task_done(self, name: str, task: asyncio.Task) -> None:  # type: ignore[type-arg]
+        """Done callback for supervised loop tasks (merger and verifier).
+
+        Classifies the completion and takes the appropriate action:
+
+        * **Cancelled** → teardown; ``_retire_loop`` without escalating.
+        * **Clean return** (``exception() is None``) → None-sentinel shutdown;
+          ``_retire_loop`` without escalating.
+        * **Exception + ``_running`` is False** → shutdown race; ``_retire_loop``
+          without escalating.  A loop dying while ``stop()`` drains the queues is not
+          an unexpected death.
+        * **Exception + ``_running`` is True** → unexpected death; emit a loud L1
+          escalation then ``_spawn_loop(name)`` to restart (bounded by the cap added
+          in step-4; unbounded here in step-2).
+
+        Calling ``task.exception()`` is also the **fix for the silent-death
+        suppression**: without retrieval, asyncio would log "Task exception was never
+        retrieved" at GC time — but because the run() task holds a strong reference to
+        the gather result, GC never fires and the exception is silently lost.  This
+        callback retrieves it unconditionally.
+        """
+        if task.cancelled():
+            # Teardown cancellation — not an unexpected death.
+            self._retire_loop(name)
+            return
+        # Retrieve the exception (kills the "never retrieved" suppression).
+        exc = task.exception()
+        if exc is None or not self._running:
+            # Clean return via the None sentinel OR shutdown race: not a death.
+            self._retire_loop(name)
+            return
+        # Unexpected death while worker is running: escalate + restart.
+        self._emit_loop_death_escalation(name, exc)
+        self._spawn_loop(name)
+
+    def _emit_loop_death_escalation(self, name: str, exc: BaseException) -> None:
+        """Emit a loud L1 ``'merge_worker_loop_died'`` escalation.
+
+        None-safe: no-op when ``self._escalation_queue`` is None (bare-worker tests).
+
+        The ``agent_role='orchestrator-merge-worker-supervisor'`` prefix marks these as
+        harness sentinels so the escalation server never downgrades their severity.
+
+        No ``has_open_l1`` dedup: the restart cap bounds volume (≤3 per window), and
+        the project directive is "prefer loud escalation over silent degradation".
+        """
+        if self._escalation_queue is None:
+            return
+        from escalation.models import Escalation  # local import — escalation optional dep
+        tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        summary = f'merge_worker_loop_died: {name} loop died unexpectedly — restarting'
+        detail = (
+            f'Loop: {name}\n'
+            f'Exception type: {type(exc).__name__}\n'
+            f'Exception: {exc}\n'
+            f'\nFull traceback:\n{tb_str}'
+        )
+        esc = Escalation(
+            id=self._escalation_queue.make_id(
+                f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}'
+            ),
+            task_id=f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}',
+            agent_role='orchestrator-merge-worker-supervisor',
+            severity='blocking',
+            level=1,
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action='Worker auto-restarted the loop; investigate the traceback.',
+        )
+        self._escalation_queue.submit(esc)
+
+    # ── run / stop ──────────────────────────────────────────────────────
+
     async def run(self) -> None:
-        """Start merger, verifier, heartbeat, and reprobe coroutines; wait for merge tasks."""
-        self._merger_task = asyncio.create_task(self._merger_loop())
-        self._verifier_task = asyncio.create_task(self._verifier_loop())
+        """Start merger, verifier, heartbeat, and reprobe coroutines; wait for merge tasks.
+
+        Uses ``await self._loops_finished.wait()`` instead of
+        ``asyncio.gather(merger, verifier)`` so the supervisor can replace dead loop
+        tasks in-place (gather binds to fixed task objects and propagates the first
+        exception — incompatible with in-process restart).
+
+        The outer-cancellation path (``except BaseException``) and heartbeat/reprobe
+        cleanup (``finally``) preserve the original semantics.  The ``finally`` also
+        cancels any still-live loop task on the terminal-halt path (so the healthy
+        sibling of a cap-exceeded loop does not leak).
+        """
+        # Reset supervisor state for this invocation.
+        self._live_loops = {'merger', 'verifier'}
+        self._loops_finished.clear()
+        # Spawn merger and verifier via _spawn_loop so the supervisor callbacks
+        # are registered from the very first iteration.
+        self._spawn_loop('merger')
+        self._spawn_loop('verifier')
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._reprobe_task = asyncio.create_task(self._reprobe_loop())
         try:
-            await asyncio.gather(self._merger_task, self._verifier_task)
+            await self._loops_finished.wait()
         except BaseException:
             for t in (
                 self._merger_task, self._verifier_task,
@@ -5979,9 +6107,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
             raise
         finally:
-            # Cancel both background tasks on both normal and exceptional exit.
-            # On the exception path the except block already cleaned them up, so
-            # .done() is True and these are no-ops.
+            # Cancel any still-live loop tasks (terminal-halt path has healthy sibling).
+            # On the exception path the except block already cleaned them up.
+            for t in (self._merger_task, self._verifier_task):
+                if t and not t.done():
+                    t.cancel()
+                    await asyncio.gather(t, return_exceptions=True)
             if self._heartbeat_task and not self._heartbeat_task.done():
                 self._heartbeat_task.cancel()
                 await asyncio.gather(self._heartbeat_task, return_exceptions=True)
