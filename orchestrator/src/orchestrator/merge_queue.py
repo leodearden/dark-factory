@@ -5967,6 +5967,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_on_loop_task_done`` on every completion so the supervisor can detect
         unexpected deaths and either restart or halt.
 
+        **Verifier restart — in-flight state survival (task 1857 design decision)**
+
+        On a verifier restart, this method does NOT clear ``self._inflight``,
+        ``self._redispatch``, ``self._n_failed``, ``self._remerge_occurred``, or
+        ``self._pending_verifier_get``.  These are *instance* attributes that outlive
+        the dead loop task.  The restarted ``_verifier_loop`` naturally resumes
+        draining them:
+
+        * **DISPATCH-FILL** drains ``_redispatch`` first (front-priority re-dispatch
+          queue), then ``_verifier_queue``, so surviving re-dispatch entries are
+          re-verified in submission order ahead of any new arrivals.
+        * **FINALIZE-HEAD** pops ``_inflight`` and calls ``_finalize_inflight``, whose
+          ``if not req.result.done()`` guard makes re-finalization idempotent — an
+          entry that was mid-finalize when the loop died cannot be double-resolved.
+
+        Therefore surviving in-flight entries are neither lost nor double-finalized.
+        The supervisor restart path **must not** clear those deques.  Finalize-or-requeue
+        is owned by the resumed loop, not the supervisor.
+
         Args:
             name: ``'merger'`` or ``'verifier'``.
 
