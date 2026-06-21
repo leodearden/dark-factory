@@ -163,3 +163,84 @@ async def test_loop_death_escalates_loudly_and_restarts(
         await asyncio.wait_for(run_task, timeout=2.0)
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — RED: bounded restarts → terminal L2 escalation + halt
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bounded_restarts_then_terminal_escalation(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+) -> None:
+    """After max_loop_restarts in-window crashes the worker must halt and emit a terminal L2.
+
+    Stub: always raises RuntimeError (with a yield so the event loop can tick).
+    Configuration: _max_loop_restarts=3, _loop_restart_window_s=1000 (all in-window).
+
+    Assertions:
+      1. run() completes within timeout (no hang — _loops_finished is set on halt).
+      2. Stub invoked exactly 4 times (1 initial + 3 restarts).
+      3. submit called 4 times: first 3 are level=1 'merge_worker_loop_died';
+         4th (terminal) is level=2 severity='critical'.
+      4. worker._supervisor_halted is True; _supervisor_halt_reason is set.
+      5. run() task completed with exception() is None (clean return, not a crash).
+    """
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    eq = _make_fake_escalation_queue()
+    worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
+    worker._shutdown_timeout = 0.1
+    worker._max_loop_restarts = 3
+    worker._loop_restart_window_s = 1000.0  # all rapid deaths fall in-window
+
+    invocation_count = 0
+
+    async def always_crashing_verifier() -> None:
+        nonlocal invocation_count
+        invocation_count += 1
+        await asyncio.sleep(0)  # yield to pace restarts
+        raise RuntimeError(f'verifier crash #{invocation_count}')
+
+    worker._verifier_loop = always_crashing_verifier  # type: ignore[method-assign]
+
+    run_task = asyncio.create_task(worker.run())
+
+    # Wait for run() to complete (supervisor halts after cap exceeded)
+    await asyncio.wait_for(run_task, timeout=10.0)
+
+    # 1. run() returned within timeout (asserted by wait_for not raising)
+
+    # 2. Stub invoked exactly 4 times (1 initial + 3 restarts)
+    assert invocation_count == 4, (
+        f'Expected 4 invocations (1 crash + 3 restarts), got {invocation_count}'
+    )
+
+    # 3. Exactly 4 submissions: 3 × L1 restart + 1 × L2 terminal
+    assert eq.submit.call_count == 4, (
+        f'Expected 4 escalation submissions, got {eq.submit.call_count}'
+    )
+    restart_escs = [eq.submit.call_args_list[i][0][0] for i in range(3)]
+    terminal_esc = eq.submit.call_args_list[3][0][0]
+    for esc in restart_escs:
+        assert esc.level == 1, f'Restart escalation should be level 1, got {esc.level}'
+        assert 'merge_worker_loop_died' in esc.summary
+    assert terminal_esc.level == 2, (
+        f'Terminal escalation should be level 2, got {terminal_esc.level}'
+    )
+    assert terminal_esc.severity == 'critical', (
+        f'Terminal escalation should be critical, got {terminal_esc.severity!r}'
+    )
+    assert 'HALTED' in terminal_esc.summary or 'cap' in terminal_esc.summary.lower(), (
+        f'Terminal summary should mention HALTED or cap: {terminal_esc.summary!r}'
+    )
+
+    # 4. Supervisor halted
+    assert worker._supervisor_halted is True, 'Expected _supervisor_halted=True'
+    assert worker._supervisor_halt_reason is not None, '_supervisor_halt_reason should be set'
+
+    # 5. run() completed cleanly (no exception propagated)
+    assert run_task.exception() is None, (
+        f'run() should not propagate an exception; got {run_task.exception()!r}'
+    )
