@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -70,6 +70,44 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     return OrchestratorConfig(project_root=git_repo, git=git_config)
+
+
+async def _make_branch_with_file(
+    git_ops: GitOps,
+    branch_name: str,
+    filename: str,
+    content: str,
+) -> Path:
+    """Create a worktree branch with one committed file and return its path."""
+    worktree = (await git_ops.create_worktree(branch_name)).path
+    (worktree / filename).write_text(content)
+    await git_ops.commit(worktree, f'Add {filename}')
+    return worktree
+
+
+def _make_request(
+    task_id: str,
+    branch: str,
+    worktree: Path,
+    config: OrchestratorConfig,
+) -> MergeRequest:
+    """Build a MergeRequest with a pending asyncio Future."""
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    return MergeRequest(
+        task_id=task_id,
+        branch=branch,
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=future,
+    )
+
+
+def _mock_verify_pass() -> AsyncMock:
+    """Return a mock that makes run_scoped_verification always pass."""
+    return AsyncMock(return_value=type('VR', (), {'passed': True, 'summary': ''})())
 
 
 def _make_fake_escalation_queue() -> MagicMock:
@@ -593,3 +631,229 @@ async def test_restart_clock_injection_window_pruning(git_ops: GitOps) -> None:
         if not t.done():
             t.cancel()
             await asyncio.gather(t, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Step 9 — RED: real _merger_loop crash must not kill the verifier
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_real_merger_crash_preserves_verifier_and_pipeline(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+) -> None:
+    """A real _merger_loop crash must NOT send a stray shutdown sentinel to the verifier.
+
+    FAILS BEFORE step-10 FIX: the merger's outer finally (:7328) unconditionally
+    does ``await self._verifier_queue.put(None)`` on the crash path.  The surviving
+    verifier consumes that sentinel, drains _inflight, and returns cleanly.
+    _on_loop_task_done('verifier', task) sees exc is None -> _retire_loop without
+    restart.  Result: a restarted merger + a permanently-dead verifier; all newly
+    merged items pile on _verifier_queue and their result Futures hang forever.
+
+    Injection: patch _maybe_coalesce_waiting_singles to raise RuntimeError on its
+    FIRST call (called OUTSIDE the inner try/except, so the raise escapes per-item
+    guards and propagates into the outer try/finally).  Subsequent calls delegate to
+    the real method (a harmless no-op when train_callback_factory is None).
+
+    Assertions:
+      1. outcome.status == 'done' — end-to-end liveness (post-crash request verified).
+      2. worker._verifier_task IS verifier_task_before (SAME object, never retired).
+      3. Escalation submitted: level==1, 'merge_worker_loop_died' in summary, 'merger'
+         in summary.
+      4. worker._merger_task is a fresh, not-done Task (restarted by supervisor).
+    """
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    eq = _make_fake_escalation_queue()
+    worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
+    worker._shutdown_timeout = 0.1
+
+    # Patch _maybe_coalesce_waiting_singles: crash on first call, delegate afterwards.
+    real_coalesce = worker._maybe_coalesce_waiting_singles
+    coalesce_call_count = 0
+
+    async def patched_coalesce() -> bool:
+        nonlocal coalesce_call_count
+        coalesce_call_count += 1
+        if coalesce_call_count == 1:
+            raise RuntimeError('merger crash injected by test')
+        return await real_coalesce()  # type: ignore[no-any-return]
+
+    worker._maybe_coalesce_waiting_singles = patched_coalesce  # type: ignore[method-assign]
+
+    # Build branch+request before starting run() so we can submit after the crash.
+    wt = await _make_branch_with_file(git_ops, 'crash-test', 'crash_file.py', 'x = 1\n')
+
+    with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+        run_task = asyncio.create_task(worker.run())
+
+        # Poll up to ~2s until run() spawns both loop tasks.
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while (
+            (worker._merger_task is None or worker._verifier_task is None)
+            and asyncio.get_event_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.02)
+
+        assert worker._merger_task is not None, 'merger_task should be set after run() starts'
+        assert worker._verifier_task is not None, 'verifier_task should be set after run() starts'
+        verifier_task_before = worker._verifier_task
+
+        # Poll up to ~3s for the merger death escalation.
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while eq.submit.call_count == 0 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+
+        # ── Assert 3: escalation emitted for merger death ─────────────────────
+        assert eq.submit.call_count >= 1, (
+            f'Expected at least 1 escalation, got {eq.submit.call_count}'
+        )
+        merger_esc = eq.submit.call_args_list[0][0][0]
+        assert merger_esc.level == 1, f'Expected level 1, got {merger_esc.level}'
+        assert merger_esc.severity == 'blocking', (
+            f'Expected severity blocking, got {merger_esc.severity!r}'
+        )
+        assert 'merge_worker_loop_died' in merger_esc.summary, (
+            f'summary missing merge_worker_loop_died: {merger_esc.summary!r}'
+        )
+        assert 'merger' in merger_esc.summary, (
+            f'summary missing "merger": {merger_esc.summary!r}'
+        )
+
+        # Give the event loop time for the supervisor to restart the merger.
+        await asyncio.sleep(0.1)
+
+        # Submit the post-crash request.
+        req = _make_request('crash-test', 'crash-test', wt, config)
+        await queue.put(req)
+
+        # ── Assert 1: end-to-end liveness — restarted merger + surviving verifier ──
+        outcome = await asyncio.wait_for(req.result, timeout=15.0)
+
+    assert outcome.status == 'done', (
+        f'Expected outcome.status="done" but got {outcome.status!r}'
+    )
+
+    # ── Assert 2: verifier is the SAME task (never retired/replaced) ─────────
+    assert worker._verifier_task is verifier_task_before, (
+        'Verifier task must be the SAME object — it must not have been retired/replaced'
+    )
+    assert not worker._verifier_task.done(), (
+        'Verifier task should still be running (not retired)'
+    )
+
+    # ── Assert 4: merger was restarted (fresh, not-done task) ────────────────
+    assert worker._merger_task is not None
+    assert not worker._merger_task.done(), 'Restarted merger task should still be running'
+
+    # ── Cleanup ──────────────────────────────────────────────────────────────
+    await worker.stop()
+    with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+        await asyncio.wait_for(run_task, timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Step 11 — RED: clean loop exit while running must be treated as death
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_clean_loop_exit_while_running_is_treated_as_death(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+) -> None:
+    """A loop that returns cleanly while self._running is True is a synthetic death.
+
+    FAILS BEFORE step-12: the current _on_loop_task_done retrieves exc=None for a
+    clean return and the guard ``if exc is None or not self._running: _retire_loop``
+    retires the loop silently with NO escalation and NO restart.
+
+    After step-12 the SHUTDOWN GUARD (``if not self._running: _retire_loop``) is
+    checked FIRST (so normal shutdown is unaffected), then any clean return while
+    running is wrapped in a synthetic RuntimeError and falls through to the
+    restart-cap + escalate path.
+
+    Setup:
+      - _verifier_loop replaced with an idle stub so the spawned restart stays benign.
+      - _running=True, _live_loops={'merger','verifier'} (both live so _retire_loop
+        won't set _loops_finished on a within-cap path).
+      - A FINISHED task that returned None (not cancelled, no exception).
+
+    Assertions:
+      1. escalation_queue.submit called once with a level==1 'merge_worker_loop_died'
+         escalation; summary contains 'verifier'.
+      2. A NEW worker._verifier_task was spawned (a different object) and is not done
+         (loop was RESTARTED, not retired).
+      3. 'verifier' is still in worker._live_loops (not retired).
+      4. worker._loops_finished is NOT set (not retired).
+    """
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    eq = _make_fake_escalation_queue()
+    worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
+
+    # Replace _verifier_loop with a harmless idle stub so the spawned restart
+    # task stays alive without doing real work.
+    async def idle_verifier() -> None:
+        while worker._running:
+            await asyncio.sleep(0.01)
+
+    worker._verifier_loop = idle_verifier  # type: ignore[method-assign]
+
+    # Construct a FINISHED task that returned None cleanly (not cancelled, no exc).
+    async def _clean_return() -> None:
+        return None
+
+    clean_task: asyncio.Task = asyncio.create_task(_clean_return())
+    await asyncio.gather(clean_task, return_exceptions=True)
+    assert clean_task.done() and not clean_task.cancelled()
+    assert clean_task.exception() is None, 'task should have a clean return (exc=None)'
+
+    # Set supervisor state: running + both loops live.
+    worker._running = True
+    worker._live_loops = {'merger', 'verifier'}
+
+    # Invoke the death callback directly.
+    worker._on_loop_task_done('verifier', clean_task)
+
+    # Give the event loop a tick to register the spawned task.
+    await asyncio.sleep(0)
+
+    # ── Assert 1: escalation submitted once with level==1 ────────────────────
+    assert eq.submit.call_count == 1, (
+        f'Expected 1 escalation (synthetic death for clean-exit-while-running), '
+        f'got {eq.submit.call_count}'
+    )
+    esc = eq.submit.call_args[0][0]
+    assert esc.level == 1, f'Expected level 1, got {esc.level}'
+    assert 'merge_worker_loop_died' in esc.summary, (
+        f'summary missing merge_worker_loop_died: {esc.summary!r}'
+    )
+    assert 'verifier' in esc.summary, (
+        f'summary missing "verifier": {esc.summary!r}'
+    )
+
+    # ── Assert 2: new verifier task spawned and not done ─────────────────────
+    assert worker._verifier_task is not None, '_verifier_task should not be None'
+    assert worker._verifier_task is not clean_task, (
+        '_verifier_task must be a NEW task (different from the clean-return task)'
+    )
+    assert not worker._verifier_task.done(), (
+        '_verifier_task should still be running (idle stub)'
+    )
+
+    # ── Assert 3: verifier still in live_loops ───────────────────────────────
+    assert 'verifier' in worker._live_loops, (
+        "'verifier' must still be in _live_loops (not retired)"
+    )
+
+    # ── Assert 4: _loops_finished NOT set ────────────────────────────────────
+    assert not worker._loops_finished.is_set(), (
+        '_loops_finished must NOT be set (loop was restarted, not retired)'
+    )
+
+    # ── Cleanup ──────────────────────────────────────────────────────────────
+    worker._running = False
+    if worker._verifier_task and not worker._verifier_task.done():
+        worker._verifier_task.cancel()
+        await asyncio.gather(worker._verifier_task, return_exceptions=True)
