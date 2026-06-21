@@ -247,6 +247,13 @@ async def test_bounded_restarts_then_terminal_escalation(
         f'run() should not propagate an exception; got {run_task.exception()!r}'
     )
 
+    # 6. Healthy sibling (merger) must be cancelled/done after terminal halt so it
+    #    does not leak.  The run() finally-block cancels any still-live loop task.
+    assert worker._merger_task is None or worker._merger_task.done(), (
+        'Healthy sibling _merger_task should be done/cancelled after terminal halt; '
+        f'got done={worker._merger_task.done() if worker._merger_task else None}'
+    )
+
 
 # ---------------------------------------------------------------------------
 # Step 5 — RED: normal shutdown / cancelled / shutdown-race do NOT escalate
@@ -466,3 +473,123 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     if worker._verifier_task and not worker._verifier_task.done():
         worker._verifier_task.cancel()
         await asyncio.gather(worker._verifier_task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Amendment 4 — clock injection: rolling-window pruning keeps within-cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restart_clock_injection_window_pruning(git_ops: GitOps) -> None:
+    """Injectable _restart_clock enables window-pruning test without real sleeps.
+
+    Verifies that aged-out restart timestamps are pruned so a death that would
+    EXCEED the cap when measured from T=0 is instead treated as WITHIN-cap once
+    enough time has elapsed.
+
+    Sequence:
+      _max_loop_restarts=2, _loop_restart_window_s=100s.
+
+      T=  0: death 1 → times=[], len=0 < 2 → within-cap, records T=0.
+      T= 10: death 2 → times=[0], len=1 < 2 → within-cap, records T=10.
+             times=[0, 10]; len=2. Without pruning, the NEXT death would be terminal.
+      T=200: death 3 → prune: both 0 and 10 are >100s ago → times=[].
+             len=0 < 2 → within-cap (NOT terminal) even though cap "appeared full".
+
+    All three deaths should produce L1 escalations; _supervisor_halted stays False.
+    Without _restart_clock injection and window pruning this would require 100+ s of
+    real elapsed time.
+    """
+    from unittest.mock import patch
+
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    eq = _make_fake_escalation_queue()
+    worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
+    worker._max_loop_restarts = 2
+    worker._loop_restart_window_s = 100.0
+
+    # Inject a controllable monotonic clock.
+    fake_time = 0.0
+    worker._restart_clock = lambda: fake_time
+
+    # Helper: create a task that has already failed with RuntimeError.
+    async def _make_dead_task() -> asyncio.Task:  # type: ignore[type-arg]
+        async def _raises() -> None:
+            raise RuntimeError('test death')
+
+        t: asyncio.Task = asyncio.create_task(_raises())  # type: ignore[type-arg]
+        await asyncio.gather(t, return_exceptions=True)
+        assert t.done() and not t.cancelled()
+        return t
+
+    # Replace _spawn_loop with a no-op that creates a dormant task (no done callback)
+    # so invocations of _on_loop_task_done don't chain into real loop logic.
+    spawned_tasks: list[asyncio.Task] = []  # type: ignore[type-arg]
+
+    async def _dormant() -> None:
+        await asyncio.sleep(3600)
+
+    def fake_spawn(name: str) -> asyncio.Task:  # type: ignore[type-arg]
+        t: asyncio.Task = asyncio.create_task(_dormant())  # type: ignore[type-arg]
+        spawned_tasks.append(t)
+        if name == 'verifier':
+            worker._verifier_task = t
+        elif name == 'merger':
+            worker._merger_task = t
+        return t
+
+    # Supervisor preconditions: _running=True, both loops live (so _retire_loop
+    # won't set _loops_finished on a within-cap path).
+    worker._running = True
+    worker._live_loops = {'merger', 'verifier'}
+
+    with patch.object(worker, '_spawn_loop', side_effect=fake_spawn):
+        # Death 1 at T=0 → within-cap (times empty, 0 < 2)
+        fake_time = 0.0
+        worker._on_loop_task_done('verifier', await _make_dead_task())
+
+        assert eq.submit.call_count == 1, (
+            f'Death 1: expected 1 L1 escalation, got {eq.submit.call_count}'
+        )
+        assert eq.submit.call_args_list[0][0][0].level == 1
+        assert worker._supervisor_halted is False
+
+        # Death 2 at T=10 → within-cap (len=1 < 2)
+        fake_time = 10.0
+        worker._on_loop_task_done('verifier', await _make_dead_task())
+
+        assert eq.submit.call_count == 2, (
+            f'Death 2: expected 2 L1 escalations total, got {eq.submit.call_count}'
+        )
+        assert eq.submit.call_args_list[1][0][0].level == 1
+        assert worker._supervisor_halted is False
+
+        # Confirm times are filled (without pruning, next death would be terminal).
+        assert len(worker._loop_restart_times['verifier']) == 2, (
+            'times deque should have 2 entries before advancing clock'
+        )
+
+        # Advance clock past the window: both T=0 and T=10 are now >100s old.
+        fake_time = 200.0
+
+        # Death 3 at T=200 → pruning must clear old entries → within-cap again.
+        worker._on_loop_task_done('verifier', await _make_dead_task())
+
+        assert eq.submit.call_count == 3, (
+            f'Death 3: expected 3 L1 escalations total (pruning kept within-cap), '
+            f'got {eq.submit.call_count}'
+        )
+        assert eq.submit.call_args_list[2][0][0].level == 1, (
+            'Death 3 after window pruning must be L1 (within-cap), not terminal L2'
+        )
+        assert worker._supervisor_halted is False, (
+            'Supervisor must not halt: old timestamps were pruned, death was within-cap'
+        )
+
+    # Cleanup: cancel all dormant tasks spawned by fake_spawn.
+    worker._running = False
+    for t in spawned_tasks:
+        if not t.done():
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)

@@ -6053,19 +6053,74 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         while times and now - times[0] > window:
             times.popleft()
         if len(times) >= self._max_loop_restarts:
-            # CAP EXCEEDED: escalate terminally and halt the worker.
-            self._emit_loop_terminal_escalation(name, exc, len(times))
+            # Bookkeeping first: guarantee run() can return even if escalation
+            # delivery raises (asyncio would log it and the done-callback would exit
+            # before the state mutations below, leaving _loops_finished un-set and
+            # run() hanging forever).
             self._supervisor_halted = True
             self._supervisor_halt_reason = (
                 f'{name} loop exceeded {self._max_loop_restarts} restarts '
                 f'within {window}s'
             )
             self._retire_loop(name)  # sets _loops_finished → run() returns
+            # Emit after bookkeeping: a submit() failure is logged by asyncio but
+            # can no longer silently prevent the worker from halting.
+            self._emit_loop_terminal_escalation(name, exc, len(times))
         else:
-            # Within cap: record timestamp, emit L1 restart escalation, respawn.
+            # Within cap: record timestamp and respawn first so the worker is live
+            # again even if escalation delivery fails.
             times.append(now)
-            self._emit_loop_death_escalation(name, exc)
             self._spawn_loop(name)
+            self._emit_loop_death_escalation(name, exc)
+
+    def _submit_loop_escalation(
+        self,
+        name: str,
+        exc: BaseException,
+        *,
+        level: int,
+        severity: str,
+        summary: str,
+        detail_prefix: str,
+        tb_label: str = 'Full traceback',
+        suggested_action: str,
+        id_key: str,
+    ) -> None:
+        """None-safe helper: build and submit a loop-supervisor escalation.
+
+        Centralises the None-guard, local ``escalation.models`` import, traceback
+        rendering, ``Escalation`` construction, and ``submit`` call that were
+        previously duplicated verbatim across
+        ``_emit_loop_death_escalation`` and ``_emit_loop_terminal_escalation``.
+
+        Args:
+            name: Loop name (``'merger'`` or ``'verifier'``), embedded in the detail.
+            exc: The exception from the dead loop task (used for traceback rendering).
+            level: Escalation level (1 for restart, 2 for terminal born-at-L2).
+            severity: ``'blocking'`` (L1) or ``'critical'`` (L2).
+            summary: One-line summary string.
+            detail_prefix: Multi-line block placed before the traceback section.
+            tb_label: Label for the traceback section; defaults to ``'Full traceback'``.
+            suggested_action: Operator instructions.
+            id_key: Unique key used for both ``make_id`` and ``task_id``.
+        """
+        if self._escalation_queue is None:
+            return
+        from escalation.models import Escalation  # local import — escalation optional dep
+        tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        detail = f'{detail_prefix}\n\n{tb_label}:\n{tb_str}'
+        esc = Escalation(
+            id=self._escalation_queue.make_id(id_key),
+            task_id=id_key,
+            agent_role='orchestrator-merge-worker-supervisor',
+            severity=severity,
+            level=level,
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action=suggested_action,
+        )
+        self._escalation_queue.submit(esc)
 
     def _emit_loop_terminal_escalation(
         self, name: str, exc: BaseException, restart_count: int
@@ -6076,48 +6131,37 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         The ``orchestrator-`` agent_role prefix marks it as a harness sentinel so the
         escalation server never downgrades the severity.
 
-        None-safe: no-op when ``self._escalation_queue`` is None.
+        None-safe (delegated to ``_submit_loop_escalation``).
         """
-        if self._escalation_queue is None:
-            return
-        from escalation.models import Escalation  # local import — escalation optional dep
-        tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        summary = (
-            f'merge_worker_loop_died: {name} loop exceeded restart cap '
-            f'({self._max_loop_restarts} restarts/{self._loop_restart_window_s}s) '
-            f'— merge worker HALTED'
-        )
-        detail = (
-            f'Loop: {name}\n'
-            f'Restart attempts in window: {restart_count}\n'
-            f'Max restarts allowed: {self._max_loop_restarts}\n'
-            f'Window: {self._loop_restart_window_s}s\n'
-            f'Last exception type: {type(exc).__name__}\n'
-            f'Last exception: {exc}\n'
-            f'\nFull traceback (last death):\n{tb_str}'
-        )
-        esc = Escalation(
-            id=self._escalation_queue.make_id(
-                f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}:terminal'
-            ),
-            task_id=f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}:terminal',
-            agent_role='orchestrator-merge-worker-supervisor',
-            severity='critical',
+        self._submit_loop_escalation(
+            name, exc,
             level=2,
-            category='infra_issue',
-            summary=summary,
-            detail=detail,
+            severity='critical',
+            summary=(
+                f'merge_worker_loop_died: {name} loop exceeded restart cap '
+                f'({self._max_loop_restarts} restarts/{self._loop_restart_window_s}s) '
+                f'— merge worker HALTED'
+            ),
+            detail_prefix=(
+                f'Loop: {name}\n'
+                f'Restart attempts in window: {restart_count}\n'
+                f'Max restarts allowed: {self._max_loop_restarts}\n'
+                f'Window: {self._loop_restart_window_s}s\n'
+                f'Last exception type: {type(exc).__name__}\n'
+                f'Last exception: {exc}'
+            ),
+            tb_label='Full traceback (last death)',
             suggested_action=(
                 'Restart the orchestrator; the merge worker is halted and no longer '
                 'draining merges.'
             ),
+            id_key=f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}:terminal',
         )
-        self._escalation_queue.submit(esc)
 
     def _emit_loop_death_escalation(self, name: str, exc: BaseException) -> None:
         """Emit a loud L1 ``'merge_worker_loop_died'`` escalation.
 
-        None-safe: no-op when ``self._escalation_queue`` is None (bare-worker tests).
+        None-safe (delegated to ``_submit_loop_escalation``).
 
         The ``agent_role='orchestrator-merge-worker-supervisor'`` prefix marks these as
         harness sentinels so the escalation server never downgrades their severity.
@@ -6125,31 +6169,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         No ``has_open_l1`` dedup: the restart cap bounds volume (≤3 per window), and
         the project directive is "prefer loud escalation over silent degradation".
         """
-        if self._escalation_queue is None:
-            return
-        from escalation.models import Escalation  # local import — escalation optional dep
-        tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        summary = f'merge_worker_loop_died: {name} loop died unexpectedly — restarting'
-        detail = (
-            f'Loop: {name}\n'
-            f'Exception type: {type(exc).__name__}\n'
-            f'Exception: {exc}\n'
-            f'\nFull traceback:\n{tb_str}'
-        )
-        esc = Escalation(
-            id=self._escalation_queue.make_id(
-                f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}'
-            ),
-            task_id=f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}',
-            agent_role='orchestrator-merge-worker-supervisor',
-            severity='blocking',
+        self._submit_loop_escalation(
+            name, exc,
             level=1,
-            category='infra_issue',
-            summary=summary,
-            detail=detail,
+            severity='blocking',
+            summary=f'merge_worker_loop_died: {name} loop died unexpectedly — restarting',
+            detail_prefix=(
+                f'Loop: {name}\n'
+                f'Exception type: {type(exc).__name__}\n'
+                f'Exception: {exc}'
+            ),
             suggested_action='Worker auto-restarted the loop; investigate the traceback.',
+            id_key=f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}',
         )
-        self._escalation_queue.submit(esc)
 
     # ── run / stop ──────────────────────────────────────────────────────
 
