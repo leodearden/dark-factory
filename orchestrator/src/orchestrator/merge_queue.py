@@ -23,6 +23,7 @@ import posixpath
 import re
 import shutil
 import time
+import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
@@ -5194,6 +5195,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # for a path; cleared on next successful touch or on ENOENT-drop so
         # each new failure episode emits exactly one WARNING.
         self._merge_wt_touch_warned: set[Path] = set()
+        # ── supervisor fields (task 1857) ────────────────────────────────
+        # Max restarts allowed per loop within the rolling window before the
+        # worker halts and emits a terminal born-at-L2 escalation.
+        self._max_loop_restarts: int = 3
+        # Rolling window in seconds for counting restarts (time.monotonic).
+        self._loop_restart_window_s: float = 300.0
+        # Injectable clock for restart-window accounting; mirrors the
+        # _maybe_log_queue_heartbeat clock-injection convention.
+        self._restart_clock: Callable[[], float] = time.monotonic
+        # Per-loop restart timestamp rings (pruned to the rolling window).
+        self._loop_restart_times: dict[str, collections.deque[float]] = {
+            'merger': collections.deque(),
+            'verifier': collections.deque(),
+        }
+        # Set of currently live loop names ('merger', 'verifier').  The
+        # supervisor retires entries from here; when empty (or halted)
+        # _loops_finished is set so run() can return.
+        self._live_loops: set[str] = set()
+        # Event that run() awaits instead of asyncio.gather(): set by the
+        # supervisor when all loops have retired normally OR a loop has
+        # permanently failed (restart cap exceeded).
+        self._loops_finished: asyncio.Event = asyncio.Event()
+        # Set True when the supervisor has halted the worker after exhausting
+        # the restart cap; run() returns immediately when this is set.
+        self._supervisor_halted: bool = False
+        # Human-readable reason for the halt; set alongside _supervisor_halted.
+        self._supervisor_halt_reason: str | None = None
 
     # ── β host allocator ──────────────────────────────────────────────────
 
@@ -9382,6 +9410,13 @@ _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX = '__verify_host_unreachable__'
 # (``'__verify_host_unreachable__recovered__X'`` vs
 #  ``'__verify_host_recovered__X'`` — no collision).
 _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX = '__verify_host_recovered__'
+
+# Sentinel task_id for the merge-worker supervisor loop-death escalation.
+# Per-loop deaths use this as a base key; terminal cap-exceeded escalations
+# append ':terminal' so they form a distinct dedup namespace.  Not dedup'd
+# via has_open_l1 — the restart cap bounds volume and "prefer loud escalation
+# over silent degradation" is the guiding policy.
+_MERGE_WORKER_LOOP_DIED_SENTINEL = '__merge_worker_loop_died__'
 
 
 def _verify_host_unreachable_sentinel(host: str) -> str:
