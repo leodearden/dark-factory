@@ -6020,14 +6020,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Classifies the completion and takes the appropriate action:
 
         * **Cancelled** → teardown; ``_retire_loop`` without escalating.
-        * **Clean return** (``exception() is None``) → None-sentinel shutdown;
-          ``_retire_loop`` without escalating.
-        * **Exception + ``_running`` is False** → shutdown race; ``_retire_loop``
-          without escalating.  A loop dying while ``stop()`` drains the queues is not
-          an unexpected death.
+        * **Any completion while ``_running`` is False** → shutdown race or normal
+          shutdown; ``_retire_loop`` without escalating.  stop() sets ``_running=False``
+          BEFORE draining, so both the clean-sentinel exit and any late exception on the
+          shutdown path hit this branch.
+        * **Clean return while ``_running`` is True** → synthetic unexpected death; a
+          supervised loop must not exit before stop() sets ``_running=False``.  Possible
+          cause: stray shutdown sentinel (step-10 guards the known source).  Escalate
+          and restart as if a real exception was thrown.
         * **Exception + ``_running`` is True** → unexpected death; emit a loud L1
-          escalation then ``_spawn_loop(name)`` to restart (bounded by the cap added
-          in step-4; unbounded here in step-2).
+          escalation then ``_spawn_loop(name)`` to restart (bounded by the cap).
 
         Calling ``task.exception()`` is also the **fix for the silent-death
         suppression**: without retrieval, asyncio would log "Task exception was never
@@ -6041,10 +6043,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
         # Retrieve the exception (kills the "never retrieved" suppression).
         exc = task.exception()
-        if exc is None or not self._running:
-            # Clean return via the None sentinel OR shutdown race: not a death.
+        # Shutdown guard FIRST: any completion (clean or late exception) while the
+        # worker is shutting down is retired without escalation.  stop() sets
+        # self._running=False BEFORE draining queues and itself pushes sentinels, so
+        # the normal shutdown path (merger/verifier exit via the None sentinel) always
+        # satisfies `not self._running` — step-5 part A/C assertions hold.
+        if not self._running:
             self._retire_loop(name)
             return
+        # Synthetic-death: a loop that returns cleanly (exc is None) while
+        # self._running is True is anomalous — no supervised loop should exit before
+        # stop() sets _running=False.  Possible cause: a stray shutdown sentinel (the
+        # step-10 fix in _merger_loop's finally guards the known source; this is
+        # belt-and-suspenders for any future regression).  Treat it as an unexpected
+        # death: restart and escalate, honoring the "never fail silent" mandate.
+        if exc is None:
+            exc = RuntimeError(
+                f'{name} loop returned cleanly while worker still running'
+                ' — possible stray shutdown sentinel or unexpected clean exit'
+            )
         # Unexpected death while worker is running: check restart cap then escalate.
         now = self._restart_clock()
         times = self._loop_restart_times[name]
