@@ -3970,3 +3970,201 @@ class TestCascadeErrorContainment:
             'asyncio.gather re-raises → worker_task.exception() is RuntimeError. '
             'GREEN (1856): per-entry guard contains error; loop exits via sentinel.'
         )
+
+    async def test_cascade_cancel_and_release_raises_contained(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """cancel_and_release raising in-body keeps _entry_released=False;
+        the not-_entry_released handler must still release lease+slot and
+        the loop must survive.
+
+        This covers the secondary error path (cascade body raises before the
+        in-body release completes) that the primary test cannot reach.  The
+        not-_entry_released branch in the except handler:
+          · best-effort cancel_and_release (contextlib.suppress)
+          · best-effort _cleanup_owned_merge_worktree (contextlib.suppress)
+          · unconditional _speculation_slot.release() for speculative entries
+
+        Without this test a regression — e.g. removing contextlib.suppress from
+        the retry, or a double slot-release — would pass the existing suite.
+        """
+        # ── N's local verify: gated (fails on first call, passes thereafter) ─
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False,
+                    summary='test_failure',
+                    test_output='FAILED',
+                    lint_output='',
+                    type_output='',
+                    category='test_failure',
+                    timed_out=False,
+                    verify_skipped=False,
+                )
+            return MagicMock(
+                passed=True,
+                summary='ok',
+                test_output='ok',
+                lint_output='',
+                type_output='',
+                category='',
+                timed_out=False,
+                verify_skipped=False,
+            )
+
+        # ── N+1's remote verify: gated ────────────────────────────────────────
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='laptop',
+        )
+
+        # ── Branches ─────────────────────────────────────────────────────────
+        wt_a = await _make_branch_with_file(git_ops, 'task/cr-a', 'cr_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/cr-b', 'cr_b.py', 'b = 2\n')
+
+        # ── Worker setup ─────────────────────────────────────────────────────
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        allocator = _inject_two_host_allocator(worker, gated_remote)
+
+        # Capture initial slot depth for exact-once release assertion.
+        depth0 = worker._speculation_slot._value
+
+        event_loop = asyncio.get_running_loop()
+        req_a = MergeRequest(
+            task_id='cr-a', branch='task/cr-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=event_loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='cr-b', branch='task/cr-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=event_loop.create_future(), lane='normal',
+        )
+
+        # ── Inject: allocator.cancel_and_release raises on its first call ────
+        # Simulates a failure during the in-body lease release at the start of
+        # the cascade except path.  _entry_released stays False → the except
+        # handler takes the not-_entry_released branch: best-effort retry of
+        # cancel_and_release + merge_wt cleanup + speculation_slot.release().
+        _original_cancel_and_release = allocator.cancel_and_release
+        _cancel_call_count: list[int] = [0]
+
+        async def _raising_cancel_and_release(lease: Any, **kwargs: Any) -> Any:
+            _cancel_call_count[0] += 1
+            if _cancel_call_count[0] == 1:
+                raise RuntimeError('Simulated cancel_and_release failure')
+            return await _original_cancel_and_release(lease, **kwargs)
+
+        allocator.cancel_and_release = _raising_cancel_and_release  # type: ignore[method-assign]
+
+        outcome_b: MergeOutcome | None = None
+        outcome_c: MergeOutcome | None = None
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for both verifies to enter (true concurrent overlap).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # N fails → head-failure cascade fires → in-body cancel_and_release raises.
+            gate_a_release.set()
+
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status not in ('done', 'already_merged'), (
+                f'Expected N to fail, got status={outcome_a.status!r}.'
+            )
+
+            # Unblock N+1's inner verify coroutine so it exits cleanly on both
+            # RED and GREEN paths (cascade already cancelled the outer verify_task).
+            gate_b_release.set()
+
+            # GREEN: except handler (not-_entry_released branch) →
+            #   MergeOutcome('blocked', 'Verifier cascade error: ...').
+            with contextlib.suppress(TimeoutError):
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+
+            # Loop-survival signal: queue a third request that should dispatch
+            # on the local host and resolve "done".
+            # NOTE: the slot assertion is placed AFTER outcome_c (below), not here.
+            # In this secondary-failure path, set_result is called before the
+            # except handler releases the slot (unlike the primary path where the
+            # in-body release precedes set_result).  Waiting for outcome_c
+            # ensures the cascade iteration has fully completed so the slot is
+            # guaranteed to be released before we measure it.
+            wt_c = await _make_branch_with_file(
+                git_ops, 'task/cr-c', 'cr_c.py', 'c = 3\n'
+            )
+            req_c = MergeRequest(
+                task_id='cr-c', branch='task/cr-c', worktree=wt_c,
+                pre_rebased=False, task_files=None, module_configs=[],
+                config=config, result=event_loop.create_future(), lane='normal',
+            )
+            await q.put(req_c)
+
+            with contextlib.suppress(TimeoutError):
+                outcome_c = await asyncio.wait_for(req_c.result, timeout=10.0)
+
+            # (3) SLOT EXACT-ONCE: check AFTER outcome_c, BEFORE stop().
+            # req_c is non-speculative (no in-flight head), so it never acquires
+            # the speculation slot.  Once req_c resolves, the verifier_loop has
+            # completed the cascade iteration and the not-_entry_released handler
+            # has released the slot exactly once.
+            # A double-release bug would leave _value == depth0+1.
+            assert worker._speculation_slot._value == depth0, (
+                f'Expected speculation slot at depth0={depth0}, '
+                f'got {worker._speculation_slot._value!r}. '
+                'The not-_entry_released handler must release the slot exactly once.'
+            )
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── (1) LOOP SURVIVES ────────────────────────────────────────────────
+        assert outcome_c is not None and outcome_c.status == 'done', (
+            f'Expected req_c to resolve "done" (loop survived cascade error), '
+            f'got {outcome_c!r}. '
+            'The not-_entry_released except branch must continue the cascade loop.'
+        )
+
+        # ── (2) OFFENDING REQ BLOCKED ────────────────────────────────────────
+        assert outcome_b is not None and outcome_b.status == 'blocked', (
+            f'Expected cascade error to resolve req_b as "blocked", '
+            f'got {outcome_b!r}. '
+            'Except handler must set MergeOutcome("blocked", "Verifier cascade error: ...").'
+        )
+
+        # ── (3b) CANCEL_AND_RELEASE RETRIED ─────────────────────────────────
+        # Once in-body (raises) + once in except handler (suppressed).
+        assert _cancel_call_count[0] >= 2, (
+            f'Expected cancel_and_release called at least twice '
+            f'(in-body: raises; not-_entry_released handler: suppressed), '
+            f'got {_cancel_call_count[0]} call(s). '
+            'The not-_entry_released branch must retry cancel_and_release.'
+        )
+
+        # ── (4) NO EXCEPTION ESCAPES ─────────────────────────────────────────
+        assert worker_task.done(), 'Worker task should be done after stop() + await'
+        assert worker_task.exception() is None, (
+            f'Expected worker task to exit cleanly (exception() is None), '
+            f'got {worker_task.exception()!r}.'
+        )

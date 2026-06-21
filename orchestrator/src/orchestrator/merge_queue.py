@@ -7313,8 +7313,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                     # Error containment (task-1856): each downstream entry is
                     # wrapped in try/except, mirroring the four sibling
-                    # _verifier_loop branches (dispatch :7184, passthrough
-                    # finalize :7230, finalize-head :7266, blocking-get :7412).
+                    # _verifier_loop branches (dispatch branch, passthrough-finalize
+                    # branch, finalize-head branch, blocking-get branch).
                     # CancelledError/KeyboardInterrupt still re-raise to honour
                     # sentinel-based shutdown: stop() terminates the loop via a
                     # None sentinel rather than direct task cancellation, so the
@@ -7409,7 +7409,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             if not _entry_released:
                                 # In-body release did not run (e.g. cancel_and_release
                                 # itself raised): best-effort release here to avoid
-                                # a lease/slot leak.
+                                # a lease/slot or merge-worktree leak.
                                 if (
                                     _entry.lease is not None
                                     and _allocator is not None
@@ -7417,6 +7417,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     with contextlib.suppress(BaseException):
                                         await _allocator.cancel_and_release(
                                             _entry.lease
+                                        )
+                                if _entry.merge_wt is not None:
+                                    with contextlib.suppress(BaseException):
+                                        await self._cleanup_owned_merge_worktree(
+                                            _entry.merge_wt
                                         )
                                 if _entry.was_speculative:
                                     self._speculation_slot.release()
