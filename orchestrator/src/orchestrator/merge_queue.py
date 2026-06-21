@@ -6185,8 +6185,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if t and not t.done():
                     t.cancel()
             await asyncio.gather(
-                self._merger_task, self._verifier_task,
-                self._heartbeat_task, self._reprobe_task,
+                *[
+                    t for t in (
+                        self._merger_task, self._verifier_task,
+                        self._heartbeat_task, self._reprobe_task,
+                    )
+                    if t is not None
+                ],
                 return_exceptions=True,
             )
             raise

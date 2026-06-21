@@ -13,13 +13,11 @@ test_merge_queue_multihost_wiring.py.
 from __future__ import annotations
 
 import asyncio
-import collections
-import dataclasses
+import contextlib
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -165,10 +163,8 @@ async def test_loop_death_escalates_loudly_and_restarts(
 
     # ── Cleanup ──────────────────────────────────────────────────────────
     await worker.stop()
-    try:
+    with contextlib.suppress(asyncio.CancelledError, TimeoutError):
         await asyncio.wait_for(run_task, timeout=2.0)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -280,10 +276,8 @@ async def test_normal_shutdown_does_not_trigger_death_path(
     run_task_a = asyncio.create_task(worker_a.run())
     await asyncio.sleep(0.05)  # let loops start
     await worker_a.stop()
-    try:
+    with contextlib.suppress(asyncio.CancelledError, TimeoutError):
         await asyncio.wait_for(run_task_a, timeout=2.0)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
-        pass
 
     assert eq_a.submit.call_count == 0, (
         f'(A) No escalation expected on clean stop, got {eq_a.submit.call_count}'
@@ -306,10 +300,8 @@ async def test_normal_shutdown_does_not_trigger_death_path(
 
     cancelled_task: asyncio.Task = asyncio.create_task(_dummy())
     cancelled_task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await cancelled_task
-    except asyncio.CancelledError:
-        pass
 
     old_verifier_task = worker_b._verifier_task
     worker_b._on_loop_task_done('verifier', cancelled_task)

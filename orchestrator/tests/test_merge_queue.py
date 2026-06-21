@@ -2423,10 +2423,8 @@ class TestSpeculativeMergeWorker:
 
         # Graceful shutdown
         await worker2.stop()
-        try:
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
             await asyncio.wait_for(worker_task2, timeout=2.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
 
     async def test_merger_exception_sends_verifier_sentinel(
         self, git_ops: GitOps, config: OrchestratorConfig,
