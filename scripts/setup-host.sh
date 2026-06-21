@@ -140,6 +140,7 @@ fi
 #   - orchestrator-dark-factory.service     (dark-factory orchestrator, supervised)
 #   - orchestrator-reify.service            (reify orchestrator, supervised)
 #   - orchestrator-autopilot-video.service  (autopilot-video orchestrator, supervised)
+#   - orchestrator-solar-challenge-platform.service (platform orchestrator, supervised)
 #   - orchestrator-watchdog.service/.timer  (60s liveness probe + dead-enabled revival)
 #
 # The orchestrator units run `uv run --frozen ...`, so process start never
@@ -162,6 +163,7 @@ cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"   "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-reify.service"          "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-autopilot-video.service" "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-my-solar-challenge.service" "$UNIT_DIR/"
+cp "$REPO_ROOT/scripts/orchestrator-solar-challenge-platform.service" "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"       "$UNIT_DIR/"
 cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"         "$UNIT_DIR/"
 
@@ -179,6 +181,8 @@ systemctl --user enable orchestrator-dark-factory.service
 systemctl --user enable orchestrator-autopilot-video.service
 # my-solar-challenge joined 2026-05-31 (escalation port 8106). Enabled by default.
 systemctl --user enable orchestrator-my-solar-challenge.service
+# solar-challenge-platform joined 2026-06-21 (escalation port 8107). Enabled by default.
+systemctl --user enable orchestrator-solar-challenge-platform.service
 ok "orchestrator units + watchdog installed and enabled"
 
 # ---------------------------------------------------------------------------
