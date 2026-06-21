@@ -23,7 +23,13 @@ from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_queue import (
+    InflightEntry,
+    MergeOutcome,
+    MergeRequest,
+    SpeculativeItem,
+    SpeculativeMergeWorker,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures — mirror test_merge_queue_restart_hook.py
@@ -341,3 +347,130 @@ async def test_normal_shutdown_does_not_trigger_death_path(
     assert worker_c._merger_task is old_merger_task, (
         '(C) _merger_task must not change on shutdown-race death'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — RED-as-regression-guard: verifier restart preserves state
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_verifier_restart_preserves_inflight_and_redispatch(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+) -> None:
+    """Within-cap verifier restart must NOT clear _inflight or _redispatch.
+
+    The supervisor path (_spawn_loop + _on_loop_task_done restart branch) must
+    never touch self._inflight, self._redispatch, or the seeded entries' result
+    Futures.  The restarted _verifier_loop naturally resumes draining them
+    (_finalize_inflight's `if not req.result.done()` guard makes re-finalization
+    idempotent).
+
+    Procedure:
+      1. Seed worker._redispatch with a SpeculativeItem marker.
+      2. Seed worker._inflight with an InflightEntry marker (verify_task=None).
+      3. Replace _verifier_loop with an idle stub.
+      4. Build a dead task (RuntimeError) and invoke _on_loop_task_done directly.
+      5. Assert: escalation submitted, new task spawned, _redispatch and _inflight
+         unchanged, Future not resolved.
+    """
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    eq = _make_fake_escalation_queue()
+    worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
+
+    # Build a minimal MergeRequest with a pending Future
+    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    req = MergeRequest(
+        task_id='sv7-task',
+        branch='task/sv7',
+        worktree=git_ops.project_root,  # doesn't need to be a real worktree
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=future,
+    )
+
+    # Build a minimal SpeculativeItem
+    item = SpeculativeItem(
+        request=req,
+        merge_result=None,
+        merge_wt=None,
+        base_sha='abc123dead',
+        speculative=False,
+        skip_verify=False,
+    )
+
+    # Build a minimal InflightEntry (passthrough: verify_task=None)
+    inflight_entry = InflightEntry(
+        item=item,
+        lease=None,
+        verify_task=None,
+        merge_wt=None,
+        was_speculative=False,
+        phase='VERIFY',
+    )
+
+    # Seed the instance deques
+    worker._redispatch.append(item)
+    worker._inflight.append(inflight_entry)
+
+    # Replace _verifier_loop with an idle stub so the spawned restart task
+    # stays alive without doing real work
+    async def idle_verifier() -> None:
+        while worker._running:
+            await asyncio.sleep(0.01)
+
+    worker._verifier_loop = idle_verifier  # type: ignore[method-assign]
+
+    # Build a dead task carrying RuntimeError
+    async def _raises() -> None:
+        raise RuntimeError('verifier died in test')
+
+    dead_task: asyncio.Task = asyncio.create_task(_raises())
+    await asyncio.gather(dead_task, return_exceptions=True)
+    assert dead_task.done() and not dead_task.cancelled()
+
+    # Set up supervisor state so the within-cap death path fires:
+    # _running=True, _live_loops has both so _retire_loop doesn't set _loops_finished
+    worker._running = True
+    worker._live_loops = {'merger', 'verifier'}
+
+    # Invoke the death callback directly (avoids running run() in background)
+    worker._on_loop_task_done('verifier', dead_task)
+
+    # Give the event loop a tick to register the spawned task
+    await asyncio.sleep(0)
+
+    # ── Assert 1: escalation submitted once ──────────────────────────────
+    assert eq.submit.call_count == 1, (
+        f'Expected 1 escalation (death escalation), got {eq.submit.call_count}'
+    )
+
+    # ── Assert 2: new verifier task spawned and running ───────────────────
+    assert worker._verifier_task is not None, '_verifier_task should not be None'
+    assert not worker._verifier_task.done(), (
+        '_verifier_task should still be running (idle stub)'
+    )
+
+    # ── Assert 3: _redispatch and _inflight are unchanged ─────────────────
+    assert len(worker._redispatch) == 1, (
+        f'_redispatch should still have 1 item, got {len(worker._redispatch)}'
+    )
+    assert worker._redispatch[0] is item, '_redispatch[0] must be the seeded item'
+    assert len(worker._inflight) == 1, (
+        f'_inflight should still have 1 entry, got {len(worker._inflight)}'
+    )
+    assert worker._inflight[0] is inflight_entry, '_inflight[0] must be the seeded entry'
+
+    # ── Assert 4: Future not resolved by supervisor ───────────────────────
+    assert not future.done(), (
+        'The seeded entry Future must not be resolved by the supervisor restart path'
+    )
+
+    # ── Cleanup ──────────────────────────────────────────────────────────
+    worker._running = False
+    if worker._verifier_task and not worker._verifier_task.done():
+        worker._verifier_task.cancel()
+        await asyncio.gather(worker._verifier_task, return_exceptions=True)
