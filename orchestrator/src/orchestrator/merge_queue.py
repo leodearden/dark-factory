@@ -23,6 +23,7 @@ import posixpath
 import re
 import shutil
 import time
+import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
@@ -5194,6 +5195,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # for a path; cleared on next successful touch or on ENOENT-drop so
         # each new failure episode emits exactly one WARNING.
         self._merge_wt_touch_warned: set[Path] = set()
+        # ── supervisor fields (task 1857) ────────────────────────────────
+        # Max restarts allowed per loop within the rolling window before the
+        # worker halts and emits a terminal born-at-L2 escalation.
+        self._max_loop_restarts: int = 3
+        # Rolling window in seconds for counting restarts (time.monotonic).
+        self._loop_restart_window_s: float = 300.0
+        # Injectable clock for restart-window accounting; mirrors the
+        # _maybe_log_queue_heartbeat clock-injection convention.
+        self._restart_clock: Callable[[], float] = time.monotonic
+        # Per-loop restart timestamp rings (pruned to the rolling window).
+        self._loop_restart_times: dict[str, collections.deque[float]] = {
+            'merger': collections.deque(),
+            'verifier': collections.deque(),
+        }
+        # Set of currently live loop names ('merger', 'verifier').  The
+        # supervisor retires entries from here; when empty (or halted)
+        # _loops_finished is set so run() can return.
+        self._live_loops: set[str] = set()
+        # Event that run() awaits instead of asyncio.gather(): set by the
+        # supervisor when all loops have retired normally OR a loop has
+        # permanently failed (restart cap exceeded).
+        self._loops_finished: asyncio.Event = asyncio.Event()
+        # Set True when the supervisor has halted the worker after exhausting
+        # the restart cap; run() returns immediately when this is set.
+        self._supervisor_halted: bool = False
+        # Human-readable reason for the halt; set alongside _supervisor_halted.
+        self._supervisor_halt_reason: str | None = None
 
     # ── β host allocator ──────────────────────────────────────────────────
 
@@ -5929,14 +5957,275 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             except Exception:
                 logger.exception('reprobe_quarantined_hosts: unexpected error in loop')
 
+    # ── supervisor (task 1857) ───────────────────────────────────────────
+
+    def _spawn_loop(self, name: str) -> asyncio.Task:  # type: ignore[type-arg]
+        """Create (or re-create) the named loop task and register the supervisor callback.
+
+        Stores the new task in ``self._merger_task`` or ``self._verifier_task`` so the
+        current task reference is always up-to-date.  The done callback calls
+        ``_on_loop_task_done`` on every completion so the supervisor can detect
+        unexpected deaths and either restart or halt.
+
+        **Verifier restart — in-flight state survival (task 1857 design decision)**
+
+        On a verifier restart, this method does NOT clear ``self._inflight``,
+        ``self._redispatch``, ``self._n_failed``, ``self._remerge_occurred``, or
+        ``self._pending_verifier_get``.  These are *instance* attributes that outlive
+        the dead loop task.  The restarted ``_verifier_loop`` naturally resumes
+        draining them:
+
+        * **DISPATCH-FILL** drains ``_redispatch`` first (front-priority re-dispatch
+          queue), then ``_verifier_queue``, so surviving re-dispatch entries are
+          re-verified in submission order ahead of any new arrivals.
+        * **FINALIZE-HEAD** pops ``_inflight`` and calls ``_finalize_inflight``, whose
+          ``if not req.result.done()`` guard makes re-finalization idempotent — an
+          entry that was mid-finalize when the loop died cannot be double-resolved.
+
+        Therefore surviving in-flight entries are neither lost nor double-finalized.
+        The supervisor restart path **must not** clear those deques.  Finalize-or-requeue
+        is owned by the resumed loop, not the supervisor.
+
+        Args:
+            name: ``'merger'`` or ``'verifier'``.
+
+        Returns:
+            The newly-created ``asyncio.Task``.
+        """
+        if name == 'merger':
+            task: asyncio.Task = asyncio.create_task(self._merger_loop())  # type: ignore[type-arg]
+            self._merger_task = task
+        elif name == 'verifier':
+            task = asyncio.create_task(self._verifier_loop())  # type: ignore[type-arg]
+            self._verifier_task = task
+        else:
+            raise ValueError(f'Unknown loop name: {name!r}')
+        task.add_done_callback(lambda t: self._on_loop_task_done(name, t))
+        return task
+
+    def _retire_loop(self, name: str) -> None:
+        """Mark a loop as no longer live; set ``_loops_finished`` when all have retired.
+
+        Called by the supervisor on any completion path (normal shutdown, cancellation,
+        or terminal cap-exceeded halt).  Sets ``_loops_finished`` as soon as all loops
+        have retired OR the worker has been supervisor-halted so ``run()`` can return.
+        """
+        self._live_loops.discard(name)
+        if not self._live_loops or self._supervisor_halted:
+            self._loops_finished.set()
+
+    def _on_loop_task_done(self, name: str, task: asyncio.Task) -> None:  # type: ignore[type-arg]
+        """Done callback for supervised loop tasks (merger and verifier).
+
+        Classifies the completion and takes the appropriate action:
+
+        * **Cancelled** → teardown; ``_retire_loop`` without escalating.
+        * **Any completion while ``_running`` is False** → shutdown race or normal
+          shutdown; ``_retire_loop`` without escalating.  stop() sets ``_running=False``
+          BEFORE draining, so both the clean-sentinel exit and any late exception on the
+          shutdown path hit this branch.
+        * **Clean return while ``_running`` is True** → synthetic unexpected death; a
+          supervised loop must not exit before stop() sets ``_running=False``.  Possible
+          cause: stray shutdown sentinel (step-10 guards the known source).  Escalate
+          and restart as if a real exception was thrown.
+        * **Exception + ``_running`` is True** → unexpected death; emit a loud L1
+          escalation then ``_spawn_loop(name)`` to restart (bounded by the cap).
+
+        Calling ``task.exception()`` is also the **fix for the silent-death
+        suppression**: without retrieval, asyncio would log "Task exception was never
+        retrieved" at GC time — but because the run() task holds a strong reference to
+        the gather result, GC never fires and the exception is silently lost.  This
+        callback retrieves it unconditionally.
+        """
+        if task.cancelled():
+            # Teardown cancellation — not an unexpected death.
+            self._retire_loop(name)
+            return
+        # Retrieve the exception (kills the "never retrieved" suppression).
+        exc = task.exception()
+        # Shutdown guard FIRST: any completion (clean or late exception) while the
+        # worker is shutting down is retired without escalation.  stop() sets
+        # self._running=False BEFORE draining queues and itself pushes sentinels, so
+        # the normal shutdown path (merger/verifier exit via the None sentinel) always
+        # satisfies `not self._running` — step-5 part A/C assertions hold.
+        if not self._running:
+            self._retire_loop(name)
+            return
+        # Synthetic-death: a loop that returns cleanly (exc is None) while
+        # self._running is True is anomalous — no supervised loop should exit before
+        # stop() sets _running=False.  Possible cause: a stray shutdown sentinel (the
+        # step-10 fix in _merger_loop's finally guards the known source; this is
+        # belt-and-suspenders for any future regression).  Treat it as an unexpected
+        # death: restart and escalate, honoring the "never fail silent" mandate.
+        if exc is None:
+            exc = RuntimeError(
+                f'{name} loop returned cleanly while worker still running'
+                ' — possible stray shutdown sentinel or unexpected clean exit'
+            )
+        # Unexpected death while worker is running: check restart cap then escalate.
+        now = self._restart_clock()
+        times = self._loop_restart_times[name]
+        window = self._loop_restart_window_s
+        # Prune restart timestamps outside the rolling window.
+        while times and now - times[0] > window:
+            times.popleft()
+        if len(times) >= self._max_loop_restarts:
+            # Bookkeeping first: guarantee run() can return even if escalation
+            # delivery raises (asyncio would log it and the done-callback would exit
+            # before the state mutations below, leaving _loops_finished un-set and
+            # run() hanging forever).
+            self._supervisor_halted = True
+            self._supervisor_halt_reason = (
+                f'{name} loop exceeded {self._max_loop_restarts} restarts '
+                f'within {window}s'
+            )
+            self._retire_loop(name)  # sets _loops_finished → run() returns
+            # Emit after bookkeeping: a submit() failure is logged by asyncio but
+            # can no longer silently prevent the worker from halting.
+            self._emit_loop_terminal_escalation(name, exc, len(times))
+        else:
+            # Within cap: record timestamp and respawn first so the worker is live
+            # again even if escalation delivery fails.
+            times.append(now)
+            self._spawn_loop(name)
+            self._emit_loop_death_escalation(name, exc)
+
+    def _submit_loop_escalation(
+        self,
+        name: str,
+        exc: BaseException,
+        *,
+        level: int,
+        severity: str,
+        summary: str,
+        detail_prefix: str,
+        tb_label: str = 'Full traceback',
+        suggested_action: str,
+        id_key: str,
+    ) -> None:
+        """None-safe helper: build and submit a loop-supervisor escalation.
+
+        Centralises the None-guard, local ``escalation.models`` import, traceback
+        rendering, ``Escalation`` construction, and ``submit`` call that were
+        previously duplicated verbatim across
+        ``_emit_loop_death_escalation`` and ``_emit_loop_terminal_escalation``.
+
+        Args:
+            name: Loop name (``'merger'`` or ``'verifier'``), embedded in the detail.
+            exc: The exception from the dead loop task (used for traceback rendering).
+            level: Escalation level (1 for restart, 2 for terminal born-at-L2).
+            severity: ``'blocking'`` (L1) or ``'critical'`` (L2).
+            summary: One-line summary string.
+            detail_prefix: Multi-line block placed before the traceback section.
+            tb_label: Label for the traceback section; defaults to ``'Full traceback'``.
+            suggested_action: Operator instructions.
+            id_key: Unique key used for both ``make_id`` and ``task_id``.
+        """
+        if self._escalation_queue is None:
+            return
+        from escalation.models import Escalation  # local import — escalation optional dep
+        tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        detail = f'{detail_prefix}\n\n{tb_label}:\n{tb_str}'
+        esc = Escalation(
+            id=self._escalation_queue.make_id(id_key),
+            task_id=id_key,
+            agent_role='orchestrator-merge-worker-supervisor',
+            severity=severity,
+            level=level,
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action=suggested_action,
+        )
+        self._escalation_queue.submit(esc)
+
+    def _emit_loop_terminal_escalation(
+        self, name: str, exc: BaseException, restart_count: int
+    ) -> None:
+        """Emit a born-at-L2 terminal escalation when the restart cap is exceeded.
+
+        ``severity='critical'`` + ``level=2`` routes straight to a human (born-at-L2).
+        The ``orchestrator-`` agent_role prefix marks it as a harness sentinel so the
+        escalation server never downgrades the severity.
+
+        None-safe (delegated to ``_submit_loop_escalation``).
+        """
+        self._submit_loop_escalation(
+            name, exc,
+            level=2,
+            severity='critical',
+            summary=(
+                f'merge_worker_loop_died: {name} loop exceeded restart cap '
+                f'({self._max_loop_restarts} restarts/{self._loop_restart_window_s}s) '
+                f'— merge worker HALTED'
+            ),
+            detail_prefix=(
+                f'Loop: {name}\n'
+                f'Restart attempts in window: {restart_count}\n'
+                f'Max restarts allowed: {self._max_loop_restarts}\n'
+                f'Window: {self._loop_restart_window_s}s\n'
+                f'Last exception type: {type(exc).__name__}\n'
+                f'Last exception: {exc}'
+            ),
+            tb_label='Full traceback (last death)',
+            suggested_action=(
+                'Restart the orchestrator; the merge worker is halted and no longer '
+                'draining merges.'
+            ),
+            id_key=f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}:terminal',
+        )
+
+    def _emit_loop_death_escalation(self, name: str, exc: BaseException) -> None:
+        """Emit a loud L1 ``'merge_worker_loop_died'`` escalation.
+
+        None-safe (delegated to ``_submit_loop_escalation``).
+
+        The ``agent_role='orchestrator-merge-worker-supervisor'`` prefix marks these as
+        harness sentinels so the escalation server never downgrades their severity.
+
+        No ``has_open_l1`` dedup: the restart cap bounds volume (≤3 per window), and
+        the project directive is "prefer loud escalation over silent degradation".
+        """
+        self._submit_loop_escalation(
+            name, exc,
+            level=1,
+            severity='blocking',
+            summary=f'merge_worker_loop_died: {name} loop died unexpectedly — restarting',
+            detail_prefix=(
+                f'Loop: {name}\n'
+                f'Exception type: {type(exc).__name__}\n'
+                f'Exception: {exc}'
+            ),
+            suggested_action='Worker auto-restarted the loop; investigate the traceback.',
+            id_key=f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}',
+        )
+
+    # ── run / stop ──────────────────────────────────────────────────────
+
     async def run(self) -> None:
-        """Start merger, verifier, heartbeat, and reprobe coroutines; wait for merge tasks."""
-        self._merger_task = asyncio.create_task(self._merger_loop())
-        self._verifier_task = asyncio.create_task(self._verifier_loop())
+        """Start merger, verifier, heartbeat, and reprobe coroutines; wait for merge tasks.
+
+        Uses ``await self._loops_finished.wait()`` instead of
+        ``asyncio.gather(merger, verifier)`` so the supervisor can replace dead loop
+        tasks in-place (gather binds to fixed task objects and propagates the first
+        exception — incompatible with in-process restart).
+
+        The outer-cancellation path (``except BaseException``) and heartbeat/reprobe
+        cleanup (``finally``) preserve the original semantics.  The ``finally`` also
+        cancels any still-live loop task on the terminal-halt path (so the healthy
+        sibling of a cap-exceeded loop does not leak).
+        """
+        # Reset supervisor state for this invocation.
+        self._live_loops = {'merger', 'verifier'}
+        self._loops_finished.clear()
+        # Spawn merger and verifier via _spawn_loop so the supervisor callbacks
+        # are registered from the very first iteration.
+        self._spawn_loop('merger')
+        self._spawn_loop('verifier')
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._reprobe_task = asyncio.create_task(self._reprobe_loop())
         try:
-            await asyncio.gather(self._merger_task, self._verifier_task)
+            await self._loops_finished.wait()
         except BaseException:
             for t in (
                 self._merger_task, self._verifier_task,
@@ -5945,15 +6234,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if t and not t.done():
                     t.cancel()
             await asyncio.gather(
-                self._merger_task, self._verifier_task,
-                self._heartbeat_task, self._reprobe_task,
+                *[
+                    t for t in (
+                        self._merger_task, self._verifier_task,
+                        self._heartbeat_task, self._reprobe_task,
+                    )
+                    if t is not None
+                ],
                 return_exceptions=True,
             )
             raise
         finally:
-            # Cancel both background tasks on both normal and exceptional exit.
-            # On the exception path the except block already cleaned them up, so
-            # .done() is True and these are no-ops.
+            # Cancel any still-live loop tasks (terminal-halt path has healthy sibling).
+            # On the exception path the except block already cleaned them up.
+            for t in (self._merger_task, self._verifier_task):
+                if t and not t.done():
+                    t.cancel()
+                    await asyncio.gather(t, return_exceptions=True)
             if self._heartbeat_task and not self._heartbeat_task.done():
                 self._heartbeat_task.cancel()
                 await asyncio.gather(self._heartbeat_task, return_exceptions=True)
@@ -6534,6 +6831,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # (abandoned-at-top, except WorktreeMissing, except Exception, outer
         # finally) releases the permit and clears this flag.
         held_spec_permit: bool = False
+        # Set True when the loop exits cleanly via the None shutdown sentinel from
+        # _acquire_next_request().  Used in the finally to decide whether to forward
+        # the sentinel to the verifier: on the crash path (exception while _running is
+        # True) this is False, so the stray put(None) that would silently kill the
+        # surviving verifier is suppressed.
+        exited_via_sentinel: bool = False
 
         try:
             while self._running:
@@ -6567,6 +6870,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 else:
                     req = await self._acquire_next_request()
                     if req is None:
+                        exited_via_sentinel = True
                         break  # shutdown sentinel
                     spec_base = None  # fresh dequeue resets speculation chain
 
@@ -7043,9 +7347,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._inflight_req.result.set_result(
                     MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
                 )
-            # Always send shutdown sentinel so the verifier exits cleanly,
-            # even if an unexpected exception propagates from the loop body.
-            await self._verifier_queue.put(None)
+            # Send shutdown sentinel ONLY when the merger is genuinely shutting down:
+            # either (a) stop() set _running=False, or (b) the loop broke cleanly via
+            # the None shutdown sentinel from _acquire_next_request (exited_via_sentinel).
+            #
+            # On the crash path (unhandled exception with _running still True and
+            # exited_via_sentinel still False) the merger must NOT push a sentinel.  If
+            # it did, the still-healthy verifier would consume it, drain _inflight, and
+            # return cleanly — _on_loop_task_done would retire the verifier without
+            # restarting it, silently killing the verifier on exactly the crash scenario
+            # the supervisor exists to prevent: a restarted merger + a permanently-dead
+            # verifier, with all newly merged items piling on _verifier_queue and result
+            # Futures hanging forever.
+            #
+            # Guard semantics:
+            #   • `not self._running` — covers the "stop() was called" case; stop() sets
+            #     _running=False (:6246) BEFORE draining and itself pushes the verifier
+            #     sentinel at :6364, so the re-drain loop there catches any late items.
+            #   • `exited_via_sentinel` — covers the "got None from the input queue"
+            #     case, which includes direct _merger_loop() test calls that put a None
+            #     in the queue without going through stop().  In the real lifecycle both
+            #     are True simultaneously (stop() sets _running=False first, THEN puts
+            #     the None); here only one may be True, but either is sufficient.
+            if not self._running or exited_via_sentinel:
+                await self._verifier_queue.put(None)
 
     # ------------------------------------------------------------------
     # Verifier coroutine
@@ -9382,6 +9707,13 @@ _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX = '__verify_host_unreachable__'
 # (``'__verify_host_unreachable__recovered__X'`` vs
 #  ``'__verify_host_recovered__X'`` — no collision).
 _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX = '__verify_host_recovered__'
+
+# Sentinel task_id for the merge-worker supervisor loop-death escalation.
+# Per-loop deaths use this as a base key; terminal cap-exceeded escalations
+# append ':terminal' so they form a distinct dedup namespace.  Not dedup'd
+# via has_open_l1 — the restart cap bounds volume and "prefer loud escalation
+# over silent degradation" is the guiding policy.
+_MERGE_WORKER_LOOP_DIED_SENTINEL = '__merge_worker_loop_died__'
 
 
 def _verify_host_unreachable_sentinel(host: str) -> str:

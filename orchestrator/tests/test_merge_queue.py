@@ -2381,26 +2381,50 @@ class TestSpeculativeMergeWorker:
         assert worker._merger_task.cancelled() or worker._merger_task.exception() is not None
         assert worker._verifier_task.cancelled() or worker._verifier_task.exception() is not None
 
-        # ── Part 2: subtask RuntimeError cancels sibling ─────────────────
+        # ── Part 2: subtask RuntimeError is supervised — escalate + restart ────
+        # (Superseded by the task-1857 supervisor: a single merger crash no longer
+        # kills run(); instead the supervisor catches it, escalates (L1), and restarts
+        # the loop.  This Part 2 verifies the new supervised contract.)
         worker2 = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker2._shutdown_timeout = 0.1
+        merger2_invocations = 0
 
-        async def crashing_merger():
-            raise RuntimeError('Merger crashed unexpectedly')
+        async def crashing_once_merger():
+            nonlocal merger2_invocations
+            merger2_invocations += 1
+            if merger2_invocations == 1:
+                raise RuntimeError('Merger crashed unexpectedly')
+            # Second invocation: idle until shutdown so run() doesn't also exit
+            while worker2._running:
+                await asyncio.sleep(0.01)
 
-        worker2._merger_loop = crashing_merger  # type: ignore[method-assign]
+        worker2._merger_loop = crashing_once_merger  # type: ignore[method-assign]
 
         worker_task2 = asyncio.create_task(worker2.run())
-        # Allow merger to crash
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
 
-        with pytest.raises((RuntimeError, asyncio.CancelledError)):
-            await asyncio.wait_for(worker_task2, timeout=5)
+        # Poll up to 2s for the restart (second merger invocation)
+        deadline2 = asyncio.get_event_loop().time() + 2.0
+        while merger2_invocations < 2 and asyncio.get_event_loop().time() < deadline2:
+            await asyncio.sleep(0.02)
 
-        assert worker2._verifier_task is not None
-        assert worker2._verifier_task.done(), (
-            'verifier_task not cancelled after merger RuntimeError'
+        # run() must NOT have raised (supervisor absorbed the crash)
+        assert not worker_task2.done(), (
+            'run() returned early — supervisor should absorb the merger crash'
         )
+        # Merger was restarted (invoked a second time)
+        assert merger2_invocations >= 2, (
+            f'Expected ≥2 merger invocations (crash + restart), got {merger2_invocations}'
+        )
+        # Verifier is still running (healthy sibling unaffected)
+        assert worker2._verifier_task is not None
+        assert not worker2._verifier_task.done(), (
+            'verifier_task should still be running after supervised merger crash'
+        )
+
+        # Graceful shutdown
+        await worker2.stop()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            await asyncio.wait_for(worker_task2, timeout=2.0)
 
     async def test_merger_exception_sends_verifier_sentinel(
         self, git_ops: GitOps, config: OrchestratorConfig,
