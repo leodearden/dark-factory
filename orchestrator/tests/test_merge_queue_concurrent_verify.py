@@ -3740,3 +3740,233 @@ class TestCascadeFiresRemoteCancel:
             'live cleared → cancel_verify sees dead id → no entry appended. '
             'GREEN (step-4): _abort_remote_verify fires before task.cancel().'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-1856 RED: CASCADE ERROR CONTAINMENT
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCascadeErrorContainment:
+    """Per-entry exception in the head-failure cascade MUST NOT kill _verifier_loop.
+
+    RED until 1856 GREEN guards each downstream entry in the cascade for-loop
+    with a try/except block, mirroring the four sibling _verifier_loop branches.
+
+    RED markers:
+    1. req_c (third request, queued post-cascade) times out — _verifier_loop is
+       dead (RuntimeError from _remerge propagated out of the unguarded cascade
+       for-loop → _verifier_task terminated; asyncio.gather re-raises →
+       worker_task carries RuntimeError).
+    2. req_b.result is never set — RuntimeError escaped before the guard could
+       resolve it as MergeOutcome('blocked', ...).
+    3. worker_task.exception() is the RuntimeError (not None).
+
+    GREEN after 1856: per-entry try/except in the cascade for-loop:
+      · CancelledError/KeyboardInterrupt still re-raised (sentinel shutdown works)
+      · Any other BaseException → logger.exception; req_b resolved as
+        MergeOutcome('blocked', reason='Verifier cascade error: ...');
+        lease+slot released exactly once (_entry_released flag); _n_failed=True;
+        continue to the next downstream entry.  The loop survives and
+        a subsequent request (req_c) dispatches on the local host and
+        resolves 'done'.
+    """
+
+    async def test_cascade_remerge_error_does_not_kill_verifier_loop(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """RuntimeError from cascade _remerge must not propagate out of _verifier_loop.
+
+        RED: unguarded _remerge raises → RuntimeError exits the cascade for-loop
+             → _verifier_loop terminates → req_c queued post-cascade times out.
+        GREEN (1856): per-entry try/except resolves req_b 'blocked', continues
+             the loop → req_c dispatches on local host and resolves 'done'.
+        """
+        # ── N's local verify: gated (fails on first call, passes thereafter) ─
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # N's verify: gate and fail
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False,
+                    summary='test_failure',
+                    test_output='FAILED',
+                    lint_output='',
+                    type_output='',
+                    category='test_failure',
+                    timed_out=False,
+                    verify_skipped=False,
+                )
+            # Any subsequent call (req_c's local verify) passes immediately.
+            return MagicMock(
+                passed=True,
+                summary='ok',
+                test_output='ok',
+                lint_output='',
+                type_output='',
+                category='',
+                timed_out=False,
+                verify_skipped=False,
+            )
+
+        # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='laptop',
+        )
+
+        # ── Branches ─────────────────────────────────────────────────────────
+        wt_a = await _make_branch_with_file(git_ops, 'task/cas-a', 'cas_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/cas-b', 'cas_b.py', 'b = 2\n')
+
+        # ── Worker setup ─────────────────────────────────────────────────────
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        # Capture initial slot depth so we can verify exact-once release later.
+        depth0 = worker._speculation_slot._value
+
+        event_loop = asyncio.get_running_loop()
+        req_a = MergeRequest(
+            task_id='cas-a', branch='task/cas-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=event_loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='cas-b', branch='task/cas-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=event_loop.create_future(), lane='normal',
+        )
+
+        # ── Inject killer: _remerge raises RuntimeError for req_b's task_id ─
+        # Simulates merge_to_main → _create_merge_worktree failing under ENOSPC.
+        _original_remerge = worker._remerge
+
+        async def _killer_remerge(req: Any, started_mono: Any) -> Any:
+            if req.task_id == 'cas-b':
+                raise RuntimeError(
+                    'Failed to create merge worktree: '
+                    '/repo/.worktrees/cas-b No space left on device'
+                )
+            return await _original_remerge(req, started_mono)
+
+        worker._remerge = _killer_remerge  # type: ignore[method-assign]
+
+        outcome_b: MergeOutcome | None = None
+        outcome_c: MergeOutcome | None = None
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for both verifies to enter (true concurrent overlap)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # N fails → head-failure cascade fires → _killer_remerge raises for N+1
+            gate_a_release.set()
+
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status not in ('done', 'already_merged'), (
+                f'Expected N to fail, got status={outcome_a.status!r}.'
+            )
+
+            # Unblock N+1's inner verify coroutine (the cascade already cancelled
+            # the outer verify_task; this releases any coroutine still awaiting
+            # gate_b so the test completes cleanly on both RED and GREEN paths).
+            gate_b_release.set()
+
+            # Wait for req_b to resolve:
+            # GREEN: except handler → MergeOutcome('blocked', 'Verifier cascade error: ...')
+            # RED:   RuntimeError escaped before handler → req_b.result never set
+            with contextlib.suppress(TimeoutError):
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+
+            # (3a) SLOT EXACT-ONCE: check BEFORE stop() (which over-releases for safety).
+            # The cascade body releases the slot at :7365, BEFORE the _remerge call.
+            # GREEN: _entry_released=True prevents the except handler from re-releasing;
+            #        slot stays at depth0 (exactly once).
+            # A naive unconditional re-release in the except handler would leave
+            # _value == depth0+1 and fail this assertion.
+            assert worker._speculation_slot._value == depth0, (
+                f'Expected speculation slot at depth0={depth0}, '
+                f'got {worker._speculation_slot._value!r}. '
+                'Slot was either leaked (under-release) or over-released '
+                '(naive unconditional re-release in except handler).'
+            )
+
+            # Queue a third request as the loop-survival signal.
+            # GREEN: verifier_loop alive → req_c dispatched on local → 'done'.
+            # RED:   verifier_loop dead (RuntimeError terminated it) → req_c
+            #        never dispatched → TimeoutError → outcome_c stays None.
+            wt_c = await _make_branch_with_file(
+                git_ops, 'task/cas-c', 'cas_c.py', 'c = 3\n'
+            )
+            req_c = MergeRequest(
+                task_id='cas-c', branch='task/cas-c', worktree=wt_c,
+                pre_rebased=False, task_files=None, module_configs=[],
+                config=config, result=event_loop.create_future(), lane='normal',
+            )
+            await q.put(req_c)
+
+            with contextlib.suppress(TimeoutError):
+                outcome_c = await asyncio.wait_for(req_c.result, timeout=10.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── (1) LOOP SURVIVES ────────────────────────────────────────────────
+        # RED: RuntimeError in _remerge propagates out of the unguarded cascade
+        #      for-loop → _verifier_loop terminates → req_c never dispatched.
+        assert outcome_c is not None and outcome_c.status == 'done', (
+            f'Expected req_c to resolve "done" (loop survived cascade error), '
+            f'got {outcome_c!r}. '
+            'RED: RuntimeError in _remerge exits the unguarded cascade for-loop '
+            '→ _verifier_loop terminates → req_c never dispatched → TimeoutError. '
+            'GREEN (1856): per-entry try/except contains the error; loop continues.'
+        )
+
+        # ── (2) OFFENDING REQ BLOCKED ────────────────────────────────────────
+        # RED: RuntimeError escaped before the handler could set the result.
+        assert outcome_b is not None and outcome_b.status == 'blocked', (
+            f'Expected cascade error to resolve req_b as "blocked", '
+            f'got {outcome_b!r}. '
+            'RED: RuntimeError propagated before the handler set req_b.result. '
+            'GREEN (1856): except sets MergeOutcome("blocked", "Verifier cascade error: ...").'
+        )
+
+        # ── (3b) LEASE RELEASED: cancel_verify called ───────────────────────
+        assert gated_remote.cancel_verify.call_count >= 1, (
+            f'Expected at least one cancel_verify call for N+1 lease release, '
+            f'got call_count={gated_remote.cancel_verify.call_count}.'
+        )
+
+        # ── (4) NO EXCEPTION ESCAPES ─────────────────────────────────────────
+        # RED: RuntimeError from _remerge propagated out of _verifier_loop;
+        #      asyncio.gather() re-raises → worker_task carries the exception.
+        assert worker_task.done(), 'Worker task should be done after stop() + await'
+        assert worker_task.exception() is None, (
+            f'Expected worker task to exit cleanly (exception() is None), '
+            f'got {worker_task.exception()!r}. '
+            'RED: RuntimeError propagated out of _verifier_loop; '
+            'asyncio.gather re-raises → worker_task.exception() is RuntimeError. '
+            'GREEN (1856): per-entry guard contains error; loop exits via sentinel.'
+        )
