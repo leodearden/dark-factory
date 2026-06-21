@@ -244,3 +244,100 @@ async def test_bounded_restarts_then_terminal_escalation(
     assert run_task.exception() is None, (
         f'run() should not propagate an exception; got {run_task.exception()!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — RED: normal shutdown / cancelled / shutdown-race do NOT escalate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_normal_shutdown_does_not_trigger_death_path(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+) -> None:
+    """Normal stop(), cancelled loops, and shutdown-race exceptions must never escalate.
+
+    Three sub-checks:
+      (A) Clean lifecycle — real loops + stop() → no submission, not halted, clean exit.
+      (B) Cancelled-task unit — _on_loop_task_done with a cancelled task → no submission.
+      (C) Shutdown-race unit — _running=False + task with RuntimeError → no submission,
+          no restart. (This is the check that was failing before step-6 when exc+!running
+          was still treated as a death.)
+    """
+    # ── (A) Clean lifecycle ───────────────────────────────────────────────
+    queue_a: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    eq_a = _make_fake_escalation_queue()
+    worker_a = SpeculativeMergeWorker(git_ops, queue_a, escalation_queue=eq_a)
+    worker_a._shutdown_timeout = 0.1
+
+    run_task_a = asyncio.create_task(worker_a.run())
+    await asyncio.sleep(0.05)  # let loops start
+    await worker_a.stop()
+    try:
+        await asyncio.wait_for(run_task_a, timeout=2.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+
+    assert eq_a.submit.call_count == 0, (
+        f'(A) No escalation expected on clean stop, got {eq_a.submit.call_count}'
+    )
+    assert worker_a._supervisor_halted is False, '(A) supervisor should not be halted'
+    assert run_task_a.done(), '(A) run_task should be done after stop()'
+    # run() should complete with no exception (or CancelledError from outer cancel)
+    if not run_task_a.cancelled():
+        exc_a = run_task_a.exception()
+        assert exc_a is None, f'(A) run() should not propagate exception: {exc_a!r}'
+
+    # ── (B) Cancelled-task unit ───────────────────────────────────────────
+    queue_b: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    eq_b = _make_fake_escalation_queue()
+    worker_b = SpeculativeMergeWorker(git_ops, queue_b, escalation_queue=eq_b)
+
+    # Build a cancelled task
+    async def _dummy() -> None:
+        await asyncio.sleep(10)
+
+    cancelled_task: asyncio.Task = asyncio.create_task(_dummy())
+    cancelled_task.cancel()
+    try:
+        await cancelled_task
+    except asyncio.CancelledError:
+        pass
+
+    old_verifier_task = worker_b._verifier_task
+    worker_b._on_loop_task_done('verifier', cancelled_task)
+
+    assert eq_b.submit.call_count == 0, (
+        f'(B) Cancelled task must not trigger escalation, got {eq_b.submit.call_count}'
+    )
+    # No new task spawned (still old value, which is None at construction time)
+    assert worker_b._verifier_task is old_verifier_task, (
+        '(B) _verifier_task must not change after cancelled-task callback'
+    )
+
+    # ── (C) Shutdown-race unit ────────────────────────────────────────────
+    queue_c: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    eq_c = _make_fake_escalation_queue()
+    worker_c = SpeculativeMergeWorker(git_ops, queue_c, escalation_queue=eq_c)
+    # Simulate shutdown in progress
+    worker_c._running = False
+
+    # Build a finished task that carries a RuntimeError
+    async def _raises() -> None:
+        raise RuntimeError('shutdown-race exception')
+
+    exc_task: asyncio.Task = asyncio.create_task(_raises())
+    await asyncio.gather(exc_task, return_exceptions=True)
+    assert exc_task.done() and not exc_task.cancelled()
+
+    old_merger_task = worker_c._merger_task
+    worker_c._on_loop_task_done('merger', exc_task)
+
+    assert eq_c.submit.call_count == 0, (
+        f'(C) Shutdown-race exception must NOT escalate, got {eq_c.submit.call_count}'
+    )
+    # No restart — _merger_task unchanged
+    assert worker_c._merger_task is old_merger_task, (
+        '(C) _merger_task must not change on shutdown-race death'
+    )
