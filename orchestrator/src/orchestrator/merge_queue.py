@@ -7311,78 +7311,122 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         except BaseException:
                             pass
 
-                    # Cancellation safety note: _downstream entries have been
-                    # moved out of self._inflight, so stop()'s inflight drain
-                    # will not reach any entry that hasn't been processed yet.
-                    # CancelledError from the bare awaits below (_abort_remote_verify
-                    # or cancel_and_release) would leave remaining entries with
-                    # unreleased leases and unresolved futures — the same pre-existing
-                    # risk as the cancel_and_release at line 7022.  In practice,
-                    # stop() terminates the loop via a None sentinel rather than
-                    # direct task cancellation, so the cascade always completes
-                    # before the sentinel is processed.  External task cancellation
-                    # (e.g. test harness timeout) can still hit this window; it is
-                    # accepted as an edge case given the sentinel-based shutdown design.
+                    # Error containment (task-1856): each downstream entry is
+                    # wrapped in try/except, mirroring the four sibling
+                    # _verifier_loop branches (dispatch branch, passthrough-finalize
+                    # branch, finalize-head branch, blocking-get branch).
+                    # CancelledError/KeyboardInterrupt still re-raise to honour
+                    # sentinel-based shutdown: stop() terminates the loop via a
+                    # None sentinel rather than direct task cancellation, so the
+                    # cascade runs to completion on normal shutdown; external
+                    # task cancellation remains an accepted edge case.
+                    # Any other BaseException is caught per entry: req.result
+                    # resolves as MergeOutcome('blocked', reason='Verifier
+                    # cascade error: ...') and the loop continues to the next
+                    # downstream entry.
+                    # Release discipline: lease+slot are released in-body at
+                    # cancel_and_release / _speculation_slot.release() BEFORE
+                    # _remerge is called; the _entry_released flag prevents a
+                    # double-release in the except handler on the
+                    # _remerge-raises path (which is the primary failure mode).
                     for _entry in _downstream:
                         _entry_status: str | None = None
-                        if _entry.verify_task is not None:
-                            # Fire remote cancel BEFORE task.cancel() so the
-                            # remote verify-merge process is signalled while
-                            # _inflight_request_id is still live (mirrors
-                            # task-1757 _run_inflight_verify fix).  Bare await
-                            # mirrors 1757's cascade-style call; the helper
-                            # swallows Exception internally, and CancelledError
-                            # propagates to stop the loop (correct behaviour).
-                            if _entry.lease is not None:
-                                await self._abort_remote_verify(
-                                    _entry.lease, _entry.item.request.task_id,
-                                )
-                            _entry.verify_task.cancel()
-                            with contextlib.suppress(BaseException):
-                                await _entry.verify_task
-                            # Peek at the completed result to detect REQUEUED
-                            # (operator-halt): the request is already back on
-                            # _queue via the abort-poll; _remerge must be skipped
-                            # to avoid a duplicate re-dispatch.
+                        _entry_released = False
+                        try:
+                            if _entry.verify_task is not None:
+                                # Fire remote cancel BEFORE task.cancel() so the
+                                # remote verify-merge process is signalled while
+                                # _inflight_request_id is still live (mirrors
+                                # task-1757 _run_inflight_verify fix).  Helper
+                                # swallows Exception internally; CancelledError
+                                # propagates to stop the loop (correct behaviour).
+                                if _entry.lease is not None:
+                                    await self._abort_remote_verify(
+                                        _entry.lease, _entry.item.request.task_id,
+                                    )
+                                _entry.verify_task.cancel()
+                                with contextlib.suppress(BaseException):
+                                    await _entry.verify_task
+                                # Peek at the completed result to detect REQUEUED
+                                # (operator-halt): the request is already back on
+                                # _queue via the abort-poll; _remerge must be
+                                # skipped to avoid a duplicate re-dispatch.
+                                if (
+                                    _entry.verify_task.done()
+                                    and not _entry.verify_task.cancelled()
+                                ):
+                                    try:
+                                        _vt_res = _entry.verify_task.result()
+                                        if hasattr(_vt_res, 'status'):
+                                            _entry_status = _vt_res.status
+                                    except BaseException:
+                                        pass
+                            if _entry.lease is not None and _allocator is not None:
+                                await _allocator.cancel_and_release(_entry.lease)
+                            if _entry.merge_wt is not None:
+                                with contextlib.suppress(BaseException):
+                                    await self._cleanup_owned_merge_worktree(
+                                        _entry.merge_wt
+                                    )
+                            if _entry.was_speculative:
+                                self._speculation_slot.release()
+                            # Past the in-body lease+slot release; the except
+                            # handler must not re-release on any path below.
+                            _entry_released = True
+                            # REQUEUED: abort-poll already put req on _queue → skip.
+                            if _entry_status == 'REQUEUED':
+                                continue
+                            # Head was REQUEUED (operator halt) and we cancelled
+                            # this downstream task before its abort-poll could
+                            # requeue it: manually put the req on _queue so
+                            # stop() can resolve it.
                             if (
-                                _entry.verify_task.done()
-                                and not _entry.verify_task.cancelled()
+                                _head_was_requeued
+                                and _entry.verify_task is not None
+                                and _entry.verify_task.cancelled()
                             ):
-                                try:
-                                    _vt_res = _entry.verify_task.result()
-                                    if hasattr(_vt_res, 'status'):
-                                        _entry_status = _vt_res.status
-                                except BaseException:
-                                    pass
-                        if _entry.lease is not None and _allocator is not None:
-                            await _allocator.cancel_and_release(_entry.lease)
-                        if _entry.merge_wt is not None:
-                            with contextlib.suppress(BaseException):
-                                await self._cleanup_owned_merge_worktree(
-                                    _entry.merge_wt
-                                )
-                        if _entry.was_speculative:
-                            self._speculation_slot.release()
-                        # REQUEUED: abort-poll already put req on _queue → skip.
-                        if _entry_status == 'REQUEUED':
+                                _entry_req = _entry.item.request
+                                if not _entry_req.result.done():
+                                    self._queue.put_nowait(_entry_req)
+                                continue
+                            _remerged = await self._remerge(
+                                _entry.item.request,
+                                _entry.item.started_monotonic,
+                            )
+                            self._redispatch.append(_remerged)
+                        except (asyncio.CancelledError, KeyboardInterrupt):
+                            raise
+                        except BaseException as _cascade_exc:
+                            _req = _entry.item.request
+                            logger.exception(
+                                'Task %s: unexpected cascade error', _req.task_id
+                            )
+                            if not _req.result.done():
+                                _req.result.set_result(MergeOutcome(
+                                    'blocked',
+                                    reason=f'Verifier cascade error: {_cascade_exc}',
+                                ))
+                            if not _entry_released:
+                                # In-body release did not run (e.g. cancel_and_release
+                                # itself raised): best-effort release here to avoid
+                                # a lease/slot or merge-worktree leak.
+                                if (
+                                    _entry.lease is not None
+                                    and _allocator is not None
+                                ):
+                                    with contextlib.suppress(BaseException):
+                                        await _allocator.cancel_and_release(
+                                            _entry.lease
+                                        )
+                                if _entry.merge_wt is not None:
+                                    with contextlib.suppress(BaseException):
+                                        await self._cleanup_owned_merge_worktree(
+                                            _entry.merge_wt
+                                        )
+                                if _entry.was_speculative:
+                                    self._speculation_slot.release()
+                            self._n_failed = True
                             continue
-                        # Head was REQUEUED (operator halt) and we cancelled this
-                        # downstream task before its abort-poll could requeue it:
-                        # manually put the req on _queue so stop() can resolve it.
-                        if (
-                            _head_was_requeued
-                            and _entry.verify_task is not None
-                            and _entry.verify_task.cancelled()
-                        ):
-                            _entry_req = _entry.item.request
-                            if not _entry_req.result.done():
-                                self._queue.put_nowait(_entry_req)
-                            continue
-                        _remerged = await self._remerge(
-                            _entry.item.request,
-                            _entry.item.started_monotonic,
-                        )
-                        self._redispatch.append(_remerged)
                     # Signal dispatch that any not-yet-dispatched followers also
                     # need re-merge (chain_invalidated guard in _dispatch_item).
                     self._remerge_occurred = True
