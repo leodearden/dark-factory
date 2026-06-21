@@ -6026,9 +6026,74 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Clean return via the None sentinel OR shutdown race: not a death.
             self._retire_loop(name)
             return
-        # Unexpected death while worker is running: escalate + restart.
-        self._emit_loop_death_escalation(name, exc)
-        self._spawn_loop(name)
+        # Unexpected death while worker is running: check restart cap then escalate.
+        now = self._restart_clock()
+        times = self._loop_restart_times[name]
+        window = self._loop_restart_window_s
+        # Prune restart timestamps outside the rolling window.
+        while times and now - times[0] > window:
+            times.popleft()
+        if len(times) >= self._max_loop_restarts:
+            # CAP EXCEEDED: escalate terminally and halt the worker.
+            self._emit_loop_terminal_escalation(name, exc, len(times))
+            self._supervisor_halted = True
+            self._supervisor_halt_reason = (
+                f'{name} loop exceeded {self._max_loop_restarts} restarts '
+                f'within {window}s'
+            )
+            self._retire_loop(name)  # sets _loops_finished → run() returns
+        else:
+            # Within cap: record timestamp, emit L1 restart escalation, respawn.
+            times.append(now)
+            self._emit_loop_death_escalation(name, exc)
+            self._spawn_loop(name)
+
+    def _emit_loop_terminal_escalation(
+        self, name: str, exc: BaseException, restart_count: int
+    ) -> None:
+        """Emit a born-at-L2 terminal escalation when the restart cap is exceeded.
+
+        ``severity='critical'`` + ``level=2`` routes straight to a human (born-at-L2).
+        The ``orchestrator-`` agent_role prefix marks it as a harness sentinel so the
+        escalation server never downgrades the severity.
+
+        None-safe: no-op when ``self._escalation_queue`` is None.
+        """
+        if self._escalation_queue is None:
+            return
+        from escalation.models import Escalation  # local import — escalation optional dep
+        tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        summary = (
+            f'merge_worker_loop_died: {name} loop exceeded restart cap '
+            f'({self._max_loop_restarts} restarts/{self._loop_restart_window_s}s) '
+            f'— merge worker HALTED'
+        )
+        detail = (
+            f'Loop: {name}\n'
+            f'Restart attempts in window: {restart_count}\n'
+            f'Max restarts allowed: {self._max_loop_restarts}\n'
+            f'Window: {self._loop_restart_window_s}s\n'
+            f'Last exception type: {type(exc).__name__}\n'
+            f'Last exception: {exc}\n'
+            f'\nFull traceback (last death):\n{tb_str}'
+        )
+        esc = Escalation(
+            id=self._escalation_queue.make_id(
+                f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}:terminal'
+            ),
+            task_id=f'{_MERGE_WORKER_LOOP_DIED_SENTINEL}:{name}:terminal',
+            agent_role='orchestrator-merge-worker-supervisor',
+            severity='critical',
+            level=2,
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action=(
+                'Restart the orchestrator; the merge worker is halted and no longer '
+                'draining merges.'
+            ),
+        )
+        self._escalation_queue.submit(esc)
 
     def _emit_loop_death_escalation(self, name: str, exc: BaseException) -> None:
         """Emit a loud L1 ``'merge_worker_loop_died'`` escalation.
