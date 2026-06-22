@@ -2898,7 +2898,6 @@ class TestFairness:
         # --- Phase 4: H completes → M can finally dispatch ---
         scheduler.release('H')
 
-        m_only = [m_task]
         scheduler.get_tasks = AsyncMock(return_value=[c_task_done, dict(h_task, status='done'), m_task])
 
         result3 = await scheduler.acquire_next()
