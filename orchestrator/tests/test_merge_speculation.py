@@ -2762,3 +2762,206 @@ class TestLateArrivalGuards:
         # (slot._value == 0 after gate_a_entered: one permit held for A's look-ahead
         # retained → B's ATTACH).  With K=1, slot._value == 0 means EXACTLY one
         # permit is in use, which is correct and cannot exceed K=1.
+
+
+# ===========================================================================
+# Step-8 Guard: submission-order CAS invariant for the late-arrival path
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestLateArrivalSubmissionOrderCAS:
+    """Step-8 guard — main advances in strict submission order on the late-arrival path.
+
+    This is the regression guard the task names explicitly (from the plan):
+
+    Assert that with a late-attached B:
+      1. A's advance_main/CAS completes (A lands on main) BEFORE B's advance_main runs.
+      2. B's expected_main kwarg equals A's merge commit (CAS is set up for the right base).
+      3. Both A and B land (outcome='done'); no interleaving or out-of-order advance.
+
+    The existing test_advance_main_submission_order_regression_guard in
+    TestB9CapstoneIntegration tests CAS ordering with mocked git_ops; this test
+    verifies the same invariant end-to-end with the real-git harness and the
+    late-arrival path (pending_spec_base attach via step-2).
+
+    This stays GREEN after step-2/step-4/step-6 because:
+      B.base_sha == A's merge commit → advance_main(expected_main=A's commit) → clean CAS.
+      After A lands, main == A's commit → B's CAS succeeds immediately ('advanced').
+      The verifier's single-threaded serial finalize loop ensures A finalizes first.
+    """
+
+    async def test_submission_order_cas_late_arrival(
+        self, spec_git_repo: Path,
+    ) -> None:
+        """A's advance_main completes before B's; B's expected_main == A's merge commit.
+
+        Drive:
+          - Gate A's LOCAL verify (gate_a_entered fires after look-ahead peek).
+          - Inject B LATE (after gate_a_entered).
+          - Gate B's REMOTE verify (gate_b_release) so B's verify enters before A lands.
+          - Release A → A lands.
+          - Release B → B advances.
+
+        Assert:
+          (a) advance_main call for A comes before call for B (submission order).
+          (b) B's advance_main was called with expected_main == A's merge commit
+              (B's CAS uses A's merge commit as the base, not the original main).
+          (c) Both A and B resolve 'done' (clean CAS, no rebase).
+        """
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+
+        # ── Spy: capture advance_main calls in order ──────────────────────────
+        advance_call_log: list[dict] = []
+        original_advance_main = git_ops.advance_main
+
+        async def _spy_advance_main(
+            merge_sha: str,
+            merge_worktree: Any = None,
+            branch: str | None = None,
+            **kwargs: Any,
+        ) -> Any:
+            result = await original_advance_main(
+                merge_sha, merge_worktree, branch=branch, **kwargs,
+            )
+            advance_call_log.append({
+                'branch': branch,
+                'expected_main': kwargs.get('expected_main'),
+                'result': str(result),
+            })
+            return result
+
+        git_ops.advance_main = _spy_advance_main  # type: ignore[method-assign]
+
+        # ── Spy: capture A's merge commit from merge_to_main ──────────────────
+        _merge_calls: list[dict] = []
+        original_merge_to_main = git_ops.merge_to_main
+
+        async def _spy_merge_to_main(
+            wt: Path, branch: str, base_sha: str | None = None,
+        ) -> Any:
+            result = await original_merge_to_main(wt, branch, base_sha=base_sha)
+            _merge_calls.append({
+                'branch': branch,
+                'merge_commit': result.merge_commit,
+            })
+            return result
+
+        git_ops.merge_to_main = _spy_merge_to_main  # type: ignore[method-assign]
+
+        # ── Gate A's LOCAL verify ─────────────────────────────────────────────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # ── Gate B's REMOTE verify ─────────────────────────────────────────────
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='cas8-laptop',
+        )
+
+        # ── Build disjoint branches ───────────────────────────────────────────
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/cas8-a', 'cas8_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/cas8-b', 'cas8_b.py', 'b = 2\n',
+        )
+
+        worker = _make_late_arrival_worker(git_ops, speculation_depth=2)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        req_a = _make_request('cas8-a', 'task/cas8-a', wt_a, config)
+        req_b = _make_request('cas8-b', 'task/cas8-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue A; wait for look-ahead peek to fire.
+            await worker._queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # Inject B LATE; wait for B's remote verify to enter.
+            await worker._queue.put(req_b)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # Release A → A lands; then release B → B advances.
+            gate_a_release.set()
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+
+            gate_b_release.set()
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── Assertions ────────────────────────────────────────────────────────
+
+        assert outcome_b.status == 'done', (
+            f'B must land cleanly after A; got {outcome_b!r}'
+        )
+
+        # (a) Submission-order CAS: A's advance_main called before B's.
+        a_advances = [c for c in advance_call_log if c['branch'] == 'task/cas8-a']
+        b_advances = [c for c in advance_call_log if c['branch'] == 'task/cas8-b']
+        assert a_advances, 'advance_main must have been called for A'
+        assert b_advances, 'advance_main must have been called for B'
+
+        a_idx = next(i for i, c in enumerate(advance_call_log) if c['branch'] == 'task/cas8-a')
+        b_idx = next(i for i, c in enumerate(advance_call_log) if c['branch'] == 'task/cas8-b')
+        assert a_idx < b_idx, (
+            f'Submission-order CAS violation: A\'s advance_main must come first; '
+            f'A at index {a_idx}, B at index {b_idx} in advance_call_log={advance_call_log!r}.\n'
+            'The verifier\'s serial finalize loop (single-threaded _verifier_loop) must '
+            'process A\'s InflightEntry before B\'s — preserving submission order.'
+        )
+
+        # (b) B's expected_main == A's merge commit.
+        a_merges = [c for c in _merge_calls if c['branch'] == 'task/cas8-a']
+        assert a_merges, 'merge_to_main must have been called for A'
+        a_merge_commit = (a_merges[0]['merge_commit'] or '').strip()
+
+        b_expected_main = b_advances[0]['expected_main']
+        assert b_expected_main == a_merge_commit, (
+            f'CAS invariant: B\'s expected_main must equal A\'s merge commit '
+            f'{a_merge_commit!r}; got expected_main={b_expected_main!r}.\n'
+            'B was merged speculatively against A\'s commit (pending_spec_base); '
+            'advance_main must use that commit as expected_main for the CAS. '
+            'After A lands, main == A\'s commit → clean fast-forward CAS for B.'
+        )
+
+        # (c) Both advance as 'advanced' (clean CAS, no rebase).
+        assert a_advances[0]['result'] == 'advanced', (
+            f'A must advance cleanly; got {a_advances[0]["result"]!r}'
+        )
+        assert b_advances[0]['result'] == 'advanced', (
+            f'B must advance cleanly (expected_main == main-after-A → clean CAS); '
+            f'got {b_advances[0]["result"]!r}.\n'
+            'If B returned rebased_pending_reverify, the pending_spec_base fix did not '
+            'set B.base_sha correctly — disjoint-skip semantic-conflict hole still open.'
+        )
+
+        # (d) Both files on main.
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=spec_git_repo,
+        )
+        assert 'cas8_a.py' in main_files, 'A\'s file must be on main'
+        assert 'cas8_b.py' in main_files, 'B\'s file must be on main'
