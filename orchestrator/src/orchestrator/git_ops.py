@@ -1282,6 +1282,8 @@ class GitOps:
             cmd = [
                 str(script), 'check',
                 '--mount', str(self.worktree_base),
+                '--min-free-gib', str(self.config.warm_lane_min_free_gib),
+                '--min-free-inodes', str(self.config.warm_lane_min_free_inodes),
             ]
             rc, _, err = await _run(cmd, cwd=self.project_root)
             if rc not in (0, 75):
@@ -1565,14 +1567,28 @@ class GitOps:
             state.  ``expected_title=None`` (default) disables the guard and
             all existing callers/tests are unaffected.
 
+        **ε pre-acquire disk-guard** (``config.warm_lane_disk_guard``, task-1860):
+            When the knob is True, runs γ ``warm-lane-disk-guard.sh check`` →
+            on exit 75 (EX_TEMPFAIL/disk pressure) invokes δ ``warm-lane-gc.sh
+            reclaim`` to free stale capacity → re-checks.  If STILL pressured,
+            returns ``WarmLaneUnavailable.DISK_PRESSURE`` so
+            :meth:`create_worktree` raises :class:`WarmLaneDiskPressure` →
+            workflow requeues (exit-75) instead of proceeding into an ENOSPC
+            build.  Runs BEFORE :func:`acquire_for` so all idle lanes remain
+            FREE for δ's reclaim.  Fail-open on absent scripts (rc 127): no
+            guard / nothing reclaimed — byte-identical to today until reify
+            γ/δ are deployed.
+
         Returns:
             WorktreeInfo  — success; lane is ASSIGNED and seeded.
             WarmLaneUnavailable.EXHAUSTED — all pool lanes are ASSIGNED
                 (backpressure; caller should requeue).
             WarmLaneUnavailable.FAULT — seed/worktree-add failure or absent
                 seed script (infra fault; caller should escalate blocked+L1).
-            WarmLaneUnavailable.DISK_PRESSURE — seed exited 75 (EX_TEMPFAIL);
-                transient disk pressure (caller should requeue with annotation).
+            WarmLaneUnavailable.DISK_PRESSURE — pre-acquire ε disk-guard
+                detected persistent pressure (rc=75 after reclaim), OR seed
+                exited 75 (EX_TEMPFAIL); transient disk pressure (caller should
+                requeue with annotation).
             WarmLaneUnavailable.DISABLED — pool knob is off; this is a
                 programming error (callers MUST guard with
                 ``if self.warm_lane_pool is not None`` before calling).

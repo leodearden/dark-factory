@@ -844,6 +844,12 @@ class GitConfig(BaseModel):
             'the retry budget with no backoff.  The block_reason '
             '"warm_lane_disk_pressure (transient infra)" is set for future '
             'scheduler special-casing (follow-up: exclude from retry cap). '
+            'DISK_PRESSURE is produced in two ways: (1) ε pre-acquire disk-guard '
+            '(warm_lane_disk_guard=True) — check γ script → reclaim δ script → '
+            'recheck, return DISK_PRESSURE if still pressured (runs before '
+            'acquire_for so idle lanes stay FREE; fail-open on absent scripts); '
+            '(2) seed exit-75 (EX_TEMPFAIL) after the lane is allocated.  Both '
+            'routes thread through the same WarmLaneDiskPressure → REQUEUED path. '
             'Note: the reify-repo PRD inv.6 text is the cross-repo counterpart '
             'of this policy; it is flagged for update separately via escalate_info.'
         ),
