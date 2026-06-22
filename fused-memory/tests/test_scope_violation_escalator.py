@@ -235,6 +235,41 @@ class TestBudgetMisconfigEscalation:
         # Fix hint names the config key.
         assert 'max_budget_usd' in payload['detail']
 
+    def test_dedup_window_expired_second_call_files_new_escalation(self, tmp_path):
+        """Once the dedup window has elapsed a second call MUST file a second file.
+
+        A regression that made dedup permanent (e.g. comparing against a sentinel
+        that never ages out) would pass a suppression-only test but break the
+        'one reminder per window' contract.  Using window=0.0 means the timestamp
+        is always stale by definition, so the second call always re-files.
+        """
+        esc = ScopeViolationEscalator(budget_misconfig_dedup_window_secs=0.0)
+        first = esc.report_budget_misconfig(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            cost_usd=0.11,
+            turns=2,
+            max_budget_usd=0.30,
+            model='sonnet',
+        )
+        assert first is not None
+        second = esc.report_budget_misconfig(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            cost_usd=0.12,
+            turns=3,
+            max_budget_usd=0.30,
+            model='sonnet',
+        )
+        assert second is not None, (
+            'second call after dedup window expired must file a new escalation'
+        )
+        assert second != first, 'second escalation must have a distinct id'
+        files = list((tmp_path / 'data' / 'escalations').glob('*.json'))
+        assert len(files) == 2, (
+            f'expected two escalation files after window expired, found: {files}'
+        )
+
 
 class TestEscalationDisabled:
     def test_no_op_when_escalation_pkg_unavailable(self, tmp_path, monkeypatch):

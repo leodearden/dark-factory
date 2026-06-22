@@ -23,9 +23,12 @@ Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalato
   matches the existing esc-2240-series scope_violation pattern referenced
   in task 1088.
 
-No burst control in v1: observed misroute volume is in the single digits
-per day, well below the noise floor a per-project rate limiter would be
-designed around.  Add when (if) volume warrants.
+Burst control: :meth:`report_budget_misconfig` applies a per-project dedup
+window (``_BUDGET_MISCONFIG_DEDUP_WINDOW_SECS``) so a sustained per-call
+budget exhaustion files ONE escalation per window rather than flooding the
+operator queue.  :meth:`report_rejection` remains unthrottled — observed
+misroute volume is in the single digits per day, well below the noise floor
+a per-project rate limiter would target.
 """
 
 from __future__ import annotations
@@ -74,7 +77,22 @@ _BUDGET_MISCONFIG_DEDUP_WINDOW_SECS: float = 300.0
 
 
 class ScopeViolationEscalator:
-    """File a ``scope_violation`` escalation for each rejected misroute."""
+    """Escalation helper for path-scope guard events.
+
+    Handles two distinct categories:
+
+    * **scope_violation** (:meth:`report_rejection`) — filed for every rejected
+      task-creation misroute detected by the path-scope guard.  Unthrottled.
+    * **adjudicator_config_defect** (:meth:`report_budget_misconfig`) — filed
+      when the path-scope adjudicator's LLM call returns ``error_max_budget_usd``
+      with ``cost_usd > 0``, indicating the per-call budget is too low for the
+      call shape (deterministic config defect, not a transient hang).
+      Burst-suppressed to one escalation per project per dedup window.
+
+    The class intentionally hosts both categories: it already owns the defensive
+    ``HAS_ESCALATION`` import, the per-project ``EscalationQueue`` cache, and the
+    never-raise submit contract that both callers need.
+    """
 
     def __init__(
         self,
