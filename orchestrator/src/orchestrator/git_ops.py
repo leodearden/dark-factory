@@ -306,6 +306,23 @@ class MergeResult:
     merge_worktree: Path | None = None
 
 
+class WarmLaneUnavailable(Enum):
+    """Discriminated failure result from :meth:`acquire_warm_lane`.
+
+    Returned instead of bare ``None`` so callers can distinguish:
+
+    * ``EXHAUSTED`` — all pool lanes are ASSIGNED; signal backpressure / requeue.
+    * ``FAULT`` — seed/worktree-add failure or absent seed script; signal blocked + L1.
+    * ``DISK_PRESSURE`` — seed exited 75 (EX_TEMPFAIL); transient infra; requeue.
+
+    A lane is always released back to FREE before this value is returned, so no
+    ASSIGNED lanes are ever leaked on failure.
+    """
+    EXHAUSTED = 'exhausted'
+    FAULT = 'fault'
+    DISK_PRESSURE = 'disk_pressure'
+
+
 @dataclass
 class WorktreeInfo:
     """Return value from create_worktree - captures worktree path and base commit.
@@ -794,7 +811,7 @@ class GitOps:
             pool_info = await self.acquire_warm_lane(
                 branch_name, start_ref, expected_title=expected_title,
             )
-            if pool_info is not None:
+            if isinstance(pool_info, WorktreeInfo):
                 # Carry stale_commits from the freshen result onto the pool info
                 return WorktreeInfo(
                     path=pool_info.path,
@@ -802,9 +819,10 @@ class GitOps:
                     stale_commits=stale_commits,
                     reify_debug_port=pool_info.reify_debug_port,
                 )
-            # Fall through to cold path (exhaustion / seed failure)
+            # Fall through to cold path (exhaustion / seed failure / disk pressure)
             logger.info(
-                'create_worktree: pool acquire failed for %s — falling back to cold path',
+                'create_worktree: pool acquire failed (%s) for %s — falling back to cold path',
+                pool_info.value if isinstance(pool_info, WarmLaneUnavailable) else pool_info,
                 branch_name,
             )
 
@@ -1365,14 +1383,12 @@ class GitOps:
         start_ref: str,
         *,
         expected_title: str | None = None,
-    ) -> 'WorktreeInfo | None':
+    ) -> 'WorktreeInfo | WarmLaneUnavailable':
         """Allocate a FREE warm lane, seed/reset it, and return a WorktreeInfo.
 
         **Create-once path** (lane not yet a registered worktree):
             ``git worktree add -b task/<branch_name> <lane> <start_ref>``,
             then seed via :meth:`_seed_warm_lane(lane, '--fresh-checkout')`.
-            If seed fails, the just-created worktree is removed and None is
-            returned (caller falls through to the cold path — inv.6).
 
         **Reset-in-place path** (lane already registered — added in step-10):
             Handled by :meth:`_reset_warm_lane` then always re-seeded from the
@@ -1391,15 +1407,23 @@ class GitOps:
             all existing callers/tests are unaffected.
 
         Returns:
-            WorktreeInfo on success; None on pool exhaustion, absent seed
-            script, or seed failure (never raises — cold-fallback signal).
+            WorktreeInfo  — success; lane is ASSIGNED and seeded.
+            WarmLaneUnavailable.EXHAUSTED — all pool lanes are ASSIGNED
+                (backpressure; caller should requeue).
+            WarmLaneUnavailable.FAULT — seed/worktree-add failure or absent
+                seed script (infra fault; caller should escalate blocked+L1).
+            WarmLaneUnavailable.DISK_PRESSURE — seed exited 75 (EX_TEMPFAIL);
+                transient disk pressure (caller should requeue with annotation).
+
+            Never raises internally; the lane is always released before
+            returning any WarmLaneUnavailable value.
         """
         if self.warm_lane_pool is None:
-            return None
+            return WarmLaneUnavailable.EXHAUSTED  # pool knob off — treat as exhausted
 
         acq = await self.warm_lane_pool.acquire_for(branch_name)
         if acq is None:
-            return None  # Pool exhausted → caller cold-fallback (inv.6)
+            return WarmLaneUnavailable.EXHAUSTED  # Pool exhausted → backpressure
         lane, reused = acq
 
         full_branch = f'{self.config.branch_prefix}{branch_name}'
@@ -1451,30 +1475,33 @@ class GitOps:
                     shutil.rmtree(lane)
                 lane.parent.mkdir(parents=True, exist_ok=True)
 
-                rc, _, err = await _run(
+                git_add_rc, _, err = await _run(
                     ['git', 'worktree', 'add', '-b', full_branch, str(lane), start_ref],
                     cwd=self.project_root,
                 )
-                if rc != 0:
+                if git_add_rc != 0:
                     logger.warning(
                         'acquire_warm_lane: git worktree add failed for %s: %s', lane, err,
                     )
                     await self.warm_lane_pool.release(lane)
-                    return None
+                    return WarmLaneUnavailable.FAULT
 
-                rc = await self._seed_warm_lane(lane, '--fresh-checkout')
-                if rc != 0:
+                seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if seed_rc != 0:
                     # Seed failed — remove the just-created worktree and release
                     logger.warning(
-                        'acquire_warm_lane: seed failed for %s; removing and cold-falling back',
-                        lane,
+                        'acquire_warm_lane: seed failed (rc=%d) for %s; removing worktree',
+                        seed_rc, lane,
                     )
                     await _run(
                         ['git', 'worktree', 'remove', str(lane), '--force'],
                         cwd=self.project_root,
                     )
                     await self.warm_lane_pool.release(lane)
-                    return None
+                    return (
+                        WarmLaneUnavailable.DISK_PRESSURE if seed_rc == 75
+                        else WarmLaneUnavailable.FAULT
+                    )
             else:
                 # ── Already-registered lane — check on-disk backstop first ─
                 # If the lane still carries THIS task's plan.json (e.g. after a
@@ -1552,7 +1579,7 @@ class GitOps:
                 'acquire_warm_lane: unexpected error for %s; releasing', lane, exc_info=True,
             )
             await self.warm_lane_pool.release(lane)
-            return None
+            return WarmLaneUnavailable.FAULT
 
     async def _reuse_warm_lane(
         self, lane_dir: Path, full_branch: str,
