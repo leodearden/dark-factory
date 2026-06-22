@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,7 +26,6 @@ from orchestrator.git_ops import (
     WorktreeInfo,
     _run,
 )
-
 
 # ---------------------------------------------------------------------------
 # Repo fixture (mirrors test_git_ops.py pattern)
@@ -127,7 +127,7 @@ def _subcommands(repo: Path) -> list[str]:
     return [line.split()[0] for line in _read_call_log(repo)]
 
 
-def _make_disk_guard_config(**overrides: object) -> GitConfig:
+def _make_disk_guard_config(**overrides: Any) -> GitConfig:
     """Build a GitConfig with disk guard enabled and canonical warm-lane settings."""
     return GitConfig(
         main_branch='main',
