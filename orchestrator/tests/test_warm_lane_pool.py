@@ -1089,34 +1089,26 @@ class TestAcquireWarmLaneResetInPlace:
         ]
         assert len(lane_registrations) == 1
 
-    async def test_recycle_reseed_failure_keeps_lane(
+    async def test_recycle_reseed_fault_returns_fault(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Recycle path: failed re-seed is fail-soft — lane kept with degraded warmth.
+        """Recycle path: failed re-seed (exit 1) → WarmLaneUnavailable.FAULT + lane released.
 
-        When seed-warm-lane.sh exits non-zero on the RECYCLE path,
-        acquire_warm_lane must still return a usable WorktreeInfo (lane remains
-        registered, worktree NOT removed).  Contrast with create-once where a
-        seed failure triggers cold-fallback (returns None).
-
-        Fails against step-2 impl (which treats recycle seed failure as fatal,
-        returning None).  Passes after step-4's fail-soft implementation.
+        When seed-warm-lane.sh exits non-zero (generic fault) on the RECYCLE path,
+        acquire_warm_lane must return FAULT (NOT a WorktreeInfo — no degraded warmth).
+        The lane is released back to FREE.
         """
+        from orchestrator.warm_lane_pool import LaneState
+
         sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
-        # First acquire (create-once): passing seed → lane registered, target/ warm
+        # First acquire (create-once): passing seed → lane registered
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None, 'prerequisite: create-once acquire must succeed'
-
-        # Place a retained artifact so we can verify it survives fail-soft recycle
-        (info_a.path / 'target').mkdir(exist_ok=True)
-        retained_artifact = info_a.path / 'target' / 'prior.bin'
-        retained_artifact.write_bytes(b'\xca\xfe' * 32)
+        assert isinstance(info_a, WorktreeInfo), f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        lane_path = info_a.path
 
         # Overwrite the seed script in the MAIN REPO to exit 1 and commit it.
-        # After _reset_warm_lane resets the lane to this commit, the lane's
-        # seed script will exit non-zero.
         fail_script = wl_git_repo / 'scripts' / 'seed-warm-lane.sh'
         fail_script.write_text(
             '#!/usr/bin/env bash\necho "forced failure" >&2\nexit 1\n'
@@ -1128,22 +1120,95 @@ class TestAcquireWarmLaneResetInPlace:
         sha_fail = sha_fail.strip()
 
         assert git_ops.warm_lane_pool is not None
-        await git_ops.warm_lane_pool.release(info_a.path)
+        await git_ops.warm_lane_pool.release(lane_path)
 
-        # Second acquire for a DIFFERENT task at sha_fail: seed exits 1.
-        # step-2 (fatal): returns None.  step-4 (fail-soft): WorktreeInfo.
-        info_b = await git_ops.acquire_warm_lane('task-B', sha_fail)
+        # Second acquire for a DIFFERENT task: seed exits 1 → must return FAULT
+        result = await git_ops.acquire_warm_lane('task-B', sha_fail)
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Recycle seed failure (exit 1) must return FAULT, got {result!r}'
+        )
+        # Lane must be released back to FREE — no leaked ASSIGNED lanes
+        assert git_ops.warm_lane_pool.state(lane_path) == LaneState.FREE, (
+            f'Lane must be FREE after FAULT, got {git_ops.warm_lane_pool.state(lane_path)!r}'
+        )
 
-        # D10 fail-soft: must return a usable lane (NOT None / cold-fallback)
-        assert info_b is not None, (
-            'Recycle seed failure must be fail-soft: return WorktreeInfo, not None'
+    async def test_recycle_reseed_disk_pressure_returns_disk_pressure(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Recycle path: seed exits 75 → WarmLaneUnavailable.DISK_PRESSURE + lane released."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # First acquire (create-once): passing seed → lane registered
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo), f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        lane_path = info_a.path
+
+        # Overwrite the seed script to exit 75 (disk pressure) and commit it
+        dp_script = wl_git_repo / 'scripts' / 'seed-warm-lane.sh'
+        dp_script.write_text(
+            '#!/usr/bin/env bash\necho "disk pressure" >&2\nexit 75\n'
         )
-        # Worktree must NOT be removed (the retained target/ survives)
-        assert await git_ops._is_registered_worktree(info_b.path), (
-            'Worktree must not be removed on recycle seed failure'
+        dp_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=wl_git_repo)
+        await _run(['git', 'commit', '-m', 'dp: seed script exits 75'], cwd=wl_git_repo)
+        _, sha_dp, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        sha_dp = sha_dp.strip()
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        # Second acquire: seed exits 75 → must return DISK_PRESSURE
+        result = await git_ops.acquire_warm_lane('task-B', sha_dp)
+        assert result is WarmLaneUnavailable.DISK_PRESSURE, (
+            f'Recycle seed failure (exit 75) must return DISK_PRESSURE, got {result!r}'
         )
-        # Same recycled lane path
-        assert info_b.path == info_a.path
+        # Lane must be released back to FREE
+        assert git_ops.warm_lane_pool.state(lane_path) == LaneState.FREE, (
+            f'Lane must be FREE after DISK_PRESSURE, got {git_ops.warm_lane_pool.state(lane_path)!r}'
+        )
+
+    async def test_recycle_reseed_is_thin_no_retained_bloat(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Recycle path (signal a): stray target/ artifact is removed before re-seed.
+
+        A stray file placed under lane/target/ BEFORE the recycle acquire must be
+        GONE after a successful recycle (the rm-before-seed defensive cleanup ran).
+        The lane itself must be the same _lane-0 (same recycled lane, not cold-created).
+        """
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # First acquire (create-once): lane registered, target/ seeded
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo), f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        lane_path = info_a.path
+
+        # Plant a stray bloat artifact under target/ to simulate retained bloat
+        (lane_path / 'target').mkdir(exist_ok=True)
+        stray = lane_path / 'target' / 'bloat.bin'
+        stray.write_bytes(b'\xde\xad\xbe\xef' * 64)
+        assert stray.exists(), 'test setup: stray artifact must exist before recycle'
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        # Second acquire (recycle, same seed script → exits 0): must succeed
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+        assert isinstance(info_b, WorktreeInfo), (
+            f'Recycle acquire must succeed (WorktreeInfo), got {info_b!r}'
+        )
+        # Signal a: stray artifact must be gone (target/ was rm-before-seed)
+        assert not stray.exists(), (
+            'Stray target/ artifact must be removed by rm-before-seed on recycle'
+        )
+        # Same recycled lane (not a cold-created worktree_base/branch_name dir)
+        assert info_b.path == lane_path, (
+            f'Recycled lane path must be the same _lane-0, got {info_b.path}'
+        )
 
 
 # ===========================================================================
