@@ -1257,6 +1257,115 @@ class GitOps:
             logger.warning('refresh_warm_base: unexpected error', exc_info=True)
             return False
 
+    # ε: warm-lane disk-guard admission helpers --------------------------------
+
+    async def _run_warm_lane_disk_guard(self) -> int:
+        """Invoke ``<project_root>/scripts/warm-lane-disk-guard.sh check``.
+
+        Mirrors the ``_seed_warm_lane``/``refresh_warm_base`` fail-soft helper
+        pattern: absent script → 127 sentinel; any unexpected exception → 127;
+        never raises.
+
+        Returns:
+            0   — healthy (disk pressure below threshold).
+            75  — disk pressure (EX_TEMPFAIL, admission should block).
+            127 — script absent or exception (fail-open sentinel).
+            other non-zero — script error (treated as fail-open by caller).
+        """
+        try:
+            script = self.project_root / 'scripts' / 'warm-lane-disk-guard.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_warm_lane_disk_guard: script absent at %s — no-op', script,
+                )
+                return 127
+            cmd = [
+                str(script), 'check',
+                '--mount', str(self.worktree_base),
+            ]
+            rc, _, err = await _run(cmd, cwd=self.project_root)
+            if rc not in (0, 75):
+                logger.warning(
+                    '_run_warm_lane_disk_guard: script exited %d (stderr=%r)', rc, err,
+                )
+            return rc
+        except Exception:
+            logger.warning(
+                '_run_warm_lane_disk_guard: unexpected error', exc_info=True,
+            )
+            return 127
+
+    async def _run_warm_lane_gc_reclaim(self) -> int:
+        """Invoke ``<project_root>/scripts/warm-lane-gc.sh reclaim``.
+
+        Fail-soft: absent script → 127 sentinel; any unexpected exception → 127;
+        never raises.  A non-zero exit is logged at WARNING and treated as
+        'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
+
+        Returns:
+            0   — reclaim succeeded.
+            127 — script absent or exception (fail-soft sentinel).
+            other non-zero — reclaim script error (caller still re-checks).
+        """
+        try:
+            script = self.project_root / 'scripts' / 'warm-lane-gc.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_warm_lane_gc_reclaim: script absent at %s — no-op', script,
+                )
+                return 127
+            cmd = [
+                str(script), 'reclaim',
+                '--mount', str(self.worktree_base),
+            ]
+            rc, _, err = await _run(cmd, cwd=self.project_root)
+            if rc != 0:
+                logger.warning(
+                    '_run_warm_lane_gc_reclaim: script exited %d (stderr=%r)', rc, err,
+                )
+            return rc
+        except Exception:
+            logger.warning(
+                '_run_warm_lane_gc_reclaim: unexpected error', exc_info=True,
+            )
+            return 127
+
+    async def _warm_lane_disk_admission_blocked(self) -> bool:
+        """Run the ε disk-pressure admission check: check → reclaim → recheck.
+
+        Mirrors ``merge_queue._ensure_verify_disk_space`` (check → prune → recheck →
+        block) for the warm-lane acquire side.
+
+        Logic:
+            1. Run γ ``warm-lane-disk-guard.sh check``.
+            2. Exit 0 or 127 or any non-(0,75) → admit (return False, fail-open).
+            3. Exit 75 (disk pressure) → log WARNING, run δ ``warm-lane-gc.sh reclaim``
+               (fail-soft; reclaim failure is logged but never blocks admission),
+               re-run γ check.
+            4. Re-check exit 75 → still pressured → block (return True).
+               Re-check exit 0/other → recovered → admit (return False).
+
+        Never raises.
+        """
+        rc = await self._run_warm_lane_disk_guard()
+        if rc != 75:
+            # 0 = healthy; 127 = absent (fail-open); other = script error (fail-open)
+            return False
+        # Disk pressure detected — attempt GC reclaim
+        logger.warning(
+            '_warm_lane_disk_admission_blocked: disk pressure detected (rc=75); '
+            'invoking warm-lane-gc.sh reclaim before re-check',
+        )
+        await self._run_warm_lane_gc_reclaim()
+        rc2 = await self._run_warm_lane_disk_guard()
+        if rc2 == 75:
+            logger.warning(
+                '_warm_lane_disk_admission_blocked: disk pressure persists after '
+                'reclaim (rc=75); blocking warm-lane admission',
+            )
+            return True
+        return False
+
     async def acquire_spec_lane(
         self,
         merge_commit: str,
