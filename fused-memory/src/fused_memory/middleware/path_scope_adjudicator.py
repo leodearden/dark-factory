@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import PathScopeAdjudicatorConfig
+    from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
 
 logger = logging.getLogger(__name__)
 
@@ -169,10 +170,12 @@ class PathScopeAdjudicator:
         config: PathScopeAdjudicatorConfig,
         usage_gate: UsageGate | None = None,
         cwd: Path | None = None,
+        scope_violation_escalator: ScopeViolationEscalator | None = None,
     ) -> None:
         self._config = config
         self._usage_gate = usage_gate
         self._cwd = cwd
+        self._escalator = scope_violation_escalator
 
         # Consecutive-ZOT circuit breaker (mirrors TaskCurator lines 505-543).
         self._consecutive_zero_output_timeouts: int = 0
@@ -333,6 +336,55 @@ class PathScopeAdjudicator:
 
         # --- Handle LLM failure ---
         if not agent_result.success:
+            # --- Budget-misconfig early branch (BEFORE the ZOT check) ---
+            # cost_usd>0 is the discriminator: it means real money was spent on a
+            # call that still hit the per-call budget ceiling — a DETERMINISTIC
+            # config defect, not a transient hang.  Gate on both subtype and
+            # cost_usd>0 so:
+            #   (a) genuine ZOTs (timed_out=True, cost=0) still fall through to
+            #       _record_zero_output_timeout (the ZOT breaker path);
+            #   (b) zero-cost error_max_budget_usd from a schema-tool-denied
+            #       pre-turn failure are NOT misclassified as a budget defect.
+            if agent_result.subtype == 'error_max_budget_usd' and agent_result.cost_usd > 0:
+                misconfig_reason = (
+                    f'budget-misconfig: error_max_budget_usd '
+                    f'cost_usd={agent_result.cost_usd} turns={agent_result.turns} '
+                    f'(config defect — per-call max_budget_usd={self._config.max_budget_usd} '
+                    f'is too low; raise config.path_scope_adjudicator.max_budget_usd)'
+                )
+                logger.warning(
+                    'path_scope_adjudicator: BUDGET MISCONFIGURATION for project %r — '
+                    'error_max_budget_usd with cost_usd=%s turns=%d '
+                    '(per-call max_budget_usd=%s is too low; '
+                    'this is a deterministic config defect, NOT a transient hang); '
+                    'failing safe',
+                    project_id, agent_result.cost_usd, agent_result.turns,
+                    self._config.max_budget_usd,
+                )
+                if self._escalator is not None:
+                    try:
+                        self._escalator.report_budget_misconfig(
+                            project_root=project_root,
+                            project_id=project_id,
+                            cost_usd=agent_result.cost_usd,
+                            turns=agent_result.turns,
+                            max_budget_usd=self._config.max_budget_usd,
+                            model=self._config.model,
+                        )
+                    except Exception:
+                        logger.exception(
+                            'path_scope_adjudicator: escalator.report_budget_misconfig '
+                            'raised for project %r; ignoring (escalation is additive)',
+                            project_id,
+                        )
+                # Early-return — the ZOT breaker counter is NEVER touched for this path.
+                return AdjudicationVerdict(
+                    verdict='uncertain',
+                    reason=misconfig_reason,
+                    failed=True,
+                    llm_used=True,
+                )
+
             if is_zero_output_timeout(agent_result):
                 # Capture a fresh timestamp so the cooldown window is measured
                 # from when the failure was observed, not from before the

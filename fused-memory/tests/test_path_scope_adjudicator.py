@@ -19,12 +19,22 @@ from fused_memory.config.schema import PathScopeAdjudicatorConfig
 # ---------------------------------------------------------------------------
 
 
-def _make_adjudicator(config: PathScopeAdjudicatorConfig | None = None, *, tmp_path=None):
+def _make_adjudicator(
+    config: PathScopeAdjudicatorConfig | None = None,
+    *,
+    tmp_path=None,
+    escalator=None,
+):
     """Construct a PathScopeAdjudicator with minimal wiring."""
     from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
 
     cfg = config or PathScopeAdjudicatorConfig()
-    return PathScopeAdjudicator(config=cfg, usage_gate=None, cwd=tmp_path)
+    return PathScopeAdjudicator(
+        config=cfg,
+        usage_gate=None,
+        cwd=tmp_path,
+        scope_violation_escalator=escalator,
+    )
 
 
 def _agent_result(
@@ -33,6 +43,8 @@ def _agent_result(
     output: str = '',
     timed_out: bool = False,
     subtype: str | None = None,
+    cost_usd: float = 0.0,
+    turns: int = 0,
 ):
     """Build a minimal AgentResult for patching."""
     from shared.cli_invoke import AgentResult
@@ -43,6 +55,8 @@ def _agent_result(
         structured_output=structured_output,
         timed_out=timed_out,
         subtype=subtype or '',
+        cost_usd=cost_usd,
+        turns=turns,
     )
 
 
@@ -323,3 +337,136 @@ class TestZeroOutputBreakerCircuit:
             'Breaker must remain CLOSED after one ZOT when success reset the counter'
         )
         assert adj._consecutive_zero_output_timeouts == 1
+
+
+# ===========================================================================
+# Step-3: budget-misconfig signal (cost>0 error_max_budget_usd → loud escalation)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestBudgetMisconfigSignal:
+    """Adjudicator emits a loud config-defect signal for cost>0 error_max_budget_usd.
+
+    Key invariants:
+    - fail-safe preserved: should_allow_creation=False, failed=True
+    - escalator.report_budget_misconfig called exactly once with cost_usd/turns/model
+    - ZOT breaker counter NOT incremented (not a hang)
+    - DISTINCT warning logged (names budget-misconfiguration, not the generic 'LLM call failed')
+    """
+
+    async def test_budget_misconfig_calls_escalator_once(self, tmp_path):
+        """error_max_budget_usd + cost_usd>0 → escalator.report_budget_misconfig called once."""
+        from unittest.mock import Mock
+
+        mock_escalator = Mock()
+        mock_escalator.report_budget_misconfig = Mock(return_value='esc-fake-1')
+        adj = _make_adjudicator(tmp_path=tmp_path, escalator=mock_escalator)
+        result = _agent_result(
+            success=False, subtype='error_max_budget_usd', cost_usd=0.11, turns=2,
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            verdict = await _do_adjudicate(adj)
+
+        mock_escalator.report_budget_misconfig.assert_called_once()
+        call_kwargs = mock_escalator.report_budget_misconfig.call_args.kwargs
+        assert call_kwargs['cost_usd'] == 0.11
+        assert call_kwargs['turns'] == 2
+        # Carries model and max_budget_usd from config.
+        from fused_memory.config.schema import PathScopeAdjudicatorConfig
+        assert call_kwargs['model'] == PathScopeAdjudicatorConfig().model
+        assert call_kwargs['max_budget_usd'] == PathScopeAdjudicatorConfig().max_budget_usd
+        # Fail-safe preserved.
+        assert verdict.should_allow_creation is False
+        assert verdict.failed is True
+
+    async def test_budget_misconfig_reason_names_config_defect(self, tmp_path):
+        """Verdict reason explicitly names the budget-misconfiguration."""
+        from unittest.mock import Mock
+
+        adj = _make_adjudicator(tmp_path=tmp_path, escalator=Mock())
+        result = _agent_result(
+            success=False, subtype='error_max_budget_usd', cost_usd=0.11, turns=2,
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            verdict = await _do_adjudicate(adj)
+
+        assert 'budget' in verdict.reason.lower() or 'misconfig' in verdict.reason.lower()
+
+    async def test_budget_misconfig_does_not_increment_zot_counter(self, tmp_path):
+        """Budget-misconfig path must NOT increment the ZOT breaker counter."""
+        from unittest.mock import Mock
+
+        adj = _make_adjudicator(tmp_path=tmp_path, escalator=Mock())
+        result = _agent_result(
+            success=False, subtype='error_max_budget_usd', cost_usd=0.11, turns=2,
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            await _do_adjudicate(adj)
+
+        assert adj._consecutive_zero_output_timeouts == 0, (
+            'ZOT breaker must not be incremented for a deterministic budget-config defect'
+        )
+
+    async def test_budget_misconfig_warning_logged(self, tmp_path, caplog):
+        """A DISTINCT WARNING is logged naming the budget-misconfiguration."""
+        import logging
+        from unittest.mock import Mock
+
+        adj = _make_adjudicator(tmp_path=tmp_path, escalator=Mock())
+        result = _agent_result(
+            success=False, subtype='error_max_budget_usd', cost_usd=0.11, turns=2,
+        )
+        with caplog.at_level(logging.WARNING), patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            await _do_adjudicate(adj)
+
+        warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            'budget' in m.lower() or 'misconfig' in m.lower() for m in warning_msgs
+        ), f'expected a budget-misconfig WARNING; got: {warning_msgs}'
+
+    async def test_genuine_zot_does_not_call_escalator(self, tmp_path):
+        """Negative: genuine ZOT (timed_out=True, cost=0) does NOT call report_budget_misconfig."""
+        from unittest.mock import Mock
+
+        mock_escalator = Mock()
+        mock_escalator.report_budget_misconfig = Mock()
+        adj = _make_adjudicator(tmp_path=tmp_path, escalator=mock_escalator)
+        # Real ZOT: timed_out=True, cost=0 → is_zero_output_timeout returns True.
+        result = _agent_result(
+            success=False, subtype='error', cost_usd=0.0, turns=0, timed_out=True,
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            await _do_adjudicate(adj)
+
+        mock_escalator.report_budget_misconfig.assert_not_called()
+        # ZOT counter IS incremented for a genuine hang.
+        assert adj._consecutive_zero_output_timeouts == 1
+
+    async def test_zero_cost_budget_subtype_does_not_call_escalator(self, tmp_path):
+        """Edge: subtype='error_max_budget_usd' with cost_usd=0.0 → NOT a config defect."""
+        from unittest.mock import Mock
+
+        mock_escalator = Mock()
+        mock_escalator.report_budget_misconfig = Mock()
+        adj = _make_adjudicator(tmp_path=tmp_path, escalator=mock_escalator)
+        # cost_usd=0.0 → guard is not met; falls through to generic failure handling.
+        result = _agent_result(
+            success=False, subtype='error_max_budget_usd', cost_usd=0.0, turns=0,
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            await _do_adjudicate(adj)
+
+        mock_escalator.report_budget_misconfig.assert_not_called()
+
+    async def test_no_escalator_budget_misconfig_still_returns_fail_safe(self, tmp_path):
+        """No escalator wired (escalator=None) → fail-safe still returned, no exception."""
+        adj = _make_adjudicator(tmp_path=tmp_path, escalator=None)
+        result = _agent_result(
+            success=False, subtype='error_max_budget_usd', cost_usd=0.11, turns=2,
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            verdict = await _do_adjudicate(adj)  # must not raise
+
+        assert verdict.should_allow_creation is False
+        assert verdict.failed is True

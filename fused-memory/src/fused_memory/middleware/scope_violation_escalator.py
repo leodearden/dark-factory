@@ -23,14 +23,18 @@ Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalato
   matches the existing esc-2240-series scope_violation pattern referenced
   in task 1088.
 
-No burst control in v1: observed misroute volume is in the single digits
-per day, well below the noise floor a per-project rate limiter would be
-designed around.  Add when (if) volume warrants.
+Burst control: :meth:`report_budget_misconfig` applies a per-project dedup
+window (``_BUDGET_MISCONFIG_DEDUP_WINDOW_SECS``) so a sustained per-call
+budget exhaustion files ONE escalation per window rather than flooding the
+operator queue.  :meth:`report_rejection` remains unthrottled — observed
+misroute volume is in the single digits per day, well below the noise floor
+a per-project rate limiter would target.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -59,12 +63,47 @@ _ANCHOR_TASK_ID: str = 'task-path-guard'
 _AGENT_ROLE: str = 'fused-memory/path-guard'
 _CATEGORY: str = 'scope_violation'
 
+# Budget-misconfig escalation constants — deliberately distinct from the
+# scope_violation family so operators can immediately tell these apart.
+_BUDGET_MISCONFIG_ANCHOR_TASK_ID: str = 'adjudicator-budget-defect'
+_BUDGET_MISCONFIG_AGENT_ROLE: str = 'fused-memory/path-scope-adjudicator'
+_BUDGET_MISCONFIG_CATEGORY: str = 'adjudicator_config_defect'
+
+# Burst-suppression dedup window (mirrors curator_escalator._ZOT_DEDUP_WINDOW_SECS).
+# A sustained per-call budget exhaustion files ONE escalation per window, not one
+# per hit, so the operator queue doesn't flood.  Intentionally short — the condition
+# resolves only via a config change, so we want one reminder per window, not silence.
+_BUDGET_MISCONFIG_DEDUP_WINDOW_SECS: float = 300.0
+
 
 class ScopeViolationEscalator:
-    """File a ``scope_violation`` escalation for each rejected misroute."""
+    """Escalation helper for path-scope guard events.
 
-    def __init__(self) -> None:
+    Handles two distinct categories:
+
+    * **scope_violation** (:meth:`report_rejection`) — filed for every rejected
+      task-creation misroute detected by the path-scope guard.  Unthrottled.
+    * **adjudicator_config_defect** (:meth:`report_budget_misconfig`) — filed
+      when the path-scope adjudicator's LLM call returns ``error_max_budget_usd``
+      with ``cost_usd > 0``, indicating the per-call budget is too low for the
+      call shape (deterministic config defect, not a transient hang).
+      Burst-suppressed to one escalation per project per dedup window.
+
+    The class intentionally hosts both categories: it already owns the defensive
+    ``HAS_ESCALATION`` import, the per-project ``EscalationQueue`` cache, and the
+    never-raise submit contract that both callers need.
+    """
+
+    def __init__(
+        self,
+        budget_misconfig_dedup_window_secs: float = _BUDGET_MISCONFIG_DEDUP_WINDOW_SECS,
+    ) -> None:
         self._queues: dict[str, EscalationQueue] = {}
+        self._budget_misconfig_dedup_window_secs = budget_misconfig_dedup_window_secs
+        # project_id → monotonic timestamp of the last submitted budget-misconfig
+        # escalation.  Prevents a sustained per-call exhaustion from flooding the
+        # operator queue with one entry per adjudicator hit.
+        self._budget_misconfig_last_submitted: dict[str, float] = {}
 
     def _queue_for(self, project_root: str) -> EscalationQueue | None:
         """Return (cached) :class:`EscalationQueue` for *project_root*.
@@ -180,5 +219,107 @@ class ScopeViolationEscalator:
             'scope_violation_escalator: queued %s for project %s '
             '(candidate=%r, suggested=%s)',
             esc_id, project_id, candidate_title[:80], target,
+        )
+        return esc_id
+
+    def report_budget_misconfig(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        cost_usd: float,
+        turns: int,
+        max_budget_usd: float,
+        model: str,
+    ) -> str | None:
+        """File an ``adjudicator_config_defect`` escalation for a budget-misconfig hit.
+
+        Called when the path-scope adjudicator's LLM call returns
+        ``error_max_budget_usd`` with ``cost_usd > 0`` — a DETERMINISTIC config
+        defect: the per-call budget (``config.path_scope_adjudicator.max_budget_usd``)
+        is too low for the call shape.  This is NOT a transient hang.
+
+        Returns the escalation id when one was filed, ``None`` otherwise
+        (escalation package missing, within dedup window, queue write failed, etc.).
+        Never raises — escalation is purely additive; the adjudicator still returns
+        its fail-safe verdict regardless of whether the escalation succeeds.
+
+        Burst-suppressed: a second call for the same *project_id* within
+        ``budget_misconfig_dedup_window_secs`` logs and returns ``None`` so that a
+        sustained per-call exhaustion files ONE escalation per window, not one per hit.
+        """
+        # Burst-suppression dedup (mirrors curator_escalator._zot_last_submitted).
+        now_mono = time.monotonic()
+        last = self._budget_misconfig_last_submitted.get(project_id)
+        if last is not None and (now_mono - last) < self._budget_misconfig_dedup_window_secs:
+            logger.info(
+                'scope_violation_escalator: deduplicating budget-misconfig escalation '
+                'for project %s (last submitted %.1fs ago < dedup window %.0fs)',
+                project_id,
+                now_mono - last,
+                self._budget_misconfig_dedup_window_secs,
+            )
+            return None
+
+        queue = self._queue_for(project_root)
+        if queue is None:
+            logger.debug(
+                'scope_violation_escalator: escalation package unavailable; '
+                'budget-misconfig for project %r will not be escalated',
+                project_id,
+            )
+            return None
+
+        detail_lines = [
+            f'project_id={project_id!r}',
+            f'project_root={project_root!r}',
+            f'cost_usd={cost_usd}',
+            f'turns={turns}',
+            f'max_budget_usd={max_budget_usd}',
+            f'model={model!r}',
+            '',
+            'The path-scope adjudicator LLM call returned error_max_budget_usd with '
+            'cost_usd > 0, indicating the per-call budget is too low for the call '
+            'shape.  This is a DETERMINISTIC CONFIG DEFECT — not a transient hang.',
+            '',
+            'FIX: raise config.path_scope_adjudicator.max_budget_usd above '
+            f'{max_budget_usd} (current value) so the adjudicator call can complete.',
+        ]
+        detail = '\n'.join(detail_lines)
+
+        try:
+            esc = Escalation(  # type: ignore[possibly-unbound]
+                id=queue.make_id(_BUDGET_MISCONFIG_ANCHOR_TASK_ID),
+                task_id=_BUDGET_MISCONFIG_ANCHOR_TASK_ID,
+                agent_role=_BUDGET_MISCONFIG_AGENT_ROLE,
+                severity='blocking',
+                category=_BUDGET_MISCONFIG_CATEGORY,
+                summary=(
+                    f'Adjudicator budget misconfiguration: error_max_budget_usd '
+                    f'cost_usd={cost_usd} turns={turns} '
+                    f'(max_budget_usd={max_budget_usd} is too low)'
+                ),
+                detail=detail,
+                suggested_action=(
+                    f'raise path_scope_adjudicator.max_budget_usd above {max_budget_usd}'
+                ),
+                level=1,
+            )
+            esc_id = queue.submit(esc)
+        except Exception:
+            logger.exception(
+                'scope_violation_escalator: failed to submit budget-misconfig escalation '
+                'for project %s (cost_usd=%s, max_budget_usd=%s)',
+                project_id, cost_usd, max_budget_usd,
+            )
+            return None
+
+        # Record the submission timestamp AFTER a successful submit only.
+        self._budget_misconfig_last_submitted[project_id] = now_mono
+
+        logger.warning(
+            'scope_violation_escalator: queued budget-misconfig escalation %s '
+            'for project %s (cost_usd=%s, turns=%d, max_budget_usd=%s, model=%r)',
+            esc_id, project_id, cost_usd, turns, max_budget_usd, model,
         )
         return esc_id
