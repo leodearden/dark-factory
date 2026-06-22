@@ -390,3 +390,135 @@ class TestAcquireWarmLaneDiskGuard:
         assert _read_call_log(git_repo) == [], (
             'Guard scripts must NOT run when warm_lane_disk_guard=False'
         )
+
+
+# ===========================================================================
+# Step 5 (RED): e2e create_worktree → WarmLaneDiskPressure + CLI contract
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestWarmLaneDiskGuardE2E:
+    """E2E and CLI-contract tests for the ε warm-lane disk-guard admission path.
+
+    The e2e tests (create_worktree raises WarmLaneDiskPressure, seed never
+    invoked) turn GREEN in step 4 because the guard is wired.
+
+    The CLI-contract threshold-flag assertions (check receives --min-free-gib
+    and --min-free-inodes) are RED today because step-2 _run_warm_lane_disk_guard
+    only passes --mount.  They turn GREEN in step 6.
+    """
+
+    async def test_create_worktree_raises_warm_lane_disk_pressure(
+        self, git_repo: Path,
+    ):
+        """Still-pressured guard: create_worktree('A') raises WarmLaneDiskPressure."""
+        await _add_all_warm_lane_scripts(git_repo)
+        _write_check_exits(git_repo, [75, 75])
+        config = _make_disk_guard_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneDiskPressure):
+            await git_ops.create_worktree('A')
+
+    async def test_disk_pressure_seed_never_invoked(
+        self, git_repo: Path,
+    ):
+        """WarmLaneDiskPressure path: seed script never ran (no seeded.bin, lane FREE)."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        await _add_all_warm_lane_scripts(git_repo)
+        _write_check_exits(git_repo, [75, 75])
+        config = _make_disk_guard_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneDiskPressure):
+            await git_ops.create_worktree('A')
+
+        lane = git_ops.worktree_base / '_lane-0'
+        # Seed never ran — no seeded.bin artifact
+        assert not (lane / 'target' / 'seeded.bin').exists(), (
+            'seeded.bin must not exist — seed must not run before disk-pressure blocks'
+        )
+        # Pool lane must stay FREE (never acquired)
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+            'Lane must remain FREE — acquire_for must not run before disk-pressure blocks'
+        )
+
+    async def test_cli_contract_check_receives_mount_and_thresholds(
+        self, git_repo: Path,
+    ):
+        """CLI contract: check received --mount, --min-free-gib, --min-free-inodes.
+
+        RED today — step-2 _run_warm_lane_disk_guard passes only --mount.
+        Turns GREEN in step 6 when threshold flags are appended.
+        """
+        await _add_all_warm_lane_scripts(git_repo)
+        _write_check_exits(git_repo, [75, 75])
+        # _make_disk_guard_config defaults: min_free_gib=50, min_free_inodes=500_000
+        config = _make_disk_guard_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneDiskPressure):
+            await git_ops.create_worktree('A')
+
+        # First and third call-log entries are 'check' invocations
+        check_lines = [
+            line for line in _read_call_log(git_repo)
+            if line.split()[0] == 'check'
+        ]
+        assert len(check_lines) >= 1, 'Expected at least one check invocation'
+        first_check = check_lines[0]
+
+        # Verify --mount flag is present with the worktree_base path
+        assert '--mount' in first_check, (
+            f'check must receive --mount; got: {first_check!r}'
+        )
+        mount_idx = first_check.split().index('--mount')
+        assert first_check.split()[mount_idx + 1] == str(git_ops.worktree_base), (
+            f'--mount value must be worktree_base={git_ops.worktree_base}; '
+            f'got {first_check.split()[mount_idx + 1]!r}'
+        )
+
+        # Verify threshold flags — RED today (step-6 adds them)
+        assert '--min-free-gib' in first_check, (
+            f'check must receive --min-free-gib; got: {first_check!r}'
+        )
+        assert '--min-free-inodes' in first_check, (
+            f'check must receive --min-free-inodes; got: {first_check!r}'
+        )
+        parts = first_check.split()
+        gib_val = parts[parts.index('--min-free-gib') + 1]
+        inodes_val = parts[parts.index('--min-free-inodes') + 1]
+        assert gib_val == '50', f'--min-free-gib must be 50; got {gib_val!r}'
+        assert inodes_val == '500000', f'--min-free-inodes must be 500000; got {inodes_val!r}'
+
+    async def test_cli_contract_gc_receives_mount(
+        self, git_repo: Path,
+    ):
+        """CLI contract: gc reclaim stub received 'reclaim --mount <worktree_base>'."""
+        await _add_all_warm_lane_scripts(git_repo)
+        _write_check_exits(git_repo, [75, 75])
+        config = _make_disk_guard_config()
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneDiskPressure):
+            await git_ops.create_worktree('A')
+
+        reclaim_lines = [
+            line for line in _read_call_log(git_repo)
+            if line.split()[0] == 'reclaim'
+        ]
+        assert len(reclaim_lines) == 1, (
+            f'Expected exactly one reclaim invocation; got {reclaim_lines}'
+        )
+        reclaim_line = reclaim_lines[0]
+        assert '--mount' in reclaim_line, (
+            f'reclaim must receive --mount; got: {reclaim_line!r}'
+        )
+        parts = reclaim_line.split()
+        mount_idx = parts.index('--mount')
+        assert parts[mount_idx + 1] == str(git_ops.worktree_base), (
+            f'reclaim --mount must be worktree_base; got {parts[mount_idx + 1]!r}'
+        )
