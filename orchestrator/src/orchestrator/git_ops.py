@@ -314,6 +314,14 @@ class WarmLaneUnavailable(Enum):
     * ``EXHAUSTED`` — all pool lanes are ASSIGNED; signal backpressure / requeue.
     * ``FAULT`` — seed/worktree-add failure or absent seed script; signal blocked + L1.
     * ``DISK_PRESSURE`` — seed exited 75 (EX_TEMPFAIL); transient infra; requeue.
+    * ``DISABLED`` — pool knob is off (``warm_lane_pool is None``); programming-error
+      sentinel returned when :meth:`acquire_warm_lane` is called without first
+      checking ``self.warm_lane_pool is not None``.  A disabled pool is NOT
+      equivalent to backpressure — callers that receive ``DISABLED`` should NOT
+      requeue; they should fall back to the cold path or raise.  The canonical
+      caller (:meth:`create_worktree`) is already guarded and will never observe
+      this value; it is provided solely to surface caller bugs clearly rather
+      than silently requeuing forever.
 
     A lane is always released back to FREE before this value is returned, so no
     ASSIGNED lanes are ever leaked on failure.
@@ -321,6 +329,7 @@ class WarmLaneUnavailable(Enum):
     EXHAUSTED = 'exhausted'
     FAULT = 'fault'
     DISK_PRESSURE = 'disk_pressure'
+    DISABLED = 'disabled'
 
 
 @dataclass
@@ -858,10 +867,13 @@ class GitOps:
                 raise WarmLaneDiskPressure(
                     f'warm-lane seed disk pressure for branch {branch_name!r}; requeue'
                 )
-            # FAULT → RuntimeError reuses existing blocked+L1 plumbing
+            # FAULT or DISABLED → RuntimeError reuses existing blocked+L1 plumbing.
+            # DISABLED is a programming error (caller bypassed the pool-enabled
+            # guard); it is treated as a fault here so blocked+L1 surfaces the
+            # bug rather than silently requeueing forever.
             raise RuntimeError(
                 f'warm-lane acquire fault for branch {branch_name!r} '
-                f'(seed/worktree-add failure or absent seed script)'
+                f'(seed/worktree-add failure, absent seed script, or pool disabled)'
             )
 
         # If worktree already exists, reuse it (common after requeue) —
@@ -1452,12 +1464,26 @@ class GitOps:
                 seed script (infra fault; caller should escalate blocked+L1).
             WarmLaneUnavailable.DISK_PRESSURE — seed exited 75 (EX_TEMPFAIL);
                 transient disk pressure (caller should requeue with annotation).
+            WarmLaneUnavailable.DISABLED — pool knob is off; this is a
+                programming error (callers MUST guard with
+                ``if self.warm_lane_pool is not None`` before calling).
+                Returned rather than raising so the function contract
+                "never raises internally" holds; callers that receive
+                DISABLED must NOT requeue — they should fall back to the
+                cold path or raise immediately.
 
             Never raises internally; the lane is always released before
             returning any WarmLaneUnavailable value.
         """
         if self.warm_lane_pool is None:
-            return WarmLaneUnavailable.EXHAUSTED  # pool knob off — treat as exhausted
+            # Programming error: callers must guard with
+            # `if self.warm_lane_pool is not None` before invoking.
+            # A disabled pool is NOT 'backpressure' — returning EXHAUSTED
+            # here would silently requeue a task forever if a future caller
+            # skips the guard.  DISABLED is a distinct sentinel so callers
+            # that don't handle it hit an explicit error path rather than
+            # infinite requeue.
+            return WarmLaneUnavailable.DISABLED
 
         acq = await self.warm_lane_pool.acquire_for(branch_name)
         if acq is None:
@@ -1496,11 +1522,20 @@ class GitOps:
                 shutil.rmtree(lane / 'target', ignore_errors=True)
                 rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                 if rc != 0:
-                    logger.warning(
-                        'acquire_warm_lane: recycle re-seed failed (rc=%d) for %s; '
-                        'releasing lane',
-                        rc, lane,
-                    )
+                    if rc == 127:
+                        logger.warning(
+                            'acquire_warm_lane: recycle re-seed — seed script absent '
+                            'for lane %s (rc=127) — check seed-warm-lane.sh '
+                            'deployment; EVERY task on this host will fault while '
+                            'pool is enabled and the script is missing',
+                            lane,
+                        )
+                    else:
+                        logger.warning(
+                            'acquire_warm_lane: recycle re-seed failed (rc=%d) for '
+                            '%s; releasing lane',
+                            rc, lane,
+                        )
                     await self.warm_lane_pool.release(lane)
                     return (
                         WarmLaneUnavailable.DISK_PRESSURE if rc == 75
@@ -1533,11 +1568,27 @@ class GitOps:
 
                 seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                 if seed_rc != 0:
-                    # Seed failed — remove the just-created worktree and release
-                    logger.warning(
-                        'acquire_warm_lane: seed failed (rc=%d) for %s; removing worktree',
-                        seed_rc, lane,
-                    )
+                    # Seed failed — remove the just-created worktree and release.
+                    # rc=127 specifically means seed-warm-lane.sh is absent from
+                    # the lane's scripts/ dir — a deploy/config error that will
+                    # affect EVERY task on this host while the pool is enabled,
+                    # producing one BLOCKED+L1 escalation per dispatched task.
+                    # Operators should check that seed-warm-lane.sh is present
+                    # and executable in the lane's checked-out scripts/ directory.
+                    if seed_rc == 127:
+                        logger.warning(
+                            'acquire_warm_lane: seed script absent for lane %s '
+                            '(rc=127) — check seed-warm-lane.sh deployment; '
+                            'EVERY task on this host will fault while pool is '
+                            'enabled and the script is missing',
+                            lane,
+                        )
+                    else:
+                        logger.warning(
+                            'acquire_warm_lane: seed failed (rc=%d) for %s; '
+                            'removing worktree',
+                            seed_rc, lane,
+                        )
                     await _run(
                         ['git', 'worktree', 'remove', str(lane), '--force'],
                         cwd=self.project_root,
@@ -1595,11 +1646,20 @@ class GitOps:
                 shutil.rmtree(lane / 'target', ignore_errors=True)
                 rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                 if rc != 0:
-                    logger.warning(
-                        'acquire_warm_lane: recycle re-seed failed (rc=%d) for %s; '
-                        'releasing lane',
-                        rc, lane,
-                    )
+                    if rc == 127:
+                        logger.warning(
+                            'acquire_warm_lane: reset-in-place re-seed — seed script '
+                            'absent for lane %s (rc=127) — check seed-warm-lane.sh '
+                            'deployment; EVERY task on this host will fault while '
+                            'pool is enabled and the script is missing',
+                            lane,
+                        )
+                    else:
+                        logger.warning(
+                            'acquire_warm_lane: recycle re-seed failed (rc=%d) for '
+                            '%s; releasing lane',
+                            rc, lane,
+                        )
                     await self.warm_lane_pool.release(lane)
                     return (
                         WarmLaneUnavailable.DISK_PRESSURE if rc == 75

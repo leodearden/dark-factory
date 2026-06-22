@@ -1861,6 +1861,18 @@ class TaskWorkflow:
             # WarmLaneDiskPressure  → transient infra (seed exited 75 EX_TEMPFAIL).
             # FAULT (RuntimeError) is deliberately NOT caught here — it falls through
             # to the broad except below → _mark_blocked → BLOCKED + L1.
+            #
+            # NOTE (Suggestion 2 / follow-up): both WarmLanePoolExhausted and
+            # WarmLaneDiskPressure requeues return WorkflowOutcome.REQUEUED here,
+            # which the harness counts against the per-task requeue_cap equally.
+            # This is intentional for EXHAUSTED (genuine backpressure) but is
+            # undesirable for DISK_PRESSURE (transient infra): a persistent disk-
+            # full condition will tight-loop, burning the retry budget with no
+            # backoff.  The block_reason discriminant is already set so a future
+            # scheduler change can special-case 'warm_lane_disk_pressure (transient
+            # infra)' to exclude disk-pressure requeues from the cap (analogous to
+            # the HTTP-5xx transient exclusion in is_transient_api_requeue).
+            # Touching scheduler.py is out of scope for this task.
             if isinstance(e, WarmLanePoolExhausted):
                 block_reason = 'warm_lane_pool_exhausted'
                 block_phase = 'backpressure'
