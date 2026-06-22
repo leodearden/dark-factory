@@ -2435,13 +2435,16 @@ class TestFairness:
 
     @pytest.mark.asyncio
     async def test_cross_tier_preemption(self):
-        """A high-tier skip-bump preempts an overlapping low-tier park.
+        """A high-tier skip-bump SHADOWS (not destroys) an overlapping low-tier park.
 
-        Setup: low-priority L is already parked on m1+m2 with skip_count=3
-        (mimicking an accumulated count). A high-priority H wants m1 and is
-        also forced to skip.  When H's _bump_skip_and_maybe_park fires, it
-        evicts L's park on m1 only (m2 survives), preserves L's _skip_count,
-        and emits both reservation_installed and reservation_evicted events.
+        Setup: low-priority L is already parked on m1+m2 with skip_count=3.
+        A high-priority H wants m1 and is also forced to skip.  When H's
+        _bump_skip_and_maybe_park fires, it SHADOWS L's park on m1 (pushes H
+        on top, L stays buried); L's park on m2 remains active.
+
+        Expected events: reservation_installed (H on m1) + reservation_shadowed
+        (L shadowed on m1).  ZERO reservation_evicted events — the old destructive
+        eviction is no longer emitted on preemption.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
@@ -2455,17 +2458,21 @@ class TestFairness:
         # parking on the first call.
         scheduler._bump_skip_and_maybe_park('H', ['m1'], tier='high')
 
-        # H now holds a park on m1; L's park on m1 is gone, but m2 survives.
+        # H is the active top on m1; L is SHADOWED on m1 (buried) but still
+        # has its park there (INV-5) AND is still active on m2.
         assert scheduler.lock_table.has_parks('H')
-        assert scheduler.lock_table.has_parks('L')
-        assert not scheduler.lock_table.try_acquire('X', ['m1'])  # H's park
-        assert not scheduler.lock_table.try_acquire('Y', ['m2'])  # L's park
+        assert scheduler.lock_table.has_parks('L'), 'L must be retained in the shadow stack'
+        # H's park on m1 blocks ALL other tasks (including shadowed L).
+        assert not scheduler.lock_table.try_acquire('X', ['m1'])   # stranger blocked
+        assert not scheduler.lock_table.try_acquire('L', ['m1'])   # shadowed L blocked (INV-2)
+        # L's park on m2 remains active — H cannot acquire m2.
+        assert not scheduler.lock_table.try_acquire('Y', ['m2'])   # L's active park
+        assert not scheduler.lock_table.try_acquire('H', ['m2'])   # H cannot acquire L's m2
 
         # L's skip_count was NOT cleared by preemption.
         assert scheduler._skip_count['L'] == 3
 
-        # Recording event store has exactly one reservation_installed (for H)
-        # and one reservation_evicted (for L).
+        # Exactly one reservation_installed (for H) and ZERO reservation_evicted.
         installed_events = [
             e for e in event_store.events
             if 'reservation_installed' in e[0]
@@ -2474,15 +2481,161 @@ class TestFairness:
             e for e in event_store.events
             if 'reservation_evicted' in e[0]
         ]
-        assert len(installed_events) == 1
+        shadowed_events = [
+            e for e in event_store.events
+            if 'reservation_shadowed' in e[0]
+        ]
+        assert len(installed_events) == 1, f'Expected 1 installed event; got {installed_events}'
         assert installed_events[0][1]['task_id'] == 'H'
-        assert len(evicted_events) == 1
-        evicted_payload = evicted_events[0][1]
-        assert evicted_payload['task_id'] == 'H'
-        assert evicted_payload['data']['modules'] == ['m1']
-        assert evicted_payload['data']['preempted_by'] == 'H'
-        assert evicted_payload['data']['preempted_by_priority'] == 'high'
-        assert evicted_payload['data']['victim'] == 'L'
+        assert len(evicted_events) == 0, (
+            f'reservation_evicted must NOT be emitted on shadow preemption; got {evicted_events}'
+        )
+        assert len(shadowed_events) == 1, f'Expected 1 shadowed event; got {shadowed_events}'
+        shadowed_payload = shadowed_events[0][1]
+        assert shadowed_payload['task_id'] == 'H'
+        assert shadowed_payload['data']['modules'] == ['m1']
+        assert shadowed_payload['data']['preempted_by'] == 'H'
+        assert shadowed_payload['data']['preempted_by_priority'] == 'high'
+        assert shadowed_payload['data']['victim'] == 'L'
+
+    # ---- reservation_restored emission at all three pop sites (step-7) ----
+
+    @pytest.mark.asyncio
+    async def test_restore_emitted_on_dispatch(self):
+        """DISPATCH pop-site: when the active-top owner dispatches, clear_parks_for
+        restores the buried owner and a reservation_restored event is emitted
+        alongside reservation_used.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        # L parks m1 at low; H shadows L on m1 at high (H is active top).
+        scheduler.lock_table.install_parks('L', ['m1'], priority='low')
+        scheduler.lock_table.install_parks('H', ['m1'], priority='high')
+        assert scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L')
+
+        h_task = {
+            'id': 'H', 'title': 'h', 'status': 'pending',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        l_task = {
+            'id': 'L', 'title': 'l', 'status': 'pending',
+            'priority': 'low', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[h_task, l_task])
+
+        await scheduler.acquire_next()
+
+        # H dispatched, its park cleared; L is now the restored active top.
+        assert not scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L'), 'L must be restored after H dispatches'
+
+        # reservation_used emitted for H (existing behavior).
+        used_events = [e for e in event_store.events if 'reservation_used' in e[0]]
+        assert len(used_events) == 1, f'Expected 1 reservation_used; got {used_events}'
+
+        # reservation_restored emitted for L alongside reservation_used.
+        restored_events = [e for e in event_store.events if 'reservation_restored' in e[0]]
+        assert len(restored_events) == 1, (
+            f'Expected 1 reservation_restored on dispatch; got {restored_events}'
+        )
+        r = restored_events[0][1]
+        assert r['data']['restored_owner'] == 'L', f'Wrong restored owner: {r}'
+        assert 'm1' in r['data']['modules'], f'Expected m1 in restored modules: {r}'
+
+    @pytest.mark.asyncio
+    async def test_restore_emitted_on_release(self):
+        """RELEASE pop-site: scheduler.release(shadowing_top) clears its parks,
+        restoring the buried owner and emitting reservation_restored.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        # H shadows L on m1.
+        scheduler.lock_table.install_parks('L', ['m1'], priority='low')
+        scheduler.lock_table.install_parks('H', ['m1'], priority='high')
+        assert scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L')
+
+        # H is currently dispatched (holds a lock elsewhere; we simulate by
+        # marking it dispatched so release() operates on a real scenario).
+        scheduler._dispatched.add('H')
+        scheduler._dispatched_priority['H'] = 'high'
+
+        scheduler.release('H')
+
+        # H's parks cleared; L is restored.
+        assert not scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L'), 'L must be restored after H releases'
+
+        # reservation_restored must be emitted.
+        restored_events = [e for e in event_store.events if 'reservation_restored' in e[0]]
+        assert len(restored_events) == 1, (
+            f'Expected 1 reservation_restored on release; got {restored_events}'
+        )
+        r = restored_events[0][1]
+        assert r['data']['restored_owner'] == 'L'
+        assert 'm1' in r['data']['modules']
+
+    @pytest.mark.asyncio
+    async def test_restore_emitted_on_gc(self):
+        """OWNER-GC pop-site: when a shadowing top is terminal/missing, prune_owners
+        removes it via _park_gc, restoring the buried owner; both reservation_expired
+        (for the GC'd owner) and reservation_restored (for the restored owner) are
+        emitted.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        # L parks m1 at medium; H (which will be cancelled) shadows L at high.
+        scheduler.lock_table.install_parks('L', ['m1'], priority='medium')
+        scheduler.lock_table.install_parks('H', ['m1'], priority='high')
+        scheduler._skip_count['H'] = 5
+        assert scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L')
+
+        # Block 'other' so L cannot dispatch this tick (lets us observe restored state).
+        scheduler.lock_table.try_acquire('blocker', ['other'])
+        scheduler._dispatched.add('blocker')
+
+        # H is cancelled; L is a live pending task.
+        h_task = {
+            'id': 'H', 'title': 'h', 'status': 'cancelled',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        l_task = {
+            'id': 'L', 'title': 'l', 'status': 'pending',
+            'priority': 'medium', 'dependencies': [],
+            'metadata': {'files': ['other']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[h_task, l_task])
+
+        await scheduler.acquire_next()
+
+        # H GC'd; L is restored as the active reservation on m1.
+        assert not scheduler.lock_table.has_parks('H'), 'H (cancelled) must be GC-evicted'
+        assert scheduler.lock_table.has_parks('L'), 'L must be restored after H is GC-evicted'
+
+        # reservation_expired emitted for H (existing GC behavior).
+        expired_events = [e for e in event_store.events if 'reservation_expired' in e[0]]
+        assert len(expired_events) == 1, f'Expected 1 reservation_expired; got {expired_events}'
+        assert expired_events[0][1]['task_id'] == 'H'
+
+        # reservation_restored emitted for L alongside reservation_expired.
+        restored_events = [e for e in event_store.events if 'reservation_restored' in e[0]]
+        assert len(restored_events) == 1, (
+            f'Expected 1 reservation_restored on GC; got {restored_events}'
+        )
+        r = restored_events[0][1]
+        assert r['data']['restored_owner'] == 'L'
+        assert 'm1' in r['data']['modules']
 
     # ---- Owner-state park-GC (step-14) ----
 
@@ -2631,6 +2784,126 @@ class TestFairness:
             if 'reservation_expired' in e[0]
         ]
         assert len(expired) == 0
+
+    # ---- G2 anti-starvation integration test (step-9, reify 4652→3427) ----
+
+    @pytest.mark.asyncio
+    async def test_anti_starvation_shadow_restore_blocks_medium(self):
+        """End-to-end regression for reify 4652→3427: shadow+restore blocks medium
+        from stealing modules after a critical task completes.
+
+        Scenario
+        --------
+        H  (high)     parks m1 + m2 (wide footprint via skip-bump parking)
+        C  (critical) preempts m1 by pushing H onto shadow stack (C on top)
+        M  (medium)   wants m1
+
+        Regression pin (old destructive eviction)
+        -----------------------------------------
+        Old code: C evicts H from m1.  When C dispatches and clears its park,
+        m1 becomes FREE and M steals it before H can reassemble its footprint.
+        H starves forever.
+
+        New shadow semantics
+        -------------------
+        C pushes on top of H on m1.  When C dispatches/clears, H is RESTORED
+        as the active top.  M is blocked at EVERY step — during the shadow AND
+        after C completes.  Only when H has acquired ALL modules (m1+m2) and
+        later releases them can M dispatch.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        # --- Phase 0: Install initial parks ---
+        # H accumulated skips and parks m1+m2 at high priority.
+        scheduler.lock_table.install_parks('H', ['m1', 'm2'], priority='high')
+        # C preempts m1 at critical priority (shadows H on m1; H still active on m2).
+        _, shadowed = scheduler.lock_table.install_parks('C', ['m1'], priority='critical')
+        assert shadowed == [('H', ['m1'])], f'Expected H shadowed on m1; got {shadowed}'
+        assert scheduler.lock_table.has_parks('H'), 'H must remain in shadow stack (INV-5)'
+        assert scheduler.lock_table.has_parks('C'), 'C must be active top on m1'
+
+        # Regression pin part 1: M cannot acquire m1 while C is on top.
+        assert not scheduler.lock_table.try_acquire('M', ['m1']), (
+            'M must be blocked by C (active top of m1) during shadow'
+        )
+
+        # --- Phase 1: C dispatches via acquire_next ---
+        c_task = {
+            'id': 'C', 'title': 'c', 'status': 'pending',
+            'priority': 'critical', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        h_task = {
+            'id': 'H', 'title': 'h', 'status': 'pending',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['m1', 'm2']},
+        }
+        m_task = {
+            'id': 'M', 'title': 'm', 'status': 'pending',
+            'priority': 'medium', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[c_task, h_task, m_task])
+
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == 'C', (
+            f'C (critical) must dispatch first; got {result}'
+        )
+        # C holds m1 now; clear_parks_for('C') restored H to top of m1.
+        assert scheduler.lock_table.has_parks('H'), (
+            'H must be restored to active top of m1 after C dispatches (INV-4)'
+        )
+        assert not scheduler.lock_table.has_parks('C'), 'C park must be cleared on dispatch'
+
+        # Regression pin part 2: M still blocked after C dispatches — H is restored.
+        assert not scheduler.lock_table.try_acquire('M', ['m1']), (
+            'M must still be blocked after C dispatches: H is restored as active top'
+        )
+
+        # reservation_restored event emitted for H (from dispatch clear_parks_for).
+        restored_on_dispatch = [e for e in event_store.events if 'reservation_restored' in e[0]]
+        assert len(restored_on_dispatch) == 1, (
+            f'Expected 1 reservation_restored on C dispatch; got {restored_on_dispatch}'
+        )
+        assert restored_on_dispatch[0][1]['data']['restored_owner'] == 'H'
+
+        # --- Phase 2: C releases m1 ---
+        scheduler.release('C')
+        # m1 is now free (C released it), H's park still active on m1.
+        assert not scheduler.lock_table._held.get('C'), 'C must have released all locks'
+        assert scheduler.lock_table.has_parks('H'), 'H park on m1 must survive C release'
+
+        # Regression pin part 3: M still cannot steal m1 — H's park guards it.
+        assert not scheduler.lock_table.try_acquire('M', ['m1']), (
+            'M must NOT steal m1 after C releases — H park still guards it (regression pin)'
+        )
+
+        # --- Phase 3: H dispatches (acquires its full footprint m1+m2) ---
+        c_task_done = dict(c_task, status='done')
+        scheduler.get_tasks = AsyncMock(return_value=[c_task_done, h_task, m_task])
+
+        result2 = await scheduler.acquire_next()
+        assert result2 is not None and result2.task_id == 'H', (
+            f'H must dispatch next (after C is done); got {result2}'
+        )
+        # H holds m1 and m2; its parks are cleared.
+        assert not scheduler.lock_table.has_parks('H'), 'H parks must be cleared on dispatch'
+        # M still cannot acquire m1 — H HOLDS it.
+        assert not scheduler.lock_table.try_acquire('M', ['m1']), (
+            'M must not acquire m1 while H holds it'
+        )
+
+        # --- Phase 4: H completes → M can finally dispatch ---
+        scheduler.release('H')
+
+        scheduler.get_tasks = AsyncMock(return_value=[c_task_done, dict(h_task, status='done'), m_task])
+
+        result3 = await scheduler.acquire_next()
+        assert result3 is not None and result3.task_id == 'M', (
+            f'M must dispatch only after H fully completes; got {result3}'
+        )
 
 
 class TestGetStatus:
@@ -4431,8 +4704,10 @@ class TestReserveNowShortCircuit:
         assert scheduler.lock_table.has_parks('A')
 
         # (b) The parks must cover A's modules (look inside _parked).
+        # _parked is now a dict[str, list[tuple[str,int]]] (LIFO stack);
+        # the active-top owner is the LAST entry in each stack.
         parked_owners = {
-            m: owner for m, (owner, _rank) in scheduler.lock_table._parked.items()
+            m: stack[-1][0] for m, stack in scheduler.lock_table._parked.items()
         }
         assert 'compiler/src' in parked_owners
         assert parked_owners['compiler/src'] == 'A'

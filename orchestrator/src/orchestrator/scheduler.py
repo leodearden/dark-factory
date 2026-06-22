@@ -441,8 +441,13 @@ class ModuleLockTable:
     ):
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
-        # normalized_module -> (owner_task_id, priority_rank)
-        self._parked: dict[str, tuple[str, int]] = {}
+        # normalized_module -> LIFO stack of (owner_task_id, priority_rank).
+        # Top = last element = the ACTIVE reservation.  Preemption by a strictly-
+        # higher-priority owner PUSHES (shadows) the lower entry instead of
+        # destroying it.  Restoration happens when the top entry is removed.
+        # INV-3: every stack is strictly rank-decreasing top-ward (top has the
+        # lowest rank / highest priority), so depth ≤ 5 (number of priority tiers).
+        self._parked: dict[str, list[tuple[str, int]]] = {}
         # task_id -> ISO8601 timestamp of first install_parks call for that owner
         self._park_install_at: dict[str, str] = {}
         self._config = config
@@ -472,137 +477,292 @@ class ModuleLockTable:
     # --- Park (reservation) helpers ---
 
     def _is_parked_blocks(self, module: str, task_id: str) -> bool:
-        """Return True iff any active park hierarchically conflicts with *module*
-        and is owned by a different task.
+        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*
+        and is owned by a different task that task_id cannot preempt (INV-2).
+
+        A buried (shadowed) reservation never blocks — only the active top of
+        each stack is consulted.
+
+        Rank-aware (step-12): first compute task_id's OWN dominant rank — the
+        minimum rank over active-top entries that *task_id* itself owns on keys
+        conflicting with *module* (None if it has no such top).  A foreign
+        conflicting top then blocks UNLESS task_id's own dominant rank is
+        strictly less (strictly higher priority) — in which case task_id
+        preempts that foreign top and is not blocked by it.  This lets a
+        preemptor acquire its own module even when hierarchical victim parks
+        are kept under their original keys (their active tops are no longer
+        moved to the preemptor's key by a re-key step).
         """
-        for parked_module, (owner, _rank) in self._parked.items():
+        # Step 1: compute task_id's own dominant rank among conflicting active tops.
+        own_dominant_rank: int | None = None
+        for parked_module, stack in self._parked.items():
+            if not stack:
+                continue
+            owner, rank = stack[-1]  # active TOP only
+            if owner != task_id:
+                continue
+            if self._conflicts(parked_module, module) and (own_dominant_rank is None or rank < own_dominant_rank):
+                own_dominant_rank = rank
+
+        # Step 2: check each foreign conflicting active top.
+        for parked_module, stack in self._parked.items():
+            if not stack:
+                continue
+            owner, rank = stack[-1]  # active TOP only (INV-2)
             if owner == task_id:
                 continue
-            if self._conflicts(parked_module, module):
-                return True
+            if not self._conflicts(parked_module, module):
+                continue
+            # Foreign conflicting top: block unless task_id has a strictly
+            # higher-priority (strictly lower rank) own conflicting top.
+            if own_dominant_rank is not None and own_dominant_rank < rank:
+                # task_id preempts this foreign top — not blocked by it.
+                continue
+            return True
         return False
 
     def has_parks(self, task_id: str) -> bool:
-        """Return True if *task_id* currently owns any reservation."""
-        return any(owner == task_id for owner, _ in self._parked.values())
+        """Return True if *task_id* owns any reservation at ANY stack level (INV-5).
+
+        Returns True for both active-top AND buried (shadowed) reservations so
+        that ``_bump_skip_and_maybe_park`` does not re-arm a duplicate park for a
+        shadowed owner.
+        """
+        for stack in self._parked.values():
+            for owner, _ in stack:
+                if owner == task_id:
+                    return True
+        return False
 
     def install_parks(
         self, task_id: str, modules: list[str], priority: str
     ) -> tuple[list[str], list[tuple[str, list[str]]]]:
         """Install reservations on the normalized form of *modules* for *task_id*.
 
-        Returns ``(installed, evicted)`` where *installed* is the list of
-        normalized modules actually parked and *evicted* is a list of
-        ``(owner_id, modules_lost)`` for any lower-priority parks displaced.
+        Returns ``(installed, shadowed)`` where *installed* is the list of
+        normalized modules actually parked (as the active top) and *shadowed* is
+        a list of ``(owner_id, modules_shadowed)`` for any lower-priority parks
+        that were PUSHED beneath the new reservation (retained, not destroyed).
 
-        Cross-tier preemption: a park with ``existing_rank > new_rank``
-        (i.e. *strictly* lower priority) is evicted. Same-tier or
-        higher-priority existing parks block installation of the new park on
-        that module (no eviction, no install for that module).
+        Cross-tier preemption (INV-1): if the active TOP of a conflicting stack
+        has ``existing_rank > new_rank`` (strictly lower priority), the new entry
+        is PUSHED on top of the stack (shadowing, not destroying, the lower entry).
+        Same-tier or higher-priority tops BLOCK installation for that module (INV-3).
+
+        Hierarchical (different-key) conflicts: victim parks are kept under
+        their ORIGINAL keys (not re-keyed onto the preemptor's key).  Rank-
+        aware blocking in ``_is_parked_blocks`` lets the preemptor acquire its
+        own module without needing to move victim entries.  This preserves each
+        victim's original module identity so that ALL victims are independently
+        restorable after the preemptor clears (step-12 fix).
         """
         depth = self._config.lock_depth
         rank = PRIORITY_RANK[coerce_tier(priority)]
         installed: list[str] = []
-        # Accumulate evictions: victim_owner -> list of modules lost.
-        eviction_acc: dict[str, list[str]] = {}
-        # Track insertion order of evicted owners for stable output.
-        eviction_order: list[str] = []
+        # Accumulate shadows: victim_owner -> list of original module keys shadowed.
+        shadow_acc: dict[str, list[str]] = {}
+        # Track insertion order of shadowed owners for stable output.
+        shadow_order: list[str] = []
         for m in modules:
             normalized = normalize_lock(m, depth)
             if not normalized:
                 continue
-            # Find all conflicting parks from other owners.
-            to_evict: list[str] = []  # parked_module keys to pop
+            # Scan only the ACTIVE TOP of each conflicting stack (INV-2).
+            to_shadow: list[tuple[str, str]] = []  # (parked_m_key, victim_owner)
             blocked = False
-            for parked_m, (owner, existing_rank) in list(self._parked.items()):
+            for parked_m, stack in list(self._parked.items()):
+                if not stack:
+                    continue
+                owner, existing_rank = stack[-1]  # active TOP (INV-2)
                 if owner == task_id:
                     continue
                 if not self._conflicts(parked_m, normalized):
                     continue
-                # Hierarchical conflict with a different owner.
+                # Hierarchical conflict with a different top owner.
                 if existing_rank > rank:
-                    # Strictly lower priority → evict.
-                    to_evict.append(parked_m)
+                    # TOP is strictly lower priority → shadow (push), retain beneath.
+                    to_shadow.append((parked_m, owner))
                 else:
-                    # Same or higher priority → block our install.
+                    # TOP is same or higher priority → block our install (INV-3).
                     blocked = True
                     break
             if blocked:
                 continue
-            # Perform evictions for this module.
-            for parked_m in to_evict:
-                owner, _ = self._parked.pop(parked_m)
-                if owner not in eviction_acc:
-                    eviction_acc[owner] = []
-                    eviction_order.append(owner)
-                eviction_acc[owner].append(parked_m)
-            self._parked[normalized] = (task_id, rank)
+            # Record shadows — all victim parks stay under their ORIGINAL keys.
+            # For exact-match conflicts (parked_m == normalized), the victim's
+            # entry stays in its stack; the new entry will be pushed on top
+            # in the install step below.  For hierarchical (different-key)
+            # conflicts, the victim park is also left untouched: rank-aware
+            # blocking in _is_parked_blocks lets the preemptor acquire its own
+            # module without moving victim entries (step-12 fix).
+            for parked_m, victim_owner in to_shadow:
+                if victim_owner not in shadow_acc:
+                    shadow_acc[victim_owner] = []
+                    shadow_order.append(victim_owner)
+                shadow_acc[victim_owner].append(parked_m)
+
+            # Push task_id onto the top of the (possibly freshly created) stack.
+            if normalized not in self._parked:
+                self._parked[normalized] = []
+            self._parked[normalized].append((task_id, rank))
             installed.append(normalized)
-        # Drop fully-evicted owners from _park_install_at so the dict stays
-        # bounded under preemption churn and a later re-install records a
-        # fresh installed_at instead of the stale setdefault-preserved value.
-        for owner in eviction_acc:
-            if not self.has_parks(owner):
-                self._park_install_at.pop(owner, None)
-        # Build evicted list in first-seen owner order, modules sorted.
-        evicted = [
-            (owner, sorted(eviction_acc[owner]))
-            for owner in eviction_order
+
+        # Build shadowed list in first-seen victim order, original module keys sorted.
+        shadowed = [
+            (owner, sorted(shadow_acc[owner]))
+            for owner in shadow_order
         ]
         if installed:
             self._park_install_at.setdefault(task_id, datetime.now(UTC).isoformat())
-        return installed, evicted
+        return installed, shadowed
 
-    def clear_parks_for(self, task_id: str) -> None:
-        """Remove every reservation owned by *task_id*."""
-        self._parked = {
-            m: (owner, rank)
-            for m, (owner, rank) in self._parked.items()
-            if owner != task_id
-        }
-        self._park_install_at.pop(task_id, None)
+    def _remove_owner(self, task_id: str) -> list[tuple[str, list[str]]]:
+        """Remove *task_id* from every stack at any level and return restored pairs.
 
-    def prune_owners(self, predicate: Callable[[str], bool]) -> list[str]:
-        """Evict every park whose owner satisfies *predicate*.
+        For each module stack where *task_id* was the ACTIVE TOP: after removal
+        the new last element (if any) becomes the active top and is reported as a
+        ``(owner, sorted_modules)`` restored pair.  Removing a buried (non-top)
+        entry leaves the top unchanged and is NOT reported as a restore (INV-4).
 
-        Iterates unique owners (deduped, first-seen order), calls
-        ``predicate(owner_id)`` at most once per owner, and drops all
-        ``_parked`` entries owned by matching tasks.
+        Drops ``_park_install_at[task_id]`` only when task_id has no remaining
+        parks at any level after removal (INV-6: preserved for shadowed owners
+        who are removed from buried slots but still have other parks).
 
-        Returns the list of evicted owner IDs in first-seen order.
+        Returns ``list[(restored_owner, sorted_modules)]`` in first-seen order.
+        Callers use the returned pairs to emit ``reservation_restored`` events.
+
+        **Hierarchical victim note**: for hierarchical (different-key) shadows,
+        the hierarchical victim's own stack is NEVER touched during the
+        preemptor's removal — the preemptor only appears in its own normalized
+        key's stack, so ``was_top`` only fires for that key.  The victim becomes
+        acquirable the instant the preemptor is removed (rank-aware blocking in
+        ``_is_parked_blocks`` stops gating on the now-absent foreign top), but no
+        ``reservation_restored`` pair is returned and no event is emitted.  This
+        asymmetry is intentional (documented in the plan's design decisions):
+        adding cross-key restore detection would require scanning all stacks for
+        newly-unblocked entries on every removal.  Exact-match shadows (same
+        key) always produce a restore pair; hierarchical shadows do not.
         """
-        # Collect unique owners in first-seen order.
+        # Track which modules had task_id as their ACTIVE TOP before removal.
+        was_top: set[str] = set()
+        for m, stack in self._parked.items():
+            if stack and stack[-1][0] == task_id:
+                was_top.add(m)
+
+        # Rebuild stacks without task_id.
+        new_parked: dict[str, list[tuple[str, int]]] = {}
+        for m, stack in self._parked.items():
+            new_stack = [(o, r) for o, r in stack if o != task_id]
+            if new_stack:
+                new_parked[m] = new_stack
+        self._parked = new_parked
+
+        # Drop install_at only when task_id is fully gone.
+        if not self.has_parks(task_id):
+            self._park_install_at.pop(task_id, None)
+
+        # Identify newly-exposed tops: modules where task_id WAS the top and
+        # a lower entry is now exposed.
+        restored_acc: dict[str, list[str]] = {}  # new_top_owner -> [modules]
+        restored_order: list[str] = []
+        for m in was_top:
+            new_stack = self._parked.get(m)
+            if new_stack:  # there is a newly-exposed lower entry
+                new_top_owner, _ = new_stack[-1]
+                if new_top_owner not in restored_acc:
+                    restored_acc[new_top_owner] = []
+                    restored_order.append(new_top_owner)
+                restored_acc[new_top_owner].append(m)
+
+        return [
+            (owner, sorted(restored_acc[owner]))
+            for owner in restored_order
+        ]
+
+    def clear_parks_for(self, task_id: str) -> list[tuple[str, list[str]]]:
+        """Remove every reservation owned by *task_id* and return restored pairs.
+
+        Delegates to ``_remove_owner`` for the actual removal + restore detection.
+        Returns ``[(restored_owner, sorted_modules)]`` for each module whose
+        newly-exposed lower entry becomes the active top — empty list when there
+        are no buried entries beneath task_id's reservations (INV-4).
+
+        Callers (Scheduler dispatch/release paths) use the returned pairs to
+        emit ``reservation_restored`` events (step-8).
+        """
+        return self._remove_owner(task_id)
+
+    def prune_owners(
+        self, predicate: Callable[[str], bool]
+    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
+        """Evict every park whose owner satisfies *predicate* at ANY stack level.
+
+        Iterates unique owners across all levels of all stacks (deduped,
+        first-seen order), calls ``predicate(owner_id)`` at most once per
+        owner, and removes all entries for matching owners via ``_remove_owner``.
+
+        Returns ``(evicted_owners, restored_pairs)`` where *evicted_owners* is
+        the list of removed owner IDs in first-seen order and *restored_pairs*
+        is a flattened list of ``(owner, sorted_modules)`` for all stacks whose
+        newly-exposed tops belong to non-evicted owners.  The Scheduler's
+        ``_park_gc`` sweep loop uses restored_pairs to emit
+        ``reservation_restored`` events (step-8).
+        """
+        # Collect unique owners in first-seen order across all stack levels.
         seen: dict[str, bool] = {}
-        for owner, _rank in self._parked.values():
-            if owner not in seen:
-                seen[owner] = predicate(owner)
-        # Evict matching owners.
-        evicted: list[str] = []
-        for owner, should_evict in seen.items():
-            if should_evict:
-                evicted.append(owner)
-        if evicted:
-            evicted_set = set(evicted)
-            self._parked = {
-                m: (owner, rank)
-                for m, (owner, rank) in self._parked.items()
-                if owner not in evicted_set
-            }
-            for owner in evicted:
-                self._park_install_at.pop(owner, None)
-        return evicted
+        for stack in self._parked.values():
+            for owner, _rank in stack:
+                if owner not in seen:
+                    seen[owner] = predicate(owner)
+        # Build evicted list.
+        evicted = [owner for owner, should in seen.items() if should]
+        # Remove each evicted owner and accumulate restored pairs.
+        all_restored_acc: dict[str, list[str]] = {}  # deduplicate across calls
+        all_restored_order: list[str] = []
+        for owner in evicted:
+            for restored_owner, mods in self._remove_owner(owner):
+                if restored_owner not in all_restored_acc:
+                    all_restored_acc[restored_owner] = list(mods)
+                    all_restored_order.append(restored_owner)
+                else:
+                    # Merge modules for the same restored owner across multiple calls.
+                    merged = sorted(set(all_restored_acc[restored_owner]) | set(mods))
+                    all_restored_acc[restored_owner] = merged
+        # Filter out any owner that is itself being evicted in this same sweep.
+        # When removing top Z exposes lower Y (recorded in all_restored), but Y
+        # also matches the predicate and is later evicted, the caller would
+        # otherwise emit a spurious reservation_restored for a task whose parks
+        # are all gone.  Filtering against the evicted set removes that noise
+        # without any state-correctness impact (the removal itself already
+        # happened via _remove_owner).
+        evicted_set = set(evicted)
+        all_restored = [
+            (owner, all_restored_acc[owner])
+            for owner in all_restored_order
+            if owner not in evicted_set
+        ]
+        return evicted, all_restored
 
     # --- Snapshot helpers (public accessors for observability) ---
 
     def snapshot_parks(self) -> dict[str, dict]:
         """Return a snapshot of current parks: ``{task_id: {modules, installed_at}}``.
 
+        Reports only the ACTIVE-TOP owner of each module stack (INV-7).  Buried
+        (shadowed) owners do not appear — the snapshot contract is identical to
+        the pre-stack single-owner semantics, keeping the dashboard's
+        ``_module_contention_counts`` and fused-memory ``get_scheduler_state``
+        working without changes.
+
         Builds a fresh dict from ``_parked`` and ``_park_install_at`` so callers
         cannot mutate internal state.  Preferred over direct ``_parked`` access in
         :meth:`Scheduler.get_state_snapshot`.
         """
         result: dict[str, dict] = {}
-        for module, (owner, _rank) in self._parked.items():
+        for module, stack in self._parked.items():
+            if not stack:
+                continue
+            owner, _rank = stack[-1]  # active TOP only (INV-7)
             if owner not in result:
                 result[owner] = {
                     'modules': [],
@@ -2285,7 +2445,7 @@ class Scheduler:
             count >= threshold
             and not self.lock_table.has_parks(task_id)
         ):
-            installed, evicted_pairs = self.lock_table.install_parks(task_id, modules, tier)
+            installed, shadowed_pairs = self.lock_table.install_parks(task_id, modules, tier)
             logger.info(
                 'Task %s reserved modules %s (skip_count=%d, tier=%s)',
                 task_id, installed, count, tier,
@@ -2300,9 +2460,13 @@ class Scheduler:
                         'priority': tier,
                     },
                 )
-                for victim, victim_modules in evicted_pairs:
+                # Emit reservation_shadowed (non-destructive shadow) for each
+                # lower-priority owner whose park was pushed beneath task_id.
+                # reservation_evicted is RETAINED as an enum member for historical
+                # event-log back-compat but is no longer emitted on preemption.
+                for victim, victim_modules in shadowed_pairs:
                     self.event_store.emit(
-                        EventType.reservation_evicted,
+                        EventType.reservation_shadowed,
                         task_id=task_id,
                         data={
                             'modules': victim_modules,
@@ -2801,7 +2965,7 @@ class Scheduler:
                 return True
             return not self._deps_satisfied(tasks_by_id[tid], status_map, tasks_by_id)
 
-        gc_evicted = self.lock_table.prune_owners(_park_gc)
+        gc_evicted, gc_restored = self.lock_table.prune_owners(_park_gc)
         for owner in gc_evicted:
             self._skip_count.pop(owner, None)
             if self.event_store:
@@ -2816,6 +2980,16 @@ class Scheduler:
                     EventType.reservation_expired,
                     task_id=owner,
                     data={'reason': reason},
+                )
+        if self.event_store:
+            for restored_owner, restored_modules in gc_restored:
+                self.event_store.emit(
+                    EventType.reservation_restored,
+                    task_id=restored_owner,
+                    data={
+                        'restored_owner': restored_owner,
+                        'modules': restored_modules,
+                    },
                 )
 
         # Drop _last_dispatch_at, _skip_count, _module_cache, _pending_anchor,
@@ -3209,13 +3383,22 @@ class Scheduler:
                 if task_id == top_id:
                     self._skip_count.pop(task_id, None)
                     if top_had_parks:
-                        self.lock_table.clear_parks_for(task_id)
+                        restored_pairs = self.lock_table.clear_parks_for(task_id)
                         if self.event_store:
                             self.event_store.emit(
                                 EventType.reservation_used,
                                 task_id=task_id,
                                 data={'modules': modules, 'priority': pri},
                             )
+                            for restored_owner, restored_modules in restored_pairs:
+                                self.event_store.emit(
+                                    EventType.reservation_restored,
+                                    task_id=restored_owner,
+                                    data={
+                                        'restored_owner': restored_owner,
+                                        'modules': restored_modules,
+                                    },
+                                )
                 else:
                     # A lower-ranked task won — top was passed over this tick.
                     self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
@@ -3646,13 +3829,23 @@ class Scheduler:
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
-        self.lock_table.clear_parks_for(task_id)
+        restored_pairs = self.lock_table.clear_parks_for(task_id)
         if self.event_store and modules:
             self.event_store.emit(
                 EventType.lock_released,
                 task_id=task_id,
                 data={'modules': modules},
             )
+        if self.event_store:
+            for restored_owner, restored_modules in restored_pairs:
+                self.event_store.emit(
+                    EventType.reservation_restored,
+                    task_id=restored_owner,
+                    data={
+                        'restored_owner': restored_owner,
+                        'modules': restored_modules,
+                    },
+                )
 
     # --- Retry cap (per-task REQUEUED counter) ---
 
