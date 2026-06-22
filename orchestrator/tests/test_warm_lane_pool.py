@@ -2163,3 +2163,125 @@ class TestRefreshWarmBaseGuards:
         git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
         result = await git_ops.refresh_warm_base()
         assert result is False, 'Non-zero script exit must return False (fail-soft)'
+
+
+# ===========================================================================
+# Step-β7: RED — create_worktree routes discriminated WarmLaneUnavailable
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeWarmLaneRouting:
+    """create_worktree with warm_lane_pool enabled routes acquire_warm_lane result.
+
+    (b) Pool exhausted → raises WarmLanePoolExhausted + no cold worktree dir.
+    (c) FAULT → raises RuntimeError + no cold dir.
+    (d) DISK_PRESSURE → raises WarmLaneDiskPressure.
+    (e) Success → returns WorktreeInfo on the pool lane (not a cold-created dir).
+    """
+
+    async def _setup_repo_with_seed(
+        self,
+        repo: Path,
+        seed_exit: int = 0,
+        port: int = 39411,
+    ) -> None:
+        """Commit a seed script that exits <seed_exit> + a debug-port script."""
+        scripts_dir = repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        if seed_exit == 0:
+            seed_body = (
+                '#!/usr/bin/env bash\n'
+                'mkdir -p "$2/target"\n'
+                'echo seeded > "$2/target/seeded.bin"\n'
+            )
+        else:
+            seed_body = (
+                f'#!/usr/bin/env bash\n'
+                f'echo "seed exit {seed_exit}" >&2\n'
+                f'exit {seed_exit}\n'
+            )
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(seed_body)
+        seed_script.chmod(0o755)
+        debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+        debug_script.write_text(f'#!/usr/bin/env bash\necho {port}\n')
+        debug_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=repo)
+        await _run(['git', 'commit', '-m', f'add seed (exit={seed_exit}) + debug-port scripts'], cwd=repo)
+
+    async def test_create_worktree_exhausted_raises_pool_exhausted(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(b) Pool exhausted → create_worktree raises WarmLanePoolExhausted.
+
+        The cold worktree dir (worktree_base/branch_name) must NOT be created —
+        no cold-path fall-through when the pool is enabled.
+        """
+        from orchestrator.git_ops import WarmLanePoolExhausted
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # Exhaust the pool with a first create_worktree call
+        info_a = await git_ops.create_worktree('task-first')
+        assert isinstance(info_a, WorktreeInfo), f'Prerequisite: first create must succeed, got {info_a!r}'
+
+        # Now pool is exhausted; second call must raise WarmLanePoolExhausted
+        cold_dir = git_ops.worktree_base / 'task-second'
+        with pytest.raises(WarmLanePoolExhausted):
+            await git_ops.create_worktree('task-second')
+
+        # Signal (b): no cold worktree dir created
+        assert not cold_dir.exists(), (
+            f'Cold dir {cold_dir} must NOT be created on pool exhaustion'
+        )
+
+    async def test_create_worktree_fault_raises_runtime_error(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(c) FAULT (seed exit 1) → create_worktree raises RuntimeError.
+
+        No degraded WorktreeInfo is returned; no cold worktree dir is created.
+        """
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=1)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        cold_dir = git_ops.worktree_base / 'task-fault'
+        with pytest.raises(RuntimeError):
+            await git_ops.create_worktree('task-fault')
+
+        # Signal (c): no cold worktree dir created
+        assert not cold_dir.exists(), (
+            f'Cold dir {cold_dir} must NOT be created on FAULT'
+        )
+
+    async def test_create_worktree_disk_pressure_raises_warm_lane_disk_pressure(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(d) DISK_PRESSURE (seed exit 75) → create_worktree raises WarmLaneDiskPressure."""
+        from orchestrator.git_ops import WarmLaneDiskPressure
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=75)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneDiskPressure):
+            await git_ops.create_worktree('task-dp')
+
+    async def test_create_worktree_success_returns_worktree_info_on_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(e) Success → WorktreeInfo whose path is the pool lane (_lane-0)."""
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info = await git_ops.create_worktree('task-success')
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo, got {info!r}'
+        # Path must be the pool lane, not a cold worktree_base/branch_name dir
+        assert '_lane-' in info.path.name, (
+            f'Expected pool lane path (_lane-*), got {info.path}'
+        )
+        cold_dir = git_ops.worktree_base / 'task-success'
+        assert not cold_dir.exists(), (
+            f'Cold dir {cold_dir} must NOT be created when pool lane was used'
+        )
