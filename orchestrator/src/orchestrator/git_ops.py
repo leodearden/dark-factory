@@ -1451,15 +1451,22 @@ class GitOps:
                 )
                 self.warm_lane_pool.drop_assignment(branch_name)
                 await self._reset_warm_lane(lane, full_branch, start_ref)
-                # D10: always re-seed from current base after identity-mismatch reset.
-                # Fail-soft: a recycled lane already has a usable (if stale) target/,
-                # so a failed re-seed degrades to the prior warmth — never cold-fallback.
+                # β: THIN re-seed — rm target/ before seeding so the re-seed is a
+                # fresh CoW copy rather than an in-place overlay on stale blobs.
+                # Defensive rmtree is robust even if reify α's replace-capable seed
+                # is not yet landed (an emptied target/ seeds cleanly either way).
+                shutil.rmtree(lane / 'target', ignore_errors=True)
                 rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                 if rc != 0:
                     logger.warning(
-                        'acquire_warm_lane: re-seed failed for recycled lane %s; '
-                        'proceeding with retained target — degraded warmth',
-                        lane,
+                        'acquire_warm_lane: recycle re-seed failed (rc=%d) for %s; '
+                        'releasing lane',
+                        rc, lane,
+                    )
+                    await self.warm_lane_pool.release(lane)
+                    return (
+                        WarmLaneUnavailable.DISK_PRESSURE if rc == 75
+                        else WarmLaneUnavailable.FAULT
                     )
                 # Falls through to shared tail
 
@@ -1544,16 +1551,21 @@ class GitOps:
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
                 await self._reset_warm_lane(lane, full_branch, start_ref)
-                # D10: always re-seed from current base after fresh reset.
-                # Fail-soft: a recycled lane already has a usable (if stale) target/,
-                # so a failed re-seed degrades to the prior warmth — never cold-fallback
-                # or block dispatch (D10 / inv.6).
+                # β: THIN re-seed — rm target/ before seeding (no retained bloat).
+                # Defensive rmtree is robust even if reify α's replace-capable seed
+                # is not yet landed (an emptied target/ seeds cleanly either way).
+                shutil.rmtree(lane / 'target', ignore_errors=True)
                 rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                 if rc != 0:
                     logger.warning(
-                        'acquire_warm_lane: re-seed failed for recycled lane %s; '
-                        'proceeding with retained target — degraded warmth',
-                        lane,
+                        'acquire_warm_lane: recycle re-seed failed (rc=%d) for %s; '
+                        'releasing lane',
+                        rc, lane,
+                    )
+                    await self.warm_lane_pool.release(lane)
+                    return (
+                        WarmLaneUnavailable.DISK_PRESSURE if rc == 75
+                        else WarmLaneUnavailable.FAULT
                     )
 
             # ── Shared tail: gitignore, scrub, base, debug-port ──────────
