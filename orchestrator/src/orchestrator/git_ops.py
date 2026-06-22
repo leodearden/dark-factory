@@ -365,6 +365,35 @@ class WorktreeMissing(FileNotFoundError):
         super().__init__(f'Worktree missing: {self.path}')
 
 
+class WarmLaneRequeue(Exception):
+    """Base class for warm-lane failures that should requeue (not block + L1).
+
+    Raised by :meth:`GitOps.create_worktree` when warm_lane_pool is enabled
+    and the pool cannot allocate a seeded lane for a transient reason.
+    Callers (workflow.run()) should return :attr:`WorkflowOutcome.REQUEUED`
+    rather than letting this propagate to the broad ``except Exception`` handler.
+
+    Subclasses:
+        WarmLanePoolExhausted — all lanes ASSIGNED (backpressure).
+        WarmLaneDiskPressure  — seed exited 75 (EX_TEMPFAIL, transient infra).
+    """
+
+
+class WarmLanePoolExhausted(WarmLaneRequeue):
+    """All pool lanes are ASSIGNED; task must be requeued (backpressure).
+
+    Scheduler should release the task and re-dispatch it when a lane frees up.
+    """
+
+
+class WarmLaneDiskPressure(WarmLaneRequeue):
+    """Seed exited 75 (EX_TEMPFAIL) — transient disk pressure / infra issue.
+
+    Task should be requeued with a ``warm_lane_disk_pressure (transient infra)``
+    block-reason annotation so the requeue is distinguishable from backpressure.
+    """
+
+
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     """Run an arbitrary subprocess command and return (returncode, stdout, stderr).
 
@@ -819,11 +848,20 @@ class GitOps:
                     stale_commits=stale_commits,
                     reify_debug_port=pool_info.reify_debug_port,
                 )
-            # Fall through to cold path (exhaustion / seed failure / disk pressure)
-            logger.info(
-                'create_worktree: pool acquire failed (%s) for %s — falling back to cold path',
-                pool_info.value if isinstance(pool_info, WarmLaneUnavailable) else pool_info,
-                branch_name,
+            # β: pool is enabled — no cold-path fall-through.  Route discriminant
+            # to the appropriate exception so callers get typed failure signals.
+            if pool_info is WarmLaneUnavailable.EXHAUSTED:
+                raise WarmLanePoolExhausted(
+                    f'warm-lane pool exhausted for branch {branch_name!r}; requeue'
+                )
+            if pool_info is WarmLaneUnavailable.DISK_PRESSURE:
+                raise WarmLaneDiskPressure(
+                    f'warm-lane seed disk pressure for branch {branch_name!r}; requeue'
+                )
+            # FAULT → RuntimeError reuses existing blocked+L1 plumbing
+            raise RuntimeError(
+                f'warm-lane acquire fault for branch {branch_name!r} '
+                f'(seed/worktree-add failure or absent seed script)'
             )
 
         # If worktree already exists, reuse it (common after requeue) —
