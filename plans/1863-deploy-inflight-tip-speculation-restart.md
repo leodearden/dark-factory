@@ -39,4 +39,33 @@ The running orchestrator-reify.service process PREDATED the #1862 merge and ther
 
 ## Restart Action
 
+**Preflight checks (all passed):**
+- Merge queue: empty (depth=0, no verify in flight) — clean quiesce ✅
+- leo-laptop reachability: `ssh leo-laptop true` exit 0 — K=2 expected on startup ✅
+- dark-factory tracked mods: none (only untracked `??` files) — dirty-tree guard passes ✅
+
+| Field | Value |
+|---|---|
+| Mechanism | `ORCH_PROJECT_ROOT=/home/leo/src/dark-factory /home/leo/src/reify/scripts/orchestrator-redeploy-restart.sh` — schedule mode |
+| Transient unit | `orch-redeploy-restart` (timer: `orch-redeploy-restart.timer`) |
+| On-active delay | 60 s after scheduling agent exits (no self-kill) |
+| Exec-mode action | blocking `systemctl --user stop` → `systemctl --user start` (never `restart`) |
+| project_root guard | `/home/leo/src/dark-factory` — verified clean at schedule time |
+| Scheduled at | approx 21:03 BST (step-2 schedule-mode agent exited) |
+| Expected fire time | approx 21:04 BST (+60 s on-active delay after agent exit) |
+| Expected active by | approx 21:06 BST (+≤90 s TimeoutStopSec graceful stop) |
+| K expectation | K=2 (leo-laptop reachable at schedule time) |
+
+Script output:
+```
+Running timer as unit: orch-redeploy-restart.timer
+Will run service as unit: orch-redeploy-restart.service
+orchestrator-redeploy-restart.sh: scheduled restart of 'orchestrator-reify.service'
+  Transient unit: orch-redeploy-restart
+  Fires in:       60s (after the scheduling agent exits)
+  project_root:   /home/leo/src/dark-factory (clean at schedule time)
+```
+
+---
+
 ## Verification
