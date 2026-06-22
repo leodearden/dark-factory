@@ -74,6 +74,7 @@ from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 # module-level functions so pytest does not collect them as tests.
 from test_merge_queue_concurrent_verify import (  # noqa: F401
     _gated_runner,
+    _id_liveness_fake_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
     _make_request,
@@ -2152,4 +2153,190 @@ class TestLateArrivalCleanCAS:
         a_advanced = advance_outcomes.get(a_advance_branch) == 'advanced'
         assert a_advanced, (
             f'A must also have advanced cleanly; got {advance_outcomes.get(a_advance_branch)!r}'
+        )
+
+
+# ===========================================================================
+# Step-5 RED→GREEN: predecessor FAILING cascades to invalidate late arrival B
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestLateArrivalFailCascade:
+    """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
+
+    DONE-WHEN 4: when predecessor A fails, the existing head-failure cascade:
+      - cancels B's in-flight speculative remote verify (cancel_verify fired live)
+      - emits speculative_discard for B with reason=previous_failed
+      - re-merges B against actual main (non-speculative)
+      - re-dispatches B so it verifies again and resolves 'done' (B's file lands)
+      - A's file does NOT land on main (A failed)
+
+    On main (RED): B merged non-speculatively against plain main → A failing
+    does not trigger the head-failure cascade for B → no speculative_discard
+    → B might land without re-verification against main+A.
+
+    GREEN after step-2: B is a speculative descendant of A; the existing
+    cascade in _verifier_loop (7608-7721) finds B in _inflight, cancels its
+    verify, re-merges against actual main, re-dispatches with _redispatch,
+    and emits speculative_discard reason=previous_failed via _dispatch_item.
+    """
+
+    async def test_predecessor_fail_cascades_to_late_arrival(
+        self, spec_git_repo: Path,
+    ) -> None:
+        """A fails; cascade cancels B's remote verify, remerges B, B lands as 'done'.
+
+        Immediately GREEN after step-2 because B is structurally a speculative
+        descendant and the existing head-failure cascade path handles it.
+        """
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+        fake_event_store = _LateArrivalFakeEventStore()
+
+        # ── Gate A's LOCAL verify — FAILS on first call, passes on subsequent ─
+        gate_a_entered = asyncio.Event()
+        gate_a_release = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_failing_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # First call: A's verify — gate then FAIL
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False, summary='tests failed', test_output='FAIL',
+                    lint_output='', type_output='', category='',
+                    timed_out=False, verify_skipped=False,
+                )
+            # Subsequent calls (B's re-verify after cascade): PASS
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # ── B's REMOTE verify: liveness-faithful runner to assert cancel-while-live ─
+        # _id_liveness_fake_runner tracks whether cancel_verify was called while the
+        # remote verify task was still running (state['live']=True).  cancel_verify
+        # fired while live → remote_cancels_while_live == [1] (DONE-WHEN 4b).
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        liveness_remote = _id_liveness_fake_runner(
+            gate_b_release, gate_b_entered, name='late5-laptop',
+        )
+
+        # ── Build disjoint branches ───────────────────────────────────────────
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/late5-a', 'late5_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/late5-b', 'late5_b.py', 'b = 2\n',
+        )
+
+        worker = _make_late_arrival_worker(git_ops, event_store=fake_event_store)
+        _inject_two_host_allocator(worker, liveness_remote)
+
+        req_a = _make_request('late5-a', 'task/late5-a', wt_a, config)
+        req_b = _make_request('late5-b', 'task/late5-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_failing_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue A; wait for its verify to enter (look-ahead peek has fired).
+            await worker._queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # Inject B LATE — after the one-shot look-ahead peek.
+            # B attaches to A's pending spec base → B merges speculatively on A's commit.
+            await worker._queue.put(req_b)
+
+            # Wait for B's remote verify to start (confirms B is dispatched as
+            # speculative descendant of A — otherwise there is no cascade to assert).
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # Release A's gate with passed=False → A fails verification.
+            gate_a_release.set()
+
+            # The head-failure cascade cancels B's remote verify, re-merges B
+            # against actual main, re-dispatches → local re-verify (call[1], passes).
+            # Wait for B to resolve 'done'.
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=25.0)
+
+            # Await A's result too (should be set to a failed outcome).
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=10.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── A failed (verify returned passed=False) ────────────────────────────
+        assert outcome_a.status != 'done', (
+            f'A must NOT land (verify failed); got outcome_a={outcome_a!r}'
+        )
+
+        # ── DONE-WHEN 4(a): speculative_merge event for B (B was dispatched
+        #    speculatively against A's commit — only present after step-2).
+        #
+        #    NOTE: speculative_discard is emitted in _dispatch_item only when a
+        #    speculative item is re-dispatched from _redispatch with _n_failed=True
+        #    (single-host path). In the two-host cascade path, the remerged item
+        #    has speculative=False (_remerge sets speculative=False), so
+        #    speculative_discard is NOT emitted at re-dispatch.  The meaningful
+        #    RED/GREEN distinguisher is the speculative_merge event for B:
+        #
+        #    RED (on main without step-2): B merged non-speculatively (spec_base=None
+        #    reset at line 6875) → no speculative_merge event for B.
+        #    GREEN (step-2): pending_spec_base carries A's commit across the blocking
+        #    dequeue → B merges speculatively → speculative_merge event for B.
+        spec_merge_events = fake_event_store.speculative_events(EventType.speculative_merge)
+        b_spec_merge = [e for e in spec_merge_events if e['task_id'] == 'late5-b']
+        assert len(b_spec_merge) == 1, (
+            f'Expected exactly one speculative_merge event for B; '
+            f'got {len(b_spec_merge)!r}: {b_spec_merge!r}.\n'
+            'RED (on main): spec_base=None reset unconditionally → B non-speculative '
+            '→ no speculative_merge event.\n'
+            'GREEN (step-2): B attaches to A\'s pending spec base → speculative=True '
+            '→ speculative_merge emitted.'
+        )
+        assert b_spec_merge[0]['data'].get('base_sha') is not None, (
+            f'speculative_merge event for B must carry a non-None base_sha; '
+            f'got data={b_spec_merge[0]["data"]!r}.'
+        )
+
+        # ── DONE-WHEN 4(b): cancel_verify fired while B's remote verify was live ─
+        # The head-failure cascade cancels B's remote verify via _abort_remote_verify
+        # before task.cancel(), so cancel_verify is called while state['live']=True.
+        # The abort-poll inside _run_inflight_verify may also fire cancel_verify while
+        # live (if it polls between the cascade's _abort_remote_verify and the
+        # CancelledError delivery), so we assert >= 1 rather than exactly 1.
+        assert liveness_remote.remote_cancels_while_live, (
+            f'cancel_verify must have been called at least once while B\'s remote '
+            f'verify was live; got remote_cancels_while_live='
+            f'{liveness_remote.remote_cancels_while_live!r}.\n'
+            'The cascade calls _abort_remote_verify before task.cancel().'
+        )
+
+        # ── DONE-WHEN 4(c): B resolves 'done' after cascade + remerge ─────────
+        # After the cascade cancels B's speculative verify and remerges B against
+        # actual main (= original main since A never landed), B re-verifies locally
+        # (call[1] returns passed=True) and advances main cleanly.
+        assert outcome_b.status == 'done', (
+            f'B must resolve done after cascade + remerge + re-verify; '
+            f'got outcome_b={outcome_b!r}.'
+        )
+
+        # ── DONE-WHEN 4(d): B's file on main; A's file NOT on main ────────────
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=spec_git_repo,
+        )
+        assert 'late5_b.py' in main_files, (
+            'B\'s file (late5_b.py) must be on main after cascade + remerge + re-verify'
+        )
+        assert 'late5_a.py' not in main_files, (
+            'A\'s file (late5_a.py) must NOT be on main (A failed verification)'
         )
