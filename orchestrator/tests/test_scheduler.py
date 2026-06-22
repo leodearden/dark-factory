@@ -2600,6 +2600,10 @@ class TestFairness:
         assert scheduler.lock_table.has_parks('H')
         assert scheduler.lock_table.has_parks('L')
 
+        # Block 'other' so L cannot dispatch this tick (lets us observe restored state).
+        scheduler.lock_table.try_acquire('blocker', ['other'])
+        scheduler._dispatched.add('blocker')
+
         # H is cancelled; L is a live pending task.
         h_task = {
             'id': 'H', 'title': 'h', 'status': 'cancelled',
@@ -2615,7 +2619,7 @@ class TestFairness:
 
         await scheduler.acquire_next()
 
-        # H GC'd; L is restored.
+        # H GC'd; L is restored as the active reservation on m1.
         assert not scheduler.lock_table.has_parks('H'), 'H (cancelled) must be GC-evicted'
         assert scheduler.lock_table.has_parks('L'), 'L must be restored after H is GC-evicted'
 

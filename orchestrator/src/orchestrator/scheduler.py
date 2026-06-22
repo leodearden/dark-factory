@@ -2922,7 +2922,7 @@ class Scheduler:
                 return True
             return not self._deps_satisfied(tasks_by_id[tid], status_map, tasks_by_id)
 
-        gc_evicted, _gc_restored = self.lock_table.prune_owners(_park_gc)
+        gc_evicted, gc_restored = self.lock_table.prune_owners(_park_gc)
         for owner in gc_evicted:
             self._skip_count.pop(owner, None)
             if self.event_store:
@@ -2937,6 +2937,16 @@ class Scheduler:
                     EventType.reservation_expired,
                     task_id=owner,
                     data={'reason': reason},
+                )
+        if self.event_store:
+            for restored_owner, restored_modules in gc_restored:
+                self.event_store.emit(
+                    EventType.reservation_restored,
+                    task_id=restored_owner,
+                    data={
+                        'restored_owner': restored_owner,
+                        'modules': restored_modules,
+                    },
                 )
 
         # Drop _last_dispatch_at, _skip_count, _module_cache, _pending_anchor,
@@ -3330,13 +3340,22 @@ class Scheduler:
                 if task_id == top_id:
                     self._skip_count.pop(task_id, None)
                     if top_had_parks:
-                        self.lock_table.clear_parks_for(task_id)
+                        restored_pairs = self.lock_table.clear_parks_for(task_id)
                         if self.event_store:
                             self.event_store.emit(
                                 EventType.reservation_used,
                                 task_id=task_id,
                                 data={'modules': modules, 'priority': pri},
                             )
+                            for restored_owner, restored_modules in restored_pairs:
+                                self.event_store.emit(
+                                    EventType.reservation_restored,
+                                    task_id=restored_owner,
+                                    data={
+                                        'restored_owner': restored_owner,
+                                        'modules': restored_modules,
+                                    },
+                                )
                 else:
                     # A lower-ranked task won — top was passed over this tick.
                     self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
@@ -3767,13 +3786,23 @@ class Scheduler:
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
-        self.lock_table.clear_parks_for(task_id)
+        restored_pairs = self.lock_table.clear_parks_for(task_id)
         if self.event_store and modules:
             self.event_store.emit(
                 EventType.lock_released,
                 task_id=task_id,
                 data={'modules': modules},
             )
+        if self.event_store:
+            for restored_owner, restored_modules in restored_pairs:
+                self.event_store.emit(
+                    EventType.reservation_restored,
+                    task_id=restored_owner,
+                    data={
+                        'restored_owner': restored_owner,
+                        'modules': restored_modules,
+                    },
+                )
 
     # --- Retry cap (per-task REQUEUED counter) ---
 
