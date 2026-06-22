@@ -251,41 +251,60 @@ class TestParkInstallAtTracking:
         )
 
     def test_partial_eviction_preserves_install_at(self):
-        """Partial eviction (owner retains another park) must keep its _park_install_at entry."""
+        """Partial shadow (owner retains another park) must keep its _park_install_at entry."""
         lt = self._make_lock_table()
         # (1) T1 parks two independent modules at medium priority.
         installed, _ = lt.install_parks('T1', ['mod/a', 'mod/b'], 'medium')
         assert len(installed) == 2, f'Expected 2 installs, got {installed}'
         ts = lt._park_install_at['T1']
 
-        # (2) T2 at critical priority evicts ONLY mod/a; T1 retains mod/b.
-        _, evicted = lt.install_parks('T2', ['mod/a'], 'critical')
-        assert evicted == [('T1', ['mod/a'])], f'Expected T1 evicted from mod/a only, got: {evicted}'
-        assert lt.has_parks('T1'), 'T1 still owns mod/b — has_parks must return True'
+        # (2) T2 at critical priority SHADOWS T1 on mod/a only; T1 keeps mod/b (active)
+        #     and is buried on mod/a (shadowed).
+        _, shadowed = lt.install_parks('T2', ['mod/a'], 'critical')
+        assert shadowed == [('T1', ['mod/a'])], f'Expected T1 shadowed on mod/a only, got: {shadowed}'
+        assert lt.has_parks('T1'), 'T1 is shadowed on mod/a AND active on mod/b — has_parks must be True'
 
-        # (3) Core assertion: original timestamp must survive the partial eviction.
+        # (3) Core assertion: original timestamp must survive the shadow.
         assert 'T1' in lt._park_install_at, (
-            'T1 still has parks (mod/b) — its _park_install_at entry must not be dropped'
+            'T1 still has parks (shadowed on mod/a + active on mod/b) — '
+            '_park_install_at entry must not be dropped'
         )
         assert lt._park_install_at['T1'] == ts, (
-            'Partial eviction must preserve the original installed_at timestamp'
+            'Shadow must preserve the original installed_at timestamp'
         )
 
     def test_park_install_at_bounded_under_preemption_churn(self):
-        """_park_install_at must not accumulate stale entries under repeated evictions."""
+        """_park_install_at must stay bounded (not accumulate stale entries) under churn.
+
+        Under shadow semantics: low0 is the first medium owner and persists across all
+        iterations (shadowed by 'high' then restored). Subsequent medium owners (low1…)
+        are blocked by low0 (same priority, INV-3). After 50 rounds exactly one entry
+        remains in _park_install_at.
+        """
         lt = self._make_lock_table()
         for i in range(50):
             lt.install_parks(f'low{i}', ['mod/a'], 'medium')
             lt.install_parks('high', ['mod/a'], 'critical')
-            lt.clear_parks_for('high')  # free mod/a for next iteration
-        # Every low{i} was fully evicted; 'high' was cleared each round.
-        assert len(lt._park_install_at) == 0, (
-            f'Expected empty _park_install_at after all evictions+clears, '
-            f'got {len(lt._park_install_at)} entries — without the fix this would be ~50'
+            lt.clear_parks_for('high')  # restore the persistent medium owner each round
+        # low0 was the first to park; it was shadowed and restored each round.
+        # low1..low49 were all blocked (same priority, INV-3).
+        # 'high' was added and cleared each round.
+        # Net result: exactly 1 entry — low0.
+        assert len(lt._park_install_at) == 1, (
+            f'Expected exactly 1 _park_install_at entry (low0 persists across all rounds), '
+            f'got {len(lt._park_install_at)}: {list(lt._park_install_at)}'
+        )
+        assert 'low0' in lt._park_install_at, (
+            'low0 must be the one persistent medium owner retained across all iterations'
         )
 
-    def test_install_parks_drops_install_at_for_fully_evicted_owner(self):
-        """Full eviction must remove the owner from _park_install_at."""
+    def test_install_parks_preserves_install_at_for_shadowed_owner(self):
+        """Shadow must RETAIN the owner's _park_install_at (owner is buried, not removed).
+
+        Under v2 shadow semantics, a strictly-higher-priority install PUSHES the lower
+        park onto the stack instead of destroying it.  The shadowed owner keeps its
+        has_parks status and its install_at timestamp until it is explicitly cleared.
+        """
         lt = self._make_lock_table()
         # (1) T1 parks mod/a at medium priority.
         installed, _ = lt.install_parks('T1', ['mod/a'], 'medium')
@@ -293,24 +312,63 @@ class TestParkInstallAtTracking:
         old_ts = lt._park_install_at['T1']
         assert 'T1' in lt._park_install_at
 
-        # (2) T2 at critical priority evicts T1 fully.
-        _, evicted = lt.install_parks('T2', ['mod/a'], 'critical')
-        assert evicted == [('T1', ['mod/a'])], f'Expected T1 evicted, got: {evicted}'
-        assert not lt.has_parks('T1'), 'T1 should have no parks after full eviction'
+        # (2) T2 at critical priority SHADOWS T1 (push, not evict).
+        _, shadowed = lt.install_parks('T2', ['mod/a'], 'critical')
+        assert shadowed == [('T1', ['mod/a'])], f'Expected T1 shadowed, got: {shadowed}'
+        # Shadow: T1 is buried, not removed.
+        assert lt.has_parks('T1'), 'T1 must still have parks (buried in shadow stack)'
 
-        # (3) Core regression: stale entry must be gone.
-        assert 'T1' not in lt._park_install_at, (
-            '_park_install_at must drop fully-evicted owner T1'
+        # (3) Core: install_at entry MUST be preserved while T1 is shadowed.
+        assert 'T1' in lt._park_install_at, (
+            '_park_install_at must retain shadowed owner T1 (it still has parks)'
+        )
+        assert lt._park_install_at['T1'] == old_ts, (
+            'Shadow must not reset or drop the installed_at timestamp'
         )
 
-        # (4) Re-install: fresh timestamp must be recorded.
-        lt.clear_parks_for('T2')  # free mod/a
+        # (4) After T2 clears, T1 is RESTORED to the top; install_at still present.
+        lt.clear_parks_for('T2')
+        assert lt.has_parks('T1'), 'T1 must be restored as active after T2 clears'
+        assert lt._park_install_at['T1'] == old_ts, (
+            'Restore must preserve the original installed_at timestamp'
+        )
+
+        # (5) Explicitly clearing T1 drops both the park and install_at.
+        lt.clear_parks_for('T1')
+        assert not lt.has_parks('T1')
+        assert 'T1' not in lt._park_install_at, (
+            '_park_install_at must be dropped when T1 is fully cleared'
+        )
+
+        # (6) Re-install produces a fresh (>= original) timestamp.
         lt.install_parks('T1', ['mod/a'], 'medium')
         assert 'T1' in lt._park_install_at, 'T1 must have a new entry after re-install'
         new_ts = lt._park_install_at['T1']
         assert datetime.fromisoformat(new_ts) >= datetime.fromisoformat(old_ts), (
             'Re-installed timestamp must be >= original'
         )
+
+    def test_snapshot_parks_reports_active_top_only(self):
+        """INV-7: snapshot_parks reports only the active-top owner per module.
+
+        A shadowed (buried) owner must NOT appear in the snapshot even though
+        has_parks returns True for it.  After the top is cleared and the buried
+        owner is restored, it appears in the next snapshot.
+        """
+        lt = self._make_lock_table()
+        lt.install_parks('L', ['mod/a'], 'low')
+        lt.install_parks('H', ['mod/a'], 'high')  # H is on top; L is buried
+
+        snap = lt.snapshot_parks()
+        assert 'H' in snap, 'Active-top H must appear in snapshot'
+        assert 'L' not in snap, 'Buried L must NOT appear in snapshot (INV-7)'
+        assert 'mod/a' in snap['H']['modules'], 'H must report mod/a in its snapshot modules'
+
+        # After H clears, L is restored and must appear in the next snapshot.
+        lt.clear_parks_for('H')
+        snap2 = lt.snapshot_parks()
+        assert 'L' in snap2, 'Restored L must appear in snapshot after H is cleared'
+        assert 'H' not in snap2, 'Cleared H must not appear in snapshot'
 
 
 # ===========================================================================
