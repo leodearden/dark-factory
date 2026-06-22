@@ -139,6 +139,103 @@ class TestEscalationEnabled:
         assert 'llm_adjudicator_reason' not in payload['detail']
 
 
+@pytest.mark.skipif(
+    not sve_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestBudgetMisconfigEscalation:
+    """ScopeViolationEscalator.report_budget_misconfig() — loud config-defect signal."""
+
+    def test_writes_distinct_escalation_file(self, tmp_path):
+        """report_budget_misconfig writes one file with category='adjudicator_config_defect'."""
+        esc = ScopeViolationEscalator()
+        esc_id = esc.report_budget_misconfig(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            cost_usd=0.11,
+            turns=2,
+            max_budget_usd=0.30,
+            model='sonnet',
+        )
+        assert esc_id is not None
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('*.json'))
+        assert len(files) == 1, f'expected one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+        assert payload['id'] == esc_id
+        # DISTINCT category — not scope_violation.
+        assert payload['category'] == 'adjudicator_config_defect'
+        assert payload['severity'] == 'blocking'
+        assert payload['agent_role'] == 'fused-memory/path-scope-adjudicator'
+        # Summary and detail name the budget misconfiguration.
+        assert 'budget' in payload['summary'].lower() or 'misconfig' in payload['summary'].lower()
+        assert str(0.11) in payload['detail'] or '0.11' in payload['detail']
+        assert str(0.30) in payload['detail'] or '0.30' in payload['detail'] or '0.3' in payload['detail']
+        assert 'sonnet' in payload['detail']
+        # Fix hint present.
+        assert 'max_budget_usd' in payload['detail']
+
+    def test_dedup_second_call_within_window_writes_no_file(self, tmp_path):
+        """Two consecutive calls for same project_id write exactly ONE file (burst-suppress)."""
+        esc = ScopeViolationEscalator(budget_misconfig_dedup_window_secs=9999.0)
+        first = esc.report_budget_misconfig(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            cost_usd=0.11,
+            turns=2,
+            max_budget_usd=0.30,
+            model='sonnet',
+        )
+        assert first is not None
+        second = esc.report_budget_misconfig(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            cost_usd=0.12,
+            turns=3,
+            max_budget_usd=0.30,
+            model='sonnet',
+        )
+        assert second is None
+        files = list((tmp_path / 'data' / 'escalations').glob('*.json'))
+        assert len(files) == 1, 'second call within dedup window must not write a new file'
+
+    def test_queue_submit_failure_returns_none_does_not_raise(self, tmp_path, monkeypatch):
+        """A queue.submit failure must be swallowed — escalation is additive."""
+        esc = ScopeViolationEscalator()
+        from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+        def boom(self, _esc):
+            raise RuntimeError('disk full')
+
+        monkeypatch.setattr(EscalationQueue, 'submit', boom)
+        result = esc.report_budget_misconfig(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            cost_usd=0.11,
+            turns=2,
+            max_budget_usd=0.30,
+            model='sonnet',
+        )
+        assert result is None  # no exception propagates
+
+    def test_escalation_detail_includes_turns_and_fix_hint(self, tmp_path):
+        """Detail must carry turns= and a concrete fix hint."""
+        esc = ScopeViolationEscalator()
+        esc.report_budget_misconfig(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            cost_usd=0.05,
+            turns=4,
+            max_budget_usd=0.10,
+            model='claude-3-5-haiku-20241022',
+        )
+        files = list((tmp_path / 'data' / 'escalations').glob('*.json'))
+        payload = json.loads(files[0].read_text())
+        assert 'turns' in payload['detail']
+        # Fix hint names the config key.
+        assert 'max_budget_usd' in payload['detail']
+
+
 class TestEscalationDisabled:
     def test_no_op_when_escalation_pkg_unavailable(self, tmp_path, monkeypatch):
         """When HAS_ESCALATION is False the escalator silently no-ops."""
