@@ -58,7 +58,6 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     GitOps,
     TrainMembership,
-    WarmLaneDiskPressure,
     WarmLanePoolExhausted,
     WarmLaneRequeue,
     _run,

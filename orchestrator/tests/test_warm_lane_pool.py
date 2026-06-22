@@ -657,7 +657,7 @@ class TestAcquireWarmLaneCreateOnce:
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
 
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert isinstance(info, WorktreeInfo)
 
     async def test_acquire_lane_path_is_pool_lane(
@@ -671,7 +671,7 @@ class TestAcquireWarmLaneCreateOnce:
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
 
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         expected_lane = git_ops.worktree_base / '_lane-0'
         assert info.path == expected_lane
 
@@ -685,7 +685,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert await git_ops._is_registered_worktree(info.path)
 
     async def test_acquire_lane_on_correct_branch(
@@ -698,7 +698,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
 
         # Check HEAD SHA matches start_ref
         _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info.path)
@@ -720,7 +720,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert len(info.base_commit) == 40
 
     async def test_acquire_provides_debug_port(
@@ -733,7 +733,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert info.reify_debug_port == 39411
 
     async def test_acquire_seed_invoked_with_fresh_checkout(
@@ -764,7 +764,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert mode_log.exists(), 'seed script was not called'
         assert mode_log.read_text().strip() == '--fresh-checkout'
 
@@ -778,7 +778,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert (info.path / 'target' / 'seeded.bin').exists()
 
     async def test_acquire_marks_pool_lane_assigned(
@@ -792,7 +792,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
 
@@ -926,13 +926,13 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         assert git_ops.warm_lane_pool is not None
         # Release the lane (mark FREE directly — release_warm_lane comes in step-12)
         await git_ops.warm_lane_pool.release(info_a.path)
 
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
         assert info_b.path == info_a.path  # same _lane-0
 
     async def test_reacquire_head_is_at_new_commit(
@@ -943,12 +943,12 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
 
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_b.path)
         assert head_sha.strip() == sha_b
@@ -961,7 +961,7 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
 
         # Simulate stray work: untracked file and modification of tracked file
         (info_a.path / 'stray.txt').write_text('should be gone\n')
@@ -973,7 +973,7 @@ class TestAcquireWarmLaneResetInPlace:
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         # stray.txt must be gone
         assert not (info_b.path / 'stray.txt').exists()
@@ -1006,7 +1006,7 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         calls_after_first = (
             seed_marker.read_text() if seed_marker.exists() else ''
         ).splitlines()
@@ -1014,7 +1014,7 @@ class TestAcquireWarmLaneResetInPlace:
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         calls_after_second = (
             seed_marker.read_text() if seed_marker.exists() else ''
@@ -1045,14 +1045,14 @@ class TestAcquireWarmLaneResetInPlace:
         seed_marker = wl_git_repo / 'seed_calls.txt'
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         # Record marker state after first (create-once) acquire
         calls_after_first = seed_marker.read_text() if seed_marker.exists() else ''
 
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         calls_after_second = seed_marker.read_text() if seed_marker.exists() else ''
         # D10: seed MUST be called on the recycle path (new line in marker)
@@ -1073,12 +1073,12 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
 
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         _, wt_list, _ = await _run(
             ['git', 'worktree', 'list', '--porcelain'], cwd=wl_git_repo,
@@ -1242,7 +1242,7 @@ class TestReleaseWarmLane:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         return git_ops, info
 
     async def test_release_marks_pool_free(
@@ -1315,7 +1315,7 @@ class TestReleaseWarmLane:
 
         _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
         info2 = await git_ops.acquire_warm_lane('task-C', start_ref.strip())
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
         assert info2.path == lane
 
     async def test_release_idempotent_when_already_free(
@@ -1401,7 +1401,7 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
 
         # Simulate agent work: WIP on a tracked file + .task/plan.json + target/
         (info1.path / 'task_work.txt').write_text('WIP changes\n')
@@ -1414,7 +1414,7 @@ class TestAcquireWarmLaneReuse:
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
 
         # TODAY: try_acquire() returns None (exhausted) → info2 is None → RED
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
     async def test_reuse_same_lane_path(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
@@ -1424,13 +1424,13 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         (info1.path / 'task_work.txt').write_text('WIP\n')
         (info1.path / '.task').mkdir(exist_ok=True)
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
         assert info2.path == info1.path
 
     async def test_reuse_preserves_task_plan_json(
@@ -1442,7 +1442,7 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         # Write .task/plan.json (gitignored by .task/.gitignore set up by acquire)
         (info1.path / '.task').mkdir(exist_ok=True)
         plan_file = info1.path / '.task' / 'plan.json'
@@ -1450,7 +1450,7 @@ class TestAcquireWarmLaneReuse:
         (info1.path / 'task_work.txt').write_text('WIP\n')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         assert plan_file.exists(), '.task/plan.json must be preserved on reuse'
         data = json.loads(plan_file.read_text())
@@ -1466,14 +1466,14 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         # Staged WIP on tracked file
         (info1.path / 'task_work.txt').write_text('WIP changes\n')
         (info1.path / '.task').mkdir(exist_ok=True)
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         # A commit with 'save WIP' in message must be reachable from HEAD
         _, log_out, _ = await _run(
@@ -1505,7 +1505,7 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         cache_file = info1.path / 'target' / 'cache.bin'
         cache_file.parent.mkdir(exist_ok=True)
         cache_file.write_bytes(b'\xca\xfe' * 64)
@@ -1514,7 +1514,7 @@ class TestAcquireWarmLaneReuse:
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         assert cache_file.exists(), 'target/cache.bin must be retained on reuse'
 
@@ -1526,7 +1526,7 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         calls_after_first = seed_marker.read_text() if seed_marker.exists() else ''
 
         (info1.path / 'task_work.txt').write_text('WIP\n')
@@ -1534,7 +1534,7 @@ class TestAcquireWarmLaneReuse:
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         calls_after_second = seed_marker.read_text() if seed_marker.exists() else ''
         assert calls_after_second == calls_after_first, (
@@ -1549,13 +1549,13 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         (info1.path / 'task_work.txt').write_text('WIP\n')
         (info1.path / '.task').mkdir(exist_ok=True)
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.assignment_for('task-A') == info1.path
@@ -1593,7 +1593,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # First GitOps: fresh acquire for 'task-A'
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
 
         # Simulate agent writing plan.json + tracked WIP
         plan_file = info1.path / '.task' / 'plan.json'
@@ -1611,7 +1611,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
 
         # TODAY: fresh-but-registered → _reset_warm_lane → git clean → .task/ gone
         # After step-24: reads plan.json, detects task_id match → _reuse_warm_lane
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
         assert info2.path == info1.path  # same _lane-0
 
         assert plan_file.exists(), '.task/plan.json must be preserved by disk backstop'
@@ -1628,7 +1628,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
 
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         plan_file = info1.path / '.task' / 'plan.json'
         plan_file.write_text('{"task_id": "task-A"}')
         (info1.path / 'task_work.txt').write_text('WIP work\n')
@@ -1636,7 +1636,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # Restart
         git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info2 = await git_ops2.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         # sha_main must be ancestor of HEAD (rebased)
         rc, _, _ = await _run(
@@ -1654,7 +1654,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # Acquire for 'task-A', write plan.json
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         plan_file = info1.path / '.task' / 'plan.json'
         plan_file.write_text('{"task_id": "task-A"}')
 
@@ -1664,7 +1664,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # Fresh restart: acquire for 'task-Z' (different branch)
         git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info2 = await git_ops2.acquire_warm_lane('task-Z', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
         assert info2.path == info1.path  # same _lane-0 (pool gave it)
 
         # .task/plan.json should be GONE (fresh reset cleaned it)
@@ -1688,7 +1688,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
 
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         plan_file = info1.path / '.task' / 'plan.json'
         plan_file.write_text('{"task_id": "task-A"}')
         calls_after_first = (
@@ -1699,7 +1699,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
 
         git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info2 = await git_ops2.acquire_warm_lane('task-Z', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         calls_after_second = (
             seed_marker.read_text() if seed_marker.exists() else ''
