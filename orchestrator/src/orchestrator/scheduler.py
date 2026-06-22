@@ -630,6 +630,18 @@ class ModuleLockTable:
 
         Returns ``list[(restored_owner, sorted_modules)]`` in first-seen order.
         Callers use the returned pairs to emit ``reservation_restored`` events.
+
+        **Hierarchical victim note**: for hierarchical (different-key) shadows,
+        the hierarchical victim's own stack is NEVER touched during the
+        preemptor's removal — the preemptor only appears in its own normalized
+        key's stack, so ``was_top`` only fires for that key.  The victim becomes
+        acquirable the instant the preemptor is removed (rank-aware blocking in
+        ``_is_parked_blocks`` stops gating on the now-absent foreign top), but no
+        ``reservation_restored`` pair is returned and no event is emitted.  This
+        asymmetry is intentional (documented in the plan's design decisions):
+        adding cross-key restore detection would require scanning all stacks for
+        newly-unblocked entries on every removal.  Exact-match shadows (same
+        key) always produce a restore pair; hierarchical shadows do not.
         """
         # Track which modules had task_id as their ACTIVE TOP before removal.
         was_top: set[str] = set()
@@ -716,9 +728,18 @@ class ModuleLockTable:
                     # Merge modules for the same restored owner across multiple calls.
                     merged = sorted(set(all_restored_acc[restored_owner]) | set(mods))
                     all_restored_acc[restored_owner] = merged
+        # Filter out any owner that is itself being evicted in this same sweep.
+        # When removing top Z exposes lower Y (recorded in all_restored), but Y
+        # also matches the predicate and is later evicted, the caller would
+        # otherwise emit a spurious reservation_restored for a task whose parks
+        # are all gone.  Filtering against the evicted set removes that noise
+        # without any state-correctness impact (the removal itself already
+        # happened via _remove_owner).
+        evicted_set = set(evicted)
         all_restored = [
             (owner, all_restored_acc[owner])
             for owner in all_restored_order
+            if owner not in evicted_set
         ]
         return evicted, all_restored
 

@@ -76,7 +76,7 @@ class TestInstallParksApi:
 class TestInstallParksPreemption:
     """Cross-tier preemption: higher-priority park SHADOWS lower-priority overlap."""
 
-    def test_higher_tier_evicts_lower_overlap(self):
+    def test_higher_tier_shadows_lower_overlap(self):
         """High-priority install SHADOWS (not destroys) a lower-priority park on the same module."""
         lt = _lt()
         lt.install_parks('L', ['m1', 'm2'], 'low')
@@ -95,7 +95,7 @@ class TestInstallParksPreemption:
         lt.clear_parks_for('H')
         assert lt.try_acquire('L', ['m1'])
 
-    def test_higher_tier_evicts_multiple_lower_owners(self):
+    def test_higher_tier_shadows_multiple_lower_owners(self):
         """A single high-priority install shadows parks from multiple owners."""
         lt = _lt()
         # L1 parks m1; L2 parks m2.
