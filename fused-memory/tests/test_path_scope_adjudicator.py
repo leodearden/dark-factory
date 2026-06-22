@@ -19,12 +19,22 @@ from fused_memory.config.schema import PathScopeAdjudicatorConfig
 # ---------------------------------------------------------------------------
 
 
-def _make_adjudicator(config: PathScopeAdjudicatorConfig | None = None, *, tmp_path=None):
+def _make_adjudicator(
+    config: PathScopeAdjudicatorConfig | None = None,
+    *,
+    tmp_path=None,
+    escalator=None,
+):
     """Construct a PathScopeAdjudicator with minimal wiring."""
     from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
 
     cfg = config or PathScopeAdjudicatorConfig()
-    return PathScopeAdjudicator(config=cfg, usage_gate=None, cwd=tmp_path)
+    return PathScopeAdjudicator(
+        config=cfg,
+        usage_gate=None,
+        cwd=tmp_path,
+        scope_violation_escalator=escalator,
+    )
 
 
 def _agent_result(
@@ -33,6 +43,8 @@ def _agent_result(
     output: str = '',
     timed_out: bool = False,
     subtype: str | None = None,
+    cost_usd: float = 0.0,
+    turns: int = 0,
 ):
     """Build a minimal AgentResult for patching."""
     from shared.cli_invoke import AgentResult
@@ -43,6 +55,8 @@ def _agent_result(
         structured_output=structured_output,
         timed_out=timed_out,
         subtype=subtype or '',
+        cost_usd=cost_usd,
+        turns=turns,
     )
 
 

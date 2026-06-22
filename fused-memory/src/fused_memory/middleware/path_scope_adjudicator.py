@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import PathScopeAdjudicatorConfig
+    from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
 
 logger = logging.getLogger(__name__)
 
@@ -169,10 +170,12 @@ class PathScopeAdjudicator:
         config: PathScopeAdjudicatorConfig,
         usage_gate: UsageGate | None = None,
         cwd: Path | None = None,
+        scope_violation_escalator: ScopeViolationEscalator | None = None,
     ) -> None:
         self._config = config
         self._usage_gate = usage_gate
         self._cwd = cwd
+        self._escalator = scope_violation_escalator
 
         # Consecutive-ZOT circuit breaker (mirrors TaskCurator lines 505-543).
         self._consecutive_zero_output_timeouts: int = 0
