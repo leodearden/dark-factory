@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, WorktreeInfo, _run
+from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 
 # ---------------------------------------------------------------------------
@@ -796,34 +796,77 @@ class TestAcquireWarmLaneCreateOnce:
         assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
 
-    async def test_acquire_exhausted_returns_none(
+    async def test_acquire_exhausted_returns_exhausted(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Pool exhaustion: acquire returns None (caller should cold-fallback)."""
+        """Pool exhaustion: acquire returns WarmLaneUnavailable.EXHAUSTED (backpressure)."""
         await _add_seed_and_debug_port_scripts(wl_git_repo)
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
         start_ref = start_ref.strip()
 
-        # Exhaust the pool
+        # Exhaust the pool with the first acquire
         info1 = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo), f'Expected WorktreeInfo, got {info1!r}'
 
-        # Next acquire should return None (exhausted)
+        # Next acquire must return EXHAUSTED — never bare None
         info2 = await git_ops.acquire_warm_lane('task-B', start_ref)
-        assert info2 is None
+        assert info2 is WarmLaneUnavailable.EXHAUSTED, (
+            f'Expected WarmLaneUnavailable.EXHAUSTED on pool exhaustion, got {info2!r}'
+        )
 
-    async def test_acquire_absent_seed_returns_none(
+    async def test_acquire_absent_seed_returns_fault(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """No seed-warm-lane.sh → acquire returns None (cold-fallback signal)."""
-        # No scripts committed — seed will fail → acquire returns None
+        """No seed-warm-lane.sh → acquire returns WarmLaneUnavailable.FAULT (infra fault)."""
+        # No scripts committed — seed will fail with rc=127 (absent script sentinel)
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
         _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is None
+        assert info is WarmLaneUnavailable.FAULT, (
+            f'Expected WarmLaneUnavailable.FAULT for absent seed script, got {info!r}'
+        )
+
+    async def test_acquire_create_once_seed_disk_pressure_returns_disk_pressure(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Create-once acquire whose seed exits 75 → WarmLaneUnavailable.DISK_PRESSURE.
+
+        The lane is released back to FREE (no leaked ASSIGNED lanes).
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        # Commit a seed script that exits 75 + a debug-port script
+        scripts_dir = wl_git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(
+            '#!/usr/bin/env bash\necho "disk pressure" >&2\nexit 75\n'
+        )
+        seed_script.chmod(0o755)
+        debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+        debug_script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        debug_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=wl_git_repo)
+        await _run(['git', 'commit', '-m', 'add disk-pressure seed script'], cwd=wl_git_repo)
+
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        result = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert result is WarmLaneUnavailable.DISK_PRESSURE, (
+            f'Expected WarmLaneUnavailable.DISK_PRESSURE for seed exit 75, got {result!r}'
+        )
+
+        # Lane must be released back to FREE — no leaked ASSIGNED lanes
+        assert git_ops.warm_lane_pool is not None
+        lane = git_ops.warm_lane_pool._base / '_lane-0'
+        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after DISK_PRESSURE failure, got {git_ops.warm_lane_pool.state(lane)!r}'
+        )
 
 
 # ===========================================================================
