@@ -1967,3 +1967,189 @@ class TestLateArrivalAttaches:
 
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
+
+
+# ===========================================================================
+# Step-3 RED→GREEN: predecessor landing produces clean CAS — no disjoint-skip
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestLateArrivalCleanCAS:
+    """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
+
+    DONE-WHEN 3: _reverify_rebased_tree is NEVER called for B; advance_main for B
+    returns 'advanced' (not 'rebased_pending_reverify'); both files are on main;
+    B's merge SHA is a descendant of A's merge commit.
+
+    On main (RED): B merged against plain main → B.base_sha = main-before-A.
+    When A lands, main = A's merge commit ≠ main-before-A → advance_main rebases
+    → 'rebased_pending_reverify' → _reverify_rebased_tree disjoint fast-path runs.
+
+    GREEN after step-2: B.base_sha = A's merge commit == main-after-A → clean CAS
+    → 'advanced' → _reverify_rebased_tree unreachable.
+    """
+
+    async def test_predecessor_land_no_reverify_clean_advance(
+        self, spec_git_repo: Path,
+    ) -> None:
+        """A lands first; B advances cleanly with no rebase and no _reverify_rebased_tree.
+
+        RED: _reverify_rebased_tree called for B (disjoint fast-path); advance returns
+        'rebased_pending_reverify'.
+
+        GREEN (step-2): B.base_sha == A's merge commit == main-after-A → 'advanced'.
+        """
+        from orchestrator.merge_queue import (
+            _reverify_rebased_tree as _orig_reverify,
+        )
+
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+        fake_event_store = _LateArrivalFakeEventStore()
+
+        # ── Spy: capture advance_main result per branch ───────────────────────
+        advance_outcomes: dict[str, str] = {}
+        original_advance_main = git_ops.advance_main
+
+        async def _spy_advance_main(
+            merge_sha: str,
+            merge_worktree: Any = None,
+            branch: str | None = None,
+            **kwargs: Any,
+        ) -> Any:
+            result = await original_advance_main(
+                merge_sha, merge_worktree, branch=branch, **kwargs,
+            )
+            if branch:
+                advance_outcomes[branch] = str(result)
+            return result
+
+        git_ops.advance_main = _spy_advance_main  # type: ignore[method-assign]
+
+        # ── Spy: track _reverify_rebased_tree calls per task_id ───────────────
+        reverify_calls: list[str] = []
+
+        async def _spy_reverify(
+            git_ops_arg: Any,
+            req_arg: Any,
+            merge_wt: Any,
+            **kwargs: Any,
+        ) -> Any:
+            reverify_calls.append(getattr(req_arg, 'task_id', '?'))
+            return await _orig_reverify(git_ops_arg, req_arg, merge_wt, **kwargs)
+
+        # ── Gate A's LOCAL verify ──────────────────────────────────────────────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # ── Gate B's REMOTE verify — hold until A has landed ─────────────────
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='late3-laptop',
+        )
+
+        # ── Build branches (disjoint files) ──────────────────────────────────
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/late3-a', 'late3_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/late3-b', 'late3_b.py', 'b = 2\n',
+        )
+
+        worker = _make_late_arrival_worker(git_ops, event_store=fake_event_store)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        req_a = _make_request('late3-a', 'task/late3-a', wt_a, config)
+        req_b = _make_request('late3-b', 'task/late3-b', wt_b, config)
+
+        # ── Run harness ────────────────────────────────────────────────────────
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _gated_local),
+            patch('orchestrator.merge_queue._reverify_rebased_tree', _spy_reverify),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue A only; wait for its verify to enter the gate (look-ahead done).
+            await worker._queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # Inject B late — after the one-shot look-ahead peek.
+            await worker._queue.put(req_b)
+
+            # Wait for B's remote verify to enter (B has been merged + dispatched).
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # Release A → A's verify completes, A's advance_main fires, A lands.
+            gate_a_release.set()
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status == 'done', f'A must land cleanly; got {outcome_a!r}'
+
+            # A has landed → main == A's merge commit.  Now release B.
+            gate_b_release.set()
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── Assertions ────────────────────────────────────────────────────────
+
+        assert outcome_b.status == 'done', (
+            f'B must land cleanly after A; got {outcome_b!r}'
+        )
+
+        # DONE-WHEN 3(a): _reverify_rebased_tree NEVER called for B.
+        # RED: B.base_sha = plain-main ≠ main-after-A → rebase → reverify called.
+        # GREEN (step-2): B.base_sha = A's commit = main-after-A → clean CAS → unreachable.
+        assert 'late3-b' not in reverify_calls, (
+            f'_reverify_rebased_tree must NOT be called for B; '
+            f'was called for task_ids: {reverify_calls!r}.\n'
+            'RED: B.base_sha = plain-main → advance_main rebases → '
+            'rebased_pending_reverify → _reverify_rebased_tree disjoint fast-path.\n'
+            'GREEN (step-2): B.base_sha == A\'s merge commit == main-after-A → '
+            'clean CAS → _reverify_rebased_tree unreachable.'
+        )
+
+        # DONE-WHEN 3(b): advance_main for B returned 'advanced' (clean CAS).
+        # RED: advance returns 'rebased_pending_reverify'.
+        # GREEN (step-2): advance returns 'advanced'.
+        b_branch = 'task/late3-b'
+        assert advance_outcomes.get(b_branch) == 'advanced', (
+            f'advance_main for B must return \'advanced\'; '
+            f'got {advance_outcomes.get(b_branch)!r}.\n'
+            'RED: B.base_sha = plain-main → mismatch with main-after-A → '
+            '\'rebased_pending_reverify\'.\n'
+            'GREEN (step-2): B.base_sha == A\'s merge commit → clean CAS → \'advanced\'.'
+        )
+
+        # DONE-WHEN 3(c): both files on main.
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=spec_git_repo,
+        )
+        assert 'late3_a.py' in main_files, 'A\'s file (late3_a.py) must be on main'
+        assert 'late3_b.py' in main_files, 'B\'s file (late3_b.py) must be on main'
+
+        # DONE-WHEN 3(d): B's merge SHA is a descendant of A's.
+        # After a clean CAS, B's merge commit was parented on A's merge commit.
+        a_advance_branch = 'task/late3-a'
+        a_advanced = advance_outcomes.get(a_advance_branch) == 'advanced'
+        assert a_advanced, (
+            f'A must also have advanced cleanly; got {advance_outcomes.get(a_advance_branch)!r}'
+        )
