@@ -666,7 +666,6 @@ class TestG5Gate:
         config = _make_config()
         git_ops = GitOps(config, ig_git_repo, warm_lane_pool_size=1)
         assert git_ops.warm_lane_pool is not None
-        lane_0 = git_ops.worktree_base / '_lane-0'
 
         # ── Phase A: THIN recycle ────────────────────────────────────────────
         info_a = await git_ops.create_worktree('A')
@@ -674,8 +673,8 @@ class TestG5Gate:
             f'Phase A: first acquire must return WorktreeInfo, got {info_a!r}'
         )
         lane_path = info_a.path
-        # Cross-phase invariant: the SAME _lane-0 is reused across all phases.
-        # (lane_0 == worktree_base/_lane-0; implicitly the only lane in a size-1 pool)
+        # Cross-phase invariant: the SAME _lane-0 is reused across all phases
+        # (implicitly the only lane in a size-1 pool).
 
         # Plant divergence artifact
         (lane_path / 'target').mkdir(exist_ok=True)
