@@ -55,7 +55,14 @@ from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, TrainMembership, _run
+from orchestrator.git_ops import (
+    GitOps,
+    TrainMembership,
+    WarmLaneDiskPressure,
+    WarmLanePoolExhausted,
+    WarmLaneRequeue,
+    _run,
+)
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
@@ -2031,6 +2038,28 @@ class TaskWorkflow:
                 f'Unhandled set_task_status rejection: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+
+        except WarmLaneRequeue as e:
+            # Discriminate the subclass for the block-reason annotation so the
+            # requeue is traceable in metrics / steward review.
+            # WarmLanePoolExhausted → backpressure (all lanes ASSIGNED).
+            # WarmLaneDiskPressure  → transient infra (seed exited 75 EX_TEMPFAIL).
+            # FAULT (RuntimeError) is deliberately NOT caught here — it falls through
+            # to the broad except below → _mark_blocked → BLOCKED + L1.
+            if isinstance(e, WarmLanePoolExhausted):
+                block_reason = 'warm_lane_pool_exhausted'
+                block_phase = 'backpressure'
+            else:  # WarmLaneDiskPressure
+                block_reason = 'warm_lane_disk_pressure (transient infra)'
+                block_phase = 'transient_infra'
+            logger.info(
+                'Task %s: warm-lane requeue (%s): %s',
+                self.task_id, block_reason, e,
+            )
+            self._last_block_reason = block_reason
+            self._last_block_phase = block_phase
+            self._last_block_detail = str(e)
+            return WorkflowOutcome.REQUEUED
 
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
