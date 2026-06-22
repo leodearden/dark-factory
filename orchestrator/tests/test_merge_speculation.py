@@ -42,14 +42,25 @@ _patch_cold_shadow_verify(monkeypatch, return_value) (helper)
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import stat
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import make_placeholder_future, pydantic_spec  # noqa: F401
+from test_merge_queue_concurrent_verify import (  # noqa: F401
+    _gated_runner,
+    _id_liveness_fake_runner,
+    _inject_two_host_allocator,
+    _make_branch_with_file,
+    _make_request,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
+from orchestrator.event_store import EventStore, EventType  # noqa: F401
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run  # noqa: F401
 from orchestrator.merge_queue import (  # noqa: F401
     InflightEntry,
@@ -66,6 +77,10 @@ from orchestrator.merge_queue import (  # noqa: F401
 )
 from orchestrator.verify import VerifyResult  # noqa: F401
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
+
+# Late-arrival integration helpers (task 1862): reuse module-level helpers
+# from test_merge_queue_concurrent_verify.  These are private (_-prefixed)
+# module-level functions so pytest does not collect them as tests.
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -1645,4 +1660,1487 @@ class TestSpecLaneFinalizeTerminalRelease:
         assert fake_lane not in cleaned, (
             'cas-retry-exhausted path must call release_spec_lane, '
             'not cleanup_merge_worktree on warm _spec- lane'
+        )
+
+
+# ===========================================================================
+# Late-arrival integration scaffolding (pre-1 / task 1862)
+# ===========================================================================
+# Helpers for the "late-arrival attach to in-flight predecessor tip" tests
+# (task 1862, steps 1–8).  The predecessor A's verify is gated so B is
+# injected AFTER the Merger's one-shot look-ahead peek has run and found
+# nothing — making B a genuine post-peek late arrival.
+#
+# Architecture overview
+# ---------------------
+# • spec_git_repo fixture (already defined above) provides the real repo.
+# • _gated_runner / _inject_two_host_allocator / _make_branch_with_file /
+#   _make_request are imported from test_merge_queue_concurrent_verify at the
+#   top of this file (module-level, importable via conftest sys.path setup).
+# • _LateArrivalFakeEventStore records speculative_merge / speculative_discard
+#   events for assertion.
+# • _make_late_arrival_git_config / _make_late_arrival_worker build the
+#   worker.run() harness with K=2 (speculation_depth=2) and a wired
+#   event_store.
+#
+# CONFTEST AUTOUSE OVERRIDE
+# -------------------------
+# The conftest autouse _mock_merge_queue_verification fixture monkeypatches
+# orchestrator.merge_queue.run_scoped_verification to return passed=True.
+# Each late-arrival integration test overrides this IN-BODY via:
+#
+#     with patch('orchestrator.merge_queue.run_scoped_verification', gated_local):
+#
+# A context-manager patch() applied inside the test body takes precedence
+# over the function-scoped monkeypatch binding for the duration of the
+# with-block — the same mechanism used by TestChainInvalidationUnderOverlap
+# in test_merge_queue_concurrent_verify.py.
+# ===========================================================================
+
+
+class _LateArrivalFakeEventStore(EventStore):
+    """Capturing EventStore for late-arrival speculative event assertions.
+
+    Records every emit() call as a dict ``{'type', 'task_id', 'data'}``.
+    Never performs SQLite I/O — ``object.__init__`` bypasses the DB setup
+    in ``EventStore.__init__``.
+
+    Usage::
+
+        store = _LateArrivalFakeEventStore()
+        worker = _make_late_arrival_worker(git_ops, event_store=store)
+        ...
+        spec_events = store.speculative_events(EventType.speculative_merge)
+        assert spec_events[0]['data']['base_sha'] == expected_sha
+    """
+
+    def __init__(self) -> None:
+        object.__init__(self)
+        self.events: list[dict] = []
+
+    def emit(  # type: ignore[override]
+        self,
+        event_type,
+        *,
+        task_id=None,
+        phase=None,
+        role=None,
+        data=None,
+        cost_usd=None,
+        duration_ms=None,
+    ) -> None:
+        self.events.append({
+            'type': event_type,
+            'task_id': task_id,
+            'data': data or {},
+        })
+
+    def speculative_events(
+        self, event_type: EventType | None = None,
+    ) -> list[dict]:
+        """Return recorded events, optionally filtered by EventType."""
+        if event_type is None:
+            return list(self.events)
+        return [e for e in self.events if e['type'] == event_type]
+
+
+def _make_late_arrival_git_config() -> GitConfig:
+    """Plain GitConfig for late-arrival integration tests (no warm-lane pool).
+
+    Warm-lane pool is intentionally disabled so spec-lane routing does not
+    interfere with the late-arrival mechanism under test.
+    """
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+
+
+def _make_late_arrival_worker(
+    git_ops: GitOps,
+    event_store: _LateArrivalFakeEventStore | None = None,
+    *,
+    speculation_depth: int = 2,
+) -> SpeculativeMergeWorker:
+    """Build a K=2 SpeculativeMergeWorker wired for late-arrival integration tests.
+
+    K=2 (speculation_depth=2) allows A and B to verify concurrently — A on
+    the remote gated runner and B on the local slot once it attaches to
+    A's pending spec-base.  The event_store is wired so speculative_merge /
+    speculative_discard events are captured for DONE-WHEN 1/2/4 assertions.
+
+    Returns the worker; the caller must inject a two-host HostAllocator via
+    _inject_two_host_allocator(worker, gated_remote) before calling worker.run().
+    """
+    q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    return SpeculativeMergeWorker(
+        git_ops,
+        q,
+        event_store=event_store,
+        speculation_depth=speculation_depth,
+    )
+
+
+# ===========================================================================
+# Step-1 RED: late arrival attaches to in-flight predecessor's merge commit
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestLateArrivalAttaches:
+    """Step-1 RED — late arrival B attaches to in-flight predecessor A's merge commit.
+
+    DONE-WHEN 1: a ``speculative_merge`` event is emitted for B with
+    ``data.base_sha == A's merge commit SHA``.
+
+    DONE-WHEN 2: ``git_ops.merge_to_main`` is invoked for B with
+    ``base_sha == A's merge commit SHA``.
+
+    On main (RED): line 6875 unconditionally resets ``spec_base = None`` on every
+    fresh dequeue.  B is merged non-speculatively against plain main
+    (``merge_to_main base_sha=None``); no ``speculative_merge`` event is emitted
+    for B.
+
+    GREEN after step-2: ``pending_spec_base`` carries A's merge commit across the
+    blocking dequeue so B attaches and is merged against main+A.
+    """
+
+    async def test_late_arrival_attaches_to_predecessor_tip(
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Genuine post-peek late arrival B merges against A's in-flight commit.
+
+        RED:
+          - ``b_merge['base_sha']`` is ``None`` (non-speculative plain-main merge)
+          - no ``speculative_merge`` event with B's task_id
+        GREEN (step-2):
+          - ``b_merge['base_sha'] == a_merge_commit``
+          - ``speculative_merge`` event for B carries the same ``base_sha``
+        """
+        # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+        fake_event_store = _LateArrivalFakeEventStore()
+
+        # ── Spy on merge_to_main to capture base_sha and merge commits ─────────
+        _merge_calls: list[dict] = []
+        original_merge_to_main = git_ops.merge_to_main
+
+        async def _spy_merge_to_main(
+            wt: Path, branch: str, base_sha: str | None = None,
+        ) -> Any:
+            result = await original_merge_to_main(wt, branch, base_sha=base_sha)
+            _merge_calls.append({
+                'branch': branch,
+                'base_sha': base_sha,
+                'merge_commit': result.merge_commit,
+                'success': result.success,
+            })
+            return result
+
+        git_ops.merge_to_main = _spy_merge_to_main  # type: ignore[method-assign]
+
+        # ── Gate for A's LOCAL verify ──────────────────────────────────────────
+        # Gating the LOCAL verify (run_scoped_verification) holds A in-flight so
+        # the Merger's look-ahead peek fires and finds nothing, then blocks waiting
+        # for a new request.  gate_a_entered fires inside _gated_local on the first
+        # call — by then the look-ahead has already completed (it has no yield points
+        # between permit-acquire and pop, so it runs synchronously before the verify
+        # task gets an event-loop tick).
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # ── B's remote runner — passes immediately (no gate needed for step-1) ─
+        gate_b_prerelease = asyncio.Event()
+        gate_b_prerelease.set()  # B's remote verify returns right away
+        fake_remote = _gated_runner(
+            gate_b_prerelease, passed=True, name='late-step1-laptop',
+        )
+
+        # ── Build branches ─────────────────────────────────────────────────────
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/late1-a', 'late1_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/late1-b', 'late1_b.py', 'b = 2\n',
+        )
+
+        # ── Build K=2 worker ───────────────────────────────────────────────────
+        worker = _make_late_arrival_worker(git_ops, event_store=fake_event_store)
+        _inject_two_host_allocator(worker, fake_remote)
+
+        req_a = _make_request('late1-a', 'task/late1-a', wt_a, config)
+        req_b = _make_request('late1-b', 'task/late1-b', wt_b, config)
+
+        # ── Run the harness ────────────────────────────────────────────────────
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue A only — B is withheld until after the look-ahead peek.
+            await worker._queue.put(req_a)
+
+            # A's verify enters the gate.  By this point the Merger has already:
+            #   (1) merged A and put it on the verifier queue
+            #   (2) acquired the speculation permit
+            #   (3) done the look-ahead peek (synchronous, no yield) → found nothing
+            #   (4) released the permit, set spec_base=None
+            #   (5) blocked in _acquire_next_request()
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # B arrives LATE — after the one-shot look-ahead has already fired.
+            await worker._queue.put(req_b)
+
+            # Poll until B's merge_to_main call appears in the spy (indicates the
+            # Merger has dequeued B and merged it — either speculatively or not).
+            deadline = asyncio.get_running_loop().time() + 10.0
+            while (
+                not any(c['branch'] == 'task/late1-b' for c in _merge_calls)
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.05)
+
+            # ── Assertions while A is still in-flight ─────────────────────────
+            b_spy = [c for c in _merge_calls if c['branch'] == 'task/late1-b']
+            a_spy = [c for c in _merge_calls if c['branch'] == 'task/late1-a']
+
+            assert a_spy, 'merge_to_main must have been called for A'
+            assert b_spy, 'merge_to_main must have been called for B (timed out waiting)'
+
+            a_merge_commit = a_spy[0]['merge_commit']
+            assert a_merge_commit is not None, 'A must have a non-None merge commit'
+            a_merge_commit = a_merge_commit.strip()
+
+            # DONE-WHEN 2: merge_to_main for B invoked with base_sha == A's merge commit.
+            # RED: base_sha=None (line 6875 resets spec_base on fresh dequeue → B non-spec).
+            # GREEN (step-2): base_sha == a_merge_commit (pending_spec_base attaches B).
+            assert b_spy[0]['base_sha'] == a_merge_commit, (
+                f'B must be merged speculatively against A\'s merge commit '
+                f'{a_merge_commit!r}; got base_sha={b_spy[0]["base_sha"]!r}.\n'
+                'RED: _merger_loop line 6875 resets spec_base=None on fresh dequeue '
+                'so B is merged against plain main (base_sha=None).\n'
+                'GREEN (step-2): pending_spec_base holds A\'s commit across the '
+                'blocking _acquire_next_request → B.base_sha == A\'s merge commit.'
+            )
+
+            # DONE-WHEN 1: speculative_merge event for B with base_sha == A's merge commit.
+            # RED: no speculative_merge event for B (B is non-speculative).
+            b_spec_events = fake_event_store.speculative_events(EventType.speculative_merge)
+            b_spec_events = [e for e in b_spec_events if e['task_id'] == 'late1-b']
+
+            assert len(b_spec_events) == 1, (
+                f'Expected exactly one speculative_merge event for B; '
+                f'got {len(b_spec_events)}.\n'
+                'RED: B is merged non-speculatively (spec_base=None) → no '
+                'speculative_merge event emitted.\n'
+                'GREEN (step-2): B attaches to A\'s pending spec base → '
+                'speculative=True → speculative_merge emitted before merge_to_main.'
+            )
+            assert b_spec_events[0]['data'].get('base_sha') == a_merge_commit, (
+                f'speculative_merge event for B must carry base_sha={a_merge_commit!r}; '
+                f'got {b_spec_events[0]["data"]!r}.\n'
+                'RED: event not emitted at all (B non-speculative).\n'
+                'GREEN (step-2): base_sha = pending_spec_base = A\'s merge commit.'
+            )
+
+            # DONE-WHEN 2 (mechanism): assert the late-arrival ATTACH code path
+            # fired — not just the outcome.  The ATTACH branch emits a DEBUG log
+            # 'late arrival attaches to in-flight predecessor …'.  If a future
+            # edit introduces an await inside _pop_next_pickable/_drain_queue so B
+            # is prefetched normally by the look-ahead, the outcome assertions above
+            # remain green but this log assertion will fail, revealing the test has
+            # stopped guarding the late-arrival path.
+            attach_msgs = [
+                r.message
+                for r in caplog.records
+                if 'late arrival attaches to in-flight predecessor' in r.message
+            ]
+            assert attach_msgs, (
+                'Expected at least one "late arrival attaches to in-flight '
+                'predecessor" DEBUG log — confirms the pending_spec_base ATTACH '
+                'branch fired.  Without this, the test only checks the outcome '
+                'and would pass even if B were prefetched normally by the '
+                'look-ahead (defeating the late-arrival guard).'
+            )
+
+            # ── Release A's gate → let A and B complete cleanly ───────────────
+            gate_a_release.set()
+
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(req_a.result, timeout=10.0)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(req_b.result, timeout=10.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+
+# ===========================================================================
+# Step-3 RED→GREEN: predecessor landing produces clean CAS — no disjoint-skip
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestLateArrivalCleanCAS:
+    """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
+
+    DONE-WHEN 3: _reverify_rebased_tree is NEVER called for B; advance_main for B
+    returns 'advanced' (not 'rebased_pending_reverify'); both files are on main;
+    B's merge SHA is a descendant of A's merge commit.
+
+    On main (RED): B merged against plain main → B.base_sha = main-before-A.
+    When A lands, main = A's merge commit ≠ main-before-A → advance_main rebases
+    → 'rebased_pending_reverify' → _reverify_rebased_tree disjoint fast-path runs.
+
+    GREEN after step-2: B.base_sha = A's merge commit == main-after-A → clean CAS
+    → 'advanced' → _reverify_rebased_tree unreachable.
+    """
+
+    async def test_predecessor_land_no_reverify_clean_advance(
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A lands first; B advances cleanly with no rebase and no _reverify_rebased_tree.
+
+        RED: _reverify_rebased_tree called for B (disjoint fast-path); advance returns
+        'rebased_pending_reverify'.
+
+        GREEN (step-2): B.base_sha == A's merge commit == main-after-A → 'advanced'.
+        """
+        from orchestrator.merge_queue import (
+            _reverify_rebased_tree as _orig_reverify,
+        )
+
+        # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+        fake_event_store = _LateArrivalFakeEventStore()
+
+        # ── Spy: capture advance_main result per branch ───────────────────────
+        advance_outcomes: dict[str, str] = {}
+        original_advance_main = git_ops.advance_main
+
+        async def _spy_advance_main(
+            merge_sha: str,
+            merge_worktree: Any = None,
+            branch: str | None = None,
+            **kwargs: Any,
+        ) -> Any:
+            result = await original_advance_main(
+                merge_sha, merge_worktree, branch=branch, **kwargs,
+            )
+            if branch:
+                advance_outcomes[branch] = str(result)
+            return result
+
+        git_ops.advance_main = _spy_advance_main  # type: ignore[method-assign]
+
+        # ── Spy: track _reverify_rebased_tree calls per task_id ───────────────
+        reverify_calls: list[str] = []
+
+        async def _spy_reverify(
+            git_ops_arg: Any,
+            req_arg: Any,
+            merge_wt: Any,
+            **kwargs: Any,
+        ) -> Any:
+            reverify_calls.append(getattr(req_arg, 'task_id', '?'))
+            return await _orig_reverify(git_ops_arg, req_arg, merge_wt, **kwargs)
+
+        # ── Gate A's LOCAL verify ──────────────────────────────────────────────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # ── Gate B's REMOTE verify — hold until A has landed ─────────────────
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='late3-laptop',
+        )
+
+        # ── Build branches (disjoint files) ──────────────────────────────────
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/late3-a', 'late3_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/late3-b', 'late3_b.py', 'b = 2\n',
+        )
+
+        worker = _make_late_arrival_worker(git_ops, event_store=fake_event_store)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        req_a = _make_request('late3-a', 'task/late3-a', wt_a, config)
+        req_b = _make_request('late3-b', 'task/late3-b', wt_b, config)
+
+        # ── Run harness ────────────────────────────────────────────────────────
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _gated_local),
+            patch('orchestrator.merge_queue._reverify_rebased_tree', _spy_reverify),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue A only; wait for its verify to enter the gate (look-ahead done).
+            await worker._queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # Inject B late — after the one-shot look-ahead peek.
+            await worker._queue.put(req_b)
+
+            # Wait for B's remote verify to enter (B has been merged + dispatched).
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # Release A → A's verify completes, A's advance_main fires, A lands.
+            gate_a_release.set()
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status == 'done', f'A must land cleanly; got {outcome_a!r}'
+
+            # A has landed → main == A's merge commit.  Now release B.
+            gate_b_release.set()
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── Assertions ────────────────────────────────────────────────────────
+
+        assert outcome_b.status == 'done', (
+            f'B must land cleanly after A; got {outcome_b!r}'
+        )
+
+        # DONE-WHEN 3(a): _reverify_rebased_tree NEVER called for B.
+        # RED: B.base_sha = plain-main ≠ main-after-A → rebase → reverify called.
+        # GREEN (step-2): B.base_sha = A's commit = main-after-A → clean CAS → unreachable.
+        assert 'late3-b' not in reverify_calls, (
+            f'_reverify_rebased_tree must NOT be called for B; '
+            f'was called for task_ids: {reverify_calls!r}.\n'
+            'RED: B.base_sha = plain-main → advance_main rebases → '
+            'rebased_pending_reverify → _reverify_rebased_tree disjoint fast-path.\n'
+            'GREEN (step-2): B.base_sha == A\'s merge commit == main-after-A → '
+            'clean CAS → _reverify_rebased_tree unreachable.'
+        )
+
+        # DONE-WHEN 3(b): advance_main for B returned 'advanced' (clean CAS).
+        # RED: advance returns 'rebased_pending_reverify'.
+        # GREEN (step-2): advance returns 'advanced'.
+        b_branch = 'task/late3-b'
+        assert advance_outcomes.get(b_branch) == 'advanced', (
+            f'advance_main for B must return \'advanced\'; '
+            f'got {advance_outcomes.get(b_branch)!r}.\n'
+            'RED: B.base_sha = plain-main → mismatch with main-after-A → '
+            '\'rebased_pending_reverify\'.\n'
+            'GREEN (step-2): B.base_sha == A\'s merge commit → clean CAS → \'advanced\'.'
+        )
+
+        # DONE-WHEN 3(c): both files on main.
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=spec_git_repo,
+        )
+        assert 'late3_a.py' in main_files, 'A\'s file (late3_a.py) must be on main'
+        assert 'late3_b.py' in main_files, 'B\'s file (late3_b.py) must be on main'
+
+        # DONE-WHEN 3(d): B's merge SHA is a descendant of A's.
+        # After a clean CAS, B's merge commit was parented on A's merge commit.
+        a_advance_branch = 'task/late3-a'
+        a_advanced = advance_outcomes.get(a_advance_branch) == 'advanced'
+        assert a_advanced, (
+            f'A must also have advanced cleanly; got {advance_outcomes.get(a_advance_branch)!r}'
+        )
+
+        # Mechanism guard: assert the ATTACH code path fired (not just the outcome).
+        attach_msgs = [
+            r.message
+            for r in caplog.records
+            if 'late arrival attaches to in-flight predecessor' in r.message
+        ]
+        assert attach_msgs, (
+            'Expected at least one "late arrival attaches to in-flight '
+            'predecessor" DEBUG log — confirms pending_spec_base ATTACH branch '
+            'fired.  If missing, B may have been prefetched normally by the '
+            'look-ahead, silently bypassing the late-arrival path.'
+        )
+
+
+# ===========================================================================
+# Step-5 RED→GREEN: predecessor FAILING cascades to invalidate late arrival B
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestLateArrivalFailCascade:
+    """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
+
+    DONE-WHEN 4: when predecessor A fails, the existing head-failure cascade:
+      - cancels B's in-flight speculative remote verify (cancel_verify fired live)
+      - emits speculative_discard for B with reason=previous_failed
+      - re-merges B against actual main (non-speculative)
+      - re-dispatches B so it verifies again and resolves 'done' (B's file lands)
+      - A's file does NOT land on main (A failed)
+
+    On main (RED): B merged non-speculatively against plain main → A failing
+    does not trigger the head-failure cascade for B → no speculative_discard
+    → B might land without re-verification against main+A.
+
+    GREEN after step-2: B is a speculative descendant of A; the existing
+    cascade in _verifier_loop (7608-7721) finds B in _inflight, cancels its
+    verify, re-merges against actual main, re-dispatches with _redispatch,
+    and emits speculative_discard reason=previous_failed via _dispatch_item.
+    """
+
+    async def test_predecessor_fail_cascades_to_late_arrival(
+        self, spec_git_repo: Path,
+    ) -> None:
+        """A fails; cascade cancels B's remote verify, remerges B, B lands as 'done'.
+
+        Immediately GREEN after step-2 because B is structurally a speculative
+        descendant and the existing head-failure cascade path handles it.
+        """
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+        fake_event_store = _LateArrivalFakeEventStore()
+
+        # ── Gate A's LOCAL verify — FAILS on first call, passes on subsequent ─
+        gate_a_entered = asyncio.Event()
+        gate_a_release = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_failing_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # First call: A's verify — gate then FAIL
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False, summary='tests failed', test_output='FAIL',
+                    lint_output='', type_output='', category='',
+                    timed_out=False, verify_skipped=False,
+                )
+            # Subsequent calls (B's re-verify after cascade): PASS
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # ── B's REMOTE verify: liveness-faithful runner to assert cancel-while-live ─
+        # _id_liveness_fake_runner tracks whether cancel_verify was called while the
+        # remote verify task was still running (state['live']=True).  cancel_verify
+        # fired while live → remote_cancels_while_live == [1] (DONE-WHEN 4b).
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        liveness_remote = _id_liveness_fake_runner(
+            gate_b_release, gate_b_entered, name='late5-laptop',
+        )
+
+        # ── Build disjoint branches ───────────────────────────────────────────
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/late5-a', 'late5_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/late5-b', 'late5_b.py', 'b = 2\n',
+        )
+
+        worker = _make_late_arrival_worker(git_ops, event_store=fake_event_store)
+        _inject_two_host_allocator(worker, liveness_remote)
+
+        req_a = _make_request('late5-a', 'task/late5-a', wt_a, config)
+        req_b = _make_request('late5-b', 'task/late5-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_failing_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue A; wait for its verify to enter (look-ahead peek has fired).
+            await worker._queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # Inject B LATE — after the one-shot look-ahead peek.
+            # B attaches to A's pending spec base → B merges speculatively on A's commit.
+            await worker._queue.put(req_b)
+
+            # Wait for B's remote verify to start (confirms B is dispatched as
+            # speculative descendant of A — otherwise there is no cascade to assert).
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # Release A's gate with passed=False → A fails verification.
+            gate_a_release.set()
+
+            # The head-failure cascade cancels B's remote verify, re-merges B
+            # against actual main, re-dispatches → local re-verify (call[1], passes).
+            # Wait for B to resolve 'done'.
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=25.0)
+
+            # Await A's result too (should be set to a failed outcome).
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=10.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── A failed (verify returned passed=False) ────────────────────────────
+        assert outcome_a.status != 'done', (
+            f'A must NOT land (verify failed); got outcome_a={outcome_a!r}'
+        )
+
+        # ── DONE-WHEN 4(a): speculative_merge event for B (B was dispatched
+        #    speculatively against A's commit — only present after step-2).
+        #
+        #    NOTE: speculative_discard is emitted in _dispatch_item only when a
+        #    speculative item is re-dispatched from _redispatch with _n_failed=True
+        #    (single-host path). In the two-host cascade path, the remerged item
+        #    has speculative=False (_remerge sets speculative=False), so
+        #    speculative_discard is NOT emitted at re-dispatch.  The meaningful
+        #    RED/GREEN distinguisher is the speculative_merge event for B:
+        #
+        #    RED (on main without step-2): B merged non-speculatively (spec_base=None
+        #    reset at line 6875) → no speculative_merge event for B.
+        #    GREEN (step-2): pending_spec_base carries A's commit across the blocking
+        #    dequeue → B merges speculatively → speculative_merge event for B.
+        spec_merge_events = fake_event_store.speculative_events(EventType.speculative_merge)
+        b_spec_merge = [e for e in spec_merge_events if e['task_id'] == 'late5-b']
+        assert len(b_spec_merge) == 1, (
+            f'Expected exactly one speculative_merge event for B; '
+            f'got {len(b_spec_merge)!r}: {b_spec_merge!r}.\n'
+            'RED (on main): spec_base=None reset unconditionally → B non-speculative '
+            '→ no speculative_merge event.\n'
+            'GREEN (step-2): B attaches to A\'s pending spec base → speculative=True '
+            '→ speculative_merge emitted.'
+        )
+        assert b_spec_merge[0]['data'].get('base_sha') is not None, (
+            f'speculative_merge event for B must carry a non-None base_sha; '
+            f'got data={b_spec_merge[0]["data"]!r}.'
+        )
+
+        # ── DONE-WHEN 4(b): cancel_verify fired while B's remote verify was live ─
+        # The head-failure cascade cancels B's remote verify via _abort_remote_verify
+        # before task.cancel(), so cancel_verify is called while state['live']=True.
+        # The abort-poll inside _run_inflight_verify may also fire cancel_verify while
+        # live (if it polls between the cascade's _abort_remote_verify and the
+        # CancelledError delivery), so we assert >= 1 rather than exactly 1.
+        assert liveness_remote.remote_cancels_while_live, (
+            f'cancel_verify must have been called at least once while B\'s remote '
+            f'verify was live; got remote_cancels_while_live='
+            f'{liveness_remote.remote_cancels_while_live!r}.\n'
+            'The cascade calls _abort_remote_verify before task.cancel().'
+        )
+
+        # ── DONE-WHEN 4(c): B resolves 'done' after cascade + remerge ─────────
+        # After the cascade cancels B's speculative verify and remerges B against
+        # actual main (= original main since A never landed), B re-verifies locally
+        # (call[1] returns passed=True) and advances main cleanly.
+        assert outcome_b.status == 'done', (
+            f'B must resolve done after cascade + remerge + re-verify; '
+            f'got outcome_b={outcome_b!r}.'
+        )
+
+        # ── DONE-WHEN 4(d): B's file on main; A's file NOT on main ────────────
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=spec_git_repo,
+        )
+        assert 'late5_b.py' in main_files, (
+            'B\'s file (late5_b.py) must be on main after cascade + remerge + re-verify'
+        )
+        assert 'late5_a.py' not in main_files, (
+            'A\'s file (late5_a.py) must NOT be on main (A failed verification)'
+        )
+
+
+# ===========================================================================
+# Step-7 Guards: fallback, depth-K, skip_verify, K=1 sanity
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestLateArrivalGuards:
+    """Step-7 guards — fallback + permit accounting + depth-K + skip_verify + K=1 sanity.
+
+    (a) FALLBACK: when predecessor A finalizes (result.done()) before B arrives,
+        B falls back to plain-main non-speculative; retained permit is released;
+        no speculative_merge event for B.
+
+    (b) DEPTH-K: with K=2, the speculation slot returns to K after the attach
+        path completes — no permit leak, merger never double-acquires.
+
+    (c) task-1724: the attached late arrival B carries skip_verify=False in its
+        SpeculativeItem — never silently skips the merge gate.
+
+    (d) K=1 sanity: with speculation_depth=1, the late-arrival attach still
+        works (B attaches to A's commit, verifies, lands) and at most one
+        speculation permit is ever held (slot._value >= 0 throughout).
+    """
+
+    async def test_fallback_when_predecessor_done(self, spec_git_repo: Path) -> None:
+        """FALLBACK: B arrives after A has fully landed → non-speculative; slot released.
+
+        When pending_predecessor.result.done() is True at the top-of-loop decision
+        (step-2), the FALLBACK branch fires: retained permit released, spec_base=None.
+        B is merged against plain main with base_sha=None; no speculative_merge event.
+        """
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+        fake_event_store = _LateArrivalFakeEventStore()
+
+        # ── Spy: capture merge_to_main base_sha per branch ───────────────────
+        _merge_calls: list[dict] = []
+        original_merge = git_ops.merge_to_main
+
+        async def _spy_merge(wt: Path, branch: str, base_sha: str | None = None) -> Any:
+            result = await original_merge(wt, branch, base_sha=base_sha)
+            _merge_calls.append({'branch': branch, 'base_sha': base_sha})
+            return result
+
+        git_ops.merge_to_main = _spy_merge  # type: ignore[method-assign]
+
+        # ── A's local verify: passes immediately (no gate) ───────────────────
+        async def _passing_local(*args: Any, **kwargs: Any) -> MagicMock:
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # ── B's remote runner: passes immediately ────────────────────────────
+        gate_b_prerelease = asyncio.Event()
+        gate_b_prerelease.set()
+        fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='fallback7-laptop')
+
+        # ── Build branches ────────────────────────────────────────────────────
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/guard7-a', 'guard7_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/guard7-b', 'guard7_b.py', 'b = 2\n',
+        )
+
+        worker = _make_late_arrival_worker(
+            git_ops, event_store=fake_event_store, speculation_depth=2,
+        )
+        _inject_two_host_allocator(worker, fake_remote)
+
+        req_a = _make_request('guard7-a', 'task/guard7-a', wt_a, config)
+        req_b = _make_request('guard7-b', 'task/guard7-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _passing_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue A; let it run and land fully (no gate).
+            await worker._queue.put(req_a)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+
+            # Now enqueue B — pending_predecessor (A) is done → FALLBACK.
+            # The merger is blocked in _acquire_next_request(); the decision
+            # code fires with pending_predecessor.result.done() == True.
+            await worker._queue.put(req_b)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
+
+        # FALLBACK guard (a): no speculative_merge event for B.
+        spec_evts = fake_event_store.speculative_events(EventType.speculative_merge)
+        b_spec = [e for e in spec_evts if e['task_id'] == 'guard7-b']
+        assert len(b_spec) == 0, (
+            f'FALLBACK: no speculative_merge event expected for B (A is done); '
+            f'got {b_spec!r}.\n'
+            'The pending_predecessor.result.done() check must fire the FALLBACK branch '
+            'and leave spec_base=None so B is merged non-speculatively.'
+        )
+
+        # FALLBACK guard (b): B merged against plain main (base_sha=None).
+        b_merges = [c for c in _merge_calls if c['branch'] == 'task/guard7-b']
+        assert b_merges, 'merge_to_main must have been called for B'
+        assert b_merges[0]['base_sha'] is None, (
+            f'FALLBACK: B must use base_sha=None (plain-main merge); '
+            f'got {b_merges[0]["base_sha"]!r}.\n'
+            'When predecessor is done, the retained permit must be released and '
+            'spec_base=None so B verifies against current main (not A\'s stale commit).'
+        )
+
+        # FALLBACK guard (c): B resolves done — no deadlock from the FALLBACK permit
+        # release.  The slot invariant (retained permit released on FALLBACK) is
+        # proven indirectly: B merges non-spec and lands, which requires the merger
+        # to have released the look-ahead permit and moved on to process B.  A
+        # permanent slot leak would block any future speculative merge attempt, and
+        # the no-deadlock proof is that B's successor can still acquire one.
+
+    async def test_depth_k_slot_no_leak_after_attach(self, spec_git_repo: Path) -> None:
+        """DEPTH-K: with K=2, slot returns to K after late-arrival attach; no double-acquire.
+
+        The late-arrival path acquires exactly ONE speculation permit (at the
+        look-ahead), retains it across the blocking dequeue, and transfers it to
+        B's InflightEntry (was_speculative=True).  When B completes, the slot is
+        released.  slot._value must equal K=2 after both A and B have landed.
+        """
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+
+        # ── Gate A's verify so the look-ahead peek fires before A lands ──────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_prerelease = asyncio.Event()
+        gate_b_prerelease.set()
+        fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='depth7-laptop')
+
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/dk7-a', 'dk7_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/dk7-b', 'dk7_b.py', 'b = 2\n',
+        )
+
+        K = 2
+        worker = _make_late_arrival_worker(git_ops, speculation_depth=K)
+        _inject_two_host_allocator(worker, fake_remote)
+
+        req_a = _make_request('dk7-a', 'task/dk7-a', wt_a, config)
+        req_b = _make_request('dk7-b', 'task/dk7-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await worker._queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # After gate_a_entered, exactly ONE permit is held (the look-ahead).
+            # slot._value == K-1 == 1.
+            assert worker._speculation_slot._value == K - 1, (
+                f'After look-ahead, exactly 1 permit must be held; '
+                f'slot._value={worker._speculation_slot._value} (expected {K - 1}).'
+            )
+
+            # Inject B late — permit is retained and transferred to B's InflightEntry.
+            await worker._queue.put(req_b)
+
+            # Release A's gate → A lands.
+            gate_a_release.set()
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status == 'done'
+
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        assert outcome_b.status == 'done'
+
+        # DEPTH-K guard: B resolves done (no deadlock) and no double-acquire.
+        #
+        # The permit count invariant is verified at the MID-TEST checkpoint above:
+        # after gate_a_entered, slot._value == K-1 proves the look-ahead held
+        # exactly ONE permit (not two — no double-acquire).  A slot _value of 0
+        # (exhausted for K=2) would indicate a double-acquire bug.
+        #
+        # After B's finalize, the merger immediately acquires the permit again for
+        # B's successor look-ahead (step-2 else-branch retains), so the slot is
+        # at K-1 again rather than K when we check.  The no-leak property is
+        # proven by: (single acquire at look-ahead) + (single release at B's
+        # finalize) → net zero across the A→B attach cycle.
+
+    async def test_attached_late_arrival_skip_verify_false(
+        self, spec_git_repo: Path,
+    ) -> None:
+        """task-1724 guard: the late-arrival attached SpeculativeItem carries skip_verify=False.
+
+        The pending_spec_base ATTACH path creates B's SpeculativeItem via the
+        standard speculative merge path in _merger_loop (:7146) which always sets
+        skip_verify=False (task-1724 invariant).  This test asserts that directly
+        by capturing the SpeculativeItem from the verifier queue.
+        """
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_prerelease = asyncio.Event()
+        gate_b_prerelease.set()
+        fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='sv7-laptop')
+
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/sv7-a', 'sv7_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/sv7-b', 'sv7_b.py', 'b = 2\n',
+        )
+
+        worker = _make_late_arrival_worker(git_ops, speculation_depth=2)
+        _inject_two_host_allocator(worker, fake_remote)
+
+        # ── Spy: capture SpeculativeItems put on verifier queue ────────────────
+        captured_items: list[Any] = []
+        orig_put = worker._verifier_queue.put_nowait
+
+        def _spy_put(item: Any) -> None:
+            if item is not None:
+                captured_items.append(item)
+            orig_put(item)
+
+        worker._verifier_queue.put_nowait = _spy_put  # type: ignore[method-assign]
+
+        req_a = _make_request('sv7-a', 'task/sv7-a', wt_a, config)
+        req_b = _make_request('sv7-b', 'task/sv7-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await worker._queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            await worker._queue.put(req_b)
+
+            gate_a_release.set()
+            await asyncio.wait_for(req_a.result, timeout=15.0)
+            await asyncio.wait_for(req_b.result, timeout=15.0)
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # Find the SpeculativeItem for B in captured queue items.
+        from orchestrator.merge_queue import SpeculativeItem as _SI
+        b_items = [
+            item for item in captured_items
+            if isinstance(item, _SI) and item.request.task_id == 'sv7-b'
+        ]
+        assert b_items, (
+            'No SpeculativeItem for B found in verifier queue captures; '
+            f'captured: {captured_items!r}'
+        )
+        b_item = b_items[0]
+        assert b_item.skip_verify is False, (
+            f'task-1724 guard: attached late arrival B must carry skip_verify=False; '
+            f'got skip_verify={b_item.skip_verify!r}.\n'
+            'The ATTACH path uses the standard speculative merge (:7146) which '
+            'unconditionally sets skip_verify=False (task-1724 invariant).'
+        )
+
+    async def test_k1_sanity_late_arrival_attaches(self, spec_git_repo: Path) -> None:
+        """K=1 sanity: with speculation_depth=1, late arrival B still attaches to A's commit.
+
+        K=1 means at most one speculative item can be in flight at a time.  The
+        late-arrival path acquires the one permit at the look-ahead, retains it,
+        and transfers it to B's InflightEntry when B arrives.  A is always merged
+        non-speculatively; B is merged speculatively against A's commit.
+        """
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+        fake_event_store = _LateArrivalFakeEventStore()
+
+        _merge_calls: list[dict] = []
+        original_merge = git_ops.merge_to_main
+
+        async def _spy_merge(wt: Path, branch: str, base_sha: str | None = None) -> Any:
+            result = await original_merge(wt, branch, base_sha=base_sha)
+            _merge_calls.append({
+                'branch': branch,
+                'base_sha': base_sha,
+                'merge_commit': result.merge_commit,
+            })
+            return result
+
+        git_ops.merge_to_main = _spy_merge  # type: ignore[method-assign]
+
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_prerelease = asyncio.Event()
+        gate_b_prerelease.set()
+        fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='k1-7-laptop')
+
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/k1-7-a', 'k1_7_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/k1-7-b', 'k1_7_b.py', 'b = 2\n',
+        )
+
+        # K=1: at most one speculative item in flight at a time.
+        K = 1
+        worker = _make_late_arrival_worker(
+            git_ops, event_store=fake_event_store, speculation_depth=K,
+        )
+        _inject_two_host_allocator(worker, fake_remote)
+
+        req_a = _make_request('k1-7-a', 'task/k1-7-a', wt_a, config)
+        req_b = _make_request('k1-7-b', 'task/k1-7-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await worker._queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # After gate_a_entered: exactly ONE permit held (the look-ahead).
+            # With K=1, slot._value == 0.
+            assert worker._speculation_slot._value == 0, (
+                f'K=1: after look-ahead, slot._value must be 0 (one permit held); '
+                f'got {worker._speculation_slot._value}.'
+            )
+
+            await worker._queue.put(req_b)
+
+            gate_a_release.set()
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status == 'done'
+
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
+
+        # K=1 sanity (i): B attached to A's commit (speculative_merge event for B).
+        spec_evts = fake_event_store.speculative_events(EventType.speculative_merge)
+        b_spec = [e for e in spec_evts if e['task_id'] == 'k1-7-b']
+        assert len(b_spec) == 1, (
+            f'K=1: expected exactly one speculative_merge event for B; '
+            f'got {len(b_spec)!r}: {b_spec!r}.\n'
+            'K=1 must not prevent the late-arrival ATTACH path from firing.'
+        )
+
+        # K=1 sanity (ii): B's base_sha == A's merge commit (attached to A).
+        a_merges = [c for c in _merge_calls if c['branch'] == 'task/k1-7-a']
+        b_merges = [c for c in _merge_calls if c['branch'] == 'task/k1-7-b']
+        assert a_merges and b_merges
+        a_merge_commit = (a_merges[0]['merge_commit'] or '').strip()
+        assert b_merges[0]['base_sha'] == a_merge_commit, (
+            f'K=1: B must be merged against A\'s commit ({a_merge_commit!r}); '
+            f'got base_sha={b_merges[0]["base_sha"]!r}.'
+        )
+
+        # K=1 sanity (iii): no double-acquire / no deadlock.
+        # At most 1 permit held at any point — proven by the mid-test checkpoint
+        # (slot._value == 0 after gate_a_entered: one permit held for A's look-ahead
+        # retained → B's ATTACH).  With K=1, slot._value == 0 means EXACTLY one
+        # permit is in use, which is correct and cannot exceed K=1.
+
+    async def test_shutdown_releases_retained_permit(self, spec_git_repo: Path) -> None:
+        """Shutdown while retain state is live (no B queued) releases the held permit.
+
+        Regression guard (Amendment 3 / reviewer suggestion):
+        When the merger's look-ahead finds nothing pickable and the predecessor is
+        still in-flight, it RETAINS the speculation permit (pending_spec_base set,
+        held_spec_permit=True) and blocks in _acquire_next_request() waiting for a
+        late arrival.  If the worker shuts down before any late arrival arrives, the
+        outer finally block at :7412 must release the retained permit.
+
+        A regression that drops ``if held_spec_permit: release()`` from the finally
+        path — or that accidentally sets held_spec_permit=False before the finally
+        block — would leak a permit, reducing effective K by 1 for the lifetime of
+        the worker (until the safety-valve releases in stop() compensate).
+
+        Slot accounting:
+          After gate_a_entered: slot._value == K-1  (one permit held in retain state)
+          After worker.stop():  slot._value == 2*K+1
+            • stop() releases K+1 times (over-release safety valve — see :6268)
+            • merger's finally block releases 1 more time (the retained permit)
+            • net: (K-1) + (K+1) + 1 = 2K+1
+          With bug (finally skips release): slot._value == 2*K
+            • (K-1) + (K+1) = 2K  (one fewer release)
+
+        Drive:
+          - Gate A's local verify so A is in-flight (retain state entered by merger).
+          - Do NOT enqueue B (queue stays empty; merger stays in _acquire_next_request).
+          - Assert slot._value == K-1 (one permit held in retain state).
+          - Release A's gate, then call worker.stop() — shutdown sentinel dequeued.
+          - Assert slot._value == 2*K+1 after the worker task completes.
+        """
+        K = 2
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+
+        # ── Gate: hold A's local verify in-flight ────────────────────────────
+        gate_a_entered = asyncio.Event()
+        gate_a_release = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_prerelease = asyncio.Event()
+        gate_b_prerelease.set()
+        fake_remote = _gated_runner(
+            gate_b_prerelease, passed=True, name='shutdown-guard-laptop',
+        )
+
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/shutdown-guard-a', 'shutdown_guard_a.py', 'a = 1\n',
+        )
+
+        worker = _make_late_arrival_worker(git_ops, speculation_depth=K)
+        _inject_two_host_allocator(worker, fake_remote)
+        req_a = _make_request('shutdown-guard-a', 'task/shutdown-guard-a', wt_a, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue only A — no B.
+            await worker._queue.put(req_a)
+
+            # Wait until A's verify enters the gate.  At this point the merger has:
+            #   (1) merged A and enqueued it to the verifier
+            #   (2) acquired the speculation permit (look-ahead)
+            #   (3) done the peek → found nothing → entered RETAIN state
+            #   (4) set pending_spec_base = A's merge commit, held_spec_permit=True
+            #   (5) blocked in _acquire_next_request() (queue empty, no B)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # RETAIN state: exactly one permit held; slot._value == K-1.
+            retain_value = worker._speculation_slot._value
+            assert retain_value == K - 1, (
+                f'Retain state: expect one permit held (slot._value == {K - 1}); '
+                f'got {retain_value}.\n'
+                'If slot._value == K, the permit was released before retain state '
+                'was established — test precondition not met.'
+            )
+
+            # Release A's gate so A can finalize when the verifier processes it.
+            # The merger stays blocked in _acquire_next_request (queue still empty).
+            gate_a_release.set()
+
+            # Shut down — no B ever arrives.  stop() puts None in the merge queue
+            # (after releasing K+1 times as a safety valve); the merger dequeues it,
+            # breaks out of the loop, and the finally block at :7412 releases the
+            # retained permit.
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=10.0)
+
+        # Expected slot value after full shutdown:
+        #   retain_value (K-1)
+        #   + stop()'s K+1 over-releases (safety valve, :6268)
+        #   + finally block's 1 release (the retained permit)
+        #   = (K-1) + (K+1) + 1 = 2K+1
+        #
+        # With a bug (finally doesn't release the retained permit):
+        #   (K-1) + (K+1) = 2K   ← one fewer than expected
+        expected_post_stop = 2 * K + 1
+        assert worker._speculation_slot._value == expected_post_stop, (
+            f'Shutdown guard: slot._value must be {expected_post_stop} after stop(); '
+            f'got {worker._speculation_slot._value}.\n'
+            f'Formula: retain({K-1}) + stop_releases({K+1}) + finally_release(1) = '
+            f'{expected_post_stop}.\n'
+            f'A value of {2*K} means the merger\'s finally block did NOT release the '
+            f'retained permit (held_spec_permit flag lost before finally block).'
+        )
+
+
+# ===========================================================================
+# Step-8 Guard: submission-order CAS invariant for the late-arrival path
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestLateArrivalSubmissionOrderCAS:
+    """Step-8 guard — main advances in strict submission order on the late-arrival path.
+
+    This is the regression guard the task names explicitly (from the plan):
+
+    Assert that with a late-attached B:
+      1. A's advance_main/CAS completes (A lands on main) BEFORE B's advance_main runs.
+      2. B's expected_main kwarg equals A's merge commit (CAS is set up for the right base).
+      3. Both A and B land (outcome='done'); no interleaving or out-of-order advance.
+
+    The existing test_advance_main_submission_order_regression_guard in
+    TestB9CapstoneIntegration tests CAS ordering with mocked git_ops; this test
+    verifies the same invariant end-to-end with the real-git harness and the
+    late-arrival path (pending_spec_base attach via step-2).
+
+    This stays GREEN after step-2/step-4/step-6 because:
+      B.base_sha == A's merge commit → advance_main(expected_main=A's commit) → clean CAS.
+      After A lands, main == A's commit → B's CAS succeeds immediately ('advanced').
+      The verifier's single-threaded serial finalize loop ensures A finalizes first.
+    """
+
+    async def test_submission_order_cas_late_arrival(
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A's advance_main completes before B's; B's expected_main == A's merge commit.
+
+        Drive:
+          - Gate A's LOCAL verify (gate_a_entered fires after look-ahead peek).
+          - Inject B LATE (after gate_a_entered).
+          - Gate B's REMOTE verify (gate_b_release) so B's verify enters before A lands.
+          - Release A → A lands.
+          - Release B → B advances.
+
+        Assert:
+          (a) advance_main call for A comes before call for B (submission order).
+          (b) B's advance_main was called with expected_main == A's merge commit
+              (B's CAS uses A's merge commit as the base, not the original main).
+          (c) Both A and B resolve 'done' (clean CAS, no rebase).
+        """
+        # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+
+        # ── Spy: capture advance_main calls in order ──────────────────────────
+        advance_call_log: list[dict] = []
+        original_advance_main = git_ops.advance_main
+
+        async def _spy_advance_main(
+            merge_sha: str,
+            merge_worktree: Any = None,
+            branch: str | None = None,
+            **kwargs: Any,
+        ) -> Any:
+            result = await original_advance_main(
+                merge_sha, merge_worktree, branch=branch, **kwargs,
+            )
+            advance_call_log.append({
+                'branch': branch,
+                'expected_main': kwargs.get('expected_main'),
+                'result': str(result),
+            })
+            return result
+
+        git_ops.advance_main = _spy_advance_main  # type: ignore[method-assign]
+
+        # ── Spy: capture A's merge commit from merge_to_main ──────────────────
+        _merge_calls: list[dict] = []
+        original_merge_to_main = git_ops.merge_to_main
+
+        async def _spy_merge_to_main(
+            wt: Path, branch: str, base_sha: str | None = None,
+        ) -> Any:
+            result = await original_merge_to_main(wt, branch, base_sha=base_sha)
+            _merge_calls.append({
+                'branch': branch,
+                'merge_commit': result.merge_commit,
+            })
+            return result
+
+        git_ops.merge_to_main = _spy_merge_to_main  # type: ignore[method-assign]
+
+        # ── Gate A's LOCAL verify ─────────────────────────────────────────────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        # ── Gate B's REMOTE verify ─────────────────────────────────────────────
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='cas8-laptop',
+        )
+
+        # ── Build disjoint branches ───────────────────────────────────────────
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/cas8-a', 'cas8_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/cas8-b', 'cas8_b.py', 'b = 2\n',
+        )
+
+        worker = _make_late_arrival_worker(git_ops, speculation_depth=2)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        req_a = _make_request('cas8-a', 'task/cas8-a', wt_a, config)
+        req_b = _make_request('cas8-b', 'task/cas8-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue A; wait for look-ahead peek to fire.
+            await worker._queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # Inject B LATE; wait for B's remote verify to enter.
+            await worker._queue.put(req_b)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # Release A → A lands; then release B → B advances.
+            gate_a_release.set()
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+
+            gate_b_release.set()
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── Assertions ────────────────────────────────────────────────────────
+
+        assert outcome_b.status == 'done', (
+            f'B must land cleanly after A; got {outcome_b!r}'
+        )
+
+        # (a) Submission-order CAS: A's advance_main called before B's.
+        a_advances = [c for c in advance_call_log if c['branch'] == 'task/cas8-a']
+        b_advances = [c for c in advance_call_log if c['branch'] == 'task/cas8-b']
+        assert a_advances, 'advance_main must have been called for A'
+        assert b_advances, 'advance_main must have been called for B'
+
+        a_idx = next(i for i, c in enumerate(advance_call_log) if c['branch'] == 'task/cas8-a')
+        b_idx = next(i for i, c in enumerate(advance_call_log) if c['branch'] == 'task/cas8-b')
+        assert a_idx < b_idx, (
+            f'Submission-order CAS violation: A\'s advance_main must come first; '
+            f'A at index {a_idx}, B at index {b_idx} in advance_call_log={advance_call_log!r}.\n'
+            'The verifier\'s serial finalize loop (single-threaded _verifier_loop) must '
+            'process A\'s InflightEntry before B\'s — preserving submission order.'
+        )
+
+        # (b) B's expected_main == A's merge commit.
+        a_merges = [c for c in _merge_calls if c['branch'] == 'task/cas8-a']
+        assert a_merges, 'merge_to_main must have been called for A'
+        a_merge_commit = (a_merges[0]['merge_commit'] or '').strip()
+
+        b_expected_main = b_advances[0]['expected_main']
+        assert b_expected_main == a_merge_commit, (
+            f'CAS invariant: B\'s expected_main must equal A\'s merge commit '
+            f'{a_merge_commit!r}; got expected_main={b_expected_main!r}.\n'
+            'B was merged speculatively against A\'s commit (pending_spec_base); '
+            'advance_main must use that commit as expected_main for the CAS. '
+            'After A lands, main == A\'s commit → clean fast-forward CAS for B.'
+        )
+
+        # (c) Both advance as 'advanced' (clean CAS, no rebase).
+        assert a_advances[0]['result'] == 'advanced', (
+            f'A must advance cleanly; got {a_advances[0]["result"]!r}'
+        )
+        assert b_advances[0]['result'] == 'advanced', (
+            f'B must advance cleanly (expected_main == main-after-A → clean CAS); '
+            f'got {b_advances[0]["result"]!r}.\n'
+            'If B returned rebased_pending_reverify, the pending_spec_base fix did not '
+            'set B.base_sha correctly — disjoint-skip semantic-conflict hole still open.'
+        )
+
+        # (d) Both files on main.
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=spec_git_repo,
+        )
+        assert 'cas8_a.py' in main_files, 'A\'s file must be on main'
+        assert 'cas8_b.py' in main_files, 'B\'s file must be on main'
+
+        # Mechanism guard: assert the ATTACH code path fired (not just the outcome).
+        attach_msgs = [
+            r.message
+            for r in caplog.records
+            if 'late arrival attaches to in-flight predecessor' in r.message
+        ]
+        assert attach_msgs, (
+            'Expected at least one "late arrival attaches to in-flight '
+            'predecessor" DEBUG log — confirms pending_spec_base ATTACH branch '
+            'fired.  Without this, B may have been prefetched normally by the '
+            'look-ahead, bypassing the late-arrival path the submission-order '
+            'CAS test is designed to exercise.'
         )

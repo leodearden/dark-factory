@@ -6831,6 +6831,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # (abandoned-at-top, except WorktreeMissing, except Exception, outer
         # finally) releases the permit and clears this flag.
         held_spec_permit: bool = False
+        # Late-arrival attach state (task 1862): when the look-ahead peek finds
+        # nothing pickable but the predecessor is still in-flight, RETAIN the
+        # held speculation permit and record the predecessor's merge commit here.
+        # A late-arriving successor will ATTACH to it at the next dequeue instead
+        # of falling back to non-speculative plain-main.
+        # Both are cleared after the ATTACH/FALLBACK decision following the next
+        # _acquire_next_request() call, and on the shutdown/break paths.
+        pending_spec_base: str | None = None   # predecessor's merge commit SHA
+        pending_predecessor: MergeRequest | None = None  # predecessor request
         # Set True when the loop exits cleanly via the None shutdown sentinel from
         # _acquire_next_request().  Used in the finally to decide whether to forward
         # the sentinel to the verifier: on the crash path (exception while _running is
@@ -6842,8 +6851,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             while self._running:
                 # γ/1719 retroactive coalescing pass — design decisions summary:
                 # • DD1: runs at the pre-dequeue point, gated on a clean pipeline
-                #   (spec_base=None and prefetched=None) so a train is never enqueued
-                #   behind an unverified speculative merge commit (:5239 warning).
+                #   (spec_base=None and prefetched=None and pending_spec_base=None)
+                #   so a train is never enqueued behind an unverified speculative merge
+                #   commit (:5239 warning).  The task-1862 retain path records the
+                #   predecessor's commit in pending_spec_base while spec_base remains
+                #   None, so pending_spec_base must also be tested here — otherwise
+                #   coalescing could form a GroupMergeRequest behind an in-flight
+                #   speculative predecessor and attach it to that predecessor's commit,
+                #   violating DD1's invariant.  (merge_train_coalesce_enabled=False by
+                #   default so this is latent; guard added for correctness when enabled.)
                 # • DD2: idempotency via candidate filter (excludes GroupMergeRequests,
                 #   done/cancelled futures); no new MergeRequest field required.
                 # • DD3: debounce via _last_coalesce_signature prevents re-stacking an
@@ -6859,7 +6875,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # When merge_train_coalesce_enabled=False (default) the call has
                 # near-zero overhead: it drains the queue (already done at acquire
                 # time), builds the candidate list, reads the knob, and returns False.
-                if spec_base is None and prefetched is None:
+                if spec_base is None and prefetched is None and pending_spec_base is None:
                     await self._maybe_coalesce_waiting_singles()
 
                 # Get next request: use pre-fetched (speculative) item if available,
@@ -6871,8 +6887,50 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     req = await self._acquire_next_request()
                     if req is None:
                         exited_via_sentinel = True
+                        # Clear pending late-arrival state before exiting.
+                        pending_spec_base = None
+                        pending_predecessor = None
                         break  # shutdown sentinel
-                    spec_base = None  # fresh dequeue resets speculation chain
+                    # ATTACH or FALLBACK: decide whether this fresh dequeue is a
+                    # late arrival that can attach to the in-flight predecessor's
+                    # merge commit (task 1862).
+                    #
+                    # ATTACH — all four conditions must hold:
+                    #   (a) pending_spec_base: predecessor's commit was recorded
+                    #   (b) held_spec_permit: speculation permit is still held
+                    #   (c) pending_predecessor: predecessor request is known
+                    #   (d) predecessor still in-flight (result future not done)
+                    #
+                    # On ATTACH: spec_base = pending_spec_base so this late
+                    # arrival merges against main+A, not plain main.  The
+                    # retained permit transfers to the verifier item on drain.
+                    #
+                    # On FALLBACK (any condition fails): release the held permit
+                    # if present and merge non-speculatively against actual main.
+                    if (
+                        pending_spec_base is not None
+                        and held_spec_permit
+                        and pending_predecessor is not None
+                        and not pending_predecessor.result.done()
+                    ):
+                        spec_base = pending_spec_base  # ATTACH
+                        logger.debug(
+                            'Task %s: late arrival attaches to in-flight '
+                            'predecessor %s (spec_base=%s)',
+                            req.task_id,
+                            pending_predecessor.task_id,
+                            pending_spec_base[:8],
+                        )
+                    else:
+                        # FALLBACK — release retained permit (if any) and merge
+                        # against actual main (plain non-speculative).
+                        if held_spec_permit:
+                            self._speculation_slot.release()
+                            held_spec_permit = False
+                        spec_base = None
+                    # Clear pending locals — consumed by ATTACH or dropped by FALLBACK.
+                    pending_spec_base = None
+                    pending_predecessor = None
 
                 self._inflight_req = req  # track for stop() race resolution
                 # Drop-on-detection: workflow soft-cancelled before worker
@@ -7259,11 +7317,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     elif self._shutdown_signaled:
                         self._speculation_slot.release()  # return unused permit
                         held_spec_permit = False
+                        # Clear pending late-arrival state before exiting.
+                        pending_spec_base = None
+                        pending_predecessor = None
                         break  # shutdown sentinel and nothing left to speculate
                     else:
-                        self._speculation_slot.release()  # no pickable item — return permit
-                        held_spec_permit = False
-                        spec_base = None  # no pickable item, no speculation
+                        # Nothing pickable right now AND predecessor is in-flight.
+                        # RETAIN the held speculation permit so a late-arriving
+                        # successor can attach to the predecessor's merge commit
+                        # (task 1862: close the disjoint-skip semantic-conflict hole).
+                        #
+                        # • DON'T release: the permit transfers to the late arrival
+                        #   on ATTACH (or is released on FALLBACK at next dequeue).
+                        # • DON'T set spec_base: the late arrival hasn't been dequeued
+                        #   yet; spec_base is set at the ATTACH/FALLBACK decision.
+                        # • Record predecessor's commit so the next dequeue can attach.
+                        pending_spec_base = merge_commit  # predecessor's merge commit
+                        pending_predecessor = req         # predecessor in-flight
+                        # held_spec_permit stays True — permit retained for late arrival
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
                     # cause: a human marked the task done and cleaned up
@@ -7693,6 +7764,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     await self._cleanup_owned_merge_worktree(
                                         _entry.merge_wt
                                     )
+                            # LATE-ARRIVAL ATTACH SYMMETRY (task 1862 step-6):
+                            # A late arrival B attached via pending_spec_base is
+                            # dispatched with speculative=True and held_spec_permit
+                            # retained (step-2), so B's InflightEntry carries
+                            # was_speculative=True.  The release below fires here
+                            # (predecessor failed → B is a downstream entry), and
+                            # _remerge returns speculative=False → re-dispatched B
+                            # has item_was_speculative=False → no duplicate release.
+                            # Slot symmetry is maintained on the late-arrival path
+                            # identically to the standard prefetch path.
                             if _entry.was_speculative:
                                 self._speculation_slot.release()
                             # Past the in-body lease+slot release; the except
@@ -8826,6 +8907,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         #   Single-host: always true at dispatch → byte-identical.
         #   Multi-host: speculative-on-in-flight → skip; handled by finalize
         #               head-failure cascade (step-20).
+        #
+        # LATE-ARRIVAL ATTACH INTERACTION (task 1862 step-4 locking guard):
+        # A late-arriving B attached to in-flight predecessor A via
+        # pending_spec_base (_merger_loop step-2) composes correctly with this
+        # gate in every dispatch race — no spurious remerge on the attach path:
+        #
+        # (a) Predecessor A still verifying at B's dispatch:
+        #     → _has_inflight_verify True → entire block below skipped.
+        #     → B dispatches as-is against A's merge commit (spec_base=A.commit).
+        #
+        # (b) Predecessor A landed CLEAN before B dispatched:
+        #     → _has_inflight_verify False → block entered.
+        #     → B.speculative=True, _n_failed=False (A landed), _remerge_occurred=False.
+        #     → First branch (`item.speculative and _n_failed|_remerge_occurred`): False.
+        #     → Second branch: `not item.speculative` γ guard False (B is speculative).
+        #     → remerge_reason remains None → NO remerge → B dispatches against
+        #       A's commit (== main-after-A) → advance_main clean CAS 'advanced'
+        #       → _reverify_rebased_tree unreachable (DONE-WHEN 3, task 1862).
+        #
+        # (c) Predecessor A FAILED before B dispatched:
+        #     → _has_inflight_verify False, _n_failed=True.
+        #     → First branch fires with reason=previous_failed → _remerge vs
+        #       actual main → existing head-failure cascade invalidates B
+        #       (DONE-WHEN 4, task 1862; tested by step-5/step-6).
+        #
+        # The `not item.speculative` γ guard on Mechanism 2 is the speculative
+        # carve-out that makes case (b) provable: even if B's base_sha happened
+        # to differ from current_main, Mechanism 2 would not fire for speculative
+        # items — preventing any main_advanced remerge on the clean-landed path.
         _has_inflight_verify = any(e.verify_task is not None for e in self._inflight)
         if not _has_inflight_verify:
             remerge_reason: str | None = None
@@ -8834,7 +8944,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'previous_failed' if self._n_failed else 'chain_invalidated'
                 )
             elif (
-                not item.speculative  # γ guard: Mechanism 2 for real items only
+                # γ guard: Mechanism 2 staleness check for REAL (non-speculative) items
+                # only.  Speculative items (including late-arrival attached via
+                # pending_spec_base) must never be remerged here on base_sha mismatch —
+                # their base_sha is intentionally the predecessor's commit, not current
+                # main; the predecessor's finalize advances main to equal it (case b
+                # above) so no staleness exists.  This guard is the explicit speculative
+                # carve-out required by task 1862 step-4.
+                not item.speculative
                 and item.immediate_outcome is None
                 and item.merge_result is not None
                 and not isinstance(req, GroupMergeRequest)
