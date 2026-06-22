@@ -4705,8 +4705,10 @@ class TestReserveNowShortCircuit:
         assert scheduler.lock_table.has_parks('A')
 
         # (b) The parks must cover A's modules (look inside _parked).
+        # _parked is now a dict[str, list[tuple[str,int]]] (LIFO stack);
+        # the active-top owner is the LAST entry in each stack.
         parked_owners = {
-            m: owner for m, (owner, _rank) in scheduler.lock_table._parked.items()
+            m: stack[-1][0] for m, stack in scheduler.lock_table._parked.items()
         }
         assert 'compiler/src' in parked_owners
         assert parked_owners['compiler/src'] == 'A'
