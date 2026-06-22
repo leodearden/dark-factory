@@ -7757,6 +7757,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     await self._cleanup_owned_merge_worktree(
                                         _entry.merge_wt
                                     )
+                            # LATE-ARRIVAL ATTACH SYMMETRY (task 1862 step-6):
+                            # A late arrival B attached via pending_spec_base is
+                            # dispatched with speculative=True and held_spec_permit
+                            # retained (step-2), so B's InflightEntry carries
+                            # was_speculative=True.  The release below fires here
+                            # (predecessor failed → B is a downstream entry), and
+                            # _remerge returns speculative=False → re-dispatched B
+                            # has item_was_speculative=False → no duplicate release.
+                            # Slot symmetry is maintained on the late-arrival path
+                            # identically to the standard prefetch path.
                             if _entry.was_speculative:
                                 self._speculation_slot.release()
                             # Past the in-body lease+slot release; the except
