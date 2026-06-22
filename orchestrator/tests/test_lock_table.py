@@ -360,3 +360,134 @@ class TestPruneOwners:
     def test_prune_expired_parks_does_not_exist(self):
         """prune_expired_parks must be gone (replaced by prune_owners)."""
         assert not hasattr(ModuleLockTable, 'prune_expired_parks')
+
+
+class TestHierarchicalPreemptionInvariants:
+    """Pinned invariants for hierarchical preemption (step-11 RED tests).
+
+    Both test cases are RED against the current re-key code:
+    - case (a): the re-key collapses distinct child keys onto one parent key,
+      leaving only one victim restorable after the preemptor clears.
+    - case (b): the re-key pops only the TOP of the victim's key, leaving the
+      buried entry exposed as a conflicting active top on the original key.
+    """
+
+    @staticmethod
+    def _check_inv3(lt: ModuleLockTable) -> None:
+        """Assert every park stack is strictly rank-decreasing top-ward (INV-3).
+
+        For each stack, the rank of the active top (last element) must be
+        strictly less than the rank of every entry beneath it, i.e., ranks
+        strictly increase from the top (index -1) downward to the bottom
+        (index 0).
+        """
+        for m, stack in lt._parked.items():
+            for i in range(len(stack) - 1, 0, -1):
+                top_rank = stack[i][1]
+                below_rank = stack[i - 1][1]
+                assert top_rank < below_rank, (
+                    f"INV-3 violated on key {m!r}: "
+                    f"entry[{i}] rank={top_rank} must be strictly less than "
+                    f"entry[{i - 1}] rank={below_rank}. "
+                    f"Full stack: {stack}"
+                )
+
+    def test_two_distinct_hierarchical_victims_no_collapse_no_inversion(self):
+        """Two distinct child-key victims must shadow under their ORIGINAL keys.
+
+        L1 parks ['backend/api'] (low), L2 parks ['backend/db'] (medium),
+        then H installs ['backend'] (high).  The shadowed return must report
+        BOTH victims under their original keys; INV-3 must hold; both victims
+        must be blocked during shadow while H can acquire freely; and after
+        clear_parks_for('H') BOTH victims must be independently restorable —
+        neither stranded under the other on a collapsed key.
+
+        RED under the current re-key code because clear_parks_for('H') exposes
+        L2 as the active top of 'backend', blocking L1's try_acquire on
+        'backend/api' permanently.
+        """
+        lt = _lt(lock_depth=3)
+        lt.install_parks('L1', ['backend/api'], 'low')    # rank 3
+        lt.install_parks('L2', ['backend/db'], 'medium')  # rank 2
+        installed, shadowed = lt.install_parks('H', ['backend'], 'high')  # rank 1
+
+        assert installed == ['backend']
+        assert {(owner, tuple(mods)) for owner, mods in shadowed} == {
+            ('L1', ('backend/api',)),
+            ('L2', ('backend/db',)),
+        }, f'Both victims must appear under their original keys; got: {shadowed}'
+
+        # During shadow: victims blocked, H can acquire freely.
+        assert not lt.try_acquire('L1', ['backend/api']), 'L1 must be blocked during H shadow'
+        assert not lt.try_acquire('L2', ['backend/db']), 'L2 must be blocked during H shadow'
+        assert lt.try_acquire('H', ['backend']), 'H must be able to acquire its reserved module'
+        lt.release('H')  # release held lock; park stacks unchanged
+
+        # INV-3: every stack strictly rank-decreasing top-ward.
+        self._check_inv3(lt)
+
+        # After H clears its park: BOTH victims must be independently restorable.
+        lt.clear_parks_for('H')
+        assert lt.try_acquire('L1', ['backend/api']), (
+            'L1 must be restorable to backend/api after H clears; '
+            'stranding L1 under L2 on the collapsed key is the regression'
+        )
+        assert lt.try_acquire('L2', ['backend/db']), (
+            'L2 must be restorable to backend/db after H clears'
+        )
+
+    def test_hierarchical_preempt_over_victim_with_buried_entry(self):
+        """Hierarchical preempt must not expose a buried entry as an active top.
+
+        X parks ['backend/api'] (low), Y parks ['backend/api'] (medium) so Y
+        exact-match-shadows X (stack [X,Y] with Y the active top).  Then H
+        installs ['backend'] (high).
+
+        After install:
+        - The 'backend/api' stack must be untouched: Y still active top, X buried.
+        - H can acquire 'backend' freely; Y cannot acquire 'backend/api'.
+        - INV-3 holds across all stacks.
+
+        After clear_parks_for('H'):
+        - Y is restored as active top of 'backend/api'.
+        - X remains correctly buried beneath Y.
+
+        RED under the current re-key code: the re-key pops only Y (the top of
+        'backend/api') and moves it to 'backend', leaving X as the sole
+        (incorrectly exposed) active top of 'backend/api', which then blocks H
+        from acquiring 'backend'.
+        """
+        lt = _lt(lock_depth=3)
+        lt.install_parks('X', ['backend/api'], 'low')    # rank 3
+        lt.install_parks('Y', ['backend/api'], 'medium') # rank 2; exact-match shadow: [X,Y]
+
+        installed, shadowed = lt.install_parks('H', ['backend'], 'high')  # rank 1
+        assert installed == ['backend']
+
+        # 'backend/api' stack must be UNTOUCHED: Y still active top, X buried.
+        assert 'backend/api' in lt._parked, (
+            "'backend/api' key must still exist in _parked after hierarchical preempt"
+        )
+        assert lt._parked['backend/api'][-1][0] == 'Y', (
+            f"Y must remain the active top of 'backend/api'; "
+            f"got {lt._parked['backend/api'][-1][0]!r}. "
+            f"Exposing X as the active top is the re-key bug."
+        )
+
+        # H can acquire 'backend' freely; Y (shadowed) cannot acquire 'backend/api'.
+        assert lt.try_acquire('H', ['backend']), (
+            'H must not be blocked by X (which the re-key bug exposes as a '
+            'conflicting active top of backend/api)'
+        )
+        assert not lt.try_acquire('Y', ['backend/api']), 'Y must be blocked while H shadows it'
+        lt.release('H')  # release held lock; park stacks unchanged
+
+        # INV-3: every stack strictly rank-decreasing top-ward.
+        self._check_inv3(lt)
+
+        # After H clears its park: Y is restored; X remains correctly buried.
+        lt.clear_parks_for('H')
+        assert lt.try_acquire('Y', ['backend/api']), 'Y must be restored after H clears'
+        assert not lt.try_acquire('X', ['backend/api']), (
+            'X must remain buried beneath restored Y'
+        )
