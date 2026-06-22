@@ -237,7 +237,7 @@ class TestParkInstallAtTracking:
         lt = self._make_lock_table()
         lt.install_parks('T', ['mod/a'], 'medium')
         assert 'T' in lt._park_install_at
-        evicted = lt.prune_owners(lambda owner: owner == 'T')
+        evicted, _restored = lt.prune_owners(lambda owner: owner == 'T')
         assert 'T' in evicted
         assert 'T' not in lt._park_install_at
 

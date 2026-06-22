@@ -247,33 +247,81 @@ class TestParkStackInvariants:
         assert lt.has_parks('high_task'), 'Active-top owner must report has_parks True'
 
 
+class TestClearParksForRestoreContract:
+    """clear_parks_for(task_id) must return restored (owner, modules) pairs (step-3)."""
+
+    def test_clear_parks_for_returns_restored_pairs_on_top_removal(self):
+        """Clearing the active top exposes the buried entry — returned as restored pair."""
+        lt = _lt()
+        lt.install_parks('L', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'high')  # H on top, L buried
+        # Clear H (the top) — exposes L as the new active top.
+        restored = lt.clear_parks_for('H')
+        assert restored == [('L', ['m1'])], f'Expected L restored to m1, got: {restored}'
+        assert lt.has_parks('L'), 'L must be the restored active top after H is cleared'
+
+    def test_clear_parks_for_returns_empty_when_no_restore(self):
+        """Clearing the only entry leaves no buried owner to restore — empty list."""
+        lt = _lt()
+        lt.install_parks('A', ['m1'], 'medium')
+        restored = lt.clear_parks_for('A')
+        assert restored == [], f'Expected empty restore list, got: {restored}'
+        assert not lt.has_parks('A')
+
+    def test_clear_parks_for_returns_empty_on_buried_removal(self):
+        """INV-4 buried clause: clearing a buried (non-top) owner reports no restore."""
+        lt = _lt()
+        lt.install_parks('L', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'high')  # H on top, L buried
+        # Clear L (the buried entry) — H stays on top; nothing is newly exposed.
+        restored = lt.clear_parks_for('L')
+        assert restored == [], f'Removing a buried entry must not report any restore, got: {restored}'
+        # H is still the active top.
+        assert lt.has_parks('H'), 'H must remain on top after buried L is cleared'
+
+    def test_clear_parks_for_returns_multiple_modules_per_restored_owner(self):
+        """When an owner is restored across multiple modules, all are in one pair."""
+        lt = _lt()
+        lt.install_parks('L', ['m1', 'm2'], 'low')
+        lt.install_parks('H', ['m1', 'm2'], 'high')  # H shadows L on both
+        restored = lt.clear_parks_for('H')
+        # L should be restored on both m1 and m2.
+        assert len(restored) == 1
+        owner, mods = restored[0]
+        assert owner == 'L'
+        assert sorted(mods) == ['m1', 'm2'], f'Expected L restored on [m1,m2], got: {mods}'
+
+
 class TestPruneOwners:
-    """prune_owners(predicate) owner-state GC and removal of prune_expired_parks."""
+    """prune_owners(predicate) owner-state GC: widened return (evicted, restored_pairs)."""
 
     def test_prune_owners_drops_matching(self):
         """prune_owners evicts owners for which the predicate returns True."""
         lt = _lt()
         lt.install_parks('A', ['m1'], 'medium')
         lt.install_parks('B', ['m2'], 'medium')
-        evicted = lt.prune_owners(lambda tid: tid == 'A')
+        evicted, restored = lt.prune_owners(lambda tid: tid == 'A')
         assert evicted == ['A']
+        assert restored == []  # A was the only owner of m1, no buried entry to expose
         assert not lt.has_parks('A')
         assert lt.has_parks('B')
 
     def test_prune_owners_returns_empty_when_no_match(self):
-        """prune_owners returns [] when the predicate never fires."""
+        """prune_owners returns ([], []) when the predicate never fires."""
         lt = _lt()
         lt.install_parks('A', ['m1'], 'medium')
-        evicted = lt.prune_owners(lambda tid: False)
+        evicted, restored = lt.prune_owners(lambda tid: False)
         assert evicted == []
+        assert restored == []
         assert lt.has_parks('A')
 
     def test_prune_owners_dedups_owners_by_first_seen(self):
-        """Owner with multiple parks appears only once in the result."""
+        """Owner with multiple parks appears only once in the evicted list."""
         lt = _lt()
         lt.install_parks('A', ['m1', 'm2'], 'medium')
-        evicted = lt.prune_owners(lambda tid: True)
+        evicted, restored = lt.prune_owners(lambda tid: True)
         assert evicted == ['A']
+        assert restored == []
 
     def test_prune_owners_predicate_called_per_owner_not_per_park(self):
         """Predicate is called at most once per distinct owner (memoized)."""
@@ -285,9 +333,29 @@ class TestPruneOwners:
             calls.append(tid)
             return True
 
-        lt.prune_owners(predicate)
+        evicted, restored = lt.prune_owners(predicate)
         # A owns two parks but predicate should be called ≤ 1 time for 'A'.
         assert calls.count('A') <= 1
+
+    def test_prune_owners_returns_restored_when_top_is_pruned(self):
+        """Pruning the active top exposes a buried entry — returned as restored pair."""
+        lt = _lt()
+        lt.install_parks('L', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'high')  # H on top, L buried
+        evicted, restored = lt.prune_owners(lambda tid: tid == 'H')
+        assert evicted == ['H']
+        assert restored == [('L', ['m1'])], f'Expected L restored after H pruned, got: {restored}'
+
+    def test_prune_owners_no_restore_when_buried_is_pruned(self):
+        """INV-4 buried clause: pruning a buried (non-top) owner reports no restore."""
+        lt = _lt()
+        lt.install_parks('L', ['m1'], 'low')
+        lt.install_parks('H', ['m1'], 'high')  # H on top, L buried
+        evicted, restored = lt.prune_owners(lambda tid: tid == 'L')
+        assert evicted == ['L']
+        assert restored == [], f'Pruning a buried entry must not produce restores, got: {restored}'
+        # H is still on top.
+        assert lt.has_parks('H'), 'H must remain the active top after buried L is pruned'
 
     def test_prune_expired_parks_does_not_exist(self):
         """prune_expired_parks must be gone (replaced by prune_owners)."""
