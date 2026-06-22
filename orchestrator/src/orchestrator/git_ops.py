@@ -1594,6 +1594,15 @@ class GitOps:
             # infinite requeue.
             return WarmLaneUnavailable.DISABLED
 
+        # ε: pre-acquire disk-guard (check → reclaim → recheck → DISK_PRESSURE/exit-75).
+        # Running BEFORE acquire_for keeps all idle lanes FREE so δ's reclaim can reset
+        # them.  On still-pressured (rc=75 after reclaim), return DISK_PRESSURE so
+        # create_worktree raises WarmLaneDiskPressure → workflow requeues as transient
+        # infra (exit-75) instead of proceeding into an ENOSPC build that SIGBUSes the
+        # linker.  Fail-open (absent script rc=127) → byte-identical to today.
+        if self.config.warm_lane_disk_guard and await self._warm_lane_disk_admission_blocked():
+            return WarmLaneUnavailable.DISK_PRESSURE
+
         acq = await self.warm_lane_pool.acquire_for(branch_name)
         if acq is None:
             return WarmLaneUnavailable.EXHAUSTED  # Pool exhausted → backpressure
