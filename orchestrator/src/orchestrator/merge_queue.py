@@ -6831,6 +6831,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # (abandoned-at-top, except WorktreeMissing, except Exception, outer
         # finally) releases the permit and clears this flag.
         held_spec_permit: bool = False
+        # Late-arrival attach state (task 1862): when the look-ahead peek finds
+        # nothing pickable but the predecessor is still in-flight, RETAIN the
+        # held speculation permit and record the predecessor's merge commit here.
+        # A late-arriving successor will ATTACH to it at the next dequeue instead
+        # of falling back to non-speculative plain-main.
+        # Both are cleared after the ATTACH/FALLBACK decision following the next
+        # _acquire_next_request() call, and on the shutdown/break paths.
+        pending_spec_base: str | None = None   # predecessor's merge commit SHA
+        pending_predecessor: MergeRequest | None = None  # predecessor request
         # Set True when the loop exits cleanly via the None shutdown sentinel from
         # _acquire_next_request().  Used in the finally to decide whether to forward
         # the sentinel to the verifier: on the crash path (exception while _running is
@@ -6871,8 +6880,50 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     req = await self._acquire_next_request()
                     if req is None:
                         exited_via_sentinel = True
+                        # Clear pending late-arrival state before exiting.
+                        pending_spec_base = None
+                        pending_predecessor = None
                         break  # shutdown sentinel
-                    spec_base = None  # fresh dequeue resets speculation chain
+                    # ATTACH or FALLBACK: decide whether this fresh dequeue is a
+                    # late arrival that can attach to the in-flight predecessor's
+                    # merge commit (task 1862).
+                    #
+                    # ATTACH — all four conditions must hold:
+                    #   (a) pending_spec_base: predecessor's commit was recorded
+                    #   (b) held_spec_permit: speculation permit is still held
+                    #   (c) pending_predecessor: predecessor request is known
+                    #   (d) predecessor still in-flight (result future not done)
+                    #
+                    # On ATTACH: spec_base = pending_spec_base so this late
+                    # arrival merges against main+A, not plain main.  The
+                    # retained permit transfers to the verifier item on drain.
+                    #
+                    # On FALLBACK (any condition fails): release the held permit
+                    # if present and merge non-speculatively against actual main.
+                    if (
+                        pending_spec_base is not None
+                        and held_spec_permit
+                        and pending_predecessor is not None
+                        and not pending_predecessor.result.done()
+                    ):
+                        spec_base = pending_spec_base  # ATTACH
+                        logger.debug(
+                            'Task %s: late arrival attaches to in-flight '
+                            'predecessor %s (spec_base=%s)',
+                            req.task_id,
+                            pending_predecessor.task_id,
+                            pending_spec_base[:8],
+                        )
+                    else:
+                        # FALLBACK — release retained permit (if any) and merge
+                        # against actual main (plain non-speculative).
+                        if held_spec_permit:
+                            self._speculation_slot.release()
+                            held_spec_permit = False
+                        spec_base = None
+                    # Clear pending locals — consumed by ATTACH or dropped by FALLBACK.
+                    pending_spec_base = None
+                    pending_predecessor = None
 
                 self._inflight_req = req  # track for stop() race resolution
                 # Drop-on-detection: workflow soft-cancelled before worker
@@ -7259,11 +7310,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     elif self._shutdown_signaled:
                         self._speculation_slot.release()  # return unused permit
                         held_spec_permit = False
+                        # Clear pending late-arrival state before exiting.
+                        pending_spec_base = None
+                        pending_predecessor = None
                         break  # shutdown sentinel and nothing left to speculate
                     else:
-                        self._speculation_slot.release()  # no pickable item — return permit
-                        held_spec_permit = False
-                        spec_base = None  # no pickable item, no speculation
+                        # Nothing pickable right now AND predecessor is in-flight.
+                        # RETAIN the held speculation permit so a late-arriving
+                        # successor can attach to the predecessor's merge commit
+                        # (task 1862: close the disjoint-skip semantic-conflict hole).
+                        #
+                        # • DON'T release: the permit transfers to the late arrival
+                        #   on ATTACH (or is released on FALLBACK at next dequeue).
+                        # • DON'T set spec_base: the late arrival hasn't been dequeued
+                        #   yet; spec_base is set at the ATTACH/FALLBACK decision.
+                        # • Record predecessor's commit so the next dequeue can attach.
+                        pending_spec_base = merge_commit  # predecessor's merge commit
+                        pending_predecessor = req         # predecessor in-flight
+                        # held_spec_permit stays True — permit retained for late arrival
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
                     # cause: a human marked the task done and cleaned up
