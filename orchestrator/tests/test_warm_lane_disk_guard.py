@@ -1,15 +1,4 @@
-"""Tests for ε warm-lane disk-guard admission control.
-
-Each step group is labelled RED/GREEN to track TDD phase:
-
-  Step 1 (RED): _warm_lane_disk_admission_blocked() — method and config knobs absent.
-  Step 3 (RED): acquire_warm_lane() guard wiring — not yet wired.
-  Step 5 (RED): CLI contract (threshold flags) and e2e create_worktree →
-                WarmLaneDiskPressure — threshold args not yet forwarded.
-
-Tests that are currently RED fail because the feature does not exist yet.
-They turn GREEN in the corresponding implementation step.
-"""
+"""Tests for ε warm-lane disk-guard admission control (task-1860)."""
 from __future__ import annotations
 
 import asyncio
@@ -55,8 +44,8 @@ def git_repo(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-async def _add_disk_guard_scripts(repo: Path) -> None:
-    """Commit stub warm-lane-disk-guard.sh and warm-lane-gc.sh into repo/scripts/.
+def _write_disk_guard_stubs(scripts_dir: Path) -> None:
+    """Write warm-lane-disk-guard.sh and warm-lane-gc.sh stubs into scripts_dir.
 
     guard stub (warm-lane-disk-guard.sh):
       - Appends "check <argv>" to <repo>/.test_disk_call_log.
@@ -66,10 +55,11 @@ async def _add_disk_guard_scripts(repo: Path) -> None:
     gc stub (warm-lane-gc.sh):
       - Appends "reclaim <argv>" to <repo>/.test_disk_call_log.
       - Exits 0.
-    """
-    scripts_dir = repo / 'scripts'
-    scripts_dir.mkdir(parents=True, exist_ok=True)
 
+    Called from both _add_disk_guard_scripts and _add_all_warm_lane_scripts to
+    keep the stub contract in one place — any future change to stub behaviour
+    (new flags, log format) only needs a single edit here.
+    """
     guard = scripts_dir / 'warm-lane-disk-guard.sh'
     guard.write_text(
         '#!/usr/bin/env bash\n'
@@ -103,6 +93,12 @@ async def _add_disk_guard_scripts(repo: Path) -> None:
     )
     gc.chmod(0o755)
 
+
+async def _add_disk_guard_scripts(repo: Path) -> None:
+    """Commit stub warm-lane-disk-guard.sh and warm-lane-gc.sh into repo/scripts/."""
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    _write_disk_guard_stubs(scripts_dir)
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'add disk-guard stub scripts'], cwd=repo)
 
@@ -143,19 +139,9 @@ def _make_disk_guard_config(**overrides: Any) -> GitConfig:
     )
 
 
-# ===========================================================================
-# Step 1 (RED): _warm_lane_disk_admission_blocked()
-# ===========================================================================
-
-
 @pytest.mark.asyncio
 class TestWarmLaneDiskAdmissionBlocked:
-    """Unit tests for GitOps._warm_lane_disk_admission_blocked().
-
-    RED today — the method and config knobs (warm_lane_disk_guard,
-    warm_lane_min_free_gib, warm_lane_min_free_inodes) do not yet exist.
-    Turns GREEN in step 2.
-    """
+    """Unit tests for GitOps._warm_lane_disk_admission_blocked()."""
 
     async def test_still_pressured_returns_true(
         self, git_repo: Path,
@@ -227,18 +213,13 @@ class TestWarmLaneDiskAdmissionBlocked:
         )
 
 
-# ===========================================================================
-# Step 3 (RED): acquire_warm_lane() consults the disk-guard before allocating
-# ===========================================================================
-
-
 async def _add_all_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
     """Commit stub seed, debug-port, disk-guard, and gc scripts into repo/scripts/.
 
-    Combines _add_warm_lane_scripts (seed + debug-port) with
-    _add_disk_guard_scripts (warm-lane-disk-guard.sh + warm-lane-gc.sh) so that
-    tests can exercise both the acquire path and the disk-guard admission gate.
-    Commits all four scripts in a single commit.
+    Combines _add_warm_lane_scripts (seed + debug-port) with the disk-guard and
+    gc stubs (via _write_disk_guard_stubs) so tests can exercise both the acquire
+    path and the disk-guard admission gate.  Commits all four scripts in a single
+    commit.
     """
     scripts_dir = repo / 'scripts'
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -255,37 +236,8 @@ async def _add_all_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
     debug.write_text(f'#!/usr/bin/env bash\necho {port}\n')
     debug.chmod(0o755)
 
-    # Disk-guard stub (same as _add_disk_guard_scripts)
-    guard = scripts_dir / 'warm-lane-disk-guard.sh'
-    guard.write_text(
-        '#!/usr/bin/env bash\n'
-        'set -euo pipefail\n'
-        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
-        'ROOT="$(dirname "$DIR")"\n'
-        'echo "check $*" >> "$ROOT/.test_disk_call_log"\n'
-        'if [ -f "$ROOT/.test_disk_check_exits" ] && [ -s "$ROOT/.test_disk_check_exits" ]; then\n'
-        '    rc=$(head -1 "$ROOT/.test_disk_check_exits")\n'
-        '    tmpf="${ROOT}/.test_disk_check_exits.tmp"\n'
-        '    tail -n +2 "$ROOT/.test_disk_check_exits" > "$tmpf"\n'
-        '    mv "$tmpf" "$ROOT/.test_disk_check_exits"\n'
-        'else\n'
-        '    rc=0\n'
-        'fi\n'
-        'exit "${rc:-0}"\n'
-    )
-    guard.chmod(0o755)
-
-    # GC stub
-    gc = scripts_dir / 'warm-lane-gc.sh'
-    gc.write_text(
-        '#!/usr/bin/env bash\n'
-        'set -euo pipefail\n'
-        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
-        'ROOT="$(dirname "$DIR")"\n'
-        'echo "reclaim $*" >> "$ROOT/.test_disk_call_log"\n'
-        'exit 0\n'
-    )
-    gc.chmod(0o755)
+    # Disk-guard + GC stubs (shared with _add_disk_guard_scripts)
+    _write_disk_guard_stubs(scripts_dir)
 
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'add all warm-lane stub scripts'], cwd=repo)
@@ -300,11 +252,7 @@ async def _get_head(repo: Path) -> str:
 
 @pytest.mark.asyncio
 class TestAcquireWarmLaneDiskGuard:
-    """Integration: acquire_warm_lane() is gated by _warm_lane_disk_admission_blocked().
-
-    RED today — the guard is not wired into acquire_warm_lane.
-    Turns GREEN in step 4.
-    """
+    """Integration: acquire_warm_lane() is gated by _warm_lane_disk_admission_blocked()."""
 
     async def test_still_pressured_returns_disk_pressure(
         self, git_repo: Path,
@@ -392,22 +340,9 @@ class TestAcquireWarmLaneDiskGuard:
         )
 
 
-# ===========================================================================
-# Step 5 (RED): e2e create_worktree → WarmLaneDiskPressure + CLI contract
-# ===========================================================================
-
-
 @pytest.mark.asyncio
 class TestWarmLaneDiskGuardE2E:
-    """E2E and CLI-contract tests for the ε warm-lane disk-guard admission path.
-
-    The e2e tests (create_worktree raises WarmLaneDiskPressure, seed never
-    invoked) turn GREEN in step 4 because the guard is wired.
-
-    The CLI-contract threshold-flag assertions (check receives --min-free-gib
-    and --min-free-inodes) are RED today because step-2 _run_warm_lane_disk_guard
-    only passes --mount.  They turn GREEN in step 6.
-    """
+    """E2E and CLI-contract tests for the ε warm-lane disk-guard admission path."""
 
     async def test_create_worktree_raises_warm_lane_disk_pressure(
         self, git_repo: Path,
@@ -449,11 +384,7 @@ class TestWarmLaneDiskGuardE2E:
     async def test_cli_contract_check_receives_mount_and_thresholds(
         self, git_repo: Path,
     ):
-        """CLI contract: check received --mount, --min-free-gib, --min-free-inodes.
-
-        RED today — step-2 _run_warm_lane_disk_guard passes only --mount.
-        Turns GREEN in step 6 when threshold flags are appended.
-        """
+        """CLI contract: check received --mount, --min-free-gib, --min-free-inodes."""
         await _add_all_warm_lane_scripts(git_repo)
         _write_check_exits(git_repo, [75, 75])
         # _make_disk_guard_config defaults: min_free_gib=50, min_free_inodes=500_000
@@ -481,7 +412,6 @@ class TestWarmLaneDiskGuardE2E:
             f'got {first_check.split()[mount_idx + 1]!r}'
         )
 
-        # Verify threshold flags — RED today (step-6 adds them)
         assert '--min-free-gib' in first_check, (
             f'check must receive --min-free-gib; got: {first_check!r}'
         )

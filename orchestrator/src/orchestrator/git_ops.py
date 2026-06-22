@@ -1279,6 +1279,15 @@ class GitOps:
                     '_run_warm_lane_disk_guard: script absent at %s — no-op', script,
                 )
                 return 127
+            # NOTE: worktree_base may not exist yet on a fresh host where no lane
+            # has been created.  In that case the real γ script will likely stat a
+            # non-existent path and return a non-(0,75) exit code, which the caller
+            # treats as fail-open (guard is an inert no-op until worktree_base first
+            # appears).  This is deliberate: the guard cannot measure a volume that
+            # does not yet exist, and the script-level fail-closed convention (df
+            # failure → 75) only applies to volume access errors, not missing mount
+            # points.  Seed the first lane to create worktree_base, then the guard
+            # becomes active.
             cmd = [
                 str(script), 'check',
                 '--mount', str(self.worktree_base),
@@ -1616,6 +1625,18 @@ class GitOps:
         # create_worktree raises WarmLaneDiskPressure → workflow requeues as transient
         # infra (exit-75) instead of proceeding into an ENOSPC build that SIGBUSes the
         # linker.  Fail-open (absent script rc=127) → byte-identical to today.
+        #
+        # Concurrency note: the guard + δ reclaim run WITHOUT holding warm_lane_pool
+        # _lock.  This is intentional — serializing on the pool lock would prevent
+        # concurrent acquires from even attempting during a reclaim.  The safety
+        # invariant is delegated to the γ/δ scripts: warm-lane-gc.sh MUST only reset
+        # lanes that have been idle beyond a configurable safety threshold (e.g. no
+        # active acquire_for in flight for those lanes).  Because acquire_for itself
+        # holds the pool lock for the registration step, a lane that is mid-acquire
+        # will be ASSIGNED in pool state and δ must skip ASSIGNED lanes.  Until reify
+        # δ (task-4717) ships with that guarantee documented, the guard is fail-open
+        # (rc 127) and the window is a no-op; document it here so the δ author knows
+        # the expected contract.
         if self.config.warm_lane_disk_guard and await self._warm_lane_disk_admission_blocked():
             return WarmLaneUnavailable.DISK_PRESSURE
 
