@@ -41,7 +41,6 @@ from orchestrator.git_ops import (
 )
 from orchestrator.warm_lane_pool import LaneState
 
-
 # ---------------------------------------------------------------------------
 # Repo fixture
 # ---------------------------------------------------------------------------
@@ -511,7 +510,7 @@ class TestFaultEscalates:
         try:
             result = await git_ops.create_worktree('Z')
             # If we get here, no exception was raised — fail
-            assert False, (
+            raise AssertionError(
                 f'create_worktree must raise on FAULT, returned {result!r}'
             )
         except RuntimeError:
@@ -726,8 +725,8 @@ class TestG5Gate:
 
         cold_y = git_ops.worktree_base / 'Y'
         assert not cold_y.exists(), (
-            f'Phase B: cold worktree_base/Y must NOT be created on exhaustion; '
-            f'β cold-fall-through guard broken'
+            'Phase B: cold worktree_base/Y must NOT be created on exhaustion; '
+            'β cold-fall-through guard broken'
         )
         assert git_ops.warm_lane_pool.state(lane_path) == LaneState.ASSIGNED, (
             'Phase B: _lane-0 must remain ASSIGNED to X during exhaustion'
