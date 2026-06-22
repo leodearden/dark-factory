@@ -2498,6 +2498,141 @@ class TestFairness:
         assert shadowed_payload['data']['preempted_by_priority'] == 'high'
         assert shadowed_payload['data']['victim'] == 'L'
 
+    # ---- reservation_restored emission at all three pop sites (step-7) ----
+
+    @pytest.mark.asyncio
+    async def test_restore_emitted_on_dispatch(self):
+        """DISPATCH pop-site: when the active-top owner dispatches, clear_parks_for
+        restores the buried owner and a reservation_restored event is emitted
+        alongside reservation_used.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        # L parks m1 at low; H shadows L on m1 at high (H is active top).
+        scheduler.lock_table.install_parks('L', ['m1'], priority='low')
+        scheduler.lock_table.install_parks('H', ['m1'], priority='high')
+        assert scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L')
+
+        h_task = {
+            'id': 'H', 'title': 'h', 'status': 'pending',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        l_task = {
+            'id': 'L', 'title': 'l', 'status': 'pending',
+            'priority': 'low', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[h_task, l_task])
+
+        await scheduler.acquire_next()
+
+        # H dispatched, its park cleared; L is now the restored active top.
+        assert not scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L'), 'L must be restored after H dispatches'
+
+        # reservation_used emitted for H (existing behavior).
+        used_events = [e for e in event_store.events if 'reservation_used' in e[0]]
+        assert len(used_events) == 1, f'Expected 1 reservation_used; got {used_events}'
+
+        # reservation_restored emitted for L alongside reservation_used.
+        restored_events = [e for e in event_store.events if 'reservation_restored' in e[0]]
+        assert len(restored_events) == 1, (
+            f'Expected 1 reservation_restored on dispatch; got {restored_events}'
+        )
+        r = restored_events[0][1]
+        assert r['data']['restored_owner'] == 'L', f'Wrong restored owner: {r}'
+        assert 'm1' in r['data']['modules'], f'Expected m1 in restored modules: {r}'
+
+    @pytest.mark.asyncio
+    async def test_restore_emitted_on_release(self):
+        """RELEASE pop-site: scheduler.release(shadowing_top) clears its parks,
+        restoring the buried owner and emitting reservation_restored.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        # H shadows L on m1.
+        scheduler.lock_table.install_parks('L', ['m1'], priority='low')
+        scheduler.lock_table.install_parks('H', ['m1'], priority='high')
+        assert scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L')
+
+        # H is currently dispatched (holds a lock elsewhere; we simulate by
+        # marking it dispatched so release() operates on a real scenario).
+        scheduler._dispatched.add('H')
+        scheduler._dispatched_priority['H'] = 'high'
+
+        scheduler.release('H')
+
+        # H's parks cleared; L is restored.
+        assert not scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L'), 'L must be restored after H releases'
+
+        # reservation_restored must be emitted.
+        restored_events = [e for e in event_store.events if 'reservation_restored' in e[0]]
+        assert len(restored_events) == 1, (
+            f'Expected 1 reservation_restored on release; got {restored_events}'
+        )
+        r = restored_events[0][1]
+        assert r['data']['restored_owner'] == 'L'
+        assert 'm1' in r['data']['modules']
+
+    @pytest.mark.asyncio
+    async def test_restore_emitted_on_gc(self):
+        """OWNER-GC pop-site: when a shadowing top is terminal/missing, prune_owners
+        removes it via _park_gc, restoring the buried owner; both reservation_expired
+        (for the GC'd owner) and reservation_restored (for the restored owner) are
+        emitted.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        # L parks m1 at medium; H (which will be cancelled) shadows L at high.
+        scheduler.lock_table.install_parks('L', ['m1'], priority='medium')
+        scheduler.lock_table.install_parks('H', ['m1'], priority='high')
+        scheduler._skip_count['H'] = 5
+        assert scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L')
+
+        # H is cancelled; L is a live pending task.
+        h_task = {
+            'id': 'H', 'title': 'h', 'status': 'cancelled',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        l_task = {
+            'id': 'L', 'title': 'l', 'status': 'pending',
+            'priority': 'medium', 'dependencies': [],
+            'metadata': {'files': ['other']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[h_task, l_task])
+
+        await scheduler.acquire_next()
+
+        # H GC'd; L is restored.
+        assert not scheduler.lock_table.has_parks('H'), 'H (cancelled) must be GC-evicted'
+        assert scheduler.lock_table.has_parks('L'), 'L must be restored after H is GC-evicted'
+
+        # reservation_expired emitted for H (existing GC behavior).
+        expired_events = [e for e in event_store.events if 'reservation_expired' in e[0]]
+        assert len(expired_events) == 1, f'Expected 1 reservation_expired; got {expired_events}'
+        assert expired_events[0][1]['task_id'] == 'H'
+
+        # reservation_restored emitted for L alongside reservation_expired.
+        restored_events = [e for e in event_store.events if 'reservation_restored' in e[0]]
+        assert len(restored_events) == 1, (
+            f'Expected 1 reservation_restored on GC; got {restored_events}'
+        )
+        r = restored_events[0][1]
+        assert r['data']['restored_owner'] == 'L'
+        assert 'm1' in r['data']['modules']
+
     # ---- Owner-state park-GC (step-14) ----
 
     @pytest.mark.asyncio
