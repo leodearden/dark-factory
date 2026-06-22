@@ -417,9 +417,8 @@ class TestBudgetMisconfigSignal:
         result = _agent_result(
             success=False, subtype='error_max_budget_usd', cost_usd=0.11, turns=2,
         )
-        with caplog.at_level(logging.WARNING):
-            with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
-                await _do_adjudicate(adj)
+        with caplog.at_level(logging.WARNING), patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
+            await _do_adjudicate(adj)
 
         warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
