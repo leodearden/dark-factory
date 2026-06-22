@@ -821,10 +821,17 @@ class GitConfig(BaseModel):
             'per-host pool of pre-seeded warm lanes (_lane-0 .. _lane-{N-1}) '
             'instead of creating a cold ephemeral git worktree for each task. '
             'Pool size N = max_concurrent_tasks (passed to GitOps at startup). '
-            'On pool exhaustion, absent seed script, or seed failure, '
-            'create_worktree falls back to the cold path — never blocks the '
-            'scheduler (inv.6).  Default False → byte-identical to today '
-            '(trivially revertible, mirrors persistent_merge_worktree knob).'
+            'Bounded-pool policy (β): acquire_warm_lane returns a discriminated '
+            'outcome — EXHAUSTED → WarmLanePoolExhausted (requeue/backpressure, '
+            'scheduler caps at pool size and waits, never cold-creates); '
+            'FAULT (seed/worktree-add failure or absent seed script) → '
+            'RuntimeError → blocked + L1; DISK_PRESSURE (seed exit-75) → '
+            'WarmLaneDiskPressure → transient-infra requeue. '
+            'The cold-path fall-through is removed while the knob is enabled. '
+            'Default False → byte-identical to today (trivially revertible, '
+            'mirrors persistent_merge_worktree knob). '
+            'Note: the reify-repo PRD inv.6 text is the cross-repo counterpart '
+            'of this policy; it is flagged for update separately via escalate_info.'
         ),
     )
     warm_lane_base_target_dir: str | None = Field(
