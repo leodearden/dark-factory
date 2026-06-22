@@ -1025,7 +1025,7 @@ class GitOps:
             reify_debug_port=port,
         )
 
-    async def _seed_warm_lane(self, lane_dir: Path, mode: str) -> bool:
+    async def _seed_warm_lane(self, lane_dir: Path, mode: str) -> int:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
         Invokes ``<lane_dir>/scripts/seed-warm-lane.sh <base_target> <lane_dir> <mode>``
@@ -1047,15 +1047,20 @@ class GitOps:
         tree provides it, consistent with the debug-port script pattern).
 
         Returns:
-            True  — script ran and exited 0 (seed succeeded, lane is warm).
-            False — script absent, exited non-zero, or any exception (fail-soft;
-                    never blocks dispatch — caller falls back to cold path).
+            0   — script ran and exited 0 (seed succeeded, lane is warm).
+            75  — script exited 75 (EX_TEMPFAIL, disk-pressure discriminant).
+            1..N — script exited with any other non-zero code (generic fault).
+            127 — script absent (command-not-found sentinel).
+            127 — any unexpected exception (non-zero sentinel, never raises).
+
+        Callers must use ``rc == 0`` for success and may inspect the exact
+        code to discriminate disk-pressure (75) from generic fault (other non-zero).
         """
         try:
             script = lane_dir / 'scripts' / 'seed-warm-lane.sh'
             if not script.exists():
                 logger.debug('_seed_warm_lane: seed script absent at %s', script)
-                return False
+                return 127  # command-not-found sentinel
             base_path = self.warm_lane_base_target_path
             if base_path.is_symlink():
                 # D8: resolve relative-sibling symlink (target -> .gen.N) to the
@@ -1089,13 +1094,12 @@ class GitOps:
                     '_seed_warm_lane: script exited %d for %s (stderr=%r)',
                     rc, lane_dir, err,
                 )
-                return False
-            return True
+            return rc
         except Exception:
             logger.warning(
                 '_seed_warm_lane: unexpected error for %s', lane_dir, exc_info=True,
             )
-            return False
+            return 127  # exception sentinel (non-zero, non-75 → generic fault)
 
     async def refresh_warm_base(self, landed_commit: str | None = None) -> bool:
         """Advance the rolling warm base by running the refresh script.
@@ -1304,13 +1308,13 @@ class GitOps:
             )
 
         # ── inv.8: ALWAYS re-seed target/ from the current warm base ─────────
-        ok = await self._seed_warm_lane(lane, '--reset-in-place')
-        if not ok:
+        rc = await self._seed_warm_lane(lane, '--reset-in-place')
+        if rc != 0:
             # Seed failed — release the partially-acquired lane back to FREE
             # (inv.6: cold fallback on seed failure, never block scheduler).
             logger.debug(
-                'acquire_spec_lane: seed failed for %s — releasing lane, cold fallback',
-                lane,
+                'acquire_spec_lane: seed failed for %s (rc=%d) — releasing lane, cold fallback',
+                lane, rc,
             )
             await self.spec_warm_lane_pool.release(lane)
             wt = await self.create_throwaway_verify_worktree(merge_commit)
@@ -1426,8 +1430,8 @@ class GitOps:
                 # D10: always re-seed from current base after identity-mismatch reset.
                 # Fail-soft: a recycled lane already has a usable (if stale) target/,
                 # so a failed re-seed degrades to the prior warmth — never cold-fallback.
-                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
-                if not ok:
+                rc = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if rc != 0:
                     logger.warning(
                         'acquire_warm_lane: re-seed failed for recycled lane %s; '
                         'proceeding with retained target — degraded warmth',
@@ -1458,8 +1462,8 @@ class GitOps:
                     await self.warm_lane_pool.release(lane)
                     return None
 
-                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
-                if not ok:
+                rc = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if rc != 0:
                     # Seed failed — remove the just-created worktree and release
                     logger.warning(
                         'acquire_warm_lane: seed failed for %s; removing and cold-falling back',
@@ -1517,8 +1521,8 @@ class GitOps:
                 # Fail-soft: a recycled lane already has a usable (if stale) target/,
                 # so a failed re-seed degrades to the prior warmth — never cold-fallback
                 # or block dispatch (D10 / inv.6).
-                ok = await self._seed_warm_lane(lane, '--fresh-checkout')
-                if not ok:
+                rc = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if rc != 0:
                     logger.warning(
                         'acquire_warm_lane: re-seed failed for recycled lane %s; '
                         'proceeding with retained target — degraded warmth',
