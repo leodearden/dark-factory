@@ -68,4 +68,20 @@ orchestrator-redeploy-restart.sh: scheduled restart of 'orchestrator-reify.servi
 
 ---
 
-## Verification
+## Verification (out-of-band, post-restart)
+
+Live state read via `systemctl --user show orchestrator-reify.service -p MainPID -p ActiveState -p ActiveEnterTimestamp` after the transient unit fired and the service completed stop→start:
+
+| Criterion | Expected | Actual | Status |
+|---|---|---|---|
+| (a) ActiveState | `active` | `active` | ✅ GREEN |
+| (b) MainPID | ≠ 3454423 (fresh process) | `937088` | ✅ GREEN |
+| (c) ActiveEnterTimestamp | AFTER 2026-06-22 20:51:23 BST (#1862 merge) | `Mon 2026-06-22 21:05:11 BST` | ✅ GREEN |
+| (d) Startup log | `"Speculative merge worker started"` in post-restart journal | Present at `21:05:13 BST` | ✅ GREEN |
+| (d2) K | hosts_total from merge queue occupancy | `hosts_total=1` (K=1 serial-local; verify_runners not yet enabled in reify config per task 1716 gate — leo-laptop SSH-reachable at schedule time but config has not enabled the runner) | ℹ️ NOTE |
+| (e) #1862 fix in loaded source | `pending_spec_base`, disjoint-skip carve-out in `merge_queue.py` | Present: `pending_spec_base` at lines 6841/6854/6857/6858/6878; disjoint gate at lines 1829/1924/1972 | ✅ GREEN |
+| (f) Behavioral (deferred) | Follower arriving mid-predecessor-verify emits `speculative_merge` with `base_sha == predecessor merge SHA`; predecessor landing shows no `_reverify_rebased_tree` / `rebased_pending_reverify` | **Deferred** — structural criteria (a)–(e) confirm fresh process running with #1862 source on disk; behavioral path requires a natural mid-flight predecessor/follower cascade; confirmed opportunistically on next real cascade | ⚠️ DEFERRED |
+
+**Delta:** Service restarted **13 min 48 s AFTER** the #1862 merge (21:05:11 BST vs 20:51:23 BST merge) — new process loads post-#1862 merge_queue.py.
+
+**Result: #1862 in-flight-tip speculation fix is DEPLOYED (structural criteria a–e GREEN).** orchestrator-reify.service PID 937088 loads the fixed `pending_spec_base` lifecycle and disjoint-skip carve-out from dark-factory main @ b41d665826.
