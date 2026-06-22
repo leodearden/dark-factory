@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, WorktreeInfo, _run
+from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 
 # ---------------------------------------------------------------------------
@@ -500,7 +500,10 @@ class TestSeedWarmLane:
     async def test_seed_calls_script_with_correct_args(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """_seed_warm_lane invokes seed-warm-lane.sh with <base_target> <lane> <mode>."""
+        """_seed_warm_lane invokes seed-warm-lane.sh with <base_target> <lane> <mode>.
+
+        Returns 0 (int) on success.
+        """
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         # Create a real lane worktree so the script can live inside it
@@ -519,7 +522,7 @@ class TestSeedWarmLane:
 
         result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
 
-        assert result is True
+        assert result == 0, f'Expected rc=0 (success), got {result!r}'
         assert marker.exists(), 'seed-warm-lane.sh was not called (marker missing)'
         recorded = marker.read_text().strip()
         base_target = str(git_ops.warm_lane_base_target_path)
@@ -528,20 +531,22 @@ class TestSeedWarmLane:
             f'Wrong args: got {recorded!r}, expected {expected!r}'
         )
 
-    async def test_seed_absent_script_returns_false(
+    async def test_seed_absent_script_returns_nonzero(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Absent seed-warm-lane.sh → returns False (no warm capability), never raises."""
+        """Absent seed-warm-lane.sh → returns non-zero sentinel (127), never raises."""
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         lane = await _make_lane_dir(wl_git_repo, '_lane-abs')
         # No script installed in lane/scripts/
         result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
-        assert result is False
+        assert result != 0, f'Expected non-zero rc for absent script, got {result!r}'
+        # Sentinel for absent script is 127 (command-not-found convention)
+        assert result == 127, f'Expected sentinel 127 for absent script, got {result!r}'
 
-    async def test_seed_nonzero_exit_returns_false(
+    async def test_seed_nonzero_exit_returns_exit_code(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Script that exits non-zero → returns False (fail-soft), never raises."""
+        """Script that exits 1 → returns exactly 1 (preserves the exit code), never raises."""
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         lane = await _make_lane_dir(wl_git_repo, '_lane-fail')
 
@@ -552,12 +557,15 @@ class TestSeedWarmLane:
         script.chmod(0o755)
 
         result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
-        assert result is False
+        assert result == 1, f'Expected rc=1 (script exit code), got {result!r}'
 
     async def test_seed_reset_in_place_mode_passes_correct_flag(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """_seed_warm_lane with '--reset-in-place' passes the correct mode flag."""
+        """_seed_warm_lane with '--reset-in-place' passes the correct mode flag.
+
+        Returns 0 (int) on success.
+        """
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         lane = await _make_lane_dir(wl_git_repo, '_lane-rip')
 
@@ -571,9 +579,31 @@ class TestSeedWarmLane:
         script.chmod(0o755)
 
         result = await git_ops._seed_warm_lane(lane, '--reset-in-place')
-        assert result is True
+        assert result == 0, f'Expected rc=0 (success), got {result!r}'
         recorded = marker.read_text().strip()
         assert recorded.endswith('--reset-in-place')
+
+    async def test_seed_disk_pressure_exit_75_returns_75(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Script that exits 75 (EX_TEMPFAIL / disk-pressure) → returns exactly 75.
+
+        This is the DISK_PRESSURE discriminant: exit 75 must be preserved as-is
+        so the caller can distinguish transient disk pressure from a generic fault.
+        """
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        lane = await _make_lane_dir(wl_git_repo, '_lane-dp')
+
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text('#!/usr/bin/env bash\necho "disk pressure" >&2\nexit 75\n')
+        script.chmod(0o755)
+
+        result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        assert result == 75, (
+            f'Expected rc=75 (EX_TEMPFAIL disk-pressure discriminant), got {result!r}'
+        )
 
 
 # ===========================================================================
@@ -627,7 +657,7 @@ class TestAcquireWarmLaneCreateOnce:
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
 
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert isinstance(info, WorktreeInfo)
 
     async def test_acquire_lane_path_is_pool_lane(
@@ -641,7 +671,7 @@ class TestAcquireWarmLaneCreateOnce:
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
 
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         expected_lane = git_ops.worktree_base / '_lane-0'
         assert info.path == expected_lane
 
@@ -655,7 +685,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert await git_ops._is_registered_worktree(info.path)
 
     async def test_acquire_lane_on_correct_branch(
@@ -668,7 +698,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
 
         # Check HEAD SHA matches start_ref
         _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info.path)
@@ -690,7 +720,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert len(info.base_commit) == 40
 
     async def test_acquire_provides_debug_port(
@@ -703,7 +733,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert info.reify_debug_port == 39411
 
     async def test_acquire_seed_invoked_with_fresh_checkout(
@@ -734,7 +764,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert mode_log.exists(), 'seed script was not called'
         assert mode_log.read_text().strip() == '--fresh-checkout'
 
@@ -748,7 +778,7 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert (info.path / 'target' / 'seeded.bin').exists()
 
     async def test_acquire_marks_pool_lane_assigned(
@@ -762,38 +792,81 @@ class TestAcquireWarmLaneCreateOnce:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.state(info.path) == LaneState.ASSIGNED
 
-    async def test_acquire_exhausted_returns_none(
+    async def test_acquire_exhausted_returns_exhausted(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Pool exhaustion: acquire returns None (caller should cold-fallback)."""
+        """Pool exhaustion: acquire returns WarmLaneUnavailable.EXHAUSTED (backpressure)."""
         await _add_seed_and_debug_port_scripts(wl_git_repo)
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
         start_ref = start_ref.strip()
 
-        # Exhaust the pool
+        # Exhaust the pool with the first acquire
         info1 = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo), f'Expected WorktreeInfo, got {info1!r}'
 
-        # Next acquire should return None (exhausted)
+        # Next acquire must return EXHAUSTED — never bare None
         info2 = await git_ops.acquire_warm_lane('task-B', start_ref)
-        assert info2 is None
+        assert info2 is WarmLaneUnavailable.EXHAUSTED, (
+            f'Expected WarmLaneUnavailable.EXHAUSTED on pool exhaustion, got {info2!r}'
+        )
 
-    async def test_acquire_absent_seed_returns_none(
+    async def test_acquire_absent_seed_returns_fault(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """No seed-warm-lane.sh → acquire returns None (cold-fallback signal)."""
-        # No scripts committed — seed will fail → acquire returns None
+        """No seed-warm-lane.sh → acquire returns WarmLaneUnavailable.FAULT (infra fault)."""
+        # No scripts committed — seed will fail with rc=127 (absent script sentinel)
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
         _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is None
+        assert info is WarmLaneUnavailable.FAULT, (
+            f'Expected WarmLaneUnavailable.FAULT for absent seed script, got {info!r}'
+        )
+
+    async def test_acquire_create_once_seed_disk_pressure_returns_disk_pressure(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Create-once acquire whose seed exits 75 → WarmLaneUnavailable.DISK_PRESSURE.
+
+        The lane is released back to FREE (no leaked ASSIGNED lanes).
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        # Commit a seed script that exits 75 + a debug-port script
+        scripts_dir = wl_git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(
+            '#!/usr/bin/env bash\necho "disk pressure" >&2\nexit 75\n'
+        )
+        seed_script.chmod(0o755)
+        debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+        debug_script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        debug_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=wl_git_repo)
+        await _run(['git', 'commit', '-m', 'add disk-pressure seed script'], cwd=wl_git_repo)
+
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        result = await git_ops.acquire_warm_lane('task-A', start_ref)
+        assert result is WarmLaneUnavailable.DISK_PRESSURE, (
+            f'Expected WarmLaneUnavailable.DISK_PRESSURE for seed exit 75, got {result!r}'
+        )
+
+        # Lane must be released back to FREE — no leaked ASSIGNED lanes
+        assert git_ops.warm_lane_pool is not None
+        lane = git_ops.warm_lane_pool._base / '_lane-0'
+        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after DISK_PRESSURE failure, got {git_ops.warm_lane_pool.state(lane)!r}'
+        )
 
 
 # ===========================================================================
@@ -853,13 +926,13 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         assert git_ops.warm_lane_pool is not None
         # Release the lane (mark FREE directly — release_warm_lane comes in step-12)
         await git_ops.warm_lane_pool.release(info_a.path)
 
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
         assert info_b.path == info_a.path  # same _lane-0
 
     async def test_reacquire_head_is_at_new_commit(
@@ -870,12 +943,12 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
 
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_b.path)
         assert head_sha.strip() == sha_b
@@ -888,7 +961,7 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
 
         # Simulate stray work: untracked file and modification of tracked file
         (info_a.path / 'stray.txt').write_text('should be gone\n')
@@ -900,7 +973,7 @@ class TestAcquireWarmLaneResetInPlace:
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         # stray.txt must be gone
         assert not (info_b.path / 'stray.txt').exists()
@@ -933,7 +1006,7 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         calls_after_first = (
             seed_marker.read_text() if seed_marker.exists() else ''
         ).splitlines()
@@ -941,7 +1014,7 @@ class TestAcquireWarmLaneResetInPlace:
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         calls_after_second = (
             seed_marker.read_text() if seed_marker.exists() else ''
@@ -972,14 +1045,14 @@ class TestAcquireWarmLaneResetInPlace:
         seed_marker = wl_git_repo / 'seed_calls.txt'
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         # Record marker state after first (create-once) acquire
         calls_after_first = seed_marker.read_text() if seed_marker.exists() else ''
 
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         calls_after_second = seed_marker.read_text() if seed_marker.exists() else ''
         # D10: seed MUST be called on the recycle path (new line in marker)
@@ -1000,12 +1073,12 @@ class TestAcquireWarmLaneResetInPlace:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None
+        assert isinstance(info_a, WorktreeInfo)
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(info_a.path)
 
         info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
-        assert info_b is not None
+        assert isinstance(info_b, WorktreeInfo)
 
         _, wt_list, _ = await _run(
             ['git', 'worktree', 'list', '--porcelain'], cwd=wl_git_repo,
@@ -1016,34 +1089,26 @@ class TestAcquireWarmLaneResetInPlace:
         ]
         assert len(lane_registrations) == 1
 
-    async def test_recycle_reseed_failure_keeps_lane(
+    async def test_recycle_reseed_fault_returns_fault(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Recycle path: failed re-seed is fail-soft — lane kept with degraded warmth.
+        """Recycle path: failed re-seed (exit 1) → WarmLaneUnavailable.FAULT + lane released.
 
-        When seed-warm-lane.sh exits non-zero on the RECYCLE path,
-        acquire_warm_lane must still return a usable WorktreeInfo (lane remains
-        registered, worktree NOT removed).  Contrast with create-once where a
-        seed failure triggers cold-fallback (returns None).
-
-        Fails against step-2 impl (which treats recycle seed failure as fatal,
-        returning None).  Passes after step-4's fail-soft implementation.
+        When seed-warm-lane.sh exits non-zero (generic fault) on the RECYCLE path,
+        acquire_warm_lane must return FAULT (NOT a WorktreeInfo — no degraded warmth).
+        The lane is released back to FREE.
         """
+        from orchestrator.warm_lane_pool import LaneState
+
         sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
-        # First acquire (create-once): passing seed → lane registered, target/ warm
+        # First acquire (create-once): passing seed → lane registered
         info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info_a is not None, 'prerequisite: create-once acquire must succeed'
-
-        # Place a retained artifact so we can verify it survives fail-soft recycle
-        (info_a.path / 'target').mkdir(exist_ok=True)
-        retained_artifact = info_a.path / 'target' / 'prior.bin'
-        retained_artifact.write_bytes(b'\xca\xfe' * 32)
+        assert isinstance(info_a, WorktreeInfo), f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        lane_path = info_a.path
 
         # Overwrite the seed script in the MAIN REPO to exit 1 and commit it.
-        # After _reset_warm_lane resets the lane to this commit, the lane's
-        # seed script will exit non-zero.
         fail_script = wl_git_repo / 'scripts' / 'seed-warm-lane.sh'
         fail_script.write_text(
             '#!/usr/bin/env bash\necho "forced failure" >&2\nexit 1\n'
@@ -1055,22 +1120,95 @@ class TestAcquireWarmLaneResetInPlace:
         sha_fail = sha_fail.strip()
 
         assert git_ops.warm_lane_pool is not None
-        await git_ops.warm_lane_pool.release(info_a.path)
+        await git_ops.warm_lane_pool.release(lane_path)
 
-        # Second acquire for a DIFFERENT task at sha_fail: seed exits 1.
-        # step-2 (fatal): returns None.  step-4 (fail-soft): WorktreeInfo.
-        info_b = await git_ops.acquire_warm_lane('task-B', sha_fail)
+        # Second acquire for a DIFFERENT task: seed exits 1 → must return FAULT
+        result = await git_ops.acquire_warm_lane('task-B', sha_fail)
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Recycle seed failure (exit 1) must return FAULT, got {result!r}'
+        )
+        # Lane must be released back to FREE — no leaked ASSIGNED lanes
+        assert git_ops.warm_lane_pool.state(lane_path) == LaneState.FREE, (
+            f'Lane must be FREE after FAULT, got {git_ops.warm_lane_pool.state(lane_path)!r}'
+        )
 
-        # D10 fail-soft: must return a usable lane (NOT None / cold-fallback)
-        assert info_b is not None, (
-            'Recycle seed failure must be fail-soft: return WorktreeInfo, not None'
+    async def test_recycle_reseed_disk_pressure_returns_disk_pressure(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Recycle path: seed exits 75 → WarmLaneUnavailable.DISK_PRESSURE + lane released."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # First acquire (create-once): passing seed → lane registered
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo), f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        lane_path = info_a.path
+
+        # Overwrite the seed script to exit 75 (disk pressure) and commit it
+        dp_script = wl_git_repo / 'scripts' / 'seed-warm-lane.sh'
+        dp_script.write_text(
+            '#!/usr/bin/env bash\necho "disk pressure" >&2\nexit 75\n'
         )
-        # Worktree must NOT be removed (the retained target/ survives)
-        assert await git_ops._is_registered_worktree(info_b.path), (
-            'Worktree must not be removed on recycle seed failure'
+        dp_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=wl_git_repo)
+        await _run(['git', 'commit', '-m', 'dp: seed script exits 75'], cwd=wl_git_repo)
+        _, sha_dp, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        sha_dp = sha_dp.strip()
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        # Second acquire: seed exits 75 → must return DISK_PRESSURE
+        result = await git_ops.acquire_warm_lane('task-B', sha_dp)
+        assert result is WarmLaneUnavailable.DISK_PRESSURE, (
+            f'Recycle seed failure (exit 75) must return DISK_PRESSURE, got {result!r}'
         )
-        # Same recycled lane path
-        assert info_b.path == info_a.path
+        # Lane must be released back to FREE
+        assert git_ops.warm_lane_pool.state(lane_path) == LaneState.FREE, (
+            f'Lane must be FREE after DISK_PRESSURE, got {git_ops.warm_lane_pool.state(lane_path)!r}'
+        )
+
+    async def test_recycle_reseed_is_thin_no_retained_bloat(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Recycle path (signal a): stray target/ artifact is removed before re-seed.
+
+        A stray file placed under lane/target/ BEFORE the recycle acquire must be
+        GONE after a successful recycle (the rm-before-seed defensive cleanup ran).
+        The lane itself must be the same _lane-0 (same recycled lane, not cold-created).
+        """
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # First acquire (create-once): lane registered, target/ seeded
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo), f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        lane_path = info_a.path
+
+        # Plant a stray bloat artifact under target/ to simulate retained bloat
+        (lane_path / 'target').mkdir(exist_ok=True)
+        stray = lane_path / 'target' / 'bloat.bin'
+        stray.write_bytes(b'\xde\xad\xbe\xef' * 64)
+        assert stray.exists(), 'test setup: stray artifact must exist before recycle'
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        # Second acquire (recycle, same seed script → exits 0): must succeed
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+        assert isinstance(info_b, WorktreeInfo), (
+            f'Recycle acquire must succeed (WorktreeInfo), got {info_b!r}'
+        )
+        # Signal a: stray artifact must be gone (target/ was rm-before-seed)
+        assert not stray.exists(), (
+            'Stray target/ artifact must be removed by rm-before-seed on recycle'
+        )
+        # Same recycled lane (not a cold-created worktree_base/branch_name dir)
+        assert info_b.path == lane_path, (
+            f'Recycled lane path must be the same _lane-0, got {info_b.path}'
+        )
 
 
 # ===========================================================================
@@ -1104,7 +1242,7 @@ class TestReleaseWarmLane:
         start_ref = start_ref.strip()
 
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
-        assert info is not None
+        assert isinstance(info, WorktreeInfo)
         return git_ops, info
 
     async def test_release_marks_pool_free(
@@ -1177,7 +1315,7 @@ class TestReleaseWarmLane:
 
         _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
         info2 = await git_ops.acquire_warm_lane('task-C', start_ref.strip())
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
         assert info2.path == lane
 
     async def test_release_idempotent_when_already_free(
@@ -1263,7 +1401,7 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
 
         # Simulate agent work: WIP on a tracked file + .task/plan.json + target/
         (info1.path / 'task_work.txt').write_text('WIP changes\n')
@@ -1276,7 +1414,7 @@ class TestAcquireWarmLaneReuse:
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
 
         # TODAY: try_acquire() returns None (exhausted) → info2 is None → RED
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
     async def test_reuse_same_lane_path(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
@@ -1286,13 +1424,13 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         (info1.path / 'task_work.txt').write_text('WIP\n')
         (info1.path / '.task').mkdir(exist_ok=True)
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
         assert info2.path == info1.path
 
     async def test_reuse_preserves_task_plan_json(
@@ -1304,7 +1442,7 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         # Write .task/plan.json (gitignored by .task/.gitignore set up by acquire)
         (info1.path / '.task').mkdir(exist_ok=True)
         plan_file = info1.path / '.task' / 'plan.json'
@@ -1312,7 +1450,7 @@ class TestAcquireWarmLaneReuse:
         (info1.path / 'task_work.txt').write_text('WIP\n')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         assert plan_file.exists(), '.task/plan.json must be preserved on reuse'
         data = json.loads(plan_file.read_text())
@@ -1328,14 +1466,14 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         # Staged WIP on tracked file
         (info1.path / 'task_work.txt').write_text('WIP changes\n')
         (info1.path / '.task').mkdir(exist_ok=True)
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         # A commit with 'save WIP' in message must be reachable from HEAD
         _, log_out, _ = await _run(
@@ -1367,7 +1505,7 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         cache_file = info1.path / 'target' / 'cache.bin'
         cache_file.parent.mkdir(exist_ok=True)
         cache_file.write_bytes(b'\xca\xfe' * 64)
@@ -1376,7 +1514,7 @@ class TestAcquireWarmLaneReuse:
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         assert cache_file.exists(), 'target/cache.bin must be retained on reuse'
 
@@ -1388,7 +1526,7 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         calls_after_first = seed_marker.read_text() if seed_marker.exists() else ''
 
         (info1.path / 'task_work.txt').write_text('WIP\n')
@@ -1396,7 +1534,7 @@ class TestAcquireWarmLaneReuse:
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         calls_after_second = seed_marker.read_text() if seed_marker.exists() else ''
         assert calls_after_second == calls_after_first, (
@@ -1411,13 +1549,13 @@ class TestAcquireWarmLaneReuse:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         info1 = await git_ops.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         (info1.path / 'task_work.txt').write_text('WIP\n')
         (info1.path / '.task').mkdir(exist_ok=True)
         (info1.path / '.task' / 'plan.json').write_text('{"task_id": "task-A"}')
 
         info2 = await git_ops.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.assignment_for('task-A') == info1.path
@@ -1455,7 +1593,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # First GitOps: fresh acquire for 'task-A'
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
 
         # Simulate agent writing plan.json + tracked WIP
         plan_file = info1.path / '.task' / 'plan.json'
@@ -1473,7 +1611,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
 
         # TODAY: fresh-but-registered → _reset_warm_lane → git clean → .task/ gone
         # After step-24: reads plan.json, detects task_id match → _reuse_warm_lane
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
         assert info2.path == info1.path  # same _lane-0
 
         assert plan_file.exists(), '.task/plan.json must be preserved by disk backstop'
@@ -1490,7 +1628,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
 
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         plan_file = info1.path / '.task' / 'plan.json'
         plan_file.write_text('{"task_id": "task-A"}')
         (info1.path / 'task_work.txt').write_text('WIP work\n')
@@ -1498,7 +1636,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # Restart
         git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info2 = await git_ops2.acquire_warm_lane('task-A', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         # sha_main must be ancestor of HEAD (rebased)
         rc, _, _ = await _run(
@@ -1516,7 +1654,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # Acquire for 'task-A', write plan.json
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         plan_file = info1.path / '.task' / 'plan.json'
         plan_file.write_text('{"task_id": "task-A"}')
 
@@ -1526,7 +1664,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # Fresh restart: acquire for 'task-Z' (different branch)
         git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info2 = await git_ops2.acquire_warm_lane('task-Z', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
         assert info2.path == info1.path  # same _lane-0 (pool gave it)
 
         # .task/plan.json should be GONE (fresh reset cleaned it)
@@ -1550,7 +1688,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
 
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
-        assert info1 is not None
+        assert isinstance(info1, WorktreeInfo)
         plan_file = info1.path / '.task' / 'plan.json'
         plan_file.write_text('{"task_id": "task-A"}')
         calls_after_first = (
@@ -1561,7 +1699,7 @@ class TestAcquireWarmLaneOnDiskBackstop:
 
         git_ops2 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info2 = await git_ops2.acquire_warm_lane('task-Z', sha_main)
-        assert info2 is not None
+        assert isinstance(info2, WorktreeInfo)
 
         calls_after_second = (
             seed_marker.read_text() if seed_marker.exists() else ''
@@ -2025,3 +2163,125 @@ class TestRefreshWarmBaseGuards:
         git_ops = GitOps(wl_git_config_rolling_base, wl_git_repo, warm_lane_pool_size=1)
         result = await git_ops.refresh_warm_base()
         assert result is False, 'Non-zero script exit must return False (fail-soft)'
+
+
+# ===========================================================================
+# Step-β7: RED — create_worktree routes discriminated WarmLaneUnavailable
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeWarmLaneRouting:
+    """create_worktree with warm_lane_pool enabled routes acquire_warm_lane result.
+
+    (b) Pool exhausted → raises WarmLanePoolExhausted + no cold worktree dir.
+    (c) FAULT → raises RuntimeError + no cold dir.
+    (d) DISK_PRESSURE → raises WarmLaneDiskPressure.
+    (e) Success → returns WorktreeInfo on the pool lane (not a cold-created dir).
+    """
+
+    async def _setup_repo_with_seed(
+        self,
+        repo: Path,
+        seed_exit: int = 0,
+        port: int = 39411,
+    ) -> None:
+        """Commit a seed script that exits <seed_exit> + a debug-port script."""
+        scripts_dir = repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        if seed_exit == 0:
+            seed_body = (
+                '#!/usr/bin/env bash\n'
+                'mkdir -p "$2/target"\n'
+                'echo seeded > "$2/target/seeded.bin"\n'
+            )
+        else:
+            seed_body = (
+                f'#!/usr/bin/env bash\n'
+                f'echo "seed exit {seed_exit}" >&2\n'
+                f'exit {seed_exit}\n'
+            )
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(seed_body)
+        seed_script.chmod(0o755)
+        debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+        debug_script.write_text(f'#!/usr/bin/env bash\necho {port}\n')
+        debug_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=repo)
+        await _run(['git', 'commit', '-m', f'add seed (exit={seed_exit}) + debug-port scripts'], cwd=repo)
+
+    async def test_create_worktree_exhausted_raises_pool_exhausted(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(b) Pool exhausted → create_worktree raises WarmLanePoolExhausted.
+
+        The cold worktree dir (worktree_base/branch_name) must NOT be created —
+        no cold-path fall-through when the pool is enabled.
+        """
+        from orchestrator.git_ops import WarmLanePoolExhausted
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # Exhaust the pool with a first create_worktree call
+        info_a = await git_ops.create_worktree('task-first')
+        assert isinstance(info_a, WorktreeInfo), f'Prerequisite: first create must succeed, got {info_a!r}'
+
+        # Now pool is exhausted; second call must raise WarmLanePoolExhausted
+        cold_dir = git_ops.worktree_base / 'task-second'
+        with pytest.raises(WarmLanePoolExhausted):
+            await git_ops.create_worktree('task-second')
+
+        # Signal (b): no cold worktree dir created
+        assert not cold_dir.exists(), (
+            f'Cold dir {cold_dir} must NOT be created on pool exhaustion'
+        )
+
+    async def test_create_worktree_fault_raises_runtime_error(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(c) FAULT (seed exit 1) → create_worktree raises RuntimeError.
+
+        No degraded WorktreeInfo is returned; no cold worktree dir is created.
+        """
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=1)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        cold_dir = git_ops.worktree_base / 'task-fault'
+        with pytest.raises(RuntimeError):
+            await git_ops.create_worktree('task-fault')
+
+        # Signal (c): no cold worktree dir created
+        assert not cold_dir.exists(), (
+            f'Cold dir {cold_dir} must NOT be created on FAULT'
+        )
+
+    async def test_create_worktree_disk_pressure_raises_warm_lane_disk_pressure(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(d) DISK_PRESSURE (seed exit 75) → create_worktree raises WarmLaneDiskPressure."""
+        from orchestrator.git_ops import WarmLaneDiskPressure
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=75)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneDiskPressure):
+            await git_ops.create_worktree('task-dp')
+
+    async def test_create_worktree_success_returns_worktree_info_on_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(e) Success → WorktreeInfo whose path is the pool lane (_lane-0)."""
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info = await git_ops.create_worktree('task-success')
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo, got {info!r}'
+        # Path must be the pool lane, not a cold worktree_base/branch_name dir
+        assert '_lane-' in info.path.name, (
+            f'Expected pool lane path (_lane-*), got {info.path}'
+        )
+        cold_dir = git_ops.worktree_base / 'task-success'
+        assert not cold_dir.exists(), (
+            f'Cold dir {cold_dir} must NOT be created when pool lane was used'
+        )

@@ -55,7 +55,13 @@ from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, TrainMembership, _run
+from orchestrator.git_ops import (
+    GitOps,
+    TrainMembership,
+    WarmLanePoolExhausted,
+    WarmLaneRequeue,
+    _run,
+)
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
@@ -1735,193 +1741,9 @@ class TaskWorkflow:
 
                 # MERGE (skip for eval mode — no merge into main)
                 if not self._worktree_external:
-                    # Train members hold at merge-deferred instead of merging;
-                    # the group-merge worker (δ₁) owns the eventual done
-                    # transition once all siblings are workspace-green (PRD §9.5,
-                    # γ₁).  The full execute→verify→review pipeline still ran
-                    # above (PRD acceptance criterion 5).  Non-train path is
-                    # byte-identical — this guard only fires when metadata.train
-                    # is a dict.
-                    _defer = await self._maybe_defer_as_train_member()
-                    if _defer is not None:
-                        return _defer
-
-                    self._enter_phase(WorkflowState.MERGE)
-
-                    # Defense-in-depth: any blocking L0 escalation, or any
-                    # born-at-L2 (critical/urgent), or any level≥2 escalation
-                    # created during execute/verify/review (e.g. plan-overwrite
-                    # from _amend, or any future code path that escalates outside
-                    # the implementer/debugger callsites) must gate the merge.
-                    # Without this, an escalation queued mid-run would sit
-                    # invisible while a merge proceeded.
-                    # D4 accepted consequence: a pending critical/urgent from a
-                    # prior incarnation DOES gate a fresh run — stop-the-line
-                    # semantics.  See _is_gating_escalation for the full policy.
-                    gating = [e for e in self._check_escalations() if _is_gating_escalation(e)]
-                    if gating:
-                        logger.warning(
-                            'Task %s: %d gating escalation(s) at MERGE entry '
-                            '— bailing to ESCALATED',
-                            self.task_id, len(gating),
-                        )
-                        return WorkflowOutcome.ESCALATED
-
-                    # Ghost-loop early exit: if branch is already on main,
-                    # skip the entire merge phase (prevents infinite retry
-                    # when code was merged by an external actor).
-                    _, branch_head, _ = await _run(
-                        ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
-                    )
-                    main_sha = await self.git_ops.get_main_sha()
-                    already_merged = await self.git_ops.is_ancestor(
-                        branch_head.strip(), main_sha,
-                    )
-
-                    # Defense-in-depth: same stale-branch-point guard as
-                    # the pre-EXECUTE check.  Should rarely fire since
-                    # we just ran execute, but guards against edge cases.
-                    #
-                    # WT_HEAD INTENTIONALLY OMITTED — see _has_prior_implementation()
-                    # docstring.  At this call site we have just run EXECUTE and
-                    # any prior rebase already happened; the iteration-log fallback
-                    # is the right signal.  The base_commit rebased-head problem
-                    # does not apply here because we are checking for the ABSENCE
-                    # of implementation work (i.e. a spurious merge signal), and a
-                    # freshly-rebased branch that completed EXECUTE will always have
-                    # iteration-log entries.
-                    if already_merged and not self._has_prior_implementation().has_work:
-                        logger.warning(
-                            f'Task {self.task_id}: branch appears merged at '
-                            f'merge phase but has no implementation entries '
-                            f'— proceeding with merge'
-                        )
-                        already_merged = False
-
-                    if not already_merged:
-                        for _merge_attempt in range(self.config.max_merge_retries):
-                            # Phase 1: pre-merge rebase (no lock, no queue slot)
-                            # Rebase the task branch onto current main and re-verify
-                            # so the queued merge phase is fast/trivial.
-                            pre_rebased = False
-                            for _attempt in range(self.config.max_pre_merge_retries):
-                                main_before = await self.git_ops.get_main_sha()
-                                if not await self.git_ops.rebase_onto_main(self.worktree):
-                                    break  # true conflict — queue will detect it
-                                verify = await run_scoped_verification(
-                                    self.worktree, self.config, self._module_configs,
-                                    task_files=self._task_files,
-                                    # role='task' is explicit for γ's explicit-is-correct
-                                    # invariant (mirrors merge_queue.py role='merge').
-                                    # 'task' is already the default so this is documentary;
-                                    # no call-site spy exists for this path — the
-                                    # _verify_debugfix_loop spy in
-                                    # test_workflow_verify_retry.py covers the primary site.
-                                    role='task',
-                                )
-                                if not verify.passed:
-                                    if verify.timed_out:
-                                        logger.warning(
-                                            f'Task {self.task_id}: post-rebase verification '
-                                            f'timed out; merge queue will retry'
-                                        )
-                                    else:
-                                        logger.warning(
-                                            f'Task {self.task_id}: post-rebase verification '
-                                            f'failed: {verify.summary}'
-                                        )
-                                        if self.event_store:
-                                            self.event_store.emit(
-                                                EventType.waste_detected,
-                                                task_id=self.task_id, phase='merge',
-                                                data={
-                                                    'waste_type': 'post_rebase_verify_fail',
-                                                    'summary': verify.summary[:200],
-                                                },
-                                            )
-                                    break
-                                main_after = await self.git_ops.get_main_sha()
-                                if main_before == main_after:
-                                    pre_rebased = True
-                                    self.metrics.pre_merge_rebase_ok += 1
-                                    break
-                                self.metrics.pre_merge_rebase_attempts += 1
-                                logger.info(
-                                    f'Task {self.task_id}: main moved during pre-merge '
-                                    f'rebase, retrying'
-                                )
-
-                            # Phase 2: submit to merge queue (replaces _merge_lock)
-                            self._last_merge_block_reason = None
-                            self._last_merge_failure_category = ''
-                            self._last_merge_failure_cause_hint = ''
-                            merge_outcome = await self._submit_to_merge_queue(
-                                branch_name, pre_rebased=pre_rebased,
-                                merge_phase=True,
-                            )
-                            if merge_outcome == WorkflowOutcome.DONE:
-                                break
-                            if merge_outcome != WorkflowOutcome.REQUEUED:
-                                # SOFT_CANCELLED / BLOCKED / ESCALATED — exit slot.
-                                # SOFT_CANCELLED arrives when _handle_soft_cancel
-                                # detected a pending soft-cancel; BLOCKED when the
-                                # steward gave up; other non-REQUEUED outcomes are
-                                # terminal and must also exit.
-                                return merge_outcome
-
-                            # Defense-in-depth (root cause #2): _cancel_event is
-                            # never cleared during a run, so each retry iteration
-                            # would re-win the cancellable race instantly and burn
-                            # another pre-merge rebase+verify before exhausting
-                            # max_merge_retries.  Checking here — immediately after
-                            # the REQUEUED guard and BEFORE the anti-thrash/retry
-                            # path — ensures a soft-cancel that arrived concurrently
-                            # with a legitimate steward-resolved REQUEUED exits on
-                            # first detection without any further rebase or log.
-                            if self._cancel_event.is_set():
-                                return await self._handle_soft_cancel('merge')
-
-                            # Fix 3 — anti-thrash guard for repeated
-                            # steward-resolved merge-phase loops on the same
-                            # outcome signature.  At threshold escalates to L1
-                            # rather than resubmitting the same merge.
-                            if self._last_merge_block_reason is not None:
-                                current_signature = self._merge_outcome_signature()
-                                prev_signature = (
-                                    self.task.get('metadata') or {}
-                                ).get('last_merge_outcome_signature')
-                                thrash_outcome = await self._check_merge_outcome_thrash(
-                                    prev_signature, current_signature,
-                                )
-                                if thrash_outcome is not None:
-                                    return thrash_outcome
-
-                            # Steward resolved — check if branch landed on main
-                            _, bh, _ = await _run(
-                                ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
-                            )
-                            main_sha = await self.git_ops.get_main_sha()
-                            if await self.git_ops.is_ancestor(bh.strip(), main_sha):
-                                logger.info(
-                                    'Task %s: branch on main after steward '
-                                    'resolution', self.task_id,
-                                )
-                                break
-                            # Retry merge
-                            logger.info(
-                                'Task %s: retrying merge (attempt %d/%d)',
-                                self.task_id, _merge_attempt + 1,
-                                self.config.max_merge_retries,
-                            )
-                        else:
-                            return await self._mark_blocked(
-                                'Merge retries exhausted after steward resolutions'
-                            )
-                    else:
-                        logger.info(
-                            f'Task {self.task_id}: branch already on main '
-                            f'— skipping merge'
-                        )
+                    _merge_result = await self._run_merge_phase(branch_name)
+                    if _merge_result is not None:
+                        return _merge_result
 
             # SUCCESS — write completion knowledge (best-effort after merge)
             try:
@@ -2032,6 +1854,40 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
 
+        except WarmLaneRequeue as e:
+            # Discriminate the subclass for the block-reason annotation so the
+            # requeue is traceable in metrics / steward review.
+            # WarmLanePoolExhausted → backpressure (all lanes ASSIGNED).
+            # WarmLaneDiskPressure  → transient infra (seed exited 75 EX_TEMPFAIL).
+            # FAULT (RuntimeError) is deliberately NOT caught here — it falls through
+            # to the broad except below → _mark_blocked → BLOCKED + L1.
+            #
+            # NOTE (Suggestion 2 / follow-up): both WarmLanePoolExhausted and
+            # WarmLaneDiskPressure requeues return WorkflowOutcome.REQUEUED here,
+            # which the harness counts against the per-task requeue_cap equally.
+            # This is intentional for EXHAUSTED (genuine backpressure) but is
+            # undesirable for DISK_PRESSURE (transient infra): a persistent disk-
+            # full condition will tight-loop, burning the retry budget with no
+            # backoff.  The block_reason discriminant is already set so a future
+            # scheduler change can special-case 'warm_lane_disk_pressure (transient
+            # infra)' to exclude disk-pressure requeues from the cap (analogous to
+            # the HTTP-5xx transient exclusion in is_transient_api_requeue).
+            # Touching scheduler.py is out of scope for this task.
+            if isinstance(e, WarmLanePoolExhausted):
+                block_reason = 'warm_lane_pool_exhausted'
+                block_phase = 'backpressure'
+            else:  # WarmLaneDiskPressure
+                block_reason = 'warm_lane_disk_pressure (transient infra)'
+                block_phase = 'transient_infra'
+            logger.info(
+                'Task %s: warm-lane requeue (%s): %s',
+                self.task_id, block_reason, e,
+            )
+            self._last_block_reason = block_reason
+            self._last_block_phase = block_phase
+            self._last_block_detail = str(e)
+            return WorkflowOutcome.REQUEUED
+
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
             return await self._mark_blocked(f'Workflow error: {e}')
@@ -2047,6 +1903,198 @@ class TaskWorkflow:
             # Cleanup per-task config dir (preserve-aware — skips when circuit
             # breaker tripped so the dir is available for forensic analysis).
             self._cleanup_config_dir()
+
+    async def _run_merge_phase(self, branch_name: str) -> WorkflowOutcome | None:
+        """Execute the MERGE phase. Returns None to fall through to SUCCESS."""
+        assert self.worktree is not None  # guaranteed by _setup_worktree_and_artifacts
+        # Train members hold at merge-deferred instead of merging;
+        # the group-merge worker (δ₁) owns the eventual done
+        # transition once all siblings are workspace-green (PRD §9.5,
+        # γ₁).  The full execute→verify→review pipeline still ran
+        # above (PRD acceptance criterion 5).  Non-train path is
+        # byte-identical — this guard only fires when metadata.train
+        # is a dict.
+        _defer = await self._maybe_defer_as_train_member()
+        if _defer is not None:
+            return _defer
+
+        self._enter_phase(WorkflowState.MERGE)
+
+        # Defense-in-depth: any blocking L0 escalation, or any
+        # born-at-L2 (critical/urgent), or any level≥2 escalation
+        # created during execute/verify/review (e.g. plan-overwrite
+        # from _amend, or any future code path that escalates outside
+        # the implementer/debugger callsites) must gate the merge.
+        # Without this, an escalation queued mid-run would sit
+        # invisible while a merge proceeded.
+        # D4 accepted consequence: a pending critical/urgent from a
+        # prior incarnation DOES gate a fresh run — stop-the-line
+        # semantics.  See _is_gating_escalation for the full policy.
+        gating = [e for e in self._check_escalations() if _is_gating_escalation(e)]
+        if gating:
+            logger.warning(
+                'Task %s: %d gating escalation(s) at MERGE entry '
+                '— bailing to ESCALATED',
+                self.task_id, len(gating),
+            )
+            return WorkflowOutcome.ESCALATED
+
+        # Ghost-loop early exit: if branch is already on main,
+        # skip the entire merge phase (prevents infinite retry
+        # when code was merged by an external actor).
+        _, branch_head, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+        )
+        main_sha = await self.git_ops.get_main_sha()
+        already_merged = await self.git_ops.is_ancestor(
+            branch_head.strip(), main_sha,
+        )
+
+        # Defense-in-depth: same stale-branch-point guard as
+        # the pre-EXECUTE check.  Should rarely fire since
+        # we just ran execute, but guards against edge cases.
+        #
+        # WT_HEAD INTENTIONALLY OMITTED — see _has_prior_implementation()
+        # docstring.  At this call site we have just run EXECUTE and
+        # any prior rebase already happened; the iteration-log fallback
+        # is the right signal.  The base_commit rebased-head problem
+        # does not apply here because we are checking for the ABSENCE
+        # of implementation work (i.e. a spurious merge signal), and a
+        # freshly-rebased branch that completed EXECUTE will always have
+        # iteration-log entries.
+        if already_merged and not self._has_prior_implementation().has_work:
+            logger.warning(
+                f'Task {self.task_id}: branch appears merged at '
+                f'merge phase but has no implementation entries '
+                f'— proceeding with merge'
+            )
+            already_merged = False
+
+        if not already_merged:
+            for _merge_attempt in range(self.config.max_merge_retries):
+                # Phase 1: pre-merge rebase (no lock, no queue slot)
+                # Rebase the task branch onto current main and re-verify
+                # so the queued merge phase is fast/trivial.
+                pre_rebased = False
+                for _attempt in range(self.config.max_pre_merge_retries):
+                    main_before = await self.git_ops.get_main_sha()
+                    if not await self.git_ops.rebase_onto_main(self.worktree):
+                        break  # true conflict — queue will detect it
+                    verify = await run_scoped_verification(
+                        self.worktree, self.config, self._module_configs,
+                        task_files=self._task_files,
+                        # role='task' is explicit for γ's explicit-is-correct
+                        # invariant (mirrors merge_queue.py role='merge').
+                        # 'task' is already the default so this is documentary;
+                        # no call-site spy exists for this path — the
+                        # _verify_debugfix_loop spy in
+                        # test_workflow_verify_retry.py covers the primary site.
+                        role='task',
+                    )
+                    if not verify.passed:
+                        if verify.timed_out:
+                            logger.warning(
+                                f'Task {self.task_id}: post-rebase verification '
+                                f'timed out; merge queue will retry'
+                            )
+                        else:
+                            logger.warning(
+                                f'Task {self.task_id}: post-rebase verification '
+                                f'failed: {verify.summary}'
+                            )
+                            if self.event_store:
+                                self.event_store.emit(
+                                    EventType.waste_detected,
+                                    task_id=self.task_id, phase='merge',
+                                    data={
+                                        'waste_type': 'post_rebase_verify_fail',
+                                        'summary': verify.summary[:200],
+                                    },
+                                )
+                        break
+                    main_after = await self.git_ops.get_main_sha()
+                    if main_before == main_after:
+                        pre_rebased = True
+                        self.metrics.pre_merge_rebase_ok += 1
+                        break
+                    self.metrics.pre_merge_rebase_attempts += 1
+                    logger.info(
+                        f'Task {self.task_id}: main moved during pre-merge '
+                        f'rebase, retrying'
+                    )
+
+                # Phase 2: submit to merge queue (replaces _merge_lock)
+                self._last_merge_block_reason = None
+                self._last_merge_failure_category = ''
+                self._last_merge_failure_cause_hint = ''
+                merge_outcome = await self._submit_to_merge_queue(
+                    branch_name, pre_rebased=pre_rebased,
+                    merge_phase=True,
+                )
+                if merge_outcome == WorkflowOutcome.DONE:
+                    break
+                if merge_outcome != WorkflowOutcome.REQUEUED:
+                    # SOFT_CANCELLED / BLOCKED / ESCALATED — exit slot.
+                    # SOFT_CANCELLED arrives when _handle_soft_cancel
+                    # detected a pending soft-cancel; BLOCKED when the
+                    # steward gave up; other non-REQUEUED outcomes are
+                    # terminal and must also exit.
+                    return merge_outcome
+
+                # Defense-in-depth (root cause #2): _cancel_event is
+                # never cleared during a run, so each retry iteration
+                # would re-win the cancellable race instantly and burn
+                # another pre-merge rebase+verify before exhausting
+                # max_merge_retries.  Checking here — immediately after
+                # the REQUEUED guard and BEFORE the anti-thrash/retry
+                # path — ensures a soft-cancel that arrived concurrently
+                # with a legitimate steward-resolved REQUEUED exits on
+                # first detection without any further rebase or log.
+                if self._cancel_event.is_set():
+                    return await self._handle_soft_cancel('merge')
+
+                # Fix 3 — anti-thrash guard for repeated
+                # steward-resolved merge-phase loops on the same
+                # outcome signature.  At threshold escalates to L1
+                # rather than resubmitting the same merge.
+                if self._last_merge_block_reason is not None:
+                    current_signature = self._merge_outcome_signature()
+                    prev_signature = (
+                        self.task.get('metadata') or {}
+                    ).get('last_merge_outcome_signature')
+                    thrash_outcome = await self._check_merge_outcome_thrash(
+                        prev_signature, current_signature,
+                    )
+                    if thrash_outcome is not None:
+                        return thrash_outcome
+
+                # Steward resolved — check if branch landed on main
+                _, bh, _ = await _run(
+                    ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+                )
+                main_sha = await self.git_ops.get_main_sha()
+                if await self.git_ops.is_ancestor(bh.strip(), main_sha):
+                    logger.info(
+                        'Task %s: branch on main after steward '
+                        'resolution', self.task_id,
+                    )
+                    break
+                # Retry merge
+                logger.info(
+                    'Task %s: retrying merge (attempt %d/%d)',
+                    self.task_id, _merge_attempt + 1,
+                    self.config.max_merge_retries,
+                )
+            else:
+                return await self._mark_blocked(
+                    'Merge retries exhausted after steward resolutions'
+                )
+        else:
+            logger.info(
+                f'Task {self.task_id}: branch already on main '
+                f'— skipping merge'
+            )
+        return None
 
     def _resolve_module_configs(self, modules: list[str] | None = None) -> list[ModuleConfig]:
         """Collect ModuleConfigs for this task's modules.
