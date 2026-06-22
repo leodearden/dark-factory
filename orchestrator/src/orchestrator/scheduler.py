@@ -501,9 +501,8 @@ class ModuleLockTable:
             owner, rank = stack[-1]  # active TOP only
             if owner != task_id:
                 continue
-            if self._conflicts(parked_module, module):
-                if own_dominant_rank is None or rank < own_dominant_rank:
-                    own_dominant_rank = rank
+            if self._conflicts(parked_module, module) and (own_dominant_rank is None or rank < own_dominant_rank):
+                own_dominant_rank = rank
 
         # Step 2: check each foreign conflicting active top.
         for parked_module, stack in self._parked.items():
