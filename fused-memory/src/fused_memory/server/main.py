@@ -574,6 +574,7 @@ async def run_server():
             config.path_scope_adjudicator,
             usage_gate=curator_usage_gate,
             cwd=Path(_primary_root) if _primary_root else None,
+            scope_violation_escalator=scope_violation_escalator,
         )
         logger.info('  Path-scope adjudicator: enabled (model=%s)', config.path_scope_adjudicator.model)
     else:
