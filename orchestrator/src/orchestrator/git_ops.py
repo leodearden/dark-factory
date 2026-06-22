@@ -1257,6 +1257,126 @@ class GitOps:
             logger.warning('refresh_warm_base: unexpected error', exc_info=True)
             return False
 
+    # ε: warm-lane disk-guard admission helpers --------------------------------
+
+    async def _run_warm_lane_disk_guard(self) -> int:
+        """Invoke ``<project_root>/scripts/warm-lane-disk-guard.sh check``.
+
+        Mirrors the ``_seed_warm_lane``/``refresh_warm_base`` fail-soft helper
+        pattern: absent script → 127 sentinel; any unexpected exception → 127;
+        never raises.
+
+        Returns:
+            0   — healthy (disk pressure below threshold).
+            75  — disk pressure (EX_TEMPFAIL, admission should block).
+            127 — script absent or exception (fail-open sentinel).
+            other non-zero — script error (treated as fail-open by caller).
+        """
+        try:
+            script = self.project_root / 'scripts' / 'warm-lane-disk-guard.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_warm_lane_disk_guard: script absent at %s — no-op', script,
+                )
+                return 127
+            # NOTE: worktree_base may not exist yet on a fresh host where no lane
+            # has been created.  In that case the real γ script will likely stat a
+            # non-existent path and return a non-(0,75) exit code, which the caller
+            # treats as fail-open (guard is an inert no-op until worktree_base first
+            # appears).  This is deliberate: the guard cannot measure a volume that
+            # does not yet exist, and the script-level fail-closed convention (df
+            # failure → 75) only applies to volume access errors, not missing mount
+            # points.  Seed the first lane to create worktree_base, then the guard
+            # becomes active.
+            cmd = [
+                str(script), 'check',
+                '--mount', str(self.worktree_base),
+                '--min-free-gib', str(self.config.warm_lane_min_free_gib),
+                '--min-free-inodes', str(self.config.warm_lane_min_free_inodes),
+            ]
+            rc, _, err = await _run(cmd, cwd=self.project_root)
+            if rc not in (0, 75):
+                logger.warning(
+                    '_run_warm_lane_disk_guard: script exited %d (stderr=%r)', rc, err,
+                )
+            return rc
+        except Exception:
+            logger.warning(
+                '_run_warm_lane_disk_guard: unexpected error', exc_info=True,
+            )
+            return 127
+
+    async def _run_warm_lane_gc_reclaim(self) -> int:
+        """Invoke ``<project_root>/scripts/warm-lane-gc.sh reclaim``.
+
+        Fail-soft: absent script → 127 sentinel; any unexpected exception → 127;
+        never raises.  A non-zero exit is logged at WARNING and treated as
+        'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
+
+        Returns:
+            0   — reclaim succeeded.
+            127 — script absent or exception (fail-soft sentinel).
+            other non-zero — reclaim script error (caller still re-checks).
+        """
+        try:
+            script = self.project_root / 'scripts' / 'warm-lane-gc.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_warm_lane_gc_reclaim: script absent at %s — no-op', script,
+                )
+                return 127
+            cmd = [
+                str(script), 'reclaim',
+                '--mount', str(self.worktree_base),
+            ]
+            rc, _, err = await _run(cmd, cwd=self.project_root)
+            if rc != 0:
+                logger.warning(
+                    '_run_warm_lane_gc_reclaim: script exited %d (stderr=%r)', rc, err,
+                )
+            return rc
+        except Exception:
+            logger.warning(
+                '_run_warm_lane_gc_reclaim: unexpected error', exc_info=True,
+            )
+            return 127
+
+    async def _warm_lane_disk_admission_blocked(self) -> bool:
+        """Run the ε disk-pressure admission check: check → reclaim → recheck.
+
+        Mirrors ``merge_queue._ensure_verify_disk_space`` (check → prune → recheck →
+        block) for the warm-lane acquire side.
+
+        Logic:
+            1. Run γ ``warm-lane-disk-guard.sh check``.
+            2. Exit 0 or 127 or any non-(0,75) → admit (return False, fail-open).
+            3. Exit 75 (disk pressure) → log WARNING, run δ ``warm-lane-gc.sh reclaim``
+               (fail-soft; reclaim failure is logged but never blocks admission),
+               re-run γ check.
+            4. Re-check exit 75 → still pressured → block (return True).
+               Re-check exit 0/other → recovered → admit (return False).
+
+        Never raises.
+        """
+        rc = await self._run_warm_lane_disk_guard()
+        if rc != 75:
+            # 0 = healthy; 127 = absent (fail-open); other = script error (fail-open)
+            return False
+        # Disk pressure detected — attempt GC reclaim
+        logger.warning(
+            '_warm_lane_disk_admission_blocked: disk pressure detected (rc=75); '
+            'invoking warm-lane-gc.sh reclaim before re-check',
+        )
+        await self._run_warm_lane_gc_reclaim()
+        rc2 = await self._run_warm_lane_disk_guard()
+        if rc2 == 75:
+            logger.warning(
+                '_warm_lane_disk_admission_blocked: disk pressure persists after '
+                'reclaim (rc=75); blocking warm-lane admission',
+            )
+            return True
+        return False
+
     async def acquire_spec_lane(
         self,
         merge_commit: str,
@@ -1456,14 +1576,28 @@ class GitOps:
             state.  ``expected_title=None`` (default) disables the guard and
             all existing callers/tests are unaffected.
 
+        **ε pre-acquire disk-guard** (``config.warm_lane_disk_guard``, task-1860):
+            When the knob is True, runs γ ``warm-lane-disk-guard.sh check`` →
+            on exit 75 (EX_TEMPFAIL/disk pressure) invokes δ ``warm-lane-gc.sh
+            reclaim`` to free stale capacity → re-checks.  If STILL pressured,
+            returns ``WarmLaneUnavailable.DISK_PRESSURE`` so
+            :meth:`create_worktree` raises :class:`WarmLaneDiskPressure` →
+            workflow requeues (exit-75) instead of proceeding into an ENOSPC
+            build.  Runs BEFORE :func:`acquire_for` so all idle lanes remain
+            FREE for δ's reclaim.  Fail-open on absent scripts (rc 127): no
+            guard / nothing reclaimed — byte-identical to today until reify
+            γ/δ are deployed.
+
         Returns:
             WorktreeInfo  — success; lane is ASSIGNED and seeded.
             WarmLaneUnavailable.EXHAUSTED — all pool lanes are ASSIGNED
                 (backpressure; caller should requeue).
             WarmLaneUnavailable.FAULT — seed/worktree-add failure or absent
                 seed script (infra fault; caller should escalate blocked+L1).
-            WarmLaneUnavailable.DISK_PRESSURE — seed exited 75 (EX_TEMPFAIL);
-                transient disk pressure (caller should requeue with annotation).
+            WarmLaneUnavailable.DISK_PRESSURE — pre-acquire ε disk-guard
+                detected persistent pressure (rc=75 after reclaim), OR seed
+                exited 75 (EX_TEMPFAIL); transient disk pressure (caller should
+                requeue with annotation).
             WarmLaneUnavailable.DISABLED — pool knob is off; this is a
                 programming error (callers MUST guard with
                 ``if self.warm_lane_pool is not None`` before calling).
@@ -1484,6 +1618,27 @@ class GitOps:
             # that don't handle it hit an explicit error path rather than
             # infinite requeue.
             return WarmLaneUnavailable.DISABLED
+
+        # ε: pre-acquire disk-guard (check → reclaim → recheck → DISK_PRESSURE/exit-75).
+        # Running BEFORE acquire_for keeps all idle lanes FREE so δ's reclaim can reset
+        # them.  On still-pressured (rc=75 after reclaim), return DISK_PRESSURE so
+        # create_worktree raises WarmLaneDiskPressure → workflow requeues as transient
+        # infra (exit-75) instead of proceeding into an ENOSPC build that SIGBUSes the
+        # linker.  Fail-open (absent script rc=127) → byte-identical to today.
+        #
+        # Concurrency note: the guard + δ reclaim run WITHOUT holding warm_lane_pool
+        # _lock.  This is intentional — serializing on the pool lock would prevent
+        # concurrent acquires from even attempting during a reclaim.  The safety
+        # invariant is delegated to the γ/δ scripts: warm-lane-gc.sh MUST only reset
+        # lanes that have been idle beyond a configurable safety threshold (e.g. no
+        # active acquire_for in flight for those lanes).  Because acquire_for itself
+        # holds the pool lock for the registration step, a lane that is mid-acquire
+        # will be ASSIGNED in pool state and δ must skip ASSIGNED lanes.  Until reify
+        # δ (task-4717) ships with that guarantee documented, the guard is fail-open
+        # (rc 127) and the window is a no-op; document it here so the δ author knows
+        # the expected contract.
+        if self.config.warm_lane_disk_guard and await self._warm_lane_disk_admission_blocked():
+            return WarmLaneUnavailable.DISK_PRESSURE
 
         acq = await self.warm_lane_pool.acquire_for(branch_name)
         if acq is None:

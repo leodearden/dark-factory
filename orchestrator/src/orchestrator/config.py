@@ -844,6 +844,12 @@ class GitConfig(BaseModel):
             'the retry budget with no backoff.  The block_reason '
             '"warm_lane_disk_pressure (transient infra)" is set for future '
             'scheduler special-casing (follow-up: exclude from retry cap). '
+            'DISK_PRESSURE is produced in two ways: (1) ε pre-acquire disk-guard '
+            '(warm_lane_disk_guard=True) — check γ script → reclaim δ script → '
+            'recheck, return DISK_PRESSURE if still pressured (runs before '
+            'acquire_for so idle lanes stay FREE; fail-open on absent scripts); '
+            '(2) seed exit-75 (EX_TEMPFAIL) after the lane is allocated.  Both '
+            'routes thread through the same WarmLaneDiskPressure → REQUEUED path. '
             'Note: the reify-repo PRD inv.6 text is the cross-repo counterpart '
             'of this policy; it is flagged for update separately via escalate_info.'
         ),
@@ -856,6 +862,43 @@ class GitConfig(BaseModel):
             'None (default) → derive from persistent_merge_worktree_path / '
             'reap_build_artifact_dirs[0] (i.e. <worktree_base>/_merge-verify/target). '
             'Set only when the seed base lives at a non-default location.'
+        ),
+    )
+    warm_lane_disk_guard: bool = Field(
+        default=False,
+        description=(
+            'When True, GitOps.acquire_warm_lane() runs a pre-acquire disk-pressure '
+            'admission check (ε) before allocating a lane: invoke the reify γ script '
+            '(scripts/warm-lane-disk-guard.sh check) → on exit 75 (EX_TEMPFAIL) '
+            'invoke the reify δ script (scripts/warm-lane-gc.sh reclaim) to free '
+            'stale capacity → re-check → if still pressured return '
+            'WarmLaneUnavailable.DISK_PRESSURE (workflow requeues as transient infra, '
+            'exit-75).  Fail-open on absent scripts (rc 127) — byte-identical to '
+            'today until reify γ/δ are deployed, mirroring the _seed_warm_lane / '
+            'refresh_warm_base absent-script convention.  Default False → '
+            'byte-identical to today and trivially revertible, mirroring the '
+            'warm_lane_pool knob convention.'
+        ),
+    )
+    warm_lane_min_free_gib: int = Field(
+        default=50,
+        ge=0,
+        description=(
+            'Minimum free disk space in GiB required before admitting a warm-lane '
+            'acquire.  Passed as --min-free-gib to the reify γ disk-guard script '
+            '(warm-lane-disk-guard.sh check).  Effective only when '
+            'warm_lane_disk_guard=True.  Matches the reify γ script env default (50 GiB).'
+        ),
+    )
+    warm_lane_min_free_inodes: int = Field(
+        default=500_000,
+        ge=0,
+        description=(
+            'Minimum free inodes required before admitting a warm-lane acquire.  '
+            'Passed as --min-free-inodes to the reify γ disk-guard script '
+            '(warm-lane-disk-guard.sh check).  Effective only when '
+            'warm_lane_disk_guard=True.  Matches the reify γ script env default '
+            '(500 000 inodes).'
         ),
     )
     merge_spec_warm_lane_pool: bool = Field(
