@@ -50,6 +50,7 @@ import pytest
 from _orch_helpers import make_placeholder_future, pydantic_spec  # noqa: F401
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
+from orchestrator.event_store import EventStore, EventType  # noqa: F401
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run  # noqa: F401
 from orchestrator.merge_queue import (  # noqa: F401
     InflightEntry,
@@ -66,6 +67,15 @@ from orchestrator.merge_queue import (  # noqa: F401
 )
 from orchestrator.verify import VerifyResult  # noqa: F401
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
+# Late-arrival integration helpers (task 1862): reuse module-level helpers
+# from test_merge_queue_concurrent_verify.  These are private (_-prefixed)
+# module-level functions so pytest does not collect them as tests.
+from test_merge_queue_concurrent_verify import (  # noqa: F401
+    _gated_runner,
+    _inject_two_host_allocator,
+    _make_branch_with_file,
+    _make_request,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -1646,3 +1656,124 @@ class TestSpecLaneFinalizeTerminalRelease:
             'cas-retry-exhausted path must call release_spec_lane, '
             'not cleanup_merge_worktree on warm _spec- lane'
         )
+
+
+# ===========================================================================
+# Late-arrival integration scaffolding (pre-1 / task 1862)
+# ===========================================================================
+# Helpers for the "late-arrival attach to in-flight predecessor tip" tests
+# (task 1862, steps 1–8).  The predecessor A's verify is gated so B is
+# injected AFTER the Merger's one-shot look-ahead peek has run and found
+# nothing — making B a genuine post-peek late arrival.
+#
+# Architecture overview
+# ---------------------
+# • spec_git_repo fixture (already defined above) provides the real repo.
+# • _gated_runner / _inject_two_host_allocator / _make_branch_with_file /
+#   _make_request are imported from test_merge_queue_concurrent_verify at the
+#   top of this file (module-level, importable via conftest sys.path setup).
+# • _LateArrivalFakeEventStore records speculative_merge / speculative_discard
+#   events for assertion.
+# • _make_late_arrival_git_config / _make_late_arrival_worker build the
+#   worker.run() harness with K=2 (speculation_depth=2) and a wired
+#   event_store.
+#
+# CONFTEST AUTOUSE OVERRIDE
+# -------------------------
+# The conftest autouse _mock_merge_queue_verification fixture monkeypatches
+# orchestrator.merge_queue.run_scoped_verification to return passed=True.
+# Each late-arrival integration test overrides this IN-BODY via:
+#
+#     with patch('orchestrator.merge_queue.run_scoped_verification', gated_local):
+#
+# A context-manager patch() applied inside the test body takes precedence
+# over the function-scoped monkeypatch binding for the duration of the
+# with-block — the same mechanism used by TestChainInvalidationUnderOverlap
+# in test_merge_queue_concurrent_verify.py.
+# ===========================================================================
+
+
+class _LateArrivalFakeEventStore(EventStore):
+    """Capturing EventStore for late-arrival speculative event assertions.
+
+    Records every emit() call as a dict ``{'type', 'task_id', 'data'}``.
+    Never performs SQLite I/O — ``object.__init__`` bypasses the DB setup
+    in ``EventStore.__init__``.
+
+    Usage::
+
+        store = _LateArrivalFakeEventStore()
+        worker = _make_late_arrival_worker(git_ops, event_store=store)
+        ...
+        spec_events = store.speculative_events(EventType.speculative_merge)
+        assert spec_events[0]['data']['base_sha'] == expected_sha
+    """
+
+    def __init__(self) -> None:
+        object.__init__(self)
+        self.events: list[dict] = []
+
+    def emit(  # type: ignore[override]
+        self,
+        event_type,
+        *,
+        task_id=None,
+        phase=None,
+        role=None,
+        data=None,
+        cost_usd=None,
+        duration_ms=None,
+    ) -> None:
+        self.events.append({
+            'type': event_type,
+            'task_id': task_id,
+            'data': data or {},
+        })
+
+    def speculative_events(
+        self, event_type: EventType | None = None,
+    ) -> list[dict]:
+        """Return recorded events, optionally filtered by EventType."""
+        if event_type is None:
+            return list(self.events)
+        return [e for e in self.events if e['type'] == event_type]
+
+
+def _make_late_arrival_git_config() -> GitConfig:
+    """Plain GitConfig for late-arrival integration tests (no warm-lane pool).
+
+    Warm-lane pool is intentionally disabled so spec-lane routing does not
+    interfere with the late-arrival mechanism under test.
+    """
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+
+
+def _make_late_arrival_worker(
+    git_ops: GitOps,
+    event_store: _LateArrivalFakeEventStore | None = None,
+    *,
+    speculation_depth: int = 2,
+) -> SpeculativeMergeWorker:
+    """Build a K=2 SpeculativeMergeWorker wired for late-arrival integration tests.
+
+    K=2 (speculation_depth=2) allows A and B to verify concurrently — A on
+    the remote gated runner and B on the local slot once it attaches to
+    A's pending spec-base.  The event_store is wired so speculative_merge /
+    speculative_discard events are captured for DONE-WHEN 1/2/4 assertions.
+
+    Returns the worker; the caller must inject a two-host HostAllocator via
+    _inject_two_host_allocator(worker, gated_remote) before calling worker.run().
+    """
+    q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    return SpeculativeMergeWorker(
+        git_ops,
+        q,
+        event_store=event_store,
+        speculation_depth=speculation_depth,
+    )
