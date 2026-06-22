@@ -478,19 +478,48 @@ class ModuleLockTable:
 
     def _is_parked_blocks(self, module: str, task_id: str) -> bool:
         """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*
-        and is owned by a different task (INV-2: top-only blocking).
+        and is owned by a different task that task_id cannot preempt (INV-2).
 
-        A buried (shadowed) reservation never blocks other owners — only the
-        active top of each stack is consulted.
+        A buried (shadowed) reservation never blocks — only the active top of
+        each stack is consulted.
+
+        Rank-aware (step-12): first compute task_id's OWN dominant rank — the
+        minimum rank over active-top entries that *task_id* itself owns on keys
+        conflicting with *module* (None if it has no such top).  A foreign
+        conflicting top then blocks UNLESS task_id's own dominant rank is
+        strictly less (strictly higher priority) — in which case task_id
+        preempts that foreign top and is not blocked by it.  This lets a
+        preemptor acquire its own module even when hierarchical victim parks
+        are kept under their original keys (their active tops are no longer
+        moved to the preemptor's key by a re-key step).
         """
+        # Step 1: compute task_id's own dominant rank among conflicting active tops.
+        own_dominant_rank: int | None = None
         for parked_module, stack in self._parked.items():
             if not stack:
                 continue
-            owner, _rank = stack[-1]  # active TOP only (INV-2)
-            if owner == task_id:
+            owner, rank = stack[-1]  # active TOP only
+            if owner != task_id:
                 continue
             if self._conflicts(parked_module, module):
-                return True
+                if own_dominant_rank is None or rank < own_dominant_rank:
+                    own_dominant_rank = rank
+
+        # Step 2: check each foreign conflicting active top.
+        for parked_module, stack in self._parked.items():
+            if not stack:
+                continue
+            owner, rank = stack[-1]  # active TOP only (INV-2)
+            if owner == task_id:
+                continue
+            if not self._conflicts(parked_module, module):
+                continue
+            # Foreign conflicting top: block unless task_id has a strictly
+            # higher-priority (strictly lower rank) own conflicting top.
+            if own_dominant_rank is not None and own_dominant_rank < rank:
+                # task_id preempts this foreign top — not blocked by it.
+                continue
+            return True
         return False
 
     def has_parks(self, task_id: str) -> bool:
@@ -521,9 +550,12 @@ class ModuleLockTable:
         is PUSHED on top of the stack (shadowing, not destroying, the lower entry).
         Same-tier or higher-priority tops BLOCK installation for that module (INV-3).
 
-        Hierarchical (different-key) conflicts: the shadowed top entry is re-keyed
-        beneath the new normalized key so the preemptor is not blocked by the old
-        parent/child key (non-destructive generalization of the old directional re-key).
+        Hierarchical (different-key) conflicts: victim parks are kept under
+        their ORIGINAL keys (not re-keyed onto the preemptor's key).  Rank-
+        aware blocking in ``_is_parked_blocks`` lets the preemptor acquire its
+        own module without needing to move victim entries.  This preserves each
+        victim's original module identity so that ALL victims are independently
+        restorable after the preemptor clears (step-12 fix).
         """
         depth = self._config.lock_depth
         rank = PRIORITY_RANK[coerce_tier(priority)]
@@ -557,23 +589,14 @@ class ModuleLockTable:
                     break
             if blocked:
                 continue
-            # Perform shadow pushes.
+            # Record shadows — all victim parks stay under their ORIGINAL keys.
+            # For exact-match conflicts (parked_m == normalized), the victim's
+            # entry stays in its stack; the new entry will be pushed on top
+            # in the install step below.  For hierarchical (different-key)
+            # conflicts, the victim park is also left untouched: rank-aware
+            # blocking in _is_parked_blocks lets the preemptor acquire its own
+            # module without moving victim entries (step-12 fix).
             for parked_m, victim_owner in to_shadow:
-                if parked_m != normalized:
-                    # Hierarchical conflict: re-key the victim's top entry to the
-                    # new normalized key so the preemptor is not blocked by the
-                    # old parent/child key (non-destructive directional re-key).
-                    old_stack = self._parked[parked_m]
-                    top_entry = old_stack.pop()
-                    if not old_stack:
-                        del self._parked[parked_m]
-                    if normalized not in self._parked:
-                        self._parked[normalized] = []
-                    self._parked[normalized].append(top_entry)
-                # else: exact match — victim entry stays in its stack; new entry
-                # will be pushed on top in the install step below.
-
-                # Record the shadow for the return value (use original key).
                 if victim_owner not in shadow_acc:
                     shadow_acc[victim_owner] = []
                     shadow_order.append(victim_owner)
