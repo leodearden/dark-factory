@@ -41,7 +41,7 @@ The running orchestrator-reify.service process PREDATED the #1862 merge and ther
 
 **Preflight checks (all passed):**
 - Merge queue: empty (depth=0, no verify in flight) — clean quiesce ✅
-- leo-laptop reachability: `ssh leo-laptop true` exit 0 — K=2 expected on startup ✅
+- leo-laptop reachability: `ssh leo-laptop true` exit 0 — SSH-reachable, but K=1 expected (verify_runners not yet enabled in reify config per task 1716 gate; SSH reachability is necessary but not sufficient) ✅
 - dark-factory tracked mods: none (only untracked `??` files) — dirty-tree guard passes ✅
 
 | Field | Value |
@@ -54,7 +54,7 @@ The running orchestrator-reify.service process PREDATED the #1862 merge and ther
 | Scheduled at | approx 21:03 BST (step-2 schedule-mode agent exited) |
 | Expected fire time | approx 21:04 BST (+60 s on-active delay after agent exit) |
 | Expected active by | approx 21:06 BST (+≤90 s TimeoutStopSec graceful stop) |
-| K expectation | K=2 (leo-laptop reachable at schedule time) |
+| K expectation | K=1 (verify_runners not yet enabled in reify config per task 1716 gate; leo-laptop SSH-reachable but runner config not enabled — SSH reachability alone is not the gating condition) |
 
 Script output:
 ```
@@ -78,10 +78,21 @@ Live state read via `systemctl --user show orchestrator-reify.service -p MainPID
 | (b) MainPID | ≠ 3454423 (fresh process) | `937088` | ✅ GREEN |
 | (c) ActiveEnterTimestamp | AFTER 2026-06-22 20:51:23 BST (#1862 merge) | `Mon 2026-06-22 21:05:11 BST` | ✅ GREEN |
 | (d) Startup log | `"Speculative merge worker started"` in post-restart journal | Present at `21:05:13 BST` | ✅ GREEN |
-| (d2) K | hosts_total from merge queue occupancy | `hosts_total=1` (K=1 serial-local; verify_runners not yet enabled in reify config per task 1716 gate — leo-laptop SSH-reachable at schedule time but config has not enabled the runner) | ℹ️ NOTE |
+| (d2) K | K=1 (verify_runners not yet enabled per task 1716 gate) | `hosts_total=1` (K=1 serial-local; verify_runners not yet enabled in reify config per task 1716 gate — expected and actual agree; leo-laptop SSH-reachable but not the gating condition) | ✅ GREEN |
 | (e) #1862 fix in loaded source | `pending_spec_base`, disjoint-skip carve-out in `merge_queue.py` | Present: `pending_spec_base` at lines 6841/6854/6857/6858/6878; disjoint gate at lines 1829/1924/1972 | ✅ GREEN |
 | (f) Behavioral (deferred) | Follower arriving mid-predecessor-verify emits `speculative_merge` with `base_sha == predecessor merge SHA`; predecessor landing shows no `_reverify_rebased_tree` / `rebased_pending_reverify` | **Deferred** — structural criteria (a)–(e) confirm fresh process running with #1862 source on disk; behavioral path requires a natural mid-flight predecessor/follower cascade; confirmed opportunistically on next real cascade | ⚠️ DEFERRED |
 
 **Delta:** Service restarted **13 min 48 s AFTER** the #1862 merge (21:05:11 BST vs 20:51:23 BST merge) — new process loads post-#1862 merge_queue.py.
 
 **Result: #1862 in-flight-tip speculation fix is DEPLOYED (structural criteria a–e GREEN).** orchestrator-reify.service PID 937088 loads the fixed `pending_spec_base` lifecycle and disjoint-skip carve-out from dark-factory main @ b41d665826.
+
+---
+
+### Open Follow-up: Behavioral Verification (criterion f)
+
+- [ ] **Owner:** Reify orchestrator on-call / first agent observing a mid-flight cascade post-deploy
+- **Trigger:** Next natural mid-flight predecessor/follower merge — a follower task arrives while a predecessor is in the `verify` phase
+- **What to confirm:**
+  - Follower emits `speculative_merge` with `base_sha == predecessor_merge_sha` (not plain `main` HEAD)
+  - Predecessor's landing journal shows **no** `_reverify_rebased_tree` / `rebased_pending_reverify` event
+- **Resolution:** Check the box, record the qualifying cascade SHA and timestamp in this file, and close the follow-up. If a natural cascade does not occur within a reasonable window, a synthetic predecessor/follower race can be provisioned as a follow-up task.
