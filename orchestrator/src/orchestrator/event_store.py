@@ -105,6 +105,8 @@ class EventType(StrEnum):
     reservation_installed = 'reservation_installed'
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
+    reservation_shadowed = 'reservation_shadowed'
+    reservation_restored = 'reservation_restored'
     reservation_used = 'reservation_used'
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
 
