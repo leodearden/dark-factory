@@ -6851,8 +6851,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             while self._running:
                 # γ/1719 retroactive coalescing pass — design decisions summary:
                 # • DD1: runs at the pre-dequeue point, gated on a clean pipeline
-                #   (spec_base=None and prefetched=None) so a train is never enqueued
-                #   behind an unverified speculative merge commit (:5239 warning).
+                #   (spec_base=None and prefetched=None and pending_spec_base=None)
+                #   so a train is never enqueued behind an unverified speculative merge
+                #   commit (:5239 warning).  The task-1862 retain path records the
+                #   predecessor's commit in pending_spec_base while spec_base remains
+                #   None, so pending_spec_base must also be tested here — otherwise
+                #   coalescing could form a GroupMergeRequest behind an in-flight
+                #   speculative predecessor and attach it to that predecessor's commit,
+                #   violating DD1's invariant.  (merge_train_coalesce_enabled=False by
+                #   default so this is latent; guard added for correctness when enabled.)
                 # • DD2: idempotency via candidate filter (excludes GroupMergeRequests,
                 #   done/cancelled futures); no new MergeRequest field required.
                 # • DD3: debounce via _last_coalesce_signature prevents re-stacking an
@@ -6868,7 +6875,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # When merge_train_coalesce_enabled=False (default) the call has
                 # near-zero overhead: it drains the queue (already done at acquire
                 # time), builds the candidate list, reads the knob, and returns False.
-                if spec_base is None and prefetched is None:
+                if spec_base is None and prefetched is None and pending_spec_base is None:
                     await self._maybe_coalesce_waiting_singles()
 
                 # Get next request: use pre-fetched (speculative) item if available,

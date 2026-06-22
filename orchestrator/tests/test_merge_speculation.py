@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import stat
 from pathlib import Path
 from typing import Any
@@ -1808,7 +1809,7 @@ class TestLateArrivalAttaches:
     """
 
     async def test_late_arrival_attaches_to_predecessor_tip(
-        self, spec_git_repo: Path,
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Genuine post-peek late arrival B merges against A's in-flight commit.
 
@@ -1819,6 +1820,9 @@ class TestLateArrivalAttaches:
           - ``b_merge['base_sha'] == a_merge_commit``
           - ``speculative_merge`` event for B carries the same ``base_sha``
         """
+        # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
         fake_event_store = _LateArrivalFakeEventStore()
@@ -1957,6 +1961,26 @@ class TestLateArrivalAttaches:
                 'GREEN (step-2): base_sha = pending_spec_base = A\'s merge commit.'
             )
 
+            # DONE-WHEN 2 (mechanism): assert the late-arrival ATTACH code path
+            # fired — not just the outcome.  The ATTACH branch emits a DEBUG log
+            # 'late arrival attaches to in-flight predecessor …'.  If a future
+            # edit introduces an await inside _pop_next_pickable/_drain_queue so B
+            # is prefetched normally by the look-ahead, the outcome assertions above
+            # remain green but this log assertion will fail, revealing the test has
+            # stopped guarding the late-arrival path.
+            attach_msgs = [
+                r.message
+                for r in caplog.records
+                if 'late arrival attaches to in-flight predecessor' in r.message
+            ]
+            assert attach_msgs, (
+                'Expected at least one "late arrival attaches to in-flight '
+                'predecessor" DEBUG log — confirms the pending_spec_base ATTACH '
+                'branch fired.  Without this, the test only checks the outcome '
+                'and would pass even if B were prefetched normally by the '
+                'look-ahead (defeating the late-arrival guard).'
+            )
+
             # ── Release A's gate → let A and B complete cleanly ───────────────
             gate_a_release.set()
 
@@ -1993,7 +2017,7 @@ class TestLateArrivalCleanCAS:
     """
 
     async def test_predecessor_land_no_reverify_clean_advance(
-        self, spec_git_repo: Path,
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A lands first; B advances cleanly with no rebase and no _reverify_rebased_tree.
 
@@ -2005,6 +2029,9 @@ class TestLateArrivalCleanCAS:
         from orchestrator.merge_queue import (
             _reverify_rebased_tree as _orig_reverify,
         )
+
+        # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -2154,6 +2181,19 @@ class TestLateArrivalCleanCAS:
         a_advanced = advance_outcomes.get(a_advance_branch) == 'advanced'
         assert a_advanced, (
             f'A must also have advanced cleanly; got {advance_outcomes.get(a_advance_branch)!r}'
+        )
+
+        # Mechanism guard: assert the ATTACH code path fired (not just the outcome).
+        attach_msgs = [
+            r.message
+            for r in caplog.records
+            if 'late arrival attaches to in-flight predecessor' in r.message
+        ]
+        assert attach_msgs, (
+            'Expected at least one "late arrival attaches to in-flight '
+            'predecessor" DEBUG log — confirms pending_spec_base ATTACH branch '
+            'fired.  If missing, B may have been prefetched normally by the '
+            'look-ahead, silently bypassing the late-arrival path.'
         )
 
 
@@ -2764,6 +2804,127 @@ class TestLateArrivalGuards:
         # retained → B's ATTACH).  With K=1, slot._value == 0 means EXACTLY one
         # permit is in use, which is correct and cannot exceed K=1.
 
+    async def test_shutdown_releases_retained_permit(self, spec_git_repo: Path) -> None:
+        """Shutdown while retain state is live (no B queued) releases the held permit.
+
+        Regression guard (Amendment 3 / reviewer suggestion):
+        When the merger's look-ahead finds nothing pickable and the predecessor is
+        still in-flight, it RETAINS the speculation permit (pending_spec_base set,
+        held_spec_permit=True) and blocks in _acquire_next_request() waiting for a
+        late arrival.  If the worker shuts down before any late arrival arrives, the
+        outer finally block at :7412 must release the retained permit.
+
+        A regression that drops ``if held_spec_permit: release()`` from the finally
+        path — or that accidentally sets held_spec_permit=False before the finally
+        block — would leak a permit, reducing effective K by 1 for the lifetime of
+        the worker (until the safety-valve releases in stop() compensate).
+
+        Slot accounting:
+          After gate_a_entered: slot._value == K-1  (one permit held in retain state)
+          After worker.stop():  slot._value == 2*K+1
+            • stop() releases K+1 times (over-release safety valve — see :6268)
+            • merger's finally block releases 1 more time (the retained permit)
+            • net: (K-1) + (K+1) + 1 = 2K+1
+          With bug (finally skips release): slot._value == 2*K
+            • (K-1) + (K+1) = 2K  (one fewer release)
+
+        Drive:
+          - Gate A's local verify so A is in-flight (retain state entered by merger).
+          - Do NOT enqueue B (queue stays empty; merger stays in _acquire_next_request).
+          - Assert slot._value == K-1 (one permit held in retain state).
+          - Release A's gate, then call worker.stop() — shutdown sentinel dequeued.
+          - Assert slot._value == 2*K+1 after the worker task completes.
+        """
+        K = 2
+        git_config = _make_late_arrival_git_config()
+        git_ops = GitOps(git_config, spec_git_repo)
+
+        # ── Gate: hold A's local verify in-flight ────────────────────────────
+        gate_a_entered = asyncio.Event()
+        gate_a_release = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_prerelease = asyncio.Event()
+        gate_b_prerelease.set()
+        fake_remote = _gated_runner(
+            gate_b_prerelease, passed=True, name='shutdown-guard-laptop',
+        )
+
+        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/shutdown-guard-a', 'shutdown_guard_a.py', 'a = 1\n',
+        )
+
+        worker = _make_late_arrival_worker(git_ops, speculation_depth=K)
+        _inject_two_host_allocator(worker, fake_remote)
+        req_a = _make_request('shutdown-guard-a', 'task/shutdown-guard-a', wt_a, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            # Enqueue only A — no B.
+            await worker._queue.put(req_a)
+
+            # Wait until A's verify enters the gate.  At this point the merger has:
+            #   (1) merged A and enqueued it to the verifier
+            #   (2) acquired the speculation permit (look-ahead)
+            #   (3) done the peek → found nothing → entered RETAIN state
+            #   (4) set pending_spec_base = A's merge commit, held_spec_permit=True
+            #   (5) blocked in _acquire_next_request() (queue empty, no B)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # RETAIN state: exactly one permit held; slot._value == K-1.
+            retain_value = worker._speculation_slot._value
+            assert retain_value == K - 1, (
+                f'Retain state: expect one permit held (slot._value == {K - 1}); '
+                f'got {retain_value}.\n'
+                'If slot._value == K, the permit was released before retain state '
+                'was established — test precondition not met.'
+            )
+
+            # Release A's gate so A can finalize when the verifier processes it.
+            # The merger stays blocked in _acquire_next_request (queue still empty).
+            gate_a_release.set()
+
+            # Shut down — no B ever arrives.  stop() puts None in the merge queue
+            # (after releasing K+1 times as a safety valve); the merger dequeues it,
+            # breaks out of the loop, and the finally block at :7412 releases the
+            # retained permit.
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=10.0)
+
+        # Expected slot value after full shutdown:
+        #   retain_value (K-1)
+        #   + stop()'s K+1 over-releases (safety valve, :6268)
+        #   + finally block's 1 release (the retained permit)
+        #   = (K-1) + (K+1) + 1 = 2K+1
+        #
+        # With a bug (finally doesn't release the retained permit):
+        #   (K-1) + (K+1) = 2K   ← one fewer than expected
+        expected_post_stop = 2 * K + 1
+        assert worker._speculation_slot._value == expected_post_stop, (
+            f'Shutdown guard: slot._value must be {expected_post_stop} after stop(); '
+            f'got {worker._speculation_slot._value}.\n'
+            f'Formula: retain({K-1}) + stop_releases({K+1}) + finally_release(1) = '
+            f'{expected_post_stop}.\n'
+            f'A value of {2*K} means the merger\'s finally block did NOT release the '
+            f'retained permit (held_spec_permit flag lost before finally block).'
+        )
+
 
 # ===========================================================================
 # Step-8 Guard: submission-order CAS invariant for the late-arrival path
@@ -2793,7 +2954,7 @@ class TestLateArrivalSubmissionOrderCAS:
     """
 
     async def test_submission_order_cas_late_arrival(
-        self, spec_git_repo: Path,
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A's advance_main completes before B's; B's expected_main == A's merge commit.
 
@@ -2810,6 +2971,9 @@ class TestLateArrivalSubmissionOrderCAS:
               (B's CAS uses A's merge commit as the base, not the original main).
           (c) Both A and B resolve 'done' (clean CAS, no rebase).
         """
+        # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
 
@@ -2966,3 +3130,17 @@ class TestLateArrivalSubmissionOrderCAS:
         )
         assert 'cas8_a.py' in main_files, 'A\'s file must be on main'
         assert 'cas8_b.py' in main_files, 'B\'s file must be on main'
+
+        # Mechanism guard: assert the ATTACH code path fired (not just the outcome).
+        attach_msgs = [
+            r.message
+            for r in caplog.records
+            if 'late arrival attaches to in-flight predecessor' in r.message
+        ]
+        assert attach_msgs, (
+            'Expected at least one "late arrival attaches to in-flight '
+            'predecessor" DEBUG log — confirms pending_spec_base ATTACH branch '
+            'fired.  Without this, B may have been prefetched normally by the '
+            'look-ahead, bypassing the late-arrival path the submission-order '
+            'CAS test is designed to exercise.'
+        )
