@@ -50,6 +50,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import make_placeholder_future, pydantic_spec  # noqa: F401
+from test_merge_queue_concurrent_verify import (  # noqa: F401
+    _gated_runner,
+    _id_liveness_fake_runner,
+    _inject_two_host_allocator,
+    _make_branch_with_file,
+    _make_request,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
 from orchestrator.event_store import EventStore, EventType  # noqa: F401
@@ -69,16 +76,10 @@ from orchestrator.merge_queue import (  # noqa: F401
 )
 from orchestrator.verify import VerifyResult  # noqa: F401
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
+
 # Late-arrival integration helpers (task 1862): reuse module-level helpers
 # from test_merge_queue_concurrent_verify.  These are private (_-prefixed)
 # module-level functions so pytest does not collect them as tests.
-from test_merge_queue_concurrent_verify import (  # noqa: F401
-    _gated_runner,
-    _id_liveness_fake_runner,
-    _inject_two_host_allocator,
-    _make_branch_with_file,
-    _make_request,
-)
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
