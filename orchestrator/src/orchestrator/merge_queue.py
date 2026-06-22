@@ -8890,6 +8890,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         #   Single-host: always true at dispatch → byte-identical.
         #   Multi-host: speculative-on-in-flight → skip; handled by finalize
         #               head-failure cascade (step-20).
+        #
+        # LATE-ARRIVAL ATTACH INTERACTION (task 1862 step-4 locking guard):
+        # A late-arriving B attached to in-flight predecessor A via
+        # pending_spec_base (_merger_loop step-2) composes correctly with this
+        # gate in every dispatch race — no spurious remerge on the attach path:
+        #
+        # (a) Predecessor A still verifying at B's dispatch:
+        #     → _has_inflight_verify True → entire block below skipped.
+        #     → B dispatches as-is against A's merge commit (spec_base=A.commit).
+        #
+        # (b) Predecessor A landed CLEAN before B dispatched:
+        #     → _has_inflight_verify False → block entered.
+        #     → B.speculative=True, _n_failed=False (A landed), _remerge_occurred=False.
+        #     → First branch (`item.speculative and _n_failed|_remerge_occurred`): False.
+        #     → Second branch: `not item.speculative` γ guard False (B is speculative).
+        #     → remerge_reason remains None → NO remerge → B dispatches against
+        #       A's commit (== main-after-A) → advance_main clean CAS 'advanced'
+        #       → _reverify_rebased_tree unreachable (DONE-WHEN 3, task 1862).
+        #
+        # (c) Predecessor A FAILED before B dispatched:
+        #     → _has_inflight_verify False, _n_failed=True.
+        #     → First branch fires with reason=previous_failed → _remerge vs
+        #       actual main → existing head-failure cascade invalidates B
+        #       (DONE-WHEN 4, task 1862; tested by step-5/step-6).
+        #
+        # The `not item.speculative` γ guard on Mechanism 2 is the speculative
+        # carve-out that makes case (b) provable: even if B's base_sha happened
+        # to differ from current_main, Mechanism 2 would not fire for speculative
+        # items — preventing any main_advanced remerge on the clean-landed path.
         _has_inflight_verify = any(e.verify_task is not None for e in self._inflight)
         if not _has_inflight_verify:
             remerge_reason: str | None = None
@@ -8898,7 +8927,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'previous_failed' if self._n_failed else 'chain_invalidated'
                 )
             elif (
-                not item.speculative  # γ guard: Mechanism 2 for real items only
+                # γ guard: Mechanism 2 staleness check for REAL (non-speculative) items
+                # only.  Speculative items (including late-arrival attached via
+                # pending_spec_base) must never be remerged here on base_sha mismatch —
+                # their base_sha is intentionally the predecessor's commit, not current
+                # main; the predecessor's finalize advances main to equal it (case b
+                # above) so no staleness exists.  This guard is the explicit speculative
+                # carve-out required by task 1862 step-4.
+                not item.speculative
                 and item.immediate_outcome is None
                 and item.merge_result is not None
                 and not isinstance(req, GroupMergeRequest)
