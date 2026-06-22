@@ -594,35 +594,85 @@ class ModuleLockTable:
             self._park_install_at.setdefault(task_id, datetime.now(UTC).isoformat())
         return installed, shadowed
 
-    def clear_parks_for(self, task_id: str) -> None:
-        """Remove every reservation owned by *task_id* at ANY stack level.
+    def _remove_owner(self, task_id: str) -> list[tuple[str, list[str]]]:
+        """Remove *task_id* from every stack at any level and return restored pairs.
 
-        Clears task_id from tops AND buried positions in every stack.
-        Empty stacks are deleted.  When removing the active top exposes a
-        buried entry, that entry becomes the new active top automatically
-        (the list structure handles this: after removing task_id entries the
-        last remaining element is the new top).  Drops ``_park_install_at``
-        for task_id unconditionally (all its reservations are gone).
+        For each module stack where *task_id* was the ACTIVE TOP: after removal
+        the new last element (if any) becomes the active top and is reported as a
+        ``(owner, sorted_modules)`` restored pair.  Removing a buried (non-top)
+        entry leaves the top unchanged and is NOT reported as a restore (INV-4).
 
-        Return-type is intentionally ``None`` in this step; widened in step-4.
+        Drops ``_park_install_at[task_id]`` only when task_id has no remaining
+        parks at any level after removal (INV-6: preserved for shadowed owners
+        who are removed from buried slots but still have other parks).
+
+        Returns ``list[(restored_owner, sorted_modules)]`` in first-seen order.
+        Callers use the returned pairs to emit ``reservation_restored`` events.
         """
+        # Track which modules had task_id as their ACTIVE TOP before removal.
+        was_top: set[str] = set()
+        for m, stack in self._parked.items():
+            if stack and stack[-1][0] == task_id:
+                was_top.add(m)
+
+        # Rebuild stacks without task_id.
         new_parked: dict[str, list[tuple[str, int]]] = {}
         for m, stack in self._parked.items():
             new_stack = [(o, r) for o, r in stack if o != task_id]
             if new_stack:
                 new_parked[m] = new_stack
         self._parked = new_parked
-        self._park_install_at.pop(task_id, None)
 
-    def prune_owners(self, predicate: Callable[[str], bool]) -> list[str]:
+        # Drop install_at only when task_id is fully gone.
+        if not self.has_parks(task_id):
+            self._park_install_at.pop(task_id, None)
+
+        # Identify newly-exposed tops: modules where task_id WAS the top and
+        # a lower entry is now exposed.
+        restored_acc: dict[str, list[str]] = {}  # new_top_owner -> [modules]
+        restored_order: list[str] = []
+        for m in was_top:
+            new_stack = self._parked.get(m)
+            if new_stack:  # there is a newly-exposed lower entry
+                new_top_owner, _ = new_stack[-1]
+                if new_top_owner not in restored_acc:
+                    restored_acc[new_top_owner] = []
+                    restored_order.append(new_top_owner)
+                restored_acc[new_top_owner].append(m)
+
+        return [
+            (owner, sorted(restored_acc[owner]))
+            for owner in restored_order
+        ]
+
+    def clear_parks_for(self, task_id: str) -> list[tuple[str, list[str]]]:
+        """Remove every reservation owned by *task_id* and return restored pairs.
+
+        Delegates to ``_remove_owner`` for the actual removal + restore detection.
+        Returns ``[(restored_owner, sorted_modules)]`` for each module whose
+        newly-exposed lower entry becomes the active top — empty list when there
+        are no buried entries beneath task_id's reservations (INV-4).
+
+        Callers (Scheduler dispatch/release paths) use the returned pairs to
+        emit ``reservation_restored`` events (step-8).
+        """
+        return self._remove_owner(task_id)
+
+    def prune_owners(
+        self, predicate: Callable[[str], bool]
+    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
         """Evict every park whose owner satisfies *predicate* at ANY stack level.
 
         Iterates unique owners across all levels of all stacks (deduped,
         first-seen order), calls ``predicate(owner_id)`` at most once per
-        owner, and removes all entries for matching owners from every stack.
+        owner, and removes all entries for matching owners via ``_remove_owner``.
 
-        Returns the list of evicted owner IDs in first-seen order.
-        Return shape is ``list[str]`` in this step; widened in step-4.
+        Returns ``(evicted_owners, restored_pairs)`` where *evicted_owners* is
+        the list of removed owner IDs in first-seen order and *restored_pairs*
+        is a flattened list of ``(owner, sorted_modules)`` for all stacks whose
+        newly-exposed tops belong to non-evicted owners.  The Scheduler's
+        ``_park_gc`` sweep loop uses restored_pairs to emit
+        ``reservation_restored`` events (step-8).
         """
         # Collect unique owners in first-seen order across all stack levels.
         seen: dict[str, bool] = {}
@@ -632,17 +682,23 @@ class ModuleLockTable:
                     seen[owner] = predicate(owner)
         # Build evicted list.
         evicted = [owner for owner, should in seen.items() if should]
-        if evicted:
-            evicted_set = set(evicted)
-            new_parked: dict[str, list[tuple[str, int]]] = {}
-            for m, stack in self._parked.items():
-                new_stack = [(o, r) for o, r in stack if o not in evicted_set]
-                if new_stack:
-                    new_parked[m] = new_stack
-            self._parked = new_parked
-            for owner in evicted:
-                self._park_install_at.pop(owner, None)
-        return evicted
+        # Remove each evicted owner and accumulate restored pairs.
+        all_restored_acc: dict[str, list[str]] = {}  # deduplicate across calls
+        all_restored_order: list[str] = []
+        for owner in evicted:
+            for restored_owner, mods in self._remove_owner(owner):
+                if restored_owner not in all_restored_acc:
+                    all_restored_acc[restored_owner] = list(mods)
+                    all_restored_order.append(restored_owner)
+                else:
+                    # Merge modules for the same restored owner across multiple calls.
+                    merged = sorted(set(all_restored_acc[restored_owner]) | set(mods))
+                    all_restored_acc[restored_owner] = merged
+        all_restored = [
+            (owner, all_restored_acc[owner])
+            for owner in all_restored_order
+        ]
+        return evicted, all_restored
 
     # --- Snapshot helpers (public accessors for observability) ---
 
@@ -2862,7 +2918,7 @@ class Scheduler:
                 return True
             return not self._deps_satisfied(tasks_by_id[tid], status_map, tasks_by_id)
 
-        gc_evicted = self.lock_table.prune_owners(_park_gc)
+        gc_evicted, _gc_restored = self.lock_table.prune_owners(_park_gc)
         for owner in gc_evicted:
             self._skip_count.pop(owner, None)
             if self.event_store:
