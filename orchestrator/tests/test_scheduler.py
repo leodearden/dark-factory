@@ -2435,13 +2435,16 @@ class TestFairness:
 
     @pytest.mark.asyncio
     async def test_cross_tier_preemption(self):
-        """A high-tier skip-bump preempts an overlapping low-tier park.
+        """A high-tier skip-bump SHADOWS (not destroys) an overlapping low-tier park.
 
-        Setup: low-priority L is already parked on m1+m2 with skip_count=3
-        (mimicking an accumulated count). A high-priority H wants m1 and is
-        also forced to skip.  When H's _bump_skip_and_maybe_park fires, it
-        evicts L's park on m1 only (m2 survives), preserves L's _skip_count,
-        and emits both reservation_installed and reservation_evicted events.
+        Setup: low-priority L is already parked on m1+m2 with skip_count=3.
+        A high-priority H wants m1 and is also forced to skip.  When H's
+        _bump_skip_and_maybe_park fires, it SHADOWS L's park on m1 (pushes H
+        on top, L stays buried); L's park on m2 remains active.
+
+        Expected events: reservation_installed (H on m1) + reservation_shadowed
+        (L shadowed on m1).  ZERO reservation_evicted events — the old destructive
+        eviction is no longer emitted on preemption.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
@@ -2455,17 +2458,21 @@ class TestFairness:
         # parking on the first call.
         scheduler._bump_skip_and_maybe_park('H', ['m1'], tier='high')
 
-        # H now holds a park on m1; L's park on m1 is gone, but m2 survives.
+        # H is the active top on m1; L is SHADOWED on m1 (buried) but still
+        # has its park there (INV-5) AND is still active on m2.
         assert scheduler.lock_table.has_parks('H')
-        assert scheduler.lock_table.has_parks('L')
-        assert not scheduler.lock_table.try_acquire('X', ['m1'])  # H's park
-        assert not scheduler.lock_table.try_acquire('Y', ['m2'])  # L's park
+        assert scheduler.lock_table.has_parks('L'), 'L must be retained in the shadow stack'
+        # H's park on m1 blocks ALL other tasks (including shadowed L).
+        assert not scheduler.lock_table.try_acquire('X', ['m1'])   # stranger blocked
+        assert not scheduler.lock_table.try_acquire('L', ['m1'])   # shadowed L blocked (INV-2)
+        # L's park on m2 remains active — H cannot acquire m2.
+        assert not scheduler.lock_table.try_acquire('Y', ['m2'])   # L's active park
+        assert not scheduler.lock_table.try_acquire('H', ['m2'])   # H cannot acquire L's m2
 
         # L's skip_count was NOT cleared by preemption.
         assert scheduler._skip_count['L'] == 3
 
-        # Recording event store has exactly one reservation_installed (for H)
-        # and one reservation_evicted (for L).
+        # Exactly one reservation_installed (for H) and ZERO reservation_evicted.
         installed_events = [
             e for e in event_store.events
             if 'reservation_installed' in e[0]
@@ -2474,15 +2481,22 @@ class TestFairness:
             e for e in event_store.events
             if 'reservation_evicted' in e[0]
         ]
-        assert len(installed_events) == 1
+        shadowed_events = [
+            e for e in event_store.events
+            if 'reservation_shadowed' in e[0]
+        ]
+        assert len(installed_events) == 1, f'Expected 1 installed event; got {installed_events}'
         assert installed_events[0][1]['task_id'] == 'H'
-        assert len(evicted_events) == 1
-        evicted_payload = evicted_events[0][1]
-        assert evicted_payload['task_id'] == 'H'
-        assert evicted_payload['data']['modules'] == ['m1']
-        assert evicted_payload['data']['preempted_by'] == 'H'
-        assert evicted_payload['data']['preempted_by_priority'] == 'high'
-        assert evicted_payload['data']['victim'] == 'L'
+        assert len(evicted_events) == 0, (
+            f'reservation_evicted must NOT be emitted on shadow preemption; got {evicted_events}'
+        )
+        assert len(shadowed_events) == 1, f'Expected 1 shadowed event; got {shadowed_events}'
+        shadowed_payload = shadowed_events[0][1]
+        assert shadowed_payload['task_id'] == 'H'
+        assert shadowed_payload['data']['modules'] == ['m1']
+        assert shadowed_payload['data']['preempted_by'] == 'H'
+        assert shadowed_payload['data']['preempted_by_priority'] == 'high'
+        assert shadowed_payload['data']['victim'] == 'L'
 
     # ---- Owner-state park-GC (step-14) ----
 
