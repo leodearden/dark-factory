@@ -500,7 +500,10 @@ class TestSeedWarmLane:
     async def test_seed_calls_script_with_correct_args(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """_seed_warm_lane invokes seed-warm-lane.sh with <base_target> <lane> <mode>."""
+        """_seed_warm_lane invokes seed-warm-lane.sh with <base_target> <lane> <mode>.
+
+        Returns 0 (int) on success.
+        """
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         # Create a real lane worktree so the script can live inside it
@@ -519,7 +522,7 @@ class TestSeedWarmLane:
 
         result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
 
-        assert result is True
+        assert result == 0, f'Expected rc=0 (success), got {result!r}'
         assert marker.exists(), 'seed-warm-lane.sh was not called (marker missing)'
         recorded = marker.read_text().strip()
         base_target = str(git_ops.warm_lane_base_target_path)
@@ -528,20 +531,22 @@ class TestSeedWarmLane:
             f'Wrong args: got {recorded!r}, expected {expected!r}'
         )
 
-    async def test_seed_absent_script_returns_false(
+    async def test_seed_absent_script_returns_nonzero(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Absent seed-warm-lane.sh → returns False (no warm capability), never raises."""
+        """Absent seed-warm-lane.sh → returns non-zero sentinel (127), never raises."""
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         lane = await _make_lane_dir(wl_git_repo, '_lane-abs')
         # No script installed in lane/scripts/
         result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
-        assert result is False
+        assert result != 0, f'Expected non-zero rc for absent script, got {result!r}'
+        # Sentinel for absent script is 127 (command-not-found convention)
+        assert result == 127, f'Expected sentinel 127 for absent script, got {result!r}'
 
-    async def test_seed_nonzero_exit_returns_false(
+    async def test_seed_nonzero_exit_returns_exit_code(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Script that exits non-zero → returns False (fail-soft), never raises."""
+        """Script that exits 1 → returns exactly 1 (preserves the exit code), never raises."""
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         lane = await _make_lane_dir(wl_git_repo, '_lane-fail')
 
@@ -552,12 +557,15 @@ class TestSeedWarmLane:
         script.chmod(0o755)
 
         result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
-        assert result is False
+        assert result == 1, f'Expected rc=1 (script exit code), got {result!r}'
 
     async def test_seed_reset_in_place_mode_passes_correct_flag(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """_seed_warm_lane with '--reset-in-place' passes the correct mode flag."""
+        """_seed_warm_lane with '--reset-in-place' passes the correct mode flag.
+
+        Returns 0 (int) on success.
+        """
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         lane = await _make_lane_dir(wl_git_repo, '_lane-rip')
 
@@ -571,9 +579,31 @@ class TestSeedWarmLane:
         script.chmod(0o755)
 
         result = await git_ops._seed_warm_lane(lane, '--reset-in-place')
-        assert result is True
+        assert result == 0, f'Expected rc=0 (success), got {result!r}'
         recorded = marker.read_text().strip()
         assert recorded.endswith('--reset-in-place')
+
+    async def test_seed_disk_pressure_exit_75_returns_75(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Script that exits 75 (EX_TEMPFAIL / disk-pressure) → returns exactly 75.
+
+        This is the DISK_PRESSURE discriminant: exit 75 must be preserved as-is
+        so the caller can distinguish transient disk pressure from a generic fault.
+        """
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        lane = await _make_lane_dir(wl_git_repo, '_lane-dp')
+
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text('#!/usr/bin/env bash\necho "disk pressure" >&2\nexit 75\n')
+        script.chmod(0o755)
+
+        result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        assert result == 75, (
+            f'Expected rc=75 (EX_TEMPFAIL disk-pressure discriminant), got {result!r}'
+        )
 
 
 # ===========================================================================
