@@ -2402,7 +2402,7 @@ class Scheduler:
             count >= threshold
             and not self.lock_table.has_parks(task_id)
         ):
-            installed, evicted_pairs = self.lock_table.install_parks(task_id, modules, tier)
+            installed, shadowed_pairs = self.lock_table.install_parks(task_id, modules, tier)
             logger.info(
                 'Task %s reserved modules %s (skip_count=%d, tier=%s)',
                 task_id, installed, count, tier,
@@ -2417,9 +2417,13 @@ class Scheduler:
                         'priority': tier,
                     },
                 )
-                for victim, victim_modules in evicted_pairs:
+                # Emit reservation_shadowed (non-destructive shadow) for each
+                # lower-priority owner whose park was pushed beneath task_id.
+                # reservation_evicted is RETAINED as an enum member for historical
+                # event-log back-compat but is no longer emitted on preemption.
+                for victim, victim_modules in shadowed_pairs:
                     self.event_store.emit(
-                        EventType.reservation_evicted,
+                        EventType.reservation_shadowed,
                         task_id=task_id,
                         data={
                             'modules': victim_modules,
