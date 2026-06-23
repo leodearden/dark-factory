@@ -5939,6 +5939,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Sets _shutdown_signaled if the sentinel is encountered.
             self._drain_queue_into_lanes()
 
+            # δ/1889 — refresh the conflict-graph over the unfrozen suffix.
+            # The debounce (signature check) makes repeated calls cheap when
+            # neither the suffix composition nor main_sha has changed.
+            # Note: the speculative-merge prefetch path may observe a slightly
+            # stale graph for items dispatched before the next acquire; that
+            # staleness window is bounded by one acquire cycle and is
+            # intentional (ε/ζ/η consume the relation, not the merge outcome).
+            await self.recompute_suffix_conflict_graph()
+
             req = self._pop_next_pickable()
             if req is not None:
                 return req
