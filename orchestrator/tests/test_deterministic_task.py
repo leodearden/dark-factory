@@ -644,3 +644,129 @@ class TestB5NoGo:
         )
         assert pending[0].level == 2
         assert await store.get_status('gate-b5') == 'blocked'
+
+
+# ---------------------------------------------------------------------------
+# B11 — restart-window replay: stamps/L2 survive orchestrator restart (step-7)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestB11RestartReplay:
+    """B11: after an orchestrator restart, a blocked gate stays quiescent.
+
+    Two variants:
+    (a) Pure gate — reach B2 blocked state, build a FRESH Harness over the
+        SAME queue_dir and SAME _StoreScheduler, re-dispatch.  Runner section 1
+        sees gate_escalated_at + pending L2 → BLOCKED without re-escalating.
+    (b) Deploy — a deploy task with before_done_ran_at pre-stamped and a pending
+        infra_issue L2 (crash mid-deploy before verify).  On re-dispatch via a
+        fresh DeterministicRunner with injected seams, runner section 2 sees
+        before_done_ran_at + pending L2 → BLOCKED (I1: script_runner not called).
+    """
+
+    async def test_pure_gate_restart_quiescent(
+        self, tmp_path: Path, mock_orch_config,
+    ) -> None:
+        """Pure gate: restart with same store+queue → quiescent BLOCKED, 1 pending L2."""
+        store = _StoreScheduler()
+        queue_dir = tmp_path / 'queue'
+        h1 = _build_harness(mock_orch_config, queue_dir, store)
+
+        task = _gate_task(task_id='gate-b11', title='B11 restart gate')
+        store.seed(task)
+        report1 = await _dispatch(h1, 'gate-b11')
+        assert report1.outcome == WorkflowOutcome.BLOCKED
+
+        # Verify B2 preconditions
+        gate = await store.get_task('gate-b11')
+        assert gate is not None
+        assert gate['metadata'].get('gate_escalated_at') is not None
+        q = EscalationQueue(queue_dir)
+        assert len(q.get_by_task('gate-b11', status='pending')) == 1
+
+        # Simulate orchestrator restart: fresh Harness, SAME queue_dir + SAME store
+        h2 = _build_harness(mock_orch_config, queue_dir, store)
+        report2 = await _dispatch(h2, 'gate-b11')
+
+        # Section 1 quiescence: gate_escalated_at set + pending L2 → BLOCKED
+        assert report2.outcome == WorkflowOutcome.BLOCKED
+        assert report2.block_reason == 'deterministic_gate'
+
+        # gate_escalated_at STILL persisted (not cleared by quiescence)
+        gate2 = await store.get_task('gate-b11')
+        assert gate2 is not None
+        assert gate2['metadata'].get('gate_escalated_at') is not None
+
+        # STILL exactly one pending L2 (no second escalation filed)
+        q2 = EscalationQueue(queue_dir)
+        pending = q2.get_by_task('gate-b11', status='pending')
+        assert len(pending) == 1
+
+    async def test_deploy_restart_no_rerun_quiescent(
+        self, tmp_path: Path,
+    ) -> None:
+        """Deploy (I1): restart with before_done_ran_at + pending L2 → no rerun, BLOCKED.
+
+        Simulates a crash mid-deploy: before_done_ran_at stamped but neither
+        before_done_verified_at nor a resolved escalation exists.  A pending
+        infra_issue L2 was left in the queue.  On rehydrate re-dispatch the
+        script_runner must NOT be called a second time (I1 once-only).
+        """
+        task_id = 'deploy-b11'
+        store = _StoreScheduler()
+        queue_dir = tmp_path / 'queue2'
+        before_done = {
+            'script': '/tmp/deploy.sh',
+            'args': [],
+            'env': {},
+            'cwd': '/tmp',
+            'timeout_secs': 30,
+            'target_unit': 'orchestrator-reify.service',
+        }
+        task = {
+            'id': task_id,
+            'title': 'B11 deploy restart',
+            'description': 'Deploy before restart test',
+            'status': 'blocked',
+            'metadata': {
+                'task_kind': 'deterministic',
+                'always_escalates': False,
+                'before_done': before_done,
+                'before_done_ran_at': '2026-01-01T00:00:00+00:00',
+            },
+        }
+        store.seed(task)
+
+        # Submit a pending infra_issue L2 (left by the prior (crashed) dispatch)
+        queue = EscalationQueue(queue_dir)
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-deterministic',
+            severity='critical',
+            category='infra_issue',
+            summary='Deploy failed: orchestrator-reify.service',
+            level=2,
+        )
+        queue.submit(esc)
+        assert len(queue.get_by_task(task_id, status='pending')) == 1
+
+        # Build runner directly with injected seams (no real systemd)
+        script_runner = AsyncMock(name='script_runner')
+        task_dict = await store.get_task(task_id)
+        assignment = _make_assignment(task_dict)
+        runner = DeterministicRunner(
+            scheduler=store,
+            escalation_queue=queue,
+            script_runner=script_runner,
+        )
+
+        outcome = await runner.run(assignment)
+
+        # I1: script_runner must NOT have been called (before_done_ran_at stamped + pending L2)
+        script_runner.assert_not_awaited()
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # Queue STILL has exactly ONE pending L2 (no second escalation filed)
+        remaining = queue.get_by_task(task_id, status='pending')
+        assert len(remaining) == 1
