@@ -1034,17 +1034,19 @@ async def _probe_live_one(
         )
     except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
         logger.debug('get_merge_queue failed for %s: %s', base_url, exc)
-        return {'entries': [], 'reachable': False, 'error': str(exc)}
+        return {'entries': [], 'reachable': False, 'error': str(exc), 'metrics': None}
     # Guard against unexpected non-dict results (e.g. a list)
     if not isinstance(result, dict):
-        return {'entries': [], 'reachable': False, 'error': 'unexpected result type'}
+        return {'entries': [], 'reachable': False, 'error': 'unexpected result type', 'metrics': None}
     # Orchestrator/worker not running → result dict has an 'error' key
     if 'error' in result:
-        return {'entries': [], 'reachable': False, 'error': result['error']}
+        return {'entries': [], 'reachable': False, 'error': result['error'], 'metrics': None}
     raw_entries = result.get('entries') or []
     return {
         'entries': [_normalize_entry(e) for e in raw_entries],
         'reachable': True,
+        # ι=1894: carry through the live metrics emitted by SpeculativeMergeWorker
+        'metrics': result.get('metrics'),
     }
 
 
