@@ -5986,6 +5986,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
+    def _warn_if_verify_base_not_frozen_tip(
+        self,
+        item: SpeculativeItem,
+        main_sha: str,
+    ) -> None:
+        """Log a WARNING when a real-verify dispatch base is not the frozen tip (ε=1890).
+
+        §5.3 invariant: a verify may only start against a base that is the tip
+        of the frozen prefix.  This guard detects "verify against a
+        speculative-only base" and surfaces it as a WARNING for observability
+        (λ integration gate / production debugging) WITHOUT changing control
+        flow, raising, or mutating any state.
+
+        Called from _dispatch_item immediately before launching the real-verify
+        task.  main_sha must be the caller's already-fetched get_main_sha()
+        result (fail-open: the guard is skipped entirely on get_main_sha error,
+        so this method is never reached with a stale/empty sha argument).
+
+        Entries with no merge_result (passthrough/conflict) are excluded:
+        they carry no merge_commit and are not part of the frozen prefix.
+
+        Pure/synchronous (no await).  Returns None in all cases.
+        """
+        if item.merge_result is None or not item.base_sha:
+            return  # passthrough / conflict — not a real-verify candidate
+        expected_tip = self.frozen_prefix_tip(main_sha)
+        if item.base_sha.strip() == expected_tip.strip():
+            return  # invariant holds
+        logger.warning(
+            'ε=1890 §5.3 guard: task %s (rid=%s) dispatched for real-verify '
+            'against a base (%r) that is NOT the frozen-prefix tip (%r); '
+            'verify_depth=%d.  This may indicate a verify against a '
+            'speculative-only base.  Control flow is unchanged (log-only guard).',
+            item.request.task_id,
+            item.request.request_id,
+            item.base_sha,
+            expected_tip,
+            len(self.frozen_prefix()),
+        )
+
     async def recompute_suffix_conflict_graph(self) -> None:
         """Recompute and store the conflict-graph over the unfrozen suffix (task δ=1889).
 
@@ -6171,8 +6211,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # ── 7. Probe each suffix item vs main_sha (conflicts_with_main marker) ──
         # This is the δ user-signal: "a new submission that conflicts with main
-        # is marked."  Base = current main_sha (ε later generalises to the
-        # frozen-prefix tip; δ uses bare main per design decision §δ.5).
+        # is marked."  Base = current main_sha.  δ uses bare main per design
+        # decision §δ.5; ε (this task) provides frozen_prefix_tip() as the
+        # seam — η (consumer task) repoints the conflicts_with_main probe base
+        # to frozen_prefix_tip() so the probe correctly targets the frozen tip
+        # rather than raw main when the frozen prefix is non-empty.
         # Reuses the same _probe_cache by (frozenset({main_sha, head})) key so
         # if any textual-edge probe already ran main_sha vs head, the result
         # is returned from cache rather than forking another subprocess.
@@ -9861,6 +9904,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # is single-threaded and _dispatch_item is the only acquirer).
             # Return None defensively so the caller puts the item back.
             return None
+
+        # ── ε=1890 log-only §5.3 guard: verify base must be frozen-prefix tip ──
+        # Fail-open: fetch main_sha in a try/except so a transient git error
+        # never blocks verify dispatch.  The guard is purely observational —
+        # it never changes control flow.  NOT wired into _verify_and_advance
+        # (the compat shim used by direct-call tests) to keep shim tests green.
+        try:
+            _guard_main_sha = await self._git_ops.get_main_sha()
+            self._warn_if_verify_base_not_frozen_tip(item, _guard_main_sha)
+        except Exception:
+            pass  # fail-open: skip the check on any git error
 
         # ── Launch background verify task ────────────────────────────────────
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
