@@ -17,23 +17,13 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Lever C — simple-task classifier
+# Lever C — author-declared simple-task trigger + contradiction veto
 # ---------------------------------------------------------------------------
 
-# Permissive title patterns: doc/comment/rename/typo/small-refactor.  The
-# auto-eval daily budget naturally caps the cost of misclassification so we
-# bias toward more rollout coverage.
-_SIMPLE_TASK_TITLE_RE = re.compile(
-    r'^\s*('
-    r'document|comment|docstring|rename|fix\s+typo|tighten|clarify|inline|'
-    r'extract|add\s+note|update\s+comment|cleanup|small\s+refactor|'
-    r'simplify|deduplicate'
-    r')\b',
-    re.IGNORECASE,
-)
-
 # Hard blockers in the description body — features, migrations, integration
-# tests, architectural changes — disqualify the task from the simple path.
+# tests, architectural changes — veto the simple path even if the author
+# declared complexity='simple'.  Token set is intentionally unchanged; tune
+# later from observed false vetoes.
 _SIMPLE_TASK_HARD_BLOCKERS_RE = re.compile(
     r'\b('
     r'architecture|migration|integration\s+test|design\s+.*\bnew\b|'
@@ -43,34 +33,39 @@ _SIMPLE_TASK_HARD_BLOCKERS_RE = re.compile(
 )
 
 
-def classify_simple_task(task: dict) -> bool:
-    """Return True iff the task matches the SIMPLE_TASK gate.
+def has_simple_task_blocker(description: str) -> bool:
+    """Return True iff *description* contains a hard-blocker contradiction token.
 
-    Permissive criteria so a SIMPLE_TASK rollout reaches a wide cohort.
-    Auto-eval comparisons against full-architect baselines provide ground
-    truth on misclassifications and let us tighten thresholds later.
+    This is the dispatch VETO — an author may declare ``complexity='simple'``
+    but then describe a migration, integration-test run, new feature, or
+    architectural change.  When True, ``is_declared_simple_task`` returns
+    False and the task follows the full architect path regardless of the
+    metadata field.  It is NOT a classifier; it is purely the contradiction
+    guard.
+    """
+    return bool(_SIMPLE_TASK_HARD_BLOCKERS_RE.search(description))
 
-    Gate (all must hold):
-    - ``len(metadata.files) <= 2``
-    - title matches one of the simple-task verbs
-    - description contains no hard-blocker tokens
-    - priority is not ``high``
+
+def is_declared_simple_task(task: dict) -> bool:
+    """Return True iff the task's author declared it as a simple task.
+
+    The simple path is taken iff:
+    - ``task['metadata']['complexity'] == 'simple'`` (author opt-in), AND
+    - the task description contains no hard-blocker contradiction token.
+
+    Priority and file count are intentionally NOT consulted — a task may be
+    high-priority or span several files/modules and still follow the simple
+    path as long as the *change* is mechanically simple.
+
+    The outer dispatch conditions (``simple_task_enabled``,
+    ``not initial_plan``, ``not auto_eval_redo``, ``not force_full_path``)
+    are checked at the workflow gate, not here.
     """
     metadata = task.get('metadata') or {}
-    files = metadata.get('files') or []
-    if not isinstance(files, list) or len(files) > 2:
+    if metadata.get('complexity') != 'simple':
         return False
-
-    title = str(task.get('title') or '')
-    if not _SIMPLE_TASK_TITLE_RE.match(title):
-        return False
-
     description = str(task.get('description') or '')
-    if _SIMPLE_TASK_HARD_BLOCKERS_RE.search(description):
-        return False
-
-    priority = str(task.get('priority') or '').lower()
-    return priority != 'high'
+    return not has_simple_task_blocker(description)
 
 
 def sha256_16(data: str) -> str:
