@@ -893,3 +893,116 @@ class TestB11RestartReplay:
         # Queue STILL has exactly ONE pending L2 (no second escalation filed)
         remaining = queue.get_by_task(task_id, status='pending')
         assert len(remaining) == 1
+
+
+# ---------------------------------------------------------------------------
+# B6 — cross-unit deploy success (step-9)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestB6CrossUnitDeploy:
+    """B6: cross-unit deploy — script runs, fresh PID verified, task driven to done.
+
+    Constructs the real DeterministicRunner directly with injected systemd seams
+    (own_unit_resolver, unit_inspector, script_runner).  The only fake is the
+    systemd edge — scheduler and EscalationQueue are real.
+    """
+
+    def _setup(self, tmp_path: Path):
+        """Build shared test objects: store, queue, task."""
+        store = _StoreScheduler()
+        queue = EscalationQueue(tmp_path / 'queue')
+        task = _deploy_task(task_id='deploy-b6', target_unit='orchestrator-reify.service')
+        store.seed(task)
+        return store, queue, task
+
+    async def test_b6_script_runner_called_once(self, tmp_path: Path) -> None:
+        """script_runner is awaited exactly once (run-once guarantee)."""
+        store, queue, task = self._setup(tmp_path)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'DIFFERENT-unit.service',
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        assignment = _make_assignment(task)
+        await runner.run(assignment)
+        script_runner.assert_awaited_once()
+
+    async def test_b6_store_status_done(self, tmp_path: Path) -> None:
+        """Store latest status is 'done' after successful cross-unit deploy."""
+        store, queue, task = self._setup(tmp_path)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'other-unit.service',
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        assignment = _make_assignment(task)
+        await runner.run(assignment)
+        assert await store.get_status('deploy-b6') == 'done'
+
+    async def test_b6_done_provenance_kind(self, tmp_path: Path) -> None:
+        """done_provenance.kind == 'deterministic-deploy'."""
+        store, queue, task = self._setup(tmp_path)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'other-unit.service',
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        assignment = _make_assignment(task)
+        await runner.run(assignment)
+        retrieved = await store.get_task('deploy-b6')
+        provenance = retrieved['metadata'].get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy'
+
+    async def test_b6_done_provenance_fresh_pid(self, tmp_path: Path) -> None:
+        """done_provenance.pid == fresh MainPID (non-sentinel, strictly > baseline)."""
+        store, queue, task = self._setup(tmp_path)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'other-unit.service',
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        assignment = _make_assignment(task)
+        await runner.run(assignment)
+        retrieved = await store.get_task('deploy-b6')
+        provenance = retrieved['metadata'].get('done_provenance', {})
+        assert provenance.get('pid') == _FRESH_UNIT_STATE['MainPID'], (
+            f"Expected fresh PID {_FRESH_UNIT_STATE['MainPID']}, "
+            f"got {provenance.get('pid')}"
+        )
+        # Strictly greater than baseline PID (fresh-PID proof)
+        assert provenance.get('pid') > _BASELINE_UNIT_STATE['MainPID']
+
+    async def test_b6_before_done_ran_at_stamped(self, tmp_path: Path) -> None:
+        """before_done_ran_at and before_done_verified_at are stamped after success."""
+        store, queue, task = self._setup(tmp_path)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'other-unit.service',
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        assignment = _make_assignment(task)
+        await runner.run(assignment)
+        retrieved = await store.get_task('deploy-b6')
+        meta = retrieved['metadata']
+        assert meta.get('before_done_ran_at') is not None, (
+            'before_done_ran_at must be stamped after deploy'
+        )
+        assert meta.get('before_done_verified_at') is not None, (
+            'before_done_verified_at must be stamped after fresh-PID verification'
+        )
