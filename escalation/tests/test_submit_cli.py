@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from escalation import submit
-from escalation.models import BORN_AT_L2_SEVERITIES
 from escalation.queue import EscalationQueue
 
 
