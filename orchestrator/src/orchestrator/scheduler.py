@@ -2852,6 +2852,30 @@ class Scheduler:
                 data={'new_order': new_order},
             )
 
+    def _owner_is_live_dispatchable(
+        self,
+        task_id: str,
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, Any],
+    ) -> bool:
+        """Return True iff *task_id* is a live, dispatchable task.
+
+        Logical INVERSE of the _park_gc reclaimability predicate
+        (scheduler.py:2996-3002): an owner is live-dispatchable iff
+        its status is not terminal AND it is present in tasks_by_id AND
+        all its deps are satisfied.
+
+        Used by the D4 guard in _drain_park_eviction_requests to refuse
+        force_clear on an owner the scheduler still considers legitimately
+        held — preventing re-introduction of the df-1865 destructive-eviction
+        starvation.
+        """
+        if status_map.get(task_id) in TERMINAL_STATUSES:
+            return False
+        if task_id not in tasks_by_id:
+            return False
+        return self._deps_satisfied(tasks_by_id[task_id], status_map, tasks_by_id)
+
     def _drain_park_eviction_requests(
         self,
         status_map: dict[str, str],
@@ -2863,15 +2887,27 @@ class Scheduler:
         so the operator audit event (reservation_force_evicted) wins over
         park-GC's reservation_expired for the same dead owner.
 
-        For each drained task_id:
-          - force_clear + emit events (unguarded in step-6; D4 guard added in step-8)
-          - pop _skip_count
+        D4 guard: if the owner is still a live dispatchable task, the row is
+        consumed (one-shot) but force_clear is NOT applied — a
+        reservation_force_evict_refused event is emitted instead.
+
+        For each drained task_id (dead owner):
+          - force_clear + pop _skip_count
           - emit reservation_force_evicted when modules is non-empty
           - emit reservation_restored for each newly-exposed shadow
         """
         if not self._park_eviction_store:
             return
         for task_id in self._park_eviction_store.drain(self._project_root):
+            # D4 guard: refuse eviction of a live, dispatchable owner.
+            if self._owner_is_live_dispatchable(task_id, status_map, tasks_by_id):
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.reservation_force_evict_refused,
+                        task_id=task_id,
+                        data={'reason': 'live_owner'},
+                    )
+                continue
             modules, restored = self.lock_table.force_clear(task_id)
             self._skip_count.pop(task_id, None)
             if modules and self.event_store:
