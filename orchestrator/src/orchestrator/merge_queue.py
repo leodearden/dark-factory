@@ -5905,6 +5905,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             rids.extend(req.request_id for req in self._lane_buffers[lane])
         return tuple(rids)
 
+    def _newest_frozen_commit(self) -> str | None:
+        """Return the newest frozen entry's merge_commit, or None (ε=1890).
+
+        Iterates _frozen_inflight_entries() in reverse (newest first) and
+        returns the first non-None merge_commit found.  Entries with no
+        merge_result (passthroughs) are skipped.
+
+        Pure/synchronous.
+        """
+        for entry in reversed(self._frozen_inflight_entries()):
+            mr = entry.item.merge_result
+            if mr is not None and mr.merge_commit:
+                return mr.merge_commit.strip()
+        return None
+
+    def frozen_prefix_tip(self, main_sha: str) -> str:
+        """Return the base SHA that η should stack bounce/verify onto (ε=1890).
+
+        Returns the newest frozen item's merge_commit (the tip of the frozen
+        speculative stack) when the frozen prefix is non-empty, or main_sha
+        when the frozen prefix is empty (tip == main when no item is verifying).
+
+        Pure/synchronous (takes main_sha as a parameter to stay await-free,
+        mirroring _pop_next_pickable's "Pure/synchronous" pattern so callers
+        such as snapshot() and unit tests work without an event loop).
+        """
+        tip = self._newest_frozen_commit()
+        return tip if tip is not None else main_sha
+
     async def recompute_suffix_conflict_graph(self) -> None:
         """Recompute and store the conflict-graph over the unfrozen suffix (task δ=1889).
 
