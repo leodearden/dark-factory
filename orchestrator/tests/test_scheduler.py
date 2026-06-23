@@ -10038,7 +10038,10 @@ class TestGetModulesAlphaDirectoryStrip:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        # lock_depth=2 is pinned explicitly: the default may be overridden by a
+        # config.yaml or env var in this environment, and test assertions in this
+        # class are depth-sensitive (file-path normalization collapses at depth=1).
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         return Scheduler(config)
 
     def test_directory_only_files_returns_task_fallback(self, scheduler: Scheduler):
@@ -10067,15 +10070,26 @@ class TestGetModulesAlphaDirectoryStrip:
         assert len(result) > 0, f'Expected at least one module from file sibling, got: {result}'
 
     def test_no_derived_module_equals_stripped_directory(self, scheduler: Scheduler):
-        """No derived module may equal a stripped directory entry."""
+        """Directory entry stripped; file sibling normalizes to its own lock key.
+
+        At lock_depth=2 (pinned in fixture): 'backend/app.py' normalizes to
+        'backend/app.py' (two path components), NOT to bare 'backend' — so the
+        stripped directory name does not collide with any derived module.
+
+        Note: the property "no derived module equals a stripped directory" is
+        NOT depth-invariant.  At depth=1 'backend/app.py' → 'backend', which
+        would equal the stripped directory.  This test pins depth=2 via the
+        class fixture and asserts the precise expected module list, not just
+        substring absence.
+        """
         task = {
             'id': 'S',
             'metadata': {'files': ['backend', 'backend/app.py']},
         }
         result = scheduler._get_modules(task)
-        # 'backend' is a directory entry and must not appear unchanged as a module.
-        assert 'backend' not in result, (
-            f'Bare directory "backend" must not survive into derived modules: {result}'
+        # At depth=2 the file derives ['backend/app.py'], not ['backend'].
+        assert result == ['backend/app.py'], (
+            f'Expected ["backend/app.py"] (depth=2 module), got: {result}'
         )
 
 
