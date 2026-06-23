@@ -66,6 +66,7 @@ def mcp_server(memory_service, task_interceptor):
 _EMPTY_SKELETON = {
     'skip_counts': {},
     'parks': {},
+    'park_stacks': {},
     'effective_priorities': {},
     'pin_queue': [],
     'overrides': {},
@@ -148,6 +149,96 @@ class TestGetSchedulerStateTool:
             f'Expected ValidationError, got {result!r}'
         )
         assert 'error' in result
+
+    def test_read_scheduler_state_empty_skeleton_includes_park_stacks(
+        self, tmp_path
+    ):
+        """read_scheduler_state returns park_stacks == {} when no snapshot file exists.
+
+        RED driver for the _empty_skeleton() gap: before the fix, park_stacks is
+        absent from the skeleton dict and this assertion fails with KeyError.
+        """
+        result = read_scheduler_state(tmp_path)
+        assert result['park_stacks'] == {}, (
+            f"Expected park_stacks == {{}} in file-absent skeleton, got {result.get('park_stacks')!r}"
+        )
+
+    def test_read_scheduler_state_passes_park_stacks_through(self, tmp_path):
+        """read_scheduler_state returns park_stacks verbatim from a snapshot on disk.
+
+        GREEN-from-start regression guard: the file-present path is a verbatim
+        json.loads pass-through; this test locks that contract so a future
+        key-whitelist or schema-coercion step cannot silently strip park_stacks.
+
+        park_stacks shape per scheduler.py:3461 — full LIFO bottom→top:
+          {module: [{owner, rank, shadowed, installed_at}, ...]}
+        """
+        park_stacks_fixture = {
+            'mod/a': [
+                {'owner': 'L', 'rank': 5, 'shadowed': True,
+                 'installed_at': '2026-06-01T00:00:00+00:00'},
+                {'owner': 'H', 'rank': 9, 'shadowed': False,
+                 'installed_at': '2026-06-01T00:00:00+00:00'},
+            ],
+        }
+        synthetic = {
+            'skip_counts': {},
+            'parks': {},
+            'park_stacks': park_stacks_fixture,
+            'effective_priorities': {},
+            'pin_queue': [],
+            'overrides': {},
+            'current_holders': {},
+            'is_paused': False,
+            'pause_reason': None,
+            'snapshot_at': '2026-06-01T12:00:00+00:00',
+        }
+        _write_snapshot(tmp_path, synthetic)
+
+        result = read_scheduler_state(tmp_path)
+        assert result['park_stacks'] == park_stacks_fixture, (
+            f'Expected park_stacks to be returned verbatim, got {result["park_stacks"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_scheduler_state_surfaces_park_stacks(
+        self, tmp_path, mcp_server
+    ):
+        """get_scheduler_state MCP tool surfaces park_stacks from a snapshot on disk.
+
+        GREEN-from-start end-to-end regression guard: verifies the full chain
+        (json.loads → asyncio.to_thread → MCP tool) does not drop park_stacks.
+        Catches a future whitelist/filter at any layer in the stack.
+        """
+        park_stacks_fixture = {
+            'mod/a': [
+                {'owner': 'L', 'rank': 5, 'shadowed': True,
+                 'installed_at': '2026-06-01T00:00:00+00:00'},
+                {'owner': 'H', 'rank': 9, 'shadowed': False,
+                 'installed_at': '2026-06-01T00:00:00+00:00'},
+            ],
+        }
+        synthetic = {
+            'skip_counts': {},
+            'parks': {},
+            'park_stacks': park_stacks_fixture,
+            'effective_priorities': {},
+            'pin_queue': [],
+            'overrides': {},
+            'current_holders': {},
+            'is_paused': False,
+            'pause_reason': None,
+            'snapshot_at': '2026-06-01T12:00:00+00:00',
+        }
+        _write_snapshot(tmp_path, synthetic)
+
+        result = await mcp_server._tool_manager.call_tool(
+            'get_scheduler_state',
+            {'project_root': str(tmp_path)},
+        )
+        assert result['park_stacks'] == park_stacks_fixture, (
+            f'Expected park_stacks surfaced end-to-end, got {result.get("park_stacks")!r}'
+        )
 
 
 # ===========================================================================
