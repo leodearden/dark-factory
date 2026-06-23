@@ -9572,3 +9572,123 @@ class TestDrainBuriedOwnerRestoredEvents:
         assert len(restored) == 1
         assert restored[0][1]['task_id'] == 'L2'
         assert 'm2' in restored[0][1]['data']['modules']
+
+
+# ---- Starvation watchdog (task 1880) ----
+
+
+class TestStarvationWatchdog:
+    """Tests for Scheduler._apply_starvation_watchdog and dispatch-site resolve.
+
+    The watchdog fires an INFO escalation when a dispatch-eligible task
+    keeps being skipped as the TOP-scored candidate past BOTH skip_threshold
+    AND idle_secs.  It self-resolves when the task dispatches.
+    """
+
+    def _make_scheduler(
+        self,
+        *,
+        skip_threshold: int = 3,
+        idle_secs: float = 100.0,
+        enabled: bool = True,
+    ) -> tuple['Scheduler', list]:
+        """Build a Scheduler with watchdog config tuned small and a mutable clock."""
+        t: list[float] = [0.0]
+
+        def fake_clock() -> float:
+            return t[0]
+
+        config = OrchestratorConfig(
+            max_per_module=1,
+            starvation_watchdog={
+                'enabled': enabled,
+                'skip_threshold': skip_threshold,
+                'idle_secs': idle_secs,
+            },
+        )
+        # Prevent fairness parks from installing before the watchdog threshold
+        # is reached (the watchdog skip_threshold=3 is deliberately smaller
+        # than the test's default fairness skip_threshold per tier so we can
+        # isolate the watchdog logic cleanly).
+        config.fairness.skip_threshold = 9999
+        scheduler = Scheduler(config, time_source=fake_clock)
+        return scheduler, t
+
+    @staticmethod
+    def _starved_task(tid: str = 'starved') -> dict:
+        return {
+            'id': tid,
+            'title': f'Starved task {tid}',
+            'status': 'pending',
+            'priority': 'medium',
+            'dependencies': [],
+            'metadata': {'files': ['backend']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_positive_fires_once_after_both_thresholds(self):
+        """Watchdog fires exactly once when skip_count >= threshold AND clock >= idle_secs.
+
+        Positive firing path:
+        - Drive 3 acquire_next ticks (skip_count bumps to 3 via loop-exhausted path).
+        - Advance clock to 150s (>= idle_secs=100).
+        - One more tick → _on_starvation_warn called exactly once, with task_id='starved'
+          and summary containing the stable 'STARVATION_WATCHDOG' marker.
+        - Additional ticks do NOT re-fire (dedup / no re-arm spam).
+        - 'starved' is in scheduler._starvation_escalated.
+        """
+        scheduler, t = self._make_scheduler()
+        callback = AsyncMock()
+        scheduler._on_starvation_warn = callback
+
+        # Seed a held lock on a dispatched 'seed' task so 'starved' can never
+        # acquire its module (loop-exhausted path → skip_count bumped each tick).
+        scheduler.lock_table.try_acquire('seed', ['backend'])
+        scheduler._dispatched.add('seed')
+
+        task = self._starved_task()
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # Drive 3 ticks to accumulate skip_count >= skip_threshold (3).
+        # Clock stays at 0 during these ticks.
+        for _ in range(3):
+            result = await scheduler.acquire_next()
+            assert result is None, 'Expected no dispatch while seed holds the lock'
+
+        assert scheduler._skip_count.get('starved', 0) >= 3, (
+            f'Expected skip_count >= 3 after 3 loop-exhausted ticks; '
+            f'got {scheduler._skip_count!r}'
+        )
+
+        # Advance clock past idle_secs (100s) and tick once more.
+        t[0] = 150.0
+        await scheduler.acquire_next()
+
+        # Both thresholds are now crossed → callback must fire exactly once.
+        callback.assert_called_once()
+        call_args = callback.call_args
+        args = call_args.args if call_args.args else ()
+        kwargs = call_args.kwargs if call_args.kwargs else {}
+
+        # task_id must be 'starved'.
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == 'starved', (
+            f'Expected task_id="starved"; got {task_id_arg!r}'
+        )
+
+        # summary must carry the stable STARVATION_WATCHDOG marker.
+        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
+        assert 'STARVATION_WATCHDOG' in str(summary_arg), (
+            f'Expected STARVATION_WATCHDOG in summary; got {summary_arg!r}'
+        )
+
+        # Further ticks must NOT re-fire the callback (dedup guard).
+        for _ in range(5):
+            await scheduler.acquire_next()
+
+        callback.assert_called_once()  # still exactly once
+
+        # 'starved' must be in _starvation_escalated after the first fire.
+        assert 'starved' in scheduler._starvation_escalated, (
+            '_starvation_escalated must contain task_id after the watchdog fires'
+        )
