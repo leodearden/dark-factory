@@ -2777,3 +2777,59 @@ class TestArchiveListingMemoisation:
         assert result_after_prune is None, (
             f'Expected None after pruning but got {result_after_prune!r}'
         )
+
+
+class TestMakeIdMaxSeqCache:
+    """make_id() must memoise the archive max_seq per task_id to avoid repeated scans."""
+
+    def _seed_archive_file(self, queue_dir: Path, esc_id: str, task_id: str, date: str) -> None:
+        """Write a resolved escalation directly into the archive (bypasses queue)."""
+        archive_dir = queue_dir / 'archive' / date
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        esc = _make_escalation(esc_id, task_id=task_id, status='resolved')
+        (archive_dir / f'{esc_id}.json').write_text(esc.to_json())
+
+    def test_archive_scanned_at_most_once_per_task_id(self, tmp_path: Path):
+        """make_id() scans the archive at most once per distinct task_id per instance.
+
+        Pre-seed archive: esc-42-5.json (task '42'), esc-99-2.json (task '99').
+        Fresh instance. Spy _iter_archive_paths (wraps).
+        Call make_id('42'), make_id('42'), make_id('99').
+        (a) both make_id('42') return 'esc-42-6' (archive max=5, root empty).
+        (b) make_id('99') returns 'esc-99-3'.
+        (c) spy.call_count <= 2 across all three calls (one scan per distinct task_id).
+
+        RED on main: make_id scans archive on every call → call_count == 3 → fails (c).
+        Note: the SECOND make_id('42') must ALSO return 'esc-42-6' because the first
+        call incremented _seq (via _next_seq), so max(archive_max+1=6, _next_seq()=2)=6.
+        """
+        queue_dir = tmp_path / 'queue'
+
+        # Pre-seed the archive with two files for different task ids.
+        self._seed_archive_file(queue_dir, 'esc-42-5', '42', '2025-06-10')
+        self._seed_archive_file(queue_dir, 'esc-99-2', '99', '2025-06-10')
+
+        # Fresh instance: cache unbuilt.
+        queue = EscalationQueue(queue_dir)
+
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            id1 = queue.make_id('42')
+            id2 = queue.make_id('42')
+            id3 = queue.make_id('99')
+
+        # (a) Both make_id('42') calls must return esc-42-6.
+        assert id1 == 'esc-42-6', f'First make_id("42") expected esc-42-6, got {id1!r}'
+        assert id2 == 'esc-42-6', (
+            f'Second make_id("42") expected esc-42-6 (cache hit), got {id2!r}'
+        )
+
+        # (b) make_id('99') must return esc-99-3.
+        assert id3 == 'esc-99-3', f'make_id("99") expected esc-99-3, got {id3!r}'
+
+        # (c) Archive scanned at most once per distinct task_id (2 total).
+        assert spy.call_count <= 2, (
+            f'Expected archive scanned <=2x (once per task_id) but '
+            f'_iter_archive_paths called {spy.call_count}x across three make_id() calls'
+        )
