@@ -8,13 +8,21 @@ tasks whose module footprint overlaps a candidate.
 Directory/file path classifier (α/γ shared predicate)
 ------------------------------------------------------
 ``CODE_EXTENSIONS``, ``is_file_path``, ``directory_locks``, and
-``strip_directory_locks`` live here so both the orchestrator scheduler (α
-enforcement point) and the fused-memory lock-charter guard (γ enforcement
-point) share ONE classifier — eliminating α/γ drift by construction.
+``strip_directory_locks`` live here so the orchestrator scheduler (α
+enforcement point) can import them without a ``fused_memory`` dependency
+(the orchestrator must not import fused_memory; see
+``agents/triage.py:78-95``).
 
-``lock_charter_guard.py`` re-exports these names unchanged so its public API
-and tests (``server/tools.py``, ``tests/test_lock_charter_guard.py``) remain
-green without modification.
+``lock_charter_guard.py`` keeps **verbatim duplicate definitions** of these
+names so it remains self-contained in the fused-memory virtual environment
+(the editable shared package in ``.venv`` may be pinned to a release that
+predates this relocation).  The two copies are **not** connected by a
+re-export; drift between them is caught by explicit equality tests:
+
+- ``shared/tests/test_locking.py::TestCodeExtensionsDriftGuard``
+  (pins this copy)
+- ``fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard``
+  (pins the lock_charter_guard.py copy)
 """
 
 from __future__ import annotations
@@ -33,9 +41,10 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# Canonical extension allowlist — single source of truth for α and γ.
+# Canonical extension allowlist — authoritative Python copy for the α enforcement point.
 # Copied verbatim from reify's scripts/lock-charter-guard.sh _EXTS (reify:4676).
-# α/γ drift guard: fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
+# Drift guard (this shared copy): shared/tests/test_locking.py::TestCodeExtensionsDriftGuard
+# Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
 # ---------------------------------------------------------------------------
 
 CODE_EXTENSIONS: frozenset[str] = frozenset({

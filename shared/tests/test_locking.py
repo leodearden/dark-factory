@@ -13,6 +13,26 @@ from shared.locking import (
     strip_directory_locks,
 )
 
+# ---------------------------------------------------------------------------
+# Drift guard — pins shared.locking.CODE_EXTENSIONS to the canonical vector.
+#
+# Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the allowlist
+# changes.  Also update the verbatim copy in
+# fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND its
+# corresponding _CANONICAL_EXTENSIONS in
+# fused-memory/tests/test_lock_charter_guard.py.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_EXTENSIONS = [
+    'c', 'cc', 'cjs', 'cpp', 'css', 'cts', 'cxx', 'gcode',
+    'h', 'hh', 'hpp', 'html',
+    'js', 'json', 'jsonc', 'jsx',
+    'lock', 'md', 'mjs', 'mts', 'png', 'py',
+    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'toml', 'ts', 'tsx', 'txt',
+    'yaml', 'yml',
+]
+
 
 class TestNormalizeLock:
     def test_default_depth_is_two(self):
@@ -193,3 +213,29 @@ class TestStripDirectoryLocks:
     def test_skips_empty_and_whitespace(self):
         files = ['', '   ', 'src/foo.py']
         assert strip_directory_locks(files) == ['src/foo.py']
+
+
+class TestCodeExtensionsDriftGuard:
+    """Pin shared.locking.CODE_EXTENSIONS to the canonical extension vector.
+
+    This is the α-copy drift guard for the shared.locking canonical source.
+    The corresponding γ-copy guard lives in
+    fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
+    and uses the same ``_CANONICAL_EXTENSIONS`` vector.  Both must be updated
+    together whenever the allowlist changes.
+    """
+
+    def test_extension_drift_guard(self):
+        """sorted(CODE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
+
+        Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the
+        allowlist changes.  Also update the verbatim copy in
+        lock_charter_guard.py and its _CANONICAL_EXTENSIONS list.
+        """
+        assert sorted(CODE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
+            f'shared.locking.CODE_EXTENSIONS has drifted from the canonical vector.\n'
+            f'  canonical : {_CANONICAL_EXTENSIONS!r}\n'
+            f'  actual    : {sorted(CODE_EXTENSIONS)!r}\n'
+            f'Update CODE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
+            f'lock_charter_guard.py.'
+        )

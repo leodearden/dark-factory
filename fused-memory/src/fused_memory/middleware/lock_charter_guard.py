@@ -32,16 +32,23 @@ Extension allowlist rationale (reify PRD §11 Q2):
 ## Predicate canonical location
 
 The α/γ shared predicate (``CODE_EXTENSIONS``, ``is_file_path``,
-``directory_locks``) is now canonical in ``shared.locking`` so that
+``directory_locks``) is canonical in ``shared.locking`` so that
 ``orchestrator.scheduler`` (α) can import it without a
 ``fused_memory`` → ``orchestrator`` cross-package edge (no-cross-package-edge
 convention documented at ``agents/triage.py:78-95``; orchestrator's pyright
 ``extraPaths`` does not include ``../fused-memory/src``).
 
-The definitions are kept here verbatim so this module remains self-contained
-in the fused-memory virtual environment (the editable shared package
-installed in .venv may be pinned to a release that predates the relocation).
-The drift-guard test (``test_extension_drift_guard``) catches any divergence.
+The definitions are **duplicated here verbatim** (not re-exported from
+``shared.locking``) so this module remains self-contained in the fused-memory
+virtual environment (the editable shared package installed in ``.venv`` may be
+pinned to a release that predates the relocation).  These two copies are
+**not** linked by a re-export.  Drift is caught by two explicit equality
+tests:
+
+- ``tests/test_lock_charter_guard.py::test_extension_drift_guard``
+  (pins this copy against ``_CANONICAL_EXTENSIONS``)
+- ``shared/tests/test_locking.py::TestCodeExtensionsDriftGuard``
+  (pins the ``shared.locking`` copy against the same canonical vector)
 """
 
 from __future__ import annotations
