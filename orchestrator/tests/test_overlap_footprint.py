@@ -218,3 +218,40 @@ class TestChangesetsOverlap:
             result = changesets_overlap("log_raiser", ["a.py"], ["b.py"])
         assert result is True
         assert any("fail-open" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Step 7: merge_queue facade re-export surface test
+# ---------------------------------------------------------------------------
+
+
+class TestMergeQueueReExports:
+    """Verify merge_queue re-exports the seam and the objects are identical."""
+
+    def test_reexport_imports_succeed_and_are_same_objects(self) -> None:
+        from orchestrator.merge_queue import (  # noqa: F401
+            DEFAULT_OVERLAP_DETECTOR as mq_DEFAULT,
+            DefaultPathOverlapDetector as mq_DefaultPathOverlapDetector,
+            Footprint as mq_Footprint,
+            OverlapFootprintDetector as mq_OverlapFootprintDetector,
+            changesets_overlap as mq_changesets_overlap,
+            get_overlap_detector as mq_get_overlap_detector,
+            register_overlap_detector as mq_register_overlap_detector,
+        )
+        from orchestrator.overlap_footprint import (
+            DEFAULT_OVERLAP_DETECTOR as ov_DEFAULT,
+            DefaultPathOverlapDetector as ov_DefaultPathOverlapDetector,
+            Footprint as ov_Footprint,
+            OverlapFootprintDetector as ov_OverlapFootprintDetector,
+            changesets_overlap as ov_changesets_overlap,
+            get_overlap_detector as ov_get_overlap_detector,
+            register_overlap_detector as ov_register_overlap_detector,
+        )
+
+        assert mq_Footprint is ov_Footprint
+        assert mq_OverlapFootprintDetector is ov_OverlapFootprintDetector
+        assert mq_DefaultPathOverlapDetector is ov_DefaultPathOverlapDetector
+        assert mq_DEFAULT is ov_DEFAULT
+        assert mq_register_overlap_detector is ov_register_overlap_detector
+        assert mq_get_overlap_detector is ov_get_overlap_detector
+        assert mq_changesets_overlap is ov_changesets_overlap
