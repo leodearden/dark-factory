@@ -2741,3 +2741,39 @@ class TestArchiveListingMemoisation:
         assert spy.call_count == 0, (
             f'Expected 0 archive rescans but _iter_archive_paths called {spy.call_count}x'
         )
+
+    def test_pruned_archive_file_returns_none_not_raise(self, tmp_path: Path):
+        """A stale listing entry whose file was pruned must return None, not raise.
+
+        Sequence on a SINGLE instance:
+        1. Submit + resolve 'esc-1-1' (archives it).
+        2. Call get('esc-1-1') to build the listing cache (entry present).
+        3. Delete the archived file directly from disk (simulates out-of-process prune).
+        4. Call get('esc-1-1').
+        Assert: returns None and does NOT raise.
+
+        RED on main-with-steps-2/4: cache still lists the id, _locate_path returns
+        the now-missing path, Escalation.from_json(path.read_text()) raises
+        FileNotFoundError (not in get()'s caught set) → clean RED.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        # Step 1: archive the escalation.
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.resolve('esc-1-1', 'to be pruned')
+
+        # Step 2: build the listing cache.
+        result = queue.get('esc-1-1')
+        assert result is not None, 'Setup: esc-1-1 must be found before pruning'
+
+        # Step 3: simulate out-of-process pruning by deleting the archive file.
+        archive_files = list((queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files) == 1, 'Setup: exactly one archive file expected'
+        archive_files[0].unlink()
+
+        # Step 4: get() must return None gracefully, not raise.
+        result_after_prune = queue.get('esc-1-1')
+        assert result_after_prune is None, (
+            f'Expected None after pruning but got {result_after_prune!r}'
+        )
