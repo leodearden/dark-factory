@@ -154,7 +154,7 @@ class DeterministicRunner:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
             tail = (stdout or b'').decode(errors='replace')[-2000:]
             return proc.returncode or 0, tail
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.wait()
             return 1, f'<script timed out after {timeout_secs}s>'
@@ -246,15 +246,24 @@ class DeterministicRunner:
                 return WorkflowOutcome.BLOCKED
             else:
                 # Escalation resolved — drive to done (I2/B4/B11).
-                # γ-guard: before_done execution on the resume path is task γ's scope.
-                # Without this guard a task with before_done set would silently skip its
-                # before_done work and be driven straight to done — bypassing the
-                # NotImplementedError guard below (which is unreachable on the resume path).
+                # γ: if before_done is set, the action must have already ran (I1) for us
+                # to safely drive to done here.  Check before_done_ran_at as proof.
                 if before_done is not None:
-                    raise NotImplementedError(
-                        f'DeterministicRunner: before_done={before_done!r} is not '
-                        'implemented on the resume path in β (task γ delivers this). '
-                        f'Task id={task_id}.'
+                    before_done_ran_at_check = metadata.get('before_done_ran_at')
+                    if not before_done_ran_at_check:
+                        # Gate resolved but before_done never ran — unexpected state.
+                        # Conservatively raise so the operator can investigate; this path
+                        # should not occur in normal operation once γ ships.
+                        raise NotImplementedError(
+                            f'DeterministicRunner: gate resolved but before_done_ran_at '
+                            f'is not set — cannot safely drive to done without proof the '
+                            f'action ran.  Task id={task_id}.'
+                        )
+                    # before_done already ran (I1) — proceed to done (act-then-ask resume)
+                    logger.info(
+                        'DeterministicRunner: task %s act-then-ask resume — '
+                        'before_done_ran_at=%s, gate resolved — setting done',
+                        task_id, before_done_ran_at_check,
                     )
                 logger.info(
                     'DeterministicRunner: task %s gate resolved — setting done',
@@ -282,8 +291,22 @@ class DeterministicRunner:
                         task_id,
                     )
                     return WorkflowOutcome.BLOCKED
-                # No pending escalation → resume-after-resolution path (step-10)
-                # Fall through to set done without re-running the deploy (step-10 adds this).
+                # No pending escalation → resume-after-resolution: drive to done (I1 no re-run)
+                logger.info(
+                    'DeterministicRunner: task %s before_done ran + escalation resolved — '
+                    'resume-after-resolution, setting done (no re-run)',
+                    task_id,
+                )
+                await self.scheduler.set_task_status(
+                    task_id,
+                    'done',
+                    done_provenance={
+                        'kind': 'deterministic-deploy',
+                        'note': 'resumed after human resolution',
+                        'unit': target_unit,
+                    },
+                )
+                return WorkflowOutcome.DONE
 
             # Stamp before_done_ran_at FIRST (crash-safe I1: stamp-before-run means a
             # crash mid-deploy leaves the stamp set → re-dispatch does NOT re-run).
