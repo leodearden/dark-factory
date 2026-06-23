@@ -21,6 +21,7 @@ from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.merge_queue import (
+    EMPTY_SUFFIX_CONFLICT_GRAPH,
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     MERGE_LANES,
     NEEDS_REBASE_REASON_PREFIX,
@@ -37,6 +38,7 @@ from orchestrator.merge_queue import (
     MergeWorker,
     SpeculativeItem,
     SpeculativeMergeWorker,
+    SuffixConflictGraph,
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
     _check_plan_files_touched_in_branch,
@@ -105,12 +107,14 @@ def _make_request(
     config: OrchestratorConfig,
     pre_rebased: bool = False,
     lane: Literal['normal', 'high'] = 'normal',
+    merge_first_enqueued_at: float | None = None,
+    request_id: str | None = None,
 ) -> MergeRequest:
     try:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     except RuntimeError:
         future = make_placeholder_future()
-    return MergeRequest(
+    kwargs: dict = dict(
         task_id=task_id,
         branch=branch,
         worktree=worktree,
@@ -120,7 +124,11 @@ def _make_request(
         config=config,
         result=future,
         lane=lane,
+        merge_first_enqueued_at=merge_first_enqueued_at,
     )
+    if request_id is not None:
+        kwargs['request_id'] = request_id
+    return MergeRequest(**kwargs)
 
 
 def _gated_verify(
