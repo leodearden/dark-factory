@@ -1,5 +1,7 @@
 """Tests for the submit_task and resolve_ticket MCP tool registrations."""
 
+import json
+import os
 from unittest.mock import AsyncMock
 
 import pytest
@@ -173,9 +175,6 @@ async def test_resolve_ticket_mcp_tool_rejects_non_prefixed_id(mcp_server, task_
 # ------------------------------------------------------------------
 
 
-import json
-import os
-
 
 # ------------------------------------------------------------------
 # deterministic task_kind guard — MCP-boundary integration (B10)
@@ -224,7 +223,7 @@ async def test_normal_with_before_done_in_metadata_rejects(mcp_server, task_inte
 @pytest.mark.asyncio
 async def test_deterministic_always_escalates_forwarded_with_task_kind_injected(mcp_server, task_interceptor, tmp_path):
     """task_kind='deterministic' + always_escalates=True → accepted; forwarded metadata has task_kind='deterministic'."""
-    result = await mcp_server._tool_manager.call_tool(
+    await mcp_server._tool_manager.call_tool(
         'submit_task',
         {
             'project_root': str(tmp_path),
@@ -248,7 +247,7 @@ async def test_valid_deploy_before_done_forwarded(mcp_server, task_interceptor, 
     script.write_text('#!/bin/sh\necho deploy\n')
     os.chmod(script, 0o755)
 
-    result = await mcp_server._tool_manager.call_tool(
+    await mcp_server._tool_manager.call_tool(
         'submit_task',
         {
             'project_root': str(tmp_path),
@@ -268,7 +267,7 @@ async def test_valid_deploy_before_done_forwarded(mcp_server, task_interceptor, 
 @pytest.mark.asyncio
 async def test_default_task_kind_normal_injected(mcp_server, task_interceptor, tmp_path):
     """Default (task_kind omitted) → forwarded metadata has task_kind='normal'."""
-    result = await mcp_server._tool_manager.call_tool(
+    await mcp_server._tool_manager.call_tool(
         'submit_task',
         {
             'project_root': str(tmp_path),
