@@ -360,10 +360,21 @@ def test_evict_button_guard_is_per_entry_live(tab_scheduler_jsx_body):
     )
 
 
-def test_evict_button_label_present(tab_scheduler_jsx_body):
-    """An evict button label or title must be present in ParkStacksSection."""
-    assert re.search(r'evict', tab_scheduler_jsx_body, re.IGNORECASE), (
-        'tab_scheduler.jsx must render an evict button/label in ParkStacksSection'
+def test_evict_button_calls_on_evict(tab_scheduler_jsx_body):
+    """The evict button must invoke onEvict(entry.owner, ...) on click and render >evict</button>.
+
+    Replaces the non-discriminating `re.search(r'evict', body, re.IGNORECASE)` test which
+    matched comments, identifiers (handleEvict/onEvict), and the endpoint string — staying
+    green even if the <button> element itself were deleted.  These two assertions pin the
+    actual button element and its click wiring, both unique to the evict <button> in
+    tab_scheduler.jsx (lines ~219, ~222), so they fail iff the button is removed or rewired.
+    """
+    body = tab_scheduler_jsx_body
+    assert re.search(r'onClick=\{\s*\(\)\s*=>\s*onEvict\(\s*entry\.owner', body), (
+        'tab_scheduler.jsx evict button must wire onClick to onEvict(entry.owner, ...)'
+    )
+    assert re.search(r'>\s*evict\s*</button>', body), (
+        'tab_scheduler.jsx must render a <button>...>evict</button> element in ParkStacksSection'
     )
 
 
