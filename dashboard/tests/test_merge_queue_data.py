@@ -3194,3 +3194,114 @@ class TestAggregatorTrainThroughput:
         tt = result['/tmp/proj-train']['train_throughput']
         assert tt['trains_landed'] == 1
         assert tt['tasks_landed_via_trains'] == 2
+
+
+# ---------------------------------------------------------------------------
+# TestProbeLiveOneMetrics (step-07 RED / step-08 GREEN)
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_with_metrics(entries: list, metrics: dict) -> dict:
+    """Build a get_merge_queue snapshot dict that includes a 'metrics' key."""
+    snap = _snapshot(entries)
+    snap['metrics'] = metrics
+    return snap
+
+
+_SAMPLE_METRICS = {
+    'retries_per_landing': 1.5,
+    'drift_at_detection': {'count': 2, 'last': 3, 'mean': 2.5, 'max': 3},
+    'landings_total': 2,
+    'retries_total': 3,
+}
+
+
+class TestProbeLiveOneMetrics:
+    """_probe_live_one and fetch_live_merge_queues must preserve the 'metrics' block.
+
+    RED until step-08 GREEN extends _probe_live_one to keep result['metrics'].
+    """
+
+    @pytest.mark.asyncio
+    async def test_probe_live_one_preserves_metrics_key(self, _clean_live_sessions):
+        """_probe_live_one returns 'metrics' when snapshot contains it."""
+        from dashboard.data.merge_queue import _probe_live_one
+
+        snap = _snapshot_with_metrics([], _SAMPLE_METRICS)
+        handler = _PerPortHandler({8400: snap})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await _probe_live_one(client, 'http://127.0.0.1:8400', timeout=5.0)
+
+        assert result['reachable'] is True
+        assert 'metrics' in result, (
+            f"_probe_live_one must carry through the snapshot 'metrics' key; "
+            f"got keys: {list(result.keys())}"
+        )
+        assert result['metrics'] == _SAMPLE_METRICS
+
+    @pytest.mark.asyncio
+    async def test_probe_live_one_metrics_with_entries(self, _clean_live_sessions):
+        """'metrics' is preserved when entries are present too."""
+        from dashboard.data.merge_queue import _probe_live_one
+
+        entries = [
+            {'task_id': '7', 'branch': 'task/7', 'state': 'queued',
+             'age_secs': 10.0, 'position': 1, 'waiter_alive': True},
+        ]
+        snap = _snapshot_with_metrics(entries, _SAMPLE_METRICS)
+        handler = _PerPortHandler({8401: snap})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await _probe_live_one(client, 'http://127.0.0.1:8401', timeout=5.0)
+
+        assert result['reachable'] is True
+        assert len(result['entries']) == 1
+        assert 'metrics' in result
+        assert result['metrics']['retries_per_landing'] == 1.5
+
+    @pytest.mark.asyncio
+    async def test_probe_live_one_metrics_none_when_absent(self, _clean_live_sessions):
+        """When snapshot has no 'metrics', result['metrics'] is None (safe default)."""
+        from dashboard.data.merge_queue import _probe_live_one
+
+        snap = _snapshot([])  # no 'metrics' key
+        handler = _PerPortHandler({8402: snap})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await _probe_live_one(client, 'http://127.0.0.1:8402', timeout=5.0)
+
+        assert result['reachable'] is True
+        assert 'metrics' in result
+        assert result['metrics'] is None
+
+    @pytest.mark.asyncio
+    async def test_probe_live_one_metrics_none_on_unreachable(self, _clean_live_sessions):
+        """Unreachable hosts return metrics=None in the error dict."""
+        from dashboard.data.merge_queue import _probe_live_one
+
+        handler = _PerPortHandler(fail_ports={8403})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await _probe_live_one(client, 'http://127.0.0.1:8403', timeout=5.0)
+
+        assert result['reachable'] is False
+        assert 'metrics' in result
+        assert result['metrics'] is None
+
+    @pytest.mark.asyncio
+    async def test_fetch_live_merge_queues_preserves_metrics(self, _clean_live_sessions):
+        """fetch_live_merge_queues threads 'metrics' through for each project."""
+        from dashboard.data.merge_queue import fetch_live_merge_queues
+
+        snap = _snapshot_with_metrics([], _SAMPLE_METRICS)
+        handler = _PerPortHandler({8410: snap})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_live_merge_queues(client, _live_urls(8410))
+
+        proj = result['proj8410']
+        assert proj['reachable'] is True
+        assert 'metrics' in proj
+        assert proj['metrics']['retries_per_landing'] == 1.5
+        assert proj['metrics']['drift_at_detection']['last'] == 3
