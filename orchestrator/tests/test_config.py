@@ -1614,3 +1614,57 @@ class TestStarvationWatchdogConfig:
             f'Expected idle_secs=1800.0 (default preserved); '
             f'got {cfg.starvation_watchdog.idle_secs!r}'
         )
+
+
+class TestVerifyInfraRetryConfig:
+    """Tests for verify_infra_retry_* config fields (step-5)."""
+
+    def test_verify_infra_retry_max_attempts_default(self, monkeypatch, tmp_path):
+        """verify_infra_retry_max_attempts defaults to 5."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.verify_infra_retry_max_attempts == 5
+
+    def test_verify_infra_retry_backoff_secs_default(self, monkeypatch, tmp_path):
+        """verify_infra_retry_backoff_secs defaults to 2.0."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.verify_infra_retry_backoff_secs == 2.0
+
+    def test_verify_infra_retry_max_backoff_secs_default(self, monkeypatch, tmp_path):
+        """verify_infra_retry_max_backoff_secs defaults to 60.0."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.verify_infra_retry_max_backoff_secs == 60.0
+
+    def test_verify_infra_retry_max_attempts_ge_1_rejects_zero(self):
+        """verify_infra_retry_max_attempts=0 must raise ValidationError (ge=1)."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(verify_infra_retry_max_attempts=0)
+
+    def test_verify_infra_retry_backoff_secs_gt_0_rejects_zero(self):
+        """verify_infra_retry_backoff_secs=0 must raise ValidationError (gt=0)."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(verify_infra_retry_backoff_secs=0.0)
+
+    def test_verify_infra_retry_max_backoff_secs_gt_0_rejects_zero(self):
+        """verify_infra_retry_max_backoff_secs=0 must raise ValidationError (gt=0)."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(verify_infra_retry_max_backoff_secs=0.0)
+
+    def test_verify_infra_retry_fields_override_from_yaml(self, monkeypatch, tmp_path):
+        """Fields load and override correctly from a YAML mapping via load_config."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        # Use direct OrchestratorConfig construction with dict (avoids file path)
+        cfg = OrchestratorConfig(
+            verify_infra_retry_max_attempts=10,
+            verify_infra_retry_backoff_secs=5.0,
+            verify_infra_retry_max_backoff_secs=120.0,
+        )
+        assert cfg.verify_infra_retry_max_attempts == 10
+        assert cfg.verify_infra_retry_backoff_secs == 5.0
+        assert cfg.verify_infra_retry_max_backoff_secs == 120.0

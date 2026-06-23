@@ -79,7 +79,9 @@ from orchestrator.task_status import (
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
+    VerifyInfraError,
     VerifyResult,
+    _is_infra_oserror,
     run_scoped_verification,
     verify_failure_is_preexisting_on_main,
 )
@@ -642,6 +644,11 @@ class TaskWorkflow:
         # from main (preexisting break).  Read at the call site (run()) to route
         # _mark_blocked with dedupe_fingerprint instead of the generic reason.
         self._inherited_break_info: dict | None = None
+        # Set by _verify_debugfix_loop when a VerifyInfraError exhausts the
+        # bounded in-process retry window.  Read at the call site (run()) to
+        # route _mark_blocked with category='infra_issue' + escalate_to_human.
+        # Mirrors _inherited_break_info / _zero_output_hang_info stash idiom.
+        self._infra_hold_info: dict | None = None
         # Set by the zero-output circuit breaker in _execute_iterations when
         # max_consecutive_zero_output_timeouts consecutive fresh-invocation
         # timeouts are detected.  Read by _execute_verify_review_loop to route
@@ -1487,7 +1494,17 @@ class TaskWorkflow:
                 cwd=self.worktree,
             )
 
-    async def run(self) -> WorkflowOutcome:
+    async def run(  # pyright: ignore[reportGeneralTypeIssues]
+        self,
+    ) -> WorkflowOutcome:
+        # reportGeneralTypeIssues: pyright reports "Code is too complex to
+        # analyze" on this method when run without the project pyproject.toml
+        # config (typeCheckingMode = "basic").  The root cause is the number
+        # of exception-handler branches added for infra-retry and bypass-done
+        # discrimination; refactoring them out is a separate architectural
+        # task.  The ignore is on the def line (the only site pyright accepts
+        # it for this diagnostic) and is narrowed to reportGeneralTypeIssues
+        # so genuine type regressions in other categories are still caught.
         """Execute the full state machine."""
         branch_name = self.task_id
         try:
@@ -1903,6 +1920,50 @@ class TaskWorkflow:
             self._last_block_phase = block_phase
             self._last_block_detail = str(e)
             return WorkflowOutcome.REQUEUED
+
+        except VerifyInfraError as e:
+            # Infra-typed exception from the verify path that escaped the
+            # in-process retry wrapper (e.g. raised outside
+            # _run_scoped_verification_with_infra_retry).  Route to
+            # infra_issue with escalate_to_human rather than the generic
+            # 'Workflow error:' task_failure block below.
+            logger.warning(
+                'Task %s: VerifyInfraError escaped run() (phase=%r errno=%r) '
+                '— routing to infra_issue',
+                self.task_id, e.phase, e.errno,
+            )
+            reason = (
+                f'Verify infra failure (phase={e.phase!r} errno={e.errno}): {e}'
+            )
+            return await self._mark_blocked(
+                reason,
+                category='infra_issue',
+                escalate_to_human=True,
+            )
+
+        except OSError as e:
+            # Bare infra-class OSError (ENOSPC/EDQUOT/EROFS/EIO/EMFILE/ENFILE)
+            # escaping the verify path outside the VerifyInfraError wrapper
+            # (e.g. a log or marker write).  Route to infra_issue.
+            # Non-infra OSErrors (EACCES, ENOENT, etc.) fall through to the
+            # same generic handler as except Exception below — Python's
+            # exception model does not allow re-raise into a sibling except
+            # clause, so we duplicate the generic path here.
+            if _is_infra_oserror(e):
+                logger.warning(
+                    'Task %s: bare infra OSError escaped run() (errno=%r) '
+                    '— routing to infra_issue',
+                    self.task_id, e.errno,
+                )
+                reason = f'Verify infra OSError (errno={e.errno}): {e}'
+                return await self._mark_blocked(
+                    reason,
+                    category='infra_issue',
+                    escalate_to_human=True,
+                )
+            # Non-infra OSError — treat the same as the broad except below.
+            logger.exception(f'Task {self.task_id} workflow error: {e}')
+            return await self._mark_blocked(f'Workflow error: {e}')
 
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
@@ -3724,6 +3785,20 @@ class TaskWorkflow:
             if verify_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
             if verify_outcome == WorkflowOutcome.BLOCKED:
+                # Infra hold takes priority: route to infra_issue with
+                # escalate_to_human so the open L1 keeps this branch OUT of
+                # pending/footprint-dispatch until the infra clears.
+                # Must be checked BEFORE _inherited_break_info to prevent the
+                # generic 'Verification attempts exhausted' task_failure block
+                # from clobbering the infra_issue category.
+                if self._infra_hold_info is not None:
+                    info = self._infra_hold_info
+                    return await self._mark_blocked(
+                        info['reason'],
+                        detail=info.get('detail', ''),
+                        category='infra_issue',
+                        escalate_to_human=True,
+                    )
                 if self._inherited_break_info is not None:
                     info = self._inherited_break_info
                     return await self._mark_blocked(
@@ -4435,6 +4510,101 @@ class TaskWorkflow:
             },
         )
 
+    async def _run_scoped_verification_with_infra_retry(
+        self,
+        *,
+        verify_attempt: int,
+    ) -> VerifyResult | None:
+        """Run :func:`run_scoped_verification` with bounded infra-error retry.
+
+        Catches :class:`VerifyInfraError` (transient infra OSErrors — ENOSPC,
+        EDQUOT, EROFS, EIO, EMFILE, ENFILE) raised during verify and retries
+        up to ``config.verify_infra_retry_max_attempts`` times with exponential
+        back-off, keeping the task CLAIMED (in-progress) throughout.
+
+        Returns
+        -------
+        VerifyResult
+            On a successful run (no infra error, or infra error cleared within
+            the retry window).
+        None
+            When the retry window is exhausted.  The caller
+            (:meth:`_verify_debugfix_loop`) interprets ``None`` as the cue to
+            stamp ``metadata.infra_hold`` (via :attr:`_infra_hold_info`) and
+            return ``WorkflowOutcome.BLOCKED``.
+
+        Modelled on the ``WarmLaneDiskPressure`` retry pattern
+        (git_ops.py / workflow.py:1857-1889) but keeps the task in-progress
+        rather than REQUEUED — the caller must not acquire a new implement
+        footprint on resume (see Task-1883 A1 root-cause analysis).
+        """
+        assert self.worktree is not None
+
+        max_attempts = self.config.verify_infra_retry_max_attempts
+        backoff_base = self.config.verify_infra_retry_backoff_secs
+        max_backoff = self.config.verify_infra_retry_max_backoff_secs
+
+        last_infra_exc: VerifyInfraError | None = None
+
+        for infra_attempt in range(max_attempts):
+            try:
+                return await run_scoped_verification(
+                    self.worktree, self.config, self._module_configs,
+                    task_files=self._task_files,
+                    attempt_id=verify_attempt + 1,
+                    task_id=self.task_id,
+                    archive_root=self.config.project_root / 'data' / 'verify-logs',
+                    force_workspace=self._train is not None,
+                    role='task',
+                )
+            except VerifyInfraError as exc:
+                last_infra_exc = exc
+                delay = min(backoff_base * (2 ** infra_attempt), max_backoff)
+                logger.warning(
+                    'Task %s: VerifyInfraError during verify (phase=%r errno=%r), '
+                    'attempt %d/%d — backing off %.1fs',
+                    self.task_id, exc.phase, exc.errno,
+                    infra_attempt + 1, max_attempts, delay,
+                )
+                await asyncio.sleep(delay)
+
+        # Window exhausted — stamp infra_hold and signal caller to BLOCK
+        # last_infra_exc is guaranteed non-None: the loop only reaches here
+        # after catching at least one VerifyInfraError (max_attempts >= 1).
+        assert last_infra_exc is not None
+        reason = (
+            f'Verify infra failure not resolved after {max_attempts} in-process '
+            f'retries (phase={last_infra_exc.phase!r} errno={last_infra_exc.errno})'
+        )
+        self._infra_hold_info = {
+            'reason': reason,
+            'detail': (
+                f'VerifyInfraError: phase={last_infra_exc.phase!r} '
+                f'errno={last_infra_exc.errno}'
+            ),
+            'category': 'infra_issue',
+            'escalate_to_human': True,
+            'phase': last_infra_exc.phase,
+            'errno': last_infra_exc.errno,
+        }
+        # Stamp metadata.infra_hold so harness recovery / escalation resolution
+        # can distinguish a verify-complete hold from a stranded in-progress task.
+        infra_hold_meta = {
+            'phase': last_infra_exc.phase,
+            'errno': last_infra_exc.errno,
+            'reason': reason,
+        }
+        try:
+            fresh = await self.scheduler.get_task(self.task_id)
+            current_meta = (fresh or {}).get('metadata') or {}
+        except Exception:
+            current_meta = {}
+        await self.scheduler.update_task(
+            self.task_id,
+            metadata={**current_meta, 'infra_hold': infra_hold_meta},
+        )
+        return None
+
     async def _verify_debugfix_loop(self) -> WorkflowOutcome:
         """Run verification, invoke debugger on failures."""
         assert self.worktree is not None and self.artifacts is not None
@@ -4455,14 +4625,12 @@ class TaskWorkflow:
                     event_label='verify_phase_rebase',
                 )
 
-            result = await run_scoped_verification(
-                self.worktree, self.config, self._module_configs, task_files=self._task_files,
-                attempt_id=verify_attempt + 1,
-                task_id=self.task_id,
-                archive_root=self.config.project_root / 'data' / 'verify-logs',
-                force_workspace=self._train is not None,
-                role='task',
+            result = await self._run_scoped_verification_with_infra_retry(
+                verify_attempt=verify_attempt,
             )
+            if result is None:
+                # Infra retry window exhausted; _infra_hold_info already stamped.
+                return WorkflowOutcome.BLOCKED
             if rebase_notice is not None:
                 self._emit_rebase_verify_cost(rebase_notice, result)
             if not result.passed:

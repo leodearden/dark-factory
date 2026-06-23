@@ -38,6 +38,15 @@ rebase_reseed_distance_threshold: 25
 # implementer.  3 matches the empirical reify task-2289 thrash window.
 max_consecutive_infra_resumes: 3
 
+# Verify-path infra retry knobs — bounded exponential back-off for transient
+# infra OSErrors (ENOSPC/EDQUOT/EROFS/EIO/EMFILE/ENFILE) caught during verify.
+# max_attempts: total in-process retries before blocking as infra_issue.
+# backoff_secs: base delay (s) for first retry; subsequent: min(b*2^n, max_b).
+# max_backoff_secs: ceiling (s) on a single retry delay.
+verify_infra_retry_max_attempts: 5
+verify_infra_retry_backoff_secs: 2.0
+verify_infra_retry_max_backoff_secs: 60.0
+
 # Fix 3 — merge-phase thrash threshold. Counter increments when the merge
 # queue returns the same blocked outcome (signature-keyed) on consecutive
 # attempts; resets to 1 on a different verdict. At threshold the

@@ -1267,6 +1267,18 @@ class OrchestratorConfig(BaseSettings):
     # (15 escalations on the same port-1420 collision before
     # verify-budget exhaustion).
     max_consecutive_infra_resumes: int = Field(default=3, ge=1)
+    # Verify-path infra retry knobs — bounded exponential back-off for
+    # transient infra OSErrors (ENOSPC etc.) caught during the verify phase.
+    # max_attempts: total in-process retry attempts before the task is blocked
+    #   with category='infra_issue'.  Default 5 gives ~1 min of back-off at
+    #   the default base/ceiling (2+4+8+16+32 = 62s total sleep across all
+    #   5 failed attempts) before declaring the infra failure persistent.
+    # backoff_secs: base delay for the first retry (seconds).  Subsequent
+    #   delays are min(backoff * 2^attempt, max_backoff).
+    # max_backoff_secs: ceiling on a single retry delay (seconds).
+    verify_infra_retry_max_attempts: int = Field(default=5, ge=1)
+    verify_infra_retry_backoff_secs: float = Field(default=2.0, gt=0)
+    verify_infra_retry_max_backoff_secs: float = Field(default=60.0, gt=0)
     # Fix 3 — thrash threshold for repeated steward-resolved merge-phase
     # failures with the same outcome signature.  Counter increments when
     # the merge queue returns a blocked outcome whose signature matches
