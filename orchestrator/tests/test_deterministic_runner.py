@@ -1048,3 +1048,121 @@ class TestBeforeDoneVerifyFail:
         outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.BLOCKED
+
+# ---------------------------------------------------------------------------
+# Step-7: B7 reaper / I1 once-only quiescence
+# (RED until step-8 adds the before_done_ran_at idempotency branch)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneOnceOnlyIdempotency:
+    """DeterministicRunner — before_done_ran_at set + pending escalation → BLOCKED (B7 reaper/I1)."""
+
+    def _pre_seed_infra_escalation(self, queue: EscalationQueue, task_id: str) -> Escalation:
+        """Submit one pending infra_issue escalation (simulates a prior failed deploy)."""
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-deterministic',
+            severity='critical',
+            category='infra_issue',
+            summary='Deploy failed: orchestrator-reify.service',
+            level=2,
+        )
+        queue.submit(esc)
+        return esc
+
+    async def test_i1_script_runner_not_called(self, tmp_path: Path):
+        """before_done_ran_at already set + pending escalation → script_runner NOT called (I1)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='500', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._pre_seed_infra_escalation(queue, '500')
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_i1_no_second_escalation_filed(self, tmp_path: Path):
+        """before_done_ran_at set + pending escalation → queue stays at exactly ONE escalation (I1)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='500', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._pre_seed_infra_escalation(queue, '500')
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('500', status='pending')
+        assert len(pending) == 1, f'Queue must stay at 1 escalation, got {len(pending)}'
+
+    async def test_i1_set_task_status_never_done(self, tmp_path: Path):
+        """before_done_ran_at set + pending escalation → set_task_status NEVER called with 'done'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='500', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._pre_seed_infra_escalation(queue, '500')
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(done_calls) == 0, 'Must NEVER set task to done when quiescent (open escalation)'
+
+    async def test_i1_outcome_is_blocked(self, tmp_path: Path):
+        """before_done_ran_at set + pending escalation → outcome is BLOCKED (B7 reaper)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='500', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._pre_seed_infra_escalation(queue, '500')
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
