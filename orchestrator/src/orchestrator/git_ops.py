@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Literal, NamedTuple, TypedDict
 
 from orchestrator.config import GitConfig
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -356,6 +356,30 @@ class WorktreeInfo:
     base_commit: str
     stale_commits: int | None = None
     reify_debug_port: int | None = None
+
+
+class ConflictProbe(NamedTuple):
+    """Result of merge_tree_conflicts — a lightweight, tuple-destructurable probe.
+
+    Fields
+    ------
+    clean:
+        True  → branch_head would merge onto base_tip without conflicts.
+        False → at least one file conflict was detected.
+    conflicted_paths:
+        Paths of conflicting files (relative to repo root).  Empty when clean.
+
+    As a NamedTuple, supports both named-field access and tuple destructuring::
+
+        probe = await git_ops.merge_tree_conflicts(base_tip, branch_head)
+        # named-field access:
+        if probe.clean: ...
+        # tuple-destructuring (PRD §5.2 contract):
+        clean, paths = probe
+    """
+
+    clean: bool
+    conflicted_paths: list[str]
 
 
 class WorktreeMissing(FileNotFoundError):
@@ -2585,6 +2609,67 @@ class GitOps:
             logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
             return False
         return True
+
+    async def merge_tree_conflicts(
+        self,
+        base_tip: str,
+        branch_head: str,
+    ) -> ConflictProbe:
+        """Probe whether *branch_head* would merge cleanly onto *base_tip*.
+
+        Uses ``git merge-tree --write-tree --name-only`` to perform an
+        object-store-only 3-way merge (git auto-computes the merge-base).
+
+        **Object-store-only contract** — MUST NOT touch worktree_base or any
+        warm-lane path.  This primitive runs at ``self.project_root`` (the
+        in-repo object store) and writes only loose tree/blob objects.
+        Consumers δ (conflict-graph), η (bounce), and ι (drift metric) all
+        depend on this ref-stable, disk-free, idempotent contract.
+
+        Returns
+        -------
+        ConflictProbe(clean=True, conflicted_paths=[])
+            when branch_head merges cleanly onto base_tip.
+        ConflictProbe(clean=False, conflicted_paths=[...])
+            when at least one conflict is detected; paths are relative to
+            repo root, byte-faithful (``-c core.quotePath=false`` disables
+            octal quoting of non-ASCII / special characters).
+
+        Raises
+        ------
+        RuntimeError
+            when git exits with a code other than 0 or 1 (e.g. 128 for an
+            unknown / bad object name).  Silently returning clean=True would
+            admit a broken branch into the verify frontier; returning
+            clean=False would falsely bounce a mergeable branch.  Loud failure
+            for a caller bug is the correct contract for a foundation primitive.
+        """
+        rc, out, err = await _run(
+            [
+                'git', '-c', 'core.quotePath=false',
+                'merge-tree', '--write-tree', '--name-only',
+                base_tip, branch_head,
+            ],
+            cwd=self.project_root,
+        )
+        if rc == 0:
+            return ConflictProbe(clean=True, conflicted_paths=[])
+        if rc == 1:
+            # stdout layout (git 2.43.0, --name-only):
+            #   line 0: merged tree OID (discard)
+            #   lines 1..k: conflicted file paths (one per line, deduplicated)
+            #   blank line: section boundary
+            #   remaining lines: informational messages ("Auto-merging…" etc.)
+            lines = out.split('\n')
+            paths: list[str] = []
+            for line in lines[1:]:  # skip the tree OID on line 0
+                if line == '':  # blank line = section boundary
+                    break
+                paths.append(line)
+            return ConflictProbe(clean=False, conflicted_paths=paths)
+        raise RuntimeError(
+            f'git merge-tree failed (rc={rc}) for {base_tip}..{branch_head}: {err}'
+        )
 
     async def stack_train_branches(self, member_ids: list[str]) -> TrainStackResult:
         """Materialize a linear branch stack for a merge-train formation.
