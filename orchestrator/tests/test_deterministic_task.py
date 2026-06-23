@@ -647,6 +647,129 @@ class TestB5NoGo:
 
 
 # ---------------------------------------------------------------------------
+# Deploy-row scaffolding (step-8)
+# ---------------------------------------------------------------------------
+
+def _deploy_task(
+    task_id: str = 'deploy-200',
+    target_unit: str = 'orchestrator-reify.service',
+    script: str = '/tmp/test-deploy.sh',
+    args: list | None = None,
+    env: dict | None = None,
+    cwd: str = '/tmp',
+    timeout_secs: int = 30,
+    before_done_ran_at: str | None = None,
+    before_done_verified_at: str | None = None,
+    before_done_verified_pid: int | None = None,
+    before_done_scheduled_at: dict | None = None,
+) -> dict:
+    """Build a deterministic deploy task dict (before_done set, always_escalates=False).
+
+    Adapted from orchestrator/tests/test_deterministic_runner.py: _deploy_task.
+    """
+    before_done: dict = {
+        'script': script,
+        'args': args if args is not None else [],
+        'env': env if env is not None else {},
+        'cwd': cwd,
+        'timeout_secs': timeout_secs,
+        'target_unit': target_unit,
+    }
+    metadata: dict = {
+        'task_kind': 'deterministic',
+        'always_escalates': False,
+        'before_done': before_done,
+    }
+    if before_done_ran_at is not None:
+        metadata['before_done_ran_at'] = before_done_ran_at
+    if before_done_verified_at is not None:
+        metadata['before_done_verified_at'] = before_done_verified_at
+    if before_done_verified_pid is not None:
+        metadata['before_done_verified_pid'] = before_done_verified_pid
+    if before_done_scheduled_at is not None:
+        metadata['before_done_scheduled_at'] = before_done_scheduled_at
+    return {
+        'id': task_id,
+        'title': f'Deploy {target_unit}',
+        'description': f'Cross-unit deploy of {target_unit}',
+        'status': 'pending',
+        'metadata': metadata,
+    }
+
+
+# Unit states for B6/B7 deploy tests (adapted from test_deterministic_runner.py)
+_BASELINE_UNIT_STATE: dict = {
+    'MainPID': 100,
+    'ActiveState': 'active',
+    'ActiveEnterTimestamp': 'Mon 2026-06-23 10:00:00 UTC',
+    'ActiveEnterTimestampMonotonic': 1_000_000,
+}
+_FRESH_UNIT_STATE: dict = {
+    'MainPID': 200,
+    'ActiveState': 'active',
+    'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC',
+    'ActiveEnterTimestampMonotonic': 2_000_000,
+}
+
+
+def _build_runner(
+    store: _StoreScheduler,
+    queue: EscalationQueue,
+    *,
+    unit_inspector=None,
+    script_runner=None,
+    own_unit_resolver=None,
+    restart_scheduler=None,
+) -> DeterministicRunner:
+    """Build a real DeterministicRunner with injected systemd seams.
+
+    Uses the real DeterministicRunner and a real file-backed EscalationQueue;
+    the only fakes are the systemd/script edges (unit_inspector, script_runner,
+    own_unit_resolver, restart_scheduler).  Missing seams default to None
+    (runner uses its built-in default, which hits real systemd — always pass
+    seams for cross-unit and self-restart tests).
+
+    Adapted from the injection pattern in orchestrator/tests/test_deterministic_runner.py.
+    """
+    return DeterministicRunner(
+        scheduler=store,
+        escalation_queue=queue,
+        unit_inspector=unit_inspector,
+        script_runner=script_runner,
+        own_unit_resolver=own_unit_resolver,
+        restart_scheduler=restart_scheduler,
+    )
+
+
+class TestDeployScaffoldSmoke:
+    """Smoke: _build_runner returns a DeterministicRunner with seams wired."""
+
+    def test_build_runner_returns_deterministic_runner(self, tmp_path: Path) -> None:
+        """_build_runner returns a DeterministicRunner instance."""
+        store = _StoreScheduler()
+        queue = EscalationQueue(tmp_path / 'queue')
+        script_runner = AsyncMock(name='script_runner')
+        runner = _build_runner(store, queue, script_runner=script_runner)
+        assert isinstance(runner, DeterministicRunner)
+        assert runner._script_runner is script_runner
+
+    def test_build_runner_seams_wired(self, tmp_path: Path) -> None:
+        """All injected seams are accessible on the runner."""
+        store = _StoreScheduler()
+        queue = EscalationQueue(tmp_path / 'q2')
+        ui = AsyncMock(name='unit_inspector')
+        sr = AsyncMock(name='script_runner')
+        our = lambda: 'my-unit.service'  # noqa: E731
+        rs = AsyncMock(name='restart_scheduler')
+        runner = _build_runner(store, queue, unit_inspector=ui, script_runner=sr,
+                               own_unit_resolver=our, restart_scheduler=rs)
+        assert runner._unit_inspector is ui
+        assert runner._script_runner is sr
+        assert runner._own_unit_resolver is our
+        assert runner._restart_scheduler is rs
+
+
+# ---------------------------------------------------------------------------
 # B11 — restart-window replay: stamps/L2 survive orchestrator restart (step-7)
 # ---------------------------------------------------------------------------
 
