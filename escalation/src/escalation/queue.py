@@ -935,6 +935,24 @@ class EscalationQueue:
             # id without a full rescan.  Only update if the cache has already been built.
             if self._archive_listing is not None:
                 self._archive_listing.setdefault(archive_dir.name, set()).add(escalation_id)
+            # Upward-bump the max_seq cache for the archived task_id so make_id()
+            # sees the newly-archived seq without a rescan.  Upward-only guarantee:
+            # never lower the cached value (external pruning can only reduce the
+            # true on-disk max, so an over-estimate is always safe; an under-estimate
+            # would cause id reuse/collision).
+            try:
+                # escalation_id is 'esc-<task_id>-<seq>'; strip the 'esc-' prefix.
+                head, tail = escalation_id.rsplit('-', 1)
+                archived_task_id = head[len('esc-'):]
+                archived_seq = int(tail)
+            except (ValueError, IndexError):
+                # Non-conforming id: clear the whole cache to force fresh scans.
+                self._archive_max_seq_cache.clear()
+            else:
+                if archived_task_id in self._archive_max_seq_cache:
+                    self._archive_max_seq_cache[archived_task_id] = max(
+                        self._archive_max_seq_cache[archived_task_id], archived_seq
+                    )
         except OSError as exc:
             logger.warning(
                 f'Failed to archive escalation {escalation_id}: {exc}; '
