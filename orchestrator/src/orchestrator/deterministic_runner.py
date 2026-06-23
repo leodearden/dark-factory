@@ -159,6 +159,52 @@ class DeterministicRunner:
             await proc.wait()
             return 1, f'<script timed out after {timeout_secs}s>'
 
+    async def _file_infra_issue_and_block(
+        self,
+        task_id: str,
+        summary: str,
+        detail: str,
+    ) -> WorkflowOutcome:
+        """File a born-at-L2 infra_issue escalation and set the task to blocked.
+
+        Reuses β's escalation construction pattern (sentinel role keeps level=2
+        past the server downgrade gate).  Includes a dedup guard — if a pending
+        escalation already exists (e.g. prior crash-safe re-dispatch), filing is
+        skipped to avoid duplicate L2 escalations.
+
+        Returns:
+            WorkflowOutcome.BLOCKED
+        """
+        from escalation.models import Escalation
+
+        existing_pending = self.escalation_queue.get_by_task(task_id, status='pending')
+        if existing_pending:
+            logger.info(
+                'DeterministicRunner: task %s already has %d pending escalation(s) — '
+                'skipping re-file (infra_issue dedup guard)',
+                task_id, len(existing_pending),
+            )
+        else:
+            esc = Escalation(
+                id=self.escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='orchestrator-deterministic',
+                severity='critical',
+                category='infra_issue',
+                summary=summary[:200],
+                detail=detail,
+                level=2,
+            )
+            self.escalation_queue.submit(esc)
+            logger.info(
+                'DeterministicRunner: filed L2 infra_issue escalation %s for task %s',
+                esc.id, task_id,
+            )
+
+        await self.scheduler.set_task_status(task_id, 'blocked')
+        logger.info('DeterministicRunner: task %s blocked — infra_issue', task_id)
+        return WorkflowOutcome.BLOCKED
+
     # ------------------------------------------------------------------
     # Main runner
     # ------------------------------------------------------------------
@@ -167,12 +213,10 @@ class DeterministicRunner:
         """Execute the deterministic gate logic for *assignment*.
 
         Returns:
-            WorkflowOutcome.DONE  — gate resolved, task driven to done (resume path).
-            WorkflowOutcome.BLOCKED — gate filed or open escalation (initial/quiescence).
+            WorkflowOutcome.DONE  — gate resolved, task driven to done.
+            WorkflowOutcome.BLOCKED — gate filed, open escalation, or deploy failure.
 
         Raises:
-            NotImplementedError — if ``metadata.before_done`` is not None (task γ),
-                either on the initial dispatch or on the resume path.
             ValueError — if ``always_escalates`` is False with ``before_done=None``
                 (unsupported misconfiguration in β).
         """
@@ -243,11 +287,17 @@ class DeterministicRunner:
             rc, out = await run_fn(before_done)
 
             if rc != 0:
-                # B7a: script failed — file infra_issue escalation (step-4)
-                raise NotImplementedError(
-                    f'DeterministicRunner: rc={rc} failure handling for before_done '
-                    'is task γ step-4. '
-                    f'Task id={task_id}.'
+                # B7a: script failed — file infra_issue escalation, set blocked (B7a)
+                deploy_detail = '\n'.join([
+                    description,
+                    f'Target unit: {target_unit}',
+                    f'Script exit code: rc={rc}',
+                    f'Output:\n{out}',
+                ])
+                return await self._file_infra_issue_and_block(
+                    task_id,
+                    summary=f'Deploy failed: {target_unit}',
+                    detail=deploy_detail,
                 )
 
             # Re-inspect to verify a fresh MainPID + strictly-later monotonic timestamp
