@@ -2022,3 +2022,394 @@ async def test_collect_scheduler_state_uses_meta_files_for_deep_path(
     assert len(modules) == 1
     assert modules[0]['path'] == 'orchestrator/src'
     assert modules[0]['holder'] == '1'
+
+
+# ---------------------------------------------------------------------------
+# task-1870 step-1: _module_contention_counts attaches per-module park fields
+# ---------------------------------------------------------------------------
+
+
+def test_module_contention_counts_attaches_parked_by_and_stack():
+    """_module_contention_counts attaches parked_by/park_stack when park_stacks is provided.
+
+    B1 contract (§5 read seam):
+    - Two live tasks 'low' (shadowed) and 'high' (active top) both contend module 'm'.
+    - park_stacks carries a 2-deep stack in bottom→top order: low then high.
+    - stack[-1] is 'high' (active top) → parked_by == 'high'.
+    - All park owners are live → parked_owner_live is True.
+    - park_stack lists both entries with correct shadowed/live flags.
+
+    UNPARKED module:
+    - A module with no matching park_stacks key gets parked_by=None, park_stack=[].
+    """
+    from dashboard.data.scheduler import _module_contention_counts
+
+    iso = '2026-01-01T10:00:00+00:00'
+
+    rows = [
+        {'task_id': 'low', 'lock_set': ['m', 'other']},
+        {'task_id': 'high', 'lock_set': ['m', 'other']},
+    ]
+    park_stacks = {
+        'm': [
+            {'owner': 'low', 'rank': 10, 'shadowed': True, 'installed_at': iso},
+            {'owner': 'high', 'rank': 5, 'shadowed': False, 'installed_at': iso},
+        ]
+    }
+    live_task_ids = {'low', 'high'}
+
+    result = _module_contention_counts(
+        rows, {}, project='p',
+        park_stacks=park_stacks,
+        live_task_ids=live_task_ids,
+    )
+
+    # Find the 'm' module entry
+    m_entry = next((e for e in result if e['path'] == 'm'), None)
+    assert m_entry is not None, "Module 'm' must appear in result"
+
+    # parked_by must be the active top (stack[-1])
+    assert m_entry['parked_by'] == 'high', (
+        f"Expected parked_by='high' (active top), got {m_entry['parked_by']!r}"
+    )
+    assert m_entry['parked_by_project'] == 'p', (
+        f"Expected parked_by_project='p', got {m_entry['parked_by_project']!r}"
+    )
+    assert m_entry['parked_owner_live'] is True, (
+        f"Expected parked_owner_live=True (both owners are live), got {m_entry['parked_owner_live']!r}"
+    )
+
+    # park_stack must list both owners with correct shadowed/live flags
+    ps = m_entry['park_stack']
+    assert len(ps) == 2, f"Expected 2 entries in park_stack, got {len(ps)}"
+
+    # Bottom entry: 'low', shadowed=True, live=True
+    assert ps[0]['owner'] == 'low'
+    assert ps[0]['shadowed'] is True
+    assert ps[0]['live'] is True
+
+    # Top entry: 'high', shadowed=False, live=True
+    assert ps[1]['owner'] == 'high'
+    assert ps[1]['shadowed'] is False
+    assert ps[1]['live'] is True
+
+    # has_dead_park: all entries are live → False
+    assert m_entry['has_dead_park'] is False, (
+        f"Expected has_dead_park=False (all live), got {m_entry['has_dead_park']!r}"
+    )
+
+    # UNPARKED module 'other': no matching park_stacks key
+    other_entry = next((e for e in result if e['path'] == 'other'), None)
+    assert other_entry is not None, "Module 'other' must appear in result"
+    assert other_entry['parked_by'] is None, (
+        f"Expected parked_by=None for unparked module, got {other_entry['parked_by']!r}"
+    )
+    assert other_entry['parked_by_project'] is None, (
+        "Expected parked_by_project=None for unparked module"
+    )
+    assert other_entry['park_stack'] == [], (
+        f"Expected park_stack=[] for unparked module, got {other_entry['park_stack']!r}"
+    )
+    assert other_entry['has_dead_park'] is False, (
+        f"Expected has_dead_park=False for unparked module, got {other_entry['has_dead_park']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1870 amend: mixed-liveness stack — live active-top + dead shadowed owner
+# ---------------------------------------------------------------------------
+
+
+def test_module_contention_counts_mixed_liveness_stack():
+    """_module_contention_counts with live active-top but dead shadowed owner.
+
+    Covers the design-consistency gap (reviewer suggestion #2/#3):
+    - parked_owner_live reflects the active top only (True when top is live).
+    - has_dead_park is True whenever ANY stack entry is dead — including
+      shadowed/non-top entries — so the banner can flag the module even when
+      the active-top owner is still alive.
+    - _stranded_park_rows emits a stranded row for the dead shadowed owner,
+      matching the ParkStacksSection per-entry 'dead' indicator.
+    """
+    from dashboard.data.scheduler import (
+        _module_contention_counts,
+        _stranded_park_rows,
+    )
+
+    iso = '2026-01-01T10:00:00+00:00'
+    # Stack: bottom=dead('ghost'), top=live('alive').  Only 'alive' in live_task_ids.
+    park_stacks = {
+        'm': [
+            {'owner': 'ghost', 'rank': 10, 'shadowed': True,  'installed_at': iso},
+            {'owner': 'alive', 'rank':  5, 'shadowed': False, 'installed_at': iso},
+        ],
+    }
+    live_task_ids = {'alive'}
+
+    # Build a row for the live top owner so it appears in contention.
+    rows = [{'task_id': 'alive', 'lock_set': ['m']}]
+
+    result = _module_contention_counts(
+        rows, {}, project='p',
+        park_stacks=park_stacks,
+        live_task_ids=live_task_ids,
+    )
+    m_entry = next((e for e in result if e['path'] == 'm'), None)
+    assert m_entry is not None, "Module 'm' must appear in result"
+
+    # Active top is live → parked_owner_live=True, parked_by='alive'
+    assert m_entry['parked_by'] == 'alive', (
+        f"Expected parked_by='alive', got {m_entry['parked_by']!r}"
+    )
+    assert m_entry['parked_owner_live'] is True, (
+        f"Expected parked_owner_live=True (top is live), got {m_entry['parked_owner_live']!r}"
+    )
+
+    # Per-entry live flags
+    ps = m_entry['park_stack']
+    assert len(ps) == 2, f"Expected 2 park_stack entries, got {len(ps)}"
+    assert ps[0]['owner'] == 'ghost'
+    assert ps[0]['live'] is False, (
+        f"Expected ps[0].live=False (dead shadowed), got {ps[0]['live']!r}"
+    )
+    assert ps[1]['owner'] == 'alive'
+    assert ps[1]['live'] is True, (
+        f"Expected ps[1].live=True (live top), got {ps[1]['live']!r}"
+    )
+
+    # has_dead_park must be True — the dead shadowed entry triggers it
+    assert m_entry['has_dead_park'] is True, (
+        f"Expected has_dead_park=True (dead shadowed owner 'ghost'), "
+        f"got {m_entry['has_dead_park']!r}"
+    )
+
+    # _stranded_park_rows: dead shadowed owner 'ghost' must produce a stranded row;
+    # live owner 'alive' must be skipped.
+    stranded = _stranded_park_rows(park_stacks, live_task_ids, project='p', project_root='/p')
+    stranded_ids = {r['task_id'] for r in stranded}
+    assert 'ghost' in stranded_ids, (
+        f"Expected stranded row for dead shadowed 'ghost', got {stranded_ids!r}"
+    )
+    assert 'alive' not in stranded_ids, (
+        f"Live owner 'alive' must not appear in stranded rows, got {stranded_ids!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1870 step-3: _stranded_park_rows flags dead owners (orphan/stranded pass)
+# ---------------------------------------------------------------------------
+
+
+def test_stranded_park_rows_flags_dead_owner():
+    """_stranded_park_rows emits one synthetic row per dead park owner.
+
+    B2 contract:
+    - Dead owner (not in live_task_ids) → row with stranded=True, correct fields.
+    - Live owner (in live_task_ids) → NO row emitted.
+    - Owner parking two modules → single deduped row, park_state['modules'] lists both.
+    """
+    from dashboard.data.scheduler import _stranded_park_rows
+
+    iso = '2026-01-01T09:00:00+00:00'
+
+    # ── Case 1: single dead owner on one module ──
+    park_stacks = {
+        'm': [{'owner': '9', 'rank': 5, 'shadowed': False, 'installed_at': iso}]
+    }
+
+    rows = _stranded_park_rows(
+        park_stacks,
+        set(),           # live_task_ids — owner '9' is NOT live
+        project='p',
+        project_root='/p',
+    )
+
+    assert len(rows) == 1, f"Expected 1 stranded row, got {len(rows)}: {rows}"
+    r = rows[0]
+
+    assert r['task_id'] == '9', f"task_id should be the owner id, got {r['task_id']!r}"
+    assert r['stranded'] is True, "stranded must be True for dead owner"
+    assert r['parked_owner_live'] is False, "parked_owner_live must be False for dead owner"
+    assert r['project'] == 'p', f"project must be 'p', got {r['project']!r}"
+    assert r['project_root'] == '/p', f"project_root must be '/p', got {r['project_root']!r}"
+    assert r['park_state']['modules'] == ['m'], (
+        f"park_state.modules must be ['m'], got {r['park_state']['modules']!r}"
+    )
+    assert r['age_seconds'] >= 0, f"age_seconds must be >= 0, got {r['age_seconds']!r}"
+    assert r['lock_set'] == ['m'], f"lock_set must be ['m'], got {r['lock_set']!r}"
+    assert r.get('title') == '(stranded park)', (
+        f"title must be '(stranded park)', got {r.get('title')!r}"
+    )
+
+    # ── Case 2: live owner → no stranded row ──
+    rows_live = _stranded_park_rows(
+        park_stacks,
+        {'9'},           # owner '9' IS live
+        project='p',
+        project_root='/p',
+    )
+    assert rows_live == [], (
+        f"Live owner must produce no stranded rows, got {rows_live!r}"
+    )
+
+    # ── Case 3: owner parking two modules → single deduped row ──
+    park_stacks_two = {
+        'm1': [{'owner': '42', 'rank': 3, 'shadowed': False, 'installed_at': iso}],
+        'm2': [{'owner': '42', 'rank': 3, 'shadowed': False, 'installed_at': iso}],
+    }
+    rows_two = _stranded_park_rows(
+        park_stacks_two,
+        set(),           # owner '42' not live
+        project='p',
+        project_root='/p',
+    )
+    assert len(rows_two) == 1, (
+        f"Same owner on two modules must produce one deduped row, got {len(rows_two)}"
+    )
+    r2 = rows_two[0]
+    assert r2['task_id'] == '42'
+    assert sorted(r2['park_state']['modules']) == ['m1', 'm2'], (
+        f"park_state.modules must list both modules, got {r2['park_state']['modules']!r}"
+    )
+    assert sorted(r2['lock_set']) == ['m1', 'm2'], (
+        f"lock_set must list both modules, got {r2['lock_set']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1870 step-5: integration — collect_scheduler_state surfaces stranded
+#   row + modules[].parked_by
+# ---------------------------------------------------------------------------
+
+
+async def test_collect_scheduler_state_surfaces_stranded_and_parked_by(
+    dummy_client, dummy_config,
+):
+    """Integration: collect_scheduler_state populates park fields and emits stranded rows.
+
+    Snapshot carries:
+      - 'mlive': 2-deep live park (owners 'low'+'high', both in active_tasks → B1)
+      - 'mdead': orphaned dead park (owner '99' NOT in active_tasks → B2)
+    active_tasks lists 'low'/'high' with meta_files=['mlive'].
+
+    Assertions:
+      (a) A row with task_id=='99' and stranded is True exists (B2 not dropped).
+      (b) The 'mlive' module has parked_by=='high', parked_owner_live is True,
+          len(park_stack)==2.
+      (c) The 'mdead' module has parked_by=='99', parked_owner_live is False.
+      (d) The synthetic stranded row did NOT inflate any module's contention
+          (contention counts reflect live waiters only).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+    iso = '2026-01-01T10:00:00+00:00'
+
+    snapshot = _scheduler_snapshot(
+        park_stacks={
+            'mlive': [
+                {'owner': 'low', 'rank': 10, 'shadowed': True, 'installed_at': iso},
+                {'owner': 'high', 'rank': 5, 'shadowed': False, 'installed_at': iso},
+            ],
+            'mdead': [
+                {'owner': '99', 'rank': 3, 'shadowed': False, 'installed_at': iso},
+            ],
+        },
+        snapshot_at='2026-01-01T10:00:00+00:00',
+    )
+
+    # 'low' and 'high' are live; '99' is NOT in active_tasks (dead/stranded)
+    # meta_files=['mlive'] → lock_set=['mlive'] at depth=2 (single-component path)
+    active_tasks = [
+        {
+            'id': f'{project}/T-low',
+            'project': project,
+            'title': 'Low task',
+            'priority': 'low',
+            'status': 'in-progress',
+            'started': 1,
+            'meta_files': ['mlive'],
+        },
+        {
+            'id': f'{project}/T-high',
+            'project': project,
+            'title': 'High task',
+            'priority': 'high',
+            'status': 'in-progress',
+            'started': 1,
+            'meta_files': ['mlive'],
+        },
+    ]
+
+    mock_mcp = AsyncMock(side_effect=[snapshot, []])
+    mock_active = AsyncMock(return_value=(active_tasks, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        rows, modules, _pins, _events, offline, _paused = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert offline == [], f'Expected no offline projects, got {offline!r}'
+
+    # (a) B2: stranded row for dead owner '99' must appear in rows
+    stranded = [r for r in rows if r.get('task_id') == '99']
+    assert len(stranded) == 1, (
+        f"Expected 1 stranded row for owner '99', got {len(stranded)}: {stranded!r}"
+    )
+    assert stranded[0].get('stranded') is True, (
+        f"Row for owner '99' must have stranded=True, got {stranded[0]!r}"
+    )
+
+    # (b) B1: 'mlive' module has parked_by='high', parked_owner_live=True, stack depth=2
+    by_path = {m['path']: m for m in modules}
+    assert 'mlive' in by_path, (
+        f"Module 'mlive' must be in modules; got paths: {list(by_path)!r}"
+    )
+    mlive = by_path['mlive']
+    assert mlive['parked_by'] == 'high', (
+        f"mlive.parked_by must be 'high' (active top), got {mlive.get('parked_by')!r}"
+    )
+    assert mlive['parked_owner_live'] is True, (
+        f"mlive.parked_owner_live must be True, got {mlive.get('parked_owner_live')!r}"
+    )
+    assert len(mlive.get('park_stack', [])) == 2, (
+        f"mlive.park_stack must have 2 entries, got {mlive.get('park_stack')!r}"
+    )
+    # All owners in 'mlive' stack are live → has_dead_park must be False
+    assert mlive.get('has_dead_park') is False, (
+        f"mlive.has_dead_park must be False (all owners live), "
+        f"got {mlive.get('has_dead_park')!r}"
+    )
+
+    # (c) 'mdead' module has parked_by='99', parked_owner_live=False (dead park)
+    assert 'mdead' in by_path, (
+        f"Module 'mdead' must be in modules (park-only, contention=0); "
+        f"got paths: {list(by_path)!r}"
+    )
+    mdead = by_path['mdead']
+    assert mdead['parked_by'] == '99', (
+        f"mdead.parked_by must be '99', got {mdead.get('parked_by')!r}"
+    )
+    assert mdead['parked_owner_live'] is False, (
+        f"mdead.parked_owner_live must be False, got {mdead.get('parked_owner_live')!r}"
+    )
+    # Dead owner in 'mdead' → has_dead_park must be True
+    assert mdead.get('has_dead_park') is True, (
+        f"mdead.has_dead_park must be True (dead owner '99'), "
+        f"got {mdead.get('has_dead_park')!r}"
+    )
+
+    # (d) Contention must reflect live waiters only — stranded row must NOT inflate it
+    assert mlive['contention'] == 2, (
+        f"mlive.contention must be 2 (live waiters 'low'+'high'), "
+        f"got {mlive.get('contention')!r}"
+    )
+    assert mdead['contention'] == 0, (
+        f"mdead.contention must be 0 (no live waiters); "
+        f"stranded row for '99' must NOT inflate contention, "
+        f"got {mdead.get('contention')!r}"
+    )

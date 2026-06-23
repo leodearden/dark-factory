@@ -133,6 +133,74 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
   );
 }
 
+// ── Park Stacks section ──
+// Rendered in the Modules sub-tab below ModulesView.
+// For each module with a non-empty park_stack, shows the full LIFO stack
+// TOP→BOTTOM (reverse of the bottom→top snapshot order) with owner, tier,
+// age, active-top vs shadowed, and live/dead indicator.
+function ParkStacksSection({ modules }) {
+  const parked = (modules || []).filter(m => m.park_stack && m.park_stack.length > 0);
+  if (parked.length === 0) return null;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 16 }}>
+      <div style={{ fontSize: 10, color: 'var(--fg-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
+        Module Park Stacks
+      </div>
+      {parked.map(m => {
+        // Render TOP→BOTTOM (reverse of bottom→top snapshot order: stack[-1] is active top)
+        const stack = [...(m.park_stack || [])].reverse();
+        return (
+          <div key={`${m.project || ''}/${m.path}`} className="panel" style={{ padding: '10px 14px' }}>
+            <div className="mono" style={{ fontSize: 11, color: 'var(--fg-0)', marginBottom: 6 }} title={m.path}>
+              {m.path}
+              {m.project && <span style={{ marginLeft: 6, color: 'var(--fg-3)', fontSize: 10 }}>·{m.project}</span>}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {stack.map((entry, idx) => {
+                const isActive = !entry.shadowed;
+                const isDead = !entry.live;
+                const ageStr = entry.installed_at ? timeago(entry.installed_at) : null;
+                return (
+                  <div
+                    key={`${entry.owner}-${idx}`}
+                    style={{
+                      display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 11,
+                      padding: '4px 8px',
+                      background: isActive ? 'var(--bg-2)' : 'transparent',
+                      borderRadius: 4,
+                      opacity: isDead ? 0.6 : 1,
+                    }}
+                  >
+                    <span className="mono" style={{ color: isDead ? 'var(--warn)' : 'var(--accent)', fontSize: 10 }}>
+                      T-{entry.owner}
+                    </span>
+                    <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>
+                      tier {entry.rank}
+                    </span>
+                    {ageStr && (
+                      <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>{ageStr}</span>
+                    )}
+                    {isActive && (
+                      <span className="badge ok" style={{ fontSize: 9, padding: '1px 5px' }}>active</span>
+                    )}
+                    {entry.shadowed && (
+                      <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>shadowed</span>
+                    )}
+                    {isDead && (
+                      <span className="badge bad" style={{ fontSize: 9, padding: '1px 5px' }}>dead</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── Modules view ──
 // Per-module cards showing holder + waiting tasks.
 function ModulesView({ modules, rows, eventsMap }) {
@@ -433,6 +501,22 @@ function SchedulerTab() {
         </div>
       )}
 
+      {/* Stranded-parks banner — modules with any dead park owner.
+           `has_dead_park` is True if any stack entry (including shadowed) is
+           dead, so a live active-top with a dead shadowed owner is also caught.
+           This keeps the banner in agreement with the per-entry dead/live
+           indicators in ParkStacksSection and with stranded rows in the task list. */}
+      {(() => {
+        const strandedMods = visibleModules.filter(m => m.has_dead_park || (m.parked_by && !m.parked_owner_live));
+        if (strandedMods.length === 0) return null;
+        const paths = strandedMods.map(m => m.path).join(', ');
+        return (
+          <div className="badge bad" style={{ padding: '6px 12px', fontSize: 11 }}>
+            ⚠ {strandedMods.length} stranded park{strandedMods.length !== 1 ? 's' : ''}: {paths}
+          </div>
+        );
+      })()}
+
       {/* Active-Pins strip */}
       <div className="panel" style={{ padding: '8px 12px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
@@ -482,11 +566,14 @@ function SchedulerTab() {
               selectedTaskId={selectedTask ? selectedTask.task_id : null}
             />
           ) : (
-            <ModulesView
-              modules={visibleModules}
-              rows={visibleRows}
-              eventsMap={events_by_task}
-            />
+            <div>
+              <ModulesView
+                modules={visibleModules}
+                rows={visibleRows}
+                eventsMap={events_by_task}
+              />
+              <ParkStacksSection modules={visibleModules} />
+            </div>
           )}
         </div>
 
