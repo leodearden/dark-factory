@@ -771,6 +771,42 @@ class ModuleLockTable:
             result[owner]['modules'].append(module)
         return result
 
+    def snapshot_park_stacks(self) -> dict[str, list[dict]]:
+        """Return a snapshot of the full LIFO park stack per module.
+
+        Keys by MODULE (distinct from :meth:`snapshot_parks`, which keys by owner).
+        Each value is the stack list in bottom→top order — ``list[-1]`` is the
+        active top (the owner that :meth:`snapshot_parks` would report), and
+        every preceding element is a shadowed (buried) owner.
+
+        Each entry dict contains:
+        - ``owner``: str — task id
+        - ``rank``: int — PRIORITY_RANK value (lower = higher priority, INV-3)
+        - ``shadowed``: bool — True for every entry except the active top
+        - ``installed_at``: str — ISO8601 timestamp from ``_park_install_at``,
+          or ``''`` if the owner has no recorded install timestamp
+
+        INV-3: ranks are strictly decreasing top-ward (``entry[i].rank > entry[i+1].rank``).
+
+        Builds fresh dicts/lists from ``_parked`` and ``_park_install_at`` so
+        callers cannot mutate internal state.
+        """
+        result: dict[str, list[dict]] = {}
+        for module, stack in self._parked.items():
+            if not stack:
+                continue
+            last_index = len(stack) - 1
+            entries: list[dict] = []
+            for idx, (owner, rank) in enumerate(stack):
+                entries.append({
+                    'owner': owner,
+                    'rank': rank,
+                    'shadowed': idx != last_index,
+                    'installed_at': self._park_install_at.get(owner, ''),
+                })
+            result[module] = entries
+        return result
+
     def snapshot_holders(self) -> dict[str, str]:
         """Return a snapshot of current lock holders: ``{module: task_id}``.
 
@@ -3419,9 +3455,12 @@ class Scheduler:
     def get_state_snapshot(self) -> dict:
         """Return a deep-copy snapshot of current in-memory scheduler state.
 
-        Contains ten top-level keys:
+        Contains eleven top-level keys:
         - skip_counts: {task_id: int}
         - parks: {task_id: {modules: [...], installed_at: str}}
+        - park_stacks: {module: [{owner, rank, shadowed, installed_at}, ...]} —
+          full LIFO stack bottom→top per module (active top + shadowed owners);
+          additive sibling to the INV-7 top-only ``parks`` key
         - effective_priorities: {task_id: str}
         - pin_queue: [{task_id: str, order: int}, ...]
         - overrides: {task_id: {boost_tier, pinned, reserve_now, ttl_until}}
@@ -3439,6 +3478,9 @@ class Scheduler:
         # parks — delegate to the public accessor so ModuleLockTable owns its
         # own representation (no private-attribute access from Scheduler).
         parks = self.lock_table.snapshot_parks()
+
+        # park_stacks — full LIFO stack per module (additive sibling to parks).
+        park_stacks = self.lock_table.snapshot_park_stacks()
 
         # effective_priorities — already a shallow dict of str→str.
         effective_priorities = dict(self._last_effective_priorities)
@@ -3484,6 +3526,7 @@ class Scheduler:
         return {
             'skip_counts': skip_counts,
             'parks': parks,
+            'park_stacks': park_stacks,
             'effective_priorities': effective_priorities,
             'pin_queue': pin_queue,
             'overrides': overrides,

@@ -372,6 +372,110 @@ class TestParkInstallAtTracking:
 
 
 # ===========================================================================
+# Step-8b: ModuleLockTable.snapshot_park_stacks()
+# ===========================================================================
+
+class TestSnapshotParkStacks:
+    """ModuleLockTable.snapshot_park_stacks() exposes the full LIFO park stack per module."""
+
+    def _make_lock_table(self) -> ModuleLockTable:
+        return ModuleLockTable(OrchestratorConfig(max_per_module=1))
+
+    def test_includes_shadowed_owners_bottom_to_top(self):
+        """B1 boundary: buried owner appears in park_stacks but not in snapshot_parks().
+
+        User-observable signal at the producer level: snapshot_park_stacks()
+        surfaces L even though snapshot_parks() omits it (INV-7).
+        """
+        lt = self._make_lock_table()
+        lt.install_parks('L', ['mod/a'], 'low')   # installed first → bottom of stack
+        lt.install_parks('H', ['mod/a'], 'high')  # installed second → active top
+
+        stacks = lt.snapshot_park_stacks()
+        assert 'mod/a' in stacks
+        entries = stacks['mod/a']
+        assert len(entries) == 2, f'Expected 2-deep stack, got {entries}'
+
+        # bottom entry: L (shadowed)
+        e0 = entries[0]
+        assert e0['owner'] == 'L'
+        assert e0['shadowed'] is True
+        assert isinstance(e0['rank'], int)
+        datetime.fromisoformat(e0['installed_at'])
+
+        # top entry: H (active)
+        e1 = entries[1]
+        assert e1['owner'] == 'H'
+        assert e1['shadowed'] is False
+        assert isinstance(e1['rank'], int)
+        datetime.fromisoformat(e1['installed_at'])
+
+        # INV-3: shadowed (bottom) entry must have strictly higher rank value than active top
+        # low=3, high=1 → L.rank(3) > H.rank(1) ✓
+        assert entries[0]['rank'] > entries[1]['rank'], (
+            f"Expected L rank > H rank (shadowed > active-top), "
+            f"got {entries[0]['rank']} <= {entries[1]['rank']}"
+        )
+
+        # User-observable signal: snapshot_parks() only has H, not L
+        snap = lt.snapshot_parks()
+        assert 'H' in snap
+        assert 'L' not in snap
+
+    def test_rank_strictly_decreasing_top_ward(self):
+        """INV-3: ranks must be strictly decreasing toward the top (last element)."""
+        lt = self._make_lock_table()
+        lt.install_parks('L', ['mod/a'], 'low')     # rank 3, becomes bottom
+        lt.install_parks('M', ['mod/a'], 'medium')  # rank 2, shadows L
+        lt.install_parks('H', ['mod/a'], 'high')    # rank 1, shadows M → active top
+
+        entries = lt.snapshot_park_stacks()['mod/a']
+        assert len(entries) == 3, f'Expected 3-deep stack, got {entries}'
+
+        for i in range(len(entries) - 1):
+            assert entries[i]['rank'] > entries[i + 1]['rank'], (
+                f'Rank not strictly decreasing top-ward: '
+                f'entry[{i}].rank={entries[i]["rank"]} <= entry[{i + 1}].rank={entries[i + 1]["rank"]}'
+            )
+        # Active top (last element) must not be shadowed; all others must be
+        assert entries[-1]['shadowed'] is False
+        for e in entries[:-1]:
+            assert e['shadowed'] is True
+
+    def test_empty_when_no_parks(self):
+        """Fresh table returns empty dict."""
+        lt = self._make_lock_table()
+        assert lt.snapshot_park_stacks() == {}
+
+    def test_is_non_aliasing_and_installed_at_default(self):
+        """Returned dicts/lists must not alias internal state; '' default for unknown installed_at."""
+        lt = self._make_lock_table()
+        lt.install_parks('L', ['mod/a'], 'low')
+        lt.install_parks('H', ['mod/a'], 'high')
+
+        stacks = lt.snapshot_park_stacks()
+
+        # Mutate the returned list and entry dict
+        stacks['mod/a'].append({'owner': 'INJECTED', 'rank': 99, 'shadowed': False, 'installed_at': ''})
+        stacks['mod/a'][0]['owner'] = 'MUTATED'
+
+        # Internal _parked must be unchanged
+        assert lt._parked['mod/a'][0][0] == 'L', '_parked must not be aliased via entry dict'
+        assert len(lt._parked['mod/a']) == 2, '_parked list must not be aliased by append'
+
+        # Future calls are unaffected by the mutation
+        fresh = lt.snapshot_park_stacks()
+        assert len(fresh['mod/a']) == 2
+        assert fresh['mod/a'][0]['owner'] == 'L'
+
+        # White-box: inject an owner absent from _park_install_at → '' default
+        lt._parked['mod/z'] = [('ghost', 0)]
+        assert 'ghost' not in lt._park_install_at
+        ghost_entries = lt.snapshot_park_stacks()['mod/z']
+        assert ghost_entries[0]['installed_at'] == ''
+
+
+# ===========================================================================
 # Step-9: _last_effective_priorities cache
 # ===========================================================================
 
@@ -420,16 +524,16 @@ class TestEffectivePrioritiesCache:
 # ===========================================================================
 
 _SNAPSHOT_KEYS = frozenset({
-    'skip_counts', 'parks', 'effective_priorities',
+    'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
     'is_paused', 'pause_reason',
 })
 
 
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns the correct ten-key dict."""
+    """get_state_snapshot() returns the correct eleven-key dict."""
 
-    def test_snapshot_returns_ten_top_level_keys(self):
+    def test_snapshot_returns_eleven_top_level_keys(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         snap = scheduler.get_state_snapshot()
         assert set(snap.keys()) == _SNAPSHOT_KEYS
@@ -439,6 +543,7 @@ class TestGetStateSnapshotShape:
         snap = scheduler.get_state_snapshot()
         assert snap['skip_counts'] == {}
         assert snap['parks'] == {}
+        assert snap['park_stacks'] == {}
         assert snap['effective_priorities'] == {}
         assert snap['pin_queue'] == []
         assert snap['overrides'] == {}
@@ -448,6 +553,35 @@ class TestGetStateSnapshotShape:
         # Pause state defaults — scheduler is not paused at construction.
         assert snap['is_paused'] is False
         assert snap['pause_reason'] is None
+
+    def test_snapshot_exposes_park_stacks_with_shadowed_owner(self):
+        """park_stacks surfaces buried owners that parks omits (user-observable signal).
+
+        install low then high on the same module; get_state_snapshot() must
+        return park_stacks with BOTH owners while parks contains only the
+        active-top owner — pinning the backward-compatible additive key.
+        """
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        lt = scheduler.lock_table
+        lt.install_parks('L', ['mod/a'], 'low')   # becomes bottom (shadowed)
+        lt.install_parks('H', ['mod/a'], 'high')  # becomes active top
+
+        snap = scheduler.get_state_snapshot()
+
+        # parks: only active top (INV-7 backward-compat shape unchanged)
+        assert 'H' in snap['parks'], 'Active-top H must appear in parks'
+        assert 'L' not in snap['parks'], 'Buried L must NOT appear in parks'
+
+        # park_stacks: full stack, both owners present
+        assert 'mod/a' in snap['park_stacks'], 'mod/a must appear in park_stacks'
+        entries = snap['park_stacks']['mod/a']
+        assert len(entries) == 2, f'Expected 2-deep stack in park_stacks, got {entries}'
+        owners = [e['owner'] for e in entries]
+        assert 'L' in owners, 'Buried L must appear in park_stacks'
+        assert 'H' in owners, 'Active H must appear in park_stacks'
+        # shadowed flags
+        assert entries[0]['shadowed'] is True   # L at bottom
+        assert entries[1]['shadowed'] is False  # H at top
 
     def test_snapshot_exposes_lock_depth(self):
         # lock_depth lets the dashboard normalize footprints the same way the
