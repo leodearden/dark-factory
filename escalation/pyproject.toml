@@ -17,6 +17,9 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+[project.scripts]
+escalation = "escalation.submit:main"
+
 [dependency-groups]
 dev = [
     "pyright>=1.1.404",
