@@ -24,7 +24,6 @@ from orchestrator.harness import Harness
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
-
 # ---------------------------------------------------------------------------
 # Task-dict builders
 # ---------------------------------------------------------------------------
@@ -169,7 +168,7 @@ def _build_harness(mock_orch_config, queue_dir: Path, store: _StoreScheduler) ->
     ):
         h = Harness(mock_orch_config)
 
-    h.scheduler = store
+    h.scheduler = store  # type: ignore[assignment]
     h._escalation_queue = EscalationQueue(queue_dir)
     git_ops = MagicMock()
     git_ops.release_lane_for_terminal_task = AsyncMock()
@@ -202,6 +201,7 @@ async def _dispatch(h: Harness, task_id: str):
     Returns the TaskReport returned by _run_slot.
     """
     task = await h.scheduler.get_task(str(task_id))
+    assert task is not None
     assignment = _make_assignment(task)
     return await h._run_slot(assignment, asyncio.Semaphore(1))
 
@@ -226,7 +226,7 @@ class TestSmoke:
         self, det_harness: Harness
     ) -> None:
         """update_task(metadata_mode='merge') merges fields and preserves existing fields."""
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id='smoke-1')
         store.seed(task)
 
@@ -242,7 +242,7 @@ class TestSmoke:
 
     async def test_store_scheduler_set_status_persists(self, det_harness: Harness) -> None:
         """set_task_status persists status transitions and done_provenance."""
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id='smoke-2')
         store.seed(task)
 
@@ -311,7 +311,7 @@ class TestB2GateDepsOk:
 
     async def test_dispatch_returns_blocked_report(self, det_harness: Harness) -> None:
         """_run_slot returns BLOCKED with block_reason='deterministic_gate'."""
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
         store.seed(task)
 
@@ -323,7 +323,7 @@ class TestB2GateDepsOk:
 
     async def test_store_status_becomes_blocked(self, det_harness: Harness) -> None:
         """_StoreScheduler reflects 'blocked' status after gate dispatch."""
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
         store.seed(task)
 
@@ -333,13 +333,13 @@ class TestB2GateDepsOk:
 
     async def test_exactly_one_born_at_l2_escalation(self, det_harness: Harness) -> None:
         """Exactly one pending L2 milestone_gate escalation is filed."""
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
         store.seed(task)
 
         await _dispatch(det_harness, 'gate-b2')
 
-        queue: EscalationQueue = det_harness._escalation_queue
+        queue: EscalationQueue = det_harness._escalation_queue  # type: ignore[assignment]
         pending = queue.get_by_task('gate-b2', status='pending')
         assert len(pending) == 1, f'Expected 1 pending escalation, got {len(pending)}'
 
@@ -351,7 +351,7 @@ class TestB2GateDepsOk:
 
     async def test_gate_escalated_at_stamped(self, det_harness: Harness) -> None:
         """metadata.gate_escalated_at is stamped in the store after dispatch."""
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
         store.seed(task)
 
@@ -364,7 +364,7 @@ class TestB2GateDepsOk:
 
     async def test_no_worktree_or_branch_created(self, det_harness: Harness) -> None:
         """No worktree/branch/agent is created — runner is built without git_ops (I4/B2)."""
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
         store.seed(task)
 
@@ -395,7 +395,7 @@ class TestB3Quiescence:
 
     async def _reach_b2_state(self, h: Harness) -> None:
         """Seed a gate and dispatch once to reach the B2 blocked+L2 state."""
-        store: _StoreScheduler = h.scheduler
+        store: _StoreScheduler = h.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id='gate-b3', title='Quiescence gate')
         store.seed(task)
         await _dispatch(h, 'gate-b3')
@@ -420,7 +420,7 @@ class TestB3Quiescence:
         await _dispatch(det_harness, 'gate-b3')
         await _dispatch(det_harness, 'gate-b3')
 
-        queue: EscalationQueue = det_harness._escalation_queue
+        queue: EscalationQueue = det_harness._escalation_queue  # type: ignore[assignment]
         pending = queue.get_by_task('gate-b3', status='pending')
         assert len(pending) == 1, (
             f'Expected exactly 1 pending escalation after quiescent re-dispatches, '
@@ -436,7 +436,7 @@ class TestB3Quiescence:
         await _dispatch(det_harness, 'gate-b3')
         await _dispatch(det_harness, 'gate-b3')
 
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         assert await store.get_status('gate-b3') == 'blocked'
 
 
@@ -463,7 +463,7 @@ class TestB4Proceed:
 
     async def _reach_resolved_state(self, h: Harness, task_id: str) -> None:
         """Dispatch → B2 state, then resolve the L2 and re-pend via resume."""
-        store: _StoreScheduler = h.scheduler
+        store: _StoreScheduler = h.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id=task_id, title='Proceed gate')
         store.seed(task)
 
@@ -471,7 +471,7 @@ class TestB4Proceed:
         await _dispatch(h, task_id)
 
         # Resolve the L2 so it leaves the pending set
-        queue: EscalationQueue = h._escalation_queue
+        queue: EscalationQueue = h._escalation_queue  # type: ignore[assignment]
         pending = queue.get_by_task(task_id, status='pending')
         assert pending, 'Pre-condition: must have a pending L2 after first dispatch'
         queue.resolve(pending[0].id, resolution='proceed')
@@ -493,7 +493,7 @@ class TestB4Proceed:
         await self._reach_resolved_state(det_harness, 'gate-b4')
         await _dispatch(det_harness, 'gate-b4')
 
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         assert await store.get_status('gate-b4') == 'done'
 
     async def test_no_new_escalation_after_resume(self, det_harness: Harness) -> None:
@@ -501,7 +501,7 @@ class TestB4Proceed:
         await self._reach_resolved_state(det_harness, 'gate-b4')
         await _dispatch(det_harness, 'gate-b4')
 
-        queue: EscalationQueue = det_harness._escalation_queue
+        queue: EscalationQueue = det_harness._escalation_queue  # type: ignore[assignment]
         # The original L2 is archived (resolved); no new pending L2 should appear
         assert queue.get_by_task('gate-b4', status='pending') == []
 
@@ -549,7 +549,7 @@ class TestB5NoGo:
         self, h: Harness, gate_id: str, n_id: str,
     ) -> None:
         """Reach B2 blocked state, then resolve + restart to clear stamps + add dep."""
-        store: _StoreScheduler = h.scheduler
+        store: _StoreScheduler = h.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id=gate_id, title='No-go gate')
         store.seed(task)
 
@@ -557,7 +557,7 @@ class TestB5NoGo:
         await _dispatch(h, gate_id)
 
         # Resolve the L2 (operator decides: no-go, re-examine)
-        queue: EscalationQueue = h._escalation_queue
+        queue: EscalationQueue = h._escalation_queue  # type: ignore[assignment]
         pending = queue.get_by_task(gate_id, status='pending')
         assert pending, 'Pre-condition: pending L2 must exist after first dispatch'
         queue.resolve(pending[0].id, resolution='no-go')
@@ -583,7 +583,7 @@ class TestB5NoGo:
         """gate_escalated_at is cleared after restart (stamp-clear mechanism, I2/B5)."""
         await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
 
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         gate = await store.get_task('gate-b5')
         assert gate is not None
         assert gate['metadata'].get('gate_escalated_at') is None
@@ -591,7 +591,7 @@ class TestB5NoGo:
     async def test_gate_repended_after_restart(self, det_harness: Harness) -> None:
         """Gate status is 'pending' after restart (line survives — not done/cancelled)."""
         await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         assert await store.get_status('gate-b5') == 'pending'
 
     async def test_original_l2_no_longer_pending_after_restart(
@@ -599,7 +599,7 @@ class TestB5NoGo:
     ) -> None:
         """The original L2 is resolved before restart — no pending escalation remains."""
         await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
-        queue: EscalationQueue = det_harness._escalation_queue
+        queue: EscalationQueue = det_harness._escalation_queue  # type: ignore[assignment]
         assert queue.get_by_task('gate-b5', status='pending') == []
 
     async def test_deps_not_satisfied_while_n_pending(
@@ -611,7 +611,7 @@ class TestB5NoGo:
         scheduler = Scheduler(config)
         await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
 
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         gate = await store.get_task('gate-b5')
         assert gate is not None
         assert scheduler._deps_satisfied(gate, {'N-1': 'pending'}) is False
@@ -625,7 +625,7 @@ class TestB5NoGo:
         scheduler = Scheduler(config)
         await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
 
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         # Land N
         await store.set_task_status('N-1', 'done')
         gate = await store.get_task('gate-b5')
@@ -637,7 +637,7 @@ class TestB5NoGo:
         assert report is not None
         assert report.outcome == WorkflowOutcome.BLOCKED
 
-        queue: EscalationQueue = det_harness._escalation_queue
+        queue: EscalationQueue = det_harness._escalation_queue  # type: ignore[assignment]
         pending = queue.get_by_task('gate-b5', status='pending')
         assert len(pending) == 1, (
             f'Expected fresh L2 after re-dispatch, got {len(pending)} pending'
@@ -798,6 +798,7 @@ class TestB11RestartReplay:
         task = _gate_task(task_id='gate-b11', title='B11 restart gate')
         store.seed(task)
         report1 = await _dispatch(h1, 'gate-b11')
+        assert report1 is not None
         assert report1.outcome == WorkflowOutcome.BLOCKED
 
         # Verify B2 preconditions
@@ -810,6 +811,7 @@ class TestB11RestartReplay:
         # Simulate orchestrator restart: fresh Harness, SAME queue_dir + SAME store
         h2 = _build_harness(mock_orch_config, queue_dir, store)
         report2 = await _dispatch(h2, 'gate-b11')
+        assert report2 is not None
 
         # Section 1 quiescence: gate_escalated_at set + pending L2 → BLOCKED
         assert report2.outcome == WorkflowOutcome.BLOCKED
@@ -877,6 +879,7 @@ class TestB11RestartReplay:
         # Build runner directly with injected seams (no real systemd)
         script_runner = AsyncMock(name='script_runner')
         task_dict = await store.get_task(task_id)
+        assert task_dict is not None
         assignment = _make_assignment(task_dict)
         runner = DeterministicRunner(
             scheduler=store,
@@ -960,6 +963,7 @@ class TestB6CrossUnitDeploy:
         assignment = _make_assignment(task)
         await runner.run(assignment)
         retrieved = await store.get_task('deploy-b6')
+        assert retrieved is not None
         provenance = retrieved['metadata'].get('done_provenance', {})
         assert provenance.get('kind') == 'deterministic-deploy'
 
@@ -977,6 +981,7 @@ class TestB6CrossUnitDeploy:
         assignment = _make_assignment(task)
         await runner.run(assignment)
         retrieved = await store.get_task('deploy-b6')
+        assert retrieved is not None
         provenance = retrieved['metadata'].get('done_provenance', {})
         assert provenance.get('pid') == _FRESH_UNIT_STATE['MainPID'], (
             f"Expected fresh PID {_FRESH_UNIT_STATE['MainPID']}, "
@@ -999,6 +1004,7 @@ class TestB6CrossUnitDeploy:
         assignment = _make_assignment(task)
         await runner.run(assignment)
         retrieved = await store.get_task('deploy-b6')
+        assert retrieved is not None
         meta = retrieved['metadata']
         assert meta.get('before_done_ran_at') is not None, (
             'before_done_ran_at must be stamped after deploy'
@@ -1067,6 +1073,7 @@ class TestB7DeployFailure:
 
         # before_done_ran_at stamped (crash-safe I1 stamp-before-run)
         retrieved = await store.get_task(task_id)
+        assert retrieved is not None
         assert retrieved['metadata'].get('before_done_ran_at') is not None
 
     async def test_b7a_rc_nonzero_blocked_and_l2(self, tmp_path: Path) -> None:
@@ -1107,6 +1114,7 @@ class TestB7DeployFailure:
 
         # Reaper re-pass: re-read task (persisted stamps visible) + re-run
         task2 = await store.get_task(task_id)
+        assert task2 is not None
         assignment2 = _make_assignment(task2)
         runner2 = _build_runner(
             store, queue,
@@ -1146,6 +1154,7 @@ class TestB7DeployFailure:
         call_count_after_first = script_runner.await_count
 
         task2 = await store.get_task(task_id)
+        assert task2 is not None
         assignment2 = _make_assignment(task2)
         # New runner with fresh unit_inspector (only returns baseline — never called again)
         unit_inspector2 = AsyncMock(return_value=_BASELINE_UNIT_STATE)
@@ -1255,6 +1264,7 @@ class TestB8SelfRestart:
         assignment = _make_assignment(task)
         await runner.run(assignment)
         retrieved = await store.get_task('deploy-b8')
+        assert retrieved is not None
         provenance = retrieved['metadata'].get('done_provenance', {})
         assert provenance.get('kind') == 'deterministic-deploy-scheduled'
         assert 'transient_unit' in provenance
@@ -1273,6 +1283,7 @@ class TestB8SelfRestart:
         assignment = _make_assignment(task)
         await runner.run(assignment)
         retrieved = await store.get_task('deploy-b8')
+        assert retrieved is not None
         meta = retrieved['metadata']
         assert meta.get('before_done_ran_at') is not None, (
             'before_done_ran_at must be stamped (crash-safe I1)'
@@ -1571,13 +1582,13 @@ class TestB12NoStrandNoWorktree:
         has_open_l1 (which only matches level=1 escalations — queue.py:392).
         """
         gate_id = 'gate-b12-strand'
-        store: _StoreScheduler = reaper_harness.scheduler
+        store: _StoreScheduler = reaper_harness.scheduler  # type: ignore[assignment]
         gate = _gate_task(task_id=gate_id, title='B12 strand gate')
         gate['status'] = 'blocked'
         store.seed(gate)
 
         # Submit a pending born-at-L2 (level=2 — NOT an L1)
-        queue: EscalationQueue = reaper_harness._escalation_queue
+        queue: EscalationQueue = reaper_harness._escalation_queue  # type: ignore[assignment]
         esc = Escalation(
             id=queue.make_id(gate_id),
             task_id=gate_id,
@@ -1617,7 +1628,7 @@ class TestB12NoStrandNoWorktree:
         self, det_harness: Harness,
     ) -> None:
         """Dispatching a gate never calls git_ops.create_worktree (no-branch, I4)."""
-        store: _StoreScheduler = det_harness.scheduler
+        store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
         task = _gate_task(task_id='gate-b12-wt', title='B12 worktree gate')
         store.seed(task)
 
