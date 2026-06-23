@@ -388,6 +388,12 @@ def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCa
             # Idempotent/never-raise via the shared primitive.
             if git_ops is not None:
                 await git_ops.release_lane_for_terminal_task(mid)
+            else:
+                logger.debug(
+                    'train %s: B3 lane release skipped for %s — '
+                    'factory built without git_ops (missing wiring?)',
+                    train_id, mid,
+                )
 
         async def redrive_member(mid: str, found_on_main: bool, sha: str | None) -> None:
             # Existence check (mirrors mark_member_done): non-task members
@@ -414,6 +420,12 @@ def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCa
                 # Idempotent/never-raise via the shared primitive.
                 if git_ops is not None:
                     await git_ops.release_lane_for_terminal_task(mid)
+                else:
+                    logger.debug(
+                        'train %s: B3 lane release skipped for %s — '
+                        'factory built without git_ops (missing wiring?)',
+                        train_id, mid,
+                    )
             else:
                 # Race-condition guard: re-check the current status from the
                 # probe we just issued.  If the member has advanced to a live
@@ -1919,6 +1931,17 @@ Output JSON matching the schema. Every task must appear in the output.
         Fail-safe MIRRORS ``_reap_orphan_worktrees``: an empty or errored
         ``get_statuses`` result ABORTS the whole sweep — never mass-free.
 
+        NOTE: there is an intentional conflation of two abort triggers:
+        (a) transient DB failure — ``get_statuses`` returned an error, and
+        (b) all assigned tasks were deleted — ``get_statuses`` returns ``{}``
+            because the scheduler filtered out every unknown id.
+        In case (b), the reconciler will not free those orphaned lanes; they
+        are expected to be caught eventually by ``_reap_orphan_worktrees`` (if
+        enabled) or by the next reconciler pass once the tasks are re-created.
+        This is accepted because case (a) and (b) are indistinguishable at the
+        ``resolver_failed`` check level and the never-mass-free invariant takes
+        precedence.
+
         Wired into:
         - startup (after ``_reap_orphan_worktrees``, before first ``acquire_next``)
         - ``_stranded_reconcile_loop`` (after ``_reconcile_stranded_in_progress``)
@@ -1958,7 +1981,14 @@ Output JSON matching the schema. Every task must appear in the output.
                     self.event_store.emit(
                         EventType.worktree_reaped,
                         task_id=branch,
-                        data={'reason': 'terminal-lane-reconciler', 'status': status},
+                        data={
+                            'reason': 'terminal-lane-reconciler',
+                            'status': status,
+                            # warm lane is FREE'd but NOT removed from disk —
+                            # use this flag to avoid over-counting worktree
+                            # removals in telemetry/downstream consumers.
+                            'warm_lane_retained': True,
+                        },
                     )
 
         if released:

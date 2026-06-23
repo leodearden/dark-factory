@@ -2106,8 +2106,10 @@ class GitOps:
         in-memory assignment map was not rebuilt for a terminal task).
 
         Uses a local ``import json as _json`` (mirrors git_ops.py:1816 idiom —
-        no module-level ``import json``).  Catches ``(ValueError, OSError)``
-        per corrupt/missing plan; never raises.
+        no module-level ``import json``).  Hoisted once above the loop rather
+        than repeated per entry (import is cached after first call, but
+        re-executing the statement inside the loop is needlessly noisy).
+        Catches ``(ValueError, OSError)`` per corrupt/missing plan; never raises.
 
         Returns the lane ``Path`` whose ``plan.json`` carries
         ``str(plan.get('task_id')) == task_id``, or ``None`` if not found.
@@ -2122,6 +2124,7 @@ class GitOps:
             entries = list(base.iterdir())
         except OSError:
             return None
+        import json as _json  # local-import idiom; hoisted above loop
         for entry in entries:
             if not entry.is_dir():
                 continue
@@ -2131,7 +2134,6 @@ class GitOps:
                 plan_path = entry / '.task' / 'plan.json'
                 if not plan_path.exists():
                     continue
-                import json as _json
                 data = _json.loads(plan_path.read_text())
                 if str(data.get('task_id')) == task_id:
                     return entry
