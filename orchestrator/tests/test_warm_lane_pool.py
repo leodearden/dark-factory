@@ -9,6 +9,7 @@ Step-5: RED — GitOps._seed_warm_lane absent.
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -2492,7 +2493,7 @@ class TestReleaseLaneForTerminalTask:
 
         orig_cleanup = git_ops.cleanup_worktree
 
-        async def spy_cleanup(*args: object, **kwargs: object) -> object:
+        async def spy_cleanup(*args: Any, **kwargs: Any) -> Any:
             cleanup_called.append(args)
             return await orig_cleanup(*args, **kwargs)
 
