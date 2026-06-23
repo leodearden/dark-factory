@@ -5849,6 +5849,183 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return buf.popleft()
         return None
 
+    # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
+
+    def _frozen_inflight_entries(self) -> list[InflightEntry]:
+        """Return ordered list of frozen InflightEntry objects (ε=1890).
+
+        Frozen = currently verifying.  The frozen prefix is the immutable
+        head of the pipeline; items here must never be reordered or re-based
+        while verification is in flight.
+
+        Definition (§5.3):
+          frozen = (self._finalizing_head if its phase is a verify/finalize phase)
+                   + [e for e in self._inflight if e.verify_task is not None]
+
+        Passthroughs (verify_task=None: conflict/already_merged/skip) are NOT
+        frozen — they carry no merge_commit and are not part of the verify
+        frontier.
+
+        Pure/synchronous — mirrors _pop_next_pickable.
+        """
+        entries: list[InflightEntry] = []
+        if (
+            self._finalizing_head is not None
+            and self._finalizing_head.phase in {'verifying', 'gate_reverify', 'finalizing'}
+        ):
+            entries.append(self._finalizing_head)
+        for e in self._inflight:
+            if e.verify_task is not None:
+                entries.append(e)
+        return entries
+
+    def frozen_prefix(self) -> tuple[str, ...]:
+        """Return request_ids of the frozen prefix in submission order (ε=1890).
+
+        The frozen prefix is the immutable head of the pipeline: items that
+        are currently in a verify / finalize phase.  Submission order matches
+        the finalizing_head (if any) followed by _inflight left-to-right.
+
+        Pure/synchronous (no await).
+        """
+        return tuple(e.item.request.request_id for e in self._frozen_inflight_entries())
+
+    def unfrozen_suffix(self) -> tuple[str, ...]:
+        """Return request_ids of the unfrozen suffix in pick order (ε=1890).
+
+        The unfrozen suffix is the lane-buffer region: items in _lane_buffers
+        (high lane before normal, FIFO within each lane).  These may be
+        reordered / inserted freely; any reorder triggers a suffix-only
+        recompute (recompute_suffix_conflict_graph).
+
+        Pure/synchronous (no await).
+        """
+        rids: list[str] = []
+        for lane in MERGE_LANES:  # high → normal, FIFO within lane
+            rids.extend(req.request_id for req in self._lane_buffers[lane])
+        return tuple(rids)
+
+    def _newest_frozen_commit(self) -> str | None:
+        """Return the newest frozen entry's merge_commit, or None (ε=1890).
+
+        Iterates _frozen_inflight_entries() in reverse (newest first) and
+        returns the first non-None merge_commit found.  Entries with no
+        merge_result (passthroughs) are skipped.
+
+        Pure/synchronous.
+        """
+        for entry in reversed(self._frozen_inflight_entries()):
+            mr = entry.item.merge_result
+            if mr is not None and mr.merge_commit:
+                return mr.merge_commit.strip()
+        return None
+
+    def frozen_prefix_tip(self, main_sha: str) -> str:
+        """Return the base SHA that η should stack bounce/verify onto (ε=1890).
+
+        Returns the newest frozen item's merge_commit (the tip of the frozen
+        speculative stack) when the frozen prefix is non-empty, or main_sha
+        when the frozen prefix is empty (tip == main when no item is verifying).
+
+        Pure/synchronous (takes main_sha as a parameter to stay await-free,
+        mirroring _pop_next_pickable's "Pure/synchronous" pattern so callers
+        such as snapshot() and unit tests work without an event loop).
+        """
+        tip = self._newest_frozen_commit()
+        return tip if tip is not None else main_sha
+
+    def check_frozen_prefix_invariant(self, main_sha: str) -> list[str]:
+        """Return §5.3 violations as human-readable strings (empty = healthy) (ε=1890).
+
+        λ's integration-gate seam: callers assert violations == [] to gate a
+        lane advance, a reorder, or a deploy.
+
+        Checks performed:
+          1. Base-chain integrity: for each frozen entry in submission order,
+             expected_base = predecessor's merge_commit (or main_sha for the
+             first entry).  If the entry has a merge_result AND its base_sha
+             does not match expected_base, record a violation naming the rid,
+             expected, and actual base.  Entries with no merge_result
+             (passthrough / conflict) are skipped — they carry no commit.
+          2. Frozen/suffix disjointness: any rid that appears in BOTH
+             frozen_prefix() and unfrozen_suffix() is a structural bug; record
+             one violation per duplicate.
+
+        Pure/synchronous — reads stored in-memory state, no await.
+        """
+        violations: list[str] = []
+        frozen_entries = self._frozen_inflight_entries()
+
+        # ── 1. Base-chain integrity ───────────────────────────────────────────
+        expected_base = main_sha.strip()
+        for entry in frozen_entries:
+            rid = entry.item.request.request_id
+            mr = entry.item.merge_result
+            if mr is None or not mr.merge_commit:
+                # No merge_commit — nothing to chain; advance expected_base
+                # only if there IS a commit to chain to (skip for passthroughs).
+                continue
+            actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
+            if actual_base != expected_base:
+                violations.append(
+                    f'frozen-prefix base-chain broken at {rid}: '
+                    f'expected base {expected_base!r} but item has {actual_base!r}'
+                )
+            # Advance expected_base for the next entry regardless of violation,
+            # so subsequent chain errors are also surfaced (not shadowed).
+            expected_base = mr.merge_commit.strip()
+
+        # ── 2. Frozen/suffix disjointness ────────────────────────────────────
+        frozen_set = set(self.frozen_prefix())
+        suffix_set = set(self.unfrozen_suffix())
+        for rid in sorted(frozen_set & suffix_set):
+            violations.append(
+                f'frozen-prefix disjointness violated: {rid!r} appears in both '
+                f'frozen prefix and unfrozen suffix'
+            )
+
+        return violations
+
+    def _warn_if_verify_base_not_frozen_tip(
+        self,
+        item: SpeculativeItem,
+        main_sha: str,
+    ) -> None:
+        """Log a WARNING when a real-verify dispatch base is not the frozen tip (ε=1890).
+
+        §5.3 invariant: a verify may only start against a base that is the tip
+        of the frozen prefix.  This guard detects "verify against a
+        speculative-only base" and surfaces it as a WARNING for observability
+        (λ integration gate / production debugging) WITHOUT changing control
+        flow, raising, or mutating any state.
+
+        Called from _dispatch_item immediately before launching the real-verify
+        task.  main_sha must be the caller's already-fetched get_main_sha()
+        result (fail-open: the guard is skipped entirely on get_main_sha error,
+        so this method is never reached with a stale/empty sha argument).
+
+        Entries with no merge_result (passthrough/conflict) are excluded:
+        they carry no merge_commit and are not part of the frozen prefix.
+
+        Pure/synchronous (no await).  Returns None in all cases.
+        """
+        if item.merge_result is None or not item.base_sha:
+            return  # passthrough / conflict — not a real-verify candidate
+        expected_tip = self.frozen_prefix_tip(main_sha)
+        if item.base_sha.strip() == expected_tip.strip():
+            return  # invariant holds
+        logger.warning(
+            'ε=1890 §5.3 guard: task %s (rid=%s) dispatched for real-verify '
+            'against a base (%r) that is NOT the frozen-prefix tip (%r); '
+            'verify_depth=%d.  This may indicate a verify against a '
+            'speculative-only base.  Control flow is unchanged (log-only guard).',
+            item.request.task_id,
+            item.request.request_id,
+            item.base_sha,
+            expected_tip,
+            len(self.frozen_prefix()),
+        )
+
     async def recompute_suffix_conflict_graph(self) -> None:
         """Recompute and store the conflict-graph over the unfrozen suffix (task δ=1889).
 
@@ -5883,9 +6060,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         synchronous and cheap (reads the stored graph; no await).
         """
         # ── 1. Build ordered suffix list ──────────────────────────────────────
+        # ε=1890 defensive exclusion: frozen items (currently verifying) must
+        # never appear as suffix-graph nodes — the frozen/suffix partition is
+        # invariant (§5.3). Compute the frozen-rid set once, then filter.
+        frozen_rids: frozenset[str] = frozenset(self.frozen_prefix())
         suffix: list[MergeRequest] = []
         for lane in MERGE_LANES:  # high → normal
-            suffix.extend(self._lane_buffers[lane])  # FIFO within each lane
+            for req in self._lane_buffers[lane]:  # FIFO within each lane
+                if req.request_id not in frozen_rids:
+                    suffix.append(req)
 
         ordered_rids = tuple(req.request_id for req in suffix)
 
@@ -6028,8 +6211,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # ── 7. Probe each suffix item vs main_sha (conflicts_with_main marker) ──
         # This is the δ user-signal: "a new submission that conflicts with main
-        # is marked."  Base = current main_sha (ε later generalises to the
-        # frozen-prefix tip; δ uses bare main per design decision §δ.5).
+        # is marked."  Base = current main_sha.  δ uses bare main per design
+        # decision §δ.5; ε (this task) provides frozen_prefix_tip() as the
+        # seam — η (consumer task) repoints the conflicts_with_main probe base
+        # to frozen_prefix_tip() so the probe correctly targets the frozen tip
+        # rather than raw main when the frozen prefix is non-empty.
         # Reuses the same _probe_cache by (frozenset({main_sha, head})) key so
         # if any textual-edge probe already ran main_sha vs head, the result
         # is returned from cache rather than forking another subprocess.
@@ -6402,6 +6588,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # head_of_line/verify_in_progress/occupancy/is_wip_halted/
             # halt_owner_esc_id/suffix_conflict_graph).
             'metrics': self._merge_metrics.as_snapshot(),
+            # ε=1890 additive key: frozen-prefix / verify-frontier partition.
+            # Populated by the pure frozen_prefix() / _newest_frozen_commit()
+            # accessors — pure synchronous read, no await, no git calls.
+            # No collision with existing keys (entries/depth/head_of_line/
+            # verify_in_progress/occupancy/is_wip_halted/halt_owner_esc_id/
+            # suffix_conflict_graph/metrics).
+            'frozen_prefix': {
+                'request_ids': list(self.frozen_prefix()),
+                'tip_merge_commit': self._newest_frozen_commit(),
+                'verify_depth': len(self.frozen_prefix()),
+            },
         }
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
@@ -9707,6 +9904,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # is single-threaded and _dispatch_item is the only acquirer).
             # Return None defensively so the caller puts the item back.
             return None
+
+        # ── ε=1890 log-only §5.3 guard: verify base must be frozen-prefix tip ──
+        # Fail-open: fetch main_sha in a try/except so a transient git error
+        # never blocks verify dispatch.  The guard is purely observational —
+        # it never changes control flow.  NOT wired into _verify_and_advance
+        # (the compat shim used by direct-call tests) to keep shim tests green.
+        try:
+            _guard_main_sha = await self._git_ops.get_main_sha()
+            self._warn_if_verify_base_not_frozen_tip(item, _guard_main_sha)
+        except Exception:
+            pass  # fail-open: skip the check on any git error
 
         # ── Launch background verify task ────────────────────────────────────
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
