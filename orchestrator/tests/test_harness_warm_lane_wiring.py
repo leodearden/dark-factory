@@ -681,3 +681,177 @@ class TestMarkInProgressDoneLaneRelease:
         assert pool.state(lane) == LaneState.FREE, (
             f'Lane must be FREE after found-on-main mark_done, got {pool.state(lane)!r}'
         )
+
+
+# ===========================================================================
+# Step-13 (1881): RED — A: status-keyed reconciler _reconcile_terminal_lanes
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestTerminalLaneReconciler:
+    """Layer A (invariant backstop): _reconcile_terminal_lanes releases any lane
+    whose assigned task is terminal and NOT in scheduler._dispatched.
+
+    Diff 7: add _reconcile_terminal_lanes near _reconcile_stranded_in_progress;
+    wire into _stranded_reconcile_loop (after _reconcile_stranded_in_progress)
+    and once at startup after _reap_orphan_worktrees.
+
+    RED: _reconcile_terminal_lanes does not exist yet; calls raise AttributeError.
+    """
+
+    async def _make_harness_with_pool(
+        self, tmp_path: Path, pool_size: int = 1
+    ):
+        """Build a harness backed by a real GitOps warm lane pool."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=pool_size,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=pool_size)
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        return harness, git_ops, git_ops.warm_lane_pool
+
+    async def test_terminal_lane_reconciler_frees_done_task_lane(self, tmp_path: Path):
+        """(16) Lane ASSIGNED to a 'done' task (not dispatched) is freed + event emitted."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.event_store import EventType
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+
+        tid = '3459'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        # Scheduler returns 'done'; _dispatched is empty (not a live workflow)
+        harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'done'}, None))
+        harness.scheduler._dispatched = set()
+
+        # Wire a mock event_store to capture emissions
+        harness.event_store = MagicMock()
+
+        # RED: _reconcile_terminal_lanes does not exist yet → AttributeError
+        await harness._reconcile_terminal_lanes()
+
+        # Lane must be freed
+        assert pool.state(lane) == LaneState.FREE, (
+            f'done-task lane must be FREE after reconciler, got {pool.state(lane)!r}'
+        )
+        # Event must be emitted with reason='terminal-lane-reconciler'
+        harness.event_store.emit.assert_called_once()
+        call_args = harness.event_store.emit.call_args
+        assert call_args.args[0] == EventType.worktree_reaped, (
+            'reconciler must emit EventType.worktree_reaped'
+        )
+        data = call_args.kwargs.get('data', {})
+        assert data.get('reason') == 'terminal-lane-reconciler', (
+            f"data.reason must be 'terminal-lane-reconciler', got {data!r}"
+        )
+
+    async def test_terminal_lane_reconciler_skips_in_progress(self, tmp_path: Path):
+        """(17) Lane ASSIGNED to an 'in-progress' task stays ASSIGNED (not terminal)."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+
+        tid = '7777'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+
+        harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'in-progress'}, None))
+        harness.scheduler._dispatched = set()
+
+        await harness._reconcile_terminal_lanes()
+
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'in-progress task lane must stay ASSIGNED — not a terminal status'
+        )
+
+    async def test_terminal_lane_reconciler_skips_dispatched(self, tmp_path: Path):
+        """(18) 'done' task in _dispatched is NOT freed (live-acquire guard)."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+
+        tid = '8888'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+
+        harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'done'}, None))
+        # Branch IS in _dispatched → guard must prevent release
+        harness.scheduler._dispatched = {tid}
+
+        await harness._reconcile_terminal_lanes()
+
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'done task in _dispatched must not be freed (live-acquire guard)'
+        )
+
+    async def test_terminal_lane_reconciler_aborts_on_empty_statuses(self, tmp_path: Path):
+        """(19) Empty get_statuses (with or without error) aborts the sweep — never mass-free."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+
+        tid = '9999'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+
+        harness.scheduler._dispatched = set()
+
+        # Case A: empty with no error
+        harness.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+        await harness._reconcile_terminal_lanes()
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'empty get_statuses must abort sweep — lane must stay ASSIGNED (never mass-free)'
+        )
+
+        # Case B: empty with an error
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({}, Exception('transient DB error'))
+        )
+        await harness._reconcile_terminal_lanes()
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'errored get_statuses must abort sweep — lane must stay ASSIGNED'
+        )
+
+    async def test_terminal_lane_reconciler_cancelled_status_frees(self, tmp_path: Path):
+        """(20) Lane ASSIGNED to a 'cancelled' task is freed."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+
+        tid = '1111'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+
+        harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'cancelled'}, None))
+        harness.scheduler._dispatched = set()
+
+        await harness._reconcile_terminal_lanes()
+
+        assert pool.state(lane) == LaneState.FREE, (
+            f'cancelled task lane must be FREE after reconciler, got {pool.state(lane)!r}'
+        )
