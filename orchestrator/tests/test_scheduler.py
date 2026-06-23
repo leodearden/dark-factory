@@ -9842,3 +9842,102 @@ class TestStarvationWatchdog:
         await scheduler.acquire_next()
 
         callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gc_terminal_task_resolves_escalation(self):
+        """(a) GC backstop: escalated task resolved + state cleared when task goes terminal.
+
+        Drive 'starved' to the escalated state (task_id in _starvation_escalated).
+        Then make get_tasks report it as 'done' (terminal).  One more
+        acquire_next tick must:
+        - call _on_starvation_resolve exactly once with task_id='starved',
+        - clear 'starved' from _starvation_escalated, AND
+        - clear 'starved' from _starvation_first_seen.
+
+        Fails until the dedicated watchdog GC block is added to the stale-id
+        sweep inside acquire_next (step-10).
+        """
+        scheduler, t = self._make_scheduler()
+        warn_cb = AsyncMock()
+        resolve_cb = AsyncMock()
+        scheduler._on_starvation_warn = warn_cb
+        scheduler._on_starvation_resolve = resolve_cb
+
+        # Seed a held lock on 'seed' so 'starved' can never acquire.
+        scheduler.lock_table.try_acquire('seed', ['backend'])
+        scheduler._dispatched.add('seed')
+
+        task = self._starved_task()
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # Drive 3 ticks to cross skip_threshold (3), then advance clock past idle_secs.
+        for _ in range(3):
+            await scheduler.acquire_next()
+        t[0] = 150.0
+        await scheduler.acquire_next()
+
+        # Pre-condition: warn fired, task is escalated.
+        warn_cb.assert_called_once()
+        assert 'starved' in scheduler._starvation_escalated, (
+            'Precondition: starved must be in _starvation_escalated before GC tick'
+        )
+        resolve_cb.assert_not_called()
+
+        # Change get_tasks to return 'starved' as terminal ('done').
+        terminal_task = dict(task, status='done')
+        scheduler.get_tasks = AsyncMock(return_value=[terminal_task])
+
+        # One tick — the GC backstop must detect 'starved' is terminal,
+        # call _on_starvation_resolve, and clear all watchdog state.
+        await scheduler.acquire_next()
+
+        resolve_cb.assert_called_once()
+        call_args = resolve_cb.call_args
+        args = call_args.args if call_args.args else ()
+        kwargs = call_args.kwargs if call_args.kwargs else {}
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == 'starved', (
+            f'Expected task_id="starved" in resolve callback; got {task_id_arg!r}'
+        )
+        assert 'starved' not in scheduler._starvation_escalated, (
+            '_starvation_escalated must be cleared by GC sweep for terminal task'
+        )
+        assert 'starved' not in scheduler._starvation_first_seen, (
+            '_starvation_first_seen must be cleared for terminal task'
+        )
+
+    @pytest.mark.asyncio
+    async def test_continuity_reset_drops_first_seen_when_not_candidate(self):
+        """(b) Continuity reset: _starvation_first_seen cleared when task leaves candidates.
+
+        A task eligible in tick 1 (pending, deps satisfied, in candidates) gets
+        its _starvation_first_seen stamped.  When it becomes terminal (absent
+        from candidates) on tick 2, the entry is dropped so the idle clock
+        resets on any future re-appearance as a candidate.
+        """
+        scheduler, _t = self._make_scheduler()
+
+        # Seed a held lock so 'starved' is a candidate but can't acquire.
+        scheduler.lock_table.try_acquire('seed', ['backend'])
+        scheduler._dispatched.add('seed')
+
+        task = self._starved_task()
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # Tick 1: 'starved' appears in candidates → _starvation_first_seen stamped.
+        await scheduler.acquire_next()
+        assert 'starved' in scheduler._starvation_first_seen, (
+            'Precondition: _starvation_first_seen must be stamped after tick 1'
+        )
+
+        # Now make 'starved' terminal so it is no longer a dispatch-eligible candidate.
+        terminal_task = dict(task, status='done')
+        scheduler.get_tasks = AsyncMock(return_value=[terminal_task])
+
+        # Tick 2: continuity reset in _apply_starvation_watchdog must drop the entry.
+        await scheduler.acquire_next()
+
+        assert 'starved' not in scheduler._starvation_first_seen, (
+            '_starvation_first_seen must be cleared by the continuity reset '
+            'when the task is no longer a dispatch-eligible candidate'
+        )
