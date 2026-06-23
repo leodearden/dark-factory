@@ -5321,15 +5321,68 @@ class NoLandingsCircuitBreaker:
         if self._tripped:
             return self._check_resume(landings_total, free_bytes)
         else:
-            return None  # skeleton — trip detection in step-04
+            return self._check_trip()
 
     # ── private helpers ──────────────────────────────────────────────────────
 
+    def _check_trip(self) -> BreakerTrip | None:
+        """Evaluate trip conditions over the last window_samples entries.
+
+        Returns a BreakerTrip(action='halt') when BOTH conditions hold:
+          1. Landing-rate == 0: landings_total is identical across the window.
+          2. Disk strictly falling: every consecutive pair of free_bytes values
+             is strictly decreasing (no plateau allowed).
+
+        Returns None otherwise.  Sets internal ``_tripped`` state on first trip.
+        """
+        if len(self._samples) < self._window_samples:
+            return None  # not enough data yet
+
+        # Evaluate over the last window_samples entries
+        window = list(self._samples)[-self._window_samples:]
+        first_landings, first_free = window[0]
+        last_landings, last_free = window[-1]
+
+        # Condition 1: landing-rate == 0 (landings count unchanged)
+        landings_flat = (last_landings == first_landings)
+
+        # Condition 2: disk strictly falling (every pair strictly less)
+        disk_falling = all(
+            window[i + 1][1] < window[i][1]
+            for i in range(len(window) - 1)
+        )
+
+        if not (landings_flat and disk_falling):
+            return None
+
+        # Both conditions met — trip
+        self._tripped = True
+        self._landings_at_trip = last_landings
+        self._free_at_trip = last_free
+
+        reason = (
+            f'No-landings circuit-breaker tripped: 0 landings over '
+            f'{self._window_samples} samples; disk free fell '
+            f'{first_free:,} → {last_free:,} bytes'
+        )
+        return BreakerTrip(
+            action='halt',
+            window_samples=self._window_samples,
+            landings_in_window=0,
+            free_start=first_free,
+            free_end=last_free,
+            reason=reason,
+        )
+
     def _check_resume(self, landings_total: int, free_bytes: int) -> BreakerTrip | None:
-        """Check resume conditions (called only while _tripped is True)."""
-        # Resume on: clean landing OR disk recovered above margin
-        # (both checked, OR semantics, PRD §5.5)
-        # (implemented in step-06 — currently returns None)
+        """Check resume conditions (called only while _tripped is True).
+
+        Resume when EITHER (OR semantics, PRD §5.5):
+          * clean landing: landings_total > landings-at-trip
+          * disk recovery: free_bytes >= free_at_trip + disk_margin_bytes
+
+        (implemented in step-06 — currently returns None)
+        """
         return None
 
 
