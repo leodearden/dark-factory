@@ -3722,6 +3722,90 @@ class InflightVerifyResult:
     spec_warm: bool = False   # True when merge_wt is a warm _spec- lane (not an ephemeral wt)
 
 
+@dataclasses.dataclass(frozen=True)
+class SuffixConflictGraph:
+    """Immutable conflict-graph over the unfrozen merge-queue suffix (task δ=1889).
+
+    Holds two distinct pair-edge relations and one per-item marker:
+
+    * **footprint_edges** — pairs whose changed-path footprints overlap (γ seam).
+      Drives future ζ (ordering) consumers; computed cheaply via path-set
+      intersection without forking git.
+
+    * **textual_edges** — pairs with genuine 3-way textual conflicts (β seam).
+      Pruned to footprint-overlapping pairs only (textual ⇒ footprint contract).
+      Drives future η (bounce) consumers; each entry represents a confirmed
+      git merge-tree conflict.
+
+    * **conflicts_with_main** — request_ids of suffix items that conflict with
+      the current main tip (the δ user-signal).
+
+    **Node identity** — request_id (the stable per-MergeRequest UUID, e.g.
+    ``'mr-a1b2c3d4'``).  Nodes are stored in pick order (high lane before
+    normal, FIFO within each lane) so the tuple doubles as the ordered view
+    of the suffix.
+
+    **Immutability** — frozen dataclass; every field is a frozenset or tuple
+    so the graph can be shared safely across the async event loop without
+    copying.
+
+    See also: EMPTY_SUFFIX_CONFLICT_GRAPH (module constant for the zero case).
+    """
+
+    nodes: tuple[str, ...]
+    """Request IDs in pick order (high lane → normal lane, FIFO within each lane)."""
+
+    textual_edges: frozenset[frozenset[str]]
+    """Unordered pairs {rid_a, rid_b} with a confirmed 3-way textual conflict."""
+
+    footprint_edges: frozenset[frozenset[str]]
+    """Unordered pairs {rid_a, rid_b} whose changed-path footprints overlap."""
+
+    conflicts_with_main: frozenset[str]
+    """Request IDs that conflict with the current main tip."""
+
+    def textual_neighbors(self, rid: str) -> frozenset[str]:
+        """Return the set of request_ids connected to *rid* via textual_edges."""
+        return frozenset(
+            next(iter(edge - {rid}))
+            for edge in self.textual_edges
+            if rid in edge
+        )
+
+    def footprint_neighbors(self, rid: str) -> frozenset[str]:
+        """Return the set of request_ids connected to *rid* via footprint_edges."""
+        return frozenset(
+            next(iter(edge - {rid}))
+            for edge in self.footprint_edges
+            if rid in edge
+        )
+
+    def to_snapshot_dict(self) -> dict:
+        """Return a JSON-safe dict representation suitable for heartbeat snapshots.
+
+        Output format:
+          nodes: list[str]                 — in pick order
+          textual_edges: list[list[str]]   — each inner list sorted; outer sorted
+          footprint_edges: list[list[str]] — same shape as textual_edges
+          conflicts_with_main: list[str]   — sorted
+        """
+        return {
+            'nodes': list(self.nodes),
+            'textual_edges': sorted(sorted(edge) for edge in self.textual_edges),
+            'footprint_edges': sorted(sorted(edge) for edge in self.footprint_edges),
+            'conflicts_with_main': sorted(self.conflicts_with_main),
+        }
+
+
+EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
+    nodes=(),
+    textual_edges=frozenset(),
+    footprint_edges=frozenset(),
+    conflicts_with_main=frozenset(),
+)
+"""Sentinel empty SuffixConflictGraph for the default/zero-suffix case."""
+
+
 class _TrainMergeHost(Protocol):
     """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
 
