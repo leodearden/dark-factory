@@ -1068,6 +1068,9 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
 )
 
 
+# NOTE: the stop-criterion prose below ("no cross-module design, no new abstraction,
+# no substantial architectural thought") mirrors the _COMPLEXITY_RUBRIC constant above
+# (the chokepoint published to all task-creating roles).  Update both in lockstep.
 SIMPLE_TASK = AgentRole(
     name='simple_task',
     system_prompt="""\

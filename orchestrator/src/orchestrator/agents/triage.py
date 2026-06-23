@@ -50,7 +50,8 @@ def is_declared_simple_task(task: dict) -> bool:
     """Return True iff the task's author declared it as a simple task.
 
     The simple path is taken iff:
-    - ``task['metadata']['complexity'] == 'simple'`` (author opt-in), AND
+    - ``task['metadata']['complexity']`` normalises to ``'simple'``
+      (case-insensitive, whitespace-stripped — author opt-in), AND
     - the task description contains no hard-blocker contradiction token.
 
     Priority and file count are intentionally NOT consulted — a task may be
@@ -62,7 +63,7 @@ def is_declared_simple_task(task: dict) -> bool:
     are checked at the workflow gate, not here.
     """
     metadata = task.get('metadata') or {}
-    if metadata.get('complexity') != 'simple':
+    if str(metadata.get('complexity') or '').strip().lower() != 'simple':
         return False
     description = str(task.get('description') or '')
     return not has_simple_task_blocker(description)

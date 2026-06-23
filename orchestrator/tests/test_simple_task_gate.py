@@ -106,3 +106,13 @@ class TestIsDeclaredSimpleTask:
         """Empty metadata dict (no complexity field) → False."""
         task = {'description': 'Add a docstring to foo.', 'metadata': {}}
         assert is_declared_simple_task(task) is False
+
+    def test_complexity_simple_uppercase_routes_to_simple_path(self):
+        """complexity='Simple' (capital S) is normalised and routes to simple path."""
+        task = _task(complexity='Simple', description='Add a docstring to foo.')
+        assert is_declared_simple_task(task) is True
+
+    def test_complexity_simple_with_whitespace_routes_to_simple_path(self):
+        """complexity=' simple ' (surrounding whitespace) is normalised and routes to simple path."""
+        task = _task(complexity=' simple ', description='Add a docstring to foo.')
+        assert is_declared_simple_task(task) is True

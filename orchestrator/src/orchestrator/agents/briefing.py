@@ -361,6 +361,9 @@ let a human triage the scope change.
         else:
             files_section = '_No files listed in task metadata — explore briefly to identify the target file(s)._'
 
+        # The stop-criterion prose below ("no new abstraction, no cross-module design,
+        # substantial architectural thought") mirrors _COMPLEXITY_RUBRIC in roles.py.
+        # Update both in lockstep if the rubric changes.
         return f"""\
 {context}
 
