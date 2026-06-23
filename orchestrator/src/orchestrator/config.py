@@ -348,6 +348,53 @@ class FairnessConfig(BaseModel):
         return int(self.skip_threshold)
 
 
+class StarvationWatchdogConfig(BaseModel):
+    """Scheduler starvation watchdog configuration.
+
+    When a ``pending`` task is dispatch-eligible (all local + external deps
+    satisfied, no live claimant) yet keeps being skipped as the TOP-scored
+    candidate past both ``skip_threshold`` and ``idle_secs``, the scheduler
+    files exactly ONE INFO-level escalation so an AFK operator is notified.
+    The escalation auto-resolves when the task finally dispatches.
+
+    Both gates must be crossed simultaneously:
+    - ``skip_threshold`` — minimum consecutive top-skips (reuses ``_skip_count``).
+    - ``idle_secs`` — minimum wall-clock seconds of continuous dispatch-eligibility
+      (anchored on the first tick the task appears as a candidate; resets if it
+      leaves the candidate pool for any tick).
+
+    Default 50 skips is well above the fairness per-tier park thresholds (0–9,
+    polish 9999) so the watchdog only fires on genuine multi-hour starvation (e.g.
+    the live reify-3465 case: 475× skipped).  Default 1800 s (30 min) provides the
+    independent wall-clock backstop required by PROPERTY 3.
+
+    Set ``enabled: false`` in orchestrator.yaml to silence the watchdog entirely.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description='Set to false to disable starvation escalation filing entirely.',
+    )
+    skip_threshold: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Minimum consecutive top-candidate skips before filing an INFO escalation. '
+            'Must be >= 1.  Well above the fairness park thresholds (0–9 / polish 9999) '
+            'so it only fires on genuine multi-hour starvation.'
+        ),
+    )
+    idle_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'Minimum wall-clock seconds of continuous dispatch-eligibility before '
+            'filing.  Anchored on the first tick the task enters the candidate pool; '
+            'reset if the task leaves the pool for any tick.  Must be > 0.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
@@ -1733,6 +1780,11 @@ class OrchestratorConfig(BaseSettings):
 
     # Scheduler fairness / anti-starvation
     fairness: FairnessConfig = Field(default_factory=FairnessConfig)
+
+    # Scheduler starvation watchdog (task 1880).
+    starvation_watchdog: StarvationWatchdogConfig = Field(
+        default_factory=StarvationWatchdogConfig,
+    )
 
     # Value/h scheduler scoring (P2/P3 — age boost, CPM weighting).
     age_alpha: float = Field(
