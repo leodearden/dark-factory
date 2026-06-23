@@ -6568,3 +6568,107 @@ class TestMergeTreeConflicts:
             'CONFLICT' not in p and 'Auto-merging' not in p
             for p in probe.conflicted_paths
         ), f'Informational text leaked into conflicted_paths: {probe.conflicted_paths!r}'
+
+    async def test_zero_worktree_creation_and_side_effect_free(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Headline: merge_tree_conflicts MUST NOT create worktrees or mutate refs.
+
+        Sets up a conflicting pair, captures before-state (worktree count,
+        worktree_base children, and SHAs of base_tip/branch_head/HEAD),
+        calls merge_tree_conflicts TWICE, then asserts:
+
+        1. Both calls return equal ConflictProbe results (deterministic/idempotent).
+        2. git worktree list count is UNCHANGED.
+        3. No _merge-* or any new child directory appeared under worktree_base.
+        4. base_tip, branch_head, and HEAD SHAs are all unchanged (side-effect-free).
+        """
+        # Seed shared.py on main so there is a common ancestor
+        (git_ops.project_root / 'shared.py').write_text('base = 0\n')
+        await _run(['git', 'add', 'shared.py'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Seed shared.py for side-effect test'], cwd=git_ops.project_root)
+
+        # Build a conflicting pair
+        wt_p = await git_ops.create_worktree('mt-p')
+        (wt_p.path / 'shared.py').write_text('base = "P"\n')
+        await git_ops.commit(wt_p.path, 'Branch mt-p: base = P')
+
+        wt_q = await git_ops.create_worktree('mt-q')
+        (wt_q.path / 'shared.py').write_text('base = "Q"\n')
+        await git_ops.commit(wt_q.path, 'Branch mt-q: base = Q')
+
+        # --- Capture before-state ---
+        # 1) Count entries in git worktree list
+        _, wt_list_before, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        wt_count_before = wt_list_before.count('\nworktree ')
+
+        # 2) Children under worktree_base (may not exist yet)
+        def _children(base: 'Path') -> 'set[str]':
+            if not base.exists():
+                return set()
+            return {p.name for p in base.iterdir()}
+
+        children_before = _children(git_ops.worktree_base)
+
+        # 3) Resolve SHAs of the two refs and HEAD
+        _, sha_p_before, _ = await _run(
+            ['git', 'rev-parse', 'task/mt-p'], cwd=git_ops.project_root,
+        )
+        _, sha_q_before, _ = await _run(
+            ['git', 'rev-parse', 'task/mt-q'], cwd=git_ops.project_root,
+        )
+        _, head_before, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+        )
+        sha_p_before = sha_p_before.strip()
+        sha_q_before = sha_q_before.strip()
+        head_before = head_before.strip()
+
+        # --- Call merge_tree_conflicts TWICE ---
+        probe1 = await git_ops.merge_tree_conflicts('task/mt-p', 'task/mt-q')
+        probe2 = await git_ops.merge_tree_conflicts('task/mt-p', 'task/mt-q')
+
+        # --- Assert post-call state ---
+        # 1) Idempotent: both calls return identical results
+        assert probe1 == probe2, (
+            f'merge_tree_conflicts is not idempotent: first={probe1!r}, second={probe2!r}'
+        )
+        assert probe1.clean is False  # they conflict
+
+        # 2) worktree list count unchanged
+        _, wt_list_after, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        wt_count_after = wt_list_after.count('\nworktree ')
+        assert wt_count_after == wt_count_before, (
+            f'git worktree list grew from {wt_count_before} to {wt_count_after} entries'
+        )
+
+        # 3) No _merge-* or new child under worktree_base
+        children_after = _children(git_ops.worktree_base)
+        new_children = children_after - children_before
+        merge_children = {c for c in new_children if '_merge' in c}
+        assert not merge_children, (
+            f'_merge-* child(ren) appeared under worktree_base: {merge_children!r}'
+        )
+        assert not new_children, (
+            f'New child dir(s) appeared under worktree_base: {new_children!r}'
+        )
+
+        # 4) Refs and HEAD unchanged
+        _, sha_p_after, _ = await _run(
+            ['git', 'rev-parse', 'task/mt-p'], cwd=git_ops.project_root,
+        )
+        _, sha_q_after, _ = await _run(
+            ['git', 'rev-parse', 'task/mt-q'], cwd=git_ops.project_root,
+        )
+        _, head_after, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+        )
+        assert sha_p_after.strip() == sha_p_before, 'task/mt-p ref was mutated'
+        assert sha_q_after.strip() == sha_q_before, 'task/mt-q ref was mutated'
+        assert head_after.strip() == head_before, 'HEAD was mutated'
