@@ -17,6 +17,7 @@ from orchestrator.overlap_footprint import (
     DefaultPathOverlapDetector,
     Footprint,
     OverlapFootprintDetector,
+    changesets_overlap,
     get_overlap_detector,
     register_overlap_detector,
 )
@@ -143,3 +144,77 @@ class TestRegistry:
         register_overlap_detector("reify", stub1)
         register_overlap_detector("reify", stub2)
         assert get_overlap_detector("reify") is stub2
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Fail-open convenience wrapper tests
+# ---------------------------------------------------------------------------
+
+
+class _OverlappingStub:
+    """Stub that always says footprints overlap."""
+
+    def footprint(self, changed_paths: object) -> Footprint:
+        return Footprint(members=frozenset(["x"]))
+
+    def overlaps(self, a: Footprint, b: Footprint) -> bool:
+        return True
+
+
+class _FootprintRaisingDetector:
+    """Stub whose footprint() always raises."""
+
+    def footprint(self, changed_paths: object) -> Footprint:
+        raise RuntimeError("footprint() exploded")
+
+    def overlaps(self, a: Footprint, b: Footprint) -> bool:
+        return False
+
+
+class _OverlapsRaisingDetector:
+    """Stub whose overlaps() always raises."""
+
+    def footprint(self, changed_paths: object) -> Footprint:
+        return Footprint(members=frozenset())
+
+    def overlaps(self, a: Footprint, b: Footprint) -> bool:
+        raise RuntimeError("overlaps() exploded")
+
+
+class TestChangesetsOverlap:
+    """Fail-open convenience wrapper changesets_overlap."""
+
+    def test_default_detector_overlapping(self, clean_registry: object) -> None:
+        result = changesets_overlap("dark_factory", ["a.py", "b.py"], ["b.py", "c.py"])
+        assert result is True
+
+    def test_default_detector_disjoint(self, clean_registry: object) -> None:
+        result = changesets_overlap("dark_factory", ["a.py"], ["b.py"])
+        assert result is False
+
+    def test_routes_to_registered_detector(self, clean_registry: object) -> None:
+        stub = _OverlappingStub()
+        register_overlap_detector("reify", stub)
+        # stub always returns True regardless of paths
+        assert changesets_overlap("reify", ["x.py"], ["y.py"]) is True
+        # dark_factory still uses the default
+        assert changesets_overlap("dark_factory", ["x.py"], ["y.py"]) is False
+
+    def test_fail_open_when_overlaps_raises(self, clean_registry: object) -> None:
+        register_overlap_detector("raiser_proj", _OverlapsRaisingDetector())
+        assert changesets_overlap("raiser_proj", ["a.py"], ["b.py"]) is True
+
+    def test_fail_open_when_footprint_raises(self, clean_registry: object) -> None:
+        register_overlap_detector("fp_raiser", _FootprintRaisingDetector())
+        assert changesets_overlap("fp_raiser", ["a.py"], ["b.py"]) is True
+
+    def test_fail_open_logs_warning(
+        self, clean_registry: object, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        register_overlap_detector("log_raiser", _OverlapsRaisingDetector())
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="orchestrator.overlap_footprint"):
+            result = changesets_overlap("log_raiser", ["a.py"], ["b.py"])
+        assert result is True
+        assert any("fail-open" in r.message.lower() for r in caplog.records)
