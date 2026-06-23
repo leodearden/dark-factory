@@ -5881,7 +5881,7 @@ async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
 
 @pytest.mark.asyncio
 class TestCreateWorktreeWarmLaneRouting:
-    """create_worktree uses the pool when enabled, falls back to cold on exhaustion."""
+    """create_worktree uses the pool when enabled; raises on exhaustion (no cold fallback)."""
 
     async def test_warm_path_returns_lane_not_branch_named_dir(
         self, git_repo: Path,
@@ -5950,10 +5950,16 @@ class TestCreateWorktreeWarmLaneRouting:
                 f'--writable {wp!r} is not under lane {lane_resolved!r}'
             )
 
-    async def test_cold_fallback_on_pool_exhaustion(
+    async def test_exhaustion_raises_no_cold_fallback(
         self, git_repo: Path,
     ):
-        """Pool exhausted: create_worktree returns a cold branch-named worktree."""
+        """Pool exhausted: create_worktree raises WarmLanePoolExhausted (no cold fallback).
+
+        Design decision (task 1859 step-8): pool exhaustion is backpressure — the
+        caller must requeue.  No cold worktree is created; the cold dir must not
+        exist after the failed call.
+        """
+        from orchestrator.git_ops import WarmLanePoolExhausted
         await _add_warm_lane_scripts(git_repo)
         config = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
@@ -5965,14 +5971,13 @@ class TestCreateWorktreeWarmLaneRouting:
         info_A = await git_ops.create_worktree('A')
         assert info_A.path == git_ops.worktree_base / '_lane-0'
 
-        # Pool exhausted — should fall back to cold (branch-named dir)
-        info_B = await git_ops.create_worktree('B')
-        expected_cold = git_ops.worktree_base / 'B'
-        assert info_B.path == expected_cold, (
-            f'Expected cold path {expected_cold}, got {info_B.path}'
+        # Pool exhausted — must raise, NOT fall back to a cold worktree dir
+        cold_path = git_ops.worktree_base / 'B'
+        with pytest.raises(WarmLanePoolExhausted):
+            await git_ops.create_worktree('B')
+        assert not cold_path.exists(), (
+            f'Cold dir {cold_path} must NOT be created on pool exhaustion'
         )
-        assert info_B.path.exists()
-        assert await git_ops._is_registered_worktree(info_B.path)
 
     async def test_knob_off_cold_path_unchanged(
         self, git_ops: GitOps,
@@ -6073,7 +6078,11 @@ class TestCleanupWorktreePoolAware:
     async def test_cleanup_cold_worktree_removed(
         self, git_repo: Path,
     ):
-        """cleanup_worktree on a cold (non-lane) path removes the worktree as before."""
+        """cleanup_worktree on a cold (non-lane) path removes the worktree as before.
+
+        Pool exhaustion now raises rather than falling back to cold, so we create
+        the cold worktree directly via 'git worktree add' to set up the precondition.
+        """
         await _add_warm_lane_scripts(git_repo)
         config = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
@@ -6081,14 +6090,19 @@ class TestCleanupWorktreePoolAware:
         )
         git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
 
-        # Exhaust the pool so Z goes to cold path
-        _info_A = await git_ops.create_worktree('A')  # -> _lane-0
-        info_Z = await git_ops.create_worktree('Z')  # -> cold <base>/Z
+        # Create a cold (non-lane) worktree directly — pool exhaustion raises,
+        # so we bypass create_worktree and add the worktree via git directly.
         cold_path = git_ops.worktree_base / 'Z'
-        assert info_Z.path == cold_path
+        cold_path.parent.mkdir(parents=True, exist_ok=True)
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/Z', str(cold_path), 'HEAD'],
+            cwd=git_repo,
+        )
+        assert cold_path.exists()
+        assert await git_ops._is_registered_worktree(cold_path)
 
         # Cleanup the cold worktree — must be removed
-        await git_ops.cleanup_worktree(info_Z.path, 'Z')
+        await git_ops.cleanup_worktree(cold_path, 'Z')
         assert not cold_path.exists(), 'Cold worktree must be removed by cleanup'
 
     async def test_cleanup_knob_off_cold_path(
