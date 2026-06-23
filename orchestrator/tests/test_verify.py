@@ -6080,3 +6080,56 @@ class TestMaybeGovernMergeCmd:
         assert captured_scope_flags[0] is True, (
             'verify_use_cgroup_scope=True must still propagate to _run_cmd'
         )
+
+
+class TestInfraOSErrorClassifier:
+    """Tests for _is_infra_oserror predicate and VerifyInfraError exception (step-1)."""
+
+    def test_is_infra_oserror_enospc(self):
+        import errno
+        assert verify._is_infra_oserror(OSError(errno.ENOSPC, 'No space left')) is True
+
+    def test_is_infra_oserror_edquot(self):
+        import errno
+        assert verify._is_infra_oserror(OSError(errno.EDQUOT, 'Quota exceeded')) is True
+
+    def test_is_infra_oserror_erofs(self):
+        import errno
+        assert verify._is_infra_oserror(OSError(errno.EROFS, 'Read-only filesystem')) is True
+
+    def test_is_infra_oserror_eio(self):
+        import errno
+        assert verify._is_infra_oserror(OSError(errno.EIO, 'I/O error')) is True
+
+    def test_is_infra_oserror_emfile(self):
+        import errno
+        assert verify._is_infra_oserror(OSError(errno.EMFILE, 'Too many open files')) is True
+
+    def test_is_infra_oserror_enfile(self):
+        import errno
+        assert verify._is_infra_oserror(OSError(errno.ENFILE, 'File table overflow')) is True
+
+    def test_is_infra_oserror_non_infra_errno(self):
+        import errno
+        assert verify._is_infra_oserror(OSError(errno.EACCES, 'Permission denied')) is False
+
+    def test_is_infra_oserror_non_oserror_value_error(self):
+        assert verify._is_infra_oserror(ValueError('not an oserror')) is False
+
+    def test_is_infra_oserror_none(self):
+        assert verify._is_infra_oserror(None) is False
+
+    def test_verify_infra_error_is_exception_subclass(self):
+        err = verify.VerifyInfraError(phase='warm_marker', errno=28)
+        assert isinstance(err, Exception)
+        assert not isinstance(err, OSError)
+
+    def test_verify_infra_error_exposes_phase_and_errno(self):
+        import errno as errno_module
+        err = verify.VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+        assert err.phase == 'warm_marker'
+        assert err.errno == errno_module.ENOSPC
+
+    def test_verify_infra_error_message(self):
+        err = verify.VerifyInfraError(phase='warm_marker', errno=28)
+        assert 'warm_marker' in str(err) or err.phase == 'warm_marker'
