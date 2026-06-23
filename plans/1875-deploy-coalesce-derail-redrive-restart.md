@@ -59,10 +59,19 @@ The running orchestrator-reify.service process PREDATED the #1867 merge and ther
 | Scheduled at | *(see script output below)* |
 | Expected fire time | ~60 s after agent exits |
 
+| Scheduled at | 2026-06-23 13:31:59 BST (transient unit armed) |
+| Expected fire time | 2026-06-23 13:32:59 BST (+60 s on-active) |
+| Expected active by | approx 13:35 BST (+≤90 s TimeoutStopSec graceful stop) |
+
 Script output:
 
 ```
-(recorded at step-2 commit time — see below)
+Running timer as unit: orch-redeploy-restart.timer
+Will run service as unit: orch-redeploy-restart.service
+orchestrator-redeploy-restart.sh: scheduled restart of 'orchestrator-reify.service'
+  Transient unit: orch-redeploy-restart
+  Fires in:       60s (after the scheduling agent exits)
+  project_root:   /home/leo/src/dark-factory (clean at schedule time)
 ```
 
 ---
