@@ -294,3 +294,88 @@ class TestB1DepsUnsatisfied:
         gate = _gate_task(task_id='gate-b1', deps=[10])
         status_map = {'10': 'done'}
         assert scheduler._deps_satisfied(gate, status_map) is True
+
+
+# ---------------------------------------------------------------------------
+# B2 — gate deps satisfied → exactly one born-at-L2 (step-3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestB2GateDepsOk:
+    """B2: first dispatch of an eligible gate files exactly one born-at-L2 and blocks.
+
+    Drives the REAL production path: _run_slot → _run_deterministic_slot →
+    real DeterministicRunner + real file-backed EscalationQueue.
+    The ONLY fake is the task backend (_StoreScheduler).
+    """
+
+    async def test_dispatch_returns_blocked_report(self, det_harness: Harness) -> None:
+        """_run_slot returns BLOCKED with block_reason='deterministic_gate'."""
+        store: _StoreScheduler = det_harness.scheduler
+        task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
+        store.seed(task)
+
+        report = await _dispatch(det_harness, 'gate-b2')
+
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.block_reason == 'deterministic_gate'
+
+    async def test_store_status_becomes_blocked(self, det_harness: Harness) -> None:
+        """_StoreScheduler reflects 'blocked' status after gate dispatch."""
+        store: _StoreScheduler = det_harness.scheduler
+        task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
+        store.seed(task)
+
+        await _dispatch(det_harness, 'gate-b2')
+
+        assert await store.get_status('gate-b2') == 'blocked'
+
+    async def test_exactly_one_born_at_l2_escalation(self, det_harness: Harness) -> None:
+        """Exactly one pending L2 milestone_gate escalation is filed."""
+        store: _StoreScheduler = det_harness.scheduler
+        task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
+        store.seed(task)
+
+        await _dispatch(det_harness, 'gate-b2')
+
+        queue: EscalationQueue = det_harness._escalation_queue
+        pending = queue.get_by_task('gate-b2', status='pending')
+        assert len(pending) == 1, f'Expected 1 pending escalation, got {len(pending)}'
+
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'milestone_gate'
+        assert esc.summary == 'Ship v2 gate'[:200]
+
+    async def test_gate_escalated_at_stamped(self, det_harness: Harness) -> None:
+        """metadata.gate_escalated_at is stamped in the store after dispatch."""
+        store: _StoreScheduler = det_harness.scheduler
+        task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
+        store.seed(task)
+
+        await _dispatch(det_harness, 'gate-b2')
+
+        retrieved = await store.get_task('gate-b2')
+        assert retrieved is not None
+        stamp = retrieved['metadata'].get('gate_escalated_at')
+        assert stamp is not None, 'gate_escalated_at must be stamped after first dispatch'
+
+    async def test_no_worktree_or_branch_created(self, det_harness: Harness) -> None:
+        """No worktree/branch/agent is created — runner is built without git_ops (I4/B2)."""
+        store: _StoreScheduler = det_harness.scheduler
+        task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
+        store.seed(task)
+
+        await _dispatch(det_harness, 'gate-b2')
+
+        # git_ops is a MagicMock; the runner is constructed without git_ops
+        # so none of the worktree-creation methods should be called.
+        git_ops = det_harness.git_ops
+        for method_name in ('create_worktree', 'checkout', 'clone_worktree'):
+            mock_attr = getattr(git_ops, method_name, None)
+            if mock_attr is not None and hasattr(mock_attr, 'call_count'):
+                assert mock_attr.call_count == 0, (
+                    f'git_ops.{method_name} must not be called for a deterministic gate'
+                )
