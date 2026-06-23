@@ -1652,7 +1652,23 @@ Output JSON matching the schema. Every task must appear in the output.
             # reserved ASSIGNED before re-dispatch.  Both sets the map AND
             # flips the lane FREE→ASSIGNED, preventing a concurrent fresh
             # acquire from stealing the lane while the original task is queued.
+            #
+            # T10 amplifier fix: if the task is already terminal (done/cancelled),
+            # release the lane instead of restoring it.  Without this, every
+            # harness restart re-ASSIGNs a dead lane, shrinking the pool forever.
+            # On a transient None status, fall through to restore (safe default;
+            # layer A self-heals the lane on the next reconcile interval).
             if pool is not None and is_lane and recovery_id:
+                term_status = await self.scheduler.get_status(recovery_id)
+                if term_status in ('done', 'cancelled'):
+                    logger.info(
+                        'Recovery: lane %s task %s terminal (%s) — '
+                        'releasing instead of restore',
+                        entry.name, recovery_id, term_status,
+                    )
+                    await self.git_ops.cleanup_worktree(entry, recovery_id)
+                    cleaned += 1
+                    continue
                 pool.restore_assignment(recovery_id, entry)
 
             # Check if plan has any completed steps
