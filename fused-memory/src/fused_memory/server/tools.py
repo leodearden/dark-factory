@@ -19,6 +19,10 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.middleware.deterministic_task_guard import (
+    deterministic_task_error,
+    inject_task_kind,
+)
 from fused_memory.middleware.lock_charter_guard import (
     directory_locks,
     extract_files,
@@ -2430,6 +2434,7 @@ def create_mcp_server(
         tag: str | None = None,
         planning_mode: bool = False,
         routing_override_reason: str = '',
+        task_kind: str = 'normal',
     ) -> dict[str, Any]:
         """Phase-1 of two-phase task creation: persist a ticket and return its id immediately.
 
@@ -2460,7 +2465,10 @@ def create_mcp_server(
             details: Task details / implementation notes
             dependencies: Comma-separated dependency task IDs
             priority: critical, high, medium, low, or polish (default medium)
-            metadata: Task metadata (object or JSON string)
+            metadata: Task metadata (object or JSON string).  Deterministic
+                tasks may supply ``before_done`` (required: ``script`` path
+                under project_root that exists and is executable, ``timeout_secs``
+                positive int) and/or ``always_escalates`` (bool) in metadata.
             tag: Tag context (optional)
             planning_mode: When True, bypass the curator and create the task
                 directly in ``deferred`` status.  Use this during heavy
@@ -2473,6 +2481,12 @@ def create_mcp_server(
                 audit log so a deliberate override is greppable.  Use only
                 when sure the task belongs to the submitting project.  If
                 unsure, escalate rather than risking a mis-filed task.
+            task_kind: ``'normal'`` (default) or ``'deterministic'``.
+                Deterministic tasks must have ``before_done`` and/or
+                ``always_escalates=True`` in metadata.  Invariants enforced at
+                creation time (B10): (1) enum; (2) deterministic without
+                before_done AND always_escalates is ill-formed no-op; (3)
+                before_done is only valid on deterministic tasks.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -2486,6 +2500,14 @@ def create_mcp_server(
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
             return lock_charter_error(_dirs)
+
+        # Deterministic-task-kind guard α: validate task_kind enum + invariants,
+        # then inject task_kind into metadata so it is persisted via the existing
+        # metadata path (both curator and planning_mode paths).
+        _det_err = deterministic_task_error(task_kind, metadata, project_root)
+        if _det_err is not None:
+            return _det_err
+        metadata = inject_task_kind(metadata, task_kind)
 
         try:
             return await task_interceptor.submit_task(
