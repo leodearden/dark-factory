@@ -1006,3 +1006,160 @@ class TestB6CrossUnitDeploy:
         assert meta.get('before_done_verified_at') is not None, (
             'before_done_verified_at must be stamped after fresh-PID verification'
         )
+
+
+# ---------------------------------------------------------------------------
+# B7 — cross-unit deploy failure + reaper no-rerun (step-10)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestB7DeployFailure:
+    """B7: cross-unit deploy failure → born-at-L2 infra_issue; I1 rerun suppressed.
+
+    Two failure sub-cases:
+    (7a) script_runner returns rc != 0 (exit error).
+    (7b) script_runner returns rc == 0 but unit_inspector returns stale state
+         (non-increasing monotonic / same or zero PID → fresh-PID check fails).
+
+    For each sub-case, a reaper re-pass (second runner.run) must NOT invoke
+    script_runner a second time (I1 once-only idempotency).
+    """
+
+    def _setup(self, tmp_path: Path, sub: str):
+        """Build store, queue, deploy task for a given sub-case label."""
+        store = _StoreScheduler()
+        queue = EscalationQueue(tmp_path / f'q-{sub}')
+        task = _deploy_task(task_id=f'deploy-b7-{sub}', target_unit='fail-unit.service')
+        store.seed(task)
+        return store, queue, task
+
+    async def _run_and_assert_blocked(
+        self,
+        store: _StoreScheduler,
+        queue: EscalationQueue,
+        task: dict,
+        unit_inspector,
+        script_runner,
+    ) -> None:
+        """First dispatch: assert BLOCKED + born-at-L2 infra_issue + before_done_ran_at."""
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'different-unit.service',
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        assignment = _make_assignment(task)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        task_id = str(task['id'])
+        assert await store.get_status(task_id) == 'blocked'
+
+        # born-at-L2 infra_issue filed
+        pending = queue.get_by_task(task_id, status='pending')
+        assert len(pending) == 1, (
+            f'Expected 1 pending L2 after deploy failure, got {len(pending)}'
+        )
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+
+        # before_done_ran_at stamped (crash-safe I1 stamp-before-run)
+        retrieved = await store.get_task(task_id)
+        assert retrieved['metadata'].get('before_done_ran_at') is not None
+
+    async def test_b7a_rc_nonzero_blocked_and_l2(self, tmp_path: Path) -> None:
+        """(7a) script_runner rc!=0 → BLOCKED, L2 infra_issue, before_done_ran_at."""
+        store, queue, task = self._setup(tmp_path, 'a')
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        await self._run_and_assert_blocked(store, queue, task, unit_inspector, script_runner)
+
+    async def test_b7b_stale_post_state_blocked_and_l2(self, tmp_path: Path) -> None:
+        """(7b) rc==0 but stale post-state → BLOCKED, L2 infra_issue, before_done_ran_at."""
+        store, queue, task = self._setup(tmp_path, 'b')
+        # Stale state: same MonotonicTimestamp as baseline (no restart detected)
+        _STALE_POST_STATE = dict(_BASELINE_UNIT_STATE)  # same as baseline — not fresh
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _STALE_POST_STATE])
+        await self._run_and_assert_blocked(store, queue, task, unit_inspector, script_runner)
+
+    async def test_b7a_reaper_no_rerun(self, tmp_path: Path) -> None:
+        """(7a) Reaper re-pass: second runner.run must NOT invoke script_runner again (I1)."""
+        store, queue, task = self._setup(tmp_path, 'a2')
+        script_runner = AsyncMock(return_value=(1, 'boom'))
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'different-unit.service',
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        assignment = _make_assignment(task)
+        task_id = str(task['id'])
+
+        # First dispatch: failure → BLOCKED + L2 filed
+        outcome1 = await runner.run(assignment)
+        assert outcome1 == WorkflowOutcome.BLOCKED
+        call_count_after_first = script_runner.await_count
+        assert call_count_after_first == 1, 'script_runner must be called exactly once'
+
+        # Reaper re-pass: re-read task (persisted stamps visible) + re-run
+        task2 = await store.get_task(task_id)
+        assignment2 = _make_assignment(task2)
+        runner2 = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'different-unit.service',
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome2 = await runner2.run(assignment2)
+
+        # I1: script_runner NOT called a second time (before_done_ran_at + pending L2)
+        assert script_runner.await_count == call_count_after_first, (
+            'script_runner must NOT be called on reaper re-pass (I1 once-only)'
+        )
+        assert outcome2 == WorkflowOutcome.BLOCKED
+
+        # Still exactly one pending L2 (no second escalation filed)
+        pending = queue.get_by_task(task_id, status='pending')
+        assert len(pending) == 1
+
+    async def test_b7b_reaper_no_rerun(self, tmp_path: Path) -> None:
+        """(7b) Reaper re-pass: stale-state failure also suppresses rerun (I1)."""
+        store, queue, task = self._setup(tmp_path, 'b2')
+        _STALE = dict(_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _STALE])
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'different-unit.service',
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        assignment = _make_assignment(task)
+        task_id = str(task['id'])
+
+        outcome1 = await runner.run(assignment)
+        assert outcome1 == WorkflowOutcome.BLOCKED
+        call_count_after_first = script_runner.await_count
+
+        task2 = await store.get_task(task_id)
+        assignment2 = _make_assignment(task2)
+        # New runner with fresh unit_inspector (only returns baseline — never called again)
+        unit_inspector2 = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        runner2 = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: 'different-unit.service',
+            unit_inspector=unit_inspector2,
+            script_runner=script_runner,
+        )
+        outcome2 = await runner2.run(assignment2)
+
+        assert script_runner.await_count == call_count_after_first, (
+            'script_runner must NOT be called on reaper re-pass (I1)'
+        )
+        assert outcome2 == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task(task_id, status='pending')
+        assert len(pending) == 1
