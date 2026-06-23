@@ -324,6 +324,58 @@ def test_index_html_cache_buster_bumped(index_html_body):
     )
 
 
+# ---------------------------------------------------------------------------
+# step-3 (task 1873): evict-park guarded button — JSX source-structure tests
+# ---------------------------------------------------------------------------
+
+
+def test_handle_evict_and_on_evict_wired(tab_scheduler_jsx_body):
+    """handleEvict callback must be defined and onEvict must be passed to ParkStacksSection."""
+    assert re.search(r'\bhandleEvict\b', tab_scheduler_jsx_body), (
+        'tab_scheduler.jsx must define a handleEvict callback'
+    )
+    assert re.search(r'onEvict\s*=\s*\{handleEvict\}', tab_scheduler_jsx_body), (
+        'tab_scheduler.jsx must pass onEvict={handleEvict} to <ParkStacksSection'
+    )
+
+
+def test_evict_button_guard_covers_liveness_and_unresolvable_root(tab_scheduler_jsx_body):
+    """The evict button's disabled guard covers both liveness and unresolvable project_root.
+
+    disabled={entry.live || !ownerProjectRoot} pins two defense-in-depth conditions:
+    - entry.live: owner is live → button disabled (live owner must not be evicted)
+    - !ownerProjectRoot: project_root absent from row index → suppresses guaranteed-400 request
+      (a dead park owner without a synthetic stranded row would send project_root:'' and
+      receive a confusing 'Evict failed (400)' toast instead of a meaningful signal)
+    """
+    assert re.search(
+        r'disabled\s*=\s*\{\s*entry\.live\s*\|\|\s*!ownerProjectRoot\s*\}',
+        tab_scheduler_jsx_body,
+    ), (
+        'tab_scheduler.jsx evict button must be guarded with '
+        'disabled={entry.live || !ownerProjectRoot} '
+        '(defense-in-depth: disabled when owner is live OR project_root is unresolvable)'
+    )
+
+
+def test_evict_button_calls_on_evict(tab_scheduler_jsx_body):
+    """The evict button must invoke onEvict(entry.owner, ...) on click and render >evict</button>.
+
+    Replaces the non-discriminating `re.search(r'evict', body, re.IGNORECASE)` test which
+    matched comments, identifiers (handleEvict/onEvict), and the endpoint string — staying
+    green even if the <button> element itself were deleted.  These two assertions pin the
+    actual button element and its click wiring, both unique to the evict <button> in
+    tab_scheduler.jsx (lines ~219, ~222), so they fail iff the button is removed or rewired.
+    """
+    body = tab_scheduler_jsx_body
+    assert re.search(r'onClick=\{\s*\(\)\s*=>\s*onEvict\(\s*entry\.owner', body), (
+        'tab_scheduler.jsx evict button must wire onClick to onEvict(entry.owner, ...)'
+    )
+    assert re.search(r'>\s*evict\s*</button>', body), (
+        'tab_scheduler.jsx must render a <button>...>evict</button> element in ParkStacksSection'
+    )
+
+
 def test_styles_css_widens_scheduler_title_column(styles_css_body):
     """styles.css must widen the scheduler title column to readable widths.
 

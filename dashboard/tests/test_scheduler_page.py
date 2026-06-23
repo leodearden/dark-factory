@@ -1171,6 +1171,87 @@ def test_reorder_pin_queue_returns_502_when_all_unreachable(client):
 
 
 # ---------------------------------------------------------------------------
+# step-1 (task 1873): POST /scheduler/evict-park — validation, proxy, 502
+# ---------------------------------------------------------------------------
+
+_EVICT_PARK_INVALID_BODIES = [
+    pytest.param(None, 'invalid_body', id='non-dict-body'),
+    pytest.param({}, 'invalid_task_id', id='missing-task_id'),
+    pytest.param({'task_id': ''}, 'invalid_task_id', id='empty-task_id'),
+    pytest.param({'task_id': 123}, 'invalid_task_id', id='task_id-not-string'),
+    pytest.param({'task_id': 'T1'}, 'invalid_project_root', id='missing-project_root'),
+    pytest.param({'task_id': 'T1', 'project_root': ''}, 'invalid_project_root', id='empty-project_root'),
+    pytest.param({'task_id': 'T1', 'project_root': 42}, 'invalid_project_root', id='project_root-not-string'),
+]
+
+
+@pytest.mark.parametrize('body,expected_error', _EVICT_PARK_INVALID_BODIES)
+def test_evict_park_endpoint_rejects_invalid_body(client, body, expected_error):
+    """Invalid body → 400 with no request_park_eviction MCP call."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+        if body is None:
+            resp = client.post(
+                '/api/v2/dashboard/scheduler/evict-park',
+                content=b'not json',
+                headers={'Content-Type': 'application/json'},
+            )
+        else:
+            resp = client.post('/api/v2/dashboard/scheduler/evict-park', json=body)
+
+    assert resp.status_code == 400
+    assert resp.json().get('error') == expected_error
+
+    _BACKGROUND_MCP_TOOLS = frozenset({'get_status', 'get_queue_stats'})
+
+    def _tool_name(c):
+        return c.kwargs.get('tool_name') or (c.args[2] if len(c.args) >= 3 else None)
+
+    unexpected = {_tool_name(c) for c in mock_mcp.call_args_list} - _BACKGROUND_MCP_TOOLS - {None}
+    assert not unexpected, (
+        f'Unexpected MCP tool call(s) on 400 path: {unexpected!r}. '
+        f'Full call list: {mock_mcp.call_args_list}'
+    )
+
+
+def test_evict_park_endpoint_proxies_verbatim_on_success(client):
+    """Valid body → 200 with MCP result forwarded verbatim; tool == request_park_eviction."""
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'requested': True, 'task_id': '42'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/evict-park',
+            json={'task_id': '42', 'project_root': '/proj'},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == mcp_result
+    mock_mcp.assert_called_once()
+    _client, _url, tool_arg, args = mock_mcp.call_args.args
+    assert tool_arg == 'request_park_eviction'
+    assert args['task_id'] == '42'
+    assert args['project_root'] == '/proj'
+
+
+def test_evict_park_endpoint_returns_502_when_all_unreachable(client):
+    """All URLs unreachable → 502 fused_memory_unreachable."""
+    from unittest.mock import AsyncMock, patch
+
+    import httpx
+
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError('refused'))):
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/evict-park',
+            json={'task_id': '42', 'project_root': '/proj'},
+        )
+
+    assert resp.status_code == 502
+    assert resp.json().get('error') == 'fused_memory_unreachable'
+
+
+# ---------------------------------------------------------------------------
 # step-32: _compose_rows propagates project and project_root fields
 # ---------------------------------------------------------------------------
 
