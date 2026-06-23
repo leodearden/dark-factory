@@ -5877,12 +5877,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if has_conflict:
                 textual_edges.add(fp_edge)
 
-        # ── 7. Store (conflicts_with_main added in step-10) ──────────────────
+        # ── 7. Probe each suffix item vs main_sha (conflicts_with_main marker) ──
+        # This is the δ user-signal: "a new submission that conflicts with main
+        # is marked."  Base = current main_sha (ε later generalises to the
+        # frozen-prefix tip; δ uses bare main per design decision §δ.5).
+        # Reuses the same _probe_cache by (frozenset({main_sha, head})) key so
+        # if any textual-edge probe already ran main_sha vs head, the result
+        # is returned from cache rather than forking another subprocess.
+        conflicts_with_main: set[str] = set()
+        for k, req in enumerate(suffix):
+            head = heads[k]
+            if head is None:
+                # Missing ref → skip (branch gone; no conservative mark here
+                # because we can't even tell if the branch exists; skipping is
+                # safer than always-conflicting for a deleted-branch item).
+                continue
+            cache_key = frozenset({main_sha, head})
+            if cache_key in _probe_cache:
+                has_main_conflict = _probe_cache[cache_key]
+            else:
+                try:
+                    probe = await self._git_ops.merge_tree_conflicts(main_sha, head)
+                    has_main_conflict = not probe.clean
+                except Exception:
+                    logger.warning(
+                        'recompute_suffix_conflict_graph: merge_tree_conflicts(main, %s) '
+                        'raised for item %s; treating as conflicts_with_main (fail-open)',
+                        head, req.request_id,
+                        exc_info=True,
+                    )
+                    has_main_conflict = True
+                _probe_cache[cache_key] = has_main_conflict
+            if has_main_conflict:
+                conflicts_with_main.add(req.request_id)
+
+        # ── 8. Store ──────────────────────────────────────────────────────────
         self._suffix_conflict_graph = SuffixConflictGraph(
             nodes=ordered_rids,
             textual_edges=frozenset(textual_edges),
             footprint_edges=frozenset(footprint_edges),
-            conflicts_with_main=frozenset(),
+            conflicts_with_main=frozenset(conflicts_with_main),
         )
         self._suffix_conflict_signature = sig
 

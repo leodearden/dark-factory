@@ -542,17 +542,22 @@ class TestConflictsWithMain:
         self, git_ops, config, git_repo
     ):
         """Branch that conflicts with main → in conflicts_with_main."""
-        # Advance main to edit line1 of shared.txt
-        (git_repo / 'shared.txt').write_text('MAIN-EDIT\nline2\nline3\n')
-        await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
-        await _run(['git', 'commit', '-m', 'Main advances: edits line1'], cwd=git_repo)
-
-        # Branch X also edits line1 → conflict with main
+        # Branch X is forked from the INITIAL main tip and edits line1 of
+        # shared.txt.  Main then advances and edits the SAME line differently.
+        # merge_tree_conflicts(main_sha, head_x) finds the common ancestor is
+        # the initial commit, so both sides modified line1 divergently → CONFLICT.
+        # (Branch must be forked BEFORE main advances; a descendant of main
+        # fast-forwards cleanly and would never appear in conflicts_with_main.)
         await _run(['git', 'checkout', '-b', 'task/conflict-x'], cwd=git_repo)
         (git_repo / 'shared.txt').write_text('X-CONFLICT\nline2\nline3\n')
         await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
         await _run(['git', 'commit', '-m', 'conflict-x edits line1'], cwd=git_repo)
         await _run(['git', 'checkout', 'main'], cwd=git_repo)
+
+        # Advance main AFTER branching so X and main diverge from a common ancestor
+        (git_repo / 'shared.txt').write_text('MAIN-EDIT\nline2\nline3\n')
+        await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'Main advances: edits line1'], cwd=git_repo)
 
         # Branch Y edits a different file → clean merge with main
         await _run(['git', 'checkout', '-b', 'task/clean-y'], cwd=git_repo)
@@ -577,16 +582,18 @@ class TestConflictsWithMain:
         self, git_ops, config, git_repo
     ):
         """snapshot()['suffix_conflict_graph']['conflicts_with_main'] lists conflicting items."""
-        # Advance main to edit shared.txt line1
-        (git_repo / 'shared.txt').write_text('MAIN-EDIT2\nline2\nline3\n')
-        await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
-        await _run(['git', 'commit', '-m', 'Main advances again'], cwd=git_repo)
-
+        # cx2 is forked from the INITIAL main tip and edits shared.txt line1.
+        # Main then advances on the same line → they diverge → conflict with main.
         await _run(['git', 'checkout', '-b', 'task/cx2'], cwd=git_repo)
         (git_repo / 'shared.txt').write_text('X2-CONFLICT\nline2\nline3\n')
         await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
         await _run(['git', 'commit', '-m', 'cx2 conflicts'], cwd=git_repo)
         await _run(['git', 'checkout', 'main'], cwd=git_repo)
+
+        # Advance main AFTER branching
+        (git_repo / 'shared.txt').write_text('MAIN-EDIT2\nline2\nline3\n')
+        await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'Main advances again'], cwd=git_repo)
 
         worker = _make_worker(git_ops)
         req_x = _make_req('task-cx2', 'cx2', config, git_repo)
