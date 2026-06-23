@@ -3722,6 +3722,90 @@ class InflightVerifyResult:
     spec_warm: bool = False   # True when merge_wt is a warm _spec- lane (not an ephemeral wt)
 
 
+@dataclasses.dataclass(frozen=True)
+class SuffixConflictGraph:
+    """Immutable conflict-graph over the unfrozen merge-queue suffix (task δ=1889).
+
+    Holds two distinct pair-edge relations and one per-item marker:
+
+    * **footprint_edges** — pairs whose changed-path footprints overlap (γ seam).
+      Drives future ζ (ordering) consumers; computed cheaply via path-set
+      intersection without forking git.
+
+    * **textual_edges** — pairs with genuine 3-way textual conflicts (β seam).
+      Pruned to footprint-overlapping pairs only (textual ⇒ footprint contract).
+      Drives future η (bounce) consumers; each entry represents a confirmed
+      git merge-tree conflict.
+
+    * **conflicts_with_main** — request_ids of suffix items that conflict with
+      the current main tip (the δ user-signal).
+
+    **Node identity** — request_id (the stable per-MergeRequest UUID, e.g.
+    ``'mr-a1b2c3d4'``).  Nodes are stored in pick order (high lane before
+    normal, FIFO within each lane) so the tuple doubles as the ordered view
+    of the suffix.
+
+    **Immutability** — frozen dataclass; every field is a frozenset or tuple
+    so the graph can be shared safely across the async event loop without
+    copying.
+
+    See also: EMPTY_SUFFIX_CONFLICT_GRAPH (module constant for the zero case).
+    """
+
+    nodes: tuple[str, ...]
+    """Request IDs in pick order (high lane → normal lane, FIFO within each lane)."""
+
+    textual_edges: frozenset[frozenset[str]]
+    """Unordered pairs {rid_a, rid_b} with a confirmed 3-way textual conflict."""
+
+    footprint_edges: frozenset[frozenset[str]]
+    """Unordered pairs {rid_a, rid_b} whose changed-path footprints overlap."""
+
+    conflicts_with_main: frozenset[str]
+    """Request IDs that conflict with the current main tip."""
+
+    def textual_neighbors(self, rid: str) -> frozenset[str]:
+        """Return the set of request_ids connected to *rid* via textual_edges."""
+        return frozenset(
+            next(iter(edge - {rid}))
+            for edge in self.textual_edges
+            if rid in edge
+        )
+
+    def footprint_neighbors(self, rid: str) -> frozenset[str]:
+        """Return the set of request_ids connected to *rid* via footprint_edges."""
+        return frozenset(
+            next(iter(edge - {rid}))
+            for edge in self.footprint_edges
+            if rid in edge
+        )
+
+    def to_snapshot_dict(self) -> dict:
+        """Return a JSON-safe dict representation suitable for heartbeat snapshots.
+
+        Output format:
+          nodes: list[str]                 — in pick order
+          textual_edges: list[list[str]]   — each inner list sorted; outer sorted
+          footprint_edges: list[list[str]] — same shape as textual_edges
+          conflicts_with_main: list[str]   — sorted
+        """
+        return {
+            'nodes': list(self.nodes),
+            'textual_edges': sorted(sorted(edge) for edge in self.textual_edges),
+            'footprint_edges': sorted(sorted(edge) for edge in self.footprint_edges),
+            'conflicts_with_main': sorted(self.conflicts_with_main),
+        }
+
+
+EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
+    nodes=(),
+    textual_edges=frozenset(),
+    footprint_edges=frozenset(),
+    conflicts_with_main=frozenset(),
+)
+"""Sentinel empty SuffixConflictGraph for the default/zero-suffix case."""
+
+
 class _TrainMergeHost(Protocol):
     """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
 
@@ -5177,6 +5261,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._lane_buffers: dict[str, collections.deque[MergeRequest]] = {
             ln: collections.deque() for ln in MERGE_LANES
         }
+        # δ/1889 — conflict-graph over the unfrozen suffix (see SuffixConflictGraph).
+        # Populated by recompute_suffix_conflict_graph(); read synchronously by
+        # snapshot().  Initialised to the sentinel empty graph so snapshot() is
+        # always valid even before the first recompute.
+        self._suffix_conflict_graph: SuffixConflictGraph = EMPTY_SUFFIX_CONFLICT_GRAPH
+        # Debounce signature for recompute_suffix_conflict_graph() — see step-12.
+        # None means "no prior compute"; a non-None value is (tuple_of_rids, main_sha).
+        self._suffix_conflict_signature: tuple[tuple[str, ...], str] | None = None
         # Resume signal: set by every unhalt method so a blocked merger
         # (waiting with no pickable item) wakes up to re-check lanes.
         # Cleared by the merger before each wait; never cancelled.
@@ -5629,6 +5721,232 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return buf.popleft()
         return None
 
+    async def recompute_suffix_conflict_graph(self) -> None:
+        """Recompute and store the conflict-graph over the unfrozen suffix (task δ=1889).
+
+        Enumerates _lane_buffers in pick order (high → normal, FIFO within each
+        lane), resolves each item's branch head SHA and changed-paths footprint,
+        builds footprint_edges (γ path-overlap) and textual_edges (β 3-way merge
+        probe), and marks items that conflict with the current main tip.
+
+        **Debounce** — short-circuits when the signature (ordered suffix
+        request_ids, main_sha) is unchanged since the last recompute.  Any change
+        to the suffix (submit/resubmit → new request_id, landing → item removed +
+        main advances, reorder → order changes) breaks the signature and forces a
+        full recompute.  Within a recompute, merge_tree_conflicts results are
+        memoized by (base_sha, head_sha) to avoid duplicate probes.
+
+        **Fail-open** — any probe error → conservative (treat as conflict/edge);
+        items with missing branch refs are skipped without aborting.  Never raises.
+
+        **Textual pruning** — the β/γ contract idealises textual-conflict ⇒
+        footprint-overlap.  The footprint is approximated via
+        ``get_changed_files(main_sha, head)`` (current-main..head delta) rather
+        than the true merge-base..head delta; this can under-report a branch's
+        footprint when main has since converged to identical content.
+        Downstream ζ/η consumers should treat ``footprint_edges`` as a
+        best-effort (not guaranteed-complete) superset.  Only
+        footprint-overlapping pairs are probed via merge_tree_conflicts,
+        collapsing the O(n²) forks to the overlap subset; a missed footprint
+        edge means the textual probe is skipped, so a genuine textual conflict
+        could be silently omitted from ``textual_edges``.
+
+        This method is async (forks git subprocesses) while snapshot() stays
+        synchronous and cheap (reads the stored graph; no await).
+        """
+        # ── 1. Build ordered suffix list ──────────────────────────────────────
+        suffix: list[MergeRequest] = []
+        for lane in MERGE_LANES:  # high → normal
+            suffix.extend(self._lane_buffers[lane])  # FIFO within each lane
+
+        ordered_rids = tuple(req.request_id for req in suffix)
+
+        # ── 2. Debounce: fetch main_sha once, compare signature ───────────────
+        try:
+            main_sha = await self._git_ops.get_main_sha()
+        except Exception:
+            logger.warning('recompute_suffix_conflict_graph: get_main_sha failed; skipping')
+            return
+
+        sig = (ordered_rids, main_sha)
+        if sig == self._suffix_conflict_signature:
+            return  # Suffix + main unchanged — prior graph is still valid
+
+        # ── 3. Empty suffix → sentinel ────────────────────────────────────────
+        if not suffix:
+            self._suffix_conflict_graph = EMPTY_SUFFIX_CONFLICT_GRAPH
+            self._suffix_conflict_signature = sig
+            return
+
+        # ── 4. Resolve branch heads + footprints ─────────────────────────────
+        branch_prefix = self._git_ops.config.branch_prefix
+        # Per-item: (head_sha | None, changed_paths | None)
+        heads: list[str | None] = []
+        changed_paths_list: list[list[str] | None] = []
+        # Initialised exactly once here so that a get_changed_files failure
+        # (set to True below) survives into the signature-caching gate at the
+        # end of this method.  Do NOT re-initialise this flag in later steps.
+        _any_probe_error = False
+
+        for req in suffix:
+            ref = f'{branch_prefix}{req.branch}'
+            try:
+                head = await self._git_ops.resolve_branch_sha(ref)
+            except Exception:
+                logger.warning(
+                    'recompute_suffix_conflict_graph: resolve_branch_sha(%r) raised; '
+                    'treating item as missing ref', ref, exc_info=True,
+                )
+                head = None
+            heads.append(head)
+
+            if head is None:
+                changed_paths_list.append(None)
+                continue
+            try:
+                # Branch delta = from merge-base to branch head; approximate
+                # using branch..main ancestor as from (git diff main..branch).
+                # Simpler: get_changed_files(main_sha, head) captures the branch
+                # delta relative to current main (sufficient for overlap detection).
+                paths = await self._git_ops.get_changed_files(main_sha, head)
+            except Exception:
+                logger.warning(
+                    'recompute_suffix_conflict_graph: get_changed_files failed for %r; '
+                    'treating footprint as unknown', ref, exc_info=True,
+                )
+                paths = None
+                _any_probe_error = True
+            changed_paths_list.append(paths)
+
+        # ── 5. Build footprint_edges via path-set intersection ────────────────
+        detector = get_overlap_detector(None)
+        footprint_edges: set[frozenset[str]] = set()
+
+        # Precompute footprints once per item — avoids O(E·n) recomputation
+        # inside the O(n²) pairwise loop (each detector.footprint() call
+        # allocates a fresh frozenset; hoisting it drops that to O(n)).
+        footprints_list: list[Footprint | None] = [
+            detector.footprint(p) if p is not None else None
+            for p in changed_paths_list
+        ]
+
+        for i in range(len(suffix)):
+            fp_i = footprints_list[i]
+            if fp_i is None:
+                continue  # missing ref — skip pairwise comparison for this item
+            for j in range(i + 1, len(suffix)):
+                fp_j = footprints_list[j]
+                if fp_j is None:
+                    continue
+                try:
+                    overlap = detector.overlaps(fp_i, fp_j)
+                except Exception:
+                    logger.warning(
+                        'recompute_suffix_conflict_graph: footprint overlap check '
+                        'raised for pair (%s, %s); treating as overlap (fail-open)',
+                        suffix[i].request_id, suffix[j].request_id,
+                        exc_info=True,
+                    )
+                    overlap = True
+                if overlap:
+                    footprint_edges.add(frozenset({
+                        suffix[i].request_id,
+                        suffix[j].request_id,
+                    }))
+
+        # ── 6. Build textual_edges via merge_tree_conflicts (β) ──────────────
+        # Only probe footprint-overlapping pairs (textual ⇒ footprint contract
+        # from γ; note footprint is an approximation — see docstring caveat —
+        # so a genuine textual conflict without a footprint edge is possible).
+        # Memoize results by frozenset({head_a, head_b}) within this recompute
+        # so a pair is probed at most once even when re-ordered.
+        _probe_cache: dict[frozenset[str], bool] = {}
+        textual_edges: set[frozenset[str]] = set()
+
+        # Build once — invariant across all footprint-edge iterations (O(n) vs O(E·n)).
+        idx_map = {req.request_id: k for k, req in enumerate(suffix)}
+
+        for fp_edge in footprint_edges:
+            rids = tuple(fp_edge)
+            i_idx = idx_map.get(rids[0])
+            j_idx = idx_map.get(rids[1])
+            if i_idx is None or j_idx is None:
+                continue
+            head_i = heads[i_idx]
+            head_j = heads[j_idx]
+            if head_i is None or head_j is None:
+                # Conservative: missing ref → treat as textual conflict
+                textual_edges.add(fp_edge)
+                continue
+            cache_key = frozenset({head_i, head_j})
+            if cache_key in _probe_cache:
+                has_conflict = _probe_cache[cache_key]
+            else:
+                try:
+                    probe = await self._git_ops.merge_tree_conflicts(head_i, head_j)
+                    has_conflict = not probe.clean
+                except Exception:
+                    logger.warning(
+                        'recompute_suffix_conflict_graph: merge_tree_conflicts raised '
+                        'for pair (%s, %s); treating as conflict (fail-open)',
+                        suffix[i_idx].request_id, suffix[j_idx].request_id,
+                        exc_info=True,
+                    )
+                    has_conflict = True
+                    _any_probe_error = True
+                _probe_cache[cache_key] = has_conflict
+            if has_conflict:
+                textual_edges.add(fp_edge)
+
+        # ── 7. Probe each suffix item vs main_sha (conflicts_with_main marker) ──
+        # This is the δ user-signal: "a new submission that conflicts with main
+        # is marked."  Base = current main_sha (ε later generalises to the
+        # frozen-prefix tip; δ uses bare main per design decision §δ.5).
+        # Reuses the same _probe_cache by (frozenset({main_sha, head})) key so
+        # if any textual-edge probe already ran main_sha vs head, the result
+        # is returned from cache rather than forking another subprocess.
+        conflicts_with_main: set[str] = set()
+        for k, req in enumerate(suffix):
+            head = heads[k]
+            if head is None:
+                # Missing ref → skip (branch gone; no conservative mark here
+                # because we can't even tell if the branch exists; skipping is
+                # safer than always-conflicting for a deleted-branch item).
+                continue
+            cache_key = frozenset({main_sha, head})
+            if cache_key in _probe_cache:
+                has_main_conflict = _probe_cache[cache_key]
+            else:
+                try:
+                    probe = await self._git_ops.merge_tree_conflicts(main_sha, head)
+                    has_main_conflict = not probe.clean
+                except Exception:
+                    logger.warning(
+                        'recompute_suffix_conflict_graph: merge_tree_conflicts(main, %s) '
+                        'raised for item %s; treating as conflicts_with_main (fail-open)',
+                        head, req.request_id,
+                        exc_info=True,
+                    )
+                    has_main_conflict = True
+                    _any_probe_error = True
+                _probe_cache[cache_key] = has_main_conflict
+            if has_main_conflict:
+                conflicts_with_main.add(req.request_id)
+
+        # ── 8. Store ──────────────────────────────────────────────────────────
+        self._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=ordered_rids,
+            textual_edges=frozenset(textual_edges),
+            footprint_edges=frozenset(footprint_edges),
+            conflicts_with_main=frozenset(conflicts_with_main),
+        )
+        # Only cache the debounce signature when every probe succeeded.  A
+        # transient error leaves the signature un-stored so the next tick
+        # re-probes rather than serving a stale conservative result behind the
+        # debounce.
+        if not _any_probe_error:
+            self._suffix_conflict_signature = sig
+
     async def _acquire_next_request(self) -> MergeRequest | None:
         """Return the next pickable request, blocking if nothing is available.
 
@@ -5647,6 +5965,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Drain any newly arrived items into lane buffers.
             # Sets _shutdown_signaled if the sentinel is encountered.
             self._drain_queue_into_lanes()
+
+            # δ/1889 — refresh the conflict-graph over the unfrozen suffix.
+            # The debounce (signature check) makes repeated calls cheap when
+            # neither the suffix composition nor main_sha has changed.
+            # Note: the speculative-merge prefetch path may observe a slightly
+            # stale graph for items dispatched before the next acquire; that
+            # staleness window is bounded by one acquire cycle and is
+            # intentional (ε/ζ/η consume the relation, not the merge outcome).
+            await self.recompute_suffix_conflict_graph()
 
             req = self._pop_next_pickable()
             if req is not None:
@@ -5883,6 +6210,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'is_wip_halted': self.is_wip_halted,
             'halt_owner_esc_id': self.halt_owner_esc_id,
             'occupancy': occupancy,
+            # δ/1889 additive key: per-suffix conflict relation (backward-compatible).
+            # Populated by recompute_suffix_conflict_graph() after each drain.
+            # Read here synchronously — no await; the expensive async build is
+            # decoupled from the read (snapshot() stays non-blocking).
+            'suffix_conflict_graph': self._suffix_conflict_graph.to_snapshot_dict(),
         }
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
