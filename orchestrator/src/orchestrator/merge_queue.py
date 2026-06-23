@@ -3516,6 +3516,13 @@ class GroupMergeRequest(MergeRequest):
     mark_member_done: Callable[[str, str], Awaitable[None]]
     """Async callback: mark a single member task done with the merge SHA."""
 
+    redrive_member: Callable[['str', bool, 'str | None'], Awaitable[None]] | None = field(
+        default=None, kw_only=True,
+    )
+    """Optional async callback: re-drive an absorbed member still merge-deferred
+    after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
+    None when not wired (back-compat with existing test constructions)."""
+
 
 @dataclass
 class MergeOutcome:
@@ -6530,6 +6537,67 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'Coalesce one-strike: marked %d task(s) after coalesce-train derail: %s',
             len(member_task_ids), member_task_ids,
         )
+
+    async def _redrive_coalesce_members(
+        self, req: 'GroupMergeRequest', main_sha: str,
+    ) -> None:
+        """Re-drive absorbed members still merge-deferred after a coalesce-train derail.
+
+        For each member task still in 'merge-deferred' status (per req.status_check):
+          - If the member's branch is already an ancestor of main (double-landing
+            guard: a partner's merge brought it in), mark it done with
+            found_on_main provenance via req.redrive_member(mid, True, sha).
+          - Otherwise flip it to 'pending' via req.redrive_member(mid, False, None)
+            so the scheduler re-dispatches a fresh solo-merge workflow that owns
+            the merge-deferred→done transition.
+
+        Members not in 'merge-deferred' (e.g. raced to 'in-progress' by a sibling)
+        are left alone — the live workflow owns their done-transition.
+
+        Per-member try/except ensures one member failure never aborts the rest or
+        kills the merger loop.  req.redrive_member=None is a back-compat no-op.
+        """
+        if req.redrive_member is None:
+            logger.warning(
+                'Coalesce train %s: _redrive_coalesce_members called but '
+                'req.redrive_member is None — cannot re-drive stranded members',
+                req.train_id,
+            )
+            return
+
+        statuses = await req.status_check(req.member_task_ids)
+        deferred_mids = [
+            mid for mid in req.member_task_ids
+            if statuses.get(mid) == 'merge-deferred'
+        ]
+
+        for mid in deferred_mids:
+            try:
+                branch = f'{self._git_ops.config.branch_prefix}{mid}'
+                on_main = await self._git_ops.is_ancestor(
+                    branch, self._git_ops.config.main_branch,
+                )
+                if on_main:
+                    sha = await self._git_ops.resolve_branch_sha(branch) or main_sha
+                    await req.redrive_member(mid, True, sha)
+                    logger.info(
+                        'Coalesce train %s: member %s already on main — '
+                        'marked done (found_on_main, sha=%s)',
+                        req.train_id, mid, sha,
+                    )
+                else:
+                    await req.redrive_member(mid, False, None)
+                    logger.info(
+                        'Coalesce train %s: member %s not on main — '
+                        'flipped to pending for solo-merge re-dispatch',
+                        req.train_id, mid,
+                    )
+            except Exception:
+                logger.exception(
+                    'Coalesce train %s: re-drive failed for member %s — '
+                    'continuing with remaining members',
+                    req.train_id, mid,
+                )
 
     def _default_coalesce_exclusion_reason(self, req: MergeRequest) -> str | None:
         """Built-in merge-ready predicate (δ/1720 confidence gate).
