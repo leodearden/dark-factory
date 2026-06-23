@@ -9694,6 +9694,74 @@ class TestStarvationWatchdog:
         )
 
     @pytest.mark.asyncio
+    async def test_self_resolve_on_dispatch(self):
+        """_on_starvation_resolve is called exactly once when the escalated task dispatches.
+
+        Drive 'starved' to the escalated state (task_id in _starvation_escalated).
+        Then release the 'seed' lock so the next acquire_next dispatches 'starved'.
+        Assert:
+        - acquire_next returns a TaskAssignment for 'starved'
+        - _on_starvation_resolve called exactly once with task_id='starved'
+        - 'starved' NOT in scheduler._starvation_escalated
+        - 'starved' NOT in scheduler._starvation_first_seen
+        """
+        scheduler, t = self._make_scheduler()
+        warn_cb = AsyncMock()
+        resolve_cb = AsyncMock()
+        scheduler._on_starvation_warn = warn_cb
+        scheduler._on_starvation_resolve = resolve_cb
+
+        # Seed a held lock on 'seed' so 'starved' can't acquire initially.
+        scheduler.lock_table.try_acquire('seed', ['backend'])
+        scheduler._dispatched.add('seed')
+
+        task = self._starved_task()
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # Drive 3 ticks to hit skip_threshold, then advance clock past idle_secs.
+        for _ in range(3):
+            await scheduler.acquire_next()
+
+        t[0] = 150.0
+        await scheduler.acquire_next()
+
+        # Verify warn callback fired (task is now in _starvation_escalated).
+        warn_cb.assert_called_once()
+        assert 'starved' in scheduler._starvation_escalated, (
+            'Precondition: starved must be in _starvation_escalated'
+        )
+        resolve_cb.assert_not_called()
+
+        # Release 'seed' so 'starved' can acquire 'backend'.
+        scheduler.lock_table.release('seed')
+        scheduler._dispatched.discard('seed')
+
+        # Next acquire_next must dispatch 'starved'.
+        result = await scheduler.acquire_next()
+        assert result is not None, 'Expected TaskAssignment after releasing seed lock'
+        assert result.task_id == 'starved', (
+            f'Expected task_id="starved"; got {result.task_id!r}'
+        )
+
+        # Resolve callback must have fired exactly once with 'starved'.
+        resolve_cb.assert_called_once()
+        call_args = resolve_cb.call_args
+        args = call_args.args if call_args.args else ()
+        kwargs = call_args.kwargs if call_args.kwargs else {}
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == 'starved', (
+            f'Expected task_id="starved" in resolve callback; got {task_id_arg!r}'
+        )
+
+        # State cleanup: 'starved' must no longer be in the escalated set or seen dict.
+        assert 'starved' not in scheduler._starvation_escalated, (
+            '_starvation_escalated must be cleared on dispatch'
+        )
+        assert 'starved' not in scheduler._starvation_first_seen, (
+            '_starvation_first_seen must be cleared on dispatch'
+        )
+
+    @pytest.mark.asyncio
     async def test_below_skip_threshold_no_callback(self):
         """(a) Below skip_threshold: fewer skips than threshold → callback NOT called.
 
