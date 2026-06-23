@@ -312,12 +312,22 @@ class DeterministicRunner:
             )
 
             if not fresh:
-                # B7b: stale/missing PID — file infra_issue escalation (step-6)
-                raise NotImplementedError(
-                    'DeterministicRunner: stale/missing PID verify for before_done '
-                    'is task γ step-6. '
-                    f'Task id={task_id}. pid={pid!r} new_monotonic={new_monotonic} '
-                    f'baseline_monotonic={baseline_monotonic}.'
+                # B7b: verify failed — file infra_issue escalation, set blocked
+                verify_detail = '\n'.join([
+                    description,
+                    f'Target unit: {target_unit}',
+                    (
+                        f'Verify failed: new MainPID={pid!r} '
+                        f'new_monotonic={new_monotonic} '
+                        f'baseline_monotonic={baseline_monotonic}'
+                    ),
+                    'Expected a fresh non-sentinel MainPID (>0) and a strictly-later '
+                    'ActiveEnterTimestampMonotonic after the deploy.',
+                ])
+                return await self._file_infra_issue_and_block(
+                    task_id,
+                    summary=f'Deploy verify failed: {target_unit}',
+                    detail=verify_detail,
                 )
 
             if not always_escalates:
