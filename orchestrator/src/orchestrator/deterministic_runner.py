@@ -55,20 +55,22 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      success path.
    - If scheduling succeeds (``rc == 0``): stamp ``before_done_scheduled_at``
      (a dict carrying the transient unit name and fire delay) as a crash-safe
-     marker.  If the runner crashes between this stamp and the done write, the
-     resume path restores done with scheduled provenance instead of
-     re-escalating as a crash window.
+     marker.  If the runner crashes between this stamp and the done write or
+     gate filing, the resume path (b-self) below handles recovery.
    - If scheduling succeeds (``rc == 0``) and ``always_escalates=False``:
      set task ``done`` with
      ``done_provenance.kind='deterministic-deploy-scheduled'`` carrying the
      transient unit name and fire delay; return DONE (done = *scheduled*, not
-     *verified*).
+     *verified*).  A crash between the stamp and done write is recovered by
+     (b-self) driving to done with scheduled provenance.
    - If scheduling succeeds (``rc == 0``) and ``always_escalates=True``
      (act-then-ask): fall through directly to section 3 (the gate) WITHOUT
      running the blocking cross-unit deploy.  The detached restart is already
      scheduled; the gate is filed as a ``milestone_gate`` escalation; the task
      is set to ``blocked``.  Neither ``unit_inspector`` nor ``script_runner``
-     are invoked on this path (self-kill and double-deploy prevention).
+     are invoked on this path (self-kill and double-deploy prevention).  A
+     crash between the stamp and the gate filing is recovered by (b-self)
+     re-filing the gate — the human-approval gate is NEVER bypassed.
    - If scheduling fails (``rc != 0``): file born-at-L2 infra_issue, block
      (parallel to γ's rc≠0/verify-fail handling); ``before_done_ran_at``
      already stamped (not re-run, I1).
@@ -388,6 +390,82 @@ class DeterministicRunner:
         logger.info('DeterministicRunner: task %s blocked — infra_issue', task_id)
         return WorkflowOutcome.BLOCKED
 
+    async def _file_milestone_gate_and_block(
+        self, task_id: str, task: dict, metadata: dict
+    ) -> WorkflowOutcome:
+        """File a born-at-L2 ``milestone_gate`` escalation and block the task.
+
+        Encapsulates section 3's gate-filing logic for reuse by:
+        - The pure-gate path (section 3) in ``run()``.
+        - The (b-self) crash-resume path when ``always_escalates=True``
+          (crash between ``before_done_scheduled_at`` stamp and gate filing).
+
+        Includes a dedup guard — if a pending escalation already exists
+        (e.g. prior crash-safe re-dispatch), filing is skipped to avoid
+        duplicate L2 escalations.  Stamps ``gate_escalated_at`` so the
+        next resume routes through section-1 quiescence.
+
+        Returns:
+            ``WorkflowOutcome.BLOCKED``
+        """
+        from escalation.models import Escalation
+
+        title = task.get('title', '')
+        description = task.get('description', '')
+        deps = task.get('dependencies', [])
+        dep_ids = [
+            str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
+        ]
+        detail_parts = [description]
+        if dep_ids:
+            detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
+        detail = '\n'.join(detail_parts)
+        gate_options = metadata.get('gate_options') or []
+
+        # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
+        # failure on the following update_task re-files the gate on next dispatch
+        # rather than silently skipping it).
+        existing_pending = self.escalation_queue.get_by_task(task_id, status='pending')
+        if existing_pending:
+            logger.info(
+                'DeterministicRunner: task %s already has %d pending escalation(s) — '
+                'skipping re-file (gate_escalated_at stamp must have failed on prior dispatch)',
+                task_id, len(existing_pending),
+            )
+        else:
+            esc = Escalation(
+                id=self.escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='orchestrator-deterministic',
+                severity='critical',
+                category='milestone_gate',
+                summary=title[:200],
+                detail=detail,
+                options=list(gate_options),
+                level=2,
+            )
+            self.escalation_queue.submit(esc)
+            logger.info(
+                'DeterministicRunner: filed L2 milestone gate escalation %s for task %s',
+                esc.id, task_id,
+            )
+
+        # Stamp gate_escalated_at AFTER successful escalation submit.
+        now_iso = datetime.now(UTC).isoformat()
+        await self.scheduler.update_task(
+            task_id,
+            {'gate_escalated_at': now_iso},
+            metadata_mode='merge',
+        )
+
+        # Set status to blocked — gate awaits human decision.
+        await self.scheduler.set_task_status(task_id, 'blocked')
+        logger.info(
+            'DeterministicRunner: task %s blocked at deterministic gate', task_id,
+        )
+
+        return WorkflowOutcome.BLOCKED
+
     # ------------------------------------------------------------------
     # Main runner
     # ------------------------------------------------------------------
@@ -408,7 +486,6 @@ class DeterministicRunner:
         task_id = str(assignment.task_id)
         task = assignment.task
         metadata = task.get('metadata') or {}
-        title = task.get('title', '')
         description = task.get('description', '')
         before_done = metadata.get('before_done')
         always_escalates = metadata.get('always_escalates', False)
@@ -533,29 +610,42 @@ class DeterministicRunner:
                 before_done_scheduled_at_stamp = metadata.get('before_done_scheduled_at')
                 if before_done_scheduled_at_stamp:
                     # (b-self) Self-restart was successfully scheduled
-                    # (before_done_scheduled_at set) but the done write did not
-                    # complete.  The detached transient unit is still registered
-                    # with the user systemd manager and WILL fire — driving to
-                    # done here is safe and avoids a spurious crash-window L2.
+                    # (before_done_scheduled_at set) but the done write or gate
+                    # filing did not complete (crash in the window after stamp).
                     _sched = before_done_scheduled_at_stamp if isinstance(before_done_scheduled_at_stamp, dict) else {}
                     logger.info(
                         'DeterministicRunner: task %s self-restart scheduled (%s) + '
-                        'crash before done write — resume with scheduled provenance '
-                        '(transient_unit=%s)',
+                        'crash before done/gate write — resume path '
+                        '(transient_unit=%s, always_escalates=%s)',
                         task_id, _sched.get('at', ''), _sched.get('transient_unit', ''),
+                        always_escalates,
                     )
-                    await self.scheduler.set_task_status(
+                    if not always_escalates:
+                        # always_escalates=False: the transient unit is registered and WILL
+                        # fire — driving to done here is safe and avoids a spurious
+                        # crash-window L2.
+                        await self.scheduler.set_task_status(
+                            task_id,
+                            'done',
+                            done_provenance={
+                                'kind': 'deterministic-deploy-scheduled',
+                                'unit': target_unit,
+                                'transient_unit': _sched.get('transient_unit', ''),
+                                'fire_delay_secs': _sched.get('fire_delay_secs', 0),
+                                'note': 'resumed after self-restart scheduled (crash before done write)',
+                            },
+                        )
+                        return WorkflowOutcome.DONE
+                    # always_escalates=True (act-then-ask): the milestone gate must NOT
+                    # be bypassed.  Re-file the gate and block; gate_escalated_at is
+                    # stamped so the next resume routes through section-1 quiescence
+                    # rather than entering this (b-self) branch again.
+                    logger.info(
+                        'DeterministicRunner: task %s scheduled-resume with '
+                        'always_escalates=True — re-filing milestone gate (gate not bypassed)',
                         task_id,
-                        'done',
-                        done_provenance={
-                            'kind': 'deterministic-deploy-scheduled',
-                            'unit': target_unit,
-                            'transient_unit': _sched.get('transient_unit', ''),
-                            'fire_delay_secs': _sched.get('fire_delay_secs', 0),
-                            'note': 'resumed after self-restart scheduled (crash before done write)',
-                        },
                     )
-                    return WorkflowOutcome.DONE
+                    return await self._file_milestone_gate_and_block(task_id, task, metadata)
 
                 if ever_escalated:
                     # (b) A failure escalation was filed and resolved by a human.
@@ -802,61 +892,4 @@ class DeterministicRunner:
                 'always_escalates=False — this combination is not supported in β.'
             )
 
-        # Build the escalation detail: description + dep IDs.
-        deps = task.get('dependencies', [])
-        dep_ids = [
-            str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
-        ]
-        detail_parts = [description]
-        if dep_ids:
-            detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
-        detail = '\n'.join(detail_parts)
-
-        gate_options = metadata.get('gate_options') or []
-
-        # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
-        # failure on the following update_task re-files the gate on next dispatch
-        # rather than silently skipping it).
-        # Dedup guard: if a prior crash-safe re-dispatch already submitted the
-        # escalation but failed before stamping gate_escalated_at, skip the
-        # submit to avoid duplicate L2 escalations (human sees multiple gates).
-        existing_pending = self.escalation_queue.get_by_task(task_id, status='pending')
-        if existing_pending:
-            logger.info(
-                'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (gate_escalated_at stamp must have failed on prior dispatch)',
-                task_id, len(existing_pending),
-            )
-        else:
-            esc = Escalation(
-                id=self.escalation_queue.make_id(task_id),
-                task_id=task_id,
-                agent_role='orchestrator-deterministic',
-                severity='critical',
-                category='milestone_gate',
-                summary=title[:200],
-                detail=detail,
-                options=list(gate_options),
-                level=2,
-            )
-            self.escalation_queue.submit(esc)
-            logger.info(
-                'DeterministicRunner: filed L2 milestone gate escalation %s for task %s',
-                esc.id, task_id,
-            )
-
-        # Stamp gate_escalated_at AFTER successful escalation submit.
-        now_iso = datetime.now(UTC).isoformat()
-        await self.scheduler.update_task(
-            task_id,
-            {'gate_escalated_at': now_iso},
-            metadata_mode='merge',
-        )
-
-        # Set status to blocked — gate awaits human decision.
-        await self.scheduler.set_task_status(task_id, 'blocked')
-        logger.info(
-            'DeterministicRunner: task %s blocked at deterministic gate', task_id,
-        )
-
-        return WorkflowOutcome.BLOCKED
+        return await self._file_milestone_gate_and_block(task_id, task, metadata)
