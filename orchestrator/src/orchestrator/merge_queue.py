@@ -6539,6 +6539,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # head_of_line/verify_in_progress/occupancy/is_wip_halted/
             # halt_owner_esc_id/suffix_conflict_graph).
             'metrics': self._merge_metrics.as_snapshot(),
+            # ε=1890 additive key: frozen-prefix / verify-frontier partition.
+            # Populated by the pure frozen_prefix() / _newest_frozen_commit()
+            # accessors — pure synchronous read, no await, no git calls.
+            # No collision with existing keys (entries/depth/head_of_line/
+            # verify_in_progress/occupancy/is_wip_halted/halt_owner_esc_id/
+            # suffix_conflict_graph/metrics).
+            'frozen_prefix': {
+                'request_ids': list(self.frozen_prefix()),
+                'tip_merge_commit': self._newest_frozen_commit(),
+                'verify_depth': len(self.frozen_prefix()),
+            },
         }
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
