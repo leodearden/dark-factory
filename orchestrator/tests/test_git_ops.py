@@ -4161,34 +4161,16 @@ class TestCreateWorktreeTrain:
         )
         assert log_ag.strip() == ''
 
-    @pytest.mark.xfail(
-        reason=(
-            'TODO(train, γ₁/γ₂ follow-up): reuse-existing-worktree path rebases onto '
-            'main instead of the predecessor tip; a requeued stacked train member '
-            'silently loses its stacking.  See git_ops.py TODO(train, β₂ follow-up) '
-            'comment.  This xfail pins the gap so it is visible until Phase-3 '
-            'γ₁/γ₂ addresses mid-verify reuse for stacked trains.'
-        ),
-        strict=True,
-    )
-    async def test_reuse_path_rebases_to_predecessor_tip_xfail(
+    async def test_reuse_path_rebases_to_predecessor_tip(
         self, git_ops: GitOps
     ):
-        """Requeued stacked train member should rebase onto predecessor tip (not main).
+        """Requeued stacked train member must rebase onto predecessor tip (not main).
 
-        KNOWN GAP (deferred to γ₁/γ₂): the reuse-existing-worktree path
-        (git_ops.py lines ~643-678) currently rebases onto main unconditionally.
-        A re-dispatched train successor therefore loses its stacking contract
-        and treats main as the base instead of its predecessor's tip.
-
-        This test documents the desired future behaviour:
+        Regression test for the reuse-existing-worktree path (git_ops.py):
           - beta is created stacked on alpha
           - beta's worktree already exists (simulating a requeue)
-          - calling create_worktree again for beta should (eventually) produce
-            WorktreeInfo.base_commit == alpha_tip, not main's SHA.
-
-        As written it asserts the desired state and is expected to FAIL (xfail)
-        until γ₁/γ₂ is implemented — proving the gap is real.
+          - calling create_worktree again for beta must produce
+            WorktreeInfo.base_commit == alpha_tip (predecessor tip, NOT main).
         """
         from orchestrator.git_ops import TrainMembership
 
@@ -4208,9 +4190,43 @@ class TestCreateWorktreeTrain:
         # The reuse path fires because worktree_path already exists.
         reused_info = await git_ops.create_worktree('reuse-beta', train=train)
 
-        # DESIRED behaviour (γ₁/γ₂): after reuse, base should still be alpha_tip.
-        # CURRENT behaviour: rebases onto main → base_commit == main's SHA (not alpha_tip).
-        assert reused_info.base_commit == alpha_tip  # ← currently fails → xfail
+        # (1) base_commit must be alpha_tip (predecessor tip), NOT main's SHA
+        assert reused_info.base_commit == alpha_tip
+
+        # (2) git log task/reuse-beta..task/reuse-alpha is empty
+        # (β still contains all of α's commits after the rebase)
+        _, log_out, _ = await _run(
+            ['git', 'log', 'task/reuse-beta..task/reuse-alpha', '--oneline'],
+            cwd=git_ops.project_root,
+        )
+        assert log_out.strip() == ''
+
+    async def test_reuse_missing_predecessor_branch_raises(
+        self, git_ops: GitOps
+    ):
+        """Reused worktree with a missing predecessor branch raises RuntimeError.
+
+        If the predecessor branch no longer exists when a stacked train member
+        is requeued, the reuse path must raise RuntimeError (mirroring the
+        create-path guard) rather than silently rebasing onto main.
+        """
+        from orchestrator.git_ops import TrainMembership
+
+        # Create a plain (non-train) worktree so the dir exists for reuse
+        await git_ops.create_worktree('reuse-guard-beta')
+
+        # Now re-invoke with train metadata pointing to a non-existent predecessor
+        with pytest.raises(RuntimeError) as exc_info:
+            await git_ops.create_worktree(
+                'reuse-guard-beta',
+                train=TrainMembership(
+                    id='T-guard', order=1,
+                    members=['ghost-predecessor', 'reuse-guard-beta'],
+                ),
+            )
+
+        msg = str(exc_info.value)
+        assert 'task/ghost-predecessor' in msg
 
 
 # ---------------------------------------------------------------------------
