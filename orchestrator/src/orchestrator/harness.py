@@ -929,6 +929,10 @@ class Harness:
             # Catches test-suite drift that scoped per-merge verify misses.
             self._start_main_tip_sweep()
 
+            # 1c1e. Start no-landings circuit-breaker (task θ/1893).
+            # Halts dispatch when landing-rate==0 AND disk is shrinking.
+            self._start_no_landings_breaker()
+
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
                 hours, rem = divmod(delay_secs, 3600)
@@ -1292,6 +1296,10 @@ class Harness:
                 await self._stop_main_tip_sweep()
             except Exception as e:
                 logger.warning(f'_stop_main_tip_sweep() failed: {e}')
+            try:
+                await self._stop_no_landings_breaker()
+            except Exception as e:
+                logger.warning(f'_stop_no_landings_breaker() failed: {e}')
             try:
                 await self._stop_escalation_server()
             except Exception as e:
@@ -3197,6 +3205,61 @@ Output JSON matching the schema. Every task must appear in the output.
         elif trip.action == 'resume':
             await self.force_resume_scheduler(reason=trip.reason)
             self._resolve_no_landings_info_escalation(trip)
+
+    # ------------------------------------------------------------------
+    # No-landings circuit-breaker: lifecycle (task θ/1893)
+    # ------------------------------------------------------------------
+
+    def _start_no_landings_breaker(self) -> None:
+        """Start the periodic no-landings circuit-breaker loop.
+
+        Mirrors ``_start_main_tip_sweep``: gate on config kill-switch, dedup
+        on a live task, then create the asyncio.Task.
+        """
+        if not self.config.no_landings_breaker_enabled:
+            return
+        if (
+            self._no_landings_breaker_task is not None
+            and not self._no_landings_breaker_task.done()
+        ):
+            return
+        self._no_landings_breaker_task = asyncio.create_task(
+            self._no_landings_breaker_loop(),
+            name='no-landings-breaker',
+        )
+        logger.info(
+            'No-landings circuit-breaker started (interval=%.0fs)',
+            self.config.no_landings_breaker_interval_secs,
+        )
+
+    async def _stop_no_landings_breaker(self) -> None:
+        """Cancel the no-landings circuit-breaker loop.
+
+        Mirrors ``_stop_main_tip_sweep``: cancel + suppress + None.
+        """
+        if self._no_landings_breaker_task is not None:
+            self._no_landings_breaker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._no_landings_breaker_task
+            self._no_landings_breaker_task = None
+            logger.info('No-landings circuit-breaker stopped')
+
+    async def _no_landings_breaker_loop(self) -> None:
+        """Wake periodically and run the no-landings breaker pass.
+
+        Mirrors ``_main_tip_sweep_loop``: sleep first, then run the pass;
+        re-raise CancelledError, swallow-and-log other exceptions so a
+        transient pass failure does not kill the loop.
+        """
+        interval = self.config.no_landings_breaker_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._run_no_landings_breaker_pass()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('No-landings circuit-breaker pass failed')
 
     async def _block_and_escalate_substrate_flip(
         self,
