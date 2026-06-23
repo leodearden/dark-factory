@@ -228,7 +228,20 @@ def _module_contention_counts(
     _stacks = park_stacks or {}
     _live = live_task_ids or set()
 
-    all_paths = set(counts.keys()) | set(_stacks.keys())
+    # Only inject a park key when it does NOT conflict with an existing
+    # contended path.  If modules_conflict(pk, cp) is True for any contended
+    # path cp, the park key lives at a different depth of the same logical
+    # module — adding it separately would produce two entries (one from
+    # counts, one contention:0 from the park key) for the same module, and
+    # modules_conflict would attach the stack to both.  The contended path
+    # already resolves the stack correctly via the modules_conflict lookup
+    # below, so the park key is superfluous.
+    contended_paths = set(counts.keys())
+    park_only_keys = {
+        pk for pk in _stacks
+        if not any(modules_conflict(pk, cp) for cp in contended_paths)
+    }
+    all_paths = contended_paths | park_only_keys
 
     result: list[dict] = []
     for path in all_paths:
@@ -256,11 +269,17 @@ def _module_contention_counts(
             park_stack_out: list[dict] = [
                 {**e, 'live': e['owner'] in _live} for e in stack
             ]
+            # True if ANY entry in the stack is dead (not just the active top).
+            # A live active-top with a dead shadowed owner is still an eviction
+            # candidate — this flag lets the banner detect that case even when
+            # parked_owner_live is True (active top is live).
+            has_dead_park: bool = any(not e['live'] for e in park_stack_out)
         else:
             parked_by = None
             parked_by_project = None
             parked_owner_live = False
             park_stack_out = []
+            has_dead_park = False
 
         result.append({
             'path': path,
@@ -275,6 +294,10 @@ def _module_contention_counts(
             'parked_by_project': parked_by_project,
             'parked_owner_live': parked_owner_live,
             'park_stack': park_stack_out,
+            # True if any park_stack entry is dead (live=False), including
+            # shadowed entries below the active top.  The banner should use
+            # this flag so a live-top/dead-shadowed module is also flagged.
+            'has_dead_park': has_dead_park,
         })
     return sorted(result, key=lambda m: (-m['contention'], m['path']))
 
@@ -282,8 +305,9 @@ def _module_contention_counts(
 def _park_age_seconds(installed_at) -> int:
     """Compute elapsed seconds from an installed_at value (ISO-8601 string or empty).
 
-    Mirrors the age-calculation logic in ``_compose_rows`` so stranded-row age
-    is computed identically and the tolerate-non-string guard is preserved.
+    Mirrors the age-calculation logic in ``_compose_rows`` (including the
+    ``logger.warning`` on parse failure) so stranded-row age is computed
+    identically and bad timestamps are surfaced in logs.
 
     Args:
         installed_at: Raw value from a park-stack entry (str, int, None, …).
@@ -292,13 +316,18 @@ def _park_age_seconds(installed_at) -> int:
 
     Returns:
         Non-negative integer seconds elapsed since *installed_at*, or 0 on
-        parse failure.
+        parse failure.  Emits a ``WARNING`` log when the value is non-empty
+        but unparseable, mirroring the diagnostic in ``_compose_rows``.
     """
     installed_at_str = str(installed_at or '')
     try:
         ts = datetime.fromisoformat(installed_at_str.replace('Z', '+00:00'))
         return max(0, int((datetime.now(UTC) - ts).total_seconds()))
     except (ValueError, TypeError):
+        if installed_at_str:
+            logger.warning(
+                'park stack installed_at unparseable: %r', installed_at_str
+            )
         return 0
 
 

@@ -501,9 +501,13 @@ function SchedulerTab() {
         </div>
       )}
 
-      {/* Stranded-parks banner — modules with a dead park owner (parked_owner_live=false) */}
+      {/* Stranded-parks banner — modules with any dead park owner.
+           `has_dead_park` is True if any stack entry (including shadowed) is
+           dead, so a live active-top with a dead shadowed owner is also caught.
+           This keeps the banner in agreement with the per-entry dead/live
+           indicators in ParkStacksSection and with stranded rows in the task list. */}
       {(() => {
-        const strandedMods = visibleModules.filter(m => m.parked_by && !m.parked_owner_live);
+        const strandedMods = visibleModules.filter(m => m.has_dead_park || (m.parked_by && !m.parked_owner_live));
         if (strandedMods.length === 0) return null;
         const paths = strandedMods.map(m => m.path).join(', ');
         return (

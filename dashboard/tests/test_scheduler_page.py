@@ -2093,6 +2093,11 @@ def test_module_contention_counts_attaches_parked_by_and_stack():
     assert ps[1]['shadowed'] is False
     assert ps[1]['live'] is True
 
+    # has_dead_park: all entries are live → False
+    assert m_entry['has_dead_park'] is False, (
+        f"Expected has_dead_park=False (all live), got {m_entry['has_dead_park']!r}"
+    )
+
     # UNPARKED module 'other': no matching park_stacks key
     other_entry = next((e for e in result if e['path'] == 'other'), None)
     assert other_entry is not None, "Module 'other' must appear in result"
@@ -2104,6 +2109,89 @@ def test_module_contention_counts_attaches_parked_by_and_stack():
     )
     assert other_entry['park_stack'] == [], (
         f"Expected park_stack=[] for unparked module, got {other_entry['park_stack']!r}"
+    )
+    assert other_entry['has_dead_park'] is False, (
+        f"Expected has_dead_park=False for unparked module, got {other_entry['has_dead_park']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1870 amend: mixed-liveness stack — live active-top + dead shadowed owner
+# ---------------------------------------------------------------------------
+
+
+def test_module_contention_counts_mixed_liveness_stack():
+    """_module_contention_counts with live active-top but dead shadowed owner.
+
+    Covers the design-consistency gap (reviewer suggestion #2/#3):
+    - parked_owner_live reflects the active top only (True when top is live).
+    - has_dead_park is True whenever ANY stack entry is dead — including
+      shadowed/non-top entries — so the banner can flag the module even when
+      the active-top owner is still alive.
+    - _stranded_park_rows emits a stranded row for the dead shadowed owner,
+      matching the ParkStacksSection per-entry 'dead' indicator.
+    """
+    from dashboard.data.scheduler import (
+        _module_contention_counts,
+        _stranded_park_rows,
+    )
+
+    iso = '2026-01-01T10:00:00+00:00'
+    # Stack: bottom=dead('ghost'), top=live('alive').  Only 'alive' in live_task_ids.
+    park_stacks = {
+        'm': [
+            {'owner': 'ghost', 'rank': 10, 'shadowed': True,  'installed_at': iso},
+            {'owner': 'alive', 'rank':  5, 'shadowed': False, 'installed_at': iso},
+        ],
+    }
+    live_task_ids = {'alive'}
+
+    # Build a row for the live top owner so it appears in contention.
+    rows = [{'task_id': 'alive', 'lock_set': ['m']}]
+
+    result = _module_contention_counts(
+        rows, {}, project='p',
+        park_stacks=park_stacks,
+        live_task_ids=live_task_ids,
+    )
+    m_entry = next((e for e in result if e['path'] == 'm'), None)
+    assert m_entry is not None, "Module 'm' must appear in result"
+
+    # Active top is live → parked_owner_live=True, parked_by='alive'
+    assert m_entry['parked_by'] == 'alive', (
+        f"Expected parked_by='alive', got {m_entry['parked_by']!r}"
+    )
+    assert m_entry['parked_owner_live'] is True, (
+        f"Expected parked_owner_live=True (top is live), got {m_entry['parked_owner_live']!r}"
+    )
+
+    # Per-entry live flags
+    ps = m_entry['park_stack']
+    assert len(ps) == 2, f"Expected 2 park_stack entries, got {len(ps)}"
+    assert ps[0]['owner'] == 'ghost'
+    assert ps[0]['live'] is False, (
+        f"Expected ps[0].live=False (dead shadowed), got {ps[0]['live']!r}"
+    )
+    assert ps[1]['owner'] == 'alive'
+    assert ps[1]['live'] is True, (
+        f"Expected ps[1].live=True (live top), got {ps[1]['live']!r}"
+    )
+
+    # has_dead_park must be True — the dead shadowed entry triggers it
+    assert m_entry['has_dead_park'] is True, (
+        f"Expected has_dead_park=True (dead shadowed owner 'ghost'), "
+        f"got {m_entry['has_dead_park']!r}"
+    )
+
+    # _stranded_park_rows: dead shadowed owner 'ghost' must produce a stranded row;
+    # live owner 'alive' must be skipped.
+    stranded = _stranded_park_rows(park_stacks, live_task_ids, project='p', project_root='/p')
+    stranded_ids = {r['task_id'] for r in stranded}
+    assert 'ghost' in stranded_ids, (
+        f"Expected stranded row for dead shadowed 'ghost', got {stranded_ids!r}"
+    )
+    assert 'alive' not in stranded_ids, (
+        f"Live owner 'alive' must not appear in stranded rows, got {stranded_ids!r}"
     )
 
 
@@ -2291,6 +2379,11 @@ async def test_collect_scheduler_state_surfaces_stranded_and_parked_by(
     assert len(mlive.get('park_stack', [])) == 2, (
         f"mlive.park_stack must have 2 entries, got {mlive.get('park_stack')!r}"
     )
+    # All owners in 'mlive' stack are live → has_dead_park must be False
+    assert mlive.get('has_dead_park') is False, (
+        f"mlive.has_dead_park must be False (all owners live), "
+        f"got {mlive.get('has_dead_park')!r}"
+    )
 
     # (c) 'mdead' module has parked_by='99', parked_owner_live=False (dead park)
     assert 'mdead' in by_path, (
@@ -2303,6 +2396,11 @@ async def test_collect_scheduler_state_surfaces_stranded_and_parked_by(
     )
     assert mdead['parked_owner_live'] is False, (
         f"mdead.parked_owner_live must be False, got {mdead.get('parked_owner_live')!r}"
+    )
+    # Dead owner in 'mdead' → has_dead_park must be True
+    assert mdead.get('has_dead_park') is True, (
+        f"mdead.has_dead_park must be True (dead owner '99'), "
+        f"got {mdead.get('has_dead_park')!r}"
     )
 
     # (d) Contention must reflect live waiters only — stranded row must NOT inflate it
