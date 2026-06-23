@@ -438,3 +438,89 @@ class TestB3Quiescence:
 
         store: _StoreScheduler = det_harness.scheduler
         assert await store.get_status('gate-b3') == 'blocked'
+
+
+# ---------------------------------------------------------------------------
+# B4 — proceed: resume → done, no re-escalate, dependent eligible (step-5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestB4Proceed:
+    """B4: resolving the L2 (proceed) and re-dispatching drives the gate to done.
+
+    Production path:
+    1. Dispatch → BLOCKED (B2 state).
+    2. queue.resolve() → L2 archived (no longer pending).
+    3. _action_teardown_and_set_status('resume') → gate re-pended, stamps PRESERVED.
+    4. _dispatch() → runner section 1 sees gate_escalated_at set + no pending L2
+       → drive to done (I2/B4).
+
+    Note: we call _action_teardown_and_set_status directly (the production method
+    invoked by _cascade_unblock_member) instead of wiring the full
+    _on_escalation_resolved callback (which requires _schedule_coro_threadsafe /
+    event-loop plumbing that is out of scope for unit tests).
+    """
+
+    async def _reach_resolved_state(self, h: Harness, task_id: str) -> None:
+        """Dispatch → B2 state, then resolve the L2 and re-pend via resume."""
+        store: _StoreScheduler = h.scheduler
+        task = _gate_task(task_id=task_id, title='Proceed gate')
+        store.seed(task)
+
+        # First dispatch → BLOCKED + L2 filed
+        await _dispatch(h, task_id)
+
+        # Resolve the L2 so it leaves the pending set
+        queue: EscalationQueue = h._escalation_queue
+        pending = queue.get_by_task(task_id, status='pending')
+        assert pending, 'Pre-condition: must have a pending L2 after first dispatch'
+        queue.resolve(pending[0].id, resolution='proceed')
+
+        # Re-pend via the production resume path (stamps preserved — NOT cleared)
+        await h._action_teardown_and_set_status(task_id, 'pending', 'resume')
+
+    async def test_resume_dispatch_returns_done(self, det_harness: Harness) -> None:
+        """Re-dispatch after resolve → report.outcome == DONE."""
+        await self._reach_resolved_state(det_harness, 'gate-b4')
+
+        report = await _dispatch(det_harness, 'gate-b4')
+
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.DONE
+
+    async def test_store_status_done_after_resume(self, det_harness: Harness) -> None:
+        """Store status is 'done' after the resume re-dispatch."""
+        await self._reach_resolved_state(det_harness, 'gate-b4')
+        await _dispatch(det_harness, 'gate-b4')
+
+        store: _StoreScheduler = det_harness.scheduler
+        assert await store.get_status('gate-b4') == 'done'
+
+    async def test_no_new_escalation_after_resume(self, det_harness: Harness) -> None:
+        """No new escalation is filed on the resume re-dispatch (gate resolved)."""
+        await self._reach_resolved_state(det_harness, 'gate-b4')
+        await _dispatch(det_harness, 'gate-b4')
+
+        queue: EscalationQueue = det_harness._escalation_queue
+        # The original L2 is archived (resolved); no new pending L2 should appear
+        assert queue.get_by_task('gate-b4', status='pending') == []
+
+    async def test_dependent_eligible_after_gate_done(
+        self, det_harness: Harness, tmp_path: Path
+    ) -> None:
+        """A dependent task is _deps_satisfied when the gate is done (B4 follow-on)."""
+        from orchestrator.config import OrchestratorConfig
+        config = OrchestratorConfig(project_root=tmp_path)
+        scheduler = Scheduler(config)
+
+        await self._reach_resolved_state(det_harness, 'gate-b4')
+        await _dispatch(det_harness, 'gate-b4')
+
+        dep_task = {
+            'id': 'worker-b4',
+            'title': 'Worker depending on gate',
+            'metadata': {'task_kind': 'normal'},
+            'dependencies': [{'id': 'gate-b4'}],
+        }
+        status_map = {'gate-b4': 'done'}
+        assert scheduler._deps_satisfied(dep_task, status_map) is True
