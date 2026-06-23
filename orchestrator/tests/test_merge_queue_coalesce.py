@@ -1751,3 +1751,198 @@ class TestOneStrikeOnErrorOutcome:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ─── 1867 Step 3 ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestRedriveCoalesceMembers:
+    """1867 step-3 (RED): _redrive_coalesce_members routes per-member based on is_ancestor.
+
+    Drives the worker method directly without going through the merger loop.
+    Exercises:
+      (a) is_ancestor=False: merge-deferred members get (mid, False, None); in-progress skipped.
+      (b) is_ancestor=True + resolve_branch_sha='tipsha': members get (mid, True, 'tipsha').
+      (c) redrive_member=None → returns without raising (None-guard).
+      (d) per-member exception isolation: one raise does not abort the others.
+    """
+
+    def _make_group(
+        self,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+        *,
+        status_check,
+        redrive_member,
+    ):
+        """Build a minimal GroupMergeRequest with a coalesce train_id."""
+        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
+
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        return GroupMergeRequest(
+            task_id='m2',
+            branch='task/m2',
+            worktree=tmp_path / 'wt-m2',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=future,
+            train_id='coalesce-tipm-deadbeef',
+            member_task_ids=['m1', 'm2', 'm3'],
+            tip_branch='task/m2',
+            tip_task_id='m2',
+            status_check=status_check,
+            mark_member_done=AsyncMock(),
+            redrive_member=redrive_member,
+        )
+
+    async def test_not_on_main_calls_redrive_for_merge_deferred_only(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """is_ancestor=False: redrive_member called for merge-deferred (m1, m2), skips in-progress (m3)."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        status_check = AsyncMock(return_value={
+            'm1': 'merge-deferred',
+            'm2': 'merge-deferred',
+            'm3': 'in-progress',
+        })
+        redrive_member = AsyncMock()
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, train_callback_factory=_stub_factory())
+
+        req = self._make_group(
+            coalesce_config, tmp_path,
+            status_check=status_check,
+            redrive_member=redrive_member,
+        )
+
+        with patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=False)):
+            await worker._redrive_coalesce_members(req, 'mainsha000')
+
+        # redrive_member must be called for m1 and m2, not for m3.
+        calls = redrive_member.await_args_list
+        called_mids = {c.args[0] for c in calls}
+        assert called_mids == {'m1', 'm2'}, (
+            f'Expected redrive_member for m1+m2; got {called_mids}'
+        )
+        # Each should be called with (mid, False, None) since is_ancestor=False.
+        for c in calls:
+            assert c.args[1] is False, f'found_on_main should be False: {c}'
+            assert c.args[2] is None, f'sha should be None when not on main: {c}'
+
+        # m3 (in-progress) must NOT be called.
+        assert 'm3' not in called_mids, 'm3 (in-progress) must be skipped'
+
+    async def test_on_main_calls_redrive_with_sha(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """is_ancestor=True + resolve_branch_sha='tipsha': called with (mid, True, 'tipsha')."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        status_check = AsyncMock(return_value={
+            'm1': 'merge-deferred',
+            'm2': 'merge-deferred',
+            'm3': 'in-progress',
+        })
+        redrive_member = AsyncMock()
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, train_callback_factory=_stub_factory())
+
+        req = self._make_group(
+            coalesce_config, tmp_path,
+            status_check=status_check,
+            redrive_member=redrive_member,
+        )
+
+        with (
+            patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
+            patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='tipsha1234')),
+        ):
+            await worker._redrive_coalesce_members(req, 'mainsha000')
+
+        calls = redrive_member.await_args_list
+        called_mids = {c.args[0] for c in calls}
+        assert called_mids == {'m1', 'm2'}, (
+            f'Expected redrive_member for m1+m2; got {called_mids}'
+        )
+        for c in calls:
+            assert c.args[1] is True, f'found_on_main should be True: {c}'
+            assert c.args[2] == 'tipsha1234', f'sha mismatch: {c}'
+
+    async def test_none_redrive_member_returns_without_raising(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """redrive_member=None → _redrive_coalesce_members returns without raising."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, train_callback_factory=_stub_factory())
+
+        req = self._make_group(
+            coalesce_config, tmp_path,
+            status_check=AsyncMock(return_value={'m1': 'merge-deferred'}),
+            redrive_member=None,
+        )
+
+        # Must not raise — None-guard in the method.
+        await worker._redrive_coalesce_members(req, 'mainsha000')
+
+    async def test_per_member_exception_does_not_abort_others(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """Exception in first member's re-drive does not prevent second member from being called."""
+        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
+
+        status_check = AsyncMock(return_value={
+            'm1': 'merge-deferred',
+            'm2': 'merge-deferred',
+        })
+        # First call raises; second should still succeed.
+        redrive_member = AsyncMock(side_effect=[Exception('m1 redrive explodes'), None])
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, train_callback_factory=_stub_factory())
+
+        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        req = GroupMergeRequest(
+            task_id='m2',
+            branch='task/m2',
+            worktree=tmp_path / 'wt-except',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=future,
+            train_id='coalesce-tipm-except',
+            member_task_ids=['m1', 'm2'],
+            tip_branch='task/m2',
+            tip_task_id='m2',
+            status_check=status_check,
+            mark_member_done=AsyncMock(),
+            redrive_member=redrive_member,
+        )
+
+        with patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=False)):
+            # Must not raise — exception is caught per-member.
+            await worker._redrive_coalesce_members(req, 'mainsha000')
+
+        # Both members should have been attempted.
+        assert redrive_member.await_count == 2, (
+            f'Expected 2 calls (both members attempted); got {redrive_member.await_count}'
+        )
