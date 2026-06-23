@@ -6675,12 +6675,18 @@ class TestMergeTreeConflicts:
     async def test_bad_revision_raises_runtime_error(
         self, git_ops: GitOps,
     ) -> None:
-        """ERROR case: git merge-tree exits 128 for an unknown revision.
+        """ERROR case: git merge-tree exits with an error rc for an unknown revision.
 
         merge_tree_conflicts must raise (not return a misleading ConflictProbe)
-        when git exits with rc not in {0, 1}.  A bad SHA is a caller bug;
-        silently returning clean=True would admit a broken branch into verify,
-        and returning clean=False would falsely bounce a mergeable branch.
+        when git exits with a non-{0,1} rc OR with rc==1 and empty stdout
+        (git reports "not something we can merge" on stderr only).  A bad SHA
+        is a caller bug; silently returning clean=True would admit a broken
+        branch into verify, and returning clean=False would falsely bounce a
+        mergeable branch.
+
+        The error message must identify the offending rc (to distinguish the
+        error path from the conflict path) and include the bogus ref (so the
+        caller can pinpoint the bad input in logs).
         """
         bogus = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
 
@@ -6688,5 +6694,10 @@ class TestMergeTreeConflicts:
             await git_ops.merge_tree_conflicts('main', bogus)
 
         err_text = str(exc_info.value)
-        # Should mention the rc and the offending refs
+        # Must mention the rc — distinguishes the error branch from the
+        # rc==1/non-empty-stdout genuine-conflict branch.
         assert 'rc=' in err_text, f'Expected rc= in error message; got: {err_text!r}'
+        # Must include the offending ref — makes the caller bug locatable in logs.
+        assert bogus in err_text, (
+            f'Expected bogus ref {bogus!r} in error message; got: {err_text!r}'
+        )

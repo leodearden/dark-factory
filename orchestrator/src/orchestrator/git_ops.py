@@ -2617,7 +2617,7 @@ class GitOps:
     ) -> ConflictProbe:
         """Probe whether *branch_head* would merge cleanly onto *base_tip*.
 
-        Uses ``git merge-tree --write-tree --name-only`` to perform an
+        Uses ``git merge-tree --write-tree --name-only -z`` to perform an
         object-store-only 3-way merge (git auto-computes the merge-base).
 
         **Object-store-only contract** — MUST NOT touch worktree_base or any
@@ -2626,23 +2626,31 @@ class GitOps:
         Consumers δ (conflict-graph), η (bounce), and ι (drift metric) all
         depend on this ref-stable, disk-free, idempotent contract.
 
+        **Performance note** — each call forks a git subprocess (fork/exec).
+        Consumer δ (conflict-graph) probes O(n²) branch pairs by design;
+        it MUST cache results or batch probes rather than calling this method
+        naively for every pair on every scheduler tick.
+
         Returns
         -------
         ConflictProbe(clean=True, conflicted_paths=[])
             when branch_head merges cleanly onto base_tip.
         ConflictProbe(clean=False, conflicted_paths=[...])
-            when at least one conflict is detected; paths are relative to
-            repo root, byte-faithful (``-c core.quotePath=false`` disables
-            octal quoting of non-ASCII / special characters).
+            when at least one conflict is detected.  Paths are relative to
+            the repo root; ``-z`` (NUL-delimited) + ``-c core.quotePath=false``
+            together make paths byte-faithful for any filename, including those
+            containing newlines or non-ASCII characters.
 
         Raises
         ------
         RuntimeError
             when git exits with a code other than 0 or 1 (e.g. 128 for an
-            unknown / bad object name).  Silently returning clean=True would
-            admit a broken branch into the verify frontier; returning
-            clean=False would falsely bounce a mergeable branch.  Loud failure
-            for a caller bug is the correct contract for a foundation primitive.
+            unknown / bad object name), OR when git exits 1 with no stdout
+            (error rather than a genuine conflict).  Silently returning
+            clean=True would admit a broken branch into the verify frontier;
+            returning clean=False would falsely bounce a mergeable branch.
+            Loud failure for a caller bug is the correct contract for a
+            foundation primitive.
         """
         # Run at self.project_root (in-repo object store) — NEVER at a
         # worktree/lane path.  git merge-tree --write-tree performs a real
@@ -2652,7 +2660,7 @@ class GitOps:
         rc, out, err = await _run(
             [
                 'git', '-c', 'core.quotePath=false',
-                'merge-tree', '--write-tree', '--name-only',
+                'merge-tree', '--write-tree', '--name-only', '-z',
                 base_tip, branch_head,
             ],
             cwd=self.project_root,
@@ -2661,31 +2669,37 @@ class GitOps:
             return ConflictProbe(clean=True, conflicted_paths=[])
         if rc == 1:
             # Distinguish a genuine conflict from a git error (e.g. bad/unknown
-            # ref).  A genuine conflict always has a merged-tree OID on the
-            # first stdout line; a git error (e.g. "not something we can merge")
-            # also exits 1 but writes nothing to stdout (only to stderr).
+            # ref).  A genuine conflict always has a merged-tree OID as the
+            # first NUL-terminated field; a git error (e.g. "not something we
+            # can merge") also exits 1 but writes nothing to stdout.
             #
-            # stdout layout for a genuine conflict (git 2.43.0, --name-only):
-            #   line 0: merged tree OID  ← non-empty, 40 hex chars
-            #   lines 1..k: conflicted file paths (one per line, deduplicated)
-            #   blank line: section boundary
-            #   remaining lines: informational messages ("Auto-merging…" etc.)
-            lines = out.split('\n')
-            oid_line = lines[0] if lines else ''
-            if not oid_line:
+            # stdout layout for a genuine conflict (git 2.43.0, --name-only -z):
+            #   field 0: merged tree OID (NUL-terminated)
+            #   fields 1..k: conflicted file paths (one per NUL-terminated field)
+            #   empty field (\0\0 boundary): section separator
+            #   remaining fields: stage/informational data (suppressed by -z
+            #                     in some versions; may still appear — stop at
+            #                     the first empty field regardless)
+            #
+            # NUL is not Python whitespace, so _run's .strip() preserves it;
+            # splitting on '\0' handles filenames that contain newlines.
+            fields = out.split('\0')
+            oid_field = fields[0] if fields else ''
+            if not oid_field:
                 # stdout is empty → git reported an error (e.g. bad ref).
                 raise RuntimeError(
-                    f'git merge-tree failed (rc={rc}) for '
-                    f'{base_tip}..{branch_head}: {err}'
+                    f'git merge-tree failed (rc={rc}) '
+                    f'merging {branch_head} onto {base_tip}: {err}'
                 )
             paths: list[str] = []
-            for line in lines[1:]:  # skip the tree OID on line 0
-                if line == '':  # blank line = section boundary
+            for field in fields[1:]:  # skip the tree OID at field 0
+                if field == '':  # empty field = \0\0 section boundary
                     break
-                paths.append(line)
+                paths.append(field)
             return ConflictProbe(clean=False, conflicted_paths=paths)
         raise RuntimeError(
-            f'git merge-tree failed (rc={rc}) for {base_tip}..{branch_head}: {err}'
+            f'git merge-tree failed (rc={rc}) '
+            f'merging {branch_head} onto {base_tip}: {err}'
         )
 
     async def stack_train_branches(self, member_ids: list[str]) -> TrainStackResult:
