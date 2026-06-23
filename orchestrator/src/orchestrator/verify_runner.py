@@ -525,11 +525,12 @@ class LocalRunner:
         encoded into a VerifyResult via a sentinel category so callers can branch
         byte-identically.
 
-        NOTE: ``spec`` is accepted for VerifyRunner protocol conformance and
-        forward-compat with γ/δ remote runners.  LocalRunner drives execution
-        from its injected callables + live config, not from the spec.
-        TODO(γ): when a RemoteRunner is added, spec replaces the per-call
-        config/module_configs projection for off-host dispatch.
+        NOTE: ``spec`` is accepted for VerifyRunner protocol conformance.
+        LocalRunner drives execution from its injected callables + live config,
+        not from the spec (by design).  RemoteRunner (defined below in this
+        module) is now the spec consumer for off-host dispatch — it serialises
+        the spec via ``spec_to_json(spec)`` and ships it as the ``--spec``
+        argument to ``orchestrator verify-merge`` over ssh.
         """
         scoped = await self._run_scoped(
             self._merge_wt,
