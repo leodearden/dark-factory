@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sys
+import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -3314,6 +3315,65 @@ class TaskWorkflow:
                 root_cause=root_cause,
             )
         return None
+
+    async def _stamp_first_merge_enqueue(self) -> float:
+        """Stamp the write-once first-submission wall-clock epoch into task metadata.
+
+        Returns the (possibly pre-existing) ``metadata.merge_first_enqueued_at``
+        value as a float, ensuring:
+
+        * The value is written exactly once — subsequent calls on the same task
+          (resubmit, post-restart re-dispatch) return the original value unchanged.
+        * The value is persisted to the backend so it survives process restart.
+        * Persistence failure is non-fatal (logged, does not block the merge).
+
+        Algorithm:
+        1. **Fast-path (in-memory)** — if the in-memory metadata already carries a
+           numeric ``merge_first_enqueued_at``, return it immediately (no I/O).
+        2. **Slow-path (backend read)** — call :meth:`_merge_fresh_metadata` to
+           overlay backend-persisted keys; if the backend already carries the value,
+           adopt it into the in-memory copy and return (no persist needed).
+        3. **Stamp** — call ``time.time()``, write into the merged metadata dict,
+           update the in-memory task, and best-effort persist via
+           ``scheduler.update_task`` (wrapped in a logged try/except).
+
+        ζ (task 1887) consumes this value at ``_pop_next_pickable`` for aging-
+        priority ordering and owns the ``enqueued_at`` fallback for legacy
+        ``None`` values.
+        """
+        metadata = self.task.get('metadata') or {}
+
+        # Fast-path: in-memory value already present (resubmit / post-restart
+        # reload where the scheduler populated the in-memory task from the backend).
+        existing = metadata.get('merge_first_enqueued_at')
+        if isinstance(existing, (int, float)):
+            return float(existing)
+
+        # Slow-path: consult backend to adopt a persisted value and protect
+        # memory_hints on the subsequent write.
+        fresh = await self._merge_fresh_metadata(
+            metadata, log_context='merge_first_enqueued_at stamp',
+        )
+        backend_existing = fresh.get('merge_first_enqueued_at')
+        if isinstance(backend_existing, (int, float)):
+            # Backend already has the value; adopt into in-memory copy, no persist.
+            self.task['metadata'] = fresh
+            return float(backend_existing)
+
+        # Neither in-memory nor backend carries the value — this is the first submit.
+        stamped = time.time()
+        fresh['merge_first_enqueued_at'] = stamped
+        self.task['metadata'] = fresh
+        try:
+            await self.scheduler.update_task(
+                self.task_id, metadata=fresh,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+            logger.warning(
+                'Task %s: failed to persist merge_first_enqueued_at: %s',
+                self.task_id, exc,
+            )
+        return stamped
 
     def _merge_outcome_signature(self) -> str:
         """Return a 16-hex-char signature for the current merge-block fingerprint.
