@@ -138,9 +138,25 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
 // For each module with a non-empty park_stack, shows the full LIFO stack
 // TOP→BOTTOM (reverse of the bottom→top snapshot order) with owner, tier,
 // age, active-top vs shadowed, and live/dead indicator.
-function ParkStacksSection({ modules }) {
+// `rows` (all visible rows, including synthetic stranded rows from the server)
+// is used to resolve each owner's project_root via the composite-key index —
+// stranded rows carry project_root keyed by ${project}/${task_id}.
+// `onEvict(taskId, projectRoot)` is called when the operator clicks evict.
+function ParkStacksSection({ modules, rows, onEvict }) {
   const parked = (modules || []).filter(m => m.park_stack && m.park_stack.length > 0);
   if (parked.length === 0) return null;
+
+  // Build a project-qualified row index to resolve each owner's project_root.
+  // Synthetic stranded rows (_stranded_park_rows, task γ) carry project_root +
+  // project + task_id (== owner), so the composite key resolves it without
+  // modifying the data layer.  Mirrors the rowByCompositeKey pattern in ModulesView.
+  const rowByCompositeKey = stUseMemo(() => {
+    const idx = {};
+    for (const r of (rows || [])) {
+      idx[`${r.project || ''}/${r.task_id}`] = r;
+    }
+    return idx;
+  }, [rows]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 16 }}>
@@ -161,6 +177,9 @@ function ParkStacksSection({ modules }) {
                 const isActive = !entry.shadowed;
                 const isDead = !entry.live;
                 const ageStr = entry.installed_at ? timeago(entry.installed_at) : null;
+                // Resolve owner's project_root from the row index (stranded rows carry it).
+                const ownerRow = rowByCompositeKey[`${m.project || ''}/${entry.owner}`] || {};
+                const ownerProjectRoot = ownerRow.project_root || '';
                 return (
                   <div
                     key={`${entry.owner}-${idx}`}
@@ -189,6 +208,18 @@ function ParkStacksSection({ modules }) {
                     )}
                     {isDead && (
                       <span className="badge bad" style={{ fontSize: 9, padding: '1px 5px' }}>dead</span>
+                    )}
+                    {/* Evict button: present on every entry, disabled when owner is live.
+                        Per-entry entry.live is the correct signal (a live top can shadow
+                        a dead owner — the has_dead_park case).  Server-side task δ is the
+                        authoritative guard; this is defense-in-depth only. */}
+                    {onEvict && (
+                      <button
+                        disabled={entry.live}
+                        onClick={() => onEvict(entry.owner, ownerProjectRoot)}
+                        style={{ marginLeft: 'auto', fontSize: 9, padding: '1px 6px', cursor: entry.live ? 'default' : 'pointer' }}
+                        title={entry.live ? 'Owner is live — eviction blocked' : 'Evict this park owner'}
+                      >evict</button>
                     )}
                   </div>
                 );
@@ -451,6 +482,24 @@ function SchedulerTab() {
     }
   }, [pin_queue, addToast]);
 
+  // ── Evict park owner ──
+  // Mirrors handleUnpin: POST to the evict-park endpoint and toast on failure.
+  // The server-side task δ guard is authoritative; this call is the UI lever.
+  const handleEvict = stUseCallback(async (taskId, projectRoot) => {
+    try {
+      const resp = await fetch('/api/v2/dashboard/scheduler/evict-park', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ task_id: taskId, project_root: projectRoot || '' }),
+      });
+      if (!resp.ok) {
+        addToast(`Evict failed (${resp.status})`);
+      }
+    } catch (err) {
+      addToast(`Evict error: ${err.message || String(err)}`);
+    }
+  }, [addToast]);
+
   // ── Unpin (clear pinned override) ──
   const handleUnpin = stUseCallback(async (taskId, projectRoot) => {
     try {
@@ -572,7 +621,7 @@ function SchedulerTab() {
                 rows={visibleRows}
                 eventsMap={events_by_task}
               />
-              <ParkStacksSection modules={visibleModules} />
+              <ParkStacksSection modules={visibleModules} rows={visibleRows} onEvict={handleEvict} />
             </div>
           )}
         </div>
