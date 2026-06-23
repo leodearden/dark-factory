@@ -1967,6 +1967,15 @@ class OrchestratorConfig(BaseSettings):
         """
         return self.project_root / 'data' / 'orchestrator' / 'scheduler_overrides.db'
 
+    @property
+    def park_eviction_requests_db_path(self) -> Path:
+        """Path to the park-eviction requests SQLite database.
+
+        Stored in a dedicated file isolated from the overrides schema to
+        keep the operator eviction lever narrow-blast-radius (PRD D3).
+        """
+        return self.project_root / 'data' / 'orchestrator' / 'park_eviction_requests.db'
+
     model_config = SettingsConfigDict(
         env_prefix='ORCH_',
         env_nested_delimiter='__',

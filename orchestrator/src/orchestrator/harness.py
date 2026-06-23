@@ -31,6 +31,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.overrides import OverrideStore
+from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import (
@@ -467,7 +468,11 @@ class Harness:
                 self._speculation_k if config.git.merge_spec_warm_lane_pool else 0
             ),
         )
-        self.scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
+        self.scheduler = Scheduler(
+            config,
+            override_store=OverrideStore.from_config(config),
+            park_eviction_store=ParkEvictionRequestStore.from_config(config),
+        )
         # Wire the park-stop trip callback: Scheduler trips → Harness.pause_scheduler.
         # This connects in-memory trip detection to the full pause bundle
         # (persistence + event + log) defined on the Harness.  Sibling tasks

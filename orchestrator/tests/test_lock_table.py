@@ -491,3 +491,47 @@ class TestHierarchicalPreemptionInvariants:
         assert not lt.try_acquire('X', ['backend/api']), (
             'X must remain buried beneath restored Y'
         )
+
+
+class TestForceClear:
+    """ModuleLockTable.force_clear(owner) — operator eviction lever."""
+
+    def test_force_clear_evicts_owner_from_all_modules(self):
+        """An owner parked on multiple modules is evicted from all of them."""
+        lt = _lt()
+        lt.install_parks('T', ['m1', 'm2', 'm3'], priority='high')
+        modules, restored = lt.force_clear('T')
+        assert not lt.has_parks('T')
+        assert modules == ['m1', 'm2', 'm3']  # sorted
+        assert restored == []
+
+    def test_force_clear_lifo_restoration(self):
+        """force_clear('T') exposes the buried L as the new active top of M.
+
+        Stack on M before: [L(buried/low), T(active-top/high)]
+        After force_clear('T'):
+          - L is the new active top — a third task Z cannot acquire M
+          - L itself CAN acquire M (owner bypass)
+          - restored pairs include ('L', ['m1'])
+        """
+        lt = _lt()
+        lt.install_parks('L', ['m1'], priority='low')
+        lt.install_parks('T', ['m1'], priority='high')  # T on top, L buried
+
+        modules, restored = lt.force_clear('T')
+
+        assert not lt.has_parks('T')
+        assert 'm1' in modules
+        # Z (third task) is blocked by newly-exposed L.
+        assert not lt.try_acquire('Z', ['m1'])
+        # L can acquire its own reservation.
+        assert lt.try_acquire('L', ['m1'])
+        # Restored pairs report L was exposed.
+        assert ('L', ['m1']) in restored
+
+    def test_force_clear_idempotent_no_parks(self):
+        """force_clear on an owner with zero parks returns ([], []) without error."""
+        lt = _lt()
+        modules, restored = lt.force_clear('nobody')
+        assert modules == []
+        assert restored == []

@@ -31,6 +31,7 @@ from orchestrator.config import (
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.overrides import OverrideRow, OverrideStore
+from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
 # task_skipped events for "effectively infinite" skip thresholds (>= this
@@ -743,6 +744,29 @@ class ModuleLockTable:
         ]
         return evicted, all_restored
 
+    def force_clear(
+        self, owner: str
+    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
+        """Evict all parks held by *owner* and return (modules, restored_pairs).
+
+        Thin wrapper over :meth:`prune_owners` that pre-collects the sorted
+        list of modules the owner was parked on before the eviction removes
+        them from the stacks.  LIFO restoration of newly-exposed tops is
+        handled by :meth:`prune_owners` → :meth:`_remove_owner`.
+
+        Returns:
+            modules: sorted list of module keys the owner was parked on.
+                     Empty list if the owner has no parks (idempotent no-op).
+            restored_pairs: list of (owner, sorted_modules) for each buried
+                            owner newly exposed as the active top.
+        """
+        modules = sorted(
+            m for m, stack in self._parked.items()
+            if any(o == owner for o, _ in stack)
+        )
+        _evicted, restored = self.prune_owners(lambda o: o == owner)
+        return modules, restored
+
     # --- Snapshot helpers (public accessors for observability) ---
 
     def snapshot_parks(self) -> dict[str, dict]:
@@ -927,6 +951,7 @@ class Scheduler:
         time_source: Callable[[], float] | None = None,
         override_store: OverrideStore | None = None,
         monotonic_clock_source: Callable[[], float] | None = None,
+        park_eviction_store: ParkEvictionRequestStore | None = None,
     ):
         self.config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
@@ -992,6 +1017,8 @@ class Scheduler:
         # was already known, not fresh user actions.  The first tick seeds the
         # snapshot without emitting events; subsequent ticks diff-emit normally.
         self._overrides_initialized: bool = False
+        # --- Park-eviction store (task 1871) ---
+        self._park_eviction_store: ParkEvictionRequestStore | None = park_eviction_store
         # --- Park-and-stop pause state (task 1322) ---
         self._paused: bool = False
         self._pause_reason: str | None = None
@@ -2825,6 +2852,91 @@ class Scheduler:
                 data={'new_order': new_order},
             )
 
+    def _owner_is_live_dispatchable(
+        self,
+        task_id: str,
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, Any],
+    ) -> bool:
+        """Return True iff *task_id* is a live, dispatchable task.
+
+        Logical INVERSE of the _park_gc reclaimability predicate
+        (scheduler.py:2996-3002): an owner is live-dispatchable iff
+        its status is not terminal AND it is present in tasks_by_id AND
+        all its deps are satisfied.
+
+        Used by the D4 guard in _drain_park_eviction_requests to refuse
+        force_clear on an owner the scheduler still considers legitimately
+        held — preventing re-introduction of the df-1865 destructive-eviction
+        starvation.
+        """
+        if status_map.get(task_id) in TERMINAL_STATUSES:
+            return False
+        if task_id not in tasks_by_id:
+            return False
+        return self._deps_satisfied(tasks_by_id[task_id], status_map, tasks_by_id)
+
+    def _drain_park_eviction_requests(
+        self,
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, Any],
+    ) -> None:
+        """Drain queued park-eviction requests and apply force_clear for dead owners.
+
+        Called once per acquire_next tick BEFORE the owner-state park-GC sweep
+        so the operator audit event (reservation_force_evicted) wins over
+        park-GC's reservation_expired for the same dead owner.
+
+        D4 guard: if the owner is still a live dispatchable task, the row is
+        consumed (one-shot) but force_clear is NOT applied — a
+        reservation_force_evict_refused event is emitted instead.
+
+        For each drained task_id (dead owner):
+          - force_clear + pop _skip_count
+          - emit reservation_force_evicted when modules is non-empty
+          - emit reservation_restored for each newly-exposed shadow
+        """
+        if not self._park_eviction_store:
+            return
+        for task_id in self._park_eviction_store.drain(self._project_root):
+            # D4 guard: refuse eviction of a live, dispatchable owner.
+            if self._owner_is_live_dispatchable(task_id, status_map, tasks_by_id):
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.reservation_force_evict_refused,
+                        task_id=task_id,
+                        data={'reason': 'live_owner'},
+                    )
+                continue
+            modules, restored = self.lock_table.force_clear(task_id)
+            self._skip_count.pop(task_id, None)
+            # Ghost-owner silent no-op contract (PRD INV-idempotence):
+            # If the owner has zero parks (already reaped by park-GC between
+            # enqueue and drain, or never held any), modules is [] and NO
+            # reservation_force_evicted event is emitted.  The row is still
+            # consumed (one-shot), so the table does not grow unbounded.
+            # The silence is intentional: suppressing the event keeps the
+            # audit log meaningful — reservation_force_evicted ⇒ something
+            # was actually cleared.  Operators who see no event after enqueueing
+            # can infer the park was already gone.  See design decision
+            # §"Emit reservation_force_evicted only when … modules non-empty".
+            if modules and self.event_store:
+                self.event_store.emit(
+                    EventType.reservation_force_evicted,
+                    task_id=task_id,
+                    data={'owner': task_id, 'modules': modules},
+                )
+            if self.event_store:
+                for restored_owner, restored_mods in restored:
+                    self.event_store.emit(
+                        EventType.reservation_restored,
+                        task_id=restored_owner,
+                        data={
+                            'restored_owner': restored_owner,
+                            'modules': restored_mods,
+                        },
+                    )
+
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
@@ -2845,6 +2957,13 @@ class Scheduler:
 
         tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES)
         if not tasks:
+            # Drain queued park-eviction requests even when no active tasks exist.
+            # With empty status_map/tasks_by_id, _owner_is_live_dispatchable
+            # returns False for all task_ids (not in tasks_by_id) — all queued
+            # evictions are processed.  Without this, an operator-enqueued
+            # eviction for a stranded park sits in the table indefinitely until
+            # some active task happens to appear and trigger a normal tick.
+            self._drain_park_eviction_requests({}, {})
             return None
 
         # Status + id indices, built once per tick.
@@ -2989,6 +3108,11 @@ class Scheduler:
                                         _tid,
                                         _dep_id,
                                     )
+
+        # Operator-issued eviction drain: process any queued force-evict
+        # requests BEFORE the automatic park-GC sweep so that operator-lever
+        # evictions emit reservation_force_evicted (not reservation_expired).
+        self._drain_park_eviction_requests(status_map, tasks_by_id)
 
         # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
         # a park whose owner is terminal / missing / deps-unsatisfied has no
