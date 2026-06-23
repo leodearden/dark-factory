@@ -87,6 +87,6 @@ Live state read via `systemctl --user show orchestrator-reify.service -p MainPID
 | (c) ActiveEnterTimestamp | AFTER 2026-06-23 13:10:10 BST (#1867 merge) | `Tue 2026-06-23 13:33:11 BST` | ✅ GREEN |
 | (d) Startup log | `"Speculative merge worker started"` in post-restart journal | Present at `13:33:14 BST` | ✅ GREEN |
 
-**Delta:** Service restarted **22 min 61 s AFTER** the #1867 merge (13:33:11 BST vs 13:10:10 BST merge) — new process loads post-#1867 merge_queue.py with the coalesce-derail re-drive fix.
+**Delta:** Service restarted **23 min 1 s AFTER** the #1867 merge (13:33:11 BST vs 13:10:10 BST merge) — new process loads post-#1867 merge_queue.py with the coalesce-derail re-drive fix.
 
 **Result: #1867 coalesce-derail re-drive fix is DEPLOYED (all criteria a–d GREEN).** orchestrator-reify.service PID 244123 loads the `redrive_member` callback and `_redrive_coalesce_members` method from dark-factory main @ fc2f8ec08f. Absorbed coalesce-train members that derail are now re-dispatched as solo merges instead of being stranded in merge-deferred.
