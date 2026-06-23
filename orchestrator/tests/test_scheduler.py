@@ -9370,3 +9370,77 @@ class TestDrainParkEvictionGuard:
         ]
         assert len(evicted_events) == 1
         assert evicted_events[0][1]['task_id'] == 'T'
+
+
+# ---- acquire_next wiring test (task 1871 step-9) ----
+
+class TestDrainCalledFromAcquireNext:
+    """Proves the tick drains the park-eviction table and runs BEFORE park-GC.
+
+    A dead owner T is present in both the park-eviction store AND would be
+    reaped by park-GC's reservation_expired sweep.  After acquire_next():
+    - the request row is gone
+    - T's park is gone
+    - a reservation_force_evicted event was emitted (NOT reservation_expired)
+      proving the drain ran first.
+    """
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_drains_eviction_store_before_park_gc(self, tmp_path):
+        from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        event_store = _RecordingEventStore()
+        eviction_store = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+
+        scheduler = Scheduler(
+            config,
+            event_store=event_store,  # type: ignore[arg-type]
+            park_eviction_store=eviction_store,
+        )
+
+        # Stack on m1: [L(buried/low), T(active-top/high)]
+        scheduler.lock_table.install_parks('L', ['m1'], priority='low')
+        scheduler.lock_table.install_parks('T', ['m1'], priority='high')
+
+        # Enqueue eviction for T (dead owner).
+        eviction_store.enqueue('T', scheduler._project_root)
+
+        # T is terminal; L is pending and live (no deps).
+        t_task = {
+            'id': 'T', 'title': 'T', 'status': 'cancelled',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        l_task = {
+            'id': 'L', 'title': 'L', 'status': 'pending',
+            'priority': 'low', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[t_task, l_task])
+
+        await scheduler.acquire_next()
+
+        # Eviction store row must be drained.
+        assert eviction_store.drain(scheduler._project_root) == []
+        # T's park is gone.
+        assert not scheduler.lock_table.has_parks('T')
+        # reservation_force_evicted emitted for T (operator audit wins).
+        force_evicted = [
+            e for e in event_store.events
+            if 'reservation_force_evicted' in e[0]
+        ]
+        assert len(force_evicted) == 1, (
+            f'Expected 1 reservation_force_evicted; got {force_evicted}'
+        )
+        assert force_evicted[0][1]['task_id'] == 'T'
+        # reservation_expired must NOT be emitted for T
+        # (park-GC finds nothing left to reap after the drain).
+        expired_for_t = [
+            e for e in event_store.events
+            if 'reservation_expired' in e[0]
+            and e[1].get('task_id') == 'T'
+        ]
+        assert expired_for_t == [], (
+            f'reservation_expired must not fire for T after drain took it; got {expired_for_t}'
+        )
