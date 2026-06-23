@@ -2660,12 +2660,24 @@ class GitOps:
         if rc == 0:
             return ConflictProbe(clean=True, conflicted_paths=[])
         if rc == 1:
-            # stdout layout (git 2.43.0, --name-only):
-            #   line 0: merged tree OID (discard)
+            # Distinguish a genuine conflict from a git error (e.g. bad/unknown
+            # ref).  A genuine conflict always has a merged-tree OID on the
+            # first stdout line; a git error (e.g. "not something we can merge")
+            # also exits 1 but writes nothing to stdout (only to stderr).
+            #
+            # stdout layout for a genuine conflict (git 2.43.0, --name-only):
+            #   line 0: merged tree OID  ← non-empty, 40 hex chars
             #   lines 1..k: conflicted file paths (one per line, deduplicated)
             #   blank line: section boundary
             #   remaining lines: informational messages ("Auto-merging…" etc.)
             lines = out.split('\n')
+            oid_line = lines[0] if lines else ''
+            if not oid_line:
+                # stdout is empty → git reported an error (e.g. bad ref).
+                raise RuntimeError(
+                    f'git merge-tree failed (rc={rc}) for '
+                    f'{base_tip}..{branch_head}: {err}'
+                )
             paths: list[str] = []
             for line in lines[1:]:  # skip the tree OID on line 0
                 if line == '':  # blank line = section boundary
