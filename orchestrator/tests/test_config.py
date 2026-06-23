@@ -1507,3 +1507,85 @@ class TestCpuGovernConfig:
         cfg = OrchestratorConfig()
         assert isinstance(cfg.cpu_governance, CpuGovernConfig)
         assert cfg.cpu_governance.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# TestStarvationWatchdogConfig (task 1880)
+# ---------------------------------------------------------------------------
+
+
+class TestStarvationWatchdogConfig:
+    """Tests for StarvationWatchdogConfig nested config + OrchestratorConfig attachment.
+
+    Mirrors the FairnessConfig / nested-config test pattern:
+      (a) defaults — bare OrchestratorConfig() exposes starvation_watchdog sub-object
+          with the expected default values.
+      (b) full yaml override — a project config with a top-level starvation_watchdog
+          block is loaded via load_config and all three fields adopt the override values.
+      (c) partial override — overriding only `enabled: false` keeps skip_threshold and
+          idle_secs at their defaults (deep-merge / no clobber).
+    """
+
+    def test_defaults(self):
+        """Bare OrchestratorConfig() exposes starvation_watchdog with correct defaults."""
+        from orchestrator.config import StarvationWatchdogConfig
+        cfg = OrchestratorConfig()
+        assert isinstance(cfg.starvation_watchdog, StarvationWatchdogConfig), (
+            f'Expected StarvationWatchdogConfig; got {type(cfg.starvation_watchdog)}'
+        )
+        assert cfg.starvation_watchdog.enabled is True, (
+            f'Expected enabled=True; got {cfg.starvation_watchdog.enabled!r}'
+        )
+        assert cfg.starvation_watchdog.skip_threshold == 50, (
+            f'Expected skip_threshold=50; got {cfg.starvation_watchdog.skip_threshold!r}'
+        )
+        assert cfg.starvation_watchdog.idle_secs == 1800.0, (
+            f'Expected idle_secs=1800.0; got {cfg.starvation_watchdog.idle_secs!r}'
+        )
+
+    def test_full_yaml_override(self, tmp_path: Path, monkeypatch):
+        """A project config with starvation_watchdog block is fully adopted by load_config."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({
+            'starvation_watchdog': {
+                'enabled': False,
+                'skip_threshold': 10,
+                'idle_secs': 300.0,
+            },
+        }))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        cfg = load_config(project_cfg)
+
+        assert cfg.starvation_watchdog.enabled is False, (
+            f'Expected enabled=False; got {cfg.starvation_watchdog.enabled!r}'
+        )
+        assert cfg.starvation_watchdog.skip_threshold == 10, (
+            f'Expected skip_threshold=10; got {cfg.starvation_watchdog.skip_threshold!r}'
+        )
+        assert cfg.starvation_watchdog.idle_secs == 300.0, (
+            f'Expected idle_secs=300.0; got {cfg.starvation_watchdog.idle_secs!r}'
+        )
+
+    def test_partial_override_merges_with_defaults(self, tmp_path: Path, monkeypatch):
+        """Overriding only enabled=False preserves skip_threshold and idle_secs defaults."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({
+            'starvation_watchdog': {
+                'enabled': False,
+            },
+        }))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        cfg = load_config(project_cfg)
+
+        assert cfg.starvation_watchdog.enabled is False, (
+            f'Expected enabled=False; got {cfg.starvation_watchdog.enabled!r}'
+        )
+        # These must keep their defaults (deep-merge must not clobber siblings).
+        assert cfg.starvation_watchdog.skip_threshold == 50, (
+            f'Expected skip_threshold=50 (default preserved); '
+            f'got {cfg.starvation_watchdog.skip_threshold!r}'
+        )
+        assert cfg.starvation_watchdog.idle_secs == 1800.0, (
+            f'Expected idle_secs=1800.0 (default preserved); '
+            f'got {cfg.starvation_watchdog.idle_secs!r}'
+        )
