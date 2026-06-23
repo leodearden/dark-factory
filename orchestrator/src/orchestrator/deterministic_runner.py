@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -147,7 +148,9 @@ class DeterministicRunner:
         """
         script = before_done['script']
         args = before_done.get('args') or []
-        env = before_done.get('env') or None  # empty dict → None (inherit env)
+        # Merge over os.environ so the child sees a full environment (PATH, HOME,
+        # XDG_RUNTIME_DIR …).  An empty / absent env dict means full inherit.
+        env = {**os.environ, **before_done['env']} if before_done.get('env') else None
         cwd = before_done.get('cwd') or None
         timeout_secs = before_done.get('timeout_secs', 60)
 
@@ -277,7 +280,21 @@ class DeterministicRunner:
                     'DeterministicRunner: task %s gate resolved — setting done',
                     task_id,
                 )
-                await self.scheduler.set_task_status(task_id, 'done')
+                if before_done is not None:
+                    # Act-then-ask resume: include deploy provenance so the audit trail
+                    # matches the B6 / resume paths and passes require_done_provenance.
+                    _ata_unit = before_done.get('target_unit', '')
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance={
+                            'kind': 'deterministic-deploy',
+                            'unit': _ata_unit,
+                            'note': 'resumed after gate resolution',
+                        },
+                    )
+                else:
+                    await self.scheduler.set_task_status(task_id, 'done')
                 return WorkflowOutcome.DONE
 
         # ── 2. before_done execution (γ) ────────────────────────────────────

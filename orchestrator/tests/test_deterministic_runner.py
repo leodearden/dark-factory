@@ -486,7 +486,17 @@ class TestIdempotentResumeAndQuiescence:
         outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.DONE
-        scheduler.set_task_status.assert_awaited_once_with('100', 'done')
+        # Act-then-ask resume must carry deterministic-deploy provenance so the audit
+        # trail matches the B6/resume paths and passes require_done_provenance.
+        scheduler.set_task_status.assert_awaited_once_with(
+            '100',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-deploy',
+                'unit': 'orchestrator-reify.service',
+                'note': 'resumed after gate resolution',
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +684,66 @@ class TestBeforeDoneCrossUnitDeploy:
 
         pending = queue.get_by_task('200', status='pending')
         assert len(pending) == 0, f'No escalation should be filed on success; got {pending}'
+
+
+# ---------------------------------------------------------------------------
+# Default seam: _default_run_script env merge
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDefaultRunScriptEnv:
+    """_default_run_script merges a partial env dict over os.environ."""
+
+    async def test_partial_env_inherits_path(self, tmp_path: Path):
+        """Passing a partial env dict must NOT drop os.environ — PATH must survive.
+
+        Regression guard for the latent footgun where ``create_subprocess_exec``
+        received the raw ``before_done['env']`` dict, which completely replaced the
+        process environment (no PATH/HOME/XDG_RUNTIME_DIR → most binaries fail to
+        resolve).  The fix merges over ``os.environ`` so the deploy script still runs
+        in a sane environment while callers can still override individual variables.
+        """
+        import os
+        from unittest.mock import patch, AsyncMock as _AsyncMock
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/bin/true',
+            'args': [],
+            'env': {'MY_DEPLOY_VAR': 'hello'},
+            'cwd': str(tmp_path),
+            'timeout_secs': 5,
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        mock_proc = _AsyncMock()
+        mock_proc.communicate = _AsyncMock(return_value=(b'', b''))
+        mock_proc.returncode = 0
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_run_script(before_done)
+
+        call_kwargs = mock_exec.call_args.kwargs
+        passed_env = call_kwargs['env']
+
+        assert passed_env is not None, (
+            'env must not be None when before_done.env is non-empty'
+        )
+        assert 'PATH' in passed_env, (
+            f'child must inherit PATH from os.environ when a partial env dict is '
+            f'passed; got env keys: {sorted(passed_env)}'
+        )
+        assert passed_env['PATH'] == os.environ['PATH'], (
+            'inherited PATH must match os.environ[PATH]'
+        )
+        assert passed_env['MY_DEPLOY_VAR'] == 'hello', (
+            'custom override from before_done.env must be present in merged env'
+        )
 
 
 # ---------------------------------------------------------------------------
