@@ -91,6 +91,14 @@ class TestFootprintAndDefaultDetector:
         """isinstance check verifies @runtime_checkable Protocol conformance."""
         assert isinstance(DEFAULT_OVERLAP_DETECTOR, OverlapFootprintDetector)
 
+    def test_footprint_is_immutable(self) -> None:
+        """Footprint is a frozen dataclass; attribute mutation must raise FrozenInstanceError."""
+        import dataclasses
+
+        fp = Footprint(members=frozenset(["a.py"]))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            fp.members = frozenset(["b.py"])  # type: ignore[misc]
+
 
 # ---------------------------------------------------------------------------
 # Step 3: Registration + default fallback tests
@@ -143,6 +151,21 @@ class TestRegistry:
         register_overlap_detector("reify", stub1)
         register_overlap_detector("reify", stub2)
         assert get_overlap_detector("reify") is stub2
+
+    def test_empty_string_project_id_is_rejected(self, clean_registry: object) -> None:
+        """Empty-string project_id raises ValueError to prevent a silent
+        registration-lookup asymmetry (get_overlap_detector('') would fall
+        through to the default, hiding the registration)."""
+        stub = _StubDetector()
+        import pytest as _pytest  # noqa: PLC0415
+
+        with _pytest.raises(ValueError, match="non-empty string"):
+            register_overlap_detector("", stub)
+
+    def test_empty_string_lookup_returns_default(self, clean_registry: object) -> None:
+        """get_overlap_detector('') must return the default (not a registered value)
+        because registration under '' is forbidden by ValueError."""
+        assert get_overlap_detector("") is DEFAULT_OVERLAP_DETECTOR
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +240,24 @@ class TestChangesetsOverlap:
             result = changesets_overlap("log_raiser", ["a.py"], ["b.py"])
         assert result is True
         assert any("fail-open" in r.message.lower() for r in caplog.records)
+
+    # ------------------------------------------------------------------
+    # project_id=None path (absence ⟹ default, per §5.1)
+    # ------------------------------------------------------------------
+
+    def test_none_project_id_overlapping(self, clean_registry: object) -> None:
+        """changesets_overlap(None, ...) routes through the default detector."""
+        assert changesets_overlap(None, ["a.py", "b.py"], ["b.py", "c.py"]) is True
+
+    def test_none_project_id_disjoint(self, clean_registry: object) -> None:
+        """changesets_overlap(None, ...) returns False for disjoint path sets."""
+        assert changesets_overlap(None, ["a.py"], ["b.py"]) is False
+
+    def test_none_project_id_ignores_registered_detector(self, clean_registry: object) -> None:
+        """None always selects the default, even if specific project_ids are registered."""
+        register_overlap_detector("reify", _OverlappingStub())
+        # Default detector: ["a.py"] vs ["b.py"] is disjoint
+        assert changesets_overlap(None, ["a.py"], ["b.py"]) is False
 
 
 # ---------------------------------------------------------------------------

@@ -110,7 +110,21 @@ def register_overlap_detector(project_id: str, detector: OverlapFootprintDetecto
     dark-factory does NOT pre-register itself — the default is reached via
     the fallback in ``get_overlap_detector``.  Only overrides (e.g. reify,
     task κ) call this function.
+
+    *project_id* must be a non-empty string; passing ``""`` raises
+    ``ValueError`` to keep registration and lookup symmetric (``get_overlap_detector("")``
+    would fall through to the default, silently ignoring the registration).
+
+    **Threading contract**: this function is intended to be called only during
+    single-threaded startup (import time or application init), before any
+    merge-queue workers begin calling ``get_overlap_detector``.  The underlying
+    ``_DETECTORS`` dict is not guarded by a lock.  If you need to register
+    detectors concurrently with live workers, add a ``threading.RLock`` here.
     """
+    if not project_id:
+        raise ValueError(
+            f"register_overlap_detector: project_id must be a non-empty string, got {project_id!r}"
+        )
     _DETECTORS[project_id] = detector
 
 
@@ -118,8 +132,13 @@ def get_overlap_detector(project_id: str | None = None) -> OverlapFootprintDetec
     """Return the detector for *project_id*, or ``DEFAULT_OVERLAP_DETECTOR``.
 
     Absence (``None`` or unregistered id) ⟹ default, per §5.1.
+
+    The guard is ``project_id is None`` (not a truthiness check) so that a
+    detector registered under an explicit key is always reachable via the same
+    key — there is no reachable empty-string registration because
+    ``register_overlap_detector`` rejects ``""``.
     """
-    if not project_id:
+    if project_id is None:
         return DEFAULT_OVERLAP_DETECTOR
     return _DETECTORS.get(project_id, DEFAULT_OVERLAP_DETECTOR)
 
