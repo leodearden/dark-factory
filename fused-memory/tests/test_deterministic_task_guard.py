@@ -14,7 +14,6 @@ from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
 )
 
-
 # ---------------------------------------------------------------------------
 # Step-1: invariant matrix tests (no filesystem)
 # ---------------------------------------------------------------------------
