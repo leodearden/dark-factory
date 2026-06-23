@@ -1280,3 +1280,70 @@ class TestB8SelfRestart:
         assert meta.get('before_done_scheduled_at') is not None, (
             'before_done_scheduled_at must be stamped after restart scheduled'
         )
+
+
+# ---------------------------------------------------------------------------
+# B9 — self-restart fire-time failure → δ submit CLI files an L2 (step-12)
+# ---------------------------------------------------------------------------
+
+class TestB9SubmitCli:
+    """B9: escalation.submit.main(['submit', ...]) files a born-at-L2 infra_issue.
+
+    Proves the OnFailure → δ → pending-L2 path by invoking δ's CLI exactly as
+    the runner's OnFailure shell branch would (deterministic_runner.py
+    _default_schedule_detached_restart).  No real systemd is needed.
+
+    δ's submit.main constructs Escalation(level=2, ...) directly and writes it
+    to the file-backed queue.  The test asserts:
+    - return code == 0
+    - queue.get_by_task(task_id, status='pending') has exactly one escalation
+    - level == 2, agent_role starts with 'orchestrator-', category == 'infra_issue'
+    """
+
+    def test_b9_submit_cli_files_l2(self, tmp_path: Path) -> None:
+        """δ submit CLI files a pending born-at-L2 infra_issue escalation."""
+        from escalation.submit import main as submit_main
+
+        task_id = 'deploy-b9'
+        queue_dir = tmp_path / 'queue'
+        unit = 'orchestrator.service'
+
+        rc = submit_main([
+            'submit',
+            '--queue-dir', str(queue_dir),
+            '--task', task_id,
+            '--severity', 'critical',
+            '--category', 'infra_issue',
+            '--summary', f'Self-restart fire-time failure: {unit}',
+            '--agent-role', 'orchestrator-deterministic',
+            '--detail', f'OnFailure: systemd-run transient unit for {unit} exited with rc=1',
+        ])
+
+        assert rc == 0, f'submit_main returned {rc} (expected 0)'
+
+        q = EscalationQueue(queue_dir)
+        pending = q.get_by_task(task_id, status='pending')
+        assert len(pending) == 1, (
+            f'Expected exactly 1 pending L2, got {len(pending)}'
+        )
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.agent_role.startswith('orchestrator-'), (
+            f'agent_role {esc.agent_role!r} must start with orchestrator-'
+        )
+        assert esc.category == 'infra_issue'
+
+    def test_b9_submit_cli_rc0(self, tmp_path: Path) -> None:
+        """submit_main returns 0 on success."""
+        from escalation.submit import main as submit_main
+
+        rc = submit_main([
+            'submit',
+            '--queue-dir', str(tmp_path / 'q2'),
+            '--task', 'b9-rc',
+            '--severity', 'critical',
+            '--category', 'infra_issue',
+            '--summary', 'Fire-time failure',
+            '--agent-role', 'orchestrator-deterministic',
+        ])
+        assert rc == 0
