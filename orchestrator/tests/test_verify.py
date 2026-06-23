@@ -6133,3 +6133,52 @@ class TestInfraOSErrorClassifier:
     def test_verify_infra_error_message(self):
         err = verify.VerifyInfraError(phase='warm_marker', errno=28)
         assert 'warm_marker' in str(err) or err.phase == 'warm_marker'
+
+
+class TestMarkVerifyWarmInfraError:
+    """Tests for _mark_verify_warm raising VerifyInfraError on infra OSErrors (step-3)."""
+
+    def test_infra_enospc_raises_verify_infra_error(self, tmp_path, monkeypatch):
+        """ENOSPC during touch() → VerifyInfraError with phase='warm_marker'."""
+        import errno as errno_module
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+
+        def bad_touch(self, exist_ok=False):
+            raise OSError(errno_module.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr('pathlib.Path.touch', bad_touch)
+
+        with pytest.raises(verify.VerifyInfraError) as exc_info:
+            verify._mark_verify_warm(tmp_path)
+
+        assert exc_info.value.phase == 'warm_marker'
+        assert exc_info.value.errno == errno_module.ENOSPC
+
+    def test_non_infra_oserror_is_swallowed(self, tmp_path, monkeypatch):
+        """Non-infra OSError (EACCES) during touch() is logged and swallowed (no raise)."""
+        import errno as errno_module
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+
+        def bad_touch(self, exist_ok=False):
+            raise OSError(errno_module.EACCES, 'Permission denied')
+
+        monkeypatch.setattr('pathlib.Path.touch', bad_touch)
+
+        # Must not raise anything
+        verify._mark_verify_warm(tmp_path)
+
+    def test_no_task_dir_is_noop(self, tmp_path, monkeypatch):
+        """Worktree without .task/ is a no-op — touch is never called."""
+        touch_called = []
+
+        def bad_touch(self, exist_ok=False):
+            touch_called.append(True)
+            raise OSError(28, 'No space left on device')
+
+        monkeypatch.setattr('pathlib.Path.touch', bad_touch)
+
+        # Should not raise and should not call touch
+        verify._mark_verify_warm(tmp_path)
+        assert not touch_called
