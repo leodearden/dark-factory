@@ -14,20 +14,17 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import collections
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
-    MERGE_LANES,
+    EMPTY_SUFFIX_CONFLICT_GRAPH,
     MergeRequest,
     SpeculativeMergeWorker,
     SuffixConflictGraph,
-    EMPTY_SUFFIX_CONFLICT_GRAPH,
 )
 
 # ── fixtures (mirrors test_merge_queue_finalize_head_visibility.py) ────────────
