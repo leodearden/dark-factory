@@ -19,6 +19,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
+from shared.locking import strip_directory_locks
 from shared.safe_io import load_json_or_warn
 
 from orchestrator import digest as digest_mod
@@ -1472,9 +1473,12 @@ Output JSON matching the schema. Every task must appear in the output.
                     task_id, json.dumps({'files': files})
                 )
                 # Also populate in-memory cache so modules are available
-                # immediately without re-fetching from taskmaster
+                # immediately without re-fetching from taskmaster.
+                # α strip: directory entries are coerced to empty before
+                # lock derivation so they cannot poison the cache and bypass
+                # _get_modules' α strip on the next tick.
                 depth = self.config.lock_depth
-                derived = files_to_modules(files, depth)
+                derived = files_to_modules(strip_directory_locks(files), depth)
                 if derived:
                     self.scheduler._module_cache[task_id] = derived
                 tagged_count += 1
