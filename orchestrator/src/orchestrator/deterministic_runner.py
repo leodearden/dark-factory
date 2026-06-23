@@ -481,8 +481,6 @@ class DeterministicRunner:
             ValueError — if ``always_escalates`` is False with ``before_done=None``
                 (unsupported misconfiguration in β).
         """
-        from escalation.models import Escalation
-
         task_id = str(assignment.task_id)
         task = assignment.task
         metadata = task.get('metadata') or {}
