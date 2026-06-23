@@ -124,7 +124,15 @@ class TestModuleLevelAll:
         from shared import locking
 
         assert hasattr(locking, '__all__'), 'locking must define __all__'
-        assert set(locking.__all__) == {'normalize_lock', 'files_to_modules', 'modules_conflict'}
+        assert set(locking.__all__) == {
+            'normalize_lock',
+            'files_to_modules',
+            'modules_conflict',
+            'CODE_EXTENSIONS',
+            'is_file_path',
+            'directory_locks',
+            'strip_directory_locks',
+        }
 
     def test_agent_result_all(self):
         from shared import agent_result
