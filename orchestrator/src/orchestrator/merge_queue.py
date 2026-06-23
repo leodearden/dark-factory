@@ -6193,18 +6193,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Returns None when every non-empty lane is halted or all buffers are
         empty.  Pure/synchronous so unit tests run without an event loop.
         """
+        graph = self._suffix_conflict_graph
         for lane in MERGE_LANES:  # high → normal
             if self.is_lane_halted(lane):
                 continue
             buf = self._lane_buffers[lane]
             if not buf:
                 continue
-            # Pick the FIFO-earliest item that minimises _aging_key (global within lane).
-            # min() is stable on equal keys → preserves FIFO order on ties.
-            idx = min(range(len(buf)), key=lambda i: _aging_key(buf[i]))
-            req = buf[idx]
-            del buf[idx]
-            return req
+            # Clique-minimal selection: scan FIFO order; pick the first item x
+            # such that no footprint-neighbor of x in the same buffer has a
+            # strictly smaller aging key than x.  Items with no buffered
+            # footprint-neighbor are vacuously minimal → pure FIFO for disjoint
+            # items.  Degrades to FIFO when graph is empty or rid is absent
+            # from the graph (footprint_neighbors returns frozenset()).
+            buf_rids: frozenset[str] = frozenset(item.request_id for item in buf)
+            for i, x in enumerate(buf):
+                neighbors = graph.footprint_neighbors(x.request_id) & buf_rids
+                key_x = _aging_key(x)
+                # x is clique-minimal iff no same-lane neighbor has key < key_x
+                if not any(_aging_key(buf[j]) < key_x
+                           for j, item in enumerate(buf)
+                           if item.request_id in neighbors):
+                    del buf[i]
+                    return x
+            # Defensive fallback (unreachable: the aging-minimal item is always
+            # minimal by the above criterion, so the loop always returns).
+            return buf.popleft()
         return None
 
     # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
