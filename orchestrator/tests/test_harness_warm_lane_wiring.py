@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -349,3 +349,92 @@ class TestCancelledWorkflowLaneRelease:
         )
         # Sanity: correct outcome returned
         assert outcome == WorkflowOutcome.CANCELLED
+
+
+# ===========================================================================
+# Step-7 (1881): RED — B2: _run_slot finally releases lane on hard-cancel
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestHardCancelLaneRelease:
+    """B2 (T5): harness._run_slot finally must release the warm lane on hard-cancel.
+
+    Hard-cancel = asyncio.CancelledError raised inside the try block of _run_slot
+    (harness.py:3402) when hard_cancel_workflow() calls task.cancel(). The slot
+    returns a synthetic TaskReport(outcome=CANCELLED) from the except clause and
+    the run() finally of the WORKFLOW never executes (B1 cannot cover this path).
+
+    Diff 4: in _run_slot finally, after the events pops, add:
+        if report is not None and report.outcome in (DONE, CANCELLED):
+            with contextlib.suppress(Exception):
+                await self.git_ops.release_lane_for_terminal_task(assignment.task_id)
+
+    RED: finally has no release; lane stays ASSIGNED after _run_slot returns.
+    """
+
+    async def test_hard_cancel_frees_lane(self, tmp_path: Path):
+        """Hard-cancelled slot (asyncio.CancelledError path) → lane freed in slot finally."""
+        from orchestrator.git_ops import GitOps  # noqa: F401
+        from orchestrator.scheduler import TaskAssignment
+        from orchestrator.warm_lane_pool import LaneState
+        from orchestrator.workflow import WorkflowOutcome
+
+        # ── Setup: minimal git repo ─────────────────────────────────────────
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+
+        # ── Harness with real git_ops (warm lane pool) + mocked scheduler ──
+        harness = _build_harness(config)
+        pool = harness.git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Pre-assign lane for task '99' (simulates harness having acquired it
+        # before dispatching the slot; T5 hard-cancel scenario)
+        await pool.acquire_for('99')
+        lane = pool.assignment_for('99')
+        assert lane is not None, 'setup: lane must be ASSIGNED for task 99'
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        # ── Configure mocked scheduler ──────────────────────────────────────
+        # carries_substrate_probe → False so the substrate gate is skipped
+        harness.scheduler.carries_substrate_probe.return_value = False
+
+        # ── Patch TaskWorkflow to simulate a hard-cancel ────────────────────
+        # workflow.run() raises CancelledError, exactly as if the slot's
+        # asyncio.Task was cancelled by hard_cancel_workflow().
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            mock_wf = MagicMock()
+            mock_wf.run = AsyncMock(side_effect=asyncio.CancelledError())
+            MockWorkflow.return_value = mock_wf
+
+            assignment = TaskAssignment(
+                task_id='99',
+                task={
+                    'id': '99', 'title': 'Hard-cancel test', 'status': 'pending',
+                    'metadata': {}, 'dependencies': [],
+                },
+                modules=[],
+            )
+            sem = asyncio.Semaphore(1)
+            report = await harness._run_slot(assignment, sem)
+
+        # Must have returned the synthetic CANCELLED report from the except clause
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.CANCELLED
+
+        # (B2 RED) Lane must be freed by the slot finally.
+        # Fails: _run_slot finally currently has no release_lane_for_terminal_task call.
+        assert pool.assignment_for('99') is None, (
+            '_run_slot finally must release the lane for a hard-cancelled slot'
+        )
+        assert pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after hard-cancel, got {pool.state(lane)!r}'
+        )
