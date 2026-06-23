@@ -115,19 +115,13 @@ function DepChip({ dep }) {
 }
 
 function LockChip({ path, label, holder, holderProject, currentTaskId, currentProject, parkedBy, parkedOwnerLive }) {
-  let cls, hint;
   const isOwn = holder && holder === currentTaskId && (holderProject || currentProject) === currentProject;
-  const holderDisplay = holder ? `T-${holder}` : null;
-  const parkedDisplay = parkedBy ? `T-${parkedBy}` : null;
-  if (!holder && parkedBy) { cls = 'lock-parked'; hint = `parked by ${parkedDisplay}`; }
-  else if (!holder) { cls = 'lock-free'; hint = 'available'; }
-  else if (isOwn) { cls = 'lock-mine'; hint = 'held by this task'; }
-  else { cls = 'lock-taken'; hint = `held by ${holderDisplay}`; }
+  const { cls, hint, ownerLabel } = window.DF_SCHED_UTILS.lockChipState({ holder, isMine: isOwn, parkedBy, parkedOwnerLive });
   return (
     <span className={`chip ${cls}`} title={`${path} · ${hint}`}>
       {label != null ? label : path.split('/').pop()}
-      {cls === 'lock-parked' && <span className="holder">⏸ {parkedDisplay}{parkedOwnerLive === false && ' ⚠'}</span>}
-      {cls === 'lock-taken' && <span className="holder">⊘ {holderDisplay}</span>}
+      {cls === 'lock-parked' && <span className="holder">⏸ {ownerLabel}</span>}
+      {cls === 'lock-taken' && <span className="holder">⊘ {ownerLabel}</span>}
     </span>
   );
 }
