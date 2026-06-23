@@ -79,21 +79,6 @@ def _extract_status(task_data: dict) -> str:
 # that happen to have the same file layout.  Extend when needed.
 _BRIEFING_REFRESH_PROJECT_ALLOWLIST: frozenset[str] = frozenset({'reify'})
 
-# ── Task-1139 scope filter ────────────────────────────────────────────────────
-# These substrings uniquely identify Mem0 flags that were written as part of the
-# FIX-A bug-mechanics description itself.  They must not be re-surfaced as live
-# flags for other tasks.  The list is intentionally narrow so legitimate flags
-# that merely mention "Stage 1" or "flagged_items" in passing are not suppressed.
-#
-# TODO(task-1139-gc): Remove this constant and _should_skip_known_bug_1139_flag
-# once the Mem0 collection no longer contains task_id=1139 flag_for_stage2
-# memories.  Trigger: verify via count_memories_by_metadata(filters={'task_id':
-# '1139', 'flag_for_stage2': True}) == 0, then delete both symbols.
-_KNOWN_BUG_1139_CONTENT_MARKERS: tuple[str, ...] = (
-    'flag_for_stage2=true but does NOT include them in flagged_items',
-    'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2',
-)
-
 # Persistence-threshold constant for FIX D (stale-flag escalation guard).
 # A flag that has survived this many Stage 2 cycles without being deleted is
 # considered stale and is surfaced in the payload for operator escalation.
@@ -117,31 +102,6 @@ def _assume_utc(dt: datetime) -> datetime:
     that the assumed-timezone behaviour has a single source of truth.
     """
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
-
-
-def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
-    """Return True iff *flag* describes the task-1139 flag-relay bug mechanics.
-
-    The active-Mem0-query path (FIX A) must not re-inject into the payload any
-    flags that were written specifically to describe *this* bug.  Two narrow
-    signals identify such a flag:
-
-    1. ``flag['task_id'] == '1139'`` (string-coerced, so int 1139 also matches).
-    2. ``flag['content']`` contains one of the ``_KNOWN_BUG_1139_CONTENT_MARKERS``
-       substrings — e.g. the sentence "Stage 1 LLM writes flags to Mem0 with
-       metadata.flag_for_stage2 but does NOT include them in flagged_items".
-
-    All other flags pass through unchanged.
-
-    .. note::
-        This filter becomes dead code once task 1139 closes and its Mem0 flags
-        are GC'd.  See the TODO on ``_KNOWN_BUG_1139_CONTENT_MARKERS`` for the
-        removal trigger.
-    """
-    if str(flag.get('task_id', '')) == '1139':
-        return True
-    content = flag.get('content', '')
-    return any(marker in content for marker in _KNOWN_BUG_1139_CONTENT_MARKERS)
 
 
 def _suppress_same_run_human_operator_dups(
@@ -2183,10 +2143,7 @@ class TaskKnowledgeSync(BaseStage):
         # automatically flows through to this counter without drift.
         self._rescued_in_window_markers = len(partition.rescued_ids)
 
-        # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
-        # the active-query path ONLY.  Stage 1's structured-output flags are
-        # intentionally emitted by the LLM and must not be suppressed here.
-        surviving = [f for f in active_flags if not _should_skip_known_bug_1139_flag(f)]
+        surviving = active_flags  # active-query path is pass-through (no scope filter)
 
         # FIX D — stale-flag persistence tracking.
         # Track how many cycles each surviving flag has survived without being

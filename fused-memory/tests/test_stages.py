@@ -4604,62 +4604,6 @@ class TestMemoryConsolidatorStaleOperatorDetector:
         assert report is not None
 
 
-# ---------------------------------------------------------------------------
-# Task 1139 — FIX A / FIX D helpers
-# ---------------------------------------------------------------------------
-
-class TestShouldSkipKnownBug1139Flag:
-    """_should_skip_known_bug_1139_flag returns True only for task-1139/bug-mechanics flags."""
-
-    def _import(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _should_skip_known_bug_1139_flag,
-        )
-        return _should_skip_known_bug_1139_flag
-
-    def test_skip_task_id_string_1139(self):
-        fn = self._import()
-        assert fn({'task_id': '1139'}) is True
-
-    def test_skip_task_id_int_1139(self):
-        """Integer task_id is coerced to string for comparison."""
-        fn = self._import()
-        assert fn({'task_id': 1139}) is True
-
-    def test_skip_bug_mechanics_content_no_task_id(self):
-        """Flag with bug-mechanics content is skipped even without task_id."""
-        fn = self._import()
-        flag = {
-            'content': (
-                'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2 '
-                'but does NOT include them in flagged_items'
-            ),
-        }
-        assert fn(flag) is True
-
-    def test_skip_content_marker_flag_for_stage2_not_include(self):
-        """The second content marker substring also triggers a skip."""
-        fn = self._import()
-        flag = {'content': 'flag_for_stage2=true but does NOT include them in flagged_items'}
-        assert fn(flag) is True
-
-    def test_pass_different_task_id_742(self):
-        fn = self._import()
-        assert fn({'task_id': '742'}) is False
-
-    def test_pass_different_task_id_with_unrelated_content(self):
-        fn = self._import()
-        assert fn({'task_id': '742', 'content': 'unrelated finding'}) is False
-
-    def test_pass_empty_dict(self):
-        fn = self._import()
-        assert fn({}) is False
-
-    def test_pass_content_mentions_stage1_but_not_bug(self):
-        fn = self._import()
-        assert fn({'content': 'mentions Stage 1 but not the bug'}) is False
-
-
 class TestAssumeUtc:
     """_assume_utc: naive datetimes get UTC attached; aware datetimes pass through unchanged."""
 
@@ -6136,8 +6080,8 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         assert '_current_run_id' in msg
 
 
-class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
-    """Scope filter suppresses task-1139/bug-mechanics flags from Mem0 active-query path."""
+class TestTaskKnowledgeSyncMem0ActiveQueryFlagRendering:
+    """Mem0 active-query flags — including task-1139/bug-mechanics ones — render in the payload."""
 
     @pytest.fixture
     def mock_deps(self):
@@ -6183,12 +6127,12 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
             'task 742 flag must appear in the payload'
 
     @pytest.mark.asyncio
-    async def test_task_1139_flag_suppressed(self, mock_deps, watermark):
+    async def test_task_1139_flag_renders(self, mock_deps, watermark):
+        """A Mem0 active-query flag with task_id=1139 renders in the payload (no suppression)."""
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='reify', project_root='/home/leo/src/reify')
         mock_deps['memory_service'].search.return_value = [
-            # run_id='test-run' matches stage._current_run_id so this flag is NOT
-            # excluded by the run-partition filter.  The task_id=1139 scope filter
-            # is what we're testing here — it must suppress the flag regardless.
+            # run_id='test-run' matches stage._current_run_id so this flag lands in
+            # partition.current → active_flags.  With the guard removed it must render.
             self._make_flag('mem-1139', 'some flag for task 1139', '1139', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -6196,20 +6140,20 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         payload = await stage.assemble_payload([], watermark, [])
         section = _extract_section(payload, '### Stage 1 Flagged Items')
 
-        assert 'some flag for task 1139' not in section, \
-            'task_id=1139 flags must be suppressed by the scope filter'
+        assert 'some flag for task 1139' in section, \
+            'task_id=1139 flags must render in the payload now that the guard is removed'
 
     @pytest.mark.asyncio
-    async def test_bug_mechanics_content_suppressed(self, mock_deps, watermark):
+    async def test_bug_mechanics_content_renders(self, mock_deps, watermark):
+        """A flag containing the old bug-mechanics content renders in the payload (no suppression)."""
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='reify', project_root='/home/leo/src/reify')
         bug_content = (
             'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2 '
             'but does NOT include them in flagged_items'
         )
         mock_deps['memory_service'].search.return_value = [
-            # run_id='test-run' matches stage._current_run_id so the flag passes the
-            # run-partition filter; the bug-mechanics content-based scope filter is
-            # what we're testing here — it must suppress the flag.
+            # run_id='test-run' matches stage._current_run_id so the flag lands in
+            # partition.current → active_flags.  With the guard removed it must render.
             self._make_flag('mem-bug', bug_content, '', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -6217,13 +6161,14 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         payload = await stage.assemble_payload([], watermark, [])
         section = _extract_section(payload, '### Stage 1 Flagged Items')
 
-        assert bug_content not in section, \
-            'Bug-mechanics content must be suppressed by scope filter'
+        assert bug_content in section, \
+            'Bug-mechanics content must render in the payload now that the guard is removed'
 
     @pytest.mark.asyncio
     async def test_stage1_items_flagged_for_task_1139_not_suppressed(self, mock_deps, watermark):
-        """Stage 1 structured-output flags for task 1139 are NOT filtered.
-        The scope filter only applies to the Mem0 active-query path."""
+        """Stage 1 structured-output flags for task 1139 render in the payload.
+        Stage 1 items_flagged are never filtered — only Mem0 active-query flags
+        go through the partition step."""
         from datetime import UTC, datetime
 
         from fused_memory.models.reconciliation import StageReport
