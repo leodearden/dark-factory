@@ -1494,7 +1494,17 @@ class TaskWorkflow:
                 cwd=self.worktree,
             )
 
-    async def run(self) -> WorkflowOutcome:  # pyright: ignore[reportGeneralTypeIssues]
+    async def run(  # pyright: ignore[reportGeneralTypeIssues]
+        self,
+    ) -> WorkflowOutcome:
+        # reportGeneralTypeIssues: pyright reports "Code is too complex to
+        # analyze" on this method when run without the project pyproject.toml
+        # config (typeCheckingMode = "basic").  The root cause is the number
+        # of exception-handler branches added for infra-retry and bypass-done
+        # discrimination; refactoring them out is a separate architectural
+        # task.  The ignore is on the def line (the only site pyright accepts
+        # it for this diagnostic) and is narrowed to reportGeneralTypeIssues
+        # so genuine type regressions in other categories are still caught.
         """Execute the full state machine."""
         branch_name = self.task_id
         try:

@@ -1270,8 +1270,9 @@ class OrchestratorConfig(BaseSettings):
     # Verify-path infra retry knobs — bounded exponential back-off for
     # transient infra OSErrors (ENOSPC etc.) caught during the verify phase.
     # max_attempts: total in-process retry attempts before the task is blocked
-    #   with category='infra_issue'.  Default 5 gives ~4 min of back-off at
-    #   the default base/ceiling before declaring the infra failure persistent.
+    #   with category='infra_issue'.  Default 5 gives ~1 min of back-off at
+    #   the default base/ceiling (2+4+8+16+32 = 62s total sleep across all
+    #   5 failed attempts) before declaring the infra failure persistent.
     # backoff_secs: base delay for the first retry (seconds).  Subsequent
     #   delays are min(backoff * 2^attempt, max_backoff).
     # max_backoff_secs: ceiling on a single retry delay (seconds).
