@@ -2105,3 +2105,84 @@ def test_module_contention_counts_attaches_parked_by_and_stack():
     assert other_entry['park_stack'] == [], (
         f"Expected park_stack=[] for unparked module, got {other_entry['park_stack']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1870 step-3: _stranded_park_rows flags dead owners (orphan/stranded pass)
+# ---------------------------------------------------------------------------
+
+
+def test_stranded_park_rows_flags_dead_owner():
+    """_stranded_park_rows emits one synthetic row per dead park owner.
+
+    B2 contract:
+    - Dead owner (not in live_task_ids) → row with stranded=True, correct fields.
+    - Live owner (in live_task_ids) → NO row emitted.
+    - Owner parking two modules → single deduped row, park_state['modules'] lists both.
+    """
+    from dashboard.data.scheduler import _stranded_park_rows
+
+    iso = '2026-01-01T09:00:00+00:00'
+
+    # ── Case 1: single dead owner on one module ──
+    park_stacks = {
+        'm': [{'owner': '9', 'rank': 5, 'shadowed': False, 'installed_at': iso}]
+    }
+
+    rows = _stranded_park_rows(
+        park_stacks,
+        set(),           # live_task_ids — owner '9' is NOT live
+        project='p',
+        project_root='/p',
+    )
+
+    assert len(rows) == 1, f"Expected 1 stranded row, got {len(rows)}: {rows}"
+    r = rows[0]
+
+    assert r['task_id'] == '9', f"task_id should be the owner id, got {r['task_id']!r}"
+    assert r['stranded'] is True, "stranded must be True for dead owner"
+    assert r['parked_owner_live'] is False, "parked_owner_live must be False for dead owner"
+    assert r['project'] == 'p', f"project must be 'p', got {r['project']!r}"
+    assert r['project_root'] == '/p', f"project_root must be '/p', got {r['project_root']!r}"
+    assert r['park_state']['modules'] == ['m'], (
+        f"park_state.modules must be ['m'], got {r['park_state']['modules']!r}"
+    )
+    assert r['age_seconds'] >= 0, f"age_seconds must be >= 0, got {r['age_seconds']!r}"
+    assert r['lock_set'] == ['m'], f"lock_set must be ['m'], got {r['lock_set']!r}"
+    assert r.get('title') == '(stranded park)', (
+        f"title must be '(stranded park)', got {r.get('title')!r}"
+    )
+
+    # ── Case 2: live owner → no stranded row ──
+    rows_live = _stranded_park_rows(
+        park_stacks,
+        {'9'},           # owner '9' IS live
+        project='p',
+        project_root='/p',
+    )
+    assert rows_live == [], (
+        f"Live owner must produce no stranded rows, got {rows_live!r}"
+    )
+
+    # ── Case 3: owner parking two modules → single deduped row ──
+    park_stacks_two = {
+        'm1': [{'owner': '42', 'rank': 3, 'shadowed': False, 'installed_at': iso}],
+        'm2': [{'owner': '42', 'rank': 3, 'shadowed': False, 'installed_at': iso}],
+    }
+    rows_two = _stranded_park_rows(
+        park_stacks_two,
+        set(),           # owner '42' not live
+        project='p',
+        project_root='/p',
+    )
+    assert len(rows_two) == 1, (
+        f"Same owner on two modules must produce one deduped row, got {len(rows_two)}"
+    )
+    r2 = rows_two[0]
+    assert r2['task_id'] == '42'
+    assert sorted(r2['park_state']['modules']) == ['m1', 'm2'], (
+        f"park_state.modules must list both modules, got {r2['park_state']['modules']!r}"
+    )
+    assert sorted(r2['lock_set']) == ['m1', 'm2'], (
+        f"lock_set must list both modules, got {r2['lock_set']!r}"
+    )
