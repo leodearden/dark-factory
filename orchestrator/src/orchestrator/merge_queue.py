@@ -6020,9 +6020,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         synchronous and cheap (reads the stored graph; no await).
         """
         # ── 1. Build ordered suffix list ──────────────────────────────────────
+        # ε=1890 defensive exclusion: frozen items (currently verifying) must
+        # never appear as suffix-graph nodes — the frozen/suffix partition is
+        # invariant (§5.3). Compute the frozen-rid set once, then filter.
+        frozen_rids: frozenset[str] = frozenset(self.frozen_prefix())
         suffix: list[MergeRequest] = []
         for lane in MERGE_LANES:  # high → normal
-            suffix.extend(self._lane_buffers[lane])  # FIFO within each lane
+            for req in self._lane_buffers[lane]:  # FIFO within each lane
+                if req.request_id not in frozen_rids:
+                    suffix.append(req)
 
         ordered_rids = tuple(req.request_id for req in suffix)
 
