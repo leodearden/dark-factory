@@ -5934,6 +5934,58 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         tip = self._newest_frozen_commit()
         return tip if tip is not None else main_sha
 
+    def check_frozen_prefix_invariant(self, main_sha: str) -> list[str]:
+        """Return §5.3 violations as human-readable strings (empty = healthy) (ε=1890).
+
+        λ's integration-gate seam: callers assert violations == [] to gate a
+        lane advance, a reorder, or a deploy.
+
+        Checks performed:
+          1. Base-chain integrity: for each frozen entry in submission order,
+             expected_base = predecessor's merge_commit (or main_sha for the
+             first entry).  If the entry has a merge_result AND its base_sha
+             does not match expected_base, record a violation naming the rid,
+             expected, and actual base.  Entries with no merge_result
+             (passthrough / conflict) are skipped — they carry no commit.
+          2. Frozen/suffix disjointness: any rid that appears in BOTH
+             frozen_prefix() and unfrozen_suffix() is a structural bug; record
+             one violation per duplicate.
+
+        Pure/synchronous — reads stored in-memory state, no await.
+        """
+        violations: list[str] = []
+        frozen_entries = self._frozen_inflight_entries()
+
+        # ── 1. Base-chain integrity ───────────────────────────────────────────
+        expected_base = main_sha.strip()
+        for entry in frozen_entries:
+            rid = entry.item.request.request_id
+            mr = entry.item.merge_result
+            if mr is None or not mr.merge_commit:
+                # No merge_commit — nothing to chain; advance expected_base
+                # only if there IS a commit to chain to (skip for passthroughs).
+                continue
+            actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
+            if actual_base != expected_base:
+                violations.append(
+                    f'frozen-prefix base-chain broken at {rid}: '
+                    f'expected base {expected_base!r} but item has {actual_base!r}'
+                )
+            # Advance expected_base for the next entry regardless of violation,
+            # so subsequent chain errors are also surfaced (not shadowed).
+            expected_base = mr.merge_commit.strip()
+
+        # ── 2. Frozen/suffix disjointness ────────────────────────────────────
+        frozen_set = set(self.frozen_prefix())
+        suffix_set = set(self.unfrozen_suffix())
+        for rid in sorted(frozen_set & suffix_set):
+            violations.append(
+                f'frozen-prefix disjointness violated: {rid!r} appears in both '
+                f'frozen prefix and unfrozen suffix'
+            )
+
+        return violations
+
     async def recompute_suffix_conflict_graph(self) -> None:
         """Recompute and store the conflict-graph over the unfrozen suffix (task δ=1889).
 
