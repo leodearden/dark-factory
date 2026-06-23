@@ -1251,6 +1251,38 @@ async def api_scheduler_reorder_pin_queue(request: Request) -> JSONResponse:
     )
 
 
+@app.post('/api/v2/dashboard/scheduler/evict-park')
+async def api_scheduler_evict_park(request: Request) -> JSONResponse:
+    """Proxy POST /scheduler/evict-park → request_park_eviction MCP tool."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = None
+
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'invalid_body'}, status_code=400)
+
+    task_id = body.get('task_id')
+    if not isinstance(task_id, str) or not task_id:
+        return JSONResponse({'error': 'invalid_task_id'}, status_code=400)
+
+    project_root = body.get('project_root')
+    if not isinstance(project_root, str) or not project_root:
+        return JSONResponse({'error': 'invalid_project_root'}, status_code=400)
+
+    config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    # request_park_eviction is a pure enqueue (returns {'requested': True, ...})
+    # with no not_found semantics — forward results verbatim like reorder_pin_queue.
+    return await _scheduler_proxy(
+        http_client,
+        config,
+        'request_park_eviction',
+        {'task_id': task_id, 'project_root': project_root},
+        treat_not_found_as_404=False,
+    )
+
+
 @app.get('/api/v2/dashboard/burndown')
 async def api_burndown(request: Request) -> JSONResponse:
     """BURNDOWN + BURNDOWN_BY_PROJECT — per-project status time series."""
