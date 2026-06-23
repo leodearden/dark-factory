@@ -5016,6 +5016,119 @@ class MergeWorker(_WipHaltMixin):
         return None  # don't resolve Future — will be reprocessed
 
 
+class MergeMetrics:
+    """Pure in-memory accumulator for ι=1894 operator metrics.
+
+    Tracks two metrics surfaced on the heartbeat snapshot and dashboard:
+
+    * **retries_per_landing** — (merge re-attempts) / (clean landings).
+      Returns ``None`` while ``landings == 0`` to avoid division by zero.
+    * **drift_at_detection** — how far main advanced (in landed-merge units)
+      between when a request was based and when its conflict was caught.
+      Stored as a bounded ring of samples; summary exposes count/last/mean/max.
+
+    ``main_position`` is the landings counter — each clean landing advances
+    main by at least one merge, so it is a deterministic in-process measure of
+    "how far main advanced" without any git calls in the hot path.
+
+    Thread / concurrency safety: SpeculativeMergeWorker runs single-threaded
+    under asyncio; all methods are synchronous and side-effect-free in the
+    sense that they produce no I/O — safe to call from any asyncio coroutine.
+
+    Args:
+        drift_window: Maximum number of drift samples to retain (FIFO ring).
+            Oldest samples are dropped when the buffer exceeds this size.
+            Default 50 (about one working hour of continuous merge activity).
+    """
+
+    def __init__(self, drift_window: int = 50) -> None:
+        self._landings: int = 0
+        self._retries: int = 0
+        self._drift_window = drift_window
+        self._drift_samples: collections.deque[int] = collections.deque(
+            maxlen=drift_window
+        )
+
+    # ── counters ─────────────────────────────────────────────────────────────
+
+    @property
+    def landings(self) -> int:
+        """Number of clean landings recorded so far."""
+        return self._landings
+
+    @property
+    def retries(self) -> int:
+        """Number of merge retries recorded so far."""
+        return self._retries
+
+    @property
+    def main_position(self) -> int:
+        """Current main position in units of clean landings.
+
+        Equivalent to ``landings`` — each clean landing advances main by at
+        least one merge, making this a deterministic proxy for "how far main
+        has advanced" without any git calls in the hot path.
+        """
+        return self._landings
+
+    @property
+    def retries_per_landing(self) -> float | None:
+        """Retries ÷ landings.  ``None`` when ``landings == 0``."""
+        if self._landings == 0:
+            return None
+        return self._retries / self._landings
+
+    # ── mutators ─────────────────────────────────────────────────────────────
+
+    def record_landing(self) -> None:
+        """Increment the clean-landing counter (advances main_position by 1)."""
+        self._landings += 1
+
+    def record_retry(self) -> None:
+        """Increment the retry counter."""
+        self._retries += 1
+
+    def record_drift(self, n: int) -> None:
+        """Append one drift sample.  Oldest sample is dropped when buffer full."""
+        self._drift_samples.append(n)
+
+    # ── summaries ────────────────────────────────────────────────────────────
+
+    def drift_summary(self) -> dict:
+        """Return ``{count, last, mean, max}`` from the retained drift samples.
+
+        All values are ``None`` when no drift has been recorded.
+        """
+        samples = list(self._drift_samples)
+        if not samples:
+            return {'count': 0, 'last': None, 'mean': None, 'max': None}
+        return {
+            'count': len(samples),
+            'last': samples[-1],
+            'mean': sum(samples) / len(samples),
+            'max': max(samples),
+        }
+
+    def as_snapshot(self) -> dict:
+        """Return the serialisable snapshot dict for embedding in worker.snapshot().
+
+        Shape::
+
+            {
+                'retries_per_landing': float | None,
+                'drift_at_detection':  {count, last, mean, max},
+                'landings_total':      int,
+                'retries_total':       int,
+            }
+        """
+        return {
+            'retries_per_landing': self.retries_per_landing,
+            'drift_at_detection': self.drift_summary(),
+            'landings_total': self._landings,
+            'retries_total': self._retries,
+        }
+
+
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
