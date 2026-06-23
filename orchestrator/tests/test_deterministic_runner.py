@@ -462,24 +462,25 @@ class TestIdempotentResumeAndQuiescence:
 
         scheduler.set_task_status.assert_not_awaited()
 
-    async def test_resume_with_before_done_set_raises_not_implemented(self, tmp_path: Path):
-        """Resume path must NOT silently skip before_done — raises NotImplementedError (γ-guard)."""
+    async def test_resume_act_then_ask_before_done_ran_drives_to_done(self, tmp_path: Path):
+        """Act-then-ask resume: gate_escalated_at + before_done_ran_at both set, empty queue → done (γ step-10)."""
         from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
 
-        # gate already escalated (so we're on the resume path), but before_done is set
+        # gate already escalated AND before_done already ran; gate escalation is resolved.
         task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
-        task['metadata']['before_done'] = 'run_tests'  # γ-incompatible in β
+        task['metadata']['before_done'] = _deploy_task()['metadata']['before_done']
+        task['metadata']['before_done_ran_at'] = '2026-06-23T10:00:00+00:00'
         assignment = _make_assignment(task)
-        queue = EscalationQueue(tmp_path)  # empty — no pending escalation → resume branch
+        queue = EscalationQueue(tmp_path)  # empty — gate escalation resolved
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
-        # Must raise, not silently skip before_done and drive to done
-        with pytest.raises(NotImplementedError):
-            await runner.run(assignment)
+        # Must NOT raise NotImplementedError — before_done already ran, drive to done
+        outcome = await runner.run(assignment)
 
-        # Must NOT have been driven to done
-        scheduler.set_task_status.assert_not_awaited()
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with('100', 'done')
 
 
 # ---------------------------------------------------------------------------
@@ -1166,3 +1167,85 @@ class TestBeforeDoneOnceOnlyIdempotency:
         outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.BLOCKED
+
+# ---------------------------------------------------------------------------
+# Step-9: resume-after-resolution (before_done_ran_at set + empty queue)
+# (RED until step-10 implements the no-pending resume path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneResumeAfterResolution:
+    """DeterministicRunner — before_done_ran_at set + no pending escalation → done (resume)."""
+
+    async def test_resume_script_runner_not_called(self, tmp_path: Path):
+        """before_done_ran_at set + empty queue → script_runner NOT called (I1 no re-run)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='600', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — prior escalation resolved
+        scheduler = _mock_scheduler(task)
+
+        # unit_inspector returns same state both calls (non-fresh) so re-run would → blocked
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_resume_drives_to_done(self, tmp_path: Path):
+        """before_done_ran_at set + empty queue → set_task_status('done') with resume provenance."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='600', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        # Must have been called with 'done' exactly once
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(done_calls) == 1, f'set_task_status must be called with done; got {scheduler.set_task_status.call_args_list}'
+        provenance = done_calls[0].kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy'
+        assert provenance.get('note') == 'resumed after human resolution'
+
+    async def test_resume_outcome_is_done(self, tmp_path: Path):
+        """before_done_ran_at set + empty queue → outcome is WorkflowOutcome.DONE."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='600', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
