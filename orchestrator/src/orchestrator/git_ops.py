@@ -912,19 +912,43 @@ class GitOps:
                     'chore: save WIP before requeue rebase',
                 )
 
-                # TODO(train, β₂ follow-up): the reuse-existing-worktree path
-                # below still rebases onto main; train γ₁/γ₂ phase will address
-                # mid-verify reuse for stacked trains.
-                # Rebase onto freshened main so the worktree starts from
-                # the latest code — critical for plan revalidation, which
-                # needs the architect to see current file contents.
-                if await self.rebase_onto_main(worktree_path):
+                # ── Resolve rebase target: train-predecessor tip or main ──────
+                # Mirror the create-path start-ref logic (lines 777-791): a
+                # stacked train member (order > 0) must rebase onto its
+                # predecessor's tip so the stacking invariant is preserved
+                # across requeues.  Rebasing onto main (the old unconditional
+                # behaviour) corrupts the train by re-parenting the delta off
+                # main instead of the predecessor's commits.
+                if train is not None and train.get('order', 0) > 0:
+                    _pred = await self._train_predecessor(train)
+                    _pred_sha = await self.resolve_branch_sha(_pred.branch)
+                    if _pred_sha is None:
+                        raise RuntimeError(
+                            f'create_worktree: predecessor branch {_pred.branch!r} '
+                            f'does not exist for requeued stacked member '
+                            f'(train_id={train.get("id")!r}, '
+                            f'order={train.get("order")}, '
+                            f'branch_name={branch_name!r}). '
+                            'The predecessor branch must exist for a requeued '
+                            'stacked member.'
+                        )
+                    rebase_target: str | None = _pred_sha
+                    base_ref: str = _pred.branch
+                else:
+                    rebase_target = None  # rebase_onto_main defaults to main
+                    base_ref = self.config.main_branch
+
+                # Rebase onto the resolved target (predecessor tip for stacked
+                # trains, main for non-train / order==0).  Critical for plan
+                # revalidation: the architect needs to see current file
+                # contents from the right base.
+                if await self.rebase_onto_main(worktree_path, onto=rebase_target):
                     # Re-capture base from worktree's own merge-base after the
                     # rebase completes.  merge-base from inside the worktree
-                    # is race-immune to concurrent main advances during
+                    # is race-immune to concurrent base-ref advances during
                     # rev-parse / rebase.
                     _, mb_out, _ = await _run(
-                        ['git', 'merge-base', self.config.main_branch, 'HEAD'],
+                        ['git', 'merge-base', base_ref, 'HEAD'],
                         cwd=worktree_path,
                     )
                     actual_base = mb_out.strip() or base_sha.strip()
@@ -932,7 +956,7 @@ class GitOps:
                     # Rebase failed (conflict) — continue on old base.
                     # Compute the actual merge-base so WorktreeInfo is truthful.
                     _, mb_out, _ = await _run(
-                        ['git', 'merge-base', self.config.main_branch, 'HEAD'],
+                        ['git', 'merge-base', base_ref, 'HEAD'],
                         cwd=worktree_path,
                     )
                     actual_base = mb_out.strip() or base_sha.strip()
