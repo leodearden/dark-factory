@@ -6838,6 +6838,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             tip_task_id=tip_id,
             status_check=callbacks.status_check,
             mark_member_done=callbacks.mark_member_done,
+            redrive_member=callbacks.redrive_member,
         )
 
         # QUEUE SURGERY: rebuild _lane_buffers['normal'] preserving FIFO order for
@@ -7057,22 +7058,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 req.train_id, spec_base[:12],
                             )
                         outcome = await _do_train_merge(self, req)
-                        # δ/1720: if a coalesce-formed train derailed with a
-                        # risky terminal outcome, mark all its members one-strike
-                        # so they are excluded from the next coalescing pass and
-                        # left to merge solo.  We use _COALESCE_RISKY_TERMINAL_STATES
-                        # (frozenset{'blocked','error'}) to align the recording
-                        # trigger with the exclusion predicate — both 'blocked'
-                        # (verify failure) and 'error' (unexpected git/infra error)
-                        # are deterministic enough to warrant solo-merge.
-                        # 'conflict' and 'wip_halted' are intentionally excluded:
-                        # a conflict may resolve after the partner task lands, and
-                        # wip_halted is policy-driven rather than a task failure.
-                        if (
-                            outcome.status in _COALESCE_RISKY_TERMINAL_STATES
-                            and req.train_id.startswith(_COALESCE_TRAIN_ID_PREFIX)
-                        ):
-                            self._mark_coalesce_derailed(req.member_task_ids)
+                        # 1867: coalesce-train derail recovery.
+                        # Both hooks below are gated on the coalesce prefix so
+                        # declared trains (kept alive by the tip workflow's re-fire)
+                        # are never touched.
+                        if req.train_id.startswith(_COALESCE_TRAIN_ID_PREFIX):
+                            # δ/1720: one-strike exclusion on risky outcomes so
+                            # derailed members are not immediately re-coalesced.
+                            # Kept on the narrower _COALESCE_RISKY_TERMINAL_STATES
+                            # set ('blocked','error') — conflicts and wip_halted are
+                            # excluded intentionally (conflict may resolve, wip_halted
+                            # is policy-driven).
+                            if outcome.status in _COALESCE_RISKY_TERMINAL_STATES:
+                                self._mark_coalesce_derailed(req.member_task_ids)
+                            # 1867: durable re-drive — re-drive any absorbed members
+                            # that are still merge-deferred to solo merge.  Gated on
+                            # outcome != 'done' (success path owns all member flips).
+                            # Broader than _COALESCE_RISKY_TERMINAL_STATES: the
+                            # per-member is_ancestor guard makes all non-done outcomes
+                            # safe (already-landed members flip done, genuinely-
+                            # unlanded members flip pending for solo re-dispatch).
+                            if outcome.status != 'done':
+                                try:
+                                    await self._redrive_coalesce_members(req, actual_main)
+                                except Exception:
+                                    logger.exception(
+                                        'Coalesce train %s: _redrive_coalesce_members '
+                                        'raised unexpectedly — members may remain stranded',
+                                        req.train_id,
+                                    )
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=False,
