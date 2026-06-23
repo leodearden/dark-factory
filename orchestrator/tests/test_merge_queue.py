@@ -17514,6 +17514,100 @@ class TestLanePickOrderHelpers:
             loop.close()
 
 
+class TestAgingPickOrder:
+    """ζ/1891 aging comparator: clique-scoped age-of-first-submission ordering."""
+
+    def _setup(self, git_ops: GitOps, config: OrchestratorConfig):
+        """Return (worker, loop) with the loop set as current event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        return worker, loop
+
+    def test_aging_orders_conflict_clique_by_first_submission(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """Within a footprint clique, the request with the oldest first-submission wins.
+
+        A is enqueued first (FIFO head) but is YOUNGER (mfea=300.0).
+        B is enqueued second but is OLDER (mfea=100.0).
+        Both share a footprint edge → they are in the same clique.
+        Expected pick order: B first (older first-submission), then A, then None.
+
+        Fails against the pure popleft() comparator which returns A (FIFO head) first.
+        """
+        worker, loop = self._setup(git_ops, config)
+        try:
+            req_a = _make_request(
+                't-a', 't-a', git_repo, config,
+                merge_first_enqueued_at=300.0, request_id='mr-a',
+            )
+            req_b = _make_request(
+                't-b', 't-b', git_repo, config,
+                merge_first_enqueued_at=100.0, request_id='mr-b',
+            )
+            # A first in buffer (FIFO head), B second
+            worker._queue.put_nowait(req_a)
+            worker._queue.put_nowait(req_b)
+            worker._drain_queue_into_lanes()
+
+            # Place A and B in the same footprint clique
+            worker._suffix_conflict_graph = SuffixConflictGraph(
+                nodes=('mr-a', 'mr-b'),
+                textual_edges=frozenset(),
+                footprint_edges=frozenset({frozenset({'mr-a', 'mr-b'})}),
+                conflicts_with_main=frozenset(),
+            )
+
+            # Older first-submission (B, mfea=100) must win over FIFO head (A, mfea=300)
+            assert worker._pop_next_pickable() is req_b
+            assert worker._pop_next_pickable() is req_a
+            assert worker._pop_next_pickable() is None
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    def test_aging_clique_fallback_to_enqueued_at_when_mfea_none(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """Legacy fallback: mfea=None → use enqueued_at (FIFO creation order).
+
+        Both requests have merge_first_enqueued_at=None; the legacy enqueued_at
+        field (set at construction time, monotonically increasing) must serve as
+        the aging key, preserving FIFO order even for conflicting clique members.
+        """
+        worker, loop = self._setup(git_ops, config)
+        try:
+            req_x = _make_request(
+                't-x', 't-x', git_repo, config,
+                merge_first_enqueued_at=None, request_id='mr-x',
+            )
+            req_y = _make_request(
+                't-y', 't-y', git_repo, config,
+                merge_first_enqueued_at=None, request_id='mr-y',
+            )
+            # X created first → smaller enqueued_at → older via fallback
+            worker._queue.put_nowait(req_x)
+            worker._queue.put_nowait(req_y)
+            worker._drain_queue_into_lanes()
+
+            worker._suffix_conflict_graph = SuffixConflictGraph(
+                nodes=('mr-x', 'mr-y'),
+                textual_edges=frozenset(),
+                footprint_edges=frozenset({frozenset({'mr-x', 'mr-y'})}),
+                conflicts_with_main=frozenset(),
+            )
+
+            # FIFO (creation) order preserved via enqueued_at fallback
+            assert worker._pop_next_pickable() is req_x
+            assert worker._pop_next_pickable() is req_y
+            assert worker._pop_next_pickable() is None
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
 @pytest.mark.asyncio
 class TestLanePickIntegration:
     """Steps 7-8: full merger loop pick-order and per-lane halt integration."""
