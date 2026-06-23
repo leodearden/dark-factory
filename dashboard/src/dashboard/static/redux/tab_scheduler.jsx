@@ -209,16 +209,18 @@ function ParkStacksSection({ modules, rows, onEvict }) {
                     {isDead && (
                       <span className="badge bad" style={{ fontSize: 9, padding: '1px 5px' }}>dead</span>
                     )}
-                    {/* Evict button: present on every entry, disabled when owner is live.
-                        Per-entry entry.live is the correct signal (a live top can shadow
-                        a dead owner — the has_dead_park case).  Server-side task δ is the
-                        authoritative guard; this is defense-in-depth only. */}
+                    {/* Evict button: present on every entry, disabled when owner is live
+                        OR when ownerProjectRoot cannot be resolved (unresolvable owner
+                        would send project_root:'' → guaranteed 400 invalid_project_root).
+                        Per-entry entry.live is the correct liveness signal (a live top can
+                        shadow a dead owner — the has_dead_park case).  Server-side task δ
+                        is the authoritative guard; this is defense-in-depth only. */}
                     {onEvict && (
                       <button
-                        disabled={entry.live}
+                        disabled={entry.live || !ownerProjectRoot}
                         onClick={() => onEvict(entry.owner, ownerProjectRoot)}
-                        style={{ marginLeft: 'auto', fontSize: 9, padding: '1px 6px', cursor: entry.live ? 'default' : 'pointer' }}
-                        title={entry.live ? 'Owner is live — eviction blocked' : 'Evict this park owner'}
+                        style={{ marginLeft: 'auto', fontSize: 9, padding: '1px 6px', cursor: (entry.live || !ownerProjectRoot) ? 'default' : 'pointer' }}
+                        title={entry.live ? 'Owner is live — eviction blocked' : !ownerProjectRoot ? 'Project root unresolvable — cannot evict' : 'Evict this park owner'}
                       >evict</button>
                     )}
                   </div>

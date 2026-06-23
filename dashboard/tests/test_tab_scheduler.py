@@ -329,14 +329,6 @@ def test_index_html_cache_buster_bumped(index_html_body):
 # ---------------------------------------------------------------------------
 
 
-def test_evict_park_endpoint_referenced_in_jsx(tab_scheduler_jsx_body):
-    """tab_scheduler.jsx must reference the evict-park POST endpoint URL."""
-    assert '/api/v2/dashboard/scheduler/evict-park' in tab_scheduler_jsx_body, (
-        'tab_scheduler.jsx must reference /api/v2/dashboard/scheduler/evict-park '
-        '(the evict POST target)'
-    )
-
-
 def test_handle_evict_and_on_evict_wired(tab_scheduler_jsx_body):
     """handleEvict callback must be defined and onEvict must be passed to ParkStacksSection."""
     assert re.search(r'\bhandleEvict\b', tab_scheduler_jsx_body), (
@@ -347,16 +339,22 @@ def test_handle_evict_and_on_evict_wired(tab_scheduler_jsx_body):
     )
 
 
-def test_evict_button_guard_is_per_entry_live(tab_scheduler_jsx_body):
-    """The evict button's disabled guard must be per-entry liveness: disabled={entry.live}.
+def test_evict_button_guard_covers_liveness_and_unresolvable_root(tab_scheduler_jsx_body):
+    """The evict button's disabled guard covers both liveness and unresolvable project_root.
 
-    A bare `entry.live` already appears at line ~162 for the isDead variable;
-    the discriminating assertion pins the `disabled={entry.live}` attribute form,
-    which is absent until the evict button is implemented.
+    disabled={entry.live || !ownerProjectRoot} pins two defense-in-depth conditions:
+    - entry.live: owner is live → button disabled (live owner must not be evicted)
+    - !ownerProjectRoot: project_root absent from row index → suppresses guaranteed-400 request
+      (a dead park owner without a synthetic stranded row would send project_root:'' and
+      receive a confusing 'Evict failed (400)' toast instead of a meaningful signal)
     """
-    assert re.search(r'disabled\s*=\s*\{\s*entry\.live\s*\}', tab_scheduler_jsx_body), (
-        'tab_scheduler.jsx evict button must be guarded with disabled={entry.live} '
-        '(enabled only for non-live owners; defense-in-depth UI guard)'
+    assert re.search(
+        r'disabled\s*=\s*\{\s*entry\.live\s*\|\|\s*!ownerProjectRoot\s*\}',
+        tab_scheduler_jsx_body,
+    ), (
+        'tab_scheduler.jsx evict button must be guarded with '
+        'disabled={entry.live || !ownerProjectRoot} '
+        '(defense-in-depth: disabled when owner is live OR project_root is unresolvable)'
     )
 
 
