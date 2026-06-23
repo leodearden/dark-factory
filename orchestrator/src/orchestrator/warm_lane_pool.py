@@ -159,6 +159,22 @@ class WarmLanePool:
         """Return the lane path currently assigned to *branch_name*, or None."""
         return self._assignments.get(branch_name)
 
+    def assignments_snapshot(self) -> dict[str, Path]:
+        """Return a shallow copy of the current assignment map.
+
+        Safety is guaranteed by the single-threaded asyncio event loop: the
+        ``dict()`` constructor contains no ``await`` point, so no concurrent
+        ``acquire_for``/``release`` mutation (which run as coroutines) can
+        interleave during the copy.  No explicit lock is needed.
+
+        The result is intentionally decoupled from the live ``_assignments``
+        dict so the caller can iterate it safely without holding any lock.
+        Momentary staleness is safe: the reconciler that consumes the snapshot
+        re-resolves each lane via the primitive (which is idempotent), so stale
+        entries are harmless.
+        """
+        return dict(self._assignments)
+
     def note_assignment(self, branch_name: str, lane: Path) -> None:
         """Record *branch_name* → *lane* in the assignment map.
 

@@ -760,3 +760,70 @@ class TestG5Gate:
             f'Phase D: expected call-log delta check→reclaim→check; '
             f'got {new_subcmds} (full new entries: {new_entries})'
         )
+
+
+# ===========================================================================
+# Step-3: RED — release_lane_for_terminal_task end-to-end seam (tests 8 & 9)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestTerminalLaneRelease:
+    """End-to-end seam: release_lane_for_terminal_task frees the lane for reuse.
+
+    Tests 8 and 9 pin the shared primitive from the integration-gate perspective.
+    All fail until release_lane_for_terminal_task is added to GitOps (step-4).
+    """
+
+    async def test_terminal_release_frees_lane_end_to_end(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """create_worktree('A')→ASSIGNED, release via primitive, re-acquire gets same _lane-0."""
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_config()
+        git_ops = GitOps(config, ig_git_repo, warm_lane_pool_size=1)
+
+        # First acquire
+        info_a = await git_ops.create_worktree('A')
+        assert isinstance(info_a, WorktreeInfo)
+        lane_path = info_a.path
+
+        # Write plan.json (mirrors what the workflow does)
+        task_dir = lane_path / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "A"}')
+
+        # Release via the shared primitive
+        assert git_ops.warm_lane_pool is not None
+        freed = await git_ops.release_lane_for_terminal_task('A')
+        assert freed is True
+        assert git_ops.warm_lane_pool.state(lane_path) == LaneState.FREE
+
+        # Fresh create_worktree must reuse the SAME _lane-0
+        info_b = await git_ops.create_worktree('B')
+        assert isinstance(info_b, WorktreeInfo)
+        assert info_b.path == lane_path, (
+            f'Fresh acquire after terminal release must reuse {lane_path}, got {info_b.path}'
+        )
+
+    async def test_cancelled_then_release_then_reacquire(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """Release (simulating cancelled task) → next create_worktree('B') succeeds."""
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_config()
+        git_ops = GitOps(config, ig_git_repo, warm_lane_pool_size=1)
+
+        # Exhaust the pool
+        info_a = await git_ops.create_worktree('A')
+        assert isinstance(info_a, WorktreeInfo)
+
+        # Release via primitive (simulating CANCELLED terminal exit)
+        freed = await git_ops.release_lane_for_terminal_task('A')
+        assert freed is True
+
+        # Now create_worktree('B') must succeed rather than raising WarmLanePoolExhausted
+        info_b = await git_ops.create_worktree('B')
+        assert isinstance(info_b, WorktreeInfo), (
+            f'After terminal release, create_worktree must succeed, got {info_b!r}'
+        )

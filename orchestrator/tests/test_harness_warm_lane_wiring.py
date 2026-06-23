@@ -6,12 +6,17 @@ max_concurrent_tasks when git.warm_lane_pool=True, and with size=0
 
 Step-17: RED — Harness constructs GitOps without warm_lane_pool_size.
 Step-18: GREEN — Harness passes warm_lane_pool_size from max_concurrent_tasks.
+Step-5 (1881): RED — B1 cancelled workflow must free lane via run() finally.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
@@ -239,3 +244,810 @@ class TestHarnessSpecPoolWiring:
         assert harness.git_ops.spec_warm_lane_pool is None, (
             'spec_warm_lane_pool must be None when knob off'
         )
+
+
+# ===========================================================================
+# Step-5 (1881): RED — B1: workflow.run() finally releases lane on CANCELLED exit
+# ===========================================================================
+
+
+async def _init_git_repo(repo: Path) -> None:
+    from orchestrator.git_ops import _run
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'init'], cwd=repo)
+
+
+@pytest.mark.asyncio
+class TestCancelledWorkflowLaneRelease:
+    """B1 (T4): workflow.run() finally must release the warm lane on CANCELLED exit.
+
+    Diff 3, sub-parts (i) and (ii):
+    (i) _handle_cancelled_terminal_exit must call self._enter_phase(CANCELLED)
+        so that workflow.state == WorkflowState.CANCELLED after the run.
+    (ii) run() finally must call git_ops.release_lane_for_terminal_task(self.task_id)
+         when self.state in (DONE, CANCELLED) and not _worktree_external.
+
+    RED: neither behaviour is present; state stays PLAN and lane stays ASSIGNED.
+    """
+
+    async def test_cancelled_workflow_frees_lane(self, tmp_path: Path):
+        """Cancelled terminal exit: (a) state==CANCELLED, (b) lane freed via primitive."""
+        from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.git_ops import GitOps
+        from orchestrator.scheduler import TaskAssignment
+        from orchestrator.warm_lane_pool import LaneState
+        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+
+        # ── Setup: minimal git repo ─────────────────────────────────────────
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        # ── GitOps with warm lane pool ──────────────────────────────────────
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Pre-assign a lane for task '42' (simulates harness having acquired it
+        # before dispatching the workflow; T4 scenario)
+        result = await pool.acquire_for('42')
+        assert result is not None
+        lane = pool.assignment_for('42')
+        assert lane is not None, 'setup: lane must be ASSIGNED for task 42'
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        # ── FakeScheduler returning 'cancelled' ─────────────────────────────
+        scheduler = FakeScheduler()
+        scheduler.statuses['42'] = ['cancelled']  # triggers TerminalExitRejection
+
+        # ── Build workflow ──────────────────────────────────────────────────
+        assignment = TaskAssignment(
+            task_id='42',
+            task={
+                'id': '42', 'title': 'Test task', 'status': 'pending',
+                'metadata': {}, 'dependencies': [],
+            },
+            modules=[],
+        )
+        workflow = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=scheduler,
+            briefing=FakeBriefing(),
+            mcp=FakeMcp(),
+            escalation_queue=EscalationQueue(tmp_path / 'esc'),
+            merge_queue=asyncio.Queue(),
+            merge_worker=None,
+        )
+
+        # ── Run ─────────────────────────────────────────────────────────────
+        outcome = await workflow.run()
+
+        # (a) state must be CANCELLED (RED: _handle_cancelled_terminal_exit
+        #     doesn't call _enter_phase(CANCELLED))
+        assert workflow.state == WorkflowState.CANCELLED, (
+            f'Expected WorkflowState.CANCELLED after cancelled run, got {workflow.state!r}'
+        )
+        # (b) lane must be freed (RED: run() finally doesn't call
+        #     release_lane_for_terminal_task)
+        assert pool.assignment_for('42') is None, (
+            'run() finally must release the lane for a CANCELLED workflow exit'
+        )
+        assert pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after CANCELLED exit, got {pool.state(lane)!r}'
+        )
+        # Sanity: correct outcome returned
+        assert outcome == WorkflowOutcome.CANCELLED
+
+
+# ===========================================================================
+# Step-7 (1881): RED — B2: _run_slot finally releases lane on hard-cancel
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestHardCancelLaneRelease:
+    """B2 (T5): harness._run_slot finally must release the warm lane on hard-cancel.
+
+    Hard-cancel = asyncio.CancelledError raised inside the try block of _run_slot
+    (harness.py:3402) when hard_cancel_workflow() calls task.cancel(). The slot
+    returns a synthetic TaskReport(outcome=CANCELLED) from the except clause and
+    the run() finally of the WORKFLOW never executes (B1 cannot cover this path).
+
+    Diff 4: in _run_slot finally, after the events pops, add:
+        if report is not None and report.outcome in (DONE, CANCELLED):
+            with contextlib.suppress(Exception):
+                await self.git_ops.release_lane_for_terminal_task(assignment.task_id)
+
+    RED: finally has no release; lane stays ASSIGNED after _run_slot returns.
+    """
+
+    async def test_hard_cancel_frees_lane(self, tmp_path: Path):
+        """Hard-cancelled slot (asyncio.CancelledError path) → lane freed in slot finally."""
+        from orchestrator.git_ops import GitOps  # noqa: F401
+        from orchestrator.scheduler import TaskAssignment
+        from orchestrator.warm_lane_pool import LaneState
+        from orchestrator.workflow import WorkflowOutcome
+
+        # ── Setup: minimal git repo ─────────────────────────────────────────
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+
+        # ── Harness with real git_ops (warm lane pool) + mocked scheduler ──
+        harness = _build_harness(config)
+        pool = harness.git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Pre-assign lane for task '99' (simulates harness having acquired it
+        # before dispatching the slot; T5 hard-cancel scenario)
+        await pool.acquire_for('99')
+        lane = pool.assignment_for('99')
+        assert lane is not None, 'setup: lane must be ASSIGNED for task 99'
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        # ── Configure mocked scheduler ──────────────────────────────────────
+        # carries_substrate_probe → False so the substrate gate is skipped
+        harness.scheduler.carries_substrate_probe.return_value = False
+
+        # ── Patch TaskWorkflow to simulate a hard-cancel ────────────────────
+        # workflow.run() raises CancelledError, exactly as if the slot's
+        # asyncio.Task was cancelled by hard_cancel_workflow().
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            mock_wf = MagicMock()
+            mock_wf.run = AsyncMock(side_effect=asyncio.CancelledError())
+            MockWorkflow.return_value = mock_wf
+
+            assignment = TaskAssignment(
+                task_id='99',
+                task={
+                    'id': '99', 'title': 'Hard-cancel test', 'status': 'pending',
+                    'metadata': {}, 'dependencies': [],
+                },
+                modules=[],
+            )
+            sem = asyncio.Semaphore(1)
+            report = await harness._run_slot(assignment, sem)
+
+        # Must have returned the synthetic CANCELLED report from the except clause
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.CANCELLED
+
+        # (B2 RED) Lane must be freed by the slot finally.
+        # Fails: _run_slot finally currently has no release_lane_for_terminal_task call.
+        assert pool.assignment_for('99') is None, (
+            '_run_slot finally must release the lane for a hard-cancelled slot'
+        )
+        assert pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after hard-cancel, got {pool.state(lane)!r}'
+        )
+
+
+# ===========================================================================
+# Step-9 (1881): RED — B3: train callbacks + redrive release lane on done-flip
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestTrainCallbackLaneRelease:
+    """B3 (T6/T7/T8): build_train_callback_factory must accept git_ops and
+    release the warm lane when mark_member_done or redrive_member flips the task done.
+
+    Diff 5a: widen build_train_callback_factory(scheduler) → (scheduler, git_ops)
+    Diff 5b: after mark_done inside mark_member_done and redrive_member, call
+             await git_ops.release_lane_for_terminal_task(mid)
+
+    RED: factory takes only `scheduler`; closures never release the lane.
+    """
+
+    async def test_merge_train_member_done_frees_lane(self, tmp_path: Path):
+        """(12) mark_member_done fires mark_done AND releases the lane."""
+        from _workflow_helpers import FakeScheduler
+
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.warm_lane_pool import LaneState
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        mid = '3459'
+        # Pre-assign lane for the member task
+        await pool.acquire_for(mid)
+        lane = pool.assignment_for(mid)
+        assert lane is not None
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        scheduler = FakeScheduler()
+        scheduler.statuses[mid] = ['merge-deferred']  # task exists in scheduler
+
+        # RED: build_train_callback_factory takes only scheduler → TypeError
+        factory = build_train_callback_factory(scheduler, git_ops)
+        callbacks = factory('train-1')
+
+        await callbacks.mark_member_done(mid, 'abc123')
+
+        # scheduler.mark_done must have been called
+        assert scheduler.statuses.get(mid, [])[-1] == 'done', (
+            'mark_member_done must flip the task to done'
+        )
+        # Lane must be freed (RED: closures don't call release_lane_for_terminal_task)
+        assert pool.assignment_for(mid) is None, (
+            'mark_member_done must release the warm lane after mark_done'
+        )
+        assert pool.state(lane) == LaneState.FREE
+
+    async def test_merge_deferred_to_done_lane_freed_at_flip(self, tmp_path: Path):
+        """(13) Lane stays ASSIGNED while MERGE_DEFERRED, freed only at the done-flip."""
+        from _workflow_helpers import FakeScheduler
+
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.warm_lane_pool import LaneState
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        mid = '7777'
+        await pool.acquire_for(mid)
+        lane = pool.assignment_for(mid)
+        assert lane is not None
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        scheduler = FakeScheduler()
+        scheduler.statuses[mid] = ['merge-deferred']
+
+        factory = build_train_callback_factory(scheduler, git_ops)
+        callbacks = factory('train-2')
+
+        # Lane is still ASSIGNED before the done-flip
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'lane must stay ASSIGNED while task is MERGE_DEFERRED (not yet done)'
+        )
+
+        # Trigger the done-flip
+        await callbacks.mark_member_done(mid, 'def456')
+
+        # Lane must be freed exactly at the done-flip (RED: not freed)
+        assert pool.assignment_for(mid) is None, (
+            'lane must be freed when mark_member_done flips to done'
+        )
+        assert pool.state(lane) == LaneState.FREE
+
+    async def test_async_merge_queue_done_frees_lane(self, tmp_path: Path):
+        """(14) redrive_member(found_on_main=True) fires mark_done AND releases the lane.
+
+        This covers T6: merge_queue has no task-pool release, so B3 (redrive_member
+        inside the factory) is the primary release path for async-merge-queue done events.
+        """
+        from _workflow_helpers import FakeScheduler
+
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.warm_lane_pool import LaneState
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        mid = '3459'
+        await pool.acquire_for(mid)
+        lane = pool.assignment_for(mid)
+        assert lane is not None
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        scheduler = FakeScheduler()
+        scheduler.statuses[mid] = ['merge-deferred']  # member exists
+
+        factory = build_train_callback_factory(scheduler, git_ops)
+        callbacks = factory('train-3')
+
+        # found_on_main=True triggers the mark_done path (T6 canonical scenario)
+        assert callbacks.redrive_member is not None
+        await callbacks.redrive_member(mid, True, 'ghi789')
+
+        # scheduler.mark_done must have been called
+        assert scheduler.statuses.get(mid, [])[-1] == 'done', (
+            'redrive_member(found_on_main=True) must flip to done'
+        )
+        # Lane must be freed (RED: redrive_member closure never releases)
+        assert pool.assignment_for(mid) is None, (
+            'redrive_member must release the warm lane after mark_done(found_on_main)'
+        )
+        assert pool.state(lane) == LaneState.FREE
+
+
+# ===========================================================================
+# Step-11 (1881): RED — B3/T9: _mark_in_progress_done releases lane via primitive
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestMarkInProgressDoneLaneRelease:
+    """B3 (T9): _mark_in_progress_done must call release_lane_for_terminal_task(tid)
+    after mark_done so that warm lanes whose in-memory assignment map was lost
+    (post-restart) are freed via the on-disk plan.json backstop.
+
+    Diff 5c: after mark_done(kind='found_on_main') inside _mark_in_progress_done,
+             add await self.git_ops.release_lane_for_terminal_task(tid).
+
+    RED: _mark_in_progress_done only calls the existing cleanup_worktree (which
+    resolves via in-memory map — lost post-restart) and never the primitive, so
+    the lane stays ASSIGNED forever.
+    """
+
+    async def test_reconciler_found_on_main_frees_lane(self, tmp_path: Path):
+        """_mark_in_progress_done frees a lane whose in-memory assignment was lost."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.git_ops import GitOps
+        from orchestrator.warm_lane_pool import LaneState
+
+        # ── Setup: minimal git repo ─────────────────────────────────────────
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        tid = '3459'
+
+        # Acquire a lane for the task (simulates pre-restart dispatch)
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        # Simulate post-restart: in-memory assignment map is cleared
+        pool._assignments.clear()
+        assert pool.assignment_for(tid) is None, 'setup: assignment map must be empty'
+
+        # Write on-disk plan.json backstop so the primitive can still find the lane
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+
+        # ── Build Harness with real git_ops ─────────────────────────────────
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        # Scheduler.mark_done must be awaitable
+        harness.scheduler.mark_done = AsyncMock()
+
+        # ── Call _mark_in_progress_done ──────────────────────────────────────
+        await harness._mark_in_progress_done(
+            tid, sha='abc123', note='test-found-on-main', reason='found-on-main',
+        )
+
+        # scheduler.mark_done must have been called
+        harness.scheduler.mark_done.assert_called_once()
+        call_kwargs = harness.scheduler.mark_done.call_args
+        assert call_kwargs.kwargs.get('kind') == 'found_on_main' or (
+            len(call_kwargs.args) >= 2 and call_kwargs.args[1] == 'found_on_main'
+        ), 'mark_done must be called with kind=found_on_main'
+
+        # (RED) Lane must be freed via the on-disk backstop.
+        # Fails: _mark_in_progress_done never calls release_lane_for_terminal_task.
+        assert pool.assignment_for(tid) is None, (
+            '_mark_in_progress_done must release the lane after mark_done '
+            '(the in-memory map was lost post-restart; the primitive uses the '
+            'on-disk plan.json backstop to locate and free the lane)'
+        )
+        assert pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after found-on-main mark_done, got {pool.state(lane)!r}'
+        )
+
+
+# ===========================================================================
+# Step-13 (1881): RED — A: status-keyed reconciler _reconcile_terminal_lanes
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestTerminalLaneReconciler:
+    """Layer A (invariant backstop): _reconcile_terminal_lanes releases any lane
+    whose assigned task is terminal and NOT in scheduler._dispatched.
+
+    Diff 7: add _reconcile_terminal_lanes near _reconcile_stranded_in_progress;
+    wire into _stranded_reconcile_loop (after _reconcile_stranded_in_progress)
+    and once at startup after _reap_orphan_worktrees.
+
+    RED: _reconcile_terminal_lanes does not exist yet; calls raise AttributeError.
+    """
+
+    async def _make_harness_with_pool(
+        self, tmp_path: Path, pool_size: int = 1
+    ):
+        """Build a harness backed by a real GitOps warm lane pool."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=pool_size,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=pool_size)
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        return harness, git_ops, git_ops.warm_lane_pool
+
+    async def test_terminal_lane_reconciler_frees_done_task_lane(self, tmp_path: Path):
+        """(16) Lane ASSIGNED to a 'done' task (not dispatched) is freed + event emitted."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.event_store import EventType
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
+
+        tid = '3459'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        # Scheduler returns 'done'; _dispatched is empty (not a live workflow)
+        harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'done'}, None))
+        harness.scheduler._dispatched = set()
+
+        # Wire a mock event_store to capture emissions
+        harness.event_store = MagicMock()
+
+        # RED: _reconcile_terminal_lanes does not exist yet → AttributeError
+        await harness._reconcile_terminal_lanes()
+
+        # Lane must be freed
+        assert pool.state(lane) == LaneState.FREE, (
+            f'done-task lane must be FREE after reconciler, got {pool.state(lane)!r}'
+        )
+        # Event must be emitted with reason='terminal-lane-reconciler'
+        harness.event_store.emit.assert_called_once()
+        call_args = harness.event_store.emit.call_args
+        assert call_args.args[0] == EventType.worktree_reaped, (
+            'reconciler must emit EventType.worktree_reaped'
+        )
+        data = call_args.kwargs.get('data', {})
+        assert data.get('reason') == 'terminal-lane-reconciler', (
+            f"data.reason must be 'terminal-lane-reconciler', got {data!r}"
+        )
+
+    async def test_terminal_lane_reconciler_skips_in_progress(self, tmp_path: Path):
+        """(17) Lane ASSIGNED to an 'in-progress' task stays ASSIGNED (not terminal)."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
+
+        tid = '7777'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+
+        harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'in-progress'}, None))
+        harness.scheduler._dispatched = set()
+
+        await harness._reconcile_terminal_lanes()
+
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'in-progress task lane must stay ASSIGNED — not a terminal status'
+        )
+
+    async def test_terminal_lane_reconciler_skips_dispatched(self, tmp_path: Path):
+        """(18) 'done' task in _dispatched is NOT freed (live-acquire guard)."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
+
+        tid = '8888'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+
+        harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'done'}, None))
+        # Branch IS in _dispatched → guard must prevent release
+        harness.scheduler._dispatched = {tid}
+
+        await harness._reconcile_terminal_lanes()
+
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'done task in _dispatched must not be freed (live-acquire guard)'
+        )
+
+    async def test_terminal_lane_reconciler_aborts_on_empty_statuses(self, tmp_path: Path):
+        """(19) Empty get_statuses (with or without error) aborts the sweep — never mass-free."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
+
+        tid = '9999'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+
+        harness.scheduler._dispatched = set()
+
+        # Case A: empty with no error
+        harness.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+        await harness._reconcile_terminal_lanes()
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'empty get_statuses must abort sweep — lane must stay ASSIGNED (never mass-free)'
+        )
+
+        # Case B: empty with an error
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({}, Exception('transient DB error'))
+        )
+        await harness._reconcile_terminal_lanes()
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'errored get_statuses must abort sweep — lane must stay ASSIGNED'
+        )
+
+    async def test_terminal_lane_reconciler_cancelled_status_frees(self, tmp_path: Path):
+        """(20) Lane ASSIGNED to a 'cancelled' task is freed."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
+
+        tid = '1111'
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+
+        harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'cancelled'}, None))
+        harness.scheduler._dispatched = set()
+
+        await harness._reconcile_terminal_lanes()
+
+        assert pool.state(lane) == LaneState.FREE, (
+            f'cancelled task lane must be FREE after reconciler, got {pool.state(lane)!r}'
+        )
+
+
+# ===========================================================================
+# Step-15 (1881): RED — T10: recovery-sweep must release terminal task lanes
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRecoveryTerminalTaskLaneRelease:
+    """T10 (Recovery fix): _recover_crashed_tasks must release lanes whose task
+    is already terminal (done/cancelled) instead of restoring the assignment.
+
+    Diff 6: inside the 'if pool is not None and is_lane and recovery_id:' block,
+    BEFORE pool.restore_assignment(...), add:
+        term_status = await self.scheduler.get_status(recovery_id)
+        if term_status in ('done', 'cancelled'):
+            await self.git_ops.cleanup_worktree(entry, recovery_id)
+            cleaned += 1; continue
+
+    RED: recovery currently restores unconditionally (pool.restore_assignment
+    is called regardless of task status).
+    """
+
+    async def _make_recovery_setup(
+        self, tmp_path: Path, *, task_id: str = '3459'
+    ):
+        """Build harness with real git repo, GitOps pool, and a lane dir with
+        plan.json carrying a completed step — the minimum _recover_crashed_tasks
+        needs to reach the restore_assignment branch.
+
+        Returns: (harness, git_ops, pool, lane_entry)
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+            worktree_identity_guard_enabled=False,  # skip identity guard for simplicity
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+
+        # Create the lane dir and plan.json so _recover_crashed_tasks finds it
+        lane_entry = git_ops.worktree_base / '_lane-0'
+        lane_entry.mkdir(parents=True, exist_ok=True)
+        task_dir = lane_entry / '.task'
+        task_dir.mkdir(exist_ok=True)
+        plan = {
+            'task_id': task_id,
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'type': 'test',
+                    'description': 'already done step',
+                    'status': 'done',
+                },
+            ],
+        }
+        (task_dir / 'plan.json').write_text(json.dumps(plan))
+
+        return harness, git_ops, pool, lane_entry
+
+    async def test_recovery_releases_terminal_task_lane(self, tmp_path: Path):
+        """(21) Done task: cleanup_worktree called, restore_assignment NOT called,
+        task NOT stored in _recovered_plans."""
+        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+
+        harness.scheduler.get_status = AsyncMock(return_value='done')
+
+        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
+             patch.object(pool, 'restore_assignment') as mock_restore:
+            await harness._recover_crashed_tasks()
+
+        # Terminal task: cleanup must have been called (closes the T10 amplifier)
+        mock_cleanup.assert_called_once()
+        # restore_assignment must NOT have been called
+        mock_restore.assert_not_called()
+        # Task must NOT be stored for resumption
+        assert '3459' not in harness._recovered_plans, (
+            'terminal task lane must not be stored in _recovered_plans'
+        )
+
+    async def test_recovery_restores_non_terminal_task_lane(self, tmp_path: Path):
+        """(22) Non-terminal task (in-progress): restore_assignment IS called;
+        plan IS stored for resumption (regression guard — existing behavior preserved)."""
+        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+
+        harness.scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock), \
+             patch.object(pool, 'restore_assignment') as mock_restore:
+            await harness._recover_crashed_tasks()
+
+        # Non-terminal: restore_assignment must be called (existing behaviour)
+        mock_restore.assert_called_once()
+        # Plan must be stored for resumption
+        assert '3459' in harness._recovered_plans, (
+            'in-progress task plan must be stored in _recovered_plans'
+        )
+
+    async def test_recovery_restores_on_status_read_failure(self, tmp_path: Path):
+        """(23) Transient get_status=None: falls through to restore_assignment.
+
+        Safe default: layer A (_reconcile_terminal_lanes) self-heals any
+        genuinely-terminal lane on the next reconcile interval.
+        """
+        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+
+        # Transient failure: get_status returns None (not in ('done','cancelled'))
+        harness.scheduler.get_status = AsyncMock(return_value=None)
+
+        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock), \
+             patch.object(pool, 'restore_assignment') as mock_restore:
+            await harness._recover_crashed_tasks()
+
+        # Fail-safe: restore_assignment must be called (layer A self-heals later)
+        mock_restore.assert_called_once()
+        assert '3459' in harness._recovered_plans, (
+            'task with None status must fall through to restore (safe default; A self-heals)'
+        )
+
+
+# ===========================================================================
+# Step-17 (1881): RED — disk-backstop opt-in wiring in _mark_in_progress_done
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestMarkInProgressDoneDiskBackstopWiring:
+    """_mark_in_progress_done must call release_lane_for_terminal_task with
+    allow_disk_backstop=True — it is the ONE legitimate disk-backstop caller
+    (the lost-map / post-restart T9 path) after the default flips to in-memory-only.
+
+    Diff 18(ii): harness._mark_in_progress_done calls
+        await self.git_ops.release_lane_for_terminal_task(tid, allow_disk_backstop=True)
+
+    RED: current _mark_in_progress_done calls without allow_disk_backstop kwarg;
+    spy sees a call without the kwarg → assert_called_once_with fails.
+    """
+
+    async def test_mark_in_progress_done_opts_into_disk_backstop(
+        self, tmp_path: Path,
+    ):
+        """_mark_in_progress_done must pass allow_disk_backstop=True to the primitive."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.git_ops import GitOps
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        harness.scheduler.mark_done = AsyncMock()
+
+        # Replace the primitive with a spy so we can inspect the kwargs
+        release_spy: AsyncMock = AsyncMock(return_value=True)
+        git_ops.release_lane_for_terminal_task = release_spy  # type: ignore[method-assign]
+
+        # Also stub cleanup_worktree to avoid real git subprocess calls
+        git_ops.cleanup_worktree = AsyncMock()  # type: ignore[method-assign]
+
+        await harness._mark_in_progress_done(
+            '3459', sha='abc123', note='found-on-main', reason='found-on-main',
+        )
+
+        # Must have been called EXACTLY once with allow_disk_backstop=True
+        release_spy.assert_called_once_with('3459', allow_disk_backstop=True)

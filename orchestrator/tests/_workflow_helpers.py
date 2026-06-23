@@ -165,6 +165,29 @@ class FakeBriefing:
     ) -> str:
         return f'Resume: {resolution[:100]}'
 
+    async def build_amender_prompt(
+        self, plan: dict, iteration_log: list, suggestions: list, locked_modules: list,
+        context: str | None = None, task_id: str | None = None,
+    ) -> str:
+        return 'Amend the plan'
+
+    async def build_revalidation_prompt(
+        self, task: dict, existing_plan: dict, changed_files: list,
+        worktree=None, context: str | None = None,
+    ) -> str:
+        return f'Revalidate: {task.get("title", "")}'
+
+    async def build_plan_tightening_prompt(
+        self, task: dict, plan: dict, not_touched: list,
+        worktree=None, context: str | None = None,
+    ) -> str:
+        return f'Tighten plan for: {task.get("title", "")}'
+
+    async def build_simple_task_prompt(
+        self, task: dict, worktree=None, context: str | None = None,
+    ) -> str:
+        return f'Simple task: {task.get("title", "")}'
+
 
 def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
     """Return a steward class that resolves all pending L0 escalations in start().
