@@ -55,6 +55,12 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      ``done_provenance.kind='deterministic-deploy-scheduled'`` carrying the
      transient unit name and fire delay; return DONE (done = *scheduled*, not
      *verified*).
+   - If scheduling succeeds (``rc == 0``) and ``always_escalates=True``
+     (act-then-ask): fall through directly to section 3 (the gate) WITHOUT
+     running the blocking cross-unit deploy.  The detached restart is already
+     scheduled; the gate is filed as a ``milestone_gate`` escalation; the task
+     is set to ``blocked``.  Neither ``unit_inspector`` nor ``script_runner``
+     are invoked on this path (self-kill and double-deploy prevention).
    - If scheduling fails (``rc != 0``): file born-at-L2 infra_issue, block
      (parallel to γ's rc≠0/verify-fail handling); ``before_done_ran_at``
      already stamped (not re-run, I1).
@@ -603,105 +609,115 @@ class DeterministicRunner:
                     )
                     return WorkflowOutcome.DONE
                 # always_escalates=True (act-then-ask, non-exemplar): fall through
-                # to the gate below (mirrors γ line 495 behaviour).
+                # to the gate (section 3) WITHOUT running the blocking cross-unit
+                # deploy.  The `if not self_target:` guard below ensures the
+                # cross-unit baseline→run→verify block is SKIPPED entirely so the
+                # orchestrator is not self-killed and the restart is not double-deployed.
                 logger.info(
                     'DeterministicRunner: task %s self-restart scheduled with '
-                    'always_escalates=True — falling through to gate',
+                    'always_escalates=True — falling through to gate (no cross-unit deploy)',
                     task_id,
                 )
 
             # ── end ε self-target branch ─────────────────────────────────────
-            # Capture baseline unit state before the deploy fires
-            inspect_fn = self._unit_inspector or self._default_inspect_unit
-            baseline = await inspect_fn(target_unit)
+            # Cross-unit blocking deploy: guarded by `if not self_target:` so a
+            # self-target task NEVER runs the blocking deploy against its own unit.
+            # Self-target always_escalates=False already returned DONE above.
+            # Self-target always_escalates=True falls through directly to the gate
+            # (section 3) WITHOUT running the blocking deploy — this prevents:
+            #   (a) self-kill: the blocking deploy would kill this runner mid-run;
+            #   (b) double-deploy: the detached transient restart was already scheduled.
+            if not self_target:
+                # Capture baseline unit state before the deploy fires
+                inspect_fn = self._unit_inspector or self._default_inspect_unit
+                baseline = await inspect_fn(target_unit)
 
-            # Run the deploy script to completion (blocking, cross-unit)
-            run_fn = self._script_runner or self._default_run_script
-            rc, out = await run_fn(before_done)
+                # Run the deploy script to completion (blocking, cross-unit)
+                run_fn = self._script_runner or self._default_run_script
+                rc, out = await run_fn(before_done)
 
-            if rc != 0:
-                # B7a: script failed — file infra_issue escalation, set blocked (B7a)
-                deploy_detail = '\n'.join([
-                    description,
-                    f'Target unit: {target_unit}',
-                    f'Script exit code: rc={rc}',
-                    f'Output:\n{out}',
-                ])
-                return await self._file_infra_issue_and_block(
-                    task_id,
-                    summary=f'Deploy failed: {target_unit}',
-                    detail=deploy_detail,
+                if rc != 0:
+                    # B7a: script failed — file infra_issue escalation, set blocked (B7a)
+                    deploy_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Script exit code: rc={rc}',
+                        f'Output:\n{out}',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy failed: {target_unit}',
+                        detail=deploy_detail,
+                    )
+
+                # Re-inspect to verify a fresh MainPID + strictly-later monotonic timestamp
+                new_state = await inspect_fn(target_unit)
+                pid: int = new_state.get('MainPID', 0)
+                new_monotonic: int = new_state.get('ActiveEnterTimestampMonotonic', 0)
+                baseline_monotonic: int = baseline.get('ActiveEnterTimestampMonotonic', 0)
+                fresh: bool = (
+                    isinstance(pid, int)
+                    and pid > 0
+                    and new_monotonic > baseline_monotonic
                 )
 
-            # Re-inspect to verify a fresh MainPID + strictly-later monotonic timestamp
-            new_state = await inspect_fn(target_unit)
-            pid: int = new_state.get('MainPID', 0)
-            new_monotonic: int = new_state.get('ActiveEnterTimestampMonotonic', 0)
-            baseline_monotonic: int = baseline.get('ActiveEnterTimestampMonotonic', 0)
-            fresh: bool = (
-                isinstance(pid, int)
-                and pid > 0
-                and new_monotonic > baseline_monotonic
-            )
+                if not fresh:
+                    # B7b: verify failed — file infra_issue escalation, set blocked
+                    verify_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        (
+                            f'Verify failed: new MainPID={pid!r} '
+                            f'new_monotonic={new_monotonic} '
+                            f'baseline_monotonic={baseline_monotonic}'
+                        ),
+                        'Expected a fresh non-sentinel MainPID (>0) and a strictly-later '
+                        'ActiveEnterTimestampMonotonic after the deploy.',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy verify failed: {target_unit}',
+                        detail=verify_detail,
+                    )
 
-            if not fresh:
-                # B7b: verify failed — file infra_issue escalation, set blocked
-                verify_detail = '\n'.join([
-                    description,
-                    f'Target unit: {target_unit}',
-                    (
-                        f'Verify failed: new MainPID={pid!r} '
-                        f'new_monotonic={new_monotonic} '
-                        f'baseline_monotonic={baseline_monotonic}'
-                    ),
-                    'Expected a fresh non-sentinel MainPID (>0) and a strictly-later '
-                    'ActiveEnterTimestampMonotonic after the deploy.',
-                ])
-                return await self._file_infra_issue_and_block(
-                    task_id,
-                    summary=f'Deploy verify failed: {target_unit}',
-                    detail=verify_detail,
-                )
+                if not always_escalates:
+                    # Pure cross-unit deploy (B6): verified → set done with provenance.
+                    # Stamp before_done_verified_at FIRST: it is the positive proof a
+                    # later resume (after a crash in the window before the done write)
+                    # requires to drive to done rather than re-escalate as a crash-window.
+                    verified_iso = datetime.now(UTC).isoformat()
+                    await self.scheduler.update_task(
+                        task_id,
+                        {
+                            'before_done_verified_at': verified_iso,
+                            'before_done_verified_pid': pid,
+                        },
+                        metadata_mode='merge',
+                    )
+                    logger.info(
+                        'DeterministicRunner: task %s before_done deploy verified — '
+                        'pid=%d unit=%s — setting done',
+                        task_id, pid, target_unit,
+                    )
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance={
+                            'kind': 'deterministic-deploy',
+                            'pid': pid,
+                            'active_enter_timestamp': new_state.get('ActiveEnterTimestamp', ''),
+                            'unit': target_unit,
+                        },
+                    )
+                    return WorkflowOutcome.DONE
 
-            if not always_escalates:
-                # Pure cross-unit deploy (B6): verified → set done with provenance.
-                # Stamp before_done_verified_at FIRST: it is the positive proof a
-                # later resume (after a crash in the window before the done write)
-                # requires to drive to done rather than re-escalate as a crash-window.
-                verified_iso = datetime.now(UTC).isoformat()
-                await self.scheduler.update_task(
-                    task_id,
-                    {
-                        'before_done_verified_at': verified_iso,
-                        'before_done_verified_pid': pid,
-                    },
-                    metadata_mode='merge',
-                )
+                # always_escalates=True with before_done (cross-unit act-then-ask):
+                # action already ran — fall through to the gate below.
                 logger.info(
-                    'DeterministicRunner: task %s before_done deploy verified — '
-                    'pid=%d unit=%s — setting done',
-                    task_id, pid, target_unit,
-                )
-                await self.scheduler.set_task_status(
+                    'DeterministicRunner: task %s before_done ran with always_escalates=True '
+                    '— falling through to gate',
                     task_id,
-                    'done',
-                    done_provenance={
-                        'kind': 'deterministic-deploy',
-                        'pid': pid,
-                        'active_enter_timestamp': new_state.get('ActiveEnterTimestamp', ''),
-                        'unit': target_unit,
-                    },
                 )
-                return WorkflowOutcome.DONE
-
-            # always_escalates=True with before_done: action already ran — fall through
-            # to the gate below (act-then-ask; γ scope = always_escalates=False only,
-            # but the structure is left consistent so act-then-ask does not crash).
-            logger.info(
-                'DeterministicRunner: task %s before_done ran with always_escalates=True '
-                '— falling through to gate',
-                task_id,
-            )
 
         # ── 3. Pure gate ─────────────────────────────────────────────────────
         # Assertion: always_escalates must be True for a pure gate task.
