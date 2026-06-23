@@ -31,6 +31,7 @@ from orchestrator.config import (
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.overrides import OverrideRow, OverrideStore
+from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
 # task_skipped events for "effectively infinite" skip thresholds (>= this
@@ -950,6 +951,7 @@ class Scheduler:
         time_source: Callable[[], float] | None = None,
         override_store: OverrideStore | None = None,
         monotonic_clock_source: Callable[[], float] | None = None,
+        park_eviction_store: ParkEvictionRequestStore | None = None,
     ):
         self.config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
@@ -1015,6 +1017,8 @@ class Scheduler:
         # was already known, not fresh user actions.  The first tick seeds the
         # snapshot without emitting events; subsequent ticks diff-emit normally.
         self._overrides_initialized: bool = False
+        # --- Park-eviction store (task 1871) ---
+        self._park_eviction_store: ParkEvictionRequestStore | None = park_eviction_store
         # --- Park-and-stop pause state (task 1322) ---
         self._paused: bool = False
         self._pause_reason: str | None = None
@@ -2847,6 +2851,45 @@ class Scheduler:
                 EventType.pin_queue_reordered,
                 data={'new_order': new_order},
             )
+
+    def _drain_park_eviction_requests(
+        self,
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, Any],
+    ) -> None:
+        """Drain queued park-eviction requests and apply force_clear for dead owners.
+
+        Called once per acquire_next tick BEFORE the owner-state park-GC sweep
+        so the operator audit event (reservation_force_evicted) wins over
+        park-GC's reservation_expired for the same dead owner.
+
+        For each drained task_id:
+          - force_clear + emit events (unguarded in step-6; D4 guard added in step-8)
+          - pop _skip_count
+          - emit reservation_force_evicted when modules is non-empty
+          - emit reservation_restored for each newly-exposed shadow
+        """
+        if not self._park_eviction_store:
+            return
+        for task_id in self._park_eviction_store.drain(self._project_root):
+            modules, restored = self.lock_table.force_clear(task_id)
+            self._skip_count.pop(task_id, None)
+            if modules and self.event_store:
+                self.event_store.emit(
+                    EventType.reservation_force_evicted,
+                    task_id=task_id,
+                    data={'owner': task_id, 'modules': modules},
+                )
+            if self.event_store:
+                for restored_owner, restored_mods in restored:
+                    self.event_store.emit(
+                        EventType.reservation_restored,
+                        task_id=restored_owner,
+                        data={
+                            'restored_owner': restored_owner,
+                            'modules': restored_mods,
+                        },
+                    )
 
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
