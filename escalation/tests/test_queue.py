@@ -2833,3 +2833,52 @@ class TestMakeIdMaxSeqCache:
             f'Expected archive scanned <=2x (once per task_id) but '
             f'_iter_archive_paths called {spy.call_count}x across three make_id() calls'
         )
+
+    def test_max_seq_cache_bumped_upward_on_archive_write(self, tmp_path: Path):
+        """_archive_resolved must bump the max_seq cache upward for the archived task_id.
+
+        Sequence on a SINGLE instance:
+        1. Pre-seed archive 'esc-42-3' (via direct write; task '42').
+        2. Call make_id('42') to seed the cache (archive_max=3 → returns 'esc-42-4').
+        3. Spy _iter_archive_paths AFTER the cache is seeded.
+        4. Submit 'esc-42-7' (high seq) and resolve it (archives it → bumps cache to 7).
+        5. Call make_id('42').
+        Assert:
+        (a) returns 'esc-42-8' (cache bumped to 7 → next 8).
+        (b) spy.call_count == 0 — value came from bumped cache, not a rescan.
+
+        RED on main-with-step-8 (no bump): cache still holds 3 → make_id returns 'esc-42-4'
+        (stale / would collide with just-archived esc-42-7) → assertion (a) fails.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        # Step 1: pre-seed archive with esc-42-3.
+        self._seed_archive_file(queue_dir, 'esc-42-3', '42', '2025-06-10')
+
+        # Step 2: seed the cache with make_id('42'); must return 'esc-42-4'.
+        initial_id = queue.make_id('42')
+        assert initial_id == 'esc-42-4', (
+            f'Setup: expected esc-42-4 to seed cache, got {initial_id!r}'
+        )
+
+        # Step 3: spy _iter_archive_paths AFTER cache is seeded.
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            # Step 4: submit esc-42-7 (higher seq) and archive it.
+            queue.submit(_make_escalation('esc-42-7', task_id='42'))
+            queue.resolve('esc-42-7', 'high seq resolve')
+
+            # Step 5: make_id('42') must see the newly-archived seq 7.
+            next_id = queue.make_id('42')
+
+        # (a) Must return 'esc-42-8' (bumped cache holds 7 → next 8).
+        assert next_id == 'esc-42-8', (
+            f'Expected esc-42-8 (cache bumped to 7 → next 8), got {next_id!r}'
+        )
+
+        # (b) No rescan: bumped cache was used.
+        assert spy.call_count == 0, (
+            f'Expected 0 archive rescans but _iter_archive_paths called {spy.call_count}x'
+        )
