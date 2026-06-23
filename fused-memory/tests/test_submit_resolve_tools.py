@@ -173,6 +173,124 @@ async def test_resolve_ticket_mcp_tool_rejects_non_prefixed_id(mcp_server, task_
 # ------------------------------------------------------------------
 
 
+import json
+import os
+
+
+# ------------------------------------------------------------------
+# deterministic task_kind guard — MCP-boundary integration (B10)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deterministic_no_before_done_no_always_escalates_rejects(mcp_server, task_interceptor, tmp_path):
+    """B10: task_kind='deterministic' with no before_done and no always_escalates → validation error naming the invariant."""
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(tmp_path),
+            'title': 'Gate task',
+            'task_kind': 'deterministic',
+        },
+    )
+    assert 'error' in result, f'Expected error, got: {result!r}'
+    assert result.get('error_type') == 'ValidationError', f'Expected ValidationError: {result!r}'
+    msg = result['error']
+    assert 'ill-formed no-op' in msg or 'must run an action' in msg or 'always escalate' in msg, (
+        f'Error message should name the no-op invariant: {msg!r}'
+    )
+    task_interceptor.submit_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_normal_with_before_done_in_metadata_rejects(mcp_server, task_interceptor, tmp_path):
+    """task_kind='normal' + metadata.before_done → validation error (before_done only on deterministic)."""
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(tmp_path),
+            'title': 'Bad task',
+            'task_kind': 'normal',
+            'metadata': {'before_done': {'script': 'run.sh', 'timeout_secs': 60}},
+        },
+    )
+    assert 'error' in result
+    assert result.get('error_type') == 'ValidationError'
+    assert 'before_done' in result['error']
+    assert 'deterministic' in result['error']
+    task_interceptor.submit_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_deterministic_always_escalates_forwarded_with_task_kind_injected(mcp_server, task_interceptor, tmp_path):
+    """task_kind='deterministic' + always_escalates=True → accepted; forwarded metadata has task_kind='deterministic'."""
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(tmp_path),
+            'title': 'Gate task',
+            'task_kind': 'deterministic',
+            'metadata': {'always_escalates': True},
+        },
+    )
+    task_interceptor.submit_task.assert_called_once()
+    forwarded_meta = task_interceptor.submit_task.call_args.kwargs['metadata']
+    if isinstance(forwarded_meta, str):
+        forwarded_meta = json.loads(forwarded_meta)
+    assert forwarded_meta.get('task_kind') == 'deterministic'
+    assert forwarded_meta.get('always_escalates') is True
+
+
+@pytest.mark.asyncio
+async def test_valid_deploy_before_done_forwarded(mcp_server, task_interceptor, tmp_path):
+    """Valid deploy: real chmod+x script + timeout_secs → accepted; forwarded metadata preserves before_done and task_kind."""
+    script = tmp_path / 'deploy.sh'
+    script.write_text('#!/bin/sh\necho deploy\n')
+    os.chmod(script, 0o755)
+
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(tmp_path),
+            'title': 'Deploy task',
+            'task_kind': 'deterministic',
+            'metadata': {'before_done': {'script': 'deploy.sh', 'timeout_secs': 60}},
+        },
+    )
+    task_interceptor.submit_task.assert_called_once()
+    forwarded_meta = task_interceptor.submit_task.call_args.kwargs['metadata']
+    if isinstance(forwarded_meta, str):
+        forwarded_meta = json.loads(forwarded_meta)
+    assert forwarded_meta.get('task_kind') == 'deterministic'
+    assert forwarded_meta.get('before_done', {}).get('script') == 'deploy.sh'
+
+
+@pytest.mark.asyncio
+async def test_default_task_kind_normal_injected(mcp_server, task_interceptor, tmp_path):
+    """Default (task_kind omitted) → forwarded metadata has task_kind='normal'."""
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(tmp_path),
+            'title': 'Ordinary task',
+        },
+    )
+    task_interceptor.submit_task.assert_called_once()
+    forwarded_meta = task_interceptor.submit_task.call_args.kwargs['metadata']
+    if isinstance(forwarded_meta, str):
+        forwarded_meta = json.loads(forwarded_meta)
+    if forwarded_meta is None:
+        forwarded_meta = {}
+    assert forwarded_meta.get('task_kind') == 'normal', (
+        f"Expected task_kind='normal', got: {forwarded_meta.get('task_kind')!r}"
+    )
+
+
+# ------------------------------------------------------------------
+# cancel_ticket MCP tool
+# ------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
 async def test_cancel_ticket_mcp_tool_delegates_to_interceptor(mcp_server, task_interceptor):
     """cancel_ticket MCP tool forwards ticket_id to interceptor.cancel_ticket
