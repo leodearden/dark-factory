@@ -108,6 +108,8 @@ class EventType(StrEnum):
     reservation_shadowed = 'reservation_shadowed'
     reservation_restored = 'reservation_restored'
     reservation_used = 'reservation_used'
+    reservation_force_evicted = 'reservation_force_evicted'
+    reservation_force_evict_refused = 'reservation_force_evict_refused'
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
 
     # Scheduler priority overrides
