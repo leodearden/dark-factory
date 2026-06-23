@@ -2159,3 +2159,127 @@ class TestMergerLoopRedrive:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ─── 1867 Step 7 — end-to-end acceptance test ────────────────────────────────
+
+@pytest.mark.asyncio
+class TestCoalesceRedriveEndToEnd:
+    """1867 step-7 (acceptance): coalesce-derail re-drive with REAL factory + FakeScheduler.
+
+    Drives the FULL pipeline (real build_train_callback_factory, real git_ops,
+    FakeScheduler) and patches only _do_train_merge to inject a 'blocked' derail.
+
+    Asserts the task-level invariant:
+      - No absorbed member remains 'merge-deferred' after a coalesce-train derail.
+      - Member whose branch IS already on main → status 'done', provenance
+        kind=='found_on_main'.
+      - Member whose branch is NOT on main → status 'pending' (re-dispatched for
+        solo merge).
+
+    This confirms the double-landing guard and the persistent re-drive together.
+    Already GREEN given steps 2/4/6.
+    """
+
+    async def test_derail_redrives_deferred_members(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """After coalesce-train derail: on-main member → done, off-main member → pending."""
+        import contextlib
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.git_ops import _run
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
+        from _workflow_helpers import FakeScheduler
+
+        # ── git setup ───────────────────────────────────────────────────────
+        # 'e2e-on': branch at main HEAD → is_ancestor(task/e2e-on, main) = True
+        await _run(['git', 'branch', 'task/e2e-on', 'main'], cwd=git_ops.project_root)
+
+        # 'e2e-off': branch with a new commit → is_ancestor = False
+        await _make_branch_with_file(git_ops, 'e2e-off', 'e2e_off.py', 'off = 1\n')
+
+        # ── scheduler setup ─────────────────────────────────────────────────
+        sched = FakeScheduler()
+        await sched.set_task_status('e2e-on', 'merge-deferred')
+        await sched.set_task_status('e2e-off', 'merge-deferred')
+
+        # REAL factory — no mocks for scheduler writes.
+        factory = build_train_callback_factory(sched)
+        cbs = factory('coalesce-e2e-deadcafe')
+
+        # ── worker setup ────────────────────────────────────────────────────
+        db_path = tmp_path / 'es_e2e.db'
+        es = EventStore(db_path=db_path, run_id='run-e2e')
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es,
+            train_callback_factory=lambda train_id: cbs,
+        )
+
+        # ── GroupMergeRequest wired with REAL callbacks ──────────────────────
+        group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        group = GroupMergeRequest(
+            task_id='e2e-off',
+            branch='task/e2e-off',
+            worktree=tmp_path / 'wt-e2e-off',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=group_future,
+            train_id='coalesce-e2e-deadcafe',
+            member_task_ids=['e2e-on', 'e2e-off'],
+            tip_branch='task/e2e-off',
+            tip_task_id='e2e-off',
+            status_check=cbs.status_check,
+            mark_member_done=cbs.mark_member_done,
+            redrive_member=cbs.redrive_member,
+        )
+
+        # ── run through merger loop with injected derail ─────────────────────
+        with patch(
+            'orchestrator.merge_queue._do_train_merge',
+            AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
+        ):
+            await queue.put(group)
+            worker_task = asyncio.create_task(worker.run())
+            await asyncio.wait_for(group_future, timeout=30)
+
+        # ── assertions ───────────────────────────────────────────────────────
+
+        # 'e2e-on': branch is on main → must be 'done' with found_on_main provenance.
+        assert sched.statuses.get('e2e-on', [])[-1] == 'done', (
+            f"e2e-on must be 'done' (found on main); "
+            f"got statuses={sched.statuses.get('e2e-on')!r}"
+        )
+        on_prov = sched.provenance.get('e2e-on', {})
+        assert on_prov.get('kind') == 'found_on_main', (
+            f"e2e-on provenance kind must be 'found_on_main'; got {on_prov!r}"
+        )
+
+        # 'e2e-off': branch is NOT on main → must be 'pending' (re-dispatched).
+        assert sched.statuses.get('e2e-off', [])[-1] == 'pending', (
+            f"e2e-off must be 'pending' (re-dispatched for solo merge); "
+            f"got statuses={sched.statuses.get('e2e-off')!r}"
+        )
+
+        # Neither member should remain 'merge-deferred'.
+        for mid in ('e2e-on', 'e2e-off'):
+            final = sched.statuses.get(mid, [])[-1] if sched.statuses.get(mid) else None
+            assert final != 'merge-deferred', (
+                f"member {mid!r} must not remain 'merge-deferred'; "
+                f"got statuses={sched.statuses.get(mid)!r}"
+            )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
