@@ -5393,8 +5393,13 @@ class NoLandingsCircuitBreaker:
         if not (clean_landing or disk_recovered):
             return None  # neither condition met — stay tripped
 
-        # Resume
+        # Resume — clear the sample buffer so a fresh full window is required
+        # before the next trip can fire.  This is the cross-cycle anti-flap
+        # guarantee: without the clear, stale pre-resume samples would still be
+        # in the deque, reducing the effective window for the next trip
+        # evaluation.  (PRD §5.5 "hysteresis to prevent flap".)
         self._tripped = False
+        self._samples.clear()  # step-08: buffer clear on resume
         reason = (
             'No-landings circuit-breaker cleared: '
             + (
