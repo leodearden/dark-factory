@@ -594,3 +594,90 @@ class TestTrainCallbackLaneRelease:
             'redrive_member must release the warm lane after mark_done(found_on_main)'
         )
         assert pool.state(lane) == LaneState.FREE
+
+
+# ===========================================================================
+# Step-11 (1881): RED — B3/T9: _mark_in_progress_done releases lane via primitive
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestMarkInProgressDoneLaneRelease:
+    """B3 (T9): _mark_in_progress_done must call release_lane_for_terminal_task(tid)
+    after mark_done so that warm lanes whose in-memory assignment map was lost
+    (post-restart) are freed via the on-disk plan.json backstop.
+
+    Diff 5c: after mark_done(kind='found_on_main') inside _mark_in_progress_done,
+             add await self.git_ops.release_lane_for_terminal_task(tid).
+
+    RED: _mark_in_progress_done only calls the existing cleanup_worktree (which
+    resolves via in-memory map — lost post-restart) and never the primitive, so
+    the lane stays ASSIGNED forever.
+    """
+
+    async def test_reconciler_found_on_main_frees_lane(self, tmp_path: Path):
+        """_mark_in_progress_done frees a lane whose in-memory assignment was lost."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.git_ops import GitOps
+        from orchestrator.warm_lane_pool import LaneState
+
+        # ── Setup: minimal git repo ─────────────────────────────────────────
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        tid = '3459'
+
+        # Acquire a lane for the task (simulates pre-restart dispatch)
+        result = await pool.acquire_for(tid)
+        assert result is not None
+        lane, _ = result
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        # Simulate post-restart: in-memory assignment map is cleared
+        pool._assignments.clear()
+        assert pool.assignment_for(tid) is None, 'setup: assignment map must be empty'
+
+        # Write on-disk plan.json backstop so the primitive can still find the lane
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+
+        # ── Build Harness with real git_ops ─────────────────────────────────
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        # Scheduler.mark_done must be awaitable
+        harness.scheduler.mark_done = AsyncMock()
+
+        # ── Call _mark_in_progress_done ──────────────────────────────────────
+        await harness._mark_in_progress_done(
+            tid, sha='abc123', note='test-found-on-main', reason='found-on-main',
+        )
+
+        # scheduler.mark_done must have been called
+        harness.scheduler.mark_done.assert_called_once()
+        call_kwargs = harness.scheduler.mark_done.call_args
+        assert call_kwargs.kwargs.get('kind') == 'found_on_main' or (
+            len(call_kwargs.args) >= 2 and call_kwargs.args[1] == 'found_on_main'
+        ), 'mark_done must be called with kind=found_on_main'
+
+        # (RED) Lane must be freed via the on-disk backstop.
+        # Fails: _mark_in_progress_done never calls release_lane_for_terminal_task.
+        assert pool.assignment_for(tid) is None, (
+            '_mark_in_progress_done must release the lane after mark_done '
+            '(the in-memory map was lost post-restart; the primitive uses the '
+            'on-disk plan.json backstop to locate and free the lane)'
+        )
+        assert pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after found-on-main mark_done, got {pool.state(lane)!r}'
+        )
