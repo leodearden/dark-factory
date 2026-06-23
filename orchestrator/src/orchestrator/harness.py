@@ -3172,14 +3172,18 @@ Output JSON matching the schema. Every task must appear in the output.
         Mirrors ``_run_main_tip_sweep`` as the single-pass testable entry point.
         """
         import shutil as _shutil  # noqa: PLC0415
+        from orchestrator.merge_queue import SpeculativeMergeWorker as _SMW  # noqa: PLC0415
 
         if self._merge_worker is None:
             return
 
-        snapshot = self._merge_worker.snapshot()
-        metrics = snapshot.get('metrics') if isinstance(snapshot, dict) else None
-        if metrics is None:
+        if not isinstance(self._merge_worker, _SMW):
             # MergeWorker (legacy, no metrics) — circuit breaker is a no-op
+            return
+
+        snapshot = self._merge_worker.snapshot()
+        metrics = snapshot.get('metrics')
+        if metrics is None:
             return
 
         landings_total: int = metrics['landings_total']
