@@ -219,10 +219,6 @@ def inject_task_kind(
         task_kind: The validated kind string to persist ('normal' or
             'deterministic').
     """
-    meta = _parse_metadata(metadata)
-    if isinstance(metadata, dict):
-        meta = dict(meta)  # shallow copy — don't mutate caller's dict
-    else:
-        meta = dict(meta)  # fresh copy from parsed result
+    meta = dict(_parse_metadata(metadata))  # shallow copy — don't mutate caller's dict
     meta['task_kind'] = task_kind
     return meta

@@ -10,8 +10,6 @@ from __future__ import annotations
 import json
 import os
 
-import pytest
-
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
 )
