@@ -53,6 +53,11 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      via ``--on-active``, nothing runs at scheduling time — the escalation is
      reached only through the shell failure branch at fire time, never on the
      success path.
+   - If scheduling succeeds (``rc == 0``): stamp ``before_done_scheduled_at``
+     (a dict carrying the transient unit name and fire delay) as a crash-safe
+     marker.  If the runner crashes between this stamp and the done write, the
+     resume path restores done with scheduled provenance instead of
+     re-escalating as a crash window.
    - If scheduling succeeds (``rc == 0``) and ``always_escalates=False``:
      set task ``done`` with
      ``done_provenance.kind='deterministic-deploy-scheduled'`` carrying the
@@ -171,9 +176,12 @@ class DeterministicRunner:
         Uses a SINGLE ``--on-active`` transient unit whose payload is a
         ``/bin/sh -c`` wrapper that runs the restart script and, *only if it
         exits non-zero*, fires δ's escalation-submit CLI before re-raising the
-        original exit code (so systemd still records the unit as failed):
+        original exit code (so journald records the unit as failed):
 
-            <script> <args>; rc=$?; [ "$rc" -ne 0 ] && <escalation submit …>; exit $rc
+            <script> <args>
+            __rc=$?
+            if [ "$__rc" -ne 0 ]; then <escalation submit …>; fi
+            exit "$__rc"
 
         Why not a separate ``OnFailure=`` handler unit?  ``systemd-run`` has no
         register-without-start mode — registering a companion handler transient
@@ -210,6 +218,16 @@ class DeterministicRunner:
         # sys.executable → python -m escalation submit (robust against PATH in the
         # detached systemd user environment).  agent-role keeps the sentinel
         # prefix so the file-backed CLI stamps a real born-at-L2 record.
+        #
+        # Deployment assumption: the `escalation` package must be importable from
+        # sys.executable's interpreter (i.e. installed into site-packages, not
+        # just reachable via a PYTHONPATH side-channel from the orchestrator
+        # service unit).  If it is not, the OnFailure branch itself fails and no
+        # L2 is filed — the task is already marked done=scheduled at this point,
+        # so the failure would be silently lost.  Operators should verify with:
+        #   <sys.executable> -c "import escalation"
+        # before deploying.  A marker-file fallback is intentionally not
+        # implemented here to keep the failure path auditable via journald.
         escalation_cmd = [
             sys.executable, '-m', 'escalation', 'submit',
             '--queue-dir', queue_dir,
@@ -218,11 +236,17 @@ class DeterministicRunner:
             '--category', 'infra_issue',
             '--summary', esc_summary[:200],
             '--agent-role', 'orchestrator-deterministic',
+            '--detail', (
+                f'Transient unit {transient_unit} fired and failed (task {task_id}). '
+                f'Check journald for restart output: '
+                f'journalctl --user -u {transient_unit}'
+            ),
         ]
 
         # Wrap the restart payload so the escalation fires only on failure.  The
-        # exit code is preserved (`exit "$__rc"`) so systemd also marks the unit
-        # failed, keeping journald/`systemctl status` consistent with the L2 file.
+        # exit code is preserved (`exit "$__rc"`) so journald records the failure.
+        # Note: --collect removes the unit from `systemctl --failed` after it
+        # exits (whether success or failure); journald retains the full log.
         payload = ' '.join(shlex.quote(p) for p in [script, *args])
         on_failure = ' '.join(shlex.quote(p) for p in escalation_cmd)
         wrapped = (
@@ -506,6 +530,33 @@ class DeterministicRunner:
                     )
                     return WorkflowOutcome.DONE
 
+                before_done_scheduled_at_stamp = metadata.get('before_done_scheduled_at')
+                if before_done_scheduled_at_stamp:
+                    # (b-self) Self-restart was successfully scheduled
+                    # (before_done_scheduled_at set) but the done write did not
+                    # complete.  The detached transient unit is still registered
+                    # with the user systemd manager and WILL fire — driving to
+                    # done here is safe and avoids a spurious crash-window L2.
+                    _sched = before_done_scheduled_at_stamp if isinstance(before_done_scheduled_at_stamp, dict) else {}
+                    logger.info(
+                        'DeterministicRunner: task %s self-restart scheduled (%s) + '
+                        'crash before done write — resume with scheduled provenance '
+                        '(transient_unit=%s)',
+                        task_id, _sched.get('at', ''), _sched.get('transient_unit', ''),
+                    )
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance={
+                            'kind': 'deterministic-deploy-scheduled',
+                            'unit': target_unit,
+                            'transient_unit': _sched.get('transient_unit', ''),
+                            'fire_delay_secs': _sched.get('fire_delay_secs', 0),
+                            'note': 'resumed after self-restart scheduled (crash before done write)',
+                        },
+                    )
+                    return WorkflowOutcome.DONE
+
                 if ever_escalated:
                     # (b) A failure escalation was filed and resolved by a human.
                     logger.info(
@@ -570,7 +621,12 @@ class DeterministicRunner:
             self_target = bool(own_unit) and (target_unit == own_unit)
             if self_target:
                 transient_unit = f'orch-redeploy-restart-{task_id}.service'
-                on_active_secs = int(before_done.get('on_active_delay_secs', 60))
+                # Clamp to a sane minimum (5 s) so a task that sets
+                # on_active_delay_secs=0 (or a non-positive value) cannot
+                # produce --on-active=0, which would make the transient unit fire
+                # effectively immediately — re-introducing the self-kill window
+                # this detached-deferral design exists to prevent.
+                on_active_secs = max(int(before_done.get('on_active_delay_secs', 60)), 5)
                 restart_fn = self._restart_scheduler or self._default_schedule_detached_restart
                 rc, tail = await restart_fn(
                     before_done,
@@ -592,6 +648,22 @@ class DeterministicRunner:
                         summary=f'Self-restart scheduling failed: {target_unit}',
                         detail=detail,
                     )
+
+                # Stamp before_done_scheduled_at — positive proof the transient unit
+                # was successfully registered.  If the orchestrator crashes between
+                # this stamp and the done write, the resume path (sub-case b-self
+                # above) drives to done with scheduled provenance instead of
+                # re-escalating as a generic crash-window.
+                await self.scheduler.update_task(
+                    task_id,
+                    {'before_done_scheduled_at': {
+                        'at': datetime.now(UTC).isoformat(),
+                        'transient_unit': transient_unit,
+                        'fire_delay_secs': on_active_secs,
+                    }},
+                    metadata_mode='merge',
+                )
+
                 if not always_escalates:
                     logger.info(
                         'DeterministicRunner: task %s self-restart scheduled — '

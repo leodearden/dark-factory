@@ -75,6 +75,7 @@ def _deploy_task(
     before_done_ran_at: str | None = None,
     before_done_verified_at: str | None = None,
     before_done_verified_pid: int | None = None,
+    before_done_scheduled_at: dict | None = None,
 ) -> dict:
     """Build a deterministic deploy task dict (before_done set, always_escalates=False)."""
     before_done: dict = {
@@ -96,6 +97,8 @@ def _deploy_task(
         metadata['before_done_verified_at'] = before_done_verified_at
     if before_done_verified_pid is not None:
         metadata['before_done_verified_pid'] = before_done_verified_pid
+    if before_done_scheduled_at is not None:
+        metadata['before_done_scheduled_at'] = before_done_scheduled_at
     return {
         'id': task_id,
         'title': 'Deploy orchestrator-reify',
@@ -1438,6 +1441,185 @@ class TestBeforeDoneCrashWindow:
 
 
 # ---------------------------------------------------------------------------
+# Scheduled-marker resume (amend: Suggestion 2): crash between
+# before_done_scheduled_at stamp and the done write.
+# before_done_scheduled_at set → transient unit registered → drive to done
+# with scheduled provenance instead of re-escalating as a crash window.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartScheduledCrashResume:
+    """before_done_ran_at + before_done_scheduled_at set, empty queue → done=scheduled.
+
+    Simulates a crash after the transient unit was registered (before_done_scheduled_at
+    stamped) but before set_task_status('done') completed.  The resume path must
+    drive to done with kind='deterministic-deploy-scheduled' rather than re-escalating
+    as a generic crash window (Suggestion 2).
+    """
+
+    async def test_scheduled_resume_drives_to_done(self, tmp_path: Path):
+        """Scheduled stamp present → done with scheduled provenance, no escalation."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='853',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-853.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # truly empty — no prior escalation
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+    async def test_scheduled_resume_sets_done_with_scheduled_kind(self, tmp_path: Path):
+        """Resume with before_done_scheduled_at → done_provenance.kind='deterministic-deploy-scheduled'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='853',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-853.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert done_calls, 'set_task_status must be called with done on scheduled resume'
+        provenance = done_calls[0].kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy-scheduled', (
+            f"done_provenance.kind must be 'deterministic-deploy-scheduled'; "
+            f"got {provenance.get('kind')!r}"
+        )
+
+    async def test_scheduled_resume_no_escalation_filed(self, tmp_path: Path):
+        """Scheduled resume must NOT re-escalate as a crash window."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='853',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-853.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        await runner.run(assignment)
+
+        all_escs = queue.get_by_task('853')
+        assert all_escs == [], (
+            f'scheduled resume must NOT re-escalate as crash-window; got {all_escs}'
+        )
+
+    async def test_scheduled_resume_does_not_rerun_deploy(self, tmp_path: Path):
+        """Scheduled resume must NOT re-invoke script_runner (I1 once-only)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='853',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-853.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_scheduled_resume_provenance_carries_transient_unit(self, tmp_path: Path):
+        """Resume provenance must carry the transient_unit from the stamp."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='854',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-854.service',
+                'fire_delay_secs': 45,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        provenance = done_calls[0].kwargs.get('done_provenance', {})
+        assert provenance.get('transient_unit') == 'orch-redeploy-restart-854.service', (
+            f"provenance.transient_unit must match stamp; "
+            f"got {provenance.get('transient_unit')!r}"
+        )
+        assert provenance.get('fire_delay_secs') == 45, (
+            f"provenance.fire_delay_secs must match stamp; "
+            f"got {provenance.get('fire_delay_secs')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Verified-marker resume: crash between verify stamp and the done write.
 # before_done_verified_at present → safe to drive to done (no re-run).
 # ---------------------------------------------------------------------------
@@ -1761,6 +1943,82 @@ class TestSelfRestartScheduled:
         )
         assert isinstance(kwargs['on_active_secs'], int) and kwargs['on_active_secs'] > 0, (
             f"on_active_secs must be a positive int; got {kwargs['on_active_secs']!r}"
+        )
+
+    async def test_b8_on_active_secs_clamped_to_minimum(self, tmp_path: Path):
+        """on_active_delay_secs=0 in before_done is clamped to >=5 (amend: Suggestion 1).
+
+        A zero or negative delay would produce --on-active=0, causing the transient
+        unit to fire immediately — re-introducing the self-kill window.  The runner
+        must enforce a floor of 5 seconds.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='851', target_unit='orchestrator-reify.service')
+        # Inject zero delay into before_done to trigger the clamp
+        task['metadata']['before_done']['on_active_delay_secs'] = 0
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        restart_scheduler.assert_awaited_once()
+        on_active = restart_scheduler.call_args.kwargs.get('on_active_secs', 0)
+        assert on_active >= 5, (
+            f'on_active_secs must be clamped to >=5 when on_active_delay_secs=0; '
+            f'got {on_active!r}'
+        )
+
+    async def test_b8_stamps_before_done_scheduled_at(self, tmp_path: Path):
+        """update_task must stamp before_done_scheduled_at with transient_unit after scheduling (amend: Suggestion 2)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='852', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        scheduled_stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_scheduled_at')
+        ]
+        assert scheduled_stamp_calls, (
+            'update_task must be called with a truthy before_done_scheduled_at stamp'
+        )
+        stamp_val = scheduled_stamp_calls[0].args[1]['before_done_scheduled_at']
+        assert isinstance(stamp_val, dict), (
+            f'before_done_scheduled_at must be a dict carrying transient_unit; got {stamp_val!r}'
+        )
+        assert '852' in stamp_val.get('transient_unit', ''), (
+            f"before_done_scheduled_at.transient_unit must contain task id '852'; "
+            f"got {stamp_val.get('transient_unit')!r}"
+        )
+        assert isinstance(stamp_val.get('fire_delay_secs'), int), (
+            f'before_done_scheduled_at.fire_delay_secs must be an int; '
+            f"got {stamp_val.get('fire_delay_secs')!r}"
         )
 
 
@@ -2254,6 +2512,45 @@ class TestDefaultScheduleDetachedRestart:
         assert 'critical' in all_argv, f"'critical' must appear in argv: {all_argv!r}"
         assert '--category' in all_argv, f'--category must appear in argv: {all_argv!r}'
         assert 'infra_issue' in all_argv, f"'infra_issue' must appear in argv: {all_argv!r}"
+
+    async def test_argv_contains_detail_with_transient_unit(self, tmp_path: Path):
+        """--detail carrying transient unit name must appear in the OnFailure escalation argv (amend: Suggestion 3).
+
+        The in-process scheduling-failure path builds a rich detail block; the fire-time
+        escalation-submit must also carry diagnostic context so a human handling a real
+        fire-time restart failure has the transient unit name for journald lookup.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--detail' in all_argv, (
+            f'--detail must appear in the OnFailure escalation argv: {all_argv!r}'
+        )
+        assert 'orch-redeploy-restart-900.service' in all_argv, (
+            f'transient unit name must appear in --detail context: {all_argv!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
