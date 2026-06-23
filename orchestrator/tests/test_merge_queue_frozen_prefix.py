@@ -402,3 +402,67 @@ class TestFrozenPrefixTip:
 
         # The passthrough is not frozen; tip is still the verifying entry's commit
         assert worker.frozen_prefix_tip('main0') == 'commitV'
+
+
+# ── step-05 RED: check_frozen_prefix_invariant(main_sha) ─────────────────────
+
+
+@pytest.mark.asyncio
+class TestCheckFrozenPrefixInvariant:
+    """check_frozen_prefix_invariant returns [] when healthy, violations when broken.
+
+    RED until step-06 GREEN implements the method.
+    """
+
+    async def test_well_formed_stack_returns_empty(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """D.base==main_sha, D.merge_commit==Dc; E.base==Dc, E.merge_commit==Ec → []."""
+        worker = _make_worker(git_ops)
+        main_sha = 'main000'
+        _, item_d = _make_fake_item('t-d', base_sha=main_sha, merge_commit='commitDc',
+                                    config=config, git_repo=git_repo)
+        _, item_e = _make_fake_item('t-e', base_sha='commitDc', merge_commit='commitEc',
+                                    config=config, git_repo=git_repo)
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+
+        violations = worker.check_frozen_prefix_invariant(main_sha)
+        assert violations == [], f'expected no violations, got: {violations}'
+
+    async def test_broken_base_chain_returns_violation(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """E.base_sha is a speculative-only SHA (not D's merge_commit) → non-empty violations."""
+        worker = _make_worker(git_ops)
+        main_sha = 'main000'
+        _, item_d = _make_fake_item('t-d', base_sha=main_sha, merge_commit='commitDc',
+                                    config=config, git_repo=git_repo)
+        # E's base_sha is wrong: it should be commitDc but is some other SHA
+        _, item_e = _make_fake_item('t-e', base_sha='wrong_speculative_sha',
+                                    merge_commit='commitEc',
+                                    config=config, git_repo=git_repo)
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+
+        violations = worker.check_frozen_prefix_invariant(main_sha)
+        assert len(violations) > 0, 'expected a base-chain violation'
+        # The violation message should name the offending rid
+        assert item_e.request.request_id in ' '.join(violations)
+
+    async def test_disjointness_violation(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A request_id in BOTH frozen prefix and unfrozen suffix → disjointness violation."""
+        worker = _make_worker(git_ops)
+        main_sha = 'main000'
+        req, item_d = _make_fake_item('t-d', base_sha=main_sha, merge_commit='commitDc',
+                                      config=config, git_repo=git_repo)
+        entry = _make_inflight_entry(item_d, verifying=True)
+        worker._inflight.append(entry)
+        # Same request also in lane buffer — violates frozen/suffix disjointness
+        worker._lane_buffers['normal'].append(req)
+
+        violations = worker.check_frozen_prefix_invariant(main_sha)
+        assert len(violations) > 0, 'expected a disjointness violation'
+        assert req.request_id in ' '.join(violations)
