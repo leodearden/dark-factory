@@ -2690,3 +2690,54 @@ class TestArchiveListingMemoisation:
             f'Expected archive scanned <=1x but _iter_archive_paths called '
             f'{spy.call_count}x across three get() calls'
         )
+
+    def test_newly_resolved_id_visible_without_rescan(self, tmp_path: Path):
+        """After resolving a NEW id, get() finds it via incremental cache update, not rescan.
+
+        Sequence on a SINGLE instance:
+        1. Submit + resolve 'esc-1-1' (archives it).
+        2. Call get('esc-1-1') to force the listing cache to build (snapshot captured).
+        3. Spy _iter_archive_paths AFTER the cache is built.
+        4. Submit + resolve 'esc-2-1' (must update the cache incrementally).
+        5. Call get('esc-2-1').
+        Assert:
+        (a) get('esc-2-1') returns the resolved escalation (not None).
+        (b) spy.call_count == 0 — the new id was found via incremental update, not rescan.
+
+        RED on main-with-only-step-2: cache built after step 2 (snapshot lacks esc-2-1)
+        → get('esc-2-1') returns None → assertion (a) fails.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        # Step 1: archive esc-1-1.
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.resolve('esc-1-1', 'first resolve')
+
+        # Step 2: force the listing cache to build (snapshot excludes esc-2-1).
+        result = queue.get('esc-1-1')
+        assert result is not None, 'Setup: esc-1-1 must be found'
+
+        # Step 3: spy AFTER the cache is already populated.
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            # Step 4: archive a NEW escalation.
+            queue.submit(_make_escalation('esc-2-1', task_id='2'))
+            queue.resolve('esc-2-1', 'second resolve')
+
+            # Step 5: look up the new id.
+            result2 = queue.get('esc-2-1')
+
+        # (a) Must return the resolved escalation (incremental update made it visible).
+        assert result2 is not None, (
+            'Expected esc-2-1 to be found via incremental listing update, got None'
+        )
+        assert result2.status == 'resolved', (
+            f'Expected status=resolved, got {result2.status!r}'
+        )
+
+        # (b) No rescan occurred — the new id was in the updated cache.
+        assert spy.call_count == 0, (
+            f'Expected 0 archive rescans but _iter_archive_paths called {spy.call_count}x'
+        )
