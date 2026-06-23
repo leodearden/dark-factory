@@ -6458,3 +6458,246 @@ class TestGetFilesTouchedInBranchWarning:
             'get_files_touched_in_branch' in t.lower()
             for t in warning_texts
         ), f'Expected WARNING to mention get_files_touched_in_branch; got: {warning_texts}'
+
+
+# ---------------------------------------------------------------------------
+# TestMergeTreeConflicts — tests for merge_tree_conflicts() (PRD §5.2, task β)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestMergeTreeConflicts:
+    """Unit tests for GitOps.merge_tree_conflicts(base_tip, branch_head).
+
+    The primitive answers "would branch_head merge cleanly onto base_tip?"
+    using git merge-tree --write-tree, with ZERO worktree creation and
+    no mutations to refs, index, or checkout.
+    """
+
+    async def test_clean_merge_returns_probe_with_no_conflicts(
+        self, git_ops: GitOps,
+    ) -> None:
+        """CLEAN case: two branches touching DIFFERENT files merge cleanly.
+
+        Checks ConflictProbe.clean, ConflictProbe.conflicted_paths,
+        and that tuple-destructuring works (NamedTuple contract).
+        """
+        # Build branch mt-a (writes a.py) and mt-b (writes b.py) off the same main.
+        wt_a = await git_ops.create_worktree('mt-a')
+        (wt_a.path / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt_a.path, 'Add a.py on mt-a')
+
+        wt_b = await git_ops.create_worktree('mt-b')
+        (wt_b.path / 'b.py').write_text('b = 1\n')
+        await git_ops.commit(wt_b.path, 'Add b.py on mt-b')
+
+        probe = await git_ops.merge_tree_conflicts('task/mt-a', 'task/mt-b')
+
+        # Named-field access
+        assert probe.clean is True
+        assert probe.conflicted_paths == []
+
+        # Tuple-destructuring (NamedTuple contract — PRD's "(clean, conflicted_paths)")
+        clean, paths = probe
+        assert clean is True
+        assert paths == []
+
+    async def test_single_file_conflict(self, git_ops: GitOps) -> None:
+        """CONFLICT case: both branches rewrite the same line of shared.py.
+
+        Asserts probe.clean is False and probe.conflicted_paths == ['shared.py']
+        (EXACT list — forces the parser to stop at the blank-line section
+        boundary and exclude informational messages like "CONFLICT (content):…").
+        """
+        # shared.py must exist on main before branching (merge-tree needs a
+        # common ancestor that already has the file).
+        (git_ops.project_root / 'shared.py').write_text('value = 0\n')
+        await _run(['git', 'add', 'shared.py'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Add shared.py on main'], cwd=git_ops.project_root)
+
+        # Branch mt-c: change shared.py to "A"
+        wt_c = await git_ops.create_worktree('mt-c')
+        (wt_c.path / 'shared.py').write_text('value = "A"\n')
+        await git_ops.commit(wt_c.path, 'Branch mt-c: value = A')
+
+        # Branch mt-d: change shared.py to "B" (conflicts with A)
+        wt_d = await git_ops.create_worktree('mt-d')
+        (wt_d.path / 'shared.py').write_text('value = "B"\n')
+        await git_ops.commit(wt_d.path, 'Branch mt-d: value = B')
+
+        probe = await git_ops.merge_tree_conflicts('task/mt-c', 'task/mt-d')
+
+        assert probe.clean is False
+        assert probe.conflicted_paths == ['shared.py'], (
+            f'Expected [\"shared.py\"], got {probe.conflicted_paths!r}'
+        )
+
+    async def test_multiple_file_conflicts(self, git_ops: GitOps) -> None:
+        """CONFLICT case: two files both conflict.
+
+        Asserts probe.clean is False and the set of conflicted_paths matches
+        exactly {f1.txt, f2.txt}, with NO informational text leaked in
+        (no 'CONFLICT' or 'Auto-merging' substrings in any path).
+        """
+        # Seed both files on main
+        for fname, content in [('f1.txt', 'line1\n'), ('f2.txt', 'line2\n')]:
+            (git_ops.project_root / fname).write_text(content)
+        await _run(['git', 'add', 'f1.txt', 'f2.txt'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Add f1.txt and f2.txt on main'], cwd=git_ops.project_root)
+
+        # Branch mt-e: change both files to "X"
+        wt_e = await git_ops.create_worktree('mt-e')
+        (wt_e.path / 'f1.txt').write_text('X\n')
+        (wt_e.path / 'f2.txt').write_text('X\n')
+        await git_ops.commit(wt_e.path, 'Branch mt-e: both X')
+
+        # Branch mt-f: change both files to "Y" (conflicts with X on both)
+        wt_f = await git_ops.create_worktree('mt-f')
+        (wt_f.path / 'f1.txt').write_text('Y\n')
+        (wt_f.path / 'f2.txt').write_text('Y\n')
+        await git_ops.commit(wt_f.path, 'Branch mt-f: both Y')
+
+        probe = await git_ops.merge_tree_conflicts('task/mt-e', 'task/mt-f')
+
+        assert probe.clean is False
+        assert set(probe.conflicted_paths) == {'f1.txt', 'f2.txt'}, (
+            f'Expected {{f1.txt, f2.txt}}, got {probe.conflicted_paths!r}'
+        )
+        # No informational text should leak into the paths list
+        assert all(
+            'CONFLICT' not in p and 'Auto-merging' not in p
+            for p in probe.conflicted_paths
+        ), f'Informational text leaked into conflicted_paths: {probe.conflicted_paths!r}'
+
+    async def test_zero_worktree_creation_and_side_effect_free(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Headline: merge_tree_conflicts MUST NOT create worktrees or mutate refs.
+
+        Sets up a conflicting pair, captures before-state (worktree count,
+        worktree_base children, and SHAs of base_tip/branch_head/HEAD),
+        calls merge_tree_conflicts TWICE, then asserts:
+
+        1. Both calls return equal ConflictProbe results (deterministic/idempotent).
+        2. git worktree list count is UNCHANGED.
+        3. No _merge-* or any new child directory appeared under worktree_base.
+        4. base_tip, branch_head, and HEAD SHAs are all unchanged (side-effect-free).
+        """
+        # Seed shared.py on main so there is a common ancestor
+        (git_ops.project_root / 'shared.py').write_text('base = 0\n')
+        await _run(['git', 'add', 'shared.py'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Seed shared.py for side-effect test'], cwd=git_ops.project_root)
+
+        # Build a conflicting pair
+        wt_p = await git_ops.create_worktree('mt-p')
+        (wt_p.path / 'shared.py').write_text('base = "P"\n')
+        await git_ops.commit(wt_p.path, 'Branch mt-p: base = P')
+
+        wt_q = await git_ops.create_worktree('mt-q')
+        (wt_q.path / 'shared.py').write_text('base = "Q"\n')
+        await git_ops.commit(wt_q.path, 'Branch mt-q: base = Q')
+
+        # --- Capture before-state ---
+        # 1) Count entries in git worktree list
+        _, wt_list_before, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        wt_count_before = wt_list_before.count('\nworktree ')
+
+        # 2) Children under worktree_base (may not exist yet)
+        def _children(base: 'Path') -> 'set[str]':
+            if not base.exists():
+                return set()
+            return {p.name for p in base.iterdir()}
+
+        children_before = _children(git_ops.worktree_base)
+
+        # 3) Resolve SHAs of the two refs and HEAD
+        _, sha_p_before, _ = await _run(
+            ['git', 'rev-parse', 'task/mt-p'], cwd=git_ops.project_root,
+        )
+        _, sha_q_before, _ = await _run(
+            ['git', 'rev-parse', 'task/mt-q'], cwd=git_ops.project_root,
+        )
+        _, head_before, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+        )
+        sha_p_before = sha_p_before.strip()
+        sha_q_before = sha_q_before.strip()
+        head_before = head_before.strip()
+
+        # --- Call merge_tree_conflicts TWICE ---
+        probe1 = await git_ops.merge_tree_conflicts('task/mt-p', 'task/mt-q')
+        probe2 = await git_ops.merge_tree_conflicts('task/mt-p', 'task/mt-q')
+
+        # --- Assert post-call state ---
+        # 1) Idempotent: both calls return identical results
+        assert probe1 == probe2, (
+            f'merge_tree_conflicts is not idempotent: first={probe1!r}, second={probe2!r}'
+        )
+        assert probe1.clean is False  # they conflict
+
+        # 2) worktree list count unchanged
+        _, wt_list_after, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        wt_count_after = wt_list_after.count('\nworktree ')
+        assert wt_count_after == wt_count_before, (
+            f'git worktree list grew from {wt_count_before} to {wt_count_after} entries'
+        )
+
+        # 3) No _merge-* or new child under worktree_base
+        children_after = _children(git_ops.worktree_base)
+        new_children = children_after - children_before
+        merge_children = {c for c in new_children if '_merge' in c}
+        assert not merge_children, (
+            f'_merge-* child(ren) appeared under worktree_base: {merge_children!r}'
+        )
+        assert not new_children, (
+            f'New child dir(s) appeared under worktree_base: {new_children!r}'
+        )
+
+        # 4) Refs and HEAD unchanged
+        _, sha_p_after, _ = await _run(
+            ['git', 'rev-parse', 'task/mt-p'], cwd=git_ops.project_root,
+        )
+        _, sha_q_after, _ = await _run(
+            ['git', 'rev-parse', 'task/mt-q'], cwd=git_ops.project_root,
+        )
+        _, head_after, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root,
+        )
+        assert sha_p_after.strip() == sha_p_before, 'task/mt-p ref was mutated'
+        assert sha_q_after.strip() == sha_q_before, 'task/mt-q ref was mutated'
+        assert head_after.strip() == head_before, 'HEAD was mutated'
+
+    async def test_bad_revision_raises_runtime_error(
+        self, git_ops: GitOps,
+    ) -> None:
+        """ERROR case: git merge-tree exits with an error rc for an unknown revision.
+
+        merge_tree_conflicts must raise (not return a misleading ConflictProbe)
+        when git exits with a non-{0,1} rc OR with rc==1 and empty stdout
+        (git reports "not something we can merge" on stderr only).  A bad SHA
+        is a caller bug; silently returning clean=True would admit a broken
+        branch into verify, and returning clean=False would falsely bounce a
+        mergeable branch.
+
+        The error message must identify the offending rc (to distinguish the
+        error path from the conflict path) and include the bogus ref (so the
+        caller can pinpoint the bad input in logs).
+        """
+        bogus = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await git_ops.merge_tree_conflicts('main', bogus)
+
+        err_text = str(exc_info.value)
+        # Must mention the rc — distinguishes the error branch from the
+        # rc==1/non-empty-stdout genuine-conflict branch.
+        assert 'rc=' in err_text, f'Expected rc= in error message; got: {err_text!r}'
+        # Must include the offending ref — makes the caller bug locatable in logs.
+        assert bogus in err_text, (
+            f'Expected bogus ref {bogus!r} in error message; got: {err_text!r}'
+        )
