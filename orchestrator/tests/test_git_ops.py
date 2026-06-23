@@ -6458,3 +6458,45 @@ class TestGetFilesTouchedInBranchWarning:
             'get_files_touched_in_branch' in t.lower()
             for t in warning_texts
         ), f'Expected WARNING to mention get_files_touched_in_branch; got: {warning_texts}'
+
+
+# ---------------------------------------------------------------------------
+# TestMergeTreeConflicts — tests for merge_tree_conflicts() (PRD §5.2, task β)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestMergeTreeConflicts:
+    """Unit tests for GitOps.merge_tree_conflicts(base_tip, branch_head).
+
+    The primitive answers "would branch_head merge cleanly onto base_tip?"
+    using git merge-tree --write-tree, with ZERO worktree creation and
+    no mutations to refs, index, or checkout.
+    """
+
+    async def test_clean_merge_returns_probe_with_no_conflicts(
+        self, git_ops: GitOps,
+    ) -> None:
+        """CLEAN case: two branches touching DIFFERENT files merge cleanly.
+
+        Checks ConflictProbe.clean, ConflictProbe.conflicted_paths,
+        and that tuple-destructuring works (NamedTuple contract).
+        """
+        # Build branch mt-a (writes a.py) and mt-b (writes b.py) off the same main.
+        wt_a = await git_ops.create_worktree('mt-a')
+        (wt_a.path / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt_a.path, 'Add a.py on mt-a')
+
+        wt_b = await git_ops.create_worktree('mt-b')
+        (wt_b.path / 'b.py').write_text('b = 1\n')
+        await git_ops.commit(wt_b.path, 'Add b.py on mt-b')
+
+        probe = await git_ops.merge_tree_conflicts('task/mt-a', 'task/mt-b')
+
+        # Named-field access
+        assert probe.clean is True
+        assert probe.conflicted_paths == []
+
+        # Tuple-destructuring (NamedTuple contract — PRD's "(clean, conflicted_paths)")
+        clean, paths = probe
+        assert clean is True
+        assert paths == []
