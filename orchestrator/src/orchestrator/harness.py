@@ -3620,6 +3620,8 @@ Output JSON matching the schema. Every task must appear in the output.
         or a plain DONE report when the gate has been resolved (resume path).
         """
         from datetime import UTC, datetime
+        if self._escalation_queue is None:
+            raise RuntimeError('_escalation_queue must be initialised before dispatching deterministic tasks')
         runner = DeterministicRunner(
             scheduler=self.scheduler,
             escalation_queue=self._escalation_queue,

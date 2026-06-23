@@ -5,10 +5,10 @@ Step-3: RED — _get_modules no-lock invariant (I4/B12) + eligibility unchanged 
 """
 
 from __future__ import annotations
+
 from pathlib import Path
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Minimal task-dict helpers

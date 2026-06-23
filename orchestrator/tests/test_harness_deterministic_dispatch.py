@@ -8,18 +8,15 @@ Step-11: RED — restart action clears gate stamps; park/abandon do NOT clear.
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
-
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -108,7 +105,7 @@ class TestRunSlotRouting:
             mock_runner.run = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
             mock_dr.return_value = mock_runner
 
-            report = await harness._run_slot(assignment, _make_sem())
+            await harness._run_slot(assignment, _make_sem())
 
         # TaskWorkflow must never have been instantiated
         mock_tw.assert_not_called()
@@ -150,6 +147,7 @@ class TestRunSlotRouting:
 
             report = await harness._run_slot(assignment, _make_sem())
 
+        assert report is not None
         assert report.block_reason == 'deterministic_gate'
 
     async def test_run_slot_det_task_done_report_on_resume(
@@ -201,7 +199,7 @@ class TestRunSlotRouting:
             mock_wf._last_block_phase = ''
             mock_tw.return_value = mock_wf
 
-            report = await harness._run_slot(assignment, _make_sem())
+            await harness._run_slot(assignment, _make_sem())
 
         # DeterministicRunner must NOT have been called
         mock_dr.assert_not_called()
@@ -270,10 +268,10 @@ class TestRestartStampClear:
         await harness._action_teardown_and_set_status(task_id, 'pending', 'restart')
 
         # update_task must have been called to clear the stamps
-        harness.scheduler.update_task.assert_awaited()
+        harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
         # Find the stamp-clearing call (should contain None values)
         stamp_clear_calls = [
-            c for c in harness.scheduler.update_task.call_args_list
+            c for c in harness.scheduler.update_task.call_args_list  # type: ignore[attr-defined]
             if c.args and isinstance(c.args[1], dict)
             and c.args[1].get('gate_escalated_at') is None
         ]
@@ -296,7 +294,7 @@ class TestRestartStampClear:
 
         # Check before_done_ran_at is also cleared
         stamp_clear_calls = [
-            c for c in harness.scheduler.update_task.call_args_list
+            c for c in harness.scheduler.update_task.call_args_list  # type: ignore[attr-defined]
             if c.args and isinstance(c.args[1], dict)
             and c.args[1].get('before_done_ran_at') is None
         ]
@@ -315,7 +313,7 @@ class TestRestartStampClear:
 
         # update_task must NOT be called for stamp clearing on park
         stamp_clear_calls = [
-            c for c in harness.scheduler.update_task.call_args_list
+            c for c in harness.scheduler.update_task.call_args_list  # type: ignore[attr-defined]
             if c.args and isinstance(c.args[1], dict)
             and c.args[1].get('gate_escalated_at') is None
         ]
@@ -335,7 +333,7 @@ class TestRestartStampClear:
         await harness._action_teardown_and_set_status(task_id, 'cancelled', 'abandon')
 
         stamp_clear_calls = [
-            c for c in harness.scheduler.update_task.call_args_list
+            c for c in harness.scheduler.update_task.call_args_list  # type: ignore[attr-defined]
             if c.args and isinstance(c.args[1], dict)
             and c.args[1].get('gate_escalated_at') is None
         ]
