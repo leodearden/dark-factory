@@ -2574,6 +2574,73 @@ async def test_done_provenance_found_on_main_short_sha_resolved(
 
 
 @pytest.mark.asyncio
+async def test_done_provenance_accepts_deterministic_deploy_with_pid(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='deterministic-deploy' with pid+unit+active_enter_timestamp is accepted without a commit.
+
+    The runner emits this shape on a successful cross-unit deploy (B6).  No git
+    commit is available (the work is a service restart, not a code merge), so
+    this kind must pass the provenance gate commit-less while preserving its
+    PID evidence in the persisted provenance blob.
+    """
+    # No git repo needed — deterministic-deploy carries no commit.
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'deterministic-deploy',
+            'pid': 4242,
+            'unit': 'orchestrator-reify.service',
+            'active_enter_timestamp': 'Mon 2026-06-23 20:09:00 UTC',
+        },
+    )
+
+    assert 'error' not in result, f'expected acceptance but got: {result}'
+    taskmaster.set_task_status.assert_called_once()
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    assert persisted['kind'] == 'deterministic-deploy'
+    assert persisted['pid'] == 4242
+    assert persisted['unit'] == 'orchestrator-reify.service'
+    assert persisted['active_enter_timestamp'] == 'Mon 2026-06-23 20:09:00 UTC'
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='deterministic-deploy' with note+unit (no pid, no commit) is accepted.
+
+    The runner emits this shape on the resume-after-human-resolution path
+    (before_done_ran_at already set, escalation cleared by operator).
+    """
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'deterministic-deploy',
+            'note': 'resumed after human resolution',
+            'unit': 'orchestrator-reify.service',
+        },
+    )
+
+    assert 'error' not in result, f'expected acceptance but got: {result}'
+    taskmaster.set_task_status.assert_called_once()
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    assert persisted['kind'] == 'deterministic-deploy'
+    assert persisted['note'] == 'resumed after human resolution'
+    assert persisted['unit'] == 'orchestrator-reify.service'
+
+
+@pytest.mark.asyncio
 async def test_update_task_rejects_metadata_done_provenance(taskmaster, reconciler, event_buffer):
     """update_task must NOT be a side door for writing done_provenance.
 
