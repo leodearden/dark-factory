@@ -46,10 +46,13 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
    - Instead of running the blocking cross-unit deploy (which would kill this
      runner mid-execution), schedules a detached ``systemd-run`` transient
      unit that fires *after* ``run()`` returns.
-   - A companion failure-handler transient unit is registered first and wired
-     via ``OnFailure=``; if the restart fires and fails, it runs δ's
-     ``escalation submit`` CLI (file-backed, no MCP server needed in the
-     detached unit) to file a born-at-L2 ``infra_issue`` escalation.
+   - The transient unit's payload is a ``/bin/sh -c`` wrapper that runs the
+     restart and, *only if it exits non-zero*, fires δ's ``escalation submit``
+     CLI (file-backed, no MCP server needed in the detached unit) to file a
+     born-at-L2 ``infra_issue`` escalation.  Because the whole unit is deferred
+     via ``--on-active``, nothing runs at scheduling time — the escalation is
+     reached only through the shell failure branch at fire time, never on the
+     success path.
    - If scheduling succeeds (``rc == 0``) and ``always_escalates=False``:
      set task ``done`` with
      ``done_provenance.kind='deterministic-deploy-scheduled'`` carrying the
@@ -165,21 +168,33 @@ class DeterministicRunner:
     ) -> tuple[int, str]:
         """Schedule a detached systemd-run transient unit for a self-restart.
 
-        Uses two systemd-run registrations:
-        1. A companion failure-handler transient unit that runs δ's escalation-
-           submit CLI if the restart fires and fails.
-        2. The main restart transient unit (--on-active) wired with
-           ``--property=OnFailure=<failure-unit>`` so systemd routes fire-time
-           failures to the handler.
+        Uses a SINGLE ``--on-active`` transient unit whose payload is a
+        ``/bin/sh -c`` wrapper that runs the restart script and, *only if it
+        exits non-zero*, fires δ's escalation-submit CLI before re-raising the
+        original exit code (so systemd still records the unit as failed):
+
+            <script> <args>; rc=$?; [ "$rc" -ne 0 ] && <escalation submit …>; exit $rc
+
+        Why not a separate ``OnFailure=`` handler unit?  ``systemd-run`` has no
+        register-without-start mode — registering a companion handler transient
+        *service* would activate it immediately at scheduling time, filing a
+        spurious born-at-L2 on EVERY successful self-deploy rather than only on a
+        fire-time failure (the bug this method previously had).  ``--on-active``
+        defers the whole unit, so NOTHING runs at registration; the escalation
+        is reached only through the shell's failure branch when the restart
+        actually fails at fire time.  This preserves the intended semantics —
+        "run δ's escalation-submit CLI iff the restart fires and fails" — with a
+        single deferred unit and no eager execution.
 
         systemd-run returns immediately after registering the transient unit;
         the orchestrator is NEVER blocked or killed — the payload fires later
         under the user systemd manager.
 
         Returns:
-            (rc, tail) — rc=0 on successful registration; rc≠0 if either
-            registration fails (tail carries the error output).
+            (rc, tail) — rc=0 on successful registration; rc≠0 if registration
+            fails (tail carries the error output).
         """
+        import shlex
         import sys
 
         queue_dir = str(self.escalation_queue.queue_dir)
@@ -187,74 +202,60 @@ class DeterministicRunner:
         script = before_done['script']
         args = before_done.get('args') or []
 
-        # Derive companion failure-handler unit name from the transient unit name
-        if transient_unit.endswith('.service'):
-            failure_unit = transient_unit[:-len('.service')] + '-failure.service'
-        else:
-            failure_unit = transient_unit + '-failure.service'
-
         esc_summary = summary or (
             f'Self-restart fire-time failure: {target_unit}'
         )
 
-        # ── 1. Register the OnFailure handler unit ───────────────────────────
-        # Runs δ's escalation-submit CLI if the restart fails at fire time.
-        # sys.executable → python -m escalation submit (robust against PATH in
-        # the detached systemd user environment).
-        failure_argv = [
-            'systemd-run', '--user',
-            f'--unit={failure_unit}',
-            '--remain-after-exit',
-            '--collect',
+        # δ's escalation-submit CLI, run ONLY when the restart fails at fire time.
+        # sys.executable → python -m escalation submit (robust against PATH in the
+        # detached systemd user environment).  agent-role keeps the sentinel
+        # prefix so the file-backed CLI stamps a real born-at-L2 record.
+        escalation_cmd = [
             sys.executable, '-m', 'escalation', 'submit',
             '--queue-dir', queue_dir,
             '--task', task_id,
             '--severity', 'critical',
             '--category', 'infra_issue',
             '--summary', esc_summary[:200],
+            '--agent-role', 'orchestrator-deterministic',
         ]
-        proc1 = await asyncio.create_subprocess_exec(
-            *failure_argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout1, _ = await proc1.communicate()
-        rc1 = proc1.returncode or 0
-        if rc1 != 0:
-            tail1 = (stdout1 or b'').decode(errors='replace')[-2000:]
-            logger.warning(
-                'DeterministicRunner: failed to register OnFailure handler unit %s '
-                '(rc=%d) for task %s',
-                failure_unit, rc1, task_id,
-            )
-            return rc1, tail1
 
-        # ── 2. Register the main restart transient unit ──────────────────────
-        # --on-active=<N>: fires N seconds after this run() returns (manifest §53).
-        # --property=OnFailure=: wires δ's failure-handler unit.
+        # Wrap the restart payload so the escalation fires only on failure.  The
+        # exit code is preserved (`exit "$__rc"`) so systemd also marks the unit
+        # failed, keeping journald/`systemctl status` consistent with the L2 file.
+        payload = ' '.join(shlex.quote(p) for p in [script, *args])
+        on_failure = ' '.join(shlex.quote(p) for p in escalation_cmd)
+        wrapped = (
+            f'{payload}; __rc=$?; '
+            f'if [ "$__rc" -ne 0 ]; then {on_failure}; fi; '
+            f'exit "$__rc"'
+        )
+
+        # --on-active=<N>: fires N seconds after this run() returns (manifest §53)
+        # and, crucially, does NOT execute at registration time — so the failure
+        # branch (and its escalation) is never reached on the success path.
         main_argv = [
             'systemd-run', '--user',
             f'--on-active={on_active_secs}',
             f'--unit={transient_unit}',
             '--collect',
-            f'--property=OnFailure={failure_unit}',
-            script, *args,
+            '/bin/sh', '-c', wrapped,
         ]
-        proc2 = await asyncio.create_subprocess_exec(
+        proc = await asyncio.create_subprocess_exec(
             *main_argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        stdout2, _ = await proc2.communicate()
-        rc2 = proc2.returncode or 0
-        tail2 = (stdout2 or b'').decode(errors='replace')[-2000:]
-        if rc2 != 0:
+        stdout, _ = await proc.communicate()
+        rc = proc.returncode or 0
+        tail = (stdout or b'').decode(errors='replace')[-2000:]
+        if rc != 0:
             logger.warning(
                 'DeterministicRunner: failed to register restart transient unit %s '
                 '(rc=%d) for task %s',
-                transient_unit, rc2, task_id,
+                transient_unit, rc, task_id,
             )
-        return rc2, tail2
+        return rc, tail
 
     async def _default_inspect_unit(self, unit: str) -> dict:
         """Query systemctl for unit state fields needed for fresh-PID verify.

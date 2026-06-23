@@ -1999,8 +1999,17 @@ class TestDefaultScheduleDetachedRestart:
             f'payload script must appear in argv: {all_argv!r}'
         )
 
-    async def test_argv_contains_on_failure_wiring(self, tmp_path: Path):
-        """OnFailure wiring token must appear in the spawn argv (--on-failure or OnFailure=)."""
+    async def test_escalation_is_gated_behind_restart_failure(self, tmp_path: Path):
+        """The escalation-submit must be wired into a failure branch, NOT run eagerly.
+
+        Previously the handler was a companion ``--unit=`` transient *service*
+        registered without ``--on-active`` — systemd-run starts such a unit
+        immediately, filing a spurious born-at-L2 on every successful self-deploy.
+        The corrected design defers the whole unit via ``--on-active`` and reaches
+        the escalation only through a shell failure branch (``[ "$rc" -ne 0 ]``)
+        that re-raises the restart's exit code.  Assert that gating is present
+        rather than an eager second registration.
+        """
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -2023,12 +2032,132 @@ class TestDefaultScheduleDetachedRestart:
                 task_id='900',
             )
 
+        # Exactly one systemd-run registration — no eager companion handler unit.
+        assert mock_exec.call_count == 1, (
+            f'expected a single systemd-run registration, got {mock_exec.call_count} '
+            '(an eager OnFailure handler unit would add a second one)'
+        )
         all_argv = ' '.join(
             str(a) for call in mock_exec.call_args_list for a in call.args
         )
-        assert 'OnFailure' in all_argv or '--on-failure' in all_argv, (
-            f'OnFailure wiring must appear in argv: {all_argv!r}'
+        # The single unit is deferred (so nothing runs at registration) and the
+        # escalation is reached only via a shell failure branch.
+        assert '--on-active' in all_argv, (
+            f'unit must be deferred via --on-active so it does not run eagerly: {all_argv!r}'
         )
+        assert '-ne 0' in all_argv, (
+            f'escalation must be gated behind a non-zero exit check: {all_argv!r}'
+        )
+
+    async def test_handler_does_not_execute_on_success_path(self, tmp_path: Path):
+        """Higher-fidelity: simulate systemd firing the wrapped payload.
+
+        Capture the ``/bin/sh -c`` wrapper systemd-run would defer, then execute
+        it for real with a SUCCEEDING restart script.  No escalation must be
+        filed (the bug was that registration itself filed one eagerly).
+        """
+        import asyncio as _asyncio
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path / 'q')
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        ok_script = tmp_path / 'deploy-ok.sh'
+        ok_script.write_text('#!/bin/sh\nexit 0\n')
+        ok_script.chmod(0o755)
+        before_done = {
+            'script': str(ok_script),
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        captured: dict = {}
+        real_exec = _asyncio.create_subprocess_exec
+
+        async def fake_exec(*argv, **kwargs):
+            captured['argv'] = argv
+            return self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', side_effect=fake_exec):
+            rc, _ = await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=1,
+                task_id='900',
+            )
+        assert rc == 0
+
+        argv = captured['argv']
+        assert argv[-3] == '/bin/sh' and argv[-2] == '-c', (
+            f'expected a /bin/sh -c wrapper payload, got {argv!r}'
+        )
+        wrapped = argv[-1]
+
+        # Fire the wrapped payload as systemd would (real shell, real CLI path).
+        proc = await real_exec(
+            '/bin/sh', '-c', wrapped,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.STDOUT,
+        )
+        await proc.communicate()
+        assert proc.returncode == 0, 'success-script wrapper must exit 0'
+        assert queue.get_by_task('900') == [], (
+            'no escalation may be filed on the success path'
+        )
+
+    async def test_handler_executes_on_failure_path(self, tmp_path: Path):
+        """Higher-fidelity counterpart: a FAILING restart fires exactly one L2.
+
+        Confirms the failure branch still reaches δ's escalation-submit CLI and
+        preserves the non-zero exit code.
+        """
+        import asyncio as _asyncio
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path / 'q')
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        fail_script = tmp_path / 'deploy-fail.sh'
+        fail_script.write_text('#!/bin/sh\nexit 7\n')
+        fail_script.chmod(0o755)
+        before_done = {
+            'script': str(fail_script),
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        captured: dict = {}
+        real_exec = _asyncio.create_subprocess_exec
+
+        async def fake_exec(*argv, **kwargs):
+            captured['argv'] = argv
+            return self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-901.service',
+                on_active_secs=1,
+                task_id='901',
+            )
+
+        wrapped = captured['argv'][-1]
+        proc = await real_exec(
+            '/bin/sh', '-c', wrapped,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.STDOUT,
+        )
+        await proc.communicate()
+        assert proc.returncode == 7, 'failure-script wrapper must preserve the exit code'
+
+        filed = queue.get_by_task('901')
+        assert len(filed) == 1, f'exactly one L2 must be filed on failure, got {len(filed)}'
+        assert filed[0].category == 'infra_issue'
+        assert filed[0].level == 2
 
     async def test_argv_contains_escalation_submit_cli(self, tmp_path: Path):
         """escalation submit CLI must appear in the spawn argv for OnFailure handling."""
