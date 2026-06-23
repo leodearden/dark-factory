@@ -2022,3 +2022,86 @@ async def test_collect_scheduler_state_uses_meta_files_for_deep_path(
     assert len(modules) == 1
     assert modules[0]['path'] == 'orchestrator/src'
     assert modules[0]['holder'] == '1'
+
+
+# ---------------------------------------------------------------------------
+# task-1870 step-1: _module_contention_counts attaches per-module park fields
+# ---------------------------------------------------------------------------
+
+
+def test_module_contention_counts_attaches_parked_by_and_stack():
+    """_module_contention_counts attaches parked_by/park_stack when park_stacks is provided.
+
+    B1 contract (§5 read seam):
+    - Two live tasks 'low' (shadowed) and 'high' (active top) both contend module 'm'.
+    - park_stacks carries a 2-deep stack in bottom→top order: low then high.
+    - stack[-1] is 'high' (active top) → parked_by == 'high'.
+    - All park owners are live → parked_owner_live is True.
+    - park_stack lists both entries with correct shadowed/live flags.
+
+    UNPARKED module:
+    - A module with no matching park_stacks key gets parked_by=None, park_stack=[].
+    """
+    from dashboard.data.scheduler import _module_contention_counts
+
+    iso = '2026-01-01T10:00:00+00:00'
+
+    rows = [
+        {'task_id': 'low', 'lock_set': ['m', 'other']},
+        {'task_id': 'high', 'lock_set': ['m', 'other']},
+    ]
+    park_stacks = {
+        'm': [
+            {'owner': 'low', 'rank': 10, 'shadowed': True, 'installed_at': iso},
+            {'owner': 'high', 'rank': 5, 'shadowed': False, 'installed_at': iso},
+        ]
+    }
+    live_task_ids = {'low', 'high'}
+
+    result = _module_contention_counts(
+        rows, {}, project='p',
+        park_stacks=park_stacks,
+        live_task_ids=live_task_ids,
+    )
+
+    # Find the 'm' module entry
+    m_entry = next((e for e in result if e['path'] == 'm'), None)
+    assert m_entry is not None, "Module 'm' must appear in result"
+
+    # parked_by must be the active top (stack[-1])
+    assert m_entry['parked_by'] == 'high', (
+        f"Expected parked_by='high' (active top), got {m_entry['parked_by']!r}"
+    )
+    assert m_entry['parked_by_project'] == 'p', (
+        f"Expected parked_by_project='p', got {m_entry['parked_by_project']!r}"
+    )
+    assert m_entry['parked_owner_live'] is True, (
+        f"Expected parked_owner_live=True (both owners are live), got {m_entry['parked_owner_live']!r}"
+    )
+
+    # park_stack must list both owners with correct shadowed/live flags
+    ps = m_entry['park_stack']
+    assert len(ps) == 2, f"Expected 2 entries in park_stack, got {len(ps)}"
+
+    # Bottom entry: 'low', shadowed=True, live=True
+    assert ps[0]['owner'] == 'low'
+    assert ps[0]['shadowed'] is True
+    assert ps[0]['live'] is True
+
+    # Top entry: 'high', shadowed=False, live=True
+    assert ps[1]['owner'] == 'high'
+    assert ps[1]['shadowed'] is False
+    assert ps[1]['live'] is True
+
+    # UNPARKED module 'other': no matching park_stacks key
+    other_entry = next((e for e in result if e['path'] == 'other'), None)
+    assert other_entry is not None, "Module 'other' must appear in result"
+    assert other_entry['parked_by'] is None, (
+        f"Expected parked_by=None for unparked module, got {other_entry['parked_by']!r}"
+    )
+    assert other_entry['parked_by_project'] is None, (
+        f"Expected parked_by_project=None for unparked module"
+    )
+    assert other_entry['park_stack'] == [], (
+        f"Expected park_stack=[] for unparked module, got {other_entry['park_stack']!r}"
+    )
