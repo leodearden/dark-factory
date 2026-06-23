@@ -14,10 +14,16 @@ Phase β delivers the **pure-gate** pattern
      no second escalation on quiescence).
    - Else (escalation resolved) → drive the task to ``done`` and return DONE
      (I2/B4/B11: resume path).
+   NOTE (γ): the resume branch must also run ``before_done`` before setting done
+   once task γ introduces before_done execution.  The NotImplementedError guard
+   in the resume branch below ensures a misconfigured task cannot silently bypass
+   before_done work.
 
 2. **Pure gate** (``before_done=None``, ``always_escalates=True``):
    - File one born-at-L2 escalation (I3: in-process submit, sentinel role
      ``orchestrator-deterministic`` keeps level=2 past the server downgrade gate).
+     Dedup: if a pending escalation already exists for the task (e.g. from a prior
+     crash-safe re-dispatch), filing is skipped to avoid duplicate L2 escalations.
    - Stamp ``metadata.gate_escalated_at`` (crash-safe: file-before-stamp means a
      stamp failure re-files rather than silently skipping the gate).
    - Set task status to ``blocked``.
@@ -49,13 +55,15 @@ class DeterministicRunner:
     Args:
         scheduler: The orchestrator Scheduler instance.
         escalation_queue: The in-process EscalationQueue for filing L2 gates.
-        event_store: Optional EventStore for task_started/completed events.
+
+    Note (γ): task γ will extend this runner with event_store and before_done
+    execution.  Adding event_store back then avoids a misleading dead dependency
+    in β.
     """
 
-    def __init__(self, scheduler, escalation_queue: EscalationQueue, event_store=None):
+    def __init__(self, scheduler, escalation_queue: EscalationQueue):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
-        self.event_store = event_store
 
     async def run(self, assignment) -> WorkflowOutcome:
         """Execute the deterministic gate logic for *assignment*.
@@ -65,7 +73,10 @@ class DeterministicRunner:
             WorkflowOutcome.BLOCKED — gate filed or open escalation (initial/quiescence).
 
         Raises:
-            NotImplementedError — if ``metadata.before_done`` is not None (task γ).
+            NotImplementedError — if ``metadata.before_done`` is not None (task γ),
+                either on the initial dispatch or on the resume path.
+            ValueError — if ``always_escalates`` is False with ``before_done=None``
+                (unsupported misconfiguration in β).
         """
         from escalation.models import Escalation
 
@@ -93,6 +104,16 @@ class DeterministicRunner:
                 return WorkflowOutcome.BLOCKED
             else:
                 # Escalation resolved — drive to done (I2/B4/B11).
+                # γ-guard: before_done execution on the resume path is task γ's scope.
+                # Without this guard a task with before_done set would silently skip its
+                # before_done work and be driven straight to done — bypassing the
+                # NotImplementedError guard below (which is unreachable on the resume path).
+                if before_done is not None:
+                    raise NotImplementedError(
+                        f'DeterministicRunner: before_done={before_done!r} is not '
+                        'implemented on the resume path in β (task γ delivers this). '
+                        f'Task id={task_id}.'
+                    )
                 logger.info(
                     'DeterministicRunner: task %s gate resolved — setting done',
                     task_id,
@@ -134,22 +155,33 @@ class DeterministicRunner:
         # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
         # failure on the following update_task re-files the gate on next dispatch
         # rather than silently skipping it).
-        esc = Escalation(
-            id=self.escalation_queue.make_id(task_id),
-            task_id=task_id,
-            agent_role='orchestrator-deterministic',
-            severity='critical',
-            category='milestone_gate',
-            summary=title[:200],
-            detail=detail,
-            options=list(gate_options),
-            level=2,
-        )
-        self.escalation_queue.submit(esc)
-        logger.info(
-            'DeterministicRunner: filed L2 milestone gate escalation %s for task %s',
-            esc.id, task_id,
-        )
+        # Dedup guard: if a prior crash-safe re-dispatch already submitted the
+        # escalation but failed before stamping gate_escalated_at, skip the
+        # submit to avoid duplicate L2 escalations (human sees multiple gates).
+        existing_pending = self.escalation_queue.get_by_task(task_id, status='pending')
+        if existing_pending:
+            logger.info(
+                'DeterministicRunner: task %s already has %d pending escalation(s) — '
+                'skipping re-file (gate_escalated_at stamp must have failed on prior dispatch)',
+                task_id, len(existing_pending),
+            )
+        else:
+            esc = Escalation(
+                id=self.escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='orchestrator-deterministic',
+                severity='critical',
+                category='milestone_gate',
+                summary=title[:200],
+                detail=detail,
+                options=list(gate_options),
+                level=2,
+            )
+            self.escalation_queue.submit(esc)
+            logger.info(
+                'DeterministicRunner: filed L2 milestone gate escalation %s for task %s',
+                esc.id, task_id,
+            )
 
         # Stamp gate_escalated_at AFTER successful escalation submit.
         now_iso = datetime.now(UTC).isoformat()

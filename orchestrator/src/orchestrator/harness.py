@@ -3625,7 +3625,6 @@ Output JSON matching the schema. Every task must appear in the output.
         runner = DeterministicRunner(
             scheduler=self.scheduler,
             escalation_queue=self._escalation_queue,
-            event_store=self.event_store,
         )
         outcome = await runner.run(assignment)
         return TaskReport(
