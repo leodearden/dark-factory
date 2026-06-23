@@ -713,13 +713,38 @@ async def collect_scheduler_state(
         rows = _compose_rows(enriched, snapshot, depth)
         all_rows.extend(rows)
 
+        # live_task_ids: the exact set _compose_rows iterates — defines "live"
+        # for the liveness oracle (PRD §3).  A park owner absent from this set
+        # is stranded and gets a synthetic row in the orphan pass below.
+        live_task_ids: set[str] = {r['task_id'] for r in rows}
+        # park_stacks: dict[module → list[entry]] from the snapshot (β pass-through).
+        # None-safe: pre-upgrade snapshots lacking the key degrade to empty dict.
+        park_stacks: dict = snapshot.get('park_stacks') or {}
+
         # Module contention from composed rows + snapshot holders.
         # Tag each module with the owning `project` so _merge_module_lists can
         # key by (project, path) — two projects sharing the same file path
         # (e.g. `src/utils.py`) must not collide into a single heatmap column.
+        # park_stacks/live_task_ids flow through so fully-stranded modules still
+        # get an entry (contention: 0) and every module entry carries
+        # parked_by/park_stack (PRD §5 read-seam contract, task γ B1/B2).
         current_holders: dict[str, str] = snapshot.get('current_holders') or {}
-        modules = _module_contention_counts(rows, current_holders, project=label)
+        modules = _module_contention_counts(
+            rows, current_holders,
+            project=label,
+            park_stacks=park_stacks,
+            live_task_ids=live_task_ids,
+        )
         all_modules = _merge_module_lists(all_modules, modules)
+
+        # Orphan/stranded pass — append synthetic rows for dead park owners
+        # AFTER module-contention is computed so contention counts reflect only
+        # live waiters (stranded rows must not inflate contention).
+        all_rows.extend(_stranded_park_rows(
+            park_stacks, live_task_ids,
+            project=label,
+            project_root=str(root),
+        ))
 
         # Pin queue — tag every pin entry with project/project_root before
         # extending.  Taskmaster task_ids are project-scoped, so the same
