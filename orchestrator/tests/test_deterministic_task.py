@@ -379,3 +379,62 @@ class TestB2GateDepsOk:
                 assert mock_attr.call_count == 0, (
                     f'git_ops.{method_name} must not be called for a deterministic gate'
                 )
+
+
+# ---------------------------------------------------------------------------
+# B3 — gate quiescence: repeated sweeps do NOT file a second L2 (step-4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestB3Quiescence:
+    """B3: re-dispatch of a blocked gate with a pending L2 stays BLOCKED without re-escalating.
+
+    Drives the production quiescence guard in DeterministicRunner section 1:
+    gate_escalated_at set + pending escalation → return BLOCKED (no re-file).
+    """
+
+    async def _reach_b2_state(self, h: Harness) -> None:
+        """Seed a gate and dispatch once to reach the B2 blocked+L2 state."""
+        store: _StoreScheduler = h.scheduler
+        task = _gate_task(task_id='gate-b3', title='Quiescence gate')
+        store.seed(task)
+        await _dispatch(h, 'gate-b3')
+
+    async def test_re_dispatches_all_return_blocked(self, det_harness: Harness) -> None:
+        """Each re-dispatch returns BLOCKED (quiescence — still open L2)."""
+        await self._reach_b2_state(det_harness)
+
+        for _ in range(2):
+            report = await _dispatch(det_harness, 'gate-b3')
+            assert report is not None
+            assert report.outcome == WorkflowOutcome.BLOCKED
+            assert report.block_reason == 'deterministic_gate'
+
+    async def test_still_exactly_one_escalation_after_re_dispatches(
+        self, det_harness: Harness
+    ) -> None:
+        """queue.get_by_task still has exactly ONE pending escalation after 3 sweeps."""
+        await self._reach_b2_state(det_harness)
+
+        # Two additional sweeps (total 3 dispatches)
+        await _dispatch(det_harness, 'gate-b3')
+        await _dispatch(det_harness, 'gate-b3')
+
+        queue: EscalationQueue = det_harness._escalation_queue
+        pending = queue.get_by_task('gate-b3', status='pending')
+        assert len(pending) == 1, (
+            f'Expected exactly 1 pending escalation after quiescent re-dispatches, '
+            f'got {len(pending)} (quiescence guard not firing?)'
+        )
+
+    async def test_status_remains_blocked_after_re_dispatches(
+        self, det_harness: Harness
+    ) -> None:
+        """Status stays 'blocked' through all quiescent sweeps."""
+        await self._reach_b2_state(det_harness)
+
+        await _dispatch(det_harness, 'gate-b3')
+        await _dispatch(det_harness, 'gate-b3')
+
+        store: _StoreScheduler = det_harness.scheduler
+        assert await store.get_status('gate-b3') == 'blocked'
