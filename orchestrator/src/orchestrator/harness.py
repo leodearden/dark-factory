@@ -41,6 +41,7 @@ from orchestrator.scheduler import (
 )
 from orchestrator.service_restart import StaleServiceRestartCoordinator
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
+from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -3372,6 +3373,17 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'Starting workflow for task {assignment.task_id}: '
                 f'{assignment.task.get("title", "")}'
             )
+
+            # ── Deterministic gate route ─────────────────────────────────────
+            # Check BEFORE substrate gate / steward / TaskWorkflow so that NO
+            # worktree, branch, agent, or steward is created (I4/B2).  The
+            # finally block still runs on the early return — releasing the
+            # semaphore, popping _escalation_events, and calling
+            # scheduler.release on the empty lock set held by a gate task.
+            if self.scheduler.is_deterministic(assignment.task):
+                return await self._run_deterministic_slot(assignment)
+            # ────────────────────────────────────────────────────────────────
+
             # Retrieve the escalation wake-event registered at dispatch time.
             # _register_escalation_event was called at the dispatch point
             # (before create_task) so _escalation_events already has an entry.
@@ -3598,6 +3610,29 @@ Output JSON matching the schema. Every task must appear in the output.
             # task is not immediately re-dispatched and re-blocked in a tight loop.
             self.scheduler.release(assignment.task_id, requeued=requeued or arm_requeue_cooldown)
             sem.release()
+
+    async def _run_deterministic_slot(self, assignment) -> TaskReport:
+        """Run a deterministic gate task via DeterministicRunner.
+
+        Instantiated with only scheduler + escalation_queue (no git_ops) —
+        structurally proving no worktree is created for a gate (I4/B2).
+        Returns a TaskReport with block_reason='deterministic_gate' on BLOCKED,
+        or a plain DONE report when the gate has been resolved (resume path).
+        """
+        from datetime import UTC, datetime
+        runner = DeterministicRunner(
+            scheduler=self.scheduler,
+            escalation_queue=self._escalation_queue,
+            event_store=self.event_store,
+        )
+        outcome = await runner.run(assignment)
+        return TaskReport(
+            task_id=assignment.task_id,
+            title=assignment.task.get('title', ''),
+            outcome=outcome,
+            completed_at=datetime.now(UTC).isoformat(),
+            block_reason='deterministic_gate' if outcome == WorkflowOutcome.BLOCKED else '',
+        )
 
     async def _maybe_auto_eval(
         self, assignment, report: TaskReport,
