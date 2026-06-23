@@ -6672,3 +6672,22 @@ class TestMergeTreeConflicts:
         assert sha_p_after.strip() == sha_p_before, 'task/mt-p ref was mutated'
         assert sha_q_after.strip() == sha_q_before, 'task/mt-q ref was mutated'
         assert head_after.strip() == head_before, 'HEAD was mutated'
+
+    async def test_bad_revision_raises_runtime_error(
+        self, git_ops: GitOps,
+    ) -> None:
+        """ERROR case: git merge-tree exits 128 for an unknown revision.
+
+        merge_tree_conflicts must raise (not return a misleading ConflictProbe)
+        when git exits with rc not in {0, 1}.  A bad SHA is a caller bug;
+        silently returning clean=True would admit a broken branch into verify,
+        and returning clean=False would falsely bounce a mergeable branch.
+        """
+        bogus = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await git_ops.merge_tree_conflicts('main', bogus)
+
+        err_text = str(exc_info.value)
+        # Should mention the rc and the offending refs
+        assert 'rc=' in err_text, f'Expected rc= in error message; got: {err_text!r}'
