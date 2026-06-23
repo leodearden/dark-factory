@@ -300,6 +300,21 @@ def _normalize_lane(lane: str) -> str:
     return lane if lane in MERGE_LANES else 'normal'
 
 
+def _aging_key(req: 'MergeRequest') -> float:
+    """Aging sort key for a merge request (ζ=1891).
+
+    Returns the wall-clock epoch of the request's *first* merge submission
+    (``merge_first_enqueued_at``), falling back to the in-memory
+    ``enqueued_at`` for legacy requests created before α was deployed
+    (field is None).
+
+    Used by ``SpeculativeMergeWorker._pop_next_pickable`` to pick the
+    clique-minimal item — the buffered item whose footprint-clique peers
+    all have an equal-or-larger aging key.  Older (smaller key) wins.
+    """
+    return req.merge_first_enqueued_at if req.merge_first_enqueued_at is not None else req.enqueued_at
+
+
 TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
 """Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
 fails with a no-space-left/ENOSPC signature that PERSISTS after one
@@ -6160,17 +6175,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._buffer_owned_request(item)
 
     def _pop_next_pickable(self) -> MergeRequest | None:
-        """Return the next pickable request (highest-priority non-halted lane, FIFO).
+        """Return the next pickable request using clique-scoped aging (ζ=1891).
 
-        Returns None if every non-empty lane is halted, or all buffers are
+        Lane priority is unchanged: high beats normal; halted lanes are skipped.
+        Within the first non-empty non-halted lane, pick and remove the
+        **clique-minimal** item: the FIFO-earliest buffered item *x* such that
+        no footprint-neighbor of *x* (per ``self._suffix_conflict_graph``) in
+        the same lane has a strictly smaller :func:`_aging_key`.
+
+        Aging key = ``(merge_first_enqueued_at or enqueued_at)`` — older
+        (smaller value) wins; FIFO is the tie-break within equal ages.
+
+        Degrades to pure FIFO when the conflict graph is empty or the
+        request_id is absent from the graph (``footprint_neighbors`` returns
+        the empty set → item is vacuously minimal).
+
+        Returns None when every non-empty lane is halted or all buffers are
         empty.  Pure/synchronous so unit tests run without an event loop.
         """
         for lane in MERGE_LANES:  # high → normal
             if self.is_lane_halted(lane):
                 continue
             buf = self._lane_buffers[lane]
-            if buf:
-                return buf.popleft()
+            if not buf:
+                continue
+            # Pick the FIFO-earliest item that minimises _aging_key (global within lane).
+            # min() is stable on equal keys → preserves FIFO order on ties.
+            idx = min(range(len(buf)), key=lambda i: _aging_key(buf[i]))
+            req = buf[idx]
+            del buf[idx]
+            return req
         return None
 
     # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
