@@ -1347,3 +1347,104 @@ class TestB9SubmitCli:
             '--agent-role', 'orchestrator-deterministic',
         ])
         assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# B10 — submit_task validation rejects ill-formed corners (step-13)
+# ---------------------------------------------------------------------------
+
+def _validate(task_kind: str, metadata: dict, project_root: str | None = None) -> dict | None:
+    """Invoke α's deterministic_task_error validator.
+
+    Tries in-process import first (succeeds in workspace-root venv).
+    Falls back to subprocess ``uv run --project fused-memory`` if
+    ModuleNotFoundError (e.g. orchestrator-only venv).
+
+    Returns the error dict or None (valid).
+    """
+    if project_root is None:
+        import tempfile
+        project_root = tempfile.mkdtemp()
+    try:
+        from fused_memory.middleware.deterministic_task_guard import (
+            deterministic_task_error,
+        )
+        return deterministic_task_error(task_kind, metadata, project_root)
+    except ModuleNotFoundError:
+        import json
+        import subprocess
+        import sys
+        from pathlib import Path as _Path
+        repo_root = _Path(__file__).parents[3]  # .worktrees/1903/
+        code = (
+            'import json, sys;'
+            'from fused_memory.middleware.deterministic_task_guard'
+            ' import deterministic_task_error;'
+            f'result = deterministic_task_error('
+            f'{task_kind!r}, {json.dumps(metadata)!r}, {project_root!r});'
+            'print(json.dumps(result))'
+        )
+        try:
+            out = subprocess.check_output(
+                [sys.executable, '-m', 'uv', 'run', '--project',
+                 str(repo_root / 'fused-memory'), 'python', '-c', code],
+                text=True,
+                timeout=30,
+            )
+            return json.loads(out.strip()) if out.strip() != 'null' else None
+        except (subprocess.SubprocessError, FileNotFoundError) as exc:
+            import pytest
+            pytest.skip(f'fused_memory not importable and uv fallback unavailable: {exc}')
+            return None  # unreachable but satisfies type checker
+
+
+class TestB10Validation:
+    """B10: α's deterministic_task_error rejects the two ill-formed corners.
+
+    (10a) deterministic + before_done=None + always_escalates=False → 'ill-formed no-op'
+    (10b) normal + before_done set → 'before_done is only valid on deterministic tasks'
+    (10c) valid deterministic gate (always_escalates=True, no before_done) → None
+
+    Uses in-process import when fused_memory is available (workspace-root venv)
+    or subprocess uv fallback otherwise.
+    """
+
+    def test_b10a_deterministic_no_op_rejected(self, tmp_path: Path) -> None:
+        """(10a) deterministic + no before_done + always_escalates=False → ill-formed no-op."""
+        result = _validate(
+            task_kind='deterministic',
+            metadata={'task_kind': 'deterministic', 'always_escalates': False, 'before_done': None},
+            project_root=str(tmp_path),
+        )
+        assert result is not None, 'Expected a validation error for ill-formed no-op'
+        assert 'error' in result
+        assert 'ill-formed no-op' in result['error'], (
+            f"Expected 'ill-formed no-op' in error, got: {result['error']!r}"
+        )
+
+    def test_b10b_before_done_on_normal_rejected(self, tmp_path: Path) -> None:
+        """(10b) normal + before_done set → 'before_done is only valid on deterministic tasks'."""
+        result = _validate(
+            task_kind='normal',
+            metadata={
+                'task_kind': 'normal',
+                'before_done': {'script': '/tmp/x.sh', 'timeout_secs': 30},
+            },
+            project_root=str(tmp_path),
+        )
+        assert result is not None, 'Expected a validation error for before_done on normal task'
+        assert 'error' in result
+        assert 'before_done is only valid on deterministic tasks' in result['error'], (
+            f"Expected 'before_done is only valid...' in error, got: {result['error']!r}"
+        )
+
+    def test_b10c_valid_deterministic_gate_passes(self, tmp_path: Path) -> None:
+        """(10c) valid deterministic gate (always_escalates=True, no before_done) → None."""
+        result = _validate(
+            task_kind='deterministic',
+            metadata={'task_kind': 'deterministic', 'always_escalates': True, 'before_done': None},
+            project_root=str(tmp_path),
+        )
+        assert result is None, (
+            f'Expected None (no error) for valid deterministic gate, got: {result!r}'
+        )
