@@ -12,6 +12,7 @@ Step-5 (1881): RED — B1 cancelled workflow must free lane via run() finally.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -854,4 +855,131 @@ class TestTerminalLaneReconciler:
 
         assert pool.state(lane) == LaneState.FREE, (
             f'cancelled task lane must be FREE after reconciler, got {pool.state(lane)!r}'
+        )
+
+
+# ===========================================================================
+# Step-15 (1881): RED — T10: recovery-sweep must release terminal task lanes
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRecoveryTerminalTaskLaneRelease:
+    """T10 (Recovery fix): _recover_crashed_tasks must release lanes whose task
+    is already terminal (done/cancelled) instead of restoring the assignment.
+
+    Diff 6: inside the 'if pool is not None and is_lane and recovery_id:' block,
+    BEFORE pool.restore_assignment(...), add:
+        term_status = await self.scheduler.get_status(recovery_id)
+        if term_status in ('done', 'cancelled'):
+            await self.git_ops.cleanup_worktree(entry, recovery_id)
+            cleaned += 1; continue
+
+    RED: recovery currently restores unconditionally (pool.restore_assignment
+    is called regardless of task status).
+    """
+
+    async def _make_recovery_setup(
+        self, tmp_path: Path, *, task_id: str = '3459'
+    ):
+        """Build harness with real git repo, GitOps pool, and a lane dir with
+        plan.json carrying a completed step — the minimum _recover_crashed_tasks
+        needs to reach the restore_assignment branch.
+
+        Returns: (harness, git_ops, pool, lane_entry)
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+            worktree_identity_guard_enabled=False,  # skip identity guard for simplicity
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+
+        # Create the lane dir and plan.json so _recover_crashed_tasks finds it
+        lane_entry = git_ops.worktree_base / '_lane-0'
+        lane_entry.mkdir(parents=True, exist_ok=True)
+        task_dir = lane_entry / '.task'
+        task_dir.mkdir(exist_ok=True)
+        plan = {
+            'task_id': task_id,
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'type': 'test',
+                    'description': 'already done step',
+                    'status': 'done',
+                },
+            ],
+        }
+        (task_dir / 'plan.json').write_text(json.dumps(plan))
+
+        return harness, git_ops, pool, lane_entry
+
+    async def test_recovery_releases_terminal_task_lane(self, tmp_path: Path):
+        """(21) Done task: cleanup_worktree called, restore_assignment NOT called,
+        task NOT stored in _recovered_plans."""
+        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+
+        harness.scheduler.get_status = AsyncMock(return_value='done')
+
+        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
+             patch.object(pool, 'restore_assignment') as mock_restore:
+            await harness._recover_crashed_tasks()
+
+        # Terminal task: cleanup must have been called (closes the T10 amplifier)
+        mock_cleanup.assert_called_once()
+        # restore_assignment must NOT have been called
+        mock_restore.assert_not_called()
+        # Task must NOT be stored for resumption
+        assert '3459' not in harness._recovered_plans, (
+            'terminal task lane must not be stored in _recovered_plans'
+        )
+
+    async def test_recovery_restores_non_terminal_task_lane(self, tmp_path: Path):
+        """(22) Non-terminal task (in-progress): restore_assignment IS called;
+        plan IS stored for resumption (regression guard — existing behavior preserved)."""
+        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+
+        harness.scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
+             patch.object(pool, 'restore_assignment') as mock_restore:
+            await harness._recover_crashed_tasks()
+
+        # Non-terminal: restore_assignment must be called (existing behaviour)
+        mock_restore.assert_called_once()
+        # Plan must be stored for resumption
+        assert '3459' in harness._recovered_plans, (
+            'in-progress task plan must be stored in _recovered_plans'
+        )
+
+    async def test_recovery_restores_on_status_read_failure(self, tmp_path: Path):
+        """(23) Transient get_status=None: falls through to restore_assignment.
+
+        Safe default: layer A (_reconcile_terminal_lanes) self-heals any
+        genuinely-terminal lane on the next reconcile interval.
+        """
+        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+
+        # Transient failure: get_status returns None (not in ('done','cancelled'))
+        harness.scheduler.get_status = AsyncMock(return_value=None)
+
+        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
+             patch.object(pool, 'restore_assignment') as mock_restore:
+            await harness._recover_crashed_tasks()
+
+        # Fail-safe: restore_assignment must be called (layer A self-heals later)
+        mock_restore.assert_called_once()
+        assert '3459' in harness._recovered_plans, (
+            'task with None status must fall through to restore (safe default; A self-heals)'
         )
