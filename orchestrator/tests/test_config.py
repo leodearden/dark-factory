@@ -124,6 +124,31 @@ class TestDefaults:
         cfg = GitConfig(commit_citation_pattern='')
         assert cfg.commit_citation_pattern == ''
 
+    def test_spare_warm_lanes_default_zero(self):
+        """GitConfig().spare_warm_lanes defaults to 0 (byte-identical for all projects)."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig()
+        assert cfg.spare_warm_lanes == 0
+
+    def test_spare_warm_lanes_explicit_override(self):
+        """spare_warm_lanes=8 is accepted and stored verbatim."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig(spare_warm_lanes=8)
+        assert cfg.spare_warm_lanes == 8
+
+    def test_spare_warm_lanes_ge_0_rejects_negative(self):
+        """spare_warm_lanes=-1 must raise ValidationError (ge=0 bound).
+
+        A negative value would shrink the pool below the derived base,
+        which is never valid.
+        """
+        from orchestrator.config import GitConfig
+
+        with pytest.raises(ValidationError):
+            GitConfig(spare_warm_lanes=-1)
+
     def test_fused_memory_defaults(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)

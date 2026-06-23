@@ -460,7 +460,8 @@ class Harness:
             config.git,
             config.project_root,
             warm_lane_pool_size=(
-                config.max_concurrent_tasks if config.git.warm_lane_pool else 0
+                (config.max_concurrent_tasks + config.git.spare_warm_lanes)
+                if config.git.warm_lane_pool else 0
             ),
             # Spec-pool size: K (same as speculation_depth) when knob on, else 0.
             # self._speculation_k is safe here — self.config is already set above.

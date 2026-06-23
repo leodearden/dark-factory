@@ -901,6 +901,20 @@ class GitConfig(BaseModel):
             'of this policy; it is flagged for update separately via escalate_info.'
         ),
     )
+    spare_warm_lanes: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            'Extra warm task-lanes allocated ABOVE the derived pool size '
+            '(max_concurrent_tasks); effective pool N = max_concurrent_tasks + '
+            'spare_warm_lanes when warm_lane_pool is on (read once at startup by '
+            'Harness, passed to GitOps). Gives acquire headroom so a transient '
+            'lane-leak / stuck-ASSIGNED lane does not exhaust the pool and force '
+            'the inv.6 cold-fallback under light load. Default 0 → byte-identical '
+            'to prior behaviour (max + 0 == max); no effect when warm_lane_pool is '
+            'off and does not size the merge-spec pool.'
+        ),
+    )
     warm_lane_base_target_dir: str | None = Field(
         default=None,
         description=(
