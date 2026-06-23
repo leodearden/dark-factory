@@ -3348,6 +3348,29 @@ class Scheduler:
                 self._external_hold_cause.pop(tid, None)
                 self._external_resolver_degraded_counts.pop(tid, None)
 
+        # Starvation-watchdog GC (task 1880): for tasks that have gone terminal
+        # or been removed from the task list while a watchdog INFO escalation is
+        # still open, self-resolve the escalation and clear the watchdog state.
+        # Uses a SEPARATE guard (not merged with the _external_hold_streak block
+        # above) so it runs even when those external dicts are empty — mirrors
+        # the dedicated _external_unresolved_counts block.  The resolve callback
+        # is wrapped in try/except so a failure never aborts the GC sweep.
+        if _stale_ids and (self._starvation_escalated or self._starvation_first_seen):
+            for tid in _stale_ids:
+                if tid in self._starvation_escalated:
+                    if self._on_starvation_resolve is not None:
+                        try:
+                            await self._on_starvation_resolve(tid)
+                        except Exception:
+                            logger.warning(
+                                'Starvation watchdog GC resolve for tid=%s raised '
+                                '— continuing GC normally',
+                                tid,
+                                exc_info=True,
+                            )
+                    self._starvation_escalated.discard(tid)
+                self._starvation_first_seen.pop(tid, None)
+
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
         # both the scored-candidate loop and the pin-dispatch loop so both
