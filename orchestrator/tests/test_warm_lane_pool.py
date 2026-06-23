@@ -2312,3 +2312,121 @@ class TestCreateWorktreeWarmLaneRouting:
         assert not cold_dir.exists(), (
             f'Cold dir {cold_dir} must NOT be created when pool lane was used'
         )
+
+
+# ===========================================================================
+# Step-3: RED — GitOps.release_lane_for_terminal_task (shared primitive)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestReleaseLaneForTerminalTask:
+    """GitOps.release_lane_for_terminal_task — idempotent, never-raise shared primitive.
+
+    Tests use in-memory assignment and disk backstop scenarios.
+    Git operations inside release_warm_lane are best-effort (fail silently when
+    no real worktree exists) so pool state assertions hold regardless.
+    """
+
+    async def test_release_resolves_via_in_memory_assignment(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Acquire '3459' → release_lane_for_terminal_task('3459') → True, lane FREE."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        result = await pool.acquire_for('3459')
+        assert result is not None
+        lane, _ = result
+
+        freed = await git_ops.release_lane_for_terminal_task('3459')
+
+        assert freed is True
+        assert pool.state(lane) == LaneState.FREE
+        assert pool.assignment_for('3459') is None
+
+    async def test_release_strips_branch_prefix(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """release_lane_for_terminal_task('task/3459') strips branch_prefix, frees lane."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        result = await pool.acquire_for('3459')
+        assert result is not None
+        lane, _ = result
+
+        freed = await git_ops.release_lane_for_terminal_task('task/3459')
+
+        assert freed is True
+        assert pool.state(lane) == LaneState.FREE
+
+    async def test_release_resolves_via_plan_json_backstop(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """ASSIGNED lane with empty _assignments → disk backstop finds and frees it."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        # try_acquire marks _lane-0 ASSIGNED but adds NO _assignments entry for '3459'
+        lane = await pool.try_acquire()
+        assert lane is not None
+
+        # Create the lane directory and write plan.json backstop
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+
+        freed = await git_ops.release_lane_for_terminal_task('3459')
+
+        assert freed is True, 'disk backstop must find _lane-0 and free it'
+        assert pool.state(lane) == LaneState.FREE
+
+    async def test_release_returns_false_when_no_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Unknown task id with no assignment and no plan.json → False, no raise."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        freed = await git_ops.release_lane_for_terminal_task('99999')
+
+        assert freed is False
+
+    async def test_release_is_idempotent(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """First release → True; second release → False; lane stays FREE (B+A double-fire)."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        result = await pool.acquire_for('3459')
+        assert result is not None
+        lane, _ = result
+
+        first = await git_ops.release_lane_for_terminal_task('3459')
+        assert first is True
+        assert pool.state(lane) == LaneState.FREE
+
+        # Second call: no in-memory assignment, no plan.json on disk
+        second = await git_ops.release_lane_for_terminal_task('3459')
+        assert second is False, '2nd call (neither in-memory nor disk) must return False'
+        assert pool.state(lane) == LaneState.FREE, 'lane must remain FREE after double-fire'
+
+    async def test_release_never_raises_on_cleanup_error(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """cleanup_worktree raising → primitive catches exception, returns False."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        result = await pool.acquire_for('3459')
+        assert result is not None
+
+        async def _raise(*args: object, **kwargs: object) -> None:
+            raise RuntimeError('simulated cleanup failure')
+
+        monkeypatch.setattr(git_ops, 'cleanup_worktree', _raise)
+
+        freed = await git_ops.release_lane_for_terminal_task('3459')
+        assert freed is False, 'cleanup error must be swallowed and return False'
