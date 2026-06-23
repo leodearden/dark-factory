@@ -10005,3 +10005,104 @@ class TestStarvationWatchdog:
             '_starvation_first_seen must be cleared by the continuity reset '
             'when the task is no longer a dispatch-eligible candidate'
         )
+
+
+# ---------------------------------------------------------------------------
+# α dispatch-time directory-lock strip tests (PRD α, task 1906)
+# ---------------------------------------------------------------------------
+
+class TestGetModulesAlphaDirectoryStrip:
+    """_get_modules must strip directory entries (α strip) before lock derivation.
+
+    A directory entry like 'crates/reify-eval/src' (no recognised file extension)
+    must NOT produce a subtree-wide prefix lock.  When ALL entries are directories
+    the result must fall through to the existing task-<id> synthetic fallback.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_directory_only_files_returns_task_fallback(self, scheduler: Scheduler):
+        """directory-only metadata.files → task-<id> fallback, not a wide module."""
+        task = {
+            'id': 'D',
+            'metadata': {'files': ['crates/reify-eval/src', 'crates/reify-eval/tests']},
+        }
+        result = scheduler._get_modules(task)
+        assert result == ['task-D'], (
+            f'Expected task-D fallback for directory-only files, got: {result}'
+        )
+
+    def test_mixed_files_strips_directory_keeps_file_module(self, scheduler: Scheduler):
+        """Mixed files: directory stripped, file sibling's module kept."""
+        task = {
+            'id': 'M',
+            'metadata': {'files': ['crates/reify-eval/src', 'crates/reify-eval/src/foo.rs']},
+        }
+        result = scheduler._get_modules(task)
+        # The file 'crates/reify-eval/src/foo.rs' should produce a module;
+        # the bare directory 'crates/reify-eval/src' must NOT appear as a module entry.
+        assert 'crates/reify-eval/src' not in result, (
+            f'Directory entry must not appear as a derived module: {result}'
+        )
+        assert len(result) > 0, f'Expected at least one module from file sibling, got: {result}'
+
+    def test_no_derived_module_equals_stripped_directory(self, scheduler: Scheduler):
+        """No derived module may equal a stripped directory entry."""
+        task = {
+            'id': 'S',
+            'metadata': {'files': ['backend', 'backend/app.py']},
+        }
+        result = scheduler._get_modules(task)
+        # 'backend' is a directory entry and must not appear unchanged as a module.
+        assert 'backend' not in result, (
+            f'Bare directory "backend" must not survive into derived modules: {result}'
+        )
+
+
+@pytest.mark.asyncio
+class TestAcquireNextDirectoryCharterBoundary:
+    """G2 boundary / repro (reify-3468): a directory-charter task must NOT block
+    an unrelated sibling that edits a file inside the same directory.
+
+    This test reproduces the exact failure: at lock_depth=10, a directory entry
+    like 'crates/reify-eval/src' previously survived normalize_lock unchanged and
+    became a prefix lock that modules_conflict treated as conflicting with EVERY
+    file under that subtree — so the sibling was blocked.
+
+    After the α strip the directory charter yields no subtree lock (or the
+    task-<id> synthetic fallback, which conflicts with nothing), so BOTH tasks
+    are dispatchable.
+    """
+
+    async def test_directory_charter_does_not_block_sibling_file_task(self):
+        """Both a directory-charter task and a file sibling are dispatchable."""
+        config = OrchestratorConfig(lock_depth=10, max_per_module=1)
+        scheduler = Scheduler(config)
+
+        task_dir = {
+            'id': 'dir',
+            'title': 'Directory charter task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['crates/reify-eval/src', 'crates/reify-eval/tests']},
+        }
+        task_sib = {
+            'id': 'sib',
+            'title': 'Sibling file task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['crates/reify-eval/src/unrelated.rs']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_dir, task_sib])
+
+        first = await scheduler.acquire_next()
+        assert first is not None, 'First acquire_next() must dispatch a task'
+
+        second = await scheduler.acquire_next()
+        assert second is not None, (
+            'Directory charter must NOT block the sibling: both should be dispatchable. '
+            f'First dispatched: {first.task_id}; second was None (blocked).'
+        )
