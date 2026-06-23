@@ -857,3 +857,194 @@ class TestBeforeDoneRcNonZero:
         outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# Step-5: B7b — verify-fail: stale/missing PID or non-fresh timestamp
+# (RED until step-6 implements the verify-fail path)
+# ---------------------------------------------------------------------------
+
+# Parametrize two sub-cases:
+#   (a) MainPID is a sentinel (0 or '-')
+#   (b) ActiveEnterTimestampMonotonic <= baseline (not strictly after)
+_STALE_POST_STATES = [
+    pytest.param(
+        # (a) sentinel: MainPID = 0
+        {'MainPID': 0, 'ActiveState': 'failed', 'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC', 'ActiveEnterTimestampMonotonic': 2_000_000},
+        id='pid-zero',
+    ),
+    pytest.param(
+        # (a) sentinel: MainPID = '-' (systemd string for inactive)
+        {'MainPID': '-', 'ActiveState': 'failed', 'ActiveEnterTimestamp': 'Mon 2026-06-23 10:00:00 UTC', 'ActiveEnterTimestampMonotonic': 2_000_000},
+        id='pid-dash',
+    ),
+    pytest.param(
+        # (b) non-fresh monotonic: equal to baseline (not strictly after)
+        {'MainPID': 200, 'ActiveState': 'active', 'ActiveEnterTimestamp': 'Mon 2026-06-23 10:00:00 UTC', 'ActiveEnterTimestampMonotonic': 1_000_000},
+        id='monotonic-equal-to-baseline',
+    ),
+    pytest.param(
+        # (b) non-fresh monotonic: strictly before baseline
+        {'MainPID': 200, 'ActiveState': 'active', 'ActiveEnterTimestamp': 'Mon 2026-06-23 09:59:00 UTC', 'ActiveEnterTimestampMonotonic': 500_000},
+        id='monotonic-before-baseline',
+    ),
+]
+
+
+@pytest.mark.asyncio
+class TestBeforeDoneVerifyFail:
+    """DeterministicRunner — before_done verify fails: stale PID / non-fresh timestamp (B7b)."""
+
+    @pytest.mark.parametrize('post_state', _STALE_POST_STATES)
+    async def test_b7b_files_exactly_one_infra_issue_escalation(self, tmp_path: Path, post_state: dict):
+        """Script rc=0 but stale unit state → exactly one pending infra_issue escalation (B7b)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='400', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, post_state])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('400', status='pending')
+        assert len(pending) == 1, f'Expected 1 pending escalation, got {len(pending)}'
+
+    @pytest.mark.parametrize('post_state', _STALE_POST_STATES)
+    async def test_b7b_escalation_level_role_category(self, tmp_path: Path, post_state: dict):
+        """Filed escalation: level=2, severity='critical', role='orchestrator-deterministic', category='infra_issue'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='400', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, post_state])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('400', status='pending')
+        assert escs[0].level == 2
+        assert escs[0].severity == 'critical'
+        assert escs[0].agent_role == 'orchestrator-deterministic'
+        assert escs[0].category == 'infra_issue'
+
+    @pytest.mark.parametrize('post_state', _STALE_POST_STATES)
+    async def test_b7b_escalation_detail_contains_target_unit(self, tmp_path: Path, post_state: dict):
+        """Escalation detail mentions the target_unit (needed for operator triage, B7b)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='400', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, post_state])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('400', status='pending')
+        assert 'orchestrator-reify.service' in escs[0].detail, (
+            f'target_unit must appear in detail: {escs[0].detail!r}'
+        )
+
+    @pytest.mark.parametrize('post_state', _STALE_POST_STATES)
+    async def test_b7b_sets_blocked_never_done(self, tmp_path: Path, post_state: dict):
+        """set_task_status called with 'blocked' and NEVER with 'done' (B7b)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='400')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, post_state])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        blocked_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'blocked']
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(blocked_calls) == 1, 'Must set blocked once'
+        assert len(done_calls) == 0, 'Must never set done on verify failure'
+
+    @pytest.mark.parametrize('post_state', _STALE_POST_STATES)
+    async def test_b7b_stamps_before_done_ran_at(self, tmp_path: Path, post_state: dict):
+        """before_done_ran_at stamped even on verify-fail (I1 crash-safe)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='400')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, post_state])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must stamp before_done_ran_at on verify-fail'
+
+    @pytest.mark.parametrize('post_state', _STALE_POST_STATES)
+    async def test_b7b_outcome_is_blocked(self, tmp_path: Path, post_state: dict):
+        """Verify-fail → outcome is WorkflowOutcome.BLOCKED (B7b)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='400')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, post_state])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
