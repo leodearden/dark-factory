@@ -4956,6 +4956,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         'plan_files_narrowed',
                     )
 
+        # Stamp write-once first-submission epoch before construction so every
+        # submit path (including coalesced/attached) records the lineage's age.
+        # The stamp is a no-op (fast-path return) when metadata already carries
+        # the value (resubmit / post-restart re-dispatch).
+        first_enqueued_at = await self._stamp_first_merge_enqueue()
+
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
         from orchestrator.merge_queue import lane_for_task_metadata
         merge_request = MergeRequest(
@@ -4968,6 +4974,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             config=self.config,
             result=future,
             lane=lane_for_task_metadata(self.task.get('metadata')),
+            merge_first_enqueued_at=first_enqueued_at,
         )
 
         attached = False
