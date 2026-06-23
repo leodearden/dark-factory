@@ -52,16 +52,6 @@ class TestDeterministicTaskErrorInvariantMatrix:
         result = deterministic_task_error('deterministic', {'always_escalates': True}, '/proj')
         assert result is None
 
-    def test_deterministic_before_done_present_accepts_without_filesystem_check(self):
-        """task_kind='deterministic', before_done={any dict} → accepted (before_done presence alone valid at step-2).
-
-        NOTE: After step-4 this case will be further validated for filesystem constraints.
-        This specific subtest is only valid before filesystem checks are added.
-        """
-        # Not testing filesystem here — that's covered in step-3/step-4
-        # Just confirm before_done dict presence is recognized (invariant-level only)
-        pass  # covered by step-3 tests
-
     def test_normal_no_before_done_accepts(self):
         """task_kind='normal', metadata=None → accept."""
         result = deterministic_task_error('normal', None, '/proj')
@@ -93,18 +83,43 @@ class TestDeterministicTaskErrorInvariantMatrix:
         assert result is not None
         assert result.get('error_type') == 'ValidationError'
 
-    def test_deterministic_always_escalates_truthy_int_accepts(self):
-        """always_escalates=1 (truthy) + no before_done → accept."""
+    def test_deterministic_always_escalates_non_bool_truthy_rejects(self):
+        """always_escalates=1 (truthy int, not bool True) + no before_done → reject.
+
+        Only the exact boolean True satisfies the gate; non-bool truthy values
+        (int 1, string 'true', etc.) do NOT, preventing 'false' → True coercion bugs.
+        """
         result = deterministic_task_error('deterministic', {'always_escalates': 1}, '/proj')
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_normal_with_always_escalates_true_rejects(self):
+        """task_kind='normal', always_escalates=True → reject (mirrors the before_done rule)."""
+        result = deterministic_task_error('normal', {'always_escalates': True}, '/proj')
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        msg = result['error']
+        assert 'always_escalates' in msg
+        assert 'deterministic' in msg
+
+    def test_non_dict_json_metadata_silently_coerced_to_empty(self):
+        """metadata that parses to a non-dict JSON value (list, number) is silently coerced
+        to an empty dict — the payload is lost rather than raising an error.
+
+        This mirrors TaskInterceptor._inject_routing_override (an accepted project convention).
+        Documented here so the behavior is explicit and observable in the test suite.
+        """
+        # A JSON array parses fine but is not a dict → coerced to {} → normal task
+        # with no before_done → accepts (no validation errors)
+        result = deterministic_task_error('normal', '["a", "b"]', '/proj')
         assert result is None
 
     def test_returns_hint_key_on_rejection(self):
-        """Rejected results may include a 'hint' key (optional but encouraged)."""
+        """Rejected results always include a 'hint' key with an actionable string."""
         result = deterministic_task_error('bogus', {}, '/proj')
         assert result is not None
-        # hint is optional but if present must be a string
-        if 'hint' in result:
-            assert isinstance(result['hint'], str)
+        assert 'hint' in result
+        assert isinstance(result['hint'], str)
 
 
 # ---------------------------------------------------------------------------

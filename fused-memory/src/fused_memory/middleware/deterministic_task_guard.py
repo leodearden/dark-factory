@@ -107,10 +107,13 @@ def deterministic_task_error(
 
     meta = _parse_metadata(metadata)
     before_done = meta.get('before_done')
-    always_escalates = bool(meta.get('always_escalates', False))
+    # Use identity check (is True) rather than bool() so that non-bool truthy values
+    # (e.g. always_escalates='false', always_escalates=1) do NOT satisfy the gate.
+    # bool('false') == True, which would silently accept the opposite of the caller's intent.
+    always_escalates = meta.get('always_escalates', False)
 
     # Invariant 2: deterministic no-op
-    if task_kind == 'deterministic' and before_done is None and not always_escalates:
+    if task_kind == 'deterministic' and before_done is None and always_escalates is not True:
         return _validation_error(
             "ill-formed no-op: a deterministic task must run an action "
             "(before_done) or always escalate (always_escalates=True).",
@@ -128,6 +131,17 @@ def deterministic_task_error(
             hint=(
                 "Either set task_kind='deterministic' to enable the before_done "
                 "action, or remove before_done from metadata."
+            ),
+        )
+
+    # Invariant 3b: always_escalates on a normal task (mirrors the before_done rule)
+    if task_kind == 'normal' and always_escalates is True:
+        return _validation_error(
+            "always_escalates is only valid on deterministic tasks "
+            "(task_kind='deterministic').",
+            hint=(
+                "Either set task_kind='deterministic' to enable the always_escalates "
+                "gate, or remove always_escalates from metadata."
             ),
         )
 
