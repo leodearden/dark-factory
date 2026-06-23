@@ -334,11 +334,14 @@ function TaskDetail({ task, allTasks }) {
               const m = moduleByPath.get(modPath);
               const holder = m && m.holder;
               const holderProject = m && m.holder_project;
+              const parkedBy = m && m.parked_by;
+              const parkedOwnerLive = m && m.parked_owner_live;
               const isMine = holder === rawTaskId && (holderProject || task.project) === task.project;
-              const cls = !holder ? 'lock-free' : isMine ? 'lock-mine' : 'lock-taken';
+              const cls = !holder ? (parkedBy ? 'lock-parked' : 'lock-free') : isMine ? 'lock-mine' : 'lock-taken';
               return (
                 <span key={modPath} className={`chip ${cls}`} title={modPath}>
                   <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelMap ? labelMap.get(modPath) : modPath}</span>
+                  {cls === 'lock-parked' && <span className="holder">⏸ T-{parkedBy}{parkedOwnerLive === false && ' ⚠'}</span>}
                   {cls === 'lock-taken' && <span className="holder">⊘ T-{holder}</span>}
                 </span>
               );
