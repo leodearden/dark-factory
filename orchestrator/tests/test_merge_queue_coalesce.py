@@ -1879,6 +1879,52 @@ class TestRedriveCoalesceMembers:
             assert c.args[1] is True, f'found_on_main should be True: {c}'
             assert c.args[2] == 'tipsha1234', f'sha mismatch: {c}'
 
+    async def test_on_main_falls_back_to_main_sha_when_resolve_returns_none(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """resolve_branch_sha=None: fallback to main_sha guards against None reaching mark_done.
+
+        The expression ``sha = resolve_branch_sha(branch) or main_sha`` must produce
+        main_sha when resolve_branch_sha returns None (e.g. branch tip is not yet
+        reachable).  This is the path most likely to regress into a None-sha mark_done
+        failure; pinning it here catches that regression.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        status_check = AsyncMock(return_value={
+            'm1': 'merge-deferred',
+        })
+        redrive_member = AsyncMock()
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, train_callback_factory=_stub_factory())
+
+        req = self._make_group(
+            coalesce_config, tmp_path,
+            status_check=status_check,
+            redrive_member=redrive_member,
+        )
+
+        with (
+            patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
+            # resolve_branch_sha returns None → must fall back to main_sha
+            patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value=None)),
+        ):
+            await worker._redrive_coalesce_members(req, 'fallback-main-sha')
+
+        calls = redrive_member.await_args_list
+        assert len(calls) == 1, f'Expected exactly 1 redrive_member call; got {len(calls)}'
+        call = calls[0]
+        assert call.args[0] == 'm1', f'mid mismatch: {call}'
+        assert call.args[1] is True, f'found_on_main should be True: {call}'
+        assert call.args[2] == 'fallback-main-sha', (
+            f'sha should fall back to main_sha when resolve_branch_sha returns None; '
+            f'got {call.args[2]!r}'
+        )
+
     async def test_none_redrive_member_returns_without_raising(
         self,
         git_ops: GitOps,

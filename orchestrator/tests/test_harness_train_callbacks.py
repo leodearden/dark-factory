@@ -308,6 +308,56 @@ class TestRedriveMember:
         assert cbs.redrive_member is not None, "redrive_member must not be None"
         assert callable(cbs.redrive_member), "redrive_member must be callable"
 
+    @pytest.mark.asyncio
+    async def test_redrive_falls_through_on_get_statuses_error(self) -> None:
+        """When get_statuses returns a transient error, redrive_member still attempts the flip.
+
+        The documented fall-through: if err is not None the existence probe cannot
+        determine whether the member is a real task, so the closure proceeds
+        conservatively and attempts the status write (fail-open policy, mirrors
+        mark_member_done accepted limitation).
+
+        Pins the contract so a regression that changed the error path to early-return
+        would be caught.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        class ErrorScheduler:
+            """get_statuses always fails; other methods record calls normally."""
+
+            def __init__(self):
+                self.statuses: dict[str, list[str]] = {}
+                self.provenance: dict[str, dict] = {}
+
+            async def get_statuses(
+                self, ids: list[str] | None = None
+            ) -> tuple[dict[str, str], Exception | None]:
+                return {}, RuntimeError('transient backend error')
+
+            async def set_task_status(
+                self, task_id: str, status: str, **_kwargs
+            ) -> None:
+                self.statuses.setdefault(task_id, []).append(status)
+
+            def clear_requeue_count(self, task_id: str) -> None:
+                pass
+
+        sched = ErrorScheduler()
+        factory = build_train_callback_factory(sched)
+        cbs = factory('train-err-fallthrough')
+
+        assert cbs.redrive_member is not None
+        # Seed nothing — existence probe will return (empty, error).
+        # The closure must still attempt the flip (fail-open fall-through).
+        await cbs.redrive_member('task-9001', False, None)
+
+        assert 'task-9001' in sched.statuses, (
+            "redrive_member must attempt set_task_status even when get_statuses errors"
+        )
+        assert sched.statuses['task-9001'][-1] == 'pending', (
+            f"expected 'pending' on error fall-through; got {sched.statuses['task-9001']!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step 7 / Step 8 — harness wiring

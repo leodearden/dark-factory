@@ -406,6 +406,23 @@ def build_train_callback_factory(scheduler: Any) -> TrainCallbackFactory:
                     note=f'coalesce-derail re-drive: branch already on main (train {train_id})',
                 )
             else:
+                # Race-condition guard: re-check the current status from the
+                # probe we just issued.  If the member has advanced to a live
+                # status (e.g. 'in-progress') in the window between the
+                # _redrive_coalesce_members snapshot and this flip, the live
+                # workflow already owns the transition — skip the clobber.
+                # When err is not None (transient backend error) we fall
+                # through conservatively and attempt the flip, mirroring the
+                # same fail-open policy as the non-task probe above.
+                current = statuses.get(mid)
+                if err is None and current is not None and current != 'merge-deferred':
+                    logger.info(
+                        'train %s: member %s is now %r (moved past merge-deferred '
+                        'since re-drive snapshot) — live workflow owns transition; '
+                        'skipping pending flip',
+                        train_id, mid, current,
+                    )
+                    return
                 # Flip to pending so the scheduler re-dispatches a fresh solo
                 # merge workflow that will own the merge-deferred→done transition.
                 await scheduler.set_task_status(mid, 'pending')

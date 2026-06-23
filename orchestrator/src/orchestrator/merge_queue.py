@@ -7078,6 +7078,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # per-member is_ancestor guard makes all non-done outcomes
                             # safe (already-landed members flip done, genuinely-
                             # unlanded members flip pending for solo re-dispatch).
+                            #
+                            # Note — wip_halted IS included here (unlike one-strike
+                            # exclusion).  A coalesce GroupMergeRequest with
+                            # wip_halted has no awaiter to re-fire it, so absorbed
+                            # members would be permanently stranded in merge-deferred
+                            # if we skipped re-drive.  Re-pending sends them back to
+                            # the scheduler as solo candidates; each fresh workflow
+                            # will hit the WIP-halt barrier independently and wait
+                            # correctly.  The one-strike exclusion rationale (wip_halted
+                            # is "policy-driven") governs whether to EXCLUDE members
+                            # from the NEXT coalescing pass, which is a separate gate.
+                            #
+                            # Known gap (out of scope): if _do_train_merge returns
+                            # 'done' but mark_member_done suffers a transient
+                            # get_statuses error, one or more members may be left
+                            # un-flipped in merge-deferred.  The re-drive below is
+                            # intentionally excluded for the 'done' path because the
+                            # success flow already logs "manual cleanup required" for
+                            # TRAIN_PARTIAL_FLIP.  Covering the done-path gap is a
+                            # follow-up task.
                             if outcome.status != 'done':
                                 try:
                                     await self._redrive_coalesce_members(req, actual_main)
