@@ -18,8 +18,8 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
-from shared.mcp_envelope import resolver_failed
 from shared.locking import strip_directory_locks
+from shared.mcp_envelope import resolver_failed
 from shared.safe_io import load_json_or_warn
 
 from orchestrator import digest as digest_mod
