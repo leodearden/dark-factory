@@ -5381,9 +5381,39 @@ class NoLandingsCircuitBreaker:
           * clean landing: landings_total > landings-at-trip
           * disk recovery: free_bytes >= free_at_trip + disk_margin_bytes
 
-        (implemented in step-06 — currently returns None)
+        The disk margin is the disk-side hysteresis: a small rise below the
+        margin threshold does NOT resume — keeps the breaker from oscillating on
+        noise just above the trip level.  On resume, _tripped is cleared so
+        ``observe()`` re-enters the trip-detection path.  Buffer clearing
+        (anti-flap full-window rebuild) is done in step-08.
         """
-        return None
+        clean_landing = landings_total > self._landings_at_trip
+        disk_recovered = free_bytes >= self._free_at_trip + self._disk_margin_bytes
+
+        if not (clean_landing or disk_recovered):
+            return None  # neither condition met — stay tripped
+
+        # Resume
+        self._tripped = False
+        reason = (
+            'No-landings circuit-breaker cleared: '
+            + (
+                f'landing detected (landings_total={landings_total} > {self._landings_at_trip})'
+                if clean_landing
+                else (
+                    f'disk recovered ({free_bytes:,} >= '
+                    f'{self._free_at_trip:,} + {self._disk_margin_bytes:,} margin)'
+                )
+            )
+        )
+        return BreakerTrip(
+            action='resume',
+            window_samples=self._window_samples,
+            landings_in_window=landings_total - self._landings_at_trip,
+            free_start=self._free_at_trip,
+            free_end=free_bytes,
+            reason=reason,
+        )
 
 
 class SpeculativeMergeWorker(_WipHaltMixin):
