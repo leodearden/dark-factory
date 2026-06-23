@@ -167,7 +167,7 @@ class TestPureGatePath:
         assert desc in escs[0].detail
 
     async def test_pure_gate_escalation_detail_contains_dep_ids(self, tmp_path: Path):
-        """Escalation detail must include the dependency IDs."""
+        """Escalation detail must include ALL dependency IDs (both 10 and 11)."""
         from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _gate_task(task_id='99', deps=[10, 11])
@@ -179,7 +179,38 @@ class TestPureGatePath:
         await runner.run(assignment)
 
         escs = queue.get_by_task('99', status='pending')
-        assert '10' in escs[0].detail or '11' in escs[0].detail
+        detail = escs[0].detail
+        # Both dep ids must appear — OR weakens the check (one id missing would pass)
+        assert '10' in detail and '11' in detail, (
+            f"Both dep ids '10' and '11' must appear in detail: {detail!r}"
+        )
+        # Prefer the formatted 'Landed dependencies: 10, 11' substring to confirm
+        # no incidental substring match (e.g. '110' or '211').
+        assert 'Landed dependencies: 10, 11' in detail, (
+            f"Expected 'Landed dependencies: 10, 11' in detail: {detail!r}"
+        )
+
+    async def test_pure_gate_escalation_detail_contains_dict_dep_ids(self, tmp_path: Path):
+        """Dict-shaped dependencies ({'id': N}) must have their IDs extracted into detail."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        # deps as list-of-dicts (the shape used by _deps_satisfied in the real scheduler)
+        task = _gate_task(task_id='99', deps=[{'id': 10}, {'id': 11}])
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('99', status='pending')
+        detail = escs[0].detail
+        assert '10' in detail and '11' in detail, (
+            f"Dict dep ids '10' and '11' must appear in detail: {detail!r}"
+        )
+        assert 'Landed dependencies: 10, 11' in detail, (
+            f"Expected 'Landed dependencies: 10, 11' from dict deps in detail: {detail!r}"
+        )
 
     async def test_pure_gate_escalation_options_from_gate_options(self, tmp_path: Path):
         """gate_options in metadata → Escalation.options."""
@@ -258,6 +289,20 @@ class TestPureGatePath:
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
         with pytest.raises(NotImplementedError):
+            await runner.run(assignment)
+
+    async def test_always_escalates_false_before_done_none_raises_value_error(self, tmp_path: Path):
+        """always_escalates=False with before_done=None → ValueError (unsupported in β)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _gate_task(task_id='99')
+        task['metadata']['always_escalates'] = False  # misconfiguration
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        with pytest.raises(ValueError, match='always_escalates=False'):
             await runner.run(assignment)
 
 
@@ -380,4 +425,23 @@ class TestIdempotentResumeAndQuiescence:
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
         await runner.run(assignment)
 
+        scheduler.set_task_status.assert_not_awaited()
+
+    async def test_resume_with_before_done_set_raises_not_implemented(self, tmp_path: Path):
+        """Resume path must NOT silently skip before_done — raises NotImplementedError (γ-guard)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        # gate already escalated (so we're on the resume path), but before_done is set
+        task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        task['metadata']['before_done'] = 'run_tests'  # γ-incompatible in β
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — no pending escalation → resume branch
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        # Must raise, not silently skip before_done and drive to done
+        with pytest.raises(NotImplementedError):
+            await runner.run(assignment)
+
+        # Must NOT have been driven to done
         scheduler.set_task_status.assert_not_awaited()
