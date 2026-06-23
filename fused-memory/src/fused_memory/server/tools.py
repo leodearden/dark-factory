@@ -2469,6 +2469,19 @@ def create_mcp_server(
                 tasks may supply ``before_done`` (required: ``script`` path
                 under project_root that exists and is executable, ``timeout_secs``
                 positive int) and/or ``always_escalates`` (bool) in metadata.
+
+                complexity (optional): set to "simple" to route this task to
+                the single-agent fast path (one Sonnet agent explores, plans,
+                edits, and commits; the architect+implementer pair is skipped,
+                but verify/review/merge still run). Declare "simple" only when
+                the change is a single coherent edit — docs or comments, a
+                rename, a localized behaviour-preserving refactor, a typo/wording
+                fix, a one-spot bug fix — that needs no new abstraction and no
+                cross-module design, and you can name the target file(s). It is
+                fine for a simple task to be high priority or to touch several
+                files/modules, as long as the change is mechanically simple.
+                When unsure, omit it — the full path is the safe default, and a
+                mis-declared task simply falls back to the architect.
             tag: Tag context (optional)
             planning_mode: When True, bypass the curator and create the task
                 directly in ``deferred`` status.  Use this during heavy
