@@ -239,6 +239,33 @@ class TestStateAccessor:
 
 
 # ===========================================================================
+# Step-1: RED — WarmLanePool.assignments_snapshot (Diff 1)
+# ===========================================================================
+
+
+class TestAssignmentsSnapshot:
+    def test_assignments_snapshot_is_a_copy(self, tmp_path: Path):
+        """assignments_snapshot() returns a shallow copy decoupled from the live dict.
+
+        Pins Diff 1: after release drops 'A' from _assignments, the snapshot
+        taken before release still contains 'A', and it is a distinct object.
+        """
+        pool = _make_pool(tmp_path, size=3)
+        result = asyncio.run(pool.acquire_for('A'))
+        assert result is not None
+        lane, _reused = result
+        snap = pool.assignments_snapshot()
+        # Release the lane — drops 'A' from _assignments
+        asyncio.run(pool.release(lane))
+        # Snapshot captured the state BEFORE release
+        assert 'A' in snap, 'snapshot must contain A even after live release'
+        # Snapshot is a distinct object from the live _assignments dict
+        assert snap is not pool._assignments, (
+            'assignments_snapshot() must return a copy, not the live dict'
+        )
+
+
+# ===========================================================================
 # Step-3: RED — GitOps pool-wiring + warm_lane_base_target_path property
 # ===========================================================================
 
