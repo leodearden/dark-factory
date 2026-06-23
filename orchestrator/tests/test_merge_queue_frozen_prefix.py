@@ -28,6 +28,7 @@ Mapping:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 from typing import Literal
 
@@ -59,8 +60,6 @@ async def _setup_repo(repo: Path) -> None:
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
     await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
     (repo / 'README.md').write_text('# Test\n')
-    (repo / 'shared.txt').write_text('line1\nline2\nline3\n')
-    (repo / 'disjoint.txt').write_text('aaa\nbbb\nccc\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
@@ -124,73 +123,6 @@ def _make_req(
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
-
-
-async def _create_branch_editing(
-    repo: Path,
-    branch_name: str,
-    filename: str,
-    content: str,
-) -> str:
-    """Create a branch that edits filename with content; return the branch SHA."""
-    await _run(['git', 'checkout', '-b', branch_name], cwd=repo)
-    (repo / filename).write_text(content)
-    await _run(['git', 'add', filename], cwd=repo)
-    await _run(['git', 'commit', '-m', f'Edit {filename} in {branch_name}'], cwd=repo)
-    _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
-    await _run(['git', 'checkout', 'main'], cwd=repo)
-    return sha.strip()
-
-
-async def _make_merged_item(
-    git_ops: GitOps,
-    config: OrchestratorConfig,
-    branch: str,
-    filename: str,
-    content: str,
-    *,
-    base_sha: str | None = None,
-) -> tuple[MergeRequest, SpeculativeItem]:
-    """Create a branch, merge it to main (or onto base_sha), return (req, item).
-
-    Mirrors test_merge_queue_concurrent_verify.py _make_merged_item.
-    base_sha allows speculative stacking: pass a prior item's merge_commit.
-    """
-    worktree = (await git_ops.create_worktree(branch)).path
-    (worktree / filename).write_text(content)
-    await git_ops.commit(worktree, f'Add {filename}')
-
-    loop = asyncio.get_running_loop()
-    req = MergeRequest(
-        task_id=branch,
-        branch=branch,
-        worktree=worktree,
-        pre_rebased=False,
-        task_files=None,
-        module_configs=[],
-        config=config,
-        result=loop.create_future(),
-        lane='normal',
-    )
-    merge_result = await git_ops.merge_to_main(worktree, branch, base_sha)
-    assert merge_result.success and merge_result.merge_commit, (
-        f'merge_to_main failed for branch {branch!r}: {merge_result}'
-    )
-    item_base_sha = base_sha if base_sha is not None else await git_ops.get_main_sha()
-    # Correct: for a non-speculative merge (base_sha=None), base_sha is main
-    # BEFORE the merge.  merge_to_main does NOT advance main (advance_main
-    # does that later in the real pipeline), so get_main_sha() here still
-    # returns the pre-merge SHA.  For speculative merges, caller supplies
-    # base_sha explicitly.
-    item = SpeculativeItem(
-        request=req,
-        merge_result=merge_result,
-        merge_wt=merge_result.merge_worktree,
-        base_sha=item_base_sha,
-        speculative=base_sha is not None,
-        skip_verify=False,
-    )
-    return req, item
 
 
 def _make_fake_item(
@@ -549,6 +481,11 @@ class TestFrozenPrefixPropertyTest:
         )
 
         # ── Assert no frozen rid appears in suffix graph nodes ────────────────
+        # NOTE: this loop is trivially satisfied here because D/E are only ever
+        # in _inflight and are never pushed into _lane_buffers, so they could
+        # not appear in the suffix graph regardless of the exclusion filter.
+        # The genuine RED→GREEN coverage for the exclusion filter lives in
+        # test_frozen_rid_excluded_from_suffix_graph below.
         frozen_rids = set(worker.frozen_prefix())
         for frozen_rid in frozen_rids:
             assert frozen_rid not in g_nodes, (
@@ -821,3 +758,270 @@ class TestWarnIfVerifyBaseNotFrozenTip:
         assert worker.frozen_prefix() == pre_frozen
         assert len(worker._inflight) == pre_inflight_len
         assert worker.frozen_prefix_tip('main0') == pre_tip
+
+
+# ── Amendment: _finalizing_head branch coverage (review suggestion) ───────────
+
+
+@pytest.mark.asyncio
+class TestFinalizingHeadInFrozenPrefix:
+    """_finalizing_head is included in the frozen prefix when its phase is
+    verifying/gate_reverify/finalizing, and excluded for other phases.
+
+    These tests exercise the _frozen_inflight_entries() branch for
+    self._finalizing_head that was untested by the original step-01/02 tests.
+
+    The _finalizing_head (set by _finalize_inflight) is the submission-order
+    head of the pipeline.  When it holds a qualifying phase it appears FIRST
+    in frozen_prefix() — older than all _inflight entries.
+    """
+
+    async def test_verifying_finalizing_head_appears_first(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """_finalizing_head with phase='verifying' appears FIRST in frozen_prefix().
+
+        Submission order: finalizing_head < _inflight head.  frozen_prefix()
+        must list the finalizing_head rid before any _inflight rid.
+        """
+        worker = _make_worker(git_ops)
+
+        _, item_d = _make_fake_item('t-d', base_sha='main0', merge_commit='sha-Dc',
+                                    config=config, git_repo=git_repo)
+        _, item_e = _make_fake_item('t-e', base_sha='sha-Dc', merge_commit='sha-Ec',
+                                    config=config, git_repo=git_repo)
+        entry_d = _make_inflight_entry(item_d, verifying=True)  # phase='verifying'
+        entry_e = _make_inflight_entry(item_e, verifying=True)
+
+        worker._finalizing_head = entry_d
+        worker._inflight.append(entry_e)
+
+        fp = worker.frozen_prefix()
+        assert len(fp) == 2, f'expected 2 frozen entries, got {fp!r}'
+        assert fp[0] == item_d.request.request_id, (
+            f'expected _finalizing_head rid first in frozen_prefix(), got {fp!r}'
+        )
+        assert fp[1] == item_e.request.request_id
+
+    async def test_verifying_finalizing_head_tip_is_inflight_newest(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """frozen_prefix_tip() returns the newest _inflight commit, not the
+        finalizing_head commit.
+
+        _frozen_inflight_entries() returns [finalizing_head, ...inflight].
+        _newest_frozen_commit() iterates in REVERSE → inflight entries are
+        newer than the finalizing_head.  The tip must be the newest inflight
+        commit (sha-Ec), proving the finalizing_head is treated as the OLDEST.
+        """
+        worker = _make_worker(git_ops)
+
+        _, item_d = _make_fake_item('t-d', base_sha='main0', merge_commit='sha-Dc',
+                                    config=config, git_repo=git_repo)
+        _, item_e = _make_fake_item('t-e', base_sha='sha-Dc', merge_commit='sha-Ec',
+                                    config=config, git_repo=git_repo)
+        entry_d = _make_inflight_entry(item_d, verifying=True)
+        entry_e = _make_inflight_entry(item_e, verifying=True)
+
+        worker._finalizing_head = entry_d
+        worker._inflight.append(entry_e)
+
+        tip = worker.frozen_prefix_tip('main0')
+        assert tip == 'sha-Ec', (
+            f"expected newest inflight commit 'sha-Ec', got {tip!r}; "
+            "the finalizing_head (sha-Dc) is the OLDEST entry and must not be "
+            "returned as the tip when a newer _inflight entry exists"
+        )
+
+    async def test_passthrough_phase_finalizing_head_excluded(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """_finalizing_head with a non-qualifying phase is excluded from frozen_prefix().
+
+        Only phases in {'verifying', 'gate_reverify', 'finalizing'} qualify.
+        A 'passthrough'-phase _finalizing_head must not appear in the frozen prefix
+        or affect frozen_prefix_tip().
+        """
+        worker = _make_worker(git_ops)
+
+        _, item_p = _make_fake_item('t-p', base_sha='main0', merge_commit='sha-Pc',
+                                    config=config, git_repo=git_repo)
+        entry_p = _make_inflight_entry(item_p, verifying=True)
+        entry_p.phase = 'passthrough'  # override to a non-qualifying phase
+
+        worker._finalizing_head = entry_p
+
+        fp = worker.frozen_prefix()
+        assert fp == (), (
+            f"passthrough-phase _finalizing_head must not appear in frozen_prefix(), "
+            f"got {fp!r}"
+        )
+        # frozen_prefix_tip falls back to main_sha when no qualifying entries exist
+        assert worker.frozen_prefix_tip('main-sentinel') == 'main-sentinel'
+
+    async def test_gate_reverify_finalizing_head_included(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """_finalizing_head with phase='gate_reverify' is included in frozen_prefix().
+
+        gate_reverify is the third qualifying phase alongside verifying and finalizing.
+        """
+        worker = _make_worker(git_ops)
+
+        _, item_g = _make_fake_item('t-g', base_sha='main0', merge_commit='sha-Gc',
+                                    config=config, git_repo=git_repo)
+        entry_g = _make_inflight_entry(item_g, verifying=True)
+        entry_g.phase = 'gate_reverify'  # a qualifying phase distinct from 'verifying'
+
+        worker._finalizing_head = entry_g
+
+        fp = worker.frozen_prefix()
+        assert item_g.request.request_id in fp, (
+            f"gate_reverify-phase _finalizing_head missing from frozen_prefix(): {fp!r}"
+        )
+
+
+# ── Amendment: _dispatch_item guard wiring tests (review suggestion) ──────────
+
+
+@pytest.mark.asyncio
+class TestDispatchItemGuardWiring:
+    """The §5.3 guard in _dispatch_item is fail-open and fires on the real dispatch path.
+
+    These tests anchor the integration seam: the guard is wired into
+    _dispatch_item (not just directly callable), and a get_main_sha() error
+    in the guard is swallowed without blocking verify dispatch.
+
+    Setup: items use speculative=True so Mechanism 2 does NOT call get_main_sha
+    in the chain-remerge block — isolating the guard's own try/except as the
+    only code path that touches get_main_sha.
+    """
+
+    async def test_dispatch_guard_fail_open_on_get_main_sha_error(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """get_main_sha() raising in the guard does not block verify dispatch (fail-open).
+
+        The try/except around the guard in _dispatch_item must swallow any
+        Exception so a transient git error never prevents a verify from launching.
+        Confirms the integration wiring: _dispatch_item returns a verifying
+        InflightEntry even when the guard's git call fails.
+        """
+        import unittest.mock as mock
+
+        worker = _make_worker(git_ops)
+
+        # Build an item that passes all _dispatch_item early-bailout checks:
+        #   - not abandoned (future not cancelled)
+        #   - not operator-halted (_operator_halt not set by default)
+        #   - no immediate_outcome
+        #   - speculative=True → Mechanism 2 won't call get_main_sha in remerge block
+        #   - merge_wt=git_repo → LocalRunner factory assertion passes
+        req, item = _make_fake_item(
+            't-dispatch-fail-open', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        item = dataclasses.replace(item, speculative=True, merge_wt=git_repo)
+
+        async def _raise_on_get_main(*_args, **_kwargs):
+            raise RuntimeError('simulated transient git error')
+
+        async def _noop_verify(_item, _lease):
+            return None
+
+        with mock.patch.object(git_ops, 'get_main_sha', side_effect=_raise_on_get_main):
+            with mock.patch.object(worker, '_run_inflight_verify', _noop_verify):
+                result = await worker._dispatch_item(item)
+
+        # Fail-open: dispatch must return a verifying InflightEntry, not None.
+        assert result is not None, (
+            '_dispatch_item returned None; expected a verifying InflightEntry '
+            'even when get_main_sha() raises inside the §5.3 guard (fail-open)'
+        )
+        assert isinstance(result, InflightEntry)
+        assert result.phase == 'verifying', f'expected phase=verifying, got {result.phase!r}'
+
+        # Clean up the background verify task to prevent event-loop warnings.
+        if result.verify_task is not None:
+            result.verify_task.cancel()
+            try:
+                await result.verify_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def test_dispatch_guard_warns_on_non_tip_base(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Guard fires a WARNING on the real _dispatch_item path when base_sha ≠ frozen tip.
+
+        Proves the guard is wired into _dispatch_item, not just directly callable.
+        Setup: frozen predecessor with merge_commit='sha-Dc'; dispatch item
+        with base_sha='wrong-base' → the wired guard must log a WARNING naming
+        the rid, confirming the integration seam is active.
+        """
+        import logging
+        import unittest.mock as mock
+
+        worker = _make_worker(git_ops)
+
+        # Frozen predecessor in _inflight: its merge_commit becomes the frozen tip.
+        _, item_d = _make_fake_item(
+            't-d-frozen', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        # Dispatch item: base_sha='wrong-base' does not match frozen tip 'sha-Dc'.
+        req_e, item_e = _make_fake_item(
+            't-e-dispatch', base_sha='wrong-base', merge_commit='sha-Ec',
+            config=config, git_repo=git_repo,
+        )
+        item_e = dataclasses.replace(item_e, speculative=True, merge_wt=git_repo)
+
+        # get_main_sha returns a valid sha so the guard call proceeds rather
+        # than raising.  The mismatch 'wrong-base' vs frozen tip 'sha-Dc'
+        # triggers the warning.
+        async def _return_main(*_args, **_kwargs) -> str:
+            return 'fake-main'
+
+        async def _noop_verify(_item, _lease):
+            return None
+
+        with mock.patch.object(git_ops, 'get_main_sha', side_effect=_return_main):
+            with mock.patch.object(worker, '_run_inflight_verify', _noop_verify):
+                with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                    result = await worker._dispatch_item(item_e)
+
+        # Guard must have fired at least one WARNING naming the dispatched rid.
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) >= 1, (
+            f'expected ≥1 WARNING from the _dispatch_item guard (integration seam), '
+            f'got {len(warnings)}: {[r.message for r in warnings]}'
+        )
+        warning_text = ' '.join(r.getMessage() for r in warnings)
+        assert (
+            req_e.request_id in warning_text
+            or item_e.request.request_id in warning_text
+        ), (
+            f'WARNING does not mention the dispatched rid {req_e.request_id!r}: '
+            f'{warning_text!r}'
+        )
+        assert 'frozen' in warning_text.lower(), (
+            f'WARNING does not mention "frozen": {warning_text!r}'
+        )
+
+        # Dispatch must still succeed — the guard is purely observational.
+        assert result is not None, 'dispatch must succeed even when guard warns'
+        assert result.phase == 'verifying'
+
+        # Clean up the background verify task.
+        if result.verify_task is not None:
+            result.verify_task.cancel()
+            try:
+                await result.verify_task
+            except (asyncio.CancelledError, Exception):
+                pass
