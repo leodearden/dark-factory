@@ -1791,7 +1791,6 @@ class TestSelfRestartSchedulingFailure:
 
     async def test_b8_failure_outcome_is_blocked(self, tmp_path: Path):
         """Scheduling failure (rc=1) → outcome is WorkflowOutcome.BLOCKED."""
-        from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
         task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
@@ -1804,7 +1803,6 @@ class TestSelfRestartSchedulingFailure:
 
     async def test_b8_failure_files_one_infra_issue_escalation(self, tmp_path: Path):
         """Scheduling failure → exactly one pending infra_issue escalation at level=2."""
-        from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
         assignment = _make_assignment(task)
@@ -1817,7 +1815,6 @@ class TestSelfRestartSchedulingFailure:
 
     async def test_b8_failure_escalation_level_severity_role_category(self, tmp_path: Path):
         """Filed escalation: level=2, severity='critical', role='orchestrator-deterministic', category='infra_issue'."""
-        from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
         assignment = _make_assignment(task)
@@ -1833,7 +1830,6 @@ class TestSelfRestartSchedulingFailure:
 
     async def test_b8_failure_escalation_detail_contains_target_unit(self, tmp_path: Path):
         """Escalation detail contains the target_unit."""
-        from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
         assignment = _make_assignment(task)
@@ -1848,7 +1844,6 @@ class TestSelfRestartSchedulingFailure:
 
     async def test_b8_failure_escalation_detail_contains_transient_unit(self, tmp_path: Path):
         """Escalation detail contains the transient unit name (includes task id '860')."""
-        from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
         assignment = _make_assignment(task)
@@ -1863,7 +1858,6 @@ class TestSelfRestartSchedulingFailure:
 
     async def test_b8_failure_set_task_blocked_never_done(self, tmp_path: Path):
         """set_task_status called with 'blocked' and NEVER with 'done' on scheduling failure."""
-        from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
         assignment = _make_assignment(task)
@@ -1878,7 +1872,6 @@ class TestSelfRestartSchedulingFailure:
 
     async def test_b8_failure_stamps_before_done_ran_at(self, tmp_path: Path):
         """update_task stamps before_done_ran_at even on scheduling failure (I1 crash-safe)."""
-        from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
         assignment = _make_assignment(task)
@@ -1913,6 +1906,7 @@ class TestDefaultScheduleDetachedRestart:
     async def test_argv_contains_systemd_run_user(self, tmp_path: Path):
         """systemd-run --user must appear in the spawn argv."""
         from unittest.mock import patch
+
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
@@ -1942,6 +1936,7 @@ class TestDefaultScheduleDetachedRestart:
     async def test_argv_contains_on_active_and_transient_unit(self, tmp_path: Path):
         """--on-active and the transient unit name must appear in the spawn argv."""
         from unittest.mock import patch
+
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
@@ -1975,6 +1970,7 @@ class TestDefaultScheduleDetachedRestart:
     async def test_argv_contains_collect_and_payload_script(self, tmp_path: Path):
         """--collect and the payload script path must appear in the spawn argv."""
         from unittest.mock import patch
+
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
@@ -2006,6 +2002,7 @@ class TestDefaultScheduleDetachedRestart:
     async def test_argv_contains_on_failure_wiring(self, tmp_path: Path):
         """OnFailure wiring token must appear in the spawn argv (--on-failure or OnFailure=)."""
         from unittest.mock import patch
+
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
@@ -2036,6 +2033,7 @@ class TestDefaultScheduleDetachedRestart:
     async def test_argv_contains_escalation_submit_cli(self, tmp_path: Path):
         """escalation submit CLI must appear in the spawn argv for OnFailure handling."""
         from unittest.mock import patch
+
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
@@ -2065,6 +2063,7 @@ class TestDefaultScheduleDetachedRestart:
     async def test_argv_contains_queue_dir(self, tmp_path: Path):
         """--queue-dir with the EscalationQueue.queue_dir path must appear in argv."""
         from unittest.mock import patch
+
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
@@ -2096,6 +2095,7 @@ class TestDefaultScheduleDetachedRestart:
     async def test_argv_contains_task_id_severity_category(self, tmp_path: Path):
         """--task, --severity critical, --category infra_issue must appear in escalation argv."""
         from unittest.mock import patch
+
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
