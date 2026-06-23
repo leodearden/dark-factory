@@ -1080,3 +1080,79 @@ def test_shape_merge_queue_includes_train_throughput():
     }
     body2 = redux_api.shape_merge_queue(raw_no_throughput)
     assert body2['MERGE_QUEUE']['dark-factory']['train_throughput'] == {}
+
+
+# ---------------------------------------------------------------------------
+# shape_merge_queue — live metrics passthrough (step-09 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+def _mq_project_base() -> dict:
+    """Minimal per-project data dict for shape_merge_queue tests."""
+    return {
+        'depth_timeseries': {'labels': [], 'values': []},
+        'outcomes': {'labels': [], 'values': []},
+        'latency': {},
+        'recent': [],
+        'speculative': {'hit_rate': 0.0},
+        'active': [],
+    }
+
+
+_LIVE_METRICS = {
+    'retries_per_landing': 1.5,
+    'drift_at_detection': {'count': 2, 'last': 3, 'mean': 2.5, 'max': 3},
+    'landings_total': 2,
+    'retries_total': 3,
+}
+
+
+def test_shape_merge_queue_surfaces_live_metrics():
+    """shape_merge_queue emits 'metrics' from live_metrics per project.
+
+    RED until step-10 GREEN adds 'metrics': dict(data.get('live_metrics') or {})
+    to each out[label] in shape_merge_queue.
+    """
+    proj = _mq_project_base()
+    proj['live_metrics'] = _LIVE_METRICS
+    raw = {'/home/leo/src/dark-factory': proj}
+    body = redux_api.shape_merge_queue(raw)
+    section = body['MERGE_QUEUE']['dark-factory']
+    assert 'metrics' in section, (
+        f"shape_merge_queue must emit 'metrics' key per project; "
+        f"got keys: {list(section.keys())}"
+    )
+    assert section['metrics'] == _LIVE_METRICS
+
+
+def test_shape_merge_queue_metrics_defaults_to_empty_when_absent():
+    """When live_metrics is absent, 'metrics' defaults to {} (no KeyError)."""
+    proj = _mq_project_base()
+    # no 'live_metrics' key
+    raw = {'/home/leo/src/dark-factory': proj}
+    body = redux_api.shape_merge_queue(raw)
+    section = body['MERGE_QUEUE']['dark-factory']
+    assert 'metrics' in section, (
+        f"'metrics' key must always be present in shaped output; "
+        f"got keys: {list(section.keys())}"
+    )
+    assert section['metrics'] == {}
+
+
+def test_shape_merge_queue_metrics_defaults_to_empty_when_none():
+    """When live_metrics is None, 'metrics' defaults to {} (safe default)."""
+    proj = _mq_project_base()
+    proj['live_metrics'] = None
+    raw = {'/home/leo/src/dark-factory': proj}
+    body = redux_api.shape_merge_queue(raw)
+    section = body['MERGE_QUEUE']['dark-factory']
+    assert section['metrics'] == {}
+
+
+def test_shape_merge_queue_metrics_rpl_value():
+    """retries_per_landing value is threaded through correctly."""
+    proj = _mq_project_base()
+    proj['live_metrics'] = {'retries_per_landing': 2.0, 'drift_at_detection': {'last': 5}}
+    raw = {'/home/leo/src/dark-factory': proj}
+    body = redux_api.shape_merge_queue(raw)
+    assert body['MERGE_QUEUE']['dark-factory']['metrics']['retries_per_landing'] == 2.0

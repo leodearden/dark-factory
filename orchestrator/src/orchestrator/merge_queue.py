@@ -5016,6 +5016,123 @@ class MergeWorker(_WipHaltMixin):
         return None  # don't resolve Future — will be reprocessed
 
 
+class MergeMetrics:
+    """Pure in-memory accumulator for ι=1894 operator metrics.
+
+    Tracks two metrics surfaced on the heartbeat snapshot and dashboard:
+
+    * **retries_per_landing** — (merge re-attempts) / (clean landings).
+      Returns ``None`` while ``landings == 0`` to avoid division by zero.
+      A "retry" is any CAS round that did not immediately advance main:
+      ``cas_failed`` (transient atomic-swap loss) and
+      ``rebased_pending_reverify`` (main advanced, fresh re-verify needed)
+      both count.  See ``_note_merge_retry`` for the rationale.
+    * **drift_at_detection** — how far main advanced (in landed-merge units)
+      between when a request was based and when its conflict was caught.
+      Stored as a bounded ring of samples; summary exposes count/last/mean/max.
+
+    ``main_position`` is the landings counter — each clean landing advances
+    main by at least one merge, so it is a deterministic in-process measure of
+    "how far main advanced" without any git calls in the hot path.
+
+    Thread / concurrency safety: SpeculativeMergeWorker runs single-threaded
+    under asyncio; all methods are synchronous and side-effect-free in the
+    sense that they produce no I/O — safe to call from any asyncio coroutine.
+
+    Args:
+        drift_window: Maximum number of drift samples to retain (FIFO ring).
+            Oldest samples are dropped when the buffer exceeds this size.
+            Default 50 (about one working hour of continuous merge activity).
+    """
+
+    def __init__(self, drift_window: int = 50) -> None:
+        self._landings: int = 0
+        self._retries: int = 0
+        self._drift_window = drift_window
+        self._drift_samples: collections.deque[int] = collections.deque(
+            maxlen=drift_window
+        )
+
+    # ── counters ─────────────────────────────────────────────────────────────
+
+    @property
+    def landings(self) -> int:
+        """Number of clean landings recorded so far."""
+        return self._landings
+
+    @property
+    def retries(self) -> int:
+        """Number of merge retries recorded so far."""
+        return self._retries
+
+    @property
+    def main_position(self) -> int:
+        """Current main position in units of clean landings.
+
+        Equivalent to ``landings`` — each clean landing advances main by at
+        least one merge, making this a deterministic proxy for "how far main
+        has advanced" without any git calls in the hot path.
+        """
+        return self._landings
+
+    @property
+    def retries_per_landing(self) -> float | None:
+        """Retries ÷ landings.  ``None`` when ``landings == 0``."""
+        if self._landings == 0:
+            return None
+        return self._retries / self._landings
+
+    # ── mutators ─────────────────────────────────────────────────────────────
+
+    def record_landing(self) -> None:
+        """Increment the clean-landing counter (advances main_position by 1)."""
+        self._landings += 1
+
+    def record_retry(self) -> None:
+        """Increment the retry counter."""
+        self._retries += 1
+
+    def record_drift(self, n: int) -> None:
+        """Append one drift sample.  Oldest sample is dropped when buffer full."""
+        self._drift_samples.append(n)
+
+    # ── summaries ────────────────────────────────────────────────────────────
+
+    def drift_summary(self) -> dict:
+        """Return ``{count, last, mean, max}`` from the retained drift samples.
+
+        All values are ``None`` when no drift has been recorded.
+        """
+        samples = list(self._drift_samples)
+        if not samples:
+            return {'count': 0, 'last': None, 'mean': None, 'max': None}
+        return {
+            'count': len(samples),
+            'last': samples[-1],
+            'mean': sum(samples) / len(samples),
+            'max': max(samples),
+        }
+
+    def as_snapshot(self) -> dict:
+        """Return the serialisable snapshot dict for embedding in worker.snapshot().
+
+        Shape::
+
+            {
+                'retries_per_landing': float | None,
+                'drift_at_detection':  {count, last, mean, max},
+                'landings_total':      int,
+                'retries_total':       int,
+            }
+        """
+        return {
+            'retries_per_landing': self.retries_per_landing,
+            'drift_at_detection': self.drift_summary(),
+            'landings_total': self._landings,
+            'retries_total': self._retries,
+        }
+
+
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
@@ -5350,6 +5467,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._supervisor_halted: bool = False
         # Human-readable reason for the halt; set alongside _supervisor_halted.
         self._supervisor_halt_reason: str | None = None
+        # ── ι=1894 live operator metrics ─────────────────────────────────────
+        # Pure in-memory accumulator: retries-per-landing + drift-at-detection.
+        # Consumed in-process by θ (circuit-breaker) and surfaced on the
+        # dashboard via snapshot()['metrics'].  No SQLite persistence needed —
+        # θ reads the live readout and the dashboard shows the live snapshot.
+        self._merge_metrics: MergeMetrics = MergeMetrics()
+        # Per-request drift base: request_id → main_position (landing count) at
+        # the moment the request entered the merger.  Popped on clean landing
+        # or conflict detection.  Mirrors the _cas_retries / _gate_retries
+        # per-task counter-dict lifecycle idiom (:5225-5245).
+        self._drift_base: dict[str, int] = {}
 
     # ── β host allocator ──────────────────────────────────────────────────
 
@@ -6009,6 +6137,58 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._buffer_owned_request(item)
             # Loop to try _pop_next_pickable again (maybe the resume unblocked a lane).
 
+    # ── ι=1894 metric wiring helpers ─────────────────────────────────────────
+
+    def _note_merge_started(self, request_id: str) -> None:
+        """Stash the current main_position for a request entering the merger.
+
+        Called when a MergeRequest is dequeued and about to be merged.
+        Records the landing count at merge-start so that if the merge later
+        conflicts we can compute drift = main_position_now − stashed_base.
+        """
+        self._drift_base[request_id] = self._merge_metrics.main_position
+
+    def _note_merge_landing(self, request_id: str) -> None:
+        """Record a clean landing and remove the stashed drift base.
+
+        Called inside the ``outcome.status == 'done'`` clean-landing branch.
+        Increments the landings counter (advancing main_position by 1) and
+        pops any _drift_base entry for this request.
+        """
+        self._merge_metrics.record_landing()
+        self._drift_base.pop(request_id, None)
+
+    def _note_merge_retry(self) -> None:
+        """Record a merge retry (CAS failure or gate reverify).
+
+        Called at the ``result == 'rebased_pending_reverify'`` branch and at
+        the ``result == 'cas_failed'`` retry path.
+
+        **Retry definition**: ``retries_per_landing`` counts every incremental
+        CAS or gate round: both ``cas_failed`` (transient atomic-swap loss) and
+        ``rebased_pending_reverify`` (main advanced under the request; needs a
+        fresh re-verify against the new tip).  Both represent additional merge
+        work driven by contention and map naturally to the operator's question
+        "how often does this queue re-attempt merges?"  If you need to
+        distinguish rebase-rebounded reverifies from pure CAS races, use
+        ``retries_total`` (the raw counter) alongside the two
+        :attr:`MergeMetrics._gate_retries`/:attr:`_cas_retries` per-task dicts
+        already maintained by the worker.
+        """
+        self._merge_metrics.record_retry()
+
+    def _note_conflict_detected(self, request_id: str) -> None:
+        """Record a drift sample when a merge conflict is detected.
+
+        Computes drift = current main_position − stashed_base (the landing
+        count at merge-start), records it as a drift sample, and pops the
+        _drift_base entry.  Defensive: a missing entry (request not started
+        via _note_merge_started) produces a drift of 0 rather than raising.
+        """
+        base = self._drift_base.pop(request_id, self._merge_metrics.main_position)
+        drift = self._merge_metrics.main_position - base
+        self._merge_metrics.record_drift(drift)
+
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
 
@@ -6215,6 +6395,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Read here synchronously — no await; the expensive async build is
             # decoupled from the read (snapshot() stays non-blocking).
             'suffix_conflict_graph': self._suffix_conflict_graph.to_snapshot_dict(),
+            # ι=1894 additive key: live operator metrics.
+            # Populated by the _note_merge_* helpers (wired at existing landing/
+            # retry/conflict code points).  Pure synchronous read — no await,
+            # no git calls.  No collision with existing keys (entries/depth/
+            # head_of_line/verify_in_progress/occupancy/is_wip_halted/
+            # halt_owner_esc_id/suffix_conflict_graph).
+            'metrics': self._merge_metrics.as_snapshot(),
         }
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
@@ -7363,6 +7550,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     pending_predecessor = None
 
                 self._inflight_req = req  # track for stop() race resolution
+                # ι=1894: stash main_position for this request so
+                # _note_conflict_detected can compute drift later.
+                self._note_merge_started(req.request_id)
                 # Drop-on-detection: workflow soft-cancelled before worker
                 # dequeued.  Skipping merge work avoids the orphan-halt
                 # window where no escalation owner is registered.
@@ -7372,6 +7562,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         held_spec_permit = False
                     spec_base = None
                     self._inflight_req = None
+                    # ι=1894 amend: drop stashed drift base — request retired without
+                    # landing or conflict detection, so it would otherwise leak forever.
+                    self._drift_base.pop(req.request_id, None)
                     continue
                 if self._event_store is not None:
                     self._event_store.emit(
@@ -7602,6 +7795,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     if merge_result.conflicts:
                         logger.info(f'Task {req.task_id}: merge conflicts')
                         _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(t0))
+                        # ι=1894: record drift = main_position − base at merge-start
+                        self._note_conflict_detected(req.request_id)
                         if merge_result.merge_worktree:
                             await self._git_ops.cleanup_merge_worktree(
                                 merge_result.merge_worktree,
@@ -9060,6 +9255,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     )
                     self._resolve_or_drop_abandoned(req, outcome)
                     if outcome.status == 'done':
+                        # ι=1894: record clean landing, pop drift base for this req
+                        self._note_merge_landing(req.request_id)
                         if (
                             outcome.merge_sha is not None
                             and self._on_merge_landed is not None
@@ -9098,6 +9295,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return True
 
                 if result == 'rebased_pending_reverify':
+                    # ι=1894: count this as a merge retry — main advanced under the
+                    # request, so a fresh re-verify is required.  Both cas_failed and
+                    # rebased_pending_reverify are included in retries_per_landing (see
+                    # _note_merge_retry docstring for the rationale).
+                    self._note_merge_retry()
                     rebased_sha = getattr(self._git_ops, '_last_advanced_sha', None)
                     rebased_from = getattr(self._git_ops, '_rebased_from', None)
                     rebased_onto = getattr(self._git_ops, '_rebased_onto', None)
@@ -9201,6 +9403,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return False
 
                 # result == 'cas_failed' — transient, retry with limit
+                # ι=1894: count CAS retry
+                self._note_merge_retry()
                 total = self._cas_retries.get(req.task_id, 0) + 1
                 self._cas_retries[req.task_id] = total
                 if total > self.MAX_CAS_RETRIES:
@@ -9253,6 +9457,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._n_failed = _n_failed_val if _n_failed_val is not None else not advanced
             # Clear finalize-head observability window — covers all return/exception paths.
             self._finalizing_head = None
+            # ι=1894 amend: defensive _drift_base cleanup — idempotent pop that covers
+            # all terminal exit paths (blocked/error/halt/wip_halted/cas-exhausted/
+            # rebased-gate-failure).  _note_merge_landing and _note_conflict_detected
+            # both use pop(key, None), so re-popping an already-cleared entry is a no-op.
+            self._drift_base.pop(req.request_id, None)
 
     async def _dispatch_item(
         self,

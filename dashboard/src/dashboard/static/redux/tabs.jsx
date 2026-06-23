@@ -910,6 +910,33 @@ function MergeTab({ projectFilter }) {
                   </div>
                 </div>
 
+                {/* ι=1894: live retries-per-landing + drift-at-detection metrics */}
+                <div className="col-span-6 panel">
+                  <div className="panel-head"><span className="title">Live merge metrics</span></div>
+                  <div className="panel-body" style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 12 }}>
+                    {(() => {
+                      const m = d.metrics || {};
+                      const rpl = m.retries_per_landing;
+                      const dd = m.drift_at_detection || {};
+                      const driftVal = dd.last != null ? dd.last : (dd.mean != null ? Number(dd.mean).toFixed(1) : null);
+                      return (
+                        <>
+                          <ST label="Retries / landing"
+                              value={rpl != null ? Number(rpl).toFixed(2) : '—'}
+                              unit=""
+                              hint={m.landings_total != null ? `${m.landings_total} landings` : 'offline'}
+                              spark={[]} sparkColor={CP.warn} />
+                          <ST label="Drift @ detect"
+                              value={driftVal != null ? driftVal : '—'}
+                              unit=""
+                              hint={dd.count ? `${dd.count} detections` : 'no conflicts'}
+                              spark={[]} sparkColor={CP.bad} />
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+
                 {d.active.length > 0 && (
                   <div className="col-span-6 panel">
                     <div className="panel-head">

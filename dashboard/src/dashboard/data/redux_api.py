@@ -448,6 +448,8 @@ def shape_merge_queue(
             'halt': dict(halts.get(label) or {'offline': True}),
             'train_events': [dict(e) for e in (data.get('train_events') or [])],
             'train_throughput': dict(data.get('train_throughput') or {}),
+            # ι=1894: live retries-per-landing + drift-at-detection metrics
+            'metrics': dict(data.get('live_metrics') or {}),
         }
     return {'MERGE_QUEUE': out}
 
