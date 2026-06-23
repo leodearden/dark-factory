@@ -10,8 +10,6 @@ Covers:
 """
 from __future__ import annotations
 
-import asyncio
-import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -120,6 +118,7 @@ class TestHarnessNoLandingsFire:
                 await harness._run_no_landings_breaker_pass()
 
         # Exactly one pending INFO escalation with the right role
+        assert harness._escalation_queue is not None
         pending = [
             e
             for e in harness._escalation_queue.get_by_task(
@@ -148,6 +147,7 @@ class TestHarnessNoLandingsFire:
             for _ in range(3):
                 await harness._run_no_landings_breaker_pass()
 
+        assert harness._escalation_queue is not None
         pending = [
             e
             for e in harness._escalation_queue.get_by_task(
@@ -178,6 +178,7 @@ class TestHarnessNoLandingsFire:
             for _ in range(6):
                 await harness._run_no_landings_breaker_pass()
 
+        assert harness._escalation_queue is not None
         all_pending = [
             e
             for e in harness._escalation_queue.get_by_task(
@@ -248,9 +249,7 @@ class TestHarnessNoLandingsResume:
         assert harness.scheduler.is_paused, 'precondition: scheduler must be paused'
 
         # Recovery: landings_total increased (clean landing happened)
-        harness._merge_worker.snapshot.return_value = {
-            'metrics': {'landings_total': 6}
-        }
+        _stub_merge_worker(harness, landings_total=6)
         with patch('shutil.disk_usage') as mock_du:
             mock_du.return_value = MagicMock(free=150_000)
             await harness._run_no_landings_breaker_pass()
@@ -267,6 +266,7 @@ class TestHarnessNoLandingsResume:
         await self._drive_to_trip(harness)
 
         # Confirm escalation was filed
+        assert harness._escalation_queue is not None
         before = [
             e
             for e in harness._escalation_queue.get_by_task(
@@ -277,14 +277,13 @@ class TestHarnessNoLandingsResume:
         assert before, 'precondition: INFO escalation must be filed before resume'
 
         # Recovery pass
-        harness._merge_worker.snapshot.return_value = {
-            'metrics': {'landings_total': 6}
-        }
+        _stub_merge_worker(harness, landings_total=6)
         with patch('shutil.disk_usage') as mock_du:
             mock_du.return_value = MagicMock(free=150_000)
             await harness._run_no_landings_breaker_pass()
 
         # After resume, no open breaker INFO escalation
+        assert harness._escalation_queue is not None
         after = [
             e
             for e in harness._escalation_queue.get_by_task(
@@ -308,9 +307,7 @@ class TestHarnessNoLandingsResume:
         # Drive the breaker's _free_at_trip: after filling window=3 with
         # drop=10000 starting at 200000, _free_at_trip = 200000 - 2*10000 = 180000
         # Recovery: free_bytes >= 180000 + 10000 = 190000
-        harness._merge_worker.snapshot.return_value = {
-            'metrics': {'landings_total': 5}  # same landings — disk path
-        }
+        _stub_merge_worker(harness, landings_total=5)  # same landings — disk path
         with patch('shutil.disk_usage') as mock_du:
             mock_du.return_value = MagicMock(free=190_000)
             await harness._run_no_landings_breaker_pass()

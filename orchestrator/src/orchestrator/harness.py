@@ -3173,7 +3173,13 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         import shutil as _shutil  # noqa: PLC0415
 
+        from orchestrator.merge_queue import SpeculativeMergeWorker as _SMW  # noqa: PLC0415
+
         if self._merge_worker is None:
+            return
+
+        if not isinstance(self._merge_worker, _SMW):
+            # MergeWorker (legacy, no metrics) — circuit breaker is a no-op
             return
 
         landings_total: int = (

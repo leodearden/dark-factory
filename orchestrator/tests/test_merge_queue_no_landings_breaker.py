@@ -10,10 +10,7 @@ Covers:
 """
 from __future__ import annotations
 
-import pytest
-
 from orchestrator.merge_queue import BreakerTrip, NoLandingsCircuitBreaker
-
 
 # ---------------------------------------------------------------------------
 # step-01: healthy / no-trip cases
