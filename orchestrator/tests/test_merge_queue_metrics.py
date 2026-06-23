@@ -9,9 +9,25 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from unittest.mock import MagicMock
+
 import pytest
 
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import MergeMetrics, SpeculativeMergeWorker
+
+
+# ---------------------------------------------------------------------------
+# Worker factory (mirrors test_merge_queue_main_health._make_git_ops pattern)
+# ---------------------------------------------------------------------------
+
+
+def _make_bare_worker(tmp_path: Path | None = None) -> SpeculativeMergeWorker:
+    """Build a SpeculativeMergeWorker with a mocked GitOps (no real git repo)."""
+    git_ops = MagicMock(spec=GitOps)
+    git_ops.project_root = tmp_path  # None-safe: __init__ guards on this
+    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
 
 
 # ---------------------------------------------------------------------------
@@ -127,3 +143,72 @@ class TestMergeMetrics:
         m = MergeMetrics()
         snap = m.as_snapshot()
         assert snap['retries_per_landing'] is None
+
+
+# ---------------------------------------------------------------------------
+# step-03: snapshot() emits 'metrics' key
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerSnapshotMetricsKey:
+    """snapshot() must include a top-level 'metrics' key from _merge_metrics.
+
+    RED until step-04 GREEN adds _merge_metrics to __init__ and 'metrics' to
+    snapshot().
+    """
+
+    def test_snapshot_has_metrics_key(self):
+        """snapshot() includes a 'metrics' key."""
+        worker = _make_bare_worker()
+        snap = worker.snapshot()
+        assert 'metrics' in snap
+
+    def test_snapshot_metrics_matches_accumulator(self):
+        """snapshot()['metrics'] equals worker._merge_metrics.as_snapshot()."""
+        worker = _make_bare_worker()
+        # Drive the accumulator directly
+        worker._merge_metrics.record_landing()
+        worker._merge_metrics.record_landing()
+        worker._merge_metrics.record_retry()
+        worker._merge_metrics.record_drift(3)
+        snap = worker.snapshot()
+        expected = worker._merge_metrics.as_snapshot()
+        assert snap['metrics'] == expected
+
+    def test_snapshot_metrics_retries_per_landing_correct(self):
+        """snapshot()['metrics']['retries_per_landing'] is numerically correct."""
+        worker = _make_bare_worker()
+        worker._merge_metrics.record_landing()
+        worker._merge_metrics.record_landing()
+        worker._merge_metrics.record_retry()
+        worker._merge_metrics.record_retry()
+        worker._merge_metrics.record_retry()
+        snap = worker.snapshot()
+        assert snap['metrics']['retries_per_landing'] == pytest.approx(1.5)
+
+    def test_snapshot_metrics_drift_at_detection_correct(self):
+        """snapshot()['metrics']['drift_at_detection'] has correct fields."""
+        worker = _make_bare_worker()
+        worker._merge_metrics.record_drift(5)
+        snap = worker.snapshot()
+        dd = snap['metrics']['drift_at_detection']
+        assert dd['count'] == 1
+        assert dd['last'] == 5
+        assert dd['max'] == 5
+
+    def test_snapshot_metrics_zero_state(self):
+        """snapshot()['metrics'] on a fresh worker has None rpl and zero landings/retries."""
+        worker = _make_bare_worker()
+        snap = worker.snapshot()
+        m = snap['metrics']
+        assert m['retries_per_landing'] is None
+        assert m['landings_total'] == 0
+        assert m['retries_total'] == 0
+        assert m['drift_at_detection']['count'] == 0
+
+    def test_snapshot_backward_compat_keys_present(self):
+        """Pre-existing snapshot keys are still present alongside 'metrics'."""
+        worker = _make_bare_worker()
+        snap = worker.snapshot()
+        for key in ('entries', 'depth', 'head_of_line', 'suffix_conflict_graph'):
+            assert key in snap, f"pre-existing key '{key}' missing from snapshot"
