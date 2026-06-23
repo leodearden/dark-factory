@@ -903,6 +903,9 @@ class TaskWorkflow:
             await self.scheduler.mark_done(
                 mid, kind='merged', sha=sha, note=f'train {train_id}',
             )
+            # Diff 5d (B3/T7): release warm lane for the done member.
+            # Idempotent/never-raise via the shared primitive.
+            await self.git_ops.release_lane_for_terminal_task(mid)
 
         if self.config.merge_verify_workspace:
             # workspace-wide verify ignores per-task scope; skip the member union loop

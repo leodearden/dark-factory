@@ -4165,7 +4165,7 @@ Output JSON matching the schema. Every task must appear in the output.
         # inject it opaquely into the worker so task γ can construct
         # GroupMergeRequests without the worker importing the scheduler
         # (pure-git-engine layering preserved; the worker never calls the factory).
-        train_callback_factory = build_train_callback_factory(self.scheduler)
+        train_callback_factory = build_train_callback_factory(self.scheduler, self.git_ops)
 
         self._merge_worker = SpeculativeMergeWorker(
             self.git_ops,
