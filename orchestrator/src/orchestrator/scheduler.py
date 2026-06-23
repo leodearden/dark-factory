@@ -4433,8 +4433,20 @@ class Scheduler:
     def _get_modules(self, task: dict) -> list[str]:
         """Extract module list from task metadata, normalized for locking.
 
-        Priority: in-memory cache > metadata.files > fallback ``task-<id>``.
+        Priority: deterministic short-circuit > in-memory cache > metadata.files
+        > fallback ``task-<id>``.
+
+        Deterministic tasks (I4/B12): return ``[]`` immediately so
+        ``acquire_next`` acquires an empty lock set for gate tasks.  A gate has
+        no file scope; the synthetic ``task-<id>`` fallback would spuriously
+        block the strand and degenerate-branch reapers.  Returning ``[]``
+        makes ``lock_table.try_acquire`` hold an empty set (no conflicts),
+        while leaving dispatch eligibility (``_deps_satisfied``) unchanged.
         """
+        # I4/B12: deterministic (gate) tasks must not hold any module lock.
+        if self.is_deterministic(task):
+            return []
+
         task_id = str(task.get('id', ''))
         depth = self.config.lock_depth
         # Check in-memory cache first (survives metadata update failures)
