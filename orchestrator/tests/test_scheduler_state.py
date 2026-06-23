@@ -372,6 +372,103 @@ class TestParkInstallAtTracking:
 
 
 # ===========================================================================
+# Step-8b: ModuleLockTable.snapshot_park_stacks()
+# ===========================================================================
+
+class TestSnapshotParkStacks:
+    """ModuleLockTable.snapshot_park_stacks() exposes the full LIFO park stack per module."""
+
+    def _make_lock_table(self) -> ModuleLockTable:
+        return ModuleLockTable(OrchestratorConfig(max_per_module=1))
+
+    def test_includes_shadowed_owners_bottom_to_top(self):
+        """B1 boundary: buried owner appears in park_stacks but not in snapshot_parks().
+
+        User-observable signal at the producer level: snapshot_park_stacks()
+        surfaces L even though snapshot_parks() omits it (INV-7).
+        """
+        lt = self._make_lock_table()
+        lt.install_parks('L', ['mod/a'], 'low')   # installed first → bottom of stack
+        lt.install_parks('H', ['mod/a'], 'high')  # installed second → active top
+
+        stacks = lt.snapshot_park_stacks()
+        assert 'mod/a' in stacks
+        entries = stacks['mod/a']
+        assert len(entries) == 2, f'Expected 2-deep stack, got {entries}'
+
+        # bottom entry: L (shadowed)
+        e0 = entries[0]
+        assert e0['owner'] == 'L'
+        assert e0['shadowed'] is True
+        assert isinstance(e0['rank'], int)
+        datetime.fromisoformat(e0['installed_at'])
+
+        # top entry: H (active)
+        e1 = entries[1]
+        assert e1['owner'] == 'H'
+        assert e1['shadowed'] is False
+        assert isinstance(e1['rank'], int)
+        datetime.fromisoformat(e1['installed_at'])
+
+        # User-observable signal: snapshot_parks() only has H, not L
+        snap = lt.snapshot_parks()
+        assert 'H' in snap
+        assert 'L' not in snap
+
+    def test_rank_strictly_decreasing_top_ward(self):
+        """INV-3: ranks must be strictly decreasing toward the top (last element)."""
+        lt = self._make_lock_table()
+        lt.install_parks('L', ['mod/a'], 'low')     # rank 3, becomes bottom
+        lt.install_parks('M', ['mod/a'], 'medium')  # rank 2, shadows L
+        lt.install_parks('H', ['mod/a'], 'high')    # rank 1, shadows M → active top
+
+        entries = lt.snapshot_park_stacks()['mod/a']
+        assert len(entries) == 3, f'Expected 3-deep stack, got {entries}'
+
+        for i in range(len(entries) - 1):
+            assert entries[i]['rank'] > entries[i + 1]['rank'], (
+                f'Rank not strictly decreasing top-ward: '
+                f'entry[{i}].rank={entries[i]["rank"]} <= entry[{i + 1}].rank={entries[i + 1]["rank"]}'
+            )
+        # Active top (last element) must not be shadowed; all others must be
+        assert entries[-1]['shadowed'] is False
+        for e in entries[:-1]:
+            assert e['shadowed'] is True
+
+    def test_empty_when_no_parks(self):
+        """Fresh table returns empty dict."""
+        lt = self._make_lock_table()
+        assert lt.snapshot_park_stacks() == {}
+
+    def test_is_non_aliasing_and_installed_at_default(self):
+        """Returned dicts/lists must not alias internal state; '' default for unknown installed_at."""
+        lt = self._make_lock_table()
+        lt.install_parks('L', ['mod/a'], 'low')
+        lt.install_parks('H', ['mod/a'], 'high')
+
+        stacks = lt.snapshot_park_stacks()
+
+        # Mutate the returned list and entry dict
+        stacks['mod/a'].append({'owner': 'INJECTED', 'rank': 99, 'shadowed': False, 'installed_at': ''})
+        stacks['mod/a'][0]['owner'] = 'MUTATED'
+
+        # Internal _parked must be unchanged
+        assert lt._parked['mod/a'][0][0] == 'L', '_parked must not be aliased via entry dict'
+        assert len(lt._parked['mod/a']) == 2, '_parked list must not be aliased by append'
+
+        # Future calls are unaffected by the mutation
+        fresh = lt.snapshot_park_stacks()
+        assert len(fresh['mod/a']) == 2
+        assert fresh['mod/a'][0]['owner'] == 'L'
+
+        # White-box: inject an owner absent from _park_install_at → '' default
+        lt._parked['mod/z'] = [('ghost', 0)]
+        assert 'ghost' not in lt._park_install_at
+        ghost_entries = lt.snapshot_park_stacks()['mod/z']
+        assert ghost_entries[0]['installed_at'] == ''
+
+
+# ===========================================================================
 # Step-9: _last_effective_priorities cache
 # ===========================================================================
 
