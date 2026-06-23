@@ -3173,18 +3173,16 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         import shutil as _shutil  # noqa: PLC0415
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker as _SMW  # noqa: PLC0415
-
         if self._merge_worker is None:
             return
 
-        if not isinstance(self._merge_worker, _SMW):
+        snapshot = self._merge_worker.snapshot()
+        metrics = snapshot.get('metrics') if isinstance(snapshot, dict) else None
+        if metrics is None:
             # MergeWorker (legacy, no metrics) — circuit breaker is a no-op
             return
 
-        landings_total: int = (
-            self._merge_worker.snapshot()['metrics']['landings_total']
-        )
+        landings_total: int = metrics['landings_total']
 
         try:
             free_bytes: int = _shutil.disk_usage(
