@@ -4228,6 +4228,77 @@ class TestCreateWorktreeTrain:
         msg = str(exc_info.value)
         assert 'task/ghost-predecessor' in msg
 
+    async def test_reuse_conflict_degrades_gracefully_for_stacked_member(
+        self, git_ops: GitOps, caplog,
+    ):
+        """Rebase conflict on a reused stacked member logs ERROR and returns old base.
+
+        Contract for the graceful-degradation path (conflict branch):
+          - create_worktree returns normally (no exception raised)
+          - WorktreeInfo.base_commit is the pre-rebase merge-base (old α tip)
+          - the conflict is logged at ERROR level with train_id and order, not
+            merely WARNING, so a broken stack is observable (Suggestion 2)
+
+        Setup: β is stacked on α; α then advances with a conflicting change to
+        the same file β already modified, so git rebase aborts.
+        """
+        from orchestrator.git_ops import TrainMembership
+
+        # α: create worktree, write shared file
+        alpha_info = await git_ops.create_worktree('reuse-conflict-alpha')
+        (alpha_info.path / 'shared.py').write_text('x = 1\n')
+        alpha_tip_v1 = await git_ops.commit(alpha_info.path, 'alpha v1: x=1')
+        assert alpha_tip_v1 is not None
+
+        # β: stacked on α (fresh create), modifies the same file
+        train = TrainMembership(
+            id='T-conflict', order=1,
+            members=['reuse-conflict-alpha', 'reuse-conflict-beta'],
+        )
+        beta_info = await git_ops.create_worktree('reuse-conflict-beta', train=train)
+        (beta_info.path / 'shared.py').write_text('x = 3\n')
+        await git_ops.commit(beta_info.path, 'beta: x=3')
+
+        # Advance α's tip with a conflicting change to the same file.
+        # Both α (x→2) and β (x→3) diverge from the original x=1, so rebasing
+        # β onto the new α tip will produce a merge conflict.
+        (alpha_info.path / 'shared.py').write_text('x = 2\n')
+        alpha_tip_v2 = await git_ops.commit(alpha_info.path, 'alpha v2: x=2')
+        assert alpha_tip_v2 is not None
+        assert alpha_tip_v2 != alpha_tip_v1
+
+        # Simulate requeue of β: fire the reuse path.
+        # The rebase onto the new α tip will conflict and be aborted.
+        with caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'):
+            reused_info = await git_ops.create_worktree(
+                'reuse-conflict-beta', train=train
+            )
+
+        # Must not raise — graceful degradation
+        # base_commit falls back to the old merge-base (α tip v1, the divergence
+        # point between the two branches before α advanced)
+        assert reused_info.base_commit == alpha_tip_v1, (
+            f'Expected base_commit={alpha_tip_v1!r} (alpha tip v1) after '
+            f'conflict degradation, got {reused_info.base_commit!r}'
+        )
+
+        # ERROR must be logged with train_id and order (not merely WARNING)
+        error_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            'Expected at least one ERROR log record for stacked-member rebase '
+            f'conflict; got records: {[r.getMessage() for r in caplog.records]}'
+        )
+        error_msgs = [r.getMessage() for r in error_records]
+        assert any('T-conflict' in m for m in error_msgs), (
+            f'Expected train_id "T-conflict" in ERROR log; got: {error_msgs}'
+        )
+        assert any('order' in m for m in error_msgs), (
+            f'Expected "order" in ERROR log message; got: {error_msgs}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestFindInflightMergeWorktree

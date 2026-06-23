@@ -729,6 +729,35 @@ class GitOps:
             branch=f'{self.config.branch_prefix}{predecessor_id}',
         )
 
+    async def _resolve_predecessor_tip(
+        self, train: TrainMembership, branch_name: str
+    ) -> tuple[str, str]:
+        """Resolve predecessor branch tip SHA and branch name for a train member.
+
+        Returns ``(predecessor_sha, predecessor_branch)`` where
+        *predecessor_sha* is the 40-char tip SHA of the predecessor's branch
+        and *predecessor_branch* is its full branch name.
+
+        Raises ``RuntimeError`` when the predecessor branch does not exist.
+        Both the initial-create path and the reuse path share this invariant:
+        the predecessor must be present before any successor can be created or
+        requeued.  Centralising the guard here prevents the two callers from
+        drifting apart — the pre-refactor duplication would have allowed the
+        two error messages (and their None-guard logic) to diverge, silently
+        reintroducing the main-rebase corruption this task fixes.
+        """
+        predecessor = await self._train_predecessor(train)
+        predecessor_sha = await self.resolve_branch_sha(predecessor.branch)
+        if predecessor_sha is None:
+            raise RuntimeError(
+                f'create_worktree: predecessor branch {predecessor.branch!r} '
+                f'does not exist (train_id={train.get("id")!r}, '
+                f'order={train.get("order")}, branch_name={branch_name!r}). '
+                'The predecessor branch must exist before any successor can be '
+                'created or requeued.'
+            )
+        return predecessor_sha, predecessor.branch
+
     async def create_worktree(
         self,
         branch_name: str,
@@ -778,17 +807,8 @@ class GitOps:
             # ── Train path: branch from predecessor's tip ─────────────────
             # PRD § 9.4: resolve the predecessor's branch and use its tip SHA
             # as start_ref so the new worktree stacks directly on top.
-            # The missing-branch guard (raise RuntimeError) is in step-12.
-            predecessor = await self._train_predecessor(train)
-            predecessor_sha = await self.resolve_branch_sha(predecessor.branch)
-            if predecessor_sha is None:
-                raise RuntimeError(
-                    f'create_worktree: predecessor branch {predecessor.branch!r} '
-                    f'does not exist (train_id={train.get("id")!r}, '
-                    f'order={train.get("order")}, branch_name={branch_name!r}). '
-                    'The predecessor worktree must be created before the successor.'
-                )
-            start_ref = predecessor_sha
+            # Guard (raise RuntimeError on None) is in _resolve_predecessor_tip.
+            start_ref, _ = await self._resolve_predecessor_tip(train, branch_name)
             stale_commits = None  # "behind remote" does not apply to sibling branches
         else:
             # ── Freshen main from remote (best-effort) ────────────────────
@@ -920,23 +940,13 @@ class GitOps:
                 # behaviour) corrupts the train by re-parenting the delta off
                 # main instead of the predecessor's commits.
                 if train is not None and train.get('order', 0) > 0:
-                    _pred = await self._train_predecessor(train)
-                    _pred_sha = await self.resolve_branch_sha(_pred.branch)
-                    if _pred_sha is None:
-                        raise RuntimeError(
-                            f'create_worktree: predecessor branch {_pred.branch!r} '
-                            f'does not exist for requeued stacked member '
-                            f'(train_id={train.get("id")!r}, '
-                            f'order={train.get("order")}, '
-                            f'branch_name={branch_name!r}). '
-                            'The predecessor branch must exist for a requeued '
-                            'stacked member.'
-                        )
-                    rebase_target: str | None = _pred_sha
-                    base_ref: str = _pred.branch
+                    # Guard (raise RuntimeError on None) is in _resolve_predecessor_tip.
+                    rebase_target, base_ref = await self._resolve_predecessor_tip(
+                        train, branch_name
+                    )
                 else:
-                    rebase_target = None  # rebase_onto_main defaults to main
-                    base_ref = self.config.main_branch
+                    rebase_target: str | None = None  # rebase_onto_main defaults to main
+                    base_ref: str = self.config.main_branch
 
                 # Rebase onto the resolved target (predecessor tip for stacked
                 # trains, main for non-train / order==0).  Critical for plan
@@ -960,11 +970,24 @@ class GitOps:
                         cwd=worktree_path,
                     )
                     actual_base = mb_out.strip() or base_sha.strip()
-                    logger.warning(
-                        'Rebase failed for reused worktree %s — continuing '
-                        'on old base %s',
-                        worktree_path, actual_base[:8],
-                    )
+                    if train is not None and train.get('order', 0) > 0:
+                        # For stacked train members a rebase conflict means the
+                        # stacking invariant is broken — log at ERROR so the
+                        # degradation is visible rather than silently shipped on
+                        # a stale base.
+                        logger.error(
+                            'Rebase conflict for stacked train member %s '
+                            '(train_id=%r, order=%s) — continuing on stale '
+                            'base %s; stack integrity is degraded.',
+                            worktree_path, train.get('id'),
+                            train.get('order'), actual_base[:8],
+                        )
+                    else:
+                        logger.warning(
+                            'Rebase failed for reused worktree %s — continuing '
+                            'on old base %s',
+                            worktree_path, actual_base[:8],
+                        )
 
                 _ensure_task_gitignore(worktree_path)
                 # Re-run on reuse so the requeued agent re-acquires a free
