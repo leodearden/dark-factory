@@ -12,6 +12,7 @@ resume→pending flip.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -191,3 +192,115 @@ class TestRevertInProgressInfraHoldGuard:
             f'Task with infra_hold on degenerate branch should still revert; '
             f'got {result!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step 15: _on_escalation_resolved — infra_hold → resume-at-verify, NOT pending
+# ---------------------------------------------------------------------------
+
+from escalation.models import Escalation  # noqa: E402 (after class definitions is fine)
+
+
+def _make_infra_esc(
+    task_id: str = '1883',
+    status: str = 'resolved',
+    level: int = 1,
+    resolved_by: str | None = None,
+) -> Escalation:
+    """Create a minimal resolved infra_issue escalation."""
+    return Escalation(
+        id=f'esc-{task_id}-99',
+        task_id=task_id,
+        agent_role='workflow',
+        severity='blocking',
+        category='infra_issue',
+        summary='ENOSPC during verify warm marker write',
+        level=level,
+        status=status,
+        resolved_by=resolved_by,
+    )
+
+
+@pytest.mark.asyncio
+class TestInfraHoldEscalationResolution:
+    """_on_escalation_resolved with infra_hold → resume-at-verify (in-progress), not pending.
+
+    RED before step-16: _cascade_unblock_member always calls set_task_status('pending'),
+    so the infra_hold task gets wrongly re-pended.
+    GREEN after step-16: infra_hold check intercepts the flip and sets 'in-progress' instead.
+    """
+
+    async def test_infra_hold_escalation_resolved_resumes_at_verify(
+        self, harness: Harness
+    ):
+        """infra_hold task: resolved infra_issue escalation → 'in-progress', NOT 'pending'.
+
+        Currently FAILS (RED): _cascade_unblock_member calls set_task_status('pending')
+        without checking infra_hold — after step-16 it will call 'in-progress' instead.
+        """
+        tid = '1883'
+
+        # Task is blocked with infra_hold set
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'metadata': {
+                'infra_hold': {'phase': 'verify', 'errno': 28, 'reason': 'ENOSPC'},
+                'branch_base_sha': _BASE_SHA,
+            },
+        })
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        esc = _make_infra_esc(task_id=tid)  # status='resolved' → legacy 'resume' action
+
+        # Ensure orphan path: task not in _escalation_events
+        harness._escalation_events.pop(tid, None)
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Must NOT flip to 'pending'
+        pending_calls = [
+            c for c in harness.scheduler.set_task_status.await_args_list
+            if c.args[1] == 'pending'
+        ]
+        assert not pending_calls, (
+            f'set_task_status("pending") was called despite infra_hold. '
+            f'An infra_hold task must resume-at-verify (in-progress), not re-pend. '
+            f'Calls: {pending_calls}'
+        )
+
+        # Must flip to 'in-progress' (resume-at-verify)
+        inprog_calls = [
+            c for c in harness.scheduler.set_task_status.await_args_list
+            if c.args[1] == 'in-progress'
+        ]
+        assert inprog_calls, (
+            f'set_task_status("in-progress") was never called for infra_hold task. '
+            f'Expected resume-at-verify but got: '
+            f'{[c.args for c in harness.scheduler.set_task_status.await_args_list]}'
+        )
+
+    async def test_no_infra_hold_still_repends(self, harness: Harness):
+        """Task without infra_hold: resolved escalation → 'pending' (no regression).
+
+        This is the contrast/no-regression case. Passes both before and after
+        step-16 (existing behaviour preserved for non-infra_hold tasks).
+        """
+        tid = '1884'
+
+        # No infra_hold in metadata
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'metadata': {},
+        })
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        esc = _make_infra_esc(task_id=tid)
+
+        harness._escalation_events.pop(tid, None)
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Normal resume → flip to 'pending'
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')
