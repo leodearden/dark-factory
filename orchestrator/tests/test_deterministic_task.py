@@ -1448,3 +1448,192 @@ class TestB10Validation:
         assert result is None, (
             f'Expected None (no error) for valid deterministic gate, got: {result!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Reaper scaffolding (step-14)
+# ---------------------------------------------------------------------------
+
+def _build_reaper_harness(
+    mock_orch_config,
+    queue_dir: Path,
+    store: _StoreScheduler,
+) -> Harness:
+    """Build a Harness wired for the strand-reaper B12 tests.
+
+    Extends _build_harness with git_ops stubs that no-op the two reaper
+    fast-paths (is_ancestor→False, find_merge_marker→None): since a gate
+    task never creates a branch, both fast-paths legitimately return false/None.
+
+    The only suppressor of the stranded_blocked re-file is the pending-escalation
+    check (harness.py:2480 `not get_by_task(tid, status='pending')`), NOT
+    has_open_l1 (level=1 only — queue.py:392).  B12 seeds a pending born-at-L2
+    to make that check suppress the re-file.
+
+    Invariants set here:
+      - git_ops.is_ancestor(branch, main) = False (no branch → not on main)
+      - git_ops.find_merge_marker(branch) = None (no merge commit)
+      - git_ops.config.branch_prefix = 'task/', main_branch = 'main'
+      - config.stranded_blocked_escalate_enabled = True (so the re-file path runs)
+      - _escalation_events is {} (gate not dispatching, no active workflow)
+      - _workflow_cancel_at is {} (no recent cancel → _workflow_cancel_recent False)
+    """
+    h = _build_harness(mock_orch_config, queue_dir, store)
+    git_ops = MagicMock()
+    git_ops.is_ancestor = AsyncMock(return_value=False)
+    git_ops.find_merge_marker = AsyncMock(return_value=None)
+    git_ops.config = MagicMock()
+    git_ops.config.branch_prefix = 'task/'
+    git_ops.config.main_branch = 'main'
+    git_ops.release_lane_for_terminal_task = AsyncMock()
+    h.git_ops = git_ops
+    h.config.stranded_blocked_escalate_enabled = True
+    # Both are set to {} by Harness.__init__ — confirm our expectations
+    assert h._escalation_events == {}, '_escalation_events must be empty at start'
+    assert h._workflow_cancel_at == {}, '_workflow_cancel_at must be empty at start'
+    return h
+
+
+@pytest.fixture
+def reaper_harness(tmp_path: Path, mock_orch_config) -> Harness:
+    """Harness wired for B12 strand-reaper tests (no-branch git_ops stubs)."""
+    store = _StoreScheduler()
+    return _build_reaper_harness(mock_orch_config, tmp_path / 'queue', store)
+
+
+class TestReaperScaffoldSmoke:
+    """Smoke: _build_reaper_harness returns a Harness with the expected git_ops stubs."""
+
+    def test_reaper_harness_builds(self, reaper_harness: Harness) -> None:
+        """reaper_harness fixture returns a Harness."""
+        assert isinstance(reaper_harness, Harness)
+
+    def test_reaper_harness_git_stubs(self, reaper_harness: Harness) -> None:
+        """git_ops has is_ancestor and find_merge_marker stubs."""
+        git = reaper_harness.git_ops
+        assert hasattr(git, 'is_ancestor')
+        assert hasattr(git, 'find_merge_marker')
+        assert git.config.branch_prefix == 'task/'
+        assert git.config.main_branch == 'main'
+
+
+# ---------------------------------------------------------------------------
+# B12 — no-lock / no-strand invisibility (step-15)
+# ---------------------------------------------------------------------------
+
+class TestB12NoLock:
+    """B12 (a): no-lock — _get_modules==[] and lock_table holds empty set for gates."""
+
+    def test_b12a_no_lock_get_modules_empty(self, tmp_path: Path) -> None:
+        """Scheduler._get_modules(gate)==[] for a deterministic gate (even with files)."""
+        from orchestrator.config import OrchestratorConfig
+        config = OrchestratorConfig(project_root=tmp_path)
+        scheduler = Scheduler(config)
+
+        # Gate with metadata.files set — _get_modules must still return []
+        gate = _gate_task(task_id='gate-b12')
+        gate['metadata']['files'] = ['orchestrator/src/orchestrator/harness.py']
+
+        modules = scheduler._get_modules(gate)
+        assert modules == [], (
+            f'Expected [] for deterministic gate, got {modules!r}'
+        )
+
+    def test_b12a_no_lock_try_acquire_empty_set(self, tmp_path: Path) -> None:
+        """lock_table.try_acquire(gate_id, []) returns True and holds an empty set."""
+        from orchestrator.config import OrchestratorConfig
+        config = OrchestratorConfig(project_root=tmp_path)
+        scheduler = Scheduler(config)
+
+        gate_id = 'gate-b12'
+        modules = scheduler._get_modules(_gate_task(task_id=gate_id))
+        assert modules == []
+
+        acquired = scheduler.lock_table.try_acquire(gate_id, modules)
+        assert acquired is True
+
+        held = scheduler.lock_table._held.get(gate_id, set())
+        assert held == set(), (
+            f'Expected empty lock set for deterministic gate, got {held!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestB12NoStrandNoWorktree:
+    """B12 (b/c): no-strand + no-worktree for blocked deterministic gates."""
+
+    async def test_b12b_no_strand_reaper_suppressed_by_pending_l2(
+        self, reaper_harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Blocked gate with pending L2 → _reconcile_one_stranded returns None, no re-file.
+
+        The suppressor is the pending-escalation check (harness.py:2480), NOT
+        has_open_l1 (which only matches level=1 escalations — queue.py:392).
+        """
+        gate_id = 'gate-b12-strand'
+        store: _StoreScheduler = reaper_harness.scheduler
+        gate = _gate_task(task_id=gate_id, title='B12 strand gate')
+        gate['status'] = 'blocked'
+        store.seed(gate)
+
+        # Submit a pending born-at-L2 (level=2 — NOT an L1)
+        queue: EscalationQueue = reaper_harness._escalation_queue
+        esc = Escalation(
+            id=queue.make_id(gate_id),
+            task_id=gate_id,
+            agent_role='orchestrator-deterministic',
+            severity='critical',
+            category='milestone_gate',
+            summary='B12 gate pending',
+            level=2,
+        )
+        queue.submit(esc)
+        assert len(queue.get_by_task(gate_id, status='pending')) == 1
+
+        # Invoke the real _reconcile_one_stranded (status='blocked', mid_run=False)
+        result = await reaper_harness._reconcile_one_stranded(
+            gate_id, 'blocked', mid_run=False
+        )
+
+        # Returns None (no action taken)
+        assert result is None, (
+            f'Expected None, got {result!r} (reaper should not touch a gated blocked task)'
+        )
+        # Status STILL 'blocked' (set_task_status never called to pending/done)
+        assert await store.get_status(gate_id) == 'blocked', (
+            'Status must remain blocked — reaper must not re-pend the gate'
+        )
+        # STILL exactly one pending escalation (original L2, no stranded_blocked L1 added)
+        still_pending = queue.get_by_task(gate_id, status='pending')
+        assert len(still_pending) == 1, (
+            f'Expected 1 pending escalation (original L2, no new L1), '
+            f'got {len(still_pending)}: {still_pending}'
+        )
+        assert still_pending[0].level == 2, (
+            'The one pending escalation must be the original L2 (not an L1 stranded_blocked)'
+        )
+
+    async def test_b12c_no_worktree_created_for_gate(
+        self, det_harness: Harness,
+    ) -> None:
+        """Dispatching a gate never calls git_ops.create_worktree (no-branch, I4)."""
+        store: _StoreScheduler = det_harness.scheduler
+        task = _gate_task(task_id='gate-b12-wt', title='B12 worktree gate')
+        store.seed(task)
+
+        await _dispatch(det_harness, 'gate-b12-wt')
+
+        # create_worktree must not have been called (runner built without git_ops
+        # in _run_deterministic_slot → no branch provisioned)
+        git_ops = det_harness.git_ops
+        create_wt = getattr(git_ops, 'create_worktree', None)
+        if create_wt is not None and hasattr(create_wt, 'call_count'):
+            assert create_wt.call_count == 0, (
+                'git_ops.create_worktree must not be called for a deterministic gate'
+            )
+        # is_ancestor / find_merge_marker also never called (no branch to inspect)
+        is_anc = getattr(git_ops, 'is_ancestor', None)
+        if is_anc is not None and hasattr(is_anc, 'call_count'):
+            assert is_anc.call_count == 0, (
+                'git_ops.is_ancestor must not be called — gate creates no branch'
+            )
