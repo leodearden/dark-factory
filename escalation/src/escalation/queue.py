@@ -144,6 +144,10 @@ class EscalationQueue:
         self._seq = 0
         self._notify_callback: Callable[[Escalation], None] | None = None
         self._resolve_callback: Callable[[Escalation], None] | None = None
+        # Cache 1 — archive listing (serves get()/_locate_path).
+        # None = not yet built; dict = {dated-subdir-name: set-of-esc-id-stems}.
+        # Lazy-built on first archive lookup; incrementally updated in _archive_resolved.
+        self._archive_listing: dict[str, set[str]] | None = None
 
     def set_notify_callback(self, callback: Callable[[Escalation], None]) -> None:
         self._notify_callback = callback
@@ -154,6 +158,26 @@ class EscalationQueue:
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
+
+    def _scan_archive_listing(self) -> dict[str, set[str]]:
+        """Build the archive listing from a single rglob scan.
+
+        Returns a dict mapping dated-subdir-name (e.g. '2025-06-15') to a set
+        of esc-id stems (e.g. {'esc-1-1', 'esc-1-2'}) for all files under the
+        archive root.  Returns an empty dict when the archive root does not exist.
+        """
+        archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
+        listing: dict[str, set[str]] = {}
+        if archive_root.exists():
+            for path in archive_root.rglob('esc-*.json'):
+                listing.setdefault(path.parent.name, set()).add(path.stem)
+        return listing
+
+    def _get_archive_listing(self) -> dict[str, set[str]]:
+        """Return the memoised archive listing, building it on first access."""
+        if self._archive_listing is None:
+            self._archive_listing = self._scan_archive_listing()
+        return self._archive_listing
 
     def _iter_archive_paths(self, pattern: str) -> Iterator[Path]:
         """Yield escalation JSON files from the archive subtree matching *pattern*.
@@ -206,8 +230,15 @@ class EscalationQueue:
         path = self.queue_dir / f'{escalation_id}.json'
         if path.exists():
             return path
-        # Fall back to archive: search all dated subdirs.
-        candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
+        # Fall back to archive using the memoised per-subdir listing.
+        # Reconstruct candidate paths from the listing without re-rglob-ing.
+        archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
+        listing = self._get_archive_listing()
+        candidates = [
+            archive_root / subdir / f'{escalation_id}.json'
+            for subdir, stems in listing.items()
+            if escalation_id in stems
+        ]
         if not candidates:
             return None
         if len(candidates) > 1:
@@ -234,10 +265,11 @@ class EscalationQueue:
         Falls back to the archive directory when the file is not in the
         queue root (i.e. the escalation has been resolved and archived).
 
-        Note: the archive fallback performs an O(|archive|) rglob on every miss.
-        For a 30-day retention window this is bounded, but callers on hot paths
-        should avoid repeated get() calls for ids known to be archived.
-        TODO: memoise the archive listing per dated subdir to reduce repeated scans.
+        The archive fallback uses a memoised per-dated-subdir listing
+        (_archive_listing) so that repeated get() calls for archived ids
+        scan the archive at most once per instance lifetime.  The listing
+        is lazily built on the first archive miss and incrementally updated
+        by _archive_resolved() when this instance archives a new escalation.
         """
         path = self._locate_path(escalation_id)
         if path is None:
