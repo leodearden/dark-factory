@@ -7,12 +7,11 @@ Step-7: RED — idempotent resume + quiescence (I2/B3/B4/B11)
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -77,7 +76,6 @@ class TestPureGatePath:
     async def test_pure_gate_submits_l2_escalation(self, tmp_path: Path):
         """Pure gate files exactly ONE born-at-L2 escalation (I3)."""
         from orchestrator.deterministic_runner import DeterministicRunner
-        from orchestrator.workflow import WorkflowOutcome
 
         task = _gate_task(task_id='99', deps=[10, 11])
         assignment = _make_assignment(task)
@@ -85,7 +83,7 @@ class TestPureGatePath:
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
-        outcome = await runner.run(assignment)
+        await runner.run(assignment)
 
         # Exactly one escalation submitted
         pending = queue.get_by_task('99', status='pending')

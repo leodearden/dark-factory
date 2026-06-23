@@ -32,6 +32,8 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from orchestrator.workflow import WorkflowOutcome
+
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
@@ -55,7 +57,7 @@ class DeterministicRunner:
         self.escalation_queue = escalation_queue
         self.event_store = event_store
 
-    async def run(self, assignment) -> 'WorkflowOutcome':  # noqa: F821
+    async def run(self, assignment) -> WorkflowOutcome:
         """Execute the deterministic gate logic for *assignment*.
 
         Returns:
@@ -66,7 +68,6 @@ class DeterministicRunner:
             NotImplementedError — if ``metadata.before_done`` is not None (task γ).
         """
         from escalation.models import Escalation
-        from orchestrator.workflow import WorkflowOutcome
 
         task_id = str(assignment.task_id)
         task = assignment.task

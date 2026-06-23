@@ -26,6 +26,7 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.config import OrchestratorConfig
+from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
@@ -41,7 +42,6 @@ from orchestrator.scheduler import (
 )
 from orchestrator.service_restart import StaleServiceRestartCoordinator
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
-from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
