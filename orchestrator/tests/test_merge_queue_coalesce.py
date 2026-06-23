@@ -1946,3 +1946,216 @@ class TestRedriveCoalesceMembers:
         assert redrive_member.await_count == 2, (
             f'Expected 2 calls (both members attempted); got {redrive_member.await_count}'
         )
+
+
+# ─── 1867 Step 5 ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestMergerLoopRedrive:
+    """1867 step-5 (RED): merger-loop wiring — _redrive_coalesce_members called on derail.
+
+    Uses the TestOneStrikeRecording pattern: queue.put(group), worker.run(),
+    await group_future.  Tests three cases:
+      (a) coalesce-prefixed train + blocked → redrive_member called for each member
+      (b) non-coalesce train + blocked → redrive_member NOT called
+      (c) coalesce train + done → redrive_member NOT called (success path owns flips)
+    """
+
+    async def test_coalesce_derail_triggers_redrive(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """(a) Coalesce-prefixed train derail (blocked) → redrive_member called per merge-deferred member."""
+        import contextlib
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
+
+        db_path = tmp_path / 'es_rd_a.db'
+        es = EventStore(db_path=db_path, run_id='run-rd-a')
+
+        redrive_member = AsyncMock()
+        status_check = AsyncMock(return_value={
+            'rd1': 'merge-deferred',
+            'rd2': 'merge-deferred',
+        })
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        group = GroupMergeRequest(
+            task_id='rd2',
+            branch='task/rd2',
+            worktree=tmp_path / 'wt-rd2',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=group_future,
+            train_id='coalesce-rd-deadbeef',
+            member_task_ids=['rd1', 'rd2'],
+            tip_branch='task/rd2',
+            tip_task_id='rd2',
+            status_check=status_check,
+            mark_member_done=AsyncMock(),
+            redrive_member=redrive_member,
+        )
+
+        with (
+            patch(
+                'orchestrator.merge_queue._do_train_merge',
+                AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
+            ),
+            patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=False)),
+        ):
+            await queue.put(group)
+            worker_task = asyncio.create_task(worker.run())
+            await asyncio.wait_for(group_future, timeout=30)
+
+        # redrive_member must be called once per merge-deferred member.
+        called_mids = {c.args[0] for c in redrive_member.await_args_list}
+        assert called_mids == {'rd1', 'rd2'}, (
+            f'Expected redrive_member for rd1+rd2; got {called_mids}'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_non_coalesce_train_derail_no_redrive(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """(b) Non-coalesce train derail → redrive_member NOT called."""
+        import contextlib
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
+
+        db_path = tmp_path / 'es_rd_b.db'
+        es = EventStore(db_path=db_path, run_id='run-rd-b')
+
+        redrive_member = AsyncMock()
+        status_check = AsyncMock(return_value={'nc1': 'merge-deferred', 'nc2': 'merge-deferred'})
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        group = GroupMergeRequest(
+            task_id='nc2',
+            branch='task/nc2',
+            worktree=tmp_path / 'wt-nc2',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=group_future,
+            train_id='train-beta-xyz',   # NOT coalesce-prefixed
+            member_task_ids=['nc1', 'nc2'],
+            tip_branch='task/nc2',
+            tip_task_id='nc2',
+            status_check=status_check,
+            mark_member_done=AsyncMock(),
+            redrive_member=redrive_member,
+        )
+
+        with patch(
+            'orchestrator.merge_queue._do_train_merge',
+            AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
+        ):
+            await queue.put(group)
+            worker_task = asyncio.create_task(worker.run())
+            await asyncio.wait_for(group_future, timeout=30)
+
+        assert redrive_member.await_count == 0, (
+            f'Non-coalesce train: redrive_member must NOT be called; '
+            f'got {redrive_member.await_count} calls'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    async def test_coalesce_train_done_no_redrive(
+        self,
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
+        tmp_path: Path,
+    ):
+        """(c) Coalesce train success (done) → redrive_member NOT called."""
+        import contextlib
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
+
+        db_path = tmp_path / 'es_rd_c.db'
+        es = EventStore(db_path=db_path, run_id='run-rd-c')
+
+        redrive_member = AsyncMock()
+        status_check = AsyncMock(return_value={'done1': 'merge-deferred', 'done2': 'merge-deferred'})
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=es,
+            train_callback_factory=_stub_factory(),
+        )
+
+        group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        group = GroupMergeRequest(
+            task_id='done2',
+            branch='task/done2',
+            worktree=tmp_path / 'wt-done2',
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=coalesce_config,
+            result=group_future,
+            train_id='coalesce-rd-success',
+            member_task_ids=['done1', 'done2'],
+            tip_branch='task/done2',
+            tip_task_id='done2',
+            status_check=status_check,
+            mark_member_done=AsyncMock(),
+            redrive_member=redrive_member,
+        )
+
+        with patch(
+            'orchestrator.merge_queue._do_train_merge',
+            AsyncMock(return_value=MergeOutcome('done', merge_sha='abc123')),
+        ):
+            await queue.put(group)
+            worker_task = asyncio.create_task(worker.run())
+            await asyncio.wait_for(group_future, timeout=30)
+
+        assert redrive_member.await_count == 0, (
+            f'Success path: redrive_member must NOT be called; '
+            f'got {redrive_member.await_count} calls'
+        )
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
