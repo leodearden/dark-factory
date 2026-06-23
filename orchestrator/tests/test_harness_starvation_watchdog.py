@@ -22,7 +22,6 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
 
-
 # ---------------------------------------------------------------------------
 # Shared helper
 # ---------------------------------------------------------------------------
@@ -254,6 +253,9 @@ class TestHarnessStarvationWatchdogWiring:
 
         assert harness.scheduler._on_starvation_resolve is not None, (
             'Harness must wire scheduler._on_starvation_resolve after construction'
+        )
+        assert harness.scheduler._on_starvation_warn is not None, (
+            'Harness must wire scheduler._on_starvation_warn after construction'
         )
 
         await harness.scheduler._on_starvation_warn(

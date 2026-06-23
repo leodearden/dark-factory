@@ -15,6 +15,7 @@ from orchestrator.config import (
     FairnessConfig,
     ModuleConfig,
     OrchestratorConfig,
+    StarvationWatchdogConfig,
 )
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
@@ -9600,11 +9601,11 @@ class TestStarvationWatchdog:
 
         config = OrchestratorConfig(
             max_per_module=1,
-            starvation_watchdog={
-                'enabled': enabled,
-                'skip_threshold': skip_threshold,
-                'idle_secs': idle_secs,
-            },
+            starvation_watchdog=StarvationWatchdogConfig(
+                enabled=enabled,
+                skip_threshold=skip_threshold,
+                idle_secs=idle_secs,
+            ),
         )
         # Prevent fairness parks from installing before the watchdog threshold
         # is reached (the watchdog skip_threshold=3 is deliberately smaller
