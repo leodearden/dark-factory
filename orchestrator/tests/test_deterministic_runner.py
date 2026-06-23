@@ -1762,3 +1762,132 @@ class TestSelfRestartScheduled:
         assert isinstance(kwargs['on_active_secs'], int) and kwargs['on_active_secs'] > 0, (
             f"on_active_secs must be a positive int; got {kwargs['on_active_secs']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-5 (ε): B8 scheduling failure → born-at-L2 infra_issue + blocked
+# (RED until step-6 implements the rc!=0 error path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartSchedulingFailure:
+    """DeterministicRunner — self-target deploy: systemd-run scheduling failure (B8/rc≠0)."""
+
+    def _make_runner(self, tmp_path: Path, task: dict, fail_output: str = 'systemd-run: failed to start transient unit'):
+        """Build a runner with self-targeting and a failing restart_scheduler."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        restart_scheduler = AsyncMock(return_value=(1, fail_output))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        return runner, queue, scheduler
+
+    async def test_b8_failure_outcome_is_blocked(self, tmp_path: Path):
+        """Scheduling failure (rc=1) → outcome is WorkflowOutcome.BLOCKED."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_b8_failure_files_one_infra_issue_escalation(self, tmp_path: Path):
+        """Scheduling failure → exactly one pending infra_issue escalation at level=2."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('860', status='pending')
+        assert len(pending) == 1, f'Expected 1 pending escalation, got {len(pending)}'
+
+    async def test_b8_failure_escalation_level_severity_role_category(self, tmp_path: Path):
+        """Filed escalation: level=2, severity='critical', role='orchestrator-deterministic', category='infra_issue'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('860', status='pending')
+        assert escs[0].level == 2
+        assert escs[0].severity == 'critical'
+        assert escs[0].agent_role == 'orchestrator-deterministic'
+        assert escs[0].category == 'infra_issue'
+
+    async def test_b8_failure_escalation_detail_contains_target_unit(self, tmp_path: Path):
+        """Escalation detail contains the target_unit."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('860', status='pending')
+        assert 'orchestrator-reify.service' in escs[0].detail, (
+            f'target_unit must appear in detail: {escs[0].detail!r}'
+        )
+
+    async def test_b8_failure_escalation_detail_contains_transient_unit(self, tmp_path: Path):
+        """Escalation detail contains the transient unit name (includes task id '860')."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('860', status='pending')
+        assert '860' in escs[0].detail, (
+            f"transient unit name (containing task id '860') must appear in detail: {escs[0].detail!r}"
+        )
+
+    async def test_b8_failure_set_task_blocked_never_done(self, tmp_path: Path):
+        """set_task_status called with 'blocked' and NEVER with 'done' on scheduling failure."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        blocked_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'blocked']
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(blocked_calls) == 1, 'set_task_status must be called once with blocked'
+        assert len(done_calls) == 0, 'set_task_status must NOT be called with done on scheduling failure'
+
+    async def test_b8_failure_stamps_before_done_ran_at(self, tmp_path: Path):
+        """update_task stamps before_done_ran_at even on scheduling failure (I1 crash-safe)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must stamp before_done_ran_at even on scheduling failure (I1)'
