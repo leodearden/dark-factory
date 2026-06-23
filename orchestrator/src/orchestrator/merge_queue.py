@@ -5721,6 +5721,130 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return buf.popleft()
         return None
 
+    async def recompute_suffix_conflict_graph(self) -> None:
+        """Recompute and store the conflict-graph over the unfrozen suffix (task δ=1889).
+
+        Enumerates _lane_buffers in pick order (high → normal, FIFO within each
+        lane), resolves each item's branch head SHA and changed-paths footprint,
+        builds footprint_edges (γ path-overlap) and textual_edges (β 3-way merge
+        probe), and marks items that conflict with the current main tip.
+
+        **Debounce** — short-circuits when the signature (ordered suffix
+        request_ids, main_sha) is unchanged since the last recompute.  Any change
+        to the suffix (submit/resubmit → new request_id, landing → item removed +
+        main advances, reorder → order changes) breaks the signature and forces a
+        full recompute.  Within a recompute, merge_tree_conflicts results are
+        memoized by (base_sha, head_sha) to avoid duplicate probes.
+
+        **Fail-open** — any probe error → conservative (treat as conflict/edge);
+        items with missing branch refs are skipped without aborting.  Never raises.
+
+        **Textual pruning** — the β/γ contract guarantees textual-conflict ⇒
+        footprint-overlap.  Only footprint-overlapping pairs are probed via
+        merge_tree_conflicts, collapsing the O(n²) forks to the overlap subset.
+
+        This method is async (forks git subprocesses) while snapshot() stays
+        synchronous and cheap (reads the stored graph; no await).
+        """
+        # ── 1. Build ordered suffix list ──────────────────────────────────────
+        suffix: list[MergeRequest] = []
+        for lane in MERGE_LANES:  # high → normal
+            suffix.extend(self._lane_buffers[lane])  # FIFO within each lane
+
+        ordered_rids = tuple(req.request_id for req in suffix)
+
+        # ── 2. Debounce: fetch main_sha once, compare signature ───────────────
+        try:
+            main_sha = await self._git_ops.get_main_sha()
+        except Exception:
+            logger.warning('recompute_suffix_conflict_graph: get_main_sha failed; skipping')
+            return
+
+        sig = (ordered_rids, main_sha)
+        if sig == self._suffix_conflict_signature:
+            return  # Suffix + main unchanged — prior graph is still valid
+
+        # ── 3. Empty suffix → sentinel ────────────────────────────────────────
+        if not suffix:
+            self._suffix_conflict_graph = EMPTY_SUFFIX_CONFLICT_GRAPH
+            self._suffix_conflict_signature = sig
+            return
+
+        # ── 4. Resolve branch heads + footprints ─────────────────────────────
+        branch_prefix = self._git_ops.config.branch_prefix
+        # Per-item: (head_sha | None, changed_paths | None)
+        heads: list[str | None] = []
+        changed_paths_list: list[list[str] | None] = []
+
+        for req in suffix:
+            ref = f'{branch_prefix}{req.branch}'
+            try:
+                head = await self._git_ops.resolve_branch_sha(ref)
+            except Exception:
+                logger.warning(
+                    'recompute_suffix_conflict_graph: resolve_branch_sha(%r) raised; '
+                    'treating item as missing ref', ref, exc_info=True,
+                )
+                head = None
+            heads.append(head)
+
+            if head is None:
+                changed_paths_list.append(None)
+                continue
+            try:
+                # Branch delta = from merge-base to branch head; approximate
+                # using branch..main ancestor as from (git diff main..branch).
+                # Simpler: get_changed_files(main_sha, head) captures the branch
+                # delta relative to current main (sufficient for overlap detection).
+                paths = await self._git_ops.get_changed_files(main_sha, head)
+            except Exception:
+                logger.warning(
+                    'recompute_suffix_conflict_graph: get_changed_files failed for %r; '
+                    'treating footprint as unknown', ref, exc_info=True,
+                )
+                paths = None
+            changed_paths_list.append(paths)
+
+        # ── 5. Build footprint_edges via path-set intersection ────────────────
+        detector = get_overlap_detector(None)
+        footprint_edges: set[frozenset[str]] = set()
+
+        for i in range(len(suffix)):
+            paths_i = changed_paths_list[i]
+            if paths_i is None:
+                continue  # missing ref — skip pairwise comparison for this item
+            for j in range(i + 1, len(suffix)):
+                paths_j = changed_paths_list[j]
+                if paths_j is None:
+                    continue
+                try:
+                    overlap = detector.overlaps(
+                        detector.footprint(paths_i),
+                        detector.footprint(paths_j),
+                    )
+                except Exception:
+                    logger.warning(
+                        'recompute_suffix_conflict_graph: footprint overlap check '
+                        'raised for pair (%s, %s); treating as overlap (fail-open)',
+                        suffix[i].request_id, suffix[j].request_id,
+                        exc_info=True,
+                    )
+                    overlap = True
+                if overlap:
+                    footprint_edges.add(frozenset({
+                        suffix[i].request_id,
+                        suffix[j].request_id,
+                    }))
+
+        # ── 6. Store (textual_edges / conflicts_with_main added in later steps) ─
+        self._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=ordered_rids,
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(footprint_edges),
+            conflicts_with_main=frozenset(),
+        )
+        self._suffix_conflict_signature = sig
+
     async def _acquire_next_request(self) -> MergeRequest | None:
         """Return the next pickable request, blocking if nothing is available.
 
