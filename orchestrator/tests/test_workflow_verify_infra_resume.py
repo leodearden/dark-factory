@@ -178,6 +178,35 @@ class TestVerifyInfraTransientRetry:
                 )
 
     @pytest.mark.asyncio
+    async def test_multiple_retries_before_success(self):
+        """Multiple consecutive VerifyInfraErrors then success → DONE after N retries."""
+        wf = _make(verify_infra_retry_max_attempts=5)
+
+        call_count = 0
+
+        async def fake_run_scoped(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 3:
+                raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+            return _passed_result()
+
+        sleep_calls = []
+
+        async def fake_sleep(secs):
+            sleep_calls.append(secs)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=fake_run_scoped),
+            patch('asyncio.sleep', side_effect=fake_sleep),
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert call_count == 4
+        assert len(sleep_calls) == 3
+
+    @pytest.mark.asyncio
     async def test_mark_blocked_not_called_on_transient_retry(self):
         """_mark_blocked is not called when a transient VerifyInfraError is retried successfully."""
         wf = _make(verify_infra_retry_max_attempts=3)
@@ -199,4 +228,108 @@ class TestVerifyInfraTransientRetry:
 
         assert not wf._mark_blocked.called, (
             '_mark_blocked must NOT be called when the transient infra error is retried successfully'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 9: Permanent VerifyInfraError (exhausts retries) → BLOCKED + infra_hold
+# ---------------------------------------------------------------------------
+
+class TestVerifyInfraPermanentExhaustion:
+    """_verify_debugfix_loop: all retries exhausted → BLOCKED with infra_hold, never pending."""
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_returns_blocked(self):
+        """When every run_scoped_verification call raises VerifyInfraError, return BLOCKED."""
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        async def always_infra(*args, **kwargs):
+            raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=always_infra),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_stamps_infra_hold_metadata(self):
+        """On exhaustion, metadata.infra_hold is stamped via scheduler.update_task."""
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        async def always_infra(*args, **kwargs):
+            raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=always_infra),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await wf._verify_debugfix_loop()
+
+        # update_task must have been called with metadata containing infra_hold
+        assert wf.scheduler.update_task.called, 'update_task must be called to stamp infra_hold'
+        call_kwargs = wf.scheduler.update_task.await_args
+        metadata_arg = call_kwargs.kwargs.get('metadata') or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
+        assert metadata_arg is not None, 'update_task must receive metadata kwarg'
+        assert 'infra_hold' in metadata_arg, f'infra_hold missing from metadata: {metadata_arg}'
+        infra_hold = metadata_arg['infra_hold']
+        assert infra_hold.get('phase') == 'warm_marker'
+        assert infra_hold.get('errno') == errno_module.ENOSPC
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_sets_infra_hold_info_dict(self):
+        """On exhaustion, self._infra_hold_info is set with category='infra_issue' and escalate_to_human."""
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        async def always_infra(*args, **kwargs):
+            raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=always_infra),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await wf._verify_debugfix_loop()
+
+        assert wf._infra_hold_info is not None, '_infra_hold_info must be set on exhaustion'
+        assert wf._infra_hold_info.get('category') == 'infra_issue'
+        assert wf._infra_hold_info.get('escalate_to_human') is True
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_never_sets_pending(self):
+        """On exhaustion, scheduler.set_task_status is never called with 'pending'."""
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        async def always_infra(*args, **kwargs):
+            raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=always_infra),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await wf._verify_debugfix_loop()
+
+        for call_args in wf.scheduler.set_task_status.await_args_list:
+            args = call_args.args
+            if len(args) >= 2:
+                assert args[1] != 'pending', f'set_task_status called with pending: {call_args}'
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_does_not_call_mark_blocked_directly(self):
+        """The loop must NOT call _mark_blocked itself on exhaustion — run() caller's job."""
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        async def always_infra(*args, **kwargs):
+            raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=always_infra),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await wf._verify_debugfix_loop()
+
+        assert not wf._mark_blocked.called, (
+            '_verify_debugfix_loop must NOT call _mark_blocked directly on exhaustion; '
+            'that is run()\'s job via _infra_hold_info stash'
         )
