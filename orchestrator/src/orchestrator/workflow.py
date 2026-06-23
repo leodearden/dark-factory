@@ -1901,6 +1901,12 @@ class TaskWorkflow:
             # otherwise so an agent's update_task(status='done') bypass doesn't
             # GC unmerged work). Skips externally-managed worktrees (eval mode).
             await self._maybe_cleanup_done_worktree()
+            # B1: release warm lane for any terminal exit (DONE or CANCELLED).
+            # Idempotent: if _maybe_cleanup_done_worktree already released (T1/T2),
+            # assignment_for returns None and the primitive returns False — no-op.
+            # Covers T3 (done-at-dispatch, branch not on main yet) and T4 (cancelled).
+            if self.state in (WorkflowState.DONE, WorkflowState.CANCELLED) and not self._worktree_external:
+                await self.git_ops.release_lane_for_terminal_task(self.task_id)
             # Cleanup per-task config dir (preserve-aware — skips when circuit
             # breaker tripped so the dir is available for forensic analysis).
             self._cleanup_config_dir()
@@ -6996,6 +7002,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 '(no reopen, no escalation)',
                 self.task_id,
             )
+            self._enter_phase(WorkflowState.CANCELLED)
             return WorkflowOutcome.CANCELLED
         return None
 
