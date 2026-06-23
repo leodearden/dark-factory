@@ -2790,3 +2790,201 @@ class TestSelfRestartActThenAskGate:
         assert pending[0].category == 'milestone_gate', (
             f'Expected category "milestone_gate", got "{pending[0].category}"'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-13 (ε): robustness_crash_resume + always_escalates=True
+# Crash between before_done_scheduled_at stamp and gate filing.
+# Resume must (re-)file the milestone gate and block (NOT drive to done).
+# RED until step-14 guards (b-self) on always_escalates and extracts helper.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartScheduledCrashResumeActThenAsk:
+    """before_done_ran_at + before_done_scheduled_at set, always_escalates=True, empty queue.
+
+    Simulates a crash AFTER before_done_scheduled_at was stamped but BEFORE section 3
+    filed the milestone gate.  Resume must (re-)file the milestone gate and block —
+    NOT drive to done — so the act-then-ask human-approval gate is never bypassed.
+    """
+
+    def _make_task(self) -> dict:
+        task = _deploy_task(
+            task_id='855',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-855.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        task['metadata']['always_escalates'] = True
+        return task
+
+    async def test_outcome_is_blocked(self, tmp_path: Path):
+        """always_escalates=True scheduled-resume must return BLOCKED, NOT DONE."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — gate_escalated_at unset
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=restart_scheduler,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_set_task_status_never_done(self, tmp_path: Path):
+        """act-then-ask scheduled-resume must NOT call set_task_status with 'done'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        for call in scheduler.set_task_status.await_args_list:
+            status = call.args[1] if len(call.args) > 1 else call.kwargs.get('status')
+            assert status != 'done', (
+                f'set_task_status was called with "done" but must not be on act-then-ask '
+                f'scheduled-resume: {call}'
+            )
+
+    async def test_milestone_gate_escalation_filed(self, tmp_path: Path):
+        """act-then-ask scheduled-resume must file exactly one milestone_gate escalation."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('855', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_gate', (
+            f'Expected category "milestone_gate", got "{esc.category}"'
+        )
+        assert esc.level == 2, f'Expected level 2, got {esc.level}'
+        assert esc.severity == 'critical', f'Expected severity "critical", got "{esc.severity}"'
+        assert esc.agent_role == 'orchestrator-deterministic', (
+            f'Expected role "orchestrator-deterministic", got "{esc.agent_role}"'
+        )
+
+    async def test_gate_escalated_at_stamped(self, tmp_path: Path):
+        """act-then-ask scheduled-resume must stamp gate_escalated_at so next resume is quiescent."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        gate_stamped = any(
+            call.args[1].get('gate_escalated_at')
+            for call in scheduler.update_task.await_args_list
+            if len(call.args) > 1 and isinstance(call.args[1], dict)
+        )
+        assert gate_stamped, (
+            'gate_escalated_at must be stamped via update_task so next resume is quiescent'
+        )
+
+    async def test_i1_no_reschedule(self, tmp_path: Path):
+        """I1 crash-safe: restart_scheduler must NOT be awaited on scheduled-resume."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        restart_scheduler.assert_not_awaited()
+
+    async def test_i1_no_script_runner(self, tmp_path: Path):
+        """I1 crash-safe: script_runner must NOT be awaited on scheduled-resume."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_i1_no_unit_inspector(self, tmp_path: Path):
+        """I1 crash-safe: unit_inspector must NOT be awaited on scheduled-resume."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        unit_inspector.assert_not_awaited()
