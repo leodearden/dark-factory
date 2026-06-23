@@ -587,6 +587,24 @@ git add -- . ':!.task'
 )
 
 
+# Canonical complexity rubric — published verbatim at both submit_task
+# instruction chokepoints so every task-creating role advertises the field.
+# Source of truth: plans/author-declared-complexity-prd.md:90-99.
+_COMPLEXITY_RUBRIC = """\
+complexity (optional): set to "simple" to route this task to the
+single-agent fast path (one Sonnet agent explores, plans, edits, and
+commits; the architect+implementer pair is skipped, but verify/review/merge
+still run). Declare "simple" only when the change is a single coherent edit
+— docs or comments, a rename, a localized behaviour-preserving refactor, a
+typo/wording fix, a one-spot bug fix — that needs no new abstraction and no
+cross-module design, and you can name the target file(s). It is fine for a
+simple task to be high priority or to touch several files/modules, as long
+as the change is mechanically simple. When unsure, omit it — the full path
+is the safe default, and a mis-declared task simply falls back to the
+architect.\
+"""
+
+
 def submit_resolve_instructions(
     metadata_template: str,
     *,
@@ -647,6 +665,8 @@ def submit_resolve_instructions(
         '     at that task. Record it the same way as `created` (the candidate was\n'
         '     absorbed, not lost).\n'
         f'   - `failed` — report the `reason` in your {outcome_target}.'
+        + '\n\n'
+        + _COMPLEXITY_RUBRIC
     )
     return textwrap.indent(raw, caller_indent)
 
@@ -701,6 +721,8 @@ def submit_only_instructions(
         '   any tickets that fail or expire as a follow-up `ticket_failure`\n'
         '   escalation; the curator\'s create/combine/drop decisions land in\n'
         '   `tasks.json` asynchronously.'
+        + '\n\n'
+        + _COMPLEXITY_RUBRIC
     )
     return textwrap.indent(raw, caller_indent)
 
@@ -1046,20 +1068,25 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
 )
 
 
+# NOTE: the stop-criterion prose below ("no cross-module design, no new abstraction,
+# no substantial architectural thought") mirrors the _COMPLEXITY_RUBRIC constant above
+# (the chokepoint published to all task-creating roles).  Update both in lockstep.
 SIMPLE_TASK = AgentRole(
     name='simple_task',
     system_prompt="""\
 You are a SIMPLE_TASK agent. The orchestrator routed this task here because
-its title and scope match a small, well-bounded change (doc edits, comment
-updates, single-file renames, small refactors, typo fixes). You replace the
-usual architect+implementer pair with a single explore-then-plan-then-implement
-session.
+its author declared complexity='simple' — a single coherent, mechanically
+simple change. A simple task may be high-priority and may span several
+files/modules; the declaration means the *change* is simple, not that the
+task is trivial. You replace the usual architect+implementer pair with a
+single explore-then-plan-then-implement session.
 
 ## Workflow
 
-1. **Read** the listed files in the briefing. Confirm the requested change is
-   actually a small, single-purpose edit. If it grows beyond ~2 files of
-   meaningful change, STOP and use one of the rejection artifacts below.
+1. **Read** the listed files in the briefing. Confirm the change is
+   mechanically simple — no cross-module design, no new abstraction, no
+   substantial architectural thought required. STOP (using a rejection
+   artifact below) only if that criterion is not met.
 2. **Plan via plan-tools MCP** — call `mcp__plan-tools__create_plan(task_id,
    title, analysis, files)` to register the plan. Do NOT write
    `.task/plan.json` directly.
@@ -1090,10 +1117,12 @@ hesitation when the task does not fit the SIMPLE_TASK pattern:
   set).  See the ARCHITECT role for the full validation trichotomy and
   escalation rules; the same logic applies here.
 
-If none of those apply but the task is simply too big for the simple path
-(e.g. it touches 5+ files, requires architectural thought, or needs a new
-abstraction), do NOT call `create_plan` — just stop. The orchestrator will
-fall through to the full architect path on the next dispatch.
+If none of those apply but the task needs cross-module design, a new
+abstraction, or substantial architectural thought, do NOT call `create_plan`
+— just stop. Spanning several files/modules alone is NOT a reason to stop;
+the criterion is whether the *change* requires design or architectural work.
+The orchestrator will fall through to the full architect path on the next
+dispatch.
 
 ## CRITICAL: Git Staging Rules
 

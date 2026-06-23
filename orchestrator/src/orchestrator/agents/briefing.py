@@ -361,6 +361,9 @@ let a human triage the scope change.
         else:
             files_section = '_No files listed in task metadata — explore briefly to identify the target file(s)._'
 
+        # The stop-criterion prose below ("no new abstraction, no cross-module design,
+        # substantial architectural thought") mirrors _COMPLEXITY_RUBRIC in roles.py.
+        # Update both in lockstep if the rubric changes.
         return f"""\
 {context}
 
@@ -372,11 +375,14 @@ let a human triage the scope change.
 
 # Action
 
-This task was routed to the SIMPLE_TASK path because the title and scope
-suggest a small, well-bounded change (doc, comment, rename, typo, small
-refactor). Your job is to do the change end-to-end in a single session:
+This task was routed to the SIMPLE_TASK path because its author declared
+complexity:simple. A simple task may be high-priority and may span several
+files/modules — the declaration means the *change* is mechanically simple,
+not that the task is trivial. Your job is to do the change end-to-end in a
+single session:
 
-1. **Read the listed files** below. Confirm the requested change is small.
+1. **Read the listed files** below. Confirm the change is mechanically
+   simple — no new abstraction, no cross-module design required.
 2. **Register a plan via plan-tools MCP** — call
    `mcp__plan-tools__create_plan(task_id, title, analysis, files)`.
    - For doc/comment-only or behaviour-preserving refactors: add a single
@@ -387,10 +393,10 @@ refactor). Your job is to do the change end-to-end in a single session:
    `mcp__plan-tools__mark_step_done(step_id, commit_sha)`.
 4. **Stop after marking done.** Do not loop further.
 
-If the task turns out to be larger than expected (touches many files,
-needs architectural thought, requires new abstractions), STOP without
-calling `create_plan`. The orchestrator will route to the full architect
-path on the next dispatch.
+If the change turns out to need cross-module design, a new abstraction, or
+substantial architectural thought, STOP without calling `create_plan` — do
+NOT stop merely because the change spans several files/modules. The
+orchestrator will route to the full architect path on the next dispatch.
 
 If the task spec itself is broken or unworkable, call
 `mcp__plan-tools__report_unactionable_task(reason, evidence)` and stop.
