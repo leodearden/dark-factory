@@ -2561,6 +2561,32 @@ Output JSON matching the schema. Every task must appear in the output.
         worktree_path = self._resolve_task_worktree(tid)
         lock_path = worktree_path / '.task' / 'plan.lock'
 
+        # A1 guard: a verify-complete task blocked by a transient infra failure
+        # (metadata.infra_hold set) must NOT be re-pended by the stranded
+        # recovery sweep.  The open infra_issue L1 is the non-dispatch hold
+        # (scheduler skips blocked rows; the open L1 suppresses stranded_blocked
+        # re-file).  Flipping to pending would force the task to re-win its
+        # full implement footprint in the scheduler's footprint-locked dispatch —
+        # the root cause of the 3465 starvation.
+        # Guard conditions: metadata.infra_hold is set AND the branch is
+        # non-degenerate (has commits beyond branch_base_sha).  Degenerate
+        # branches (provisioned but never implemented) are not protected because
+        # there is no real work to preserve.
+        try:
+            _infra_task = await self.scheduler.get_task(tid)
+            _infra_meta = (_infra_task or {}).get('metadata') or {}
+        except Exception:
+            _infra_meta = {}
+        if _infra_meta.get('infra_hold'):
+            _branch = f'{self.git_ops.config.branch_prefix}{tid}'
+            if not await self._branch_is_degenerate(_branch, _infra_meta):
+                logger.info(
+                    'Reconcile: task %s has infra_hold on non-degenerate branch '
+                    '— skipping pending revert; held for infra resume',
+                    tid,
+                )
+                return None
+
         if not lock_path.exists():
             # No worktree or no lock → orphan, revert.
             if (
