@@ -2198,6 +2198,25 @@ class Scheduler:
                 await self._on_starvation_warn(tid, summary=summary, detail=detail)
                 self._starvation_escalated.add(tid)
 
+    async def _resolve_starvation_escalation(self, task_id: str) -> None:
+        """Resolve the open starvation-watchdog INFO escalation for *task_id*.
+
+        Called at BOTH dispatch sites in ``acquire_next`` (pinned + scored paths)
+        right after the task is added to ``_dispatched``.  Idempotent: if the task
+        was never escalated (not in ``_starvation_escalated``), this is a no-op.
+        Always clears ``_starvation_escalated``/``_starvation_first_seen`` entries
+        unconditionally so state is bounded (PROPERTY 2 — no stale residue).
+
+        Callers wrap every call in try/except (log + continue) so a resolve
+        failure can NEVER abort a successful dispatch (PROPERTY 1).
+        """
+        in_escalated = task_id in self._starvation_escalated
+        if in_escalated and self._on_starvation_resolve is not None:
+            await self._on_starvation_resolve(task_id)
+        # Unconditionally clear both dicts so no stale residue survives.
+        self._starvation_escalated.discard(task_id)
+        self._starvation_first_seen.pop(task_id, None)
+
     async def update_task(
         self,
         task_id: str,
@@ -3595,6 +3614,19 @@ class Scheduler:
                 pin_modules = self._get_modules(pin_task)
                 if self.lock_table.try_acquire(pin_tid, pin_modules):
                     self._dispatched.add(pin_tid)
+                    # Starvation-watchdog resolve (task 1880): if a pinned task
+                    # had an open INFO escalation, self-resolve it now.
+                    # Wrapped in try/except so a resolve failure can NEVER abort
+                    # a successful dispatch (PROPERTY 1).
+                    try:
+                        await self._resolve_starvation_escalation(pin_tid)
+                    except Exception:
+                        logger.warning(
+                            'Starvation watchdog resolve for pin_tid=%s raised — '
+                            'dispatch continues normally',
+                            pin_tid,
+                            exc_info=True,
+                        )
                     if pin_signal is not None:
                         self._last_dispatch_at[pin_tid] = self._time_source()
                     pin_pri = effective_priorities.get(
@@ -3652,6 +3684,19 @@ class Scheduler:
             modules = self._get_modules(task)
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
+                # Starvation-watchdog resolve (task 1880): if this scored task
+                # had an open INFO escalation, self-resolve it now that it is
+                # dispatching.  Wrapped in try/except so a resolve failure can
+                # NEVER abort a successful dispatch (PROPERTY 1).
+                try:
+                    await self._resolve_starvation_escalation(task_id)
+                except Exception:
+                    logger.warning(
+                        'Starvation watchdog resolve for task_id=%s raised — '
+                        'dispatch continues normally',
+                        task_id,
+                        exc_info=True,
+                    )
                 # arm cooldown gate — only for signal-bearing dispatches.
                 # Steward signals that arrive *after* a signal-free dispatch
                 # will not retroactively suppress re-dispatch; the gate is
