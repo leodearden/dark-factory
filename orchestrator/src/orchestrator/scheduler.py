@@ -1387,6 +1387,24 @@ class Scheduler:
         from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
         return extract_probe_set(task) is not None
 
+    @staticmethod
+    def is_deterministic(task: dict) -> bool:
+        """Return True iff *task* is a deterministic-kind task.
+
+        Reads ``task['metadata']['task_kind']`` and returns True when it equals
+        ``'deterministic'``.  Tolerates missing/None metadata gracefully,
+        mirroring the ``carries_substrate_probe`` pattern (scheduler.py:1372).
+
+        This is the single source of truth used by:
+          - ``Harness._run_slot`` (route to DeterministicRunner)
+          - ``Scheduler._get_modules`` (no-lock, I4/B12)
+          - ``Harness._action_teardown_and_set_status`` (restart stamp-clear)
+        """
+        metadata = task.get('metadata') or {}
+        if not isinstance(metadata, dict):
+            return False
+        return metadata.get('task_kind') == 'deterministic'
+
     async def tasks_by_train(self, train_id: str) -> list[dict]:
         """Return tasks belonging to ``train_id``, sorted ascending by train.order (root→tip).
 
