@@ -2125,3 +2125,109 @@ class TestDefaultScheduleDetachedRestart:
         assert 'critical' in all_argv, f"'critical' must appear in argv: {all_argv!r}"
         assert '--category' in all_argv, f'--category must appear in argv: {all_argv!r}'
         assert 'infra_issue' in all_argv, f"'infra_issue' must appear in argv: {all_argv!r}"
+
+
+# ---------------------------------------------------------------------------
+# Step-9 (ε): own-unit resolution from ORCH_UNIT env var + end-to-end
+# self-detection without injected resolver
+# (RED until step-10 finalises _default_resolve_own_unit + docstring)
+# ---------------------------------------------------------------------------
+
+class TestResolveOwnUnitSync:
+    """DeterministicRunner — synchronous unit tests for _default_resolve_own_unit."""
+
+    def test_default_resolve_own_unit_reads_env(self, tmp_path: Path, monkeypatch):
+        """_default_resolve_own_unit() returns ORCH_UNIT when set."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        monkeypatch.setenv('ORCH_UNIT', 'orchestrator-reify.service')
+        assert runner._default_resolve_own_unit() == 'orchestrator-reify.service'
+
+    def test_default_resolve_own_unit_returns_empty_when_unset(self, tmp_path: Path, monkeypatch):
+        """_default_resolve_own_unit() returns '' when ORCH_UNIT is not set."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        monkeypatch.delenv('ORCH_UNIT', raising=False)
+        assert runner._default_resolve_own_unit() == ''
+
+
+@pytest.mark.asyncio
+class TestResolveOwnUnit:
+    """DeterministicRunner — end-to-end ORCH_UNIT env self-detection without injected resolver."""
+
+    async def test_env_self_detection_takes_self_path(self, tmp_path: Path, monkeypatch):
+        """Without own_unit_resolver, ORCH_UNIT==target_unit → self path taken (restart_scheduler awaited, script_runner NOT)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        monkeypatch.setenv('ORCH_UNIT', 'orchestrator-reify.service')
+
+        task = _deploy_task(task_id='870', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        # Construct WITHOUT own_unit_resolver — must use env var path
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            restart_scheduler=restart_scheduler,
+            # own_unit_resolver intentionally omitted
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        restart_scheduler.assert_awaited_once()
+        script_runner.assert_not_awaited()
+
+        # done_provenance.kind must be 'deterministic-deploy-scheduled'
+        call = scheduler.set_task_status.call_args
+        provenance = call.kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy-scheduled'
+
+    async def test_env_unset_takes_cross_unit_path(self, tmp_path: Path, monkeypatch):
+        """ORCH_UNIT unset → fail-open to cross-unit path (script_runner awaited, kind='deterministic-deploy')."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        monkeypatch.delenv('ORCH_UNIT', raising=False)
+
+        task = _deploy_task(task_id='875', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        # Construct WITHOUT own_unit_resolver — ORCH_UNIT unset → cross-unit path
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            restart_scheduler=restart_scheduler,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        script_runner.assert_awaited_once()
+        restart_scheduler.assert_not_awaited()
+
+        # done_provenance.kind must be 'deterministic-deploy' (cross-unit)
+        call = scheduler.set_task_status.call_args
+        provenance = call.kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy'

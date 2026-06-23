@@ -1,4 +1,4 @@
-"""DeterministicRunner — orchestrator-side runner for deterministic gate tasks (β/γ).
+"""DeterministicRunner — orchestrator-side runner for deterministic gate tasks (β/γ/ε).
 
 A *deterministic* task (``metadata.task_kind == 'deterministic'``) is routed
 here by ``Harness._run_slot`` instead of ``TaskWorkflow``.  The runner holds
@@ -32,8 +32,34 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
        (infra_issue, blocked); never phantom-done, never re-run (I1).
 
 2. **before_done execution** (γ: ``before_done`` is not None):
-   - Stamp ``metadata.before_done_ran_at`` FIRST (crash-safe I1: never re-run
-     the deploy if we crash mid-flight).
+   The ``before_done_ran_at`` stamp is written FIRST (crash-safe I1) and is
+   SHARED between the self-target (ε) and cross-unit sub-paths below.
+
+   Phase ε **self-restart** sub-path (``before_done.target_unit`` == own unit):
+   - Detects self-target by comparing ``before_done.target_unit`` to the
+     orchestrator's own systemd unit name, resolved from the ``ORCH_UNIT``
+     environment variable via ``_default_resolve_own_unit()``.  An empty or
+     unresolved ``ORCH_UNIT`` fails-open to the cross-unit path so existing
+     CI runs (where ``ORCH_UNIT`` is unset) are unaffected.
+   - **Operator requirement**: set ``ORCH_UNIT=<unit-name>`` in the
+     ``[Service] Environment`` of the orchestrator's own systemd unit.
+   - Instead of running the blocking cross-unit deploy (which would kill this
+     runner mid-execution), schedules a detached ``systemd-run`` transient
+     unit that fires *after* ``run()`` returns.
+   - A companion failure-handler transient unit is registered first and wired
+     via ``OnFailure=``; if the restart fires and fails, it runs δ's
+     ``escalation submit`` CLI (file-backed, no MCP server needed in the
+     detached unit) to file a born-at-L2 ``infra_issue`` escalation.
+   - If scheduling succeeds (``rc == 0``) and ``always_escalates=False``:
+     set task ``done`` with
+     ``done_provenance.kind='deterministic-deploy-scheduled'`` carrying the
+     transient unit name and fire delay; return DONE (done = *scheduled*, not
+     *verified*).
+   - If scheduling fails (``rc != 0``): file born-at-L2 infra_issue, block
+     (parallel to γ's rc≠0/verify-fail handling); ``before_done_ran_at``
+     already stamped (not re-run, I1).
+
+   Phase γ **cross-unit** sub-path (``target_unit`` ≠ own unit or ``ORCH_UNIT`` unset):
    - Capture baseline unit state (``unit_inspector``).
    - Run the deploy script to completion (``script_runner``, blocking).
    - If ``rc != 0``: file born-at-L2 ``infra_issue`` escalation, set blocked
