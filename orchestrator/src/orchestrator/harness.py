@@ -302,7 +302,7 @@ class HarnessReport:
         return '\n'.join(lines)
 
 
-def build_train_callback_factory(scheduler: Any) -> TrainCallbackFactory:
+def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCallbackFactory:
     """Build a per-train callback factory that captures the live scheduler.
 
     Returns a factory function ``factory(train_id) -> TrainCallbacks`` whose
@@ -384,6 +384,10 @@ def build_train_callback_factory(scheduler: Any) -> TrainCallbackFactory:
                 )
                 return
             await scheduler.mark_done(mid, kind='merged', sha=sha, note=f'train {train_id}')
+            # B3 (T7): release warm lane for the done member after the status flip.
+            # Idempotent/never-raise via the shared primitive.
+            if git_ops is not None:
+                await git_ops.release_lane_for_terminal_task(mid)
 
         async def redrive_member(mid: str, found_on_main: bool, sha: str | None) -> None:
             # Existence check (mirrors mark_member_done): non-task members
@@ -406,6 +410,10 @@ def build_train_callback_factory(scheduler: Any) -> TrainCallbackFactory:
                     sha=sha,
                     note=f'coalesce-derail re-drive: branch already on main (train {train_id})',
                 )
+                # B3 (T6/T8): release warm lane after the done flip.
+                # Idempotent/never-raise via the shared primitive.
+                if git_ops is not None:
+                    await git_ops.release_lane_for_terminal_task(mid)
             else:
                 # Race-condition guard: re-check the current status from the
                 # probe we just issued.  If the member has advanced to a live
