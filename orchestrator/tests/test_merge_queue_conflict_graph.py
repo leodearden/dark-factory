@@ -454,17 +454,33 @@ class TestTextualEdgesSubsetOfFootprint:
     async def test_different_line_edit_no_textual_edge(
         self, git_ops, config, git_repo
     ):
-        """Branches editing DIFFERENT lines of the same file → footprint overlap but no textual edge."""
-        await _run(['git', 'checkout', '-b', 'task/branch-c'], cwd=git_repo)
-        (git_repo / 'shared.txt').write_text('EDITED-BY-C\nline2\nline3\n')
+        """Branches editing DIFFERENT lines of the same file → footprint overlap but no textual edge.
+
+        Uses a 20-line file so the edited lines (line 1 and line 15) are >6 lines
+        apart, preventing git's 3-line context window from creating overlapping
+        diff hunks (adjacent-line edits in a small file DO conflict because the
+        context windows cover the same region of the file).
+        """
+        # Build a large file so well-separated edits don't overlap in context
+        large_content = '\n'.join(f'original-line-{i}' for i in range(1, 21)) + '\n'
+        c_content = large_content.replace('original-line-1\n', 'EDITED-BY-C\n', 1)
+        d_content = large_content.replace('original-line-15\n', 'EDITED-BY-D\n', 1)
+
+        # Populate initial large file on main
+        (git_repo / 'shared.txt').write_text(large_content)
         await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
-        await _run(['git', 'commit', '-m', 'branch-c edits line1'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'Add large shared.txt'], cwd=git_repo)
+
+        await _run(['git', 'checkout', '-b', 'task/branch-c'], cwd=git_repo)
+        (git_repo / 'shared.txt').write_text(c_content)
+        await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'branch-c edits line 1 of 20'], cwd=git_repo)
         await _run(['git', 'checkout', 'main'], cwd=git_repo)
 
         await _run(['git', 'checkout', '-b', 'task/branch-d'], cwd=git_repo)
-        (git_repo / 'shared.txt').write_text('line1\nEDITED-BY-D\nline3\n')
+        (git_repo / 'shared.txt').write_text(d_content)
         await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
-        await _run(['git', 'commit', '-m', 'branch-d edits line2'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'branch-d edits line 15 of 20'], cwd=git_repo)
         await _run(['git', 'checkout', 'main'], cwd=git_repo)
 
         worker = _make_worker(git_ops)

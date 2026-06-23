@@ -5836,10 +5836,51 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         suffix[j].request_id,
                     }))
 
-        # ── 6. Store (textual_edges / conflicts_with_main added in later steps) ─
+        # ── 6. Build textual_edges via merge_tree_conflicts (β) ──────────────
+        # Only probe footprint-overlapping pairs (textual ⇒ footprint contract
+        # from γ lets us skip non-overlapping pairs soundly — saves forks).
+        # Memoize results by frozenset({head_a, head_b}) within this recompute
+        # so a pair is probed at most once even when re-ordered.
+        _probe_cache: dict[frozenset[str], bool] = {}
+        textual_edges: set[frozenset[str]] = set()
+
+        for fp_edge in footprint_edges:
+            rids = tuple(fp_edge)
+            # Map request_ids back to their indices in suffix
+            idx_map = {req.request_id: k for k, req in enumerate(suffix)}
+            i_idx = idx_map.get(rids[0])
+            j_idx = idx_map.get(rids[1])
+            if i_idx is None or j_idx is None:
+                continue
+            head_i = heads[i_idx]
+            head_j = heads[j_idx]
+            if head_i is None or head_j is None:
+                # Conservative: missing ref → treat as textual conflict
+                textual_edges.add(fp_edge)
+                continue
+            cache_key = frozenset({head_i, head_j})
+            if cache_key in _probe_cache:
+                has_conflict = _probe_cache[cache_key]
+            else:
+                try:
+                    probe = await self._git_ops.merge_tree_conflicts(head_i, head_j)
+                    has_conflict = not probe.clean
+                except Exception:
+                    logger.warning(
+                        'recompute_suffix_conflict_graph: merge_tree_conflicts raised '
+                        'for pair (%s, %s); treating as conflict (fail-open)',
+                        suffix[i_idx].request_id, suffix[j_idx].request_id,
+                        exc_info=True,
+                    )
+                    has_conflict = True
+                _probe_cache[cache_key] = has_conflict
+            if has_conflict:
+                textual_edges.add(fp_edge)
+
+        # ── 7. Store (conflicts_with_main added in step-10) ──────────────────
         self._suffix_conflict_graph = SuffixConflictGraph(
             nodes=ordered_rids,
-            textual_edges=frozenset(),
+            textual_edges=frozenset(textual_edges),
             footprint_edges=frozenset(footprint_edges),
             conflicts_with_main=frozenset(),
         )
