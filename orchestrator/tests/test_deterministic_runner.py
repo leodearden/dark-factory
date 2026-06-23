@@ -48,9 +48,12 @@ def _gate_task(
 
 
 def _make_assignment(task: dict):
-    """Build a minimal TaskAssignment-like object for the runner."""
+    """Build a minimal TaskAssignment-like object for the runner.
+
+    Deterministic tasks hold an empty modules list (I4/B12: no module lock).
+    """
     from orchestrator.scheduler import TaskAssignment
-    return TaskAssignment(task_id=str(task['id']), task=task)
+    return TaskAssignment(task_id=str(task['id']), task=task, modules=[])
 
 
 def _mock_scheduler(task: dict):
