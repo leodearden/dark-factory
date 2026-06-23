@@ -410,6 +410,13 @@ class TestSnapshotParkStacks:
         assert isinstance(e1['rank'], int)
         datetime.fromisoformat(e1['installed_at'])
 
+        # INV-3: shadowed (bottom) entry must have strictly higher rank value than active top
+        # low=3, high=1 → L.rank(3) > H.rank(1) ✓
+        assert entries[0]['rank'] > entries[1]['rank'], (
+            f"Expected L rank > H rank (shadowed > active-top), "
+            f"got {entries[0]['rank']} <= {entries[1]['rank']}"
+        )
+
         # User-observable signal: snapshot_parks() only has H, not L
         snap = lt.snapshot_parks()
         assert 'H' in snap
