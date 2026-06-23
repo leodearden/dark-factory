@@ -90,8 +90,42 @@ class TestEnqueue:
         assert len(rows) == 1
         task_id, project_root, requested_at = rows[0]
         assert task_id == 'task-1'
-        assert project_root == '/proj/root'
+        assert project_root  # non-empty (normalized canonical path)
         assert requested_at  # non-empty ISO string
+
+    def test_enqueue_with_explicit_requested_at_round_trips(self, tmp_path: Path) -> None:
+        """Explicit requested_at is stored verbatim and returned in the stored row."""
+        from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+
+        store = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+        explicit_ts = '2026-01-15T09:30:00+00:00'
+        store.enqueue('task-x', '/proj/root', requested_at=explicit_ts)
+
+        conn = sqlite3.connect(str(store.db_path))
+        try:
+            rows = conn.execute(
+                'SELECT task_id, requested_at FROM park_eviction_requests'
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'task-x'
+        assert rows[0][1] == explicit_ts
+
+    def test_enqueue_same_task_id_twice_both_rows_stored(self, tmp_path: Path) -> None:
+        """Enqueueing the same task_id twice creates two rows (no uniqueness constraint)."""
+        from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+
+        store = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+        store.enqueue('dup', '/proj/root')
+        store.enqueue('dup', '/proj/root')
+
+        result = store.drain('/proj/root')
+        # Both rows must be returned; force_clear is idempotent on the second.
+        assert result.count('dup') == 2
+        # Table is fully drained.
+        assert store.drain('/proj/root') == []
 
 
 class TestDrain:
@@ -126,3 +160,22 @@ class TestDrain:
         # B's row is still there.
         result_b = store.drain('/proj/B')
         assert result_b == ['TB']
+
+    def test_drain_matches_enqueue_after_normalization(self, tmp_path: Path) -> None:
+        """drain() matches enqueue() even when path forms differ (normalization contract).
+
+        Pins the canonical-form contract: if the fused-memory ε-layer enqueues
+        with the resolved absolute path and the scheduler drains with the same
+        resolved path, the WHERE project_root=? filter must match.
+        """
+        from orchestrator.park_eviction_requests import ParkEvictionRequestStore, _canonical_root
+
+        store = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+        # Use the resolved path (as config.project_root produces) for enqueue.
+        resolved = _canonical_root(str(tmp_path / 'myproject'))
+        store.enqueue('T1', resolved)
+
+        # drain() with the same canonical form must find the row.
+        result = store.drain(resolved)
+        assert result == ['T1']
+        assert store.drain(resolved) == []

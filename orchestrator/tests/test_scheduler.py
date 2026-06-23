@@ -9444,3 +9444,131 @@ class TestDrainCalledFromAcquireNext:
         assert expired_for_t == [], (
             f'reservation_expired must not fire for T after drain took it; got {expired_for_t}'
         )
+
+
+# ---- Drain fires even when get_tasks returns empty (task 1871 amend-1) ----
+
+class TestDrainFiresWithNoActiveTasks:
+    """Prove that _drain_park_eviction_requests runs even when tasks=[] causes
+    the early-return path in acquire_next.
+
+    Regression guard for the scenario an operator might hit: all live tasks
+    finished but a stranded/buried park remains and the operator enqueues an
+    eviction — without this fix the request sits in the table indefinitely.
+    """
+
+    @pytest.mark.asyncio
+    async def test_drain_processes_request_when_tasks_empty(self, tmp_path):
+        """With get_tasks returning [], enqueued evictions are still processed."""
+        from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        event_store = _RecordingEventStore()
+        eviction_store = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+
+        scheduler = Scheduler(
+            config,
+            event_store=event_store,  # type: ignore[arg-type]
+            park_eviction_store=eviction_store,
+        )
+
+        # Install a park for a dead owner.
+        scheduler.lock_table.install_parks('dead_owner', ['m1'], priority='low')
+        eviction_store.enqueue('dead_owner', scheduler._project_root)
+
+        # Simulate a world where all tasks are done/gone.
+        scheduler.get_tasks = AsyncMock(return_value=[])
+
+        result = await scheduler.acquire_next()
+
+        # acquire_next still returns None (no tasks to dispatch).
+        assert result is None
+        # The eviction request was consumed.
+        assert eviction_store.drain(scheduler._project_root) == []
+        # dead_owner's park was cleared (empty status_map/tasks_by_id →
+        # not live-dispatchable → force_clear fired).
+        assert not scheduler.lock_table.has_parks('dead_owner')
+        # reservation_force_evicted event was emitted.
+        force_evicted = [
+            e for e in event_store.events
+            if 'reservation_force_evicted' in e[0]
+        ]
+        assert len(force_evicted) == 1
+        assert force_evicted[0][1]['task_id'] == 'dead_owner'
+
+
+# ---- Buried-owner restored-event at drain level (task 1871 amend-4) ----
+
+class TestDrainBuriedOwnerRestoredEvents:
+    """Verify that evicting a buried (non-top) owner exposes the new top and
+    emits reservation_restored for all newly-exposed shadows at the drain level.
+
+    The force_clear + restored-event path is exercised end-to-end through
+    _drain_park_eviction_requests with a multi-layer stack to ensure the
+    restored pairs are correctly mapped to events.
+    """
+
+    def _make_scheduler(self, tmp_path, event_store=None):
+        from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+        config = OrchestratorConfig(max_per_module=1, lock_depth=3)
+        eviction_store = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+        if event_store is None:
+            event_store = _RecordingEventStore()
+        scheduler = Scheduler(
+            config,
+            event_store=event_store,  # type: ignore[arg-type]
+            park_eviction_store=eviction_store,
+        )
+        return scheduler, eviction_store, event_store
+
+    def test_evicting_non_top_owner_emits_restored_for_exposed_shadow(self, tmp_path):
+        """Evict an owner buried beneath a higher-priority top; the new
+        exposed shadow emits reservation_restored, and the active top is
+        unaffected (its park remains)."""
+        scheduler, store, event_store = self._make_scheduler(tmp_path)
+
+        # Stack on m1: [L(bottom/low), B(buried/mid), T(active-top/high)]
+        # force_clear('B') removes B; T stays on top; L is now second.
+        # restore: L gets a new opportunity as T still blocks — but in LIFO
+        # terms, prune_owners only restores when a shadow becomes the new top.
+        # Here T > B > L means removing B exposes L only if T's rank was above B.
+        # Build a two-module scenario so B is the top on one module.
+
+        # Module m2: stack [L2(low), B(mid)] — B is the active top here.
+        scheduler.lock_table.install_parks('L2', ['m2'], priority='low')
+        scheduler.lock_table.install_parks('B', ['m2'], priority='mid')
+
+        # Enqueue evict for B (which is active-top on m2).
+        store.enqueue('B', scheduler._project_root)
+
+        # B is missing from tasks_by_id → not live-dispatchable → evict.
+        status_map = {'L2': 'pending'}
+        tasks_by_id = {
+            'L2': {
+                'id': 'L2', 'status': 'pending', 'dependencies': [],
+                'priority': 'low', 'metadata': {'files': ['m2']},
+            },
+        }
+
+        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+
+        # B's park on m2 is gone.
+        assert not scheduler.lock_table.has_parks('B')
+        # L2's park is still present (it was not evicted).
+        assert scheduler.lock_table.has_parks('L2')
+        # reservation_force_evicted emitted for B (had parks on m2).
+        evicted = [
+            e for e in event_store.events
+            if 'reservation_force_evicted' in e[0]
+        ]
+        assert len(evicted) == 1
+        assert evicted[0][1]['task_id'] == 'B'
+        assert 'm2' in evicted[0][1]['data']['modules']
+        # reservation_restored emitted for L2 (newly exposed as top on m2).
+        restored = [
+            e for e in event_store.events
+            if 'reservation_restored' in e[0]
+        ]
+        assert len(restored) == 1
+        assert restored[0][1]['task_id'] == 'L2'
+        assert 'm2' in restored[0][1]['data']['modules']

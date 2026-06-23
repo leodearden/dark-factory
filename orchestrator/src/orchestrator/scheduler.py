@@ -2910,6 +2910,16 @@ class Scheduler:
                 continue
             modules, restored = self.lock_table.force_clear(task_id)
             self._skip_count.pop(task_id, None)
+            # Ghost-owner silent no-op contract (PRD INV-idempotence):
+            # If the owner has zero parks (already reaped by park-GC between
+            # enqueue and drain, or never held any), modules is [] and NO
+            # reservation_force_evicted event is emitted.  The row is still
+            # consumed (one-shot), so the table does not grow unbounded.
+            # The silence is intentional: suppressing the event keeps the
+            # audit log meaningful — reservation_force_evicted ⇒ something
+            # was actually cleared.  Operators who see no event after enqueueing
+            # can infer the park was already gone.  See design decision
+            # §"Emit reservation_force_evicted only when … modules non-empty".
             if modules and self.event_store:
                 self.event_store.emit(
                     EventType.reservation_force_evicted,
@@ -2947,6 +2957,13 @@ class Scheduler:
 
         tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES)
         if not tasks:
+            # Drain queued park-eviction requests even when no active tasks exist.
+            # With empty status_map/tasks_by_id, _owner_is_live_dispatchable
+            # returns False for all task_ids (not in tasks_by_id) — all queued
+            # evictions are processed.  Without this, an operator-enqueued
+            # eviction for a stranded park sits in the table indefinitely until
+            # some active task happens to appear and trigger a normal tick.
+            self._drain_park_eviction_requests({}, {})
             return None
 
         # Status + id indices, built once per tick.
