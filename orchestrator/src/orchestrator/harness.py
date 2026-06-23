@@ -2785,6 +2785,16 @@ Output JSON matching the schema. Every task must appear in the output.
         the task).  One open INFO escalation per task; subsequent calls are
         deduped while a pending watchdog escalation already exists.  No-ops
         gracefully when no escalation queue is attached.
+
+        **Routing note:** filed at ``severity='info', level=0``.  Level-0 INFO
+        escalations are surfaced via the steward's pending-escalation view and
+        any external monitors polling the escalation queue (e.g. dashboards,
+        alerting webhooks).  They do NOT auto-promote to L1/L2 and do NOT
+        block or interrupt the scheduler — they are a passive signal intended
+        for an operator reviewing the queue at their next opportunity.  If
+        immediate paging is required for a specific deployment, configure an
+        external monitor to watch for ``agent_role='orchestrator-starvation-watchdog'``
+        pending entries and promote or alert as appropriate.
         """
         if not self._escalation_queue:
             return

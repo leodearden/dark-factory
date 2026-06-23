@@ -74,6 +74,15 @@ __all__ = [
 # benign side-effect of an idempotent terminal -> terminal write.
 _TERMINAL_STATUSES = frozenset({'done', 'cancelled'})
 
+# Non-terminal but non-candidate statuses for the starvation watchdog GC.
+# Tasks in these states leave the dispatch-eligible candidate pool without
+# going terminal, so the dispatch-site resolve and the _stale_ids sweep would
+# never fire for them.  The GC backstop uses this set to auto-resolve any open
+# starvation-watchdog INFO escalation when a task moves to one of these states.
+_STARVATION_NON_ELIGIBLE = frozenset(
+    {'blocked', 'deferred', 'review', 'merge-deferred'}
+)
+
 
 class SetTaskStatusRejected(Exception):
     """Base class for non-transient set_task_status rejections.
@@ -2180,19 +2189,21 @@ class Scheduler:
                 and self._on_starvation_warn is not None
             ):
                 summary = (
-                    f'STARVATION_WATCHDOG: task {tid} skipped {skip}× as top '
-                    f'candidate (threshold={cfg.skip_threshold}) for '
+                    f'STARVATION_WATCHDOG: task {tid} skip_count={skip} '
+                    f'(threshold={cfg.skip_threshold}), dispatch-eligible for '
                     f'{idle_elapsed:.0f}s (idle_secs={cfg.idle_secs}) — '
-                    f'dispatch-eligible but unable to acquire locks'
+                    f'unable to acquire locks'
                 )
                 detail = (
-                    f'Task {tid} has been the highest-scored dispatch-eligible '
-                    f'candidate (all deps satisfied, no live claimant) for '
-                    f'{skip} consecutive top-skips over {idle_elapsed:.0f}s '
-                    f'without acquiring its module locks.  This typically indicates '
-                    f'persistent lock contention (broad-footprint task vs. a '
-                    f'long-running narrow task) that has not been resolved by the '
-                    f'fairness parks.\n\n'
+                    f'Task {tid} has been dispatch-eligible (all deps satisfied, '
+                    f'no live claimant) for {idle_elapsed:.0f}s and has '
+                    f'accumulated skip_count={skip} (tallied while this task is '
+                    f'the highest-scored candidate unable to acquire its module '
+                    f'locks; a task displaced by a higher-priority task retains '
+                    f'its accumulated count without incrementing).  This typically '
+                    f'indicates persistent lock contention (broad-footprint task '
+                    f'vs. a long-running narrow task) that has not been resolved '
+                    f'by the fairness parks.\n\n'
                     f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
                 )
                 await self._on_starvation_warn(tid, summary=summary, detail=detail)
@@ -3351,12 +3362,22 @@ class Scheduler:
         # Starvation-watchdog GC (task 1880): for tasks that have gone terminal
         # or been removed from the task list while a watchdog INFO escalation is
         # still open, self-resolve the escalation and clear the watchdog state.
+        # Also resolves for tasks that transition to a non-terminal but
+        # non-eligible status (blocked/deferred/review/merge-deferred) — those
+        # leave the candidate pool without going terminal, so the dispatch-site
+        # resolve and the _stale_ids sweep would never fire.  'in-progress'
+        # tasks are already resolved at the dispatch site; 'pending' tasks may
+        # return to candidacy so we keep their escalation.
         # Uses a SEPARATE guard (not merged with the _external_hold_streak block
         # above) so it runs even when those external dicts are empty — mirrors
         # the dedicated _external_unresolved_counts block.  The resolve callback
         # is wrapped in try/except so a failure never aborts the GC sweep.
-        if _stale_ids and (self._starvation_escalated or self._starvation_first_seen):
-            for tid in _stale_ids:
+        _starvation_gc_ids: set[str] = set(_stale_ids)
+        for _tid in self._starvation_escalated:
+            if status_map.get(_tid) in _STARVATION_NON_ELIGIBLE:
+                _starvation_gc_ids.add(_tid)
+        if _starvation_gc_ids and (self._starvation_escalated or self._starvation_first_seen):
+            for tid in _starvation_gc_ids:
                 if tid in self._starvation_escalated:
                     if self._on_starvation_resolve is not None:
                         try:

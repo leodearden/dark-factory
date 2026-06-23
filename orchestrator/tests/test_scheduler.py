@@ -9908,6 +9908,69 @@ class TestStarvationWatchdog:
         )
 
     @pytest.mark.asyncio
+    async def test_gc_non_eligible_status_resolves_escalation(self):
+        """GC backstop resolves escalation when task moves to blocked/deferred.
+
+        A task in 'blocked' or 'deferred' is non-terminal but leaves the
+        candidate pool.  The dispatch-site resolve never fires (no dispatch)
+        and the _stale_ids sweep skips it (not terminal).  The extended GC
+        backstop must detect the non-eligible status and auto-resolve.
+
+        Drive 'starved' to escalated state, then flip its status to 'blocked'.
+        One acquire_next tick must:
+        - call _on_starvation_resolve exactly once with task_id='starved', AND
+        - clear 'starved' from _starvation_escalated.
+
+        Fails until the GC block checks _STARVATION_NON_ELIGIBLE in addition
+        to _stale_ids.
+        """
+        scheduler, t = self._make_scheduler()
+        warn_cb = AsyncMock()
+        resolve_cb = AsyncMock()
+        scheduler._on_starvation_warn = warn_cb
+        scheduler._on_starvation_resolve = resolve_cb
+
+        # Seed a held lock on 'seed' so 'starved' can never acquire.
+        scheduler.lock_table.try_acquire('seed', ['backend'])
+        scheduler._dispatched.add('seed')
+
+        task = self._starved_task()
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # Drive 3 ticks to cross skip_threshold (3), then advance past idle_secs.
+        for _ in range(3):
+            await scheduler.acquire_next()
+        t[0] = 150.0
+        await scheduler.acquire_next()
+
+        # Pre-condition: warn fired, task is escalated.
+        warn_cb.assert_called_once()
+        assert 'starved' in scheduler._starvation_escalated, (
+            'Precondition: starved must be in _starvation_escalated before GC tick'
+        )
+        resolve_cb.assert_not_called()
+
+        # Change get_tasks to return 'starved' as 'blocked' (non-terminal, non-candidate).
+        blocked_task = dict(task, status='blocked')
+        scheduler.get_tasks = AsyncMock(return_value=[blocked_task])
+
+        # One tick — the extended GC backstop must detect 'starved' is blocked,
+        # call _on_starvation_resolve, and clear watchdog state.
+        await scheduler.acquire_next()
+
+        resolve_cb.assert_called_once()
+        call_args = resolve_cb.call_args
+        args = call_args.args if call_args.args else ()
+        kwargs = call_args.kwargs if call_args.kwargs else {}
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == 'starved', (
+            f'Expected task_id="starved" in resolve callback; got {task_id_arg!r}'
+        )
+        assert 'starved' not in scheduler._starvation_escalated, (
+            '_starvation_escalated must be cleared by GC sweep for blocked task'
+        )
+
+    @pytest.mark.asyncio
     async def test_continuity_reset_drops_first_seen_when_not_candidate(self):
         """(b) Continuity reset: _starvation_first_seen cleared when task leaves candidates.
 
