@@ -1650,3 +1650,115 @@ class TestSelfRestartScheduled:
         provenance = call.kwargs.get('done_provenance')
         assert provenance is not None, 'done_provenance must be passed as a kwarg'
         assert provenance['kind'] == 'deterministic-deploy-scheduled'
+
+    async def test_b8_provenance_transient_unit_contains_task_id(self, tmp_path: Path):
+        """done_provenance.transient_unit is a non-empty string containing the task id (step-3)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        provenance = scheduler.set_task_status.call_args.kwargs.get('done_provenance', {})
+        transient_unit = provenance.get('transient_unit', '')
+        assert transient_unit, 'done_provenance.transient_unit must be a non-empty string'
+        assert '850' in transient_unit, (
+            f"transient_unit must contain the task id '850'; got {transient_unit!r}"
+        )
+
+    async def test_b8_provenance_fire_delay_secs_positive_int(self, tmp_path: Path):
+        """done_provenance.fire_delay_secs is an int > 0 (step-3)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        provenance = scheduler.set_task_status.call_args.kwargs.get('done_provenance', {})
+        fire_delay = provenance.get('fire_delay_secs')
+        assert isinstance(fire_delay, int), f'fire_delay_secs must be an int; got {fire_delay!r}'
+        assert fire_delay > 0, f'fire_delay_secs must be > 0; got {fire_delay!r}'
+
+    async def test_b8_provenance_unit_equals_target_unit(self, tmp_path: Path):
+        """done_provenance.unit equals the target_unit from before_done (step-3)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        provenance = scheduler.set_task_status.call_args.kwargs.get('done_provenance', {})
+        assert provenance.get('unit') == 'orchestrator-reify.service', (
+            f"done_provenance.unit must equal target_unit; got {provenance.get('unit')!r}"
+        )
+
+    async def test_b8_restart_scheduler_called_with_transient_unit_and_delay(self, tmp_path: Path):
+        """restart_scheduler awaited with transient_unit and on_active_secs kwargs (step-3)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        restart_scheduler.assert_awaited_once()
+        kwargs = restart_scheduler.call_args.kwargs
+        assert 'transient_unit' in kwargs, 'restart_scheduler must receive transient_unit kwarg'
+        assert 'on_active_secs' in kwargs, 'restart_scheduler must receive on_active_secs kwarg'
+        assert '850' in kwargs['transient_unit'], (
+            f"transient_unit kwarg must contain task id '850'; got {kwargs['transient_unit']!r}"
+        )
+        assert isinstance(kwargs['on_active_secs'], int) and kwargs['on_active_secs'] > 0, (
+            f"on_active_secs must be a positive int; got {kwargs['on_active_secs']!r}"
+        )
