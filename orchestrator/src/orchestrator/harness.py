@@ -6073,6 +6073,42 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return
 
+        # A1 guard: an infra_hold task is a verify-complete branch held by a
+        # transient infra failure.  Flipping it to 'pending' would force it to
+        # re-compete for its implement footprint in the scheduler's footprint-locked
+        # dispatch — the 3465 starvation root cause.  Instead resume-at-verify:
+        # set in-progress (the scheduler already skips re-implement for branches
+        # with prior work via _has_prior_implementation) and clear the hold.
+        _infra_task = await self.scheduler.get_task(task_id)
+        _infra_meta = (_infra_task or {}).get('metadata') or {}
+        if _infra_meta.get('infra_hold'):
+            try:
+                # Clear infra_hold sentinel before flipping status so a concurrent
+                # stranded-recovery sweep (which reads infra_hold) cannot race.
+                await self.scheduler.update_task(
+                    task_id,
+                    {'infra_hold': None},
+                    metadata_mode='merge',
+                )
+                await self.scheduler.set_task_status(task_id, 'in-progress')
+                logger.info(
+                    'cascade-unblock: task %s has infra_hold — resuming at verify '
+                    '(blocked→in-progress) via %s; infra_hold cleared',
+                    task_id, escalation.resolved_by,
+                )
+            except SetTaskStatusRejected as e:
+                logger.warning(
+                    'cascade-unblock: infra_hold resume refused for %s '
+                    '(TOCTOU race or guard): %s',
+                    task_id, e,
+                )
+            except Exception:
+                logger.warning(
+                    'cascade-unblock: infra_hold resume failed for %s',
+                    task_id, exc_info=True,
+                )
+            return
+
         # Re-block guard (C5/D6): count same-signature re-pends cross-incarnation;
         # withhold the flip when the threshold is reached.
         if not await self._check_reblock_guard(escalation, task_id):
