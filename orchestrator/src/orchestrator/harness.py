@@ -2606,6 +2606,12 @@ Output JSON matching the schema. Every task must appear in the output.
         await self.scheduler.mark_done(
             tid, kind='found_on_main', sha=sha, note=note,
         )
+        # Diff 5c (T9 hardening): release warm lane after the done flip.
+        # cleanup_worktree (above) frees the lane only when the in-memory
+        # assignment map still has tid; the primitive's on-disk plan.json
+        # backstop covers the lost-map (post-restart) case.  Idempotent
+        # when cleanup_worktree already freed it.
+        await self.git_ops.release_lane_for_terminal_task(tid)
         logger.info(
             'Reconcile: marked task %s done (reason=%s)', tid, reason,
         )
