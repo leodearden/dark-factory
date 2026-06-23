@@ -6133,6 +6133,47 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._buffer_owned_request(item)
             # Loop to try _pop_next_pickable again (maybe the resume unblocked a lane).
 
+    # ── ι=1894 metric wiring helpers ─────────────────────────────────────────
+
+    def _note_merge_started(self, request_id: str) -> None:
+        """Stash the current main_position for a request entering the merger.
+
+        Called when a MergeRequest is dequeued and about to be merged.
+        Records the landing count at merge-start so that if the merge later
+        conflicts we can compute drift = main_position_now − stashed_base.
+        """
+        self._drift_base[request_id] = self._merge_metrics.main_position
+
+    def _note_merge_landing(self, request_id: str) -> None:
+        """Record a clean landing and remove the stashed drift base.
+
+        Called inside the ``outcome.status == 'done'`` clean-landing branch.
+        Increments the landings counter (advancing main_position by 1) and
+        pops any _drift_base entry for this request.
+        """
+        self._merge_metrics.record_landing()
+        self._drift_base.pop(request_id, None)
+
+    def _note_merge_retry(self) -> None:
+        """Record a merge retry (CAS failure or gate reverify).
+
+        Called at the ``result == 'rebased_pending_reverify'`` branch and at
+        the ``result == 'cas_failed'`` retry path.
+        """
+        self._merge_metrics.record_retry()
+
+    def _note_conflict_detected(self, request_id: str) -> None:
+        """Record a drift sample when a merge conflict is detected.
+
+        Computes drift = current main_position − stashed_base (the landing
+        count at merge-start), records it as a drift sample, and pops the
+        _drift_base entry.  Defensive: a missing entry (request not started
+        via _note_merge_started) produces a drift of 0 rather than raising.
+        """
+        base = self._drift_base.pop(request_id, self._merge_metrics.main_position)
+        drift = self._merge_metrics.main_position - base
+        self._merge_metrics.record_drift(drift)
+
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
 
@@ -7494,6 +7535,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     pending_predecessor = None
 
                 self._inflight_req = req  # track for stop() race resolution
+                # ι=1894: stash main_position for this request so
+                # _note_conflict_detected can compute drift later.
+                self._note_merge_started(req.request_id)
                 # Drop-on-detection: workflow soft-cancelled before worker
                 # dequeued.  Skipping merge work avoids the orphan-halt
                 # window where no escalation owner is registered.
@@ -7733,6 +7777,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     if merge_result.conflicts:
                         logger.info(f'Task {req.task_id}: merge conflicts')
                         _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(t0))
+                        # ι=1894: record drift = main_position − base at merge-start
+                        self._note_conflict_detected(req.request_id)
                         if merge_result.merge_worktree:
                             await self._git_ops.cleanup_merge_worktree(
                                 merge_result.merge_worktree,
@@ -9191,6 +9237,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     )
                     self._resolve_or_drop_abandoned(req, outcome)
                     if outcome.status == 'done':
+                        # ι=1894: record clean landing, pop drift base for this req
+                        self._note_merge_landing(req.request_id)
                         if (
                             outcome.merge_sha is not None
                             and self._on_merge_landed is not None
@@ -9229,6 +9277,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return True
 
                 if result == 'rebased_pending_reverify':
+                    # ι=1894: count this as a merge retry
+                    self._note_merge_retry()
                     rebased_sha = getattr(self._git_ops, '_last_advanced_sha', None)
                     rebased_from = getattr(self._git_ops, '_rebased_from', None)
                     rebased_onto = getattr(self._git_ops, '_rebased_onto', None)
@@ -9332,6 +9382,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return False
 
                 # result == 'cas_failed' — transient, retry with limit
+                # ι=1894: count CAS retry
+                self._note_merge_retry()
                 total = self._cas_retries.get(req.task_id, 0) + 1
                 self._cas_retries[req.task_id] = total
                 if total > self.MAX_CAS_RETRIES:
