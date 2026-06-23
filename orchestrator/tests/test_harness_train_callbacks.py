@@ -246,6 +246,7 @@ class TestRedriveMember:
         factory = build_train_callback_factory(sched)
         cbs = factory('train-xyz')
 
+        assert cbs.redrive_member is not None
         await cbs.redrive_member('5001', False, None)
 
         assert sched.statuses['5001'][-1] == 'pending', (
@@ -263,6 +264,7 @@ class TestRedriveMember:
         factory = build_train_callback_factory(sched)
         cbs = factory('train-abc')
 
+        assert cbs.redrive_member is not None
         await cbs.redrive_member('5002', True, 'cafe1234beef')
 
         assert sched.statuses['5002'][-1] == 'done', (
@@ -285,6 +287,7 @@ class TestRedriveMember:
         cbs = factory('train-xyz')
 
         # Must not raise.
+        assert cbs.redrive_member is not None
         await cbs.redrive_member('nonexistent-9999', False, None)
 
         # No scheduler state was written.

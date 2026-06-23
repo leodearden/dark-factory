@@ -2190,6 +2190,8 @@ class TestCoalesceRedriveEndToEnd:
         """After coalesce-train derail: on-main member → done, off-main member → pending."""
         import contextlib
 
+        from _workflow_helpers import FakeScheduler
+
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import _run
         from orchestrator.harness import build_train_callback_factory
@@ -2198,7 +2200,6 @@ class TestCoalesceRedriveEndToEnd:
             MergeOutcome,
             SpeculativeMergeWorker,
         )
-        from _workflow_helpers import FakeScheduler
 
         # ── git setup ───────────────────────────────────────────────────────
         # 'e2e-on': branch at main HEAD → is_ancestor(task/e2e-on, main) = True

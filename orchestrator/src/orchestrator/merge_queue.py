@@ -3451,7 +3451,7 @@ class TrainCallbacks:
     mark_member_done: Callable[[str, str], Awaitable[None]]
     """Async callback: mark a single member task done with the merge SHA."""
 
-    redrive_member: Callable[[str, bool, 'str | None'], Awaitable[None]] | None = None
+    redrive_member: Callable[[str, bool, str | None], Awaitable[None]] | None = None
     """Async callback: re-drive an absorbed member that is still merge-deferred
     after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
     found_on_main=True → mark done with found_on_main provenance (double-landing
@@ -3516,7 +3516,7 @@ class GroupMergeRequest(MergeRequest):
     mark_member_done: Callable[[str, str], Awaitable[None]]
     """Async callback: mark a single member task done with the merge SHA."""
 
-    redrive_member: Callable[['str', bool, 'str | None'], Awaitable[None]] | None = field(
+    redrive_member: Callable[[str, bool, str | None], Awaitable[None]] | None = field(
         default=None, kw_only=True,
     )
     """Optional async callback: re-drive an absorbed member still merge-deferred
@@ -6539,7 +6539,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         )
 
     async def _redrive_coalesce_members(
-        self, req: 'GroupMergeRequest', main_sha: str,
+        self, req: GroupMergeRequest, main_sha: str,
     ) -> None:
         """Re-drive absorbed members still merge-deferred after a coalesce-train derail.
 
