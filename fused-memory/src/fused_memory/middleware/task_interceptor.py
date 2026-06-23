@@ -3535,7 +3535,7 @@ def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> d
     }
 
 
-_VALID_PROVENANCE_KINDS = ('merged', 'found_on_main')
+_VALID_PROVENANCE_KINDS = ('merged', 'found_on_main', 'deterministic-deploy')
 
 
 async def _validate_done_provenance(
@@ -3549,9 +3549,13 @@ async def _validate_done_provenance(
 
     Schema:
         {
-            "kind": "merged" | "found_on_main",  # required
-            "commit": <sha-or-ref>,              # required for both kinds
-            "note":   <free text>,               # required if kind="found_on_main"
+            "kind": "merged" | "found_on_main" | "deterministic-deploy",  # required
+            "commit": <sha-or-ref>,              # required for "merged"/"found_on_main"
+            "note":   <free text>,               # required if kind="found_on_main";
+                                                 # optional for "deterministic-deploy"
+            "pid":    <int>,                     # deterministic-deploy: new MainPID
+            "unit":   <str>,                     # deterministic-deploy: target unit name
+            "active_enter_timestamp": <str>,     # deterministic-deploy: new AET string
         }
 
     - ``kind="merged"``: the work landed on main via a merge commit. ``commit``
@@ -3563,6 +3567,13 @@ async def _validate_done_provenance(
       required. ``commit`` is resolved + ancestor-checked identical to
       ``kind="merged"``; the kinds differ only in audit semantics (``note``
       is required for ``found_on_main`` to cite the providing task/commit).
+    - ``kind="deterministic-deploy"``: the task was completed by a cross-unit
+      service restart, not a code merge. No ``commit`` is required or expected.
+      ``pid`` (int), ``unit`` (str), and ``active_enter_timestamp`` (str) carry
+      the PID evidence captured after the restart; ``note`` may carry a
+      human-readable annotation (e.g. resume path). The phantom-done file gate
+      is NOT bypassed for this kind — deploy gate tasks carry no
+      ``metadata.files`` so the gate is already a no-op.
 
     Returns ``(error_payload, resolved_provenance)``. Error payload is a
     structured dict suitable for returning to the MCP caller; when it is
@@ -3617,16 +3628,19 @@ async def _validate_done_provenance(
     if kind is None:
         return _done_provenance_error(
             task_id,
-            'done_provenance.kind is required (must be "merged" or '
-            '"found_on_main"). Use kind="merged" with commit=<merge-sha> '
-            'after a successful merge_request, or kind="found_on_main" with '
-            'note=<explanation> when the implementation is already on main '
-            'from a sibling task.',
+            'done_provenance.kind is required (must be "merged", '
+            '"found_on_main", or "deterministic-deploy"). Use kind="merged" '
+            'with commit=<merge-sha> after a successful merge_request, '
+            'kind="found_on_main" with note=<explanation> when the '
+            'implementation is already on main from a sibling task, or '
+            'kind="deterministic-deploy" for a cross-unit service-restart '
+            'deploy (no commit required).',
         ), None
     if kind not in _VALID_PROVENANCE_KINDS:
         return _done_provenance_error(
             task_id,
-            f'done_provenance.kind must be "merged" or "found_on_main" (got {kind!r})',
+            f'done_provenance.kind must be "merged", "found_on_main", or '
+            f'"deterministic-deploy" (got {kind!r})',
         ), None
 
     if kind == 'merged' and commit_input is None:
@@ -3677,6 +3691,26 @@ async def _validate_done_provenance(
             ), None
     if note is not None:
         resolved['note'] = note
+
+    if kind == 'deterministic-deploy':
+        # Preserve the PID evidence captured by DeterministicRunner after
+        # a cross-unit service restart (B6 success path and resume path).
+        # Only copy fields that carry the right type — silently skip missing
+        # or wrongly-typed fields so a partial shape (e.g. resume without pid)
+        # is still accepted.
+        pid = raw.get('pid')
+        unit = raw.get('unit')
+        active_enter_timestamp = raw.get('active_enter_timestamp')
+        if isinstance(pid, int):
+            resolved['pid'] = pid
+        if isinstance(unit, str):
+            unit_stripped = unit.strip()
+            if unit_stripped:
+                resolved['unit'] = unit_stripped
+        if isinstance(active_enter_timestamp, str):
+            aet_stripped = active_enter_timestamp.strip()
+            if aet_stripped:
+                resolved['active_enter_timestamp'] = aet_stripped
 
     return None, resolved
 
