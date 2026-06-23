@@ -2644,6 +2644,11 @@ class GitOps:
             clean=False would falsely bounce a mergeable branch.  Loud failure
             for a caller bug is the correct contract for a foundation primitive.
         """
+        # Run at self.project_root (in-repo object store) — NEVER at a
+        # worktree/lane path.  git merge-tree --write-tree performs a real
+        # 3-way merge writing ONLY loose tree/blob objects to the object store;
+        # it does not create worktrees, mutate the index, perform a checkout,
+        # or write any refs.  Consumers δ/η/ι depend on this invariant.
         rc, out, err = await _run(
             [
                 'git', '-c', 'core.quotePath=false',
