@@ -5463,6 +5463,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._supervisor_halted: bool = False
         # Human-readable reason for the halt; set alongside _supervisor_halted.
         self._supervisor_halt_reason: str | None = None
+        # ── ι=1894 live operator metrics ─────────────────────────────────────
+        # Pure in-memory accumulator: retries-per-landing + drift-at-detection.
+        # Consumed in-process by θ (circuit-breaker) and surfaced on the
+        # dashboard via snapshot()['metrics'].  No SQLite persistence needed —
+        # θ reads the live readout and the dashboard shows the live snapshot.
+        self._merge_metrics: MergeMetrics = MergeMetrics()
+        # Per-request drift base: request_id → main_position (landing count) at
+        # the moment the request entered the merger.  Popped on clean landing
+        # or conflict detection.  Mirrors the _cas_retries / _gate_retries
+        # per-task counter-dict lifecycle idiom (:5225-5245).
+        self._drift_base: dict[str, int] = {}
 
     # ── β host allocator ──────────────────────────────────────────────────
 
@@ -6328,6 +6339,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Read here synchronously — no await; the expensive async build is
             # decoupled from the read (snapshot() stays non-blocking).
             'suffix_conflict_graph': self._suffix_conflict_graph.to_snapshot_dict(),
+            # ι=1894 additive key: live operator metrics.
+            # Populated by the _note_merge_* helpers (wired at existing landing/
+            # retry/conflict code points).  Pure synchronous read — no await,
+            # no git calls.  No collision with existing keys (entries/depth/
+            # head_of_line/verify_in_progress/occupancy/is_wip_halted/
+            # halt_owner_esc_id/suffix_conflict_graph).
+            'metrics': self._merge_metrics.as_snapshot(),
         }
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
