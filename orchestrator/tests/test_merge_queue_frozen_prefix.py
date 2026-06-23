@@ -468,6 +468,133 @@ class TestCheckFrozenPrefixInvariant:
         assert req.request_id in ' '.join(violations)
 
 
+# ── step-09 RED: HEADLINE property test ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestFrozenPrefixPropertyTest:
+    """HEADLINE (§5.3): in-flight verify immutable under suffix reorder/insert;
+    recompute excludes frozen rids from the suffix-conflict-graph nodes.
+
+    RED until step-10 GREEN adds the frozen-rid exclusion filter to
+    recompute_suffix_conflict_graph().  The immutability assertion (a) already
+    holds (emergent from δ's _lane_buffers-only recompute); only the exclusion
+    assertion (b) fails RED.
+    """
+
+    async def test_inflight_immutable_under_suffix_reorder(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """(a) In-flight entries are unchanged after suffix reorder + recompute.
+
+        Setup: D/E in _inflight (verifying); F/G in _lane_buffers['normal'].
+        Capture state, reverse F/G, recompute, assert:
+          - D/E base_sha UNCHANGED
+          - D/E inflight identity/order UNCHANGED
+          - frozen_prefix() and frozen_prefix_tip(main) UNCHANGED
+          - check_frozen_prefix_invariant(main) == []
+          - suffix_conflict_graph.nodes equals NEW order (G before F)
+          - No frozen rid (D/E) in suffix_conflict_graph.nodes
+        """
+        main_sha = 'fake-main-sha'
+        worker = _make_worker(git_ops)
+
+        # Build D and E as fake inflight items (pure unit — no real git merges
+        # needed for the immutability assertion; base_sha / merge_commit are
+        # constructed to form a well-chained stack)
+        _, item_d = _make_fake_item('t-d', base_sha=main_sha, merge_commit='sha-Dc',
+                                    config=config, git_repo=git_repo)
+        _, item_e = _make_fake_item('t-e', base_sha='sha-Dc', merge_commit='sha-Ec',
+                                    config=config, git_repo=git_repo)
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+
+        # F and G are lane-buffer items (simple MergeRequest objects; fake branches
+        # that recompute_suffix_conflict_graph will fail-open on for edges/footprint,
+        # but their request_ids still appear in nodes which is what we assert).
+        req_f = _make_req('t-f', 'task/t-f', config, git_repo)
+        req_g = _make_req('t-g', 'task/t-g', config, git_repo)
+        worker._lane_buffers['normal'].append(req_f)
+        worker._lane_buffers['normal'].append(req_g)
+
+        # ── Capture pre-reorder state ─────────────────────────────────────────
+        pre_d_base = item_d.base_sha
+        pre_e_base = item_e.base_sha
+        pre_frozen = worker.frozen_prefix()
+        pre_tip = worker.frozen_prefix_tip(main_sha)
+        pre_inflight = list(worker._inflight)  # shallow copy for identity check
+
+        # ── Reorder: F, G → G, F ─────────────────────────────────────────────
+        worker._lane_buffers['normal'].clear()
+        worker._lane_buffers['normal'].append(req_g)
+        worker._lane_buffers['normal'].append(req_f)
+        await worker.recompute_suffix_conflict_graph()
+
+        # ── Assert inflight immutability ──────────────────────────────────────
+        assert item_d.base_sha == pre_d_base, 'D.base_sha mutated by reorder'
+        assert item_e.base_sha == pre_e_base, 'E.base_sha mutated by reorder'
+        assert list(worker._inflight) == pre_inflight, '_inflight order/identity changed'
+        assert worker.frozen_prefix() == pre_frozen, 'frozen_prefix() changed'
+        assert worker.frozen_prefix_tip(main_sha) == pre_tip, 'frozen_prefix_tip changed'
+        assert worker.check_frozen_prefix_invariant(main_sha) == [], (
+            'invariant broken after reorder'
+        )
+
+        # ── Assert suffix graph reflects new order (G before F) ──────────────
+        g_after = worker._suffix_conflict_graph
+        g_nodes = g_after.nodes
+        assert req_g.request_id in g_nodes, 'G missing from suffix graph nodes'
+        assert req_f.request_id in g_nodes, 'F missing from suffix graph nodes'
+        assert g_nodes.index(req_g.request_id) < g_nodes.index(req_f.request_id), (
+            'suffix graph does not reflect new G-before-F order'
+        )
+
+        # ── Assert no frozen rid appears in suffix graph nodes ────────────────
+        frozen_rids = set(worker.frozen_prefix())
+        for frozen_rid in frozen_rids:
+            assert frozen_rid not in g_nodes, (
+                f'frozen rid {frozen_rid!r} appeared in suffix_conflict_graph.nodes'
+            )
+
+    async def test_frozen_rid_excluded_from_suffix_graph(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """(b) Exclusion filter: a frozen rid pushed into _lane_buffers is excluded.
+
+        This is the genuine RED→GREEN delta: before step-10 adds the exclusion
+        filter, a frozen request that is also in _lane_buffers appears in
+        suffix_conflict_graph.nodes.  After step-10, it is excluded.
+
+        Setup: item D in _inflight (verifying); also D's request pushed into
+        _lane_buffers.  Recompute → D's rid must NOT appear in nodes.
+        """
+        main_sha = 'fake-main-sha'
+        worker = _make_worker(git_ops)
+
+        req_d, item_d = _make_fake_item('t-d-excl', base_sha=main_sha,
+                                        merge_commit='sha-Dc-excl',
+                                        config=config, git_repo=git_repo)
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        # Intentionally push the SAME request into _lane_buffers (simulates the
+        # bug this filter guards against: a frozen rid leaking into the suffix).
+        worker._lane_buffers['normal'].append(req_d)
+
+        # Also add an innocent item so the suffix is non-empty (gives
+        # recompute something to build without the early-empty-suffix return)
+        req_innocent = _make_req('t-innocent', 'task/t-innocent', config, git_repo)
+        worker._lane_buffers['normal'].append(req_innocent)
+
+        await worker.recompute_suffix_conflict_graph()
+
+        g_nodes = worker._suffix_conflict_graph.nodes
+        assert req_d.request_id not in g_nodes, (
+            f'frozen rid {req_d.request_id!r} appeared in suffix graph nodes '
+            f'(exclusion filter missing)'
+        )
+        assert req_innocent.request_id in g_nodes, 'innocent item disappeared'
+
+
 # ── step-07 RED: snapshot() exposes additive 'frozen_prefix' key ─────────────
 
 
