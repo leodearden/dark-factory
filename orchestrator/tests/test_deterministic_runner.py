@@ -75,6 +75,7 @@ def _deploy_task(
     before_done_ran_at: str | None = None,
     before_done_verified_at: str | None = None,
     before_done_verified_pid: int | None = None,
+    before_done_scheduled_at: dict | None = None,
 ) -> dict:
     """Build a deterministic deploy task dict (before_done set, always_escalates=False)."""
     before_done: dict = {
@@ -96,6 +97,8 @@ def _deploy_task(
         metadata['before_done_verified_at'] = before_done_verified_at
     if before_done_verified_pid is not None:
         metadata['before_done_verified_pid'] = before_done_verified_pid
+    if before_done_scheduled_at is not None:
+        metadata['before_done_scheduled_at'] = before_done_scheduled_at
     return {
         'id': task_id,
         'title': 'Deploy orchestrator-reify',
@@ -1438,6 +1441,185 @@ class TestBeforeDoneCrashWindow:
 
 
 # ---------------------------------------------------------------------------
+# Scheduled-marker resume (amend: Suggestion 2): crash between
+# before_done_scheduled_at stamp and the done write.
+# before_done_scheduled_at set → transient unit registered → drive to done
+# with scheduled provenance instead of re-escalating as a crash window.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartScheduledCrashResume:
+    """before_done_ran_at + before_done_scheduled_at set, empty queue → done=scheduled.
+
+    Simulates a crash after the transient unit was registered (before_done_scheduled_at
+    stamped) but before set_task_status('done') completed.  The resume path must
+    drive to done with kind='deterministic-deploy-scheduled' rather than re-escalating
+    as a generic crash window (Suggestion 2).
+    """
+
+    async def test_scheduled_resume_drives_to_done(self, tmp_path: Path):
+        """Scheduled stamp present → done with scheduled provenance, no escalation."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='853',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-853.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # truly empty — no prior escalation
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+    async def test_scheduled_resume_sets_done_with_scheduled_kind(self, tmp_path: Path):
+        """Resume with before_done_scheduled_at → done_provenance.kind='deterministic-deploy-scheduled'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='853',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-853.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert done_calls, 'set_task_status must be called with done on scheduled resume'
+        provenance = done_calls[0].kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy-scheduled', (
+            f"done_provenance.kind must be 'deterministic-deploy-scheduled'; "
+            f"got {provenance.get('kind')!r}"
+        )
+
+    async def test_scheduled_resume_no_escalation_filed(self, tmp_path: Path):
+        """Scheduled resume must NOT re-escalate as a crash window."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='853',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-853.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        await runner.run(assignment)
+
+        all_escs = queue.get_by_task('853')
+        assert all_escs == [], (
+            f'scheduled resume must NOT re-escalate as crash-window; got {all_escs}'
+        )
+
+    async def test_scheduled_resume_does_not_rerun_deploy(self, tmp_path: Path):
+        """Scheduled resume must NOT re-invoke script_runner (I1 once-only)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='853',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-853.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_scheduled_resume_provenance_carries_transient_unit(self, tmp_path: Path):
+        """Resume provenance must carry the transient_unit from the stamp."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='854',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-854.service',
+                'fire_delay_secs': 45,
+            },
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        provenance = done_calls[0].kwargs.get('done_provenance', {})
+        assert provenance.get('transient_unit') == 'orch-redeploy-restart-854.service', (
+            f"provenance.transient_unit must match stamp; "
+            f"got {provenance.get('transient_unit')!r}"
+        )
+        assert provenance.get('fire_delay_secs') == 45, (
+            f"provenance.fire_delay_secs must match stamp; "
+            f"got {provenance.get('fire_delay_secs')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Verified-marker resume: crash between verify stamp and the done write.
 # before_done_verified_at present → safe to drive to done (no re-run).
 # ---------------------------------------------------------------------------
@@ -1479,3 +1661,1330 @@ class TestBeforeDoneVerifiedResume:
         provenance = done_calls[0].kwargs.get('done_provenance', {})
         assert provenance.get('kind') == 'deterministic-deploy'
         assert provenance.get('pid') == 200
+
+
+# ---------------------------------------------------------------------------
+# Step-1 (ε): B8 core — self-target deploy: detached restart, done=scheduled
+# (RED until step-2 adds own_unit_resolver + restart_scheduler seams)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartScheduled:
+    """DeterministicRunner — self-target deploy: scheduling deferred restart, done=scheduled (B8)."""
+
+    async def test_b8_outcome_is_done(self, tmp_path: Path):
+        """Self-target deploy schedules restart and returns DONE immediately (B8)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+    async def test_b8_restart_scheduler_called_once(self, tmp_path: Path):
+        """restart_scheduler awaited exactly once (the detached systemd-run call)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        restart_scheduler.assert_awaited_once()
+
+    async def test_b8_script_runner_not_called(self, tmp_path: Path):
+        """script_runner must NOT be awaited on self-target path (no blocking cross-unit deploy)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_b8_unit_inspector_not_called(self, tmp_path: Path):
+        """unit_inspector must NOT be awaited on self-target path (no baseline/verify)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        unit_inspector.assert_not_awaited()
+
+    async def test_b8_stamps_before_done_ran_at(self, tmp_path: Path):
+        """update_task must stamp before_done_ran_at with a truthy value (I1 crash-safe)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must be called with a truthy before_done_ran_at stamp'
+
+    async def test_b8_set_task_status_done_with_scheduled_kind(self, tmp_path: Path):
+        """set_task_status awaited with ('850', 'done', done_provenance.kind='deterministic-deploy-scheduled')."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[0] == '850'
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance is not None, 'done_provenance must be passed as a kwarg'
+        assert provenance['kind'] == 'deterministic-deploy-scheduled'
+
+    async def test_b8_provenance_transient_unit_contains_task_id(self, tmp_path: Path):
+        """done_provenance.transient_unit is a non-empty string containing the task id (step-3)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        provenance = scheduler.set_task_status.call_args.kwargs.get('done_provenance', {})
+        transient_unit = provenance.get('transient_unit', '')
+        assert transient_unit, 'done_provenance.transient_unit must be a non-empty string'
+        assert '850' in transient_unit, (
+            f"transient_unit must contain the task id '850'; got {transient_unit!r}"
+        )
+
+    async def test_b8_provenance_fire_delay_secs_positive_int(self, tmp_path: Path):
+        """done_provenance.fire_delay_secs is an int > 0 (step-3)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        provenance = scheduler.set_task_status.call_args.kwargs.get('done_provenance', {})
+        fire_delay = provenance.get('fire_delay_secs')
+        assert isinstance(fire_delay, int), f'fire_delay_secs must be an int; got {fire_delay!r}'
+        assert fire_delay > 0, f'fire_delay_secs must be > 0; got {fire_delay!r}'
+
+    async def test_b8_provenance_unit_equals_target_unit(self, tmp_path: Path):
+        """done_provenance.unit equals the target_unit from before_done (step-3)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        provenance = scheduler.set_task_status.call_args.kwargs.get('done_provenance', {})
+        assert provenance.get('unit') == 'orchestrator-reify.service', (
+            f"done_provenance.unit must equal target_unit; got {provenance.get('unit')!r}"
+        )
+
+    async def test_b8_restart_scheduler_called_with_transient_unit_and_delay(self, tmp_path: Path):
+        """restart_scheduler awaited with transient_unit and on_active_secs kwargs (step-3)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        restart_scheduler.assert_awaited_once()
+        kwargs = restart_scheduler.call_args.kwargs
+        assert 'transient_unit' in kwargs, 'restart_scheduler must receive transient_unit kwarg'
+        assert 'on_active_secs' in kwargs, 'restart_scheduler must receive on_active_secs kwarg'
+        assert '850' in kwargs['transient_unit'], (
+            f"transient_unit kwarg must contain task id '850'; got {kwargs['transient_unit']!r}"
+        )
+        assert isinstance(kwargs['on_active_secs'], int) and kwargs['on_active_secs'] > 0, (
+            f"on_active_secs must be a positive int; got {kwargs['on_active_secs']!r}"
+        )
+
+    async def test_b8_on_active_secs_clamped_to_minimum(self, tmp_path: Path):
+        """on_active_delay_secs=0 in before_done is clamped to >=5 (amend: Suggestion 1).
+
+        A zero or negative delay would produce --on-active=0, causing the transient
+        unit to fire immediately — re-introducing the self-kill window.  The runner
+        must enforce a floor of 5 seconds.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='851', target_unit='orchestrator-reify.service')
+        # Inject zero delay into before_done to trigger the clamp
+        task['metadata']['before_done']['on_active_delay_secs'] = 0
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        restart_scheduler.assert_awaited_once()
+        on_active = restart_scheduler.call_args.kwargs.get('on_active_secs', 0)
+        assert on_active >= 5, (
+            f'on_active_secs must be clamped to >=5 when on_active_delay_secs=0; '
+            f'got {on_active!r}'
+        )
+
+    async def test_b8_stamps_before_done_scheduled_at(self, tmp_path: Path):
+        """update_task must stamp before_done_scheduled_at with transient_unit after scheduling (amend: Suggestion 2)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='852', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        scheduled_stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_scheduled_at')
+        ]
+        assert scheduled_stamp_calls, (
+            'update_task must be called with a truthy before_done_scheduled_at stamp'
+        )
+        stamp_val = scheduled_stamp_calls[0].args[1]['before_done_scheduled_at']
+        assert isinstance(stamp_val, dict), (
+            f'before_done_scheduled_at must be a dict carrying transient_unit; got {stamp_val!r}'
+        )
+        assert '852' in stamp_val.get('transient_unit', ''), (
+            f"before_done_scheduled_at.transient_unit must contain task id '852'; "
+            f"got {stamp_val.get('transient_unit')!r}"
+        )
+        assert isinstance(stamp_val.get('fire_delay_secs'), int), (
+            f'before_done_scheduled_at.fire_delay_secs must be an int; '
+            f"got {stamp_val.get('fire_delay_secs')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-5 (ε): B8 scheduling failure → born-at-L2 infra_issue + blocked
+# (RED until step-6 implements the rc!=0 error path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartSchedulingFailure:
+    """DeterministicRunner — self-target deploy: systemd-run scheduling failure (B8/rc≠0)."""
+
+    def _make_runner(self, tmp_path: Path, task: dict, fail_output: str = 'systemd-run: failed to start transient unit'):
+        """Build a runner with self-targeting and a failing restart_scheduler."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        restart_scheduler = AsyncMock(return_value=(1, fail_output))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        return runner, queue, scheduler
+
+    async def test_b8_failure_outcome_is_blocked(self, tmp_path: Path):
+        """Scheduling failure (rc=1) → outcome is WorkflowOutcome.BLOCKED."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_b8_failure_files_one_infra_issue_escalation(self, tmp_path: Path):
+        """Scheduling failure → exactly one pending infra_issue escalation at level=2."""
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('860', status='pending')
+        assert len(pending) == 1, f'Expected 1 pending escalation, got {len(pending)}'
+
+    async def test_b8_failure_escalation_level_severity_role_category(self, tmp_path: Path):
+        """Filed escalation: level=2, severity='critical', role='orchestrator-deterministic', category='infra_issue'."""
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('860', status='pending')
+        assert escs[0].level == 2
+        assert escs[0].severity == 'critical'
+        assert escs[0].agent_role == 'orchestrator-deterministic'
+        assert escs[0].category == 'infra_issue'
+
+    async def test_b8_failure_escalation_detail_contains_target_unit(self, tmp_path: Path):
+        """Escalation detail contains the target_unit."""
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('860', status='pending')
+        assert 'orchestrator-reify.service' in escs[0].detail, (
+            f'target_unit must appear in detail: {escs[0].detail!r}'
+        )
+
+    async def test_b8_failure_escalation_detail_contains_transient_unit(self, tmp_path: Path):
+        """Escalation detail contains the transient unit name (includes task id '860')."""
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('860', status='pending')
+        assert '860' in escs[0].detail, (
+            f"transient unit name (containing task id '860') must appear in detail: {escs[0].detail!r}"
+        )
+
+    async def test_b8_failure_set_task_blocked_never_done(self, tmp_path: Path):
+        """set_task_status called with 'blocked' and NEVER with 'done' on scheduling failure."""
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        blocked_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'blocked']
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(blocked_calls) == 1, 'set_task_status must be called once with blocked'
+        assert len(done_calls) == 0, 'set_task_status must NOT be called with done on scheduling failure'
+
+    async def test_b8_failure_stamps_before_done_ran_at(self, tmp_path: Path):
+        """update_task stamps before_done_ran_at even on scheduling failure (I1 crash-safe)."""
+
+        task = _deploy_task(task_id='860', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must stamp before_done_ran_at even on scheduling failure (I1)'
+
+
+# ---------------------------------------------------------------------------
+# Step-7 (ε): _default_schedule_detached_restart argv shape / OnFailure wiring
+# (RED until step-8 implements the real systemd-run spawn)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDefaultScheduleDetachedRestart:
+    """_default_schedule_detached_restart produces correct systemd-run argv and
+    OnFailure wiring to the δ escalation-submit CLI."""
+
+    def _make_mock_proc(self, returncode: int = 0) -> object:
+        """Return a mock proc with communicate() → (b'', b'') and returncode."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+        mock_proc.returncode = returncode
+        return mock_proc
+
+    async def test_argv_contains_systemd_run_user(self, tmp_path: Path):
+        """systemd-run --user must appear in the spawn argv."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert 'systemd-run' in all_argv, f'systemd-run must appear in argv: {all_argv!r}'
+        assert '--user' in all_argv, f'--user must appear in argv: {all_argv!r}'
+
+    async def test_argv_contains_on_active_and_transient_unit(self, tmp_path: Path):
+        """--on-active and the transient unit name must appear in the spawn argv."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--on-active' in all_argv or 'on-active=60' in all_argv, (
+            f'--on-active must appear in argv: {all_argv!r}'
+        )
+        assert 'orch-redeploy-restart-900.service' in all_argv, (
+            f'transient unit name must appear in argv: {all_argv!r}'
+        )
+
+    async def test_argv_contains_collect_and_payload_script(self, tmp_path: Path):
+        """--collect and the payload script path must appear in the spawn argv."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--collect' in all_argv, f'--collect must appear in argv: {all_argv!r}'
+        assert '/usr/local/bin/restart-deploy.sh' in all_argv, (
+            f'payload script must appear in argv: {all_argv!r}'
+        )
+
+    async def test_escalation_is_gated_behind_restart_failure(self, tmp_path: Path):
+        """The escalation-submit must be wired into a failure branch, NOT run eagerly.
+
+        Previously the handler was a companion ``--unit=`` transient *service*
+        registered without ``--on-active`` — systemd-run starts such a unit
+        immediately, filing a spurious born-at-L2 on every successful self-deploy.
+        The corrected design defers the whole unit via ``--on-active`` and reaches
+        the escalation only through a shell failure branch (``[ "$rc" -ne 0 ]``)
+        that re-raises the restart's exit code.  Assert that gating is present
+        rather than an eager second registration.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        # Exactly one systemd-run registration — no eager companion handler unit.
+        assert mock_exec.call_count == 1, (
+            f'expected a single systemd-run registration, got {mock_exec.call_count} '
+            '(an eager OnFailure handler unit would add a second one)'
+        )
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        # The single unit is deferred (so nothing runs at registration) and the
+        # escalation is reached only via a shell failure branch.
+        assert '--on-active' in all_argv, (
+            f'unit must be deferred via --on-active so it does not run eagerly: {all_argv!r}'
+        )
+        assert '-ne 0' in all_argv, (
+            f'escalation must be gated behind a non-zero exit check: {all_argv!r}'
+        )
+
+    async def test_handler_does_not_execute_on_success_path(self, tmp_path: Path):
+        """Higher-fidelity: simulate systemd firing the wrapped payload.
+
+        Capture the ``/bin/sh -c`` wrapper systemd-run would defer, then execute
+        it for real with a SUCCEEDING restart script.  No escalation must be
+        filed (the bug was that registration itself filed one eagerly).
+        """
+        import asyncio as _asyncio
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path / 'q')
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        ok_script = tmp_path / 'deploy-ok.sh'
+        ok_script.write_text('#!/bin/sh\nexit 0\n')
+        ok_script.chmod(0o755)
+        before_done = {
+            'script': str(ok_script),
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        captured: dict = {}
+        real_exec = _asyncio.create_subprocess_exec
+
+        async def fake_exec(*argv, **kwargs):
+            captured['argv'] = argv
+            return self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', side_effect=fake_exec):
+            rc, _ = await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=1,
+                task_id='900',
+            )
+        assert rc == 0
+
+        argv = captured['argv']
+        assert argv[-3] == '/bin/sh' and argv[-2] == '-c', (
+            f'expected a /bin/sh -c wrapper payload, got {argv!r}'
+        )
+        wrapped = argv[-1]
+
+        # Fire the wrapped payload as systemd would (real shell, real CLI path).
+        proc = await real_exec(
+            '/bin/sh', '-c', wrapped,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.STDOUT,
+        )
+        await proc.communicate()
+        assert proc.returncode == 0, 'success-script wrapper must exit 0'
+        assert queue.get_by_task('900') == [], (
+            'no escalation may be filed on the success path'
+        )
+
+    async def test_handler_executes_on_failure_path(self, tmp_path: Path):
+        """Higher-fidelity counterpart: a FAILING restart fires exactly one L2.
+
+        Confirms the failure branch still reaches δ's escalation-submit CLI and
+        preserves the non-zero exit code.
+        """
+        import asyncio as _asyncio
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path / 'q')
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        fail_script = tmp_path / 'deploy-fail.sh'
+        fail_script.write_text('#!/bin/sh\nexit 7\n')
+        fail_script.chmod(0o755)
+        before_done = {
+            'script': str(fail_script),
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        captured: dict = {}
+        real_exec = _asyncio.create_subprocess_exec
+
+        async def fake_exec(*argv, **kwargs):
+            captured['argv'] = argv
+            return self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-901.service',
+                on_active_secs=1,
+                task_id='901',
+            )
+
+        wrapped = captured['argv'][-1]
+        proc = await real_exec(
+            '/bin/sh', '-c', wrapped,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.STDOUT,
+        )
+        await proc.communicate()
+        assert proc.returncode == 7, 'failure-script wrapper must preserve the exit code'
+
+        filed = queue.get_by_task('901')
+        assert len(filed) == 1, f'exactly one L2 must be filed on failure, got {len(filed)}'
+        assert filed[0].category == 'infra_issue'
+        assert filed[0].level == 2
+
+    async def test_argv_contains_escalation_submit_cli(self, tmp_path: Path):
+        """escalation submit CLI must appear in the spawn argv for OnFailure handling."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert 'escalation' in all_argv, f"'escalation' must appear in argv: {all_argv!r}"
+        assert 'submit' in all_argv, f"'submit' must appear in argv: {all_argv!r}"
+
+    async def test_argv_contains_queue_dir(self, tmp_path: Path):
+        """--queue-dir with the EscalationQueue.queue_dir path must appear in argv."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--queue-dir' in all_argv, f'--queue-dir must appear in argv: {all_argv!r}'
+        assert str(queue.queue_dir) in all_argv, (
+            f'queue_dir path {queue.queue_dir!r} must appear in argv: {all_argv!r}'
+        )
+
+    async def test_argv_contains_task_id_severity_category(self, tmp_path: Path):
+        """--task, --severity critical, --category infra_issue must appear in escalation argv."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--task' in all_argv, f'--task must appear in argv: {all_argv!r}'
+        assert '900' in all_argv, f"task id '900' must appear in argv: {all_argv!r}"
+        assert '--severity' in all_argv, f'--severity must appear in argv: {all_argv!r}'
+        assert 'critical' in all_argv, f"'critical' must appear in argv: {all_argv!r}"
+        assert '--category' in all_argv, f'--category must appear in argv: {all_argv!r}'
+        assert 'infra_issue' in all_argv, f"'infra_issue' must appear in argv: {all_argv!r}"
+
+    async def test_argv_contains_detail_with_transient_unit(self, tmp_path: Path):
+        """--detail carrying transient unit name must appear in the OnFailure escalation argv (amend: Suggestion 3).
+
+        The in-process scheduling-failure path builds a rich detail block; the fire-time
+        escalation-submit must also carry diagnostic context so a human handling a real
+        fire-time restart failure has the transient unit name for journald lookup.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--detail' in all_argv, (
+            f'--detail must appear in the OnFailure escalation argv: {all_argv!r}'
+        )
+        assert 'orch-redeploy-restart-900.service' in all_argv, (
+            f'transient unit name must appear in --detail context: {all_argv!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-9 (ε): own-unit resolution from ORCH_UNIT env var + end-to-end
+# self-detection without injected resolver
+# (RED until step-10 finalises _default_resolve_own_unit + docstring)
+# ---------------------------------------------------------------------------
+
+class TestResolveOwnUnitSync:
+    """DeterministicRunner — synchronous unit tests for _default_resolve_own_unit."""
+
+    def test_default_resolve_own_unit_reads_env(self, tmp_path: Path, monkeypatch):
+        """_default_resolve_own_unit() returns ORCH_UNIT when set."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        monkeypatch.setenv('ORCH_UNIT', 'orchestrator-reify.service')
+        assert runner._default_resolve_own_unit() == 'orchestrator-reify.service'
+
+    def test_default_resolve_own_unit_returns_empty_when_unset(self, tmp_path: Path, monkeypatch):
+        """_default_resolve_own_unit() returns '' when ORCH_UNIT is not set."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        monkeypatch.delenv('ORCH_UNIT', raising=False)
+        assert runner._default_resolve_own_unit() == ''
+
+
+@pytest.mark.asyncio
+class TestResolveOwnUnit:
+    """DeterministicRunner — end-to-end ORCH_UNIT env self-detection without injected resolver."""
+
+    async def test_env_self_detection_takes_self_path(self, tmp_path: Path, monkeypatch):
+        """Without own_unit_resolver, ORCH_UNIT==target_unit → self path taken (restart_scheduler awaited, script_runner NOT)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        monkeypatch.setenv('ORCH_UNIT', 'orchestrator-reify.service')
+
+        task = _deploy_task(task_id='870', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        # Construct WITHOUT own_unit_resolver — must use env var path
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            restart_scheduler=restart_scheduler,
+            # own_unit_resolver intentionally omitted
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        restart_scheduler.assert_awaited_once()
+        script_runner.assert_not_awaited()
+
+        # done_provenance.kind must be 'deterministic-deploy-scheduled'
+        call = scheduler.set_task_status.call_args
+        provenance = call.kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy-scheduled'
+
+    async def test_env_unset_takes_cross_unit_path(self, tmp_path: Path, monkeypatch):
+        """ORCH_UNIT unset → fail-open to cross-unit path (script_runner awaited, kind='deterministic-deploy')."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        monkeypatch.delenv('ORCH_UNIT', raising=False)
+
+        task = _deploy_task(task_id='875', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        # Construct WITHOUT own_unit_resolver — ORCH_UNIT unset → cross-unit path
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            restart_scheduler=restart_scheduler,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        script_runner.assert_awaited_once()
+        restart_scheduler.assert_not_awaited()
+
+        # done_provenance.kind must be 'deterministic-deploy' (cross-unit)
+        call = scheduler.set_task_status.call_args
+        provenance = call.kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy'
+
+
+# ---------------------------------------------------------------------------
+# Step-11 (ε): B8 robustness — self-target + always_escalates=True gates WITHOUT
+# running the blocking cross-unit deploy (reviewer: robustness_self_kill).
+# (RED until step-12 guards cross-unit deploy with `if not self_target:`)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartActThenAskGate:
+    """DeterministicRunner — self-target deploy with always_escalates=True: gates WITHOUT blocking deploy."""
+
+    def _make_runner(self, scheduler, queue, unit_inspector, script_runner, restart_scheduler):
+        from orchestrator.deterministic_runner import DeterministicRunner
+        return DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+
+    def _act_then_ask_task(self):
+        task = _deploy_task(task_id='870', target_unit='orchestrator-reify.service')
+        task['metadata']['always_escalates'] = True
+        return task
+
+    async def test_script_runner_not_awaited(self, tmp_path: Path):
+        """Self-kill prevention: script_runner MUST NOT be awaited on self-target path."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_unit_inspector_not_awaited(self, tmp_path: Path):
+        """No baseline/verify on self-target path: unit_inspector MUST NOT be awaited."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        unit_inspector.assert_not_awaited()
+
+    async def test_restart_scheduler_called_once(self, tmp_path: Path):
+        """Detached restart is scheduled exactly once (no double-deploy)."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        restart_scheduler.assert_awaited_once()
+
+    async def test_outcome_is_blocked(self, tmp_path: Path):
+        """Self-target act-then-ask falls through to gate and returns BLOCKED."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_set_task_status_never_done(self, tmp_path: Path):
+        """set_task_status must NEVER be called with 'done' on act-then-ask self-target path."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        for call in scheduler.set_task_status.await_args_list:
+            status = call.args[1] if len(call.args) > 1 else call.kwargs.get('status')
+            assert status != 'done', (
+                f'set_task_status was called with "done" but must not be on act-then-ask self-target path: {call}'
+            )
+
+    async def test_gate_escalation_category_milestone_gate(self, tmp_path: Path):
+        """The escalation filed must have category=='milestone_gate' (NOT 'infra_issue')."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('870', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'milestone_gate', (
+            f'Expected category "milestone_gate", got "{pending[0].category}"'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-13 (ε): robustness_crash_resume + always_escalates=True
+# Crash between before_done_scheduled_at stamp and gate filing.
+# Resume must (re-)file the milestone gate and block (NOT drive to done).
+# RED until step-14 guards (b-self) on always_escalates and extracts helper.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartScheduledCrashResumeActThenAsk:
+    """before_done_ran_at + before_done_scheduled_at set, always_escalates=True, empty queue.
+
+    Simulates a crash AFTER before_done_scheduled_at was stamped but BEFORE section 3
+    filed the milestone gate.  Resume must (re-)file the milestone gate and block —
+    NOT drive to done — so the act-then-ask human-approval gate is never bypassed.
+    """
+
+    def _make_task(self) -> dict:
+        task = _deploy_task(
+            task_id='855',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-855.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        task['metadata']['always_escalates'] = True
+        return task
+
+    async def test_outcome_is_blocked(self, tmp_path: Path):
+        """always_escalates=True scheduled-resume must return BLOCKED, NOT DONE."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — gate_escalated_at unset
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=restart_scheduler,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_set_task_status_never_done(self, tmp_path: Path):
+        """act-then-ask scheduled-resume must NOT call set_task_status with 'done'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        for call in scheduler.set_task_status.await_args_list:
+            status = call.args[1] if len(call.args) > 1 else call.kwargs.get('status')
+            assert status != 'done', (
+                f'set_task_status was called with "done" but must not be on act-then-ask '
+                f'scheduled-resume: {call}'
+            )
+
+    async def test_milestone_gate_escalation_filed(self, tmp_path: Path):
+        """act-then-ask scheduled-resume must file exactly one milestone_gate escalation."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('855', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_gate', (
+            f'Expected category "milestone_gate", got "{esc.category}"'
+        )
+        assert esc.level == 2, f'Expected level 2, got {esc.level}'
+        assert esc.severity == 'critical', f'Expected severity "critical", got "{esc.severity}"'
+        assert esc.agent_role == 'orchestrator-deterministic', (
+            f'Expected role "orchestrator-deterministic", got "{esc.agent_role}"'
+        )
+
+    async def test_gate_escalated_at_stamped(self, tmp_path: Path):
+        """act-then-ask scheduled-resume must stamp gate_escalated_at so next resume is quiescent."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        gate_stamped = any(
+            call.args[1].get('gate_escalated_at')
+            for call in scheduler.update_task.await_args_list
+            if len(call.args) > 1 and isinstance(call.args[1], dict)
+        )
+        assert gate_stamped, (
+            'gate_escalated_at must be stamped via update_task so next resume is quiescent'
+        )
+
+    async def test_i1_no_reschedule(self, tmp_path: Path):
+        """I1 crash-safe: restart_scheduler must NOT be awaited on scheduled-resume."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        restart_scheduler.assert_not_awaited()
+
+    async def test_i1_no_script_runner(self, tmp_path: Path):
+        """I1 crash-safe: script_runner must NOT be awaited on scheduled-resume."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_i1_no_unit_inspector(self, tmp_path: Path):
+        """I1 crash-safe: unit_inspector must NOT be awaited on scheduled-resume."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = self._make_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        unit_inspector.assert_not_awaited()
