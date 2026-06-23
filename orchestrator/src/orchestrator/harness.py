@@ -26,6 +26,7 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.config import OrchestratorConfig
+from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
@@ -3372,6 +3373,17 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'Starting workflow for task {assignment.task_id}: '
                 f'{assignment.task.get("title", "")}'
             )
+
+            # ── Deterministic gate route ─────────────────────────────────────
+            # Check BEFORE substrate gate / steward / TaskWorkflow so that NO
+            # worktree, branch, agent, or steward is created (I4/B2).  The
+            # finally block still runs on the early return — releasing the
+            # semaphore, popping _escalation_events, and calling
+            # scheduler.release on the empty lock set held by a gate task.
+            if self.scheduler.is_deterministic(assignment.task):
+                return await self._run_deterministic_slot(assignment)
+            # ────────────────────────────────────────────────────────────────
+
             # Retrieve the escalation wake-event registered at dispatch time.
             # _register_escalation_event was called at the dispatch point
             # (before create_task) so _escalation_events already has an entry.
@@ -3598,6 +3610,30 @@ Output JSON matching the schema. Every task must appear in the output.
             # task is not immediately re-dispatched and re-blocked in a tight loop.
             self.scheduler.release(assignment.task_id, requeued=requeued or arm_requeue_cooldown)
             sem.release()
+
+    async def _run_deterministic_slot(self, assignment) -> TaskReport:
+        """Run a deterministic gate task via DeterministicRunner.
+
+        Instantiated with only scheduler + escalation_queue (no git_ops) —
+        structurally proving no worktree is created for a gate (I4/B2).
+        Returns a TaskReport with block_reason='deterministic_gate' on BLOCKED,
+        or a plain DONE report when the gate has been resolved (resume path).
+        """
+        from datetime import UTC, datetime
+        if self._escalation_queue is None:
+            raise RuntimeError('_escalation_queue must be initialised before dispatching deterministic tasks')
+        runner = DeterministicRunner(
+            scheduler=self.scheduler,
+            escalation_queue=self._escalation_queue,
+        )
+        outcome = await runner.run(assignment)
+        return TaskReport(
+            task_id=assignment.task_id,
+            title=assignment.task.get('title', ''),
+            outcome=outcome,
+            completed_at=datetime.now(UTC).isoformat(),
+            block_reason='deterministic_gate' if outcome == WorkflowOutcome.BLOCKED else '',
+        )
 
     async def _maybe_auto_eval(
         self, assignment, report: TaskReport,
@@ -5739,6 +5775,24 @@ Output JSON matching the schema. Every task must appear in the output.
                     action, task_id, target_status, e,
                 )
                 return
+
+            # Restart path: clear deterministic gate stamps so the re-dispatched
+            # runner re-fires the gate from scratch.  resume preserves stamps so
+            # the runner's idempotency drives the gate to done instead (I2/B4/B5).
+            # park/abandon/close_only are left untouched — stamps preserved.
+            if action == 'restart':
+                task = await self.scheduler.get_task(task_id)
+                if task is not None and Scheduler.is_deterministic(task):
+                    await self.scheduler.update_task(
+                        task_id,
+                        {'gate_escalated_at': None, 'before_done_ran_at': None},
+                        metadata_mode='merge',
+                    )
+                    logger.info(
+                        'action-teardown restart: cleared deterministic gate stamps '
+                        'for task %s so re-dispatch re-fires the gate',
+                        task_id,
+                    )
 
             # Kill sequence for a live workflow (C3.1, D9).
             # Status write is already done above — kill strictly follows.
