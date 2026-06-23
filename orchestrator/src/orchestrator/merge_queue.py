@@ -5206,6 +5206,133 @@ class MergeMetrics:
         }
 
 
+# ── No-landings circuit-breaker (θ=1893, PRD §5.5) ──────────────────────────
+
+# PROVISIONAL thresholds — PRD §11: calibrate from ι's landings_total metric.
+# These are module-level defaults that the constructor can override (tests
+# inject small values).  A follow-up task will calibrate from production data.
+_NO_LANDINGS_WINDOW_SAMPLES: int = 10  # ≈ 10 min at 60 s interval
+_NO_LANDINGS_DISK_MARGIN_BYTES: int = 512 * 1024 * 1024  # 512 MiB
+
+
+@dataclasses.dataclass(frozen=True)
+class BreakerTrip:
+    """Immutable decision record returned by NoLandingsCircuitBreaker.observe().
+
+    ``action`` is either ``'halt'`` (trip just fired) or ``'resume'`` (breaker
+    just cleared).  The remaining fields carry the window context used to build
+    the operator escalation message.
+
+    Fields
+    ------
+    action          : ``'halt'`` or ``'resume'``
+    window_samples  : configured window size (number of samples)
+    landings_in_window : landings that occurred in the last window (0 on halt)
+    free_start      : free-bytes at the START of the evaluated window
+    free_end        : free-bytes at the END of the evaluated window (last sample)
+    reason          : human-readable one-liner for log/escalation messages
+    """
+
+    action: str
+    window_samples: int
+    landings_in_window: int
+    free_start: int
+    free_end: int
+    reason: str
+
+
+class NoLandingsCircuitBreaker:
+    """Detect and contain the residual merge-churn spiral (PRD §5.5).
+
+    Accumulates a rolling window of (landings_total, free_bytes) samples.
+    ``observe()`` returns a ``BreakerTrip`` decision when conditions change,
+    or ``None`` when no state transition occurs.
+
+    **Trip conditions (AND)**:
+    * rolling ``landing-rate == 0``: ``last.landings == first.landings`` over
+      the full ``window_samples``
+    * disk strictly falling: every consecutive free_bytes is strictly less than
+      its predecessor across the full window
+
+    **Resume conditions (OR)**:
+    * a clean landing: ``landings_total`` increased above the value at trip time
+    * disk recovered: ``free_bytes >= free_at_trip + disk_margin_bytes``
+
+    **Anti-flap**:
+    * disk-side margin hysteresis (small rise below margin does not resume)
+    * sample buffer is CLEARED on every resume — a fresh full window of
+      flat+falling samples is required before the next trip can fire
+
+    Args
+    ----
+    window_samples    : Number of consecutive samples needed to trip.
+    disk_margin_bytes : Disk must recover at least this many bytes above the
+                        trip-point free_bytes to resume on disk signal.
+
+    Notes
+    -----
+    * Pure / synchronous — no I/O, no asyncio.  Fully unit-testable.
+    * Thread safety: SpeculativeMergeWorker runs single-threaded under asyncio;
+      all methods here are synchronous and produce no I/O.
+    * Tripped state is *sticky*: once ``_tripped`` is True, ``observe()`` only
+      returns a ``BreakerTrip`` for the resume transition — not for every call.
+    """
+
+    def __init__(
+        self,
+        window_samples: int = _NO_LANDINGS_WINDOW_SAMPLES,
+        disk_margin_bytes: int = _NO_LANDINGS_DISK_MARGIN_BYTES,
+    ) -> None:
+        self._window_samples = window_samples
+        self._disk_margin_bytes = disk_margin_bytes
+        # Rolling buffer of (landings_total, free_bytes) tuples, bounded to
+        # window_samples entries (oldest drops automatically via maxlen).
+        self._samples: collections.deque[tuple[int, int]] = collections.deque(
+            maxlen=window_samples
+        )
+        self._tripped: bool = False
+        # Stashed at trip time for resume comparison
+        self._landings_at_trip: int = 0
+        self._free_at_trip: int = 0
+
+    # ── public interface ─────────────────────────────────────────────────────
+
+    def observe(self, landings_total: int, free_bytes: int) -> BreakerTrip | None:
+        """Feed one sample; return a BreakerTrip decision or None.
+
+        Args
+        ----
+        landings_total : monotonically non-decreasing landing counter from
+                         ``worker.snapshot()['metrics']['landings_total']``.
+        free_bytes     : current disk free bytes on the warm-lane volume
+                         (``shutil.disk_usage(worktree_base).free``).
+
+        Returns
+        -------
+        ``BreakerTrip(action='halt', ...)``
+            Trip just fired — caller should halt dispatch.
+        ``BreakerTrip(action='resume', ...)``
+            Breaker just cleared — caller should resume dispatch.
+        ``None``
+            No state change.
+        """
+        self._samples.append((landings_total, free_bytes))
+
+        if self._tripped:
+            return self._check_resume(landings_total, free_bytes)
+        else:
+            return None  # skeleton — trip detection in step-04
+
+    # ── private helpers ──────────────────────────────────────────────────────
+
+    def _check_resume(self, landings_total: int, free_bytes: int) -> BreakerTrip | None:
+        """Check resume conditions (called only while _tripped is True)."""
+        # Resume on: clean landing OR disk recovered above margin
+        # (both checked, OR semantics, PRD §5.5)
+        # (implemented in step-06 — currently returns None)
+        return None
+
+
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
