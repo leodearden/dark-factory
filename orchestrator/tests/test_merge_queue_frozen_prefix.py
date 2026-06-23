@@ -245,3 +245,99 @@ def _make_inflight_entry(
         was_speculative=False,
         phase='verifying',
     )
+
+
+# ── step-01 RED: frozen_prefix() + unfrozen_suffix() ─────────────────────────
+
+
+@pytest.mark.asyncio
+class TestFrozenAndUnfrozenAccessors:
+    """frozen_prefix() and unfrozen_suffix() partition the pipeline state.
+
+    RED until step-02 GREEN adds the methods to SpeculativeMergeWorker.
+    """
+
+    async def test_bare_worker_frozen_prefix_empty(
+        self, git_ops: GitOps,
+    ) -> None:
+        """A bare worker has no in-flight entries → frozen_prefix() == ()."""
+        worker = _make_worker(git_ops)
+        assert worker.frozen_prefix() == ()
+
+    async def test_bare_worker_unfrozen_suffix_empty(
+        self, git_ops: GitOps,
+    ) -> None:
+        """A bare worker has no lane-buffer items → unfrozen_suffix() == ()."""
+        worker = _make_worker(git_ops)
+        assert worker.unfrozen_suffix() == ()
+
+    async def test_two_verifying_inflight_in_frozen_prefix(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Two verifying InflightEntry items → frozen_prefix() == (rid_a, rid_b)."""
+        worker = _make_worker(git_ops)
+        _, item_a = _make_fake_item('t-a', base_sha='aaa0', merge_commit='aaa1',
+                                    config=config, git_repo=git_repo)
+        _, item_b = _make_fake_item('t-b', base_sha='aaa1', merge_commit='aaa2',
+                                    config=config, git_repo=git_repo)
+        entry_a = _make_inflight_entry(item_a, verifying=True)
+        entry_b = _make_inflight_entry(item_b, verifying=True)
+        worker._inflight.append(entry_a)
+        worker._inflight.append(entry_b)
+
+        fp = worker.frozen_prefix()
+        assert fp == (item_a.request.request_id, item_b.request.request_id)
+
+    async def test_passthrough_excluded_from_frozen_prefix(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A passthrough entry (verify_task=None) is EXCLUDED from frozen_prefix()."""
+        worker = _make_worker(git_ops)
+        _, item_a = _make_fake_item('t-a', base_sha='aaa0', merge_commit='aaa1',
+                                    config=config, git_repo=git_repo)
+        _, item_pass = _make_fake_item('t-pass', base_sha='aaa1', merge_commit=None,
+                                       config=config, git_repo=git_repo)
+        entry_a = _make_inflight_entry(item_a, verifying=True)
+        entry_pass = _make_inflight_entry(item_pass, verifying=False)  # passthrough
+        worker._inflight.append(entry_a)
+        worker._inflight.append(entry_pass)
+
+        fp = worker.frozen_prefix()
+        assert item_a.request.request_id in fp
+        assert item_pass.request.request_id not in fp
+
+    async def test_lane_buffers_appear_in_unfrozen_suffix(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Requests in _lane_buffers appear in unfrozen_suffix(), high before normal."""
+        worker = _make_worker(git_ops)
+        req_hi = _make_req('t-hi', 'task/t-hi', config, git_repo, lane='high')
+        req_n1 = _make_req('t-n1', 'task/t-n1', config, git_repo)
+        req_n2 = _make_req('t-n2', 'task/t-n2', config, git_repo)
+        worker._lane_buffers['high'].append(req_hi)
+        worker._lane_buffers['normal'].append(req_n1)
+        worker._lane_buffers['normal'].append(req_n2)
+
+        us = worker.unfrozen_suffix()
+        # high lane before normal
+        hi_idx = us.index(req_hi.request_id)
+        n1_idx = us.index(req_n1.request_id)
+        n2_idx = us.index(req_n2.request_id)
+        assert hi_idx < n1_idx < n2_idx
+
+    async def test_frozen_and_unfrozen_are_disjoint(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """frozen_prefix() and unfrozen_suffix() must be disjoint sets."""
+        worker = _make_worker(git_ops)
+        _, item_a = _make_fake_item('t-a', base_sha='aaa0', merge_commit='aaa1',
+                                    config=config, git_repo=git_repo)
+        _, item_b = _make_fake_item('t-b', config=config, git_repo=git_repo)
+        entry_a = _make_inflight_entry(item_a, verifying=True)
+        worker._inflight.append(entry_a)
+        req_b = item_b.request
+        worker._lane_buffers['normal'].append(req_b)
+
+        fp = set(worker.frozen_prefix())
+        us = set(worker.unfrozen_suffix())
+        assert fp & us == set(), f'frozen ∩ unfrozen should be empty, got {fp & us}'
