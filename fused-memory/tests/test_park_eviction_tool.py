@@ -14,9 +14,9 @@ the git-worktree validator.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -138,11 +138,13 @@ async def test_request_park_eviction_happy_path(tmp_path, mcp_server):
         '— a non-canonical stored value would cause silent drain failure'
     )
 
-    # requested_at must parse as a tz-aware datetime (UTC).
+    # requested_at must parse as a tz-aware datetime with a UTC zero offset.
+    # datetime.now(UTC) produces offset +00:00; checking utcoffset()==timedelta(0)
+    # is stricter than tzinfo is not None and would catch any non-UTC tz-aware form.
     parsed = datetime.fromisoformat(requested_at_col)
-    assert parsed.tzinfo is not None, (
-        f'requested_at {requested_at_col!r} is not tz-aware; '
-        'δ drain relies on ISO8601 UTC timestamps for ordering'
+    assert parsed.utcoffset() == timedelta(0), (
+        f'requested_at {requested_at_col!r} is not UTC (utcoffset={parsed.utcoffset()!r}); '
+        'producer uses datetime.now(UTC) — stored offset must be zero'
     )
 
 
@@ -238,4 +240,85 @@ async def test_request_park_eviction_append_only(tmp_path, mcp_server):
     count = _row_count(tmp_path)
     assert count == 2, (
         f'expected 2 rows after two enqueues (plain INSERT, no dedupe), got {count}'
+    )
+
+
+# ===========================================================================
+# Canonicalization — non-canonical project_root is resolved before storage
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_request_park_eviction_noncanonical_project_root(tmp_path, mcp_server):
+    """A non-canonical project_root (e.g. trailing slash) is resolved before storage.
+
+    This test proves the .resolve() step does real work: even though tmp_path
+    is already absolute, feeding it with a trailing slash produces a distinct
+    string that .resolve() must normalise.  Without the .resolve() call the
+    stored project_root would be 'str(tmp_path) + "/"', which is NOT equal to
+    the drain's 'str(Path(config.project_root).resolve())' and would cause
+    silent drain failure.
+    """
+    # Append a trailing slash so the raw input differs from the resolved form.
+    noncanonical_root = str(tmp_path) + '/'
+    canonical_root = str(Path(noncanonical_root).resolve())  # == str(tmp_path)
+    assert noncanonical_root != canonical_root, 'precondition: inputs differ'
+
+    result = await mcp_server._tool_manager.call_tool(
+        'request_park_eviction',
+        {'task_id': 'test-canon', 'project_root': noncanonical_root},
+    )
+    assert result == {'requested': True, 'task_id': 'test-canon'}
+
+    # The stored project_root must be the RESOLVED form, not the raw input.
+    conn = _open_db(canonical_root)
+    try:
+        rows = conn.execute(
+            'SELECT project_root FROM park_eviction_requests WHERE task_id = ?',
+            ('test-canon',),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert len(rows) == 1, f'expected 1 row, got {len(rows)}'
+    stored_root = rows[0][0]
+    assert stored_root == canonical_root, (
+        f'stored project_root {stored_root!r} != resolved canonical form {canonical_root!r}; '
+        "the .resolve() step is load-bearing for δ drain's WHERE clause"
+    )
+    assert stored_root != noncanonical_root, (
+        'stored project_root equals the raw non-canonical input — '
+        '.resolve() was not applied'
+    )
+
+
+# ===========================================================================
+# Error path — DB failure returns error dict without propagating
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_request_park_eviction_db_error(tmp_path, mcp_server):
+    """A DB-open failure returns an error dict; the exception is not propagated.
+
+    The tool's except-branch is an explicit part of the return contract
+    (returns {'error': ..., 'error_type': ...}); this test confirms it is
+    exercised and that the exception does not bubble up as an unhandled error.
+    """
+    injected = RuntimeError('simulated DB open failure')
+
+    with patch(
+        'fused_memory.server.tools._open_park_eviction_db',
+        side_effect=injected,
+    ):
+        result = await mcp_server._tool_manager.call_tool(
+            'request_park_eviction',
+            {'task_id': '7', 'project_root': str(tmp_path)},
+        )
+
+    assert 'error' in result, f'expected error key in result, got {result!r}'
+    assert 'error_type' in result, f'expected error_type key in result, got {result!r}'
+    # No row should have been written since the DB open itself failed.
+    assert _row_count(tmp_path) == 0, (
+        'expected 0 rows after DB-open failure, found rows'
     )

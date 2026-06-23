@@ -265,7 +265,7 @@ async def _open_park_eviction_db(project_root: str) -> aiosqlite.Connection:
 
     Creates parent directories on first call, applies the full Phase-3 durability
     pragma triad (journal_mode=WAL, busy_timeout=5000ms, synchronous=FULL,
-    wal_autocheckpoint=100), and runs idempotent DDL.
+    wal_autocheckpoint=100, journal_size_limit=64MiB), and runs idempotent DDL.
 
     WAL growth is bounded by ``wal_autocheckpoint=100`` combined with the
     scheduler draining (DELETE) every tick — no periodic-checkpoint wiring
