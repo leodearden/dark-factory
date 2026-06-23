@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import pytest
 
+import orchestrator.overlap_footprint as _ov_mod
 from orchestrator.overlap_footprint import (
     DEFAULT_OVERLAP_DETECTOR,
     DefaultPathOverlapDetector,
     Footprint,
     OverlapFootprintDetector,
+    get_overlap_detector,
+    register_overlap_detector,
 )
 
 
@@ -87,3 +90,56 @@ class TestFootprintAndDefaultDetector:
     def test_default_overlap_detector_conforms_to_protocol(self) -> None:
         """isinstance check verifies @runtime_checkable Protocol conformance."""
         assert isinstance(DEFAULT_OVERLAP_DETECTOR, OverlapFootprintDetector)
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Registration + default fallback tests
+# ---------------------------------------------------------------------------
+
+
+class _StubDetector:
+    """Minimal detector stub for registry tests."""
+
+    def footprint(self, changed_paths: object) -> Footprint:
+        return Footprint(members=frozenset())
+
+    def overlaps(self, a: Footprint, b: Footprint) -> bool:
+        return False
+
+
+@pytest.fixture()
+def clean_registry() -> object:
+    """Snapshot and restore _DETECTORS so tests don't leak global state."""
+    snapshot = dict(_ov_mod._DETECTORS)
+    yield
+    _ov_mod._DETECTORS.clear()
+    _ov_mod._DETECTORS.update(snapshot)
+
+
+class TestRegistry:
+    """Registration + default fallback."""
+
+    def test_none_returns_default(self, clean_registry: object) -> None:
+        assert get_overlap_detector(None) is DEFAULT_OVERLAP_DETECTOR
+
+    def test_unregistered_project_returns_default(self, clean_registry: object) -> None:
+        assert get_overlap_detector("some_unregistered_project") is DEFAULT_OVERLAP_DETECTOR
+
+    def test_registered_project_returns_custom(self, clean_registry: object) -> None:
+        stub = _StubDetector()
+        register_overlap_detector("reify", stub)
+        assert get_overlap_detector("reify") is stub
+
+    def test_other_project_still_gets_default_after_registration(
+        self, clean_registry: object
+    ) -> None:
+        stub = _StubDetector()
+        register_overlap_detector("reify", stub)
+        assert get_overlap_detector("dark_factory") is DEFAULT_OVERLAP_DETECTOR
+
+    def test_reregistration_overwrites(self, clean_registry: object) -> None:
+        stub1 = _StubDetector()
+        stub2 = _StubDetector()
+        register_overlap_detector("reify", stub1)
+        register_overlap_detector("reify", stub2)
+        assert get_overlap_detector("reify") is stub2
