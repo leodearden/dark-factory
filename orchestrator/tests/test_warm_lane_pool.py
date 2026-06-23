@@ -2364,7 +2364,12 @@ class TestReleaseLaneForTerminalTask:
     async def test_release_resolves_via_plan_json_backstop(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """ASSIGNED lane with empty _assignments → disk backstop finds and frees it."""
+        """ASSIGNED lane with empty _assignments → disk backstop finds and frees it.
+
+        Updated in step-18: the disk backstop is now opt-in (allow_disk_backstop=True).
+        This test represents the legitimate lost-map restart path — callers that
+        genuinely need the disk scan must explicitly opt in.
+        """
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         pool = git_ops.warm_lane_pool
         assert pool is not None
@@ -2377,7 +2382,7 @@ class TestReleaseLaneForTerminalTask:
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
 
-        freed = await git_ops.release_lane_for_terminal_task('3459')
+        freed = await git_ops.release_lane_for_terminal_task('3459', allow_disk_backstop=True)
 
         assert freed is True, 'disk backstop must find _lane-0 and free it'
         assert pool.state(lane) == LaneState.FREE

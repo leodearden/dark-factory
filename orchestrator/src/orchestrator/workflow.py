@@ -1905,8 +1905,11 @@ class TaskWorkflow:
             # GC unmerged work). Skips externally-managed worktrees (eval mode).
             await self._maybe_cleanup_done_worktree()
             # B1: release warm lane for any terminal exit (DONE or CANCELLED).
-            # Idempotent: if _maybe_cleanup_done_worktree already released (T1/T2),
-            # assignment_for returns None and the primitive returns False — no-op.
+            # Uses the default allow_disk_backstop=False: if
+            # _maybe_cleanup_done_worktree already released the lane and dropped
+            # the in-memory assignment (T1/T2 sync-merge path), assignment_for
+            # returns None → primitive returns False immediately (true no-op —
+            # no disk scan, no redundant cleanup_worktree / git branch -D retry).
             # Covers T3 (done-at-dispatch, branch not on main yet) and T4 (cancelled).
             if self.state in (WorkflowState.DONE, WorkflowState.CANCELLED) and not self._worktree_external:
                 await self.git_ops.release_lane_for_terminal_task(self.task_id)

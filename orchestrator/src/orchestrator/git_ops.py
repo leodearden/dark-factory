@@ -2036,7 +2036,12 @@ class GitOps:
         await self.warm_lane_pool.release(lane_dir)
         logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
 
-    async def release_lane_for_terminal_task(self, task_id_or_branch: str) -> bool:
+    async def release_lane_for_terminal_task(
+        self,
+        task_id_or_branch: str,
+        *,
+        allow_disk_backstop: bool = False,
+    ) -> bool:
         """Idempotent, never-raise primitive — release the warm lane assigned to a terminal task.
 
         Shared by all terminal-exit paths (B1/B2/B3 event wiring + A periodic
@@ -2045,17 +2050,34 @@ class GitOps:
         Resolution order:
         1. Strip ``config.branch_prefix`` to get the bare task id.
         2. In-memory: ``pool.assignment_for(bare_id)`` — O(1), covers the
-           common live-process path.
+           common live-process path.  This is the ONLY resolution used when
+           ``allow_disk_backstop=False`` (the default).  When the in-memory
+           lookup returns None the primitive returns ``False`` immediately —
+           a true no-op (no disk scan, no redundant ``cleanup_worktree`` /
+           ``git branch -D`` retry).
         3. On-disk backstop: ``_find_lane_by_plan_task_id(bare_id)`` — scans
-           ``worktree_base/_lane-*/.task/plan.json``; covers post-restart where
-           the assignment map was rebuilt (or not) but the plan is on disk.
+           ``worktree_base/_lane-*/.task/plan.json``; used ONLY when
+           ``allow_disk_backstop=True`` (reserved for the lost-map /
+           post-restart path: :meth:`_mark_in_progress_done`).  A theft guard
+           checks whether the resolved lane has since been re-acquired by a
+           different live task; if so, the release is refused (returns False)
+           to prevent stealing a live task's lane via a stale plan.json.
 
-        If neither resolves, returns ``False`` (no lane to free — already free
-        or never assigned).  Otherwise routes through :meth:`cleanup_worktree`
-        (pool-aware: calls :meth:`release_warm_lane` for warm lanes) and
-        returns ``True``.
+        If neither resolves (or the theft guard refuses), returns ``False``
+        (no lane to free — already free or not assigned to this task).
+        Otherwise routes through :meth:`cleanup_worktree` (pool-aware: calls
+        :meth:`release_warm_lane` for warm lanes) and returns ``True``.
 
         All exceptions are caught and logged; never raises.
+
+        Args:
+            task_id_or_branch: Task id or full branch name (prefix stripped).
+            allow_disk_backstop: When True, fall back to scanning ``plan.json``
+                files on disk if the in-memory assignment map has no entry.
+                Defaults to False — callers on B1/B2/B3/A paths must NOT
+                pass this; it is reserved for ``_mark_in_progress_done``
+                (T9 lost-map / post-restart path).
+
         Returns:
             ``True`` if a lane was found and freed, ``False`` otherwise.
         """
@@ -2073,9 +2095,25 @@ class GitOps:
         # Resolve lane via in-memory assignment first
         lane = self.warm_lane_pool.assignment_for(bare_id)
 
-        # Fall back to the on-disk plan.json backstop
-        if lane is None:
-            lane = self._find_lane_by_plan_task_id(bare_id)
+        # Optionally fall back to the on-disk plan.json backstop (opt-in only)
+        if lane is None and allow_disk_backstop:
+            disk_lane = self._find_lane_by_plan_task_id(bare_id)
+            if disk_lane is not None:
+                # Theft guard: check if the disk-resolved lane has since been
+                # re-acquired by a DIFFERENT live task (stale plan.json window).
+                # Use assignments_snapshot() — no lock needed (single event loop).
+                snap = self.warm_lane_pool.assignments_snapshot()
+                holder = next(
+                    (br for br, ln in snap.items() if ln == disk_lane), None
+                )
+                if holder is not None and holder != bare_id:
+                    logger.warning(
+                        'release_lane_for_terminal_task: theft guard refused — '
+                        'disk-resolved lane %s for task %r is now held by %r',
+                        disk_lane, bare_id, holder,
+                    )
+                    disk_lane = None
+            lane = disk_lane
 
         if lane is None:
             logger.debug(

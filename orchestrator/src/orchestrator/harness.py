@@ -2716,10 +2716,13 @@ Output JSON matching the schema. Every task must appear in the output.
         )
         # Diff 5c (T9 hardening): release warm lane after the done flip.
         # cleanup_worktree (above) frees the lane only when the in-memory
-        # assignment map still has tid; the primitive's on-disk plan.json
-        # backstop covers the lost-map (post-restart) case.  Idempotent
-        # when cleanup_worktree already freed it.
-        await self.git_ops.release_lane_for_terminal_task(tid)
+        # assignment map still has tid; opt into the on-disk plan.json
+        # backstop (allow_disk_backstop=True) to cover the lost-map /
+        # post-restart case where the assignment map was cleared on restart.
+        # The theft guard inside the primitive refuses if the disk-resolved
+        # lane has since been re-acquired by a different live task.
+        # Idempotent when cleanup_worktree already freed it.
+        await self.git_ops.release_lane_for_terminal_task(tid, allow_disk_backstop=True)
         logger.info(
             'Reconcile: marked task %s done (reason=%s)', tid, reason,
         )
@@ -3566,10 +3569,12 @@ Output JSON matching the schema. Every task must appear in the output.
             self._terminal_cancel_counts.pop(assignment.task_id, None)
             # B2: belt-and-suspenders release for hard-cancel (T5) and any
             # DONE/CANCELLED that missed B1 (e.g. workflow.run() hard-cancelled
-            # before its own finally could run).  Idempotent: normal exits already
-            # freed the lane in B1 — assignment_for returns None and the primitive
-            # returns False (no-op).  contextlib.suppress swallows any residual
-            # error so a hiccup here never prevents scheduler.release below.
+            # before its own finally could run).  Uses the default
+            # allow_disk_backstop=False: normal exits already freed the lane in
+            # B1 and dropped the in-memory assignment → primitive returns False
+            # immediately (true no-op — no disk scan, no redundant cleanup).
+            # contextlib.suppress swallows any residual error so a hiccup here
+            # never prevents scheduler.release below.
             if report is not None and report.outcome in (WorkflowOutcome.DONE, WorkflowOutcome.CANCELLED):
                 with contextlib.suppress(Exception):
                     await self.git_ops.release_lane_for_terminal_task(assignment.task_id)
