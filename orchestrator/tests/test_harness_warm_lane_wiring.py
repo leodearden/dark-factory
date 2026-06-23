@@ -34,6 +34,7 @@ def _make_config(
     *,
     max_concurrent_tasks: int,
     warm_lane_pool: bool,
+    spare_warm_lanes: int = 0,
     tmp_path: Path,
 ) -> OrchestratorConfig:
     """Build a minimal OrchestratorConfig with the given warm-lane settings."""
@@ -44,7 +45,7 @@ def _make_config(
     return OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=max_concurrent_tasks,
-        git=GitConfig(warm_lane_pool=warm_lane_pool),
+        git=GitConfig(warm_lane_pool=warm_lane_pool, spare_warm_lanes=spare_warm_lanes),
     )
 
 
@@ -106,6 +107,44 @@ class TestHarnessWarmLaneWiring:
         harness = _build_harness(config)
 
         # size=0 → GitOps treats it as disabled → None
+        assert harness.git_ops.warm_lane_pool is None
+
+    def test_spare_warm_lanes_adds_to_pool_size(self, tmp_path: Path):
+        """spare_warm_lanes=3 adds headroom: pool.size == max_concurrent_tasks + spare."""
+        config = _make_config(
+            max_concurrent_tasks=7,
+            warm_lane_pool=True,
+            spare_warm_lanes=3,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_pool is not None
+        assert harness.git_ops.warm_lane_pool.size == 10  # 7 + 3
+
+    def test_spare_warm_lanes_zero_is_byte_identical(self, tmp_path: Path):
+        """spare_warm_lanes=0 (default) → pool.size == max_concurrent_tasks (no change)."""
+        config = _make_config(
+            max_concurrent_tasks=5,
+            warm_lane_pool=True,
+            spare_warm_lanes=0,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_pool is not None
+        assert harness.git_ops.warm_lane_pool.size == 5  # 5 + 0
+
+    def test_spare_warm_lanes_no_effect_when_pool_off(self, tmp_path: Path):
+        """spare_warm_lanes=5 has no effect when warm_lane_pool=False → pool is None."""
+        config = _make_config(
+            max_concurrent_tasks=4,
+            warm_lane_pool=False,
+            spare_warm_lanes=5,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
         assert harness.git_ops.warm_lane_pool is None
 
 
