@@ -461,6 +461,7 @@ class TestTrainCallbackLaneRelease:
     async def test_merge_train_member_done_frees_lane(self, tmp_path: Path):
         """(12) mark_member_done fires mark_done AND releases the lane."""
         from _workflow_helpers import FakeScheduler
+
         from orchestrator.harness import build_train_callback_factory
         from orchestrator.warm_lane_pool import LaneState
 
@@ -482,6 +483,7 @@ class TestTrainCallbackLaneRelease:
         # Pre-assign lane for the member task
         await pool.acquire_for(mid)
         lane = pool.assignment_for(mid)
+        assert lane is not None
         assert pool.state(lane) == LaneState.ASSIGNED
 
         scheduler = FakeScheduler()
@@ -506,6 +508,7 @@ class TestTrainCallbackLaneRelease:
     async def test_merge_deferred_to_done_lane_freed_at_flip(self, tmp_path: Path):
         """(13) Lane stays ASSIGNED while MERGE_DEFERRED, freed only at the done-flip."""
         from _workflow_helpers import FakeScheduler
+
         from orchestrator.harness import build_train_callback_factory
         from orchestrator.warm_lane_pool import LaneState
 
@@ -526,6 +529,7 @@ class TestTrainCallbackLaneRelease:
         mid = '7777'
         await pool.acquire_for(mid)
         lane = pool.assignment_for(mid)
+        assert lane is not None
         assert pool.state(lane) == LaneState.ASSIGNED
 
         scheduler = FakeScheduler()
@@ -555,6 +559,7 @@ class TestTrainCallbackLaneRelease:
         inside the factory) is the primary release path for async-merge-queue done events.
         """
         from _workflow_helpers import FakeScheduler
+
         from orchestrator.harness import build_train_callback_factory
         from orchestrator.warm_lane_pool import LaneState
 
@@ -575,6 +580,7 @@ class TestTrainCallbackLaneRelease:
         mid = '3459'
         await pool.acquire_for(mid)
         lane = pool.assignment_for(mid)
+        assert lane is not None
         assert pool.state(lane) == LaneState.ASSIGNED
 
         scheduler = FakeScheduler()
@@ -584,7 +590,8 @@ class TestTrainCallbackLaneRelease:
         callbacks = factory('train-3')
 
         # found_on_main=True triggers the mark_done path (T6 canonical scenario)
-        await callbacks.redrive_member(mid, found_on_main=True, sha='ghi789')
+        assert callbacks.redrive_member is not None
+        await callbacks.redrive_member(mid, True, 'ghi789')
 
         # scheduler.mark_done must have been called
         assert scheduler.statuses.get(mid, [])[-1] == 'done', (
@@ -727,6 +734,7 @@ class TestTerminalLaneReconciler:
         from orchestrator.warm_lane_pool import LaneState
 
         harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
 
         tid = '3459'
         result = await pool.acquire_for(tid)
@@ -766,6 +774,7 @@ class TestTerminalLaneReconciler:
         from orchestrator.warm_lane_pool import LaneState
 
         harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
 
         tid = '7777'
         result = await pool.acquire_for(tid)
@@ -788,6 +797,7 @@ class TestTerminalLaneReconciler:
         from orchestrator.warm_lane_pool import LaneState
 
         harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
 
         tid = '8888'
         result = await pool.acquire_for(tid)
@@ -811,6 +821,7 @@ class TestTerminalLaneReconciler:
         from orchestrator.warm_lane_pool import LaneState
 
         harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
 
         tid = '9999'
         result = await pool.acquire_for(tid)
@@ -842,6 +853,7 @@ class TestTerminalLaneReconciler:
         from orchestrator.warm_lane_pool import LaneState
 
         harness, _git_ops, pool = await self._make_harness_with_pool(tmp_path)
+        assert pool is not None
 
         tid = '1111'
         result = await pool.acquire_for(tid)
@@ -952,7 +964,7 @@ class TestRecoveryTerminalTaskLaneRelease:
 
         harness.scheduler.get_status = AsyncMock(return_value='in-progress')
 
-        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
+        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock), \
              patch.object(pool, 'restore_assignment') as mock_restore:
             await harness._recover_crashed_tasks()
 
@@ -974,7 +986,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         # Transient failure: get_status returns None (not in ('done','cancelled'))
         harness.scheduler.get_status = AsyncMock(return_value=None)
 
-        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
+        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock), \
              patch.object(pool, 'restore_assignment') as mock_restore:
             await harness._recover_crashed_tasks()
 
