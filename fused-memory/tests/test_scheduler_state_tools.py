@@ -77,6 +77,29 @@ _EMPTY_SKELETON = {
 }
 
 
+_PARK_STACKS_FIXTURE = {
+    'mod/a': [
+        {'owner': 'L', 'rank': 5, 'shadowed': True,
+         'installed_at': '2026-06-01T00:00:00+00:00'},
+        {'owner': 'H', 'rank': 9, 'shadowed': False,
+         'installed_at': '2026-06-01T00:00:00+00:00'},
+    ],
+}
+
+_SNAPSHOT_WITH_PARK_STACKS = {
+    'skip_counts': {},
+    'parks': {},
+    'park_stacks': _PARK_STACKS_FIXTURE,
+    'effective_priorities': {},
+    'pin_queue': [],
+    'overrides': {},
+    'current_holders': {},
+    'is_paused': False,
+    'pause_reason': None,
+    'snapshot_at': '2026-06-01T12:00:00+00:00',
+}
+
+
 def _write_snapshot(project_root: Path, data: dict) -> Path:
     """Write a synthetic scheduler_state.json under project_root."""
     path = project_root / 'data' / 'orchestrator' / 'scheduler_state.json'
@@ -173,30 +196,10 @@ class TestGetSchedulerStateTool:
         park_stacks shape per scheduler.py:3461 — full LIFO bottom→top:
           {module: [{owner, rank, shadowed, installed_at}, ...]}
         """
-        park_stacks_fixture = {
-            'mod/a': [
-                {'owner': 'L', 'rank': 5, 'shadowed': True,
-                 'installed_at': '2026-06-01T00:00:00+00:00'},
-                {'owner': 'H', 'rank': 9, 'shadowed': False,
-                 'installed_at': '2026-06-01T00:00:00+00:00'},
-            ],
-        }
-        synthetic = {
-            'skip_counts': {},
-            'parks': {},
-            'park_stacks': park_stacks_fixture,
-            'effective_priorities': {},
-            'pin_queue': [],
-            'overrides': {},
-            'current_holders': {},
-            'is_paused': False,
-            'pause_reason': None,
-            'snapshot_at': '2026-06-01T12:00:00+00:00',
-        }
-        _write_snapshot(tmp_path, synthetic)
+        _write_snapshot(tmp_path, _SNAPSHOT_WITH_PARK_STACKS)
 
         result = read_scheduler_state(tmp_path)
-        assert result['park_stacks'] == park_stacks_fixture, (
+        assert result['park_stacks'] == _PARK_STACKS_FIXTURE, (
             f'Expected park_stacks to be returned verbatim, got {result["park_stacks"]!r}'
         )
 
@@ -210,33 +213,13 @@ class TestGetSchedulerStateTool:
         (json.loads → asyncio.to_thread → MCP tool) does not drop park_stacks.
         Catches a future whitelist/filter at any layer in the stack.
         """
-        park_stacks_fixture = {
-            'mod/a': [
-                {'owner': 'L', 'rank': 5, 'shadowed': True,
-                 'installed_at': '2026-06-01T00:00:00+00:00'},
-                {'owner': 'H', 'rank': 9, 'shadowed': False,
-                 'installed_at': '2026-06-01T00:00:00+00:00'},
-            ],
-        }
-        synthetic = {
-            'skip_counts': {},
-            'parks': {},
-            'park_stacks': park_stacks_fixture,
-            'effective_priorities': {},
-            'pin_queue': [],
-            'overrides': {},
-            'current_holders': {},
-            'is_paused': False,
-            'pause_reason': None,
-            'snapshot_at': '2026-06-01T12:00:00+00:00',
-        }
-        _write_snapshot(tmp_path, synthetic)
+        _write_snapshot(tmp_path, _SNAPSHOT_WITH_PARK_STACKS)
 
         result = await mcp_server._tool_manager.call_tool(
             'get_scheduler_state',
             {'project_root': str(tmp_path)},
         )
-        assert result['park_stacks'] == park_stacks_fixture, (
+        assert result['park_stacks'] == _PARK_STACKS_FIXTURE, (
             f'Expected park_stacks surfaced end-to-end, got {result.get("park_stacks")!r}'
         )
 
