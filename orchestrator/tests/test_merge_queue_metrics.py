@@ -17,7 +17,6 @@ import pytest
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import MergeMetrics, SpeculativeMergeWorker
 
-
 # ---------------------------------------------------------------------------
 # Worker factory (mirrors test_merge_queue_main_health._make_git_ops pattern)
 # ---------------------------------------------------------------------------
