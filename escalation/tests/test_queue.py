@@ -2644,3 +2644,49 @@ class TestSubmitResolveAdoptLock:
         assert any(eid == 'esc-3-1' for _, eid in acquired), (
             f'Expected lock acquisition for esc-3-1; got {acquired}'
         )
+
+
+class TestArchiveListingMemoisation:
+    """get() must memoise the archive listing so repeated calls scan at most once."""
+
+    def test_archive_scanned_at_most_once_across_repeated_gets(self, tmp_path: Path):
+        """Calling get(id) three times on a FRESH instance must scan the archive <=1x.
+
+        Instance A: submit + resolve 'esc-1-1' (moves it to archive).
+        Instance B: fresh, cache unbuilt.  Spy _iter_archive_paths (wraps).
+        Three sequential B.get('esc-1-1') calls.
+        (a) all calls return status='resolved'.
+        (b) spy.call_count <= 1 (archive scanned at most once total).
+
+        RED on current main: _locate_path calls _iter_archive_paths on every
+        root-miss → call_count == 3 → assertion (<=1) fails.
+        """
+        queue_dir = tmp_path / 'queue'
+
+        # Instance A: submit and resolve so the file moves to archive.
+        instance_a = EscalationQueue(queue_dir)
+        instance_a.submit(_make_escalation('esc-1-1'))
+        instance_a.resolve('esc-1-1', 'archived by instance A')
+
+        # Instance B: fresh, no cache yet.
+        instance_b = EscalationQueue(queue_dir)
+
+        with patch.object(
+            instance_b, '_iter_archive_paths', wraps=instance_b._iter_archive_paths,
+        ) as spy:
+            result1 = instance_b.get('esc-1-1')
+            result2 = instance_b.get('esc-1-1')
+            result3 = instance_b.get('esc-1-1')
+
+        # (a) Every call must return the resolved escalation.
+        for i, result in enumerate([result1, result2, result3], start=1):
+            assert result is not None, f'Call {i}: expected Escalation, got None'
+            assert result.status == 'resolved', (
+                f'Call {i}: expected status=resolved, got {result.status!r}'
+            )
+
+        # (b) Archive must be scanned at most once (memoised listing).
+        assert spy.call_count <= 1, (
+            f'Expected archive scanned <=1x but _iter_archive_paths called '
+            f'{spy.call_count}x across three get() calls'
+        )
