@@ -3414,11 +3414,15 @@ Output JSON matching the schema. Every task must appear in the output.
                 'returning synthetic CANCELLED report',
                 assignment.task_id,
             )
-            return TaskReport(
+            # Assign to `report` so the B2 release in the finally block can see
+            # the CANCELLED outcome and free the warm lane (the finally reads
+            # `report` to gate the release; a bare `return` leaves it None).
+            report = TaskReport(
                 task_id=assignment.task_id,
                 title=assignment.task.get('title', ''),
                 outcome=WorkflowOutcome.CANCELLED,
             )
+            return report
         except Exception as e:
             logger.exception(f'Workflow slot error for task {assignment.task_id}: {e}')
             arm_requeue_cooldown = True  # any unhandled slot exception → arm cooldown in finally
@@ -3438,6 +3442,15 @@ Output JSON matching the schema. Every task must appear in the output.
             # _run_slot) and lazily pruned by the sweep's grace-check reader.
             self._workflow_slot_tasks.pop(assignment.task_id, None)
             self._terminal_cancel_counts.pop(assignment.task_id, None)
+            # B2: belt-and-suspenders release for hard-cancel (T5) and any
+            # DONE/CANCELLED that missed B1 (e.g. workflow.run() hard-cancelled
+            # before its own finally could run).  Idempotent: normal exits already
+            # freed the lane in B1 — assignment_for returns None and the primitive
+            # returns False (no-op).  contextlib.suppress swallows any residual
+            # error so a hiccup here never prevents scheduler.release below.
+            if report is not None and report.outcome in (WorkflowOutcome.DONE, WorkflowOutcome.CANCELLED):
+                with contextlib.suppress(Exception):
+                    await self.git_ops.release_lane_for_terminal_task(assignment.task_id)
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
             if report is not None:
                 requeued = await self._apply_retry_cap(
