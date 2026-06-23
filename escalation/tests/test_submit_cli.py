@@ -55,6 +55,32 @@ class TestSubmitCli:
             f'Expected sentinel role starting with orchestrator-, got {esc.agent_role!r}'
         )
 
+    def test_submit_rejects_non_sentinel_agent_role(self, tmp_path: Path):
+        """Non-sentinel --agent-role is rejected before any disk write.
+
+        The CLI stamps level=2 directly, bypassing server.py's _chokepoint_or_submit
+        downgrade gate.  A non-sentinel role (not harness-* or orchestrator-*) would
+        produce a born-at-L2 record that violates the sentinel-namespace invariant, so
+        submit.py rejects it via parser.error() (exit code 2) before any disk write.
+        """
+        with pytest.raises(SystemExit) as exc:
+            submit.main([
+                'submit',
+                '--queue-dir', str(tmp_path),
+                '--task', '5',
+                '--severity', 'critical',
+                '--category', 'infra_issue',
+                '--summary', 's',
+                '--agent-role', 'some-agent',  # not harness-* or orchestrator-*
+            ])
+        assert exc.value.code == 2, (
+            f'Expected SystemExit(2) for non-sentinel agent_role, got {exc.value.code}'
+        )
+        # Nothing should have been written to the queue
+        assert EscalationQueue(tmp_path).get_pending() == [], (
+            'No escalation should be written when agent_role is rejected'
+        )
+
     def test_submit_rejects_non_l2_severity(self, tmp_path: Path):
         """Non-BORN_AT_L2_SEVERITIES severity is rejected before any disk write.
 
@@ -118,7 +144,12 @@ class TestSubmitCli:
         """Seam-contract: escalation/pyproject.toml declares the console-script entrypoint.
 
         Protects task ε's systemd-run --on-failure target (`escalation submit ...`).
-        Fails if the [project.scripts] table is missing or has a typo.
+        Fails if the [project.scripts] table is missing, the 'escalation' key is absent,
+        or the configured module:attr does not resolve to a callable.
+
+        The exact string is intentionally NOT pinned: we verify the entry point
+        resolves to a callable rather than asserting a literal, so benign moves
+        (e.g. main() renamed or relocated) don't produce false failures.
         """
         import importlib
         import tomllib
@@ -131,10 +162,49 @@ class TestSubmitCli:
             data = tomllib.load(f)
 
         scripts = data.get('project', {}).get('scripts', {})
-        assert scripts.get('escalation') == 'escalation.submit:main', (
-            f"Expected project.scripts.escalation = 'escalation.submit:main', got {scripts!r}"
+        ep_value = scripts.get('escalation', '')
+        assert ep_value, (
+            "Expected [project.scripts] to declare an 'escalation' console-script entry point"
+        )
+        # Verify the entry point is in 'module:attr' format and resolves to a callable.
+        assert ':' in ep_value, (
+            f"Entry point must be 'module:attr' format, got {ep_value!r}"
+        )
+        ep_module_name, ep_attr_name = ep_value.rsplit(':', 1)
+        ep_mod = importlib.import_module(ep_module_name)
+        ep_fn = getattr(ep_mod, ep_attr_name, None)
+        assert callable(ep_fn), (
+            f"Entry point {ep_value!r} must resolve to a callable, got {ep_fn!r}"
         )
 
-        # Also verify the target is importable and callable
-        mod = importlib.import_module('escalation.submit')
-        assert callable(mod.main), 'escalation.submit.main must be callable'
+    def test_console_script_form_if_installed(self, tmp_path: Path):
+        """Behavioral test of the `escalation submit ...` console-script form.
+
+        Exercises task ε's production seam: the systemd-run --on-failure target.
+        Skipped when the console script is not installed in PATH (common in
+        worktree dev environments before `uv sync --reinstall`).
+        """
+        import shutil
+        escalation_script = shutil.which('escalation')
+        if not escalation_script:
+            pytest.skip('escalation console script not installed in PATH')
+
+        proc = subprocess.run(
+            [
+                escalation_script,
+                'submit',
+                '--queue-dir', str(tmp_path),
+                '--task', '99',
+                '--severity', 'critical',
+                '--category', 'infra_issue',
+                '--summary', 'console-script behavioral test',
+            ],
+            capture_output=True,
+        )
+        assert proc.returncode == 0, (
+            f'Expected returncode=0; stderr={proc.stderr.decode()!r}'
+        )
+        pending = EscalationQueue(tmp_path).get_pending()
+        assert len(pending) == 1
+        assert pending[0].level == 2
+        assert pending[0].severity == 'critical'

@@ -37,6 +37,13 @@ logger = logging.getLogger(__name__)
 # consistent with server-filed L2s for dashboard/audit.
 DEFAULT_AGENT_ROLE = 'orchestrator-deterministic'
 
+# Harness sentinel role prefixes — mirrors server.py:_HARNESS_SENTINEL_ROLE_PREFIXES.
+# Defined here (rather than imported from server.py) because importing server.py
+# pulls in fastmcp, sweep, dedupe, and other heavy dependencies inappropriate for
+# a lightweight CLI entry point.  Update this tuple whenever server.py's
+# _HARNESS_SENTINEL_ROLE_PREFIXES changes.
+_HARNESS_SENTINEL_ROLE_PREFIXES: tuple[str, ...] = ('harness-', 'orchestrator-')
+
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for filing a born-at-L2 escalation to the file-backed queue.
@@ -47,6 +54,12 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         0 on success; argparse exits with 2 on invalid arguments.
     """
+    # Configure logging so the success line is visible regardless of invocation form
+    # (console-script `escalation submit`, `python -m escalation submit`, or direct
+    # module).  basicConfig is a no-op when the root logger already has handlers so
+    # it is safe to call here even when a caller has configured logging themselves.
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
     parser = argparse.ArgumentParser(
         description='File a born-at-L2 escalation directly to the file-backed queue.',
     )
@@ -100,7 +113,8 @@ def main(argv: list[str] | None = None) -> int:
         dest='agent_role',
         help=(
             f'Sentinel agent role (default: {DEFAULT_AGENT_ROLE!r}). '
-            'Must start with orchestrator-* to satisfy the sentinel namespace contract.'
+            f'Must start with one of {_HARNESS_SENTINEL_ROLE_PREFIXES} '
+            'to satisfy the sentinel namespace contract (enforced).'
         ),
     )
 
@@ -109,6 +123,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != 'submit':
         parser.print_help()
         return 2
+
+    # Validate --agent-role against the sentinel namespace contract.
+    # The CLI stamps level=2 directly, bypassing server.py's _chokepoint_or_submit
+    # downgrade gate.  A non-sentinel role would produce a born-at-L2 record with
+    # a non-sentinel role — exactly the combination the server prevents.  Reject
+    # before any disk write, consistent with the --severity restriction.
+    if not any(args.agent_role.startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES):
+        parser.error(
+            f'--agent-role {args.agent_role!r} does not start with a sentinel prefix '
+            f'{_HARNESS_SENTINEL_ROLE_PREFIXES}; '
+            'only sentinel roles (harness-*, orchestrator-*) may file L2 escalations'
+        )
 
     # EscalationQueue.__init__ creates queue_dir (parents=True, exist_ok=True),
     # matching the detached OnFailure context where the dir may not yet exist.
@@ -133,5 +159,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     sys.exit(main())
