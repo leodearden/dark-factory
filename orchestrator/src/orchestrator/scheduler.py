@@ -743,6 +743,29 @@ class ModuleLockTable:
         ]
         return evicted, all_restored
 
+    def force_clear(
+        self, owner: str
+    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
+        """Evict all parks held by *owner* and return (modules, restored_pairs).
+
+        Thin wrapper over :meth:`prune_owners` that pre-collects the sorted
+        list of modules the owner was parked on before the eviction removes
+        them from the stacks.  LIFO restoration of newly-exposed tops is
+        handled by :meth:`prune_owners` → :meth:`_remove_owner`.
+
+        Returns:
+            modules: sorted list of module keys the owner was parked on.
+                     Empty list if the owner has no parks (idempotent no-op).
+            restored_pairs: list of (owner, sorted_modules) for each buried
+                            owner newly exposed as the active top.
+        """
+        modules = sorted(
+            m for m, stack in self._parked.items()
+            if any(o == owner for o, _ in stack)
+        )
+        _evicted, restored = self.prune_owners(lambda o: o == owner)
+        return modules, restored
+
     # --- Snapshot helpers (public accessors for observability) ---
 
     def snapshot_parks(self) -> dict[str, dict]:
