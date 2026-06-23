@@ -995,6 +995,10 @@ class Harness:
             # so scheduler._dispatched is empty and no live workflow can race
             # the sweep.  Self-gates on worktree_orphan_reaper_enabled.
             await self._reap_orphan_worktrees()
+            # Diff 7: startup terminal-lane sweep (layer A backstop).
+            # Runs after the orphan reaper so scheduler._dispatched is still
+            # empty — no live workflow can race the release.
+            await self._reconcile_terminal_lanes()
 
             statuses, _ = await self.scheduler.get_statuses()
             self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
@@ -1887,6 +1891,64 @@ Output JSON matching the schema. Every task must appear in the output.
         esc_event = asyncio.Event()
         self._escalation_events[task_id] = esc_event
         return esc_event
+
+    async def _reconcile_terminal_lanes(self) -> None:
+        """Release warm lanes whose assigned tasks are terminal and not live.
+
+        Layer A (invariant backstop): sweeps every ASSIGNED lane, checks the
+        task status via ``scheduler.get_statuses``, and releases lanes whose
+        task is done/cancelled and not in ``scheduler._dispatched`` (the
+        live-acquire guard prevents racing a fresh ``acquire_for``).
+
+        Fail-safe MIRRORS ``_reap_orphan_worktrees``: an empty or errored
+        ``get_statuses`` result ABORTS the whole sweep — never mass-free.
+
+        Wired into:
+        - startup (after ``_reap_orphan_worktrees``, before first ``acquire_next``)
+        - ``_stranded_reconcile_loop`` (after ``_reconcile_stranded_in_progress``)
+
+        Reuses ``stranded_reconcile_interval_secs``; no new config knob.
+        """
+        pool = self.git_ops.warm_lane_pool
+        if pool is None:
+            return
+
+        assignments = pool.assignments_snapshot()
+        if not assignments:
+            return
+
+        statuses, err = await self.scheduler.get_statuses(list(assignments.keys()))
+        if resolver_failed(statuses, err):
+            logger.warning(
+                'Terminal-lane reconciler: get_statuses returned %s — '
+                'aborting sweep (fail-safe against transient DB failure or '
+                'empty task tree)',
+                'error' if err is not None else 'empty',
+            )
+            return
+
+        released = 0
+        for branch in list(assignments.keys()):
+            status = statuses.get(branch)
+            if status not in ('done', 'cancelled'):
+                continue
+            if branch in self.scheduler._dispatched:
+                # Live-acquire guard: a workflow may have just acquired this
+                # branch; skip to avoid racing the fresh dispatch.
+                continue
+            if await self.git_ops.release_lane_for_terminal_task(branch):
+                released += 1
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.worktree_reaped,
+                        task_id=branch,
+                        data={'reason': 'terminal-lane-reconciler', 'status': status},
+                    )
+
+        if released:
+            logger.info(
+                'Terminal-lane reconciler: released %d lane(s)', released,
+            )
 
     async def _reconcile_stranded_in_progress(self, *, mid_run: bool = False) -> int:
         """Sweep stranded in-progress tasks back to pending (or done).
@@ -5190,6 +5252,8 @@ Output JSON matching the schema. Every task must appear in the output.
             try:
                 await asyncio.sleep(interval)
                 await self._reconcile_stranded_in_progress(mid_run=True)
+                # Diff 7: periodic terminal-lane sweep (layer A backstop).
+                await self._reconcile_terminal_lanes()
             except asyncio.CancelledError:
                 raise
             except Exception:
