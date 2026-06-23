@@ -23,7 +23,6 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import MergeOutcome, MergeRequest
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
-
 # ---------------------------------------------------------------------------
 # Shared fixture builder (mirrors test_workflow_merge_thrash._make)
 # ---------------------------------------------------------------------------
