@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -21,6 +22,51 @@ from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Infra-class OSError classification (step-1/step-2)
+# ---------------------------------------------------------------------------
+
+#: Errno values that indicate a transient infrastructure failure (disk
+#: pressure, quota, read-only fs, I/O error, fd exhaustion).  Mirrors the
+#: set used in merge_queue._ENOSPC_MARKERS and git_ops.WarmLaneDiskPressure.
+_INFRA_ERRNOS: frozenset[int] = frozenset({
+    errno.ENOSPC,   # No space left on device
+    errno.EDQUOT,   # Quota exceeded
+    errno.EROFS,    # Read-only file system
+    errno.EIO,      # I/O error
+    errno.EMFILE,   # Too many open files (process)
+    errno.ENFILE,   # File table overflow (system)
+})
+
+
+def _is_infra_oserror(exc: object) -> bool:
+    """Return True iff *exc* is an OSError whose errno is in _INFRA_ERRNOS."""
+    return isinstance(exc, OSError) and exc.errno in _INFRA_ERRNOS
+
+
+class VerifyInfraError(Exception):
+    """A transient infrastructure failure detected during the verify phase.
+
+    Raised when an infra-class OSError (ENOSPC, EDQUOT, EROFS, EIO, EMFILE,
+    ENFILE) is encountered at a well-known verify call site.  Unlike a bare
+    OSError, this typed exception:
+
+    * Is NOT an OSError subclass — caught distinctly before the broad
+      ``except Exception`` handler in workflow.run().
+    * Carries ``phase`` (which verify sub-step failed) and ``errno`` (the
+      original errno value) for structured logging and metadata stamping.
+
+    Modelled on WarmLaneDiskPressure (git_ops.py) but intentionally does NOT
+    map to WorkflowOutcome.REQUEUED; it routes to the bounded in-process retry
+    / infra_hold path instead.
+    """
+
+    def __init__(self, phase: str, errno: int | None, message: str = '') -> None:
+        self.phase = phase
+        self.errno = errno
+        msg = message or f'infra OSError during verify phase={phase!r} errno={errno}'
+        super().__init__(msg)
 
 
 def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str | None:
