@@ -341,3 +341,64 @@ class TestFrozenAndUnfrozenAccessors:
         fp = set(worker.frozen_prefix())
         us = set(worker.unfrozen_suffix())
         assert fp & us == set(), f'frozen ∩ unfrozen should be empty, got {fp & us}'
+
+
+# ── step-03 RED: frozen_prefix_tip(main_sha) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestFrozenPrefixTip:
+    """frozen_prefix_tip(main_sha) returns the newest frozen merge_commit.
+
+    RED until step-04 GREEN adds _newest_frozen_commit + frozen_prefix_tip.
+    """
+
+    async def test_empty_inflight_returns_main_sha(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Empty frozen prefix → frozen_prefix_tip returns main_sha unchanged."""
+        worker = _make_worker(git_ops)
+        assert worker.frozen_prefix_tip('mainsha0') == 'mainsha0'
+
+    async def test_single_verifying_entry_returns_merge_commit(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """One verifying inflight entry → tip is its merge_commit."""
+        worker = _make_worker(git_ops)
+        _, item = _make_fake_item('t-x', base_sha='main0', merge_commit='commitX',
+                                  config=config, git_repo=git_repo)
+        entry = _make_inflight_entry(item, verifying=True)
+        worker._inflight.append(entry)
+        assert worker.frozen_prefix_tip('main0') == 'commitX'
+
+    async def test_two_stacked_entries_returns_newest(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Two stacked entries: tip is the second (newest/top-of-stack) merge_commit."""
+        worker = _make_worker(git_ops)
+        _, item_d = _make_fake_item('t-d', base_sha='main0', merge_commit='commitX',
+                                    config=config, git_repo=git_repo)
+        _, item_e = _make_fake_item('t-e', base_sha='commitX', merge_commit='commitY',
+                                    config=config, git_repo=git_repo)
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+
+        # Deque order: D (left/head) → E (right/tail); tip is E (last/newest)
+        assert worker.frozen_prefix_tip('main0') == 'commitY'
+
+    async def test_passthrough_entry_skipped(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Entry with no merge_commit (passthrough/conflict) skipped in tip walk."""
+        worker = _make_worker(git_ops)
+        # A verifying entry with a real commit
+        _, item_v = _make_fake_item('t-v', base_sha='main0', merge_commit='commitV',
+                                    config=config, git_repo=git_repo)
+        # A passthrough entry (merge_result=None → no merge_commit)
+        _, item_p = _make_fake_item('t-p', base_sha='main0', merge_commit=None,
+                                    config=config, git_repo=git_repo)
+        worker._inflight.append(_make_inflight_entry(item_v, verifying=True))
+        worker._inflight.append(_make_inflight_entry(item_p, verifying=False))
+
+        # The passthrough is not frozen; tip is still the verifying entry's commit
+        assert worker.frozen_prefix_tip('main0') == 'commitV'
