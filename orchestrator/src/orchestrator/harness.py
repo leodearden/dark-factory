@@ -5775,6 +5775,24 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
                 return
 
+            # Restart path: clear deterministic gate stamps so the re-dispatched
+            # runner re-fires the gate from scratch.  resume preserves stamps so
+            # the runner's idempotency drives the gate to done instead (I2/B4/B5).
+            # park/abandon/close_only are left untouched — stamps preserved.
+            if action == 'restart':
+                task = await self.scheduler.get_task(task_id)
+                if task is not None and Scheduler.is_deterministic(task):
+                    await self.scheduler.update_task(
+                        task_id,
+                        {'gate_escalated_at': None, 'before_done_ran_at': None},
+                        metadata_mode='merge',
+                    )
+                    logger.info(
+                        'action-teardown restart: cleared deterministic gate stamps '
+                        'for task %s so re-dispatch re-fires the gate',
+                        task_id,
+                    )
+
             # Kill sequence for a live workflow (C3.1, D9).
             # Status write is already done above — kill strictly follows.
             if self.is_workflow_active(task_id):
