@@ -268,6 +268,22 @@ class DeterministicRunner:
         # Self-target detection + detached systemd-run is deferred to ε.
         if before_done is not None:
             target_unit: str = before_done.get('target_unit', '')
+            before_done_ran_at = metadata.get('before_done_ran_at')
+
+            # I1 once-only idempotency guard (parallel to β's gate_escalated_at branch):
+            # if the deploy already ran, check whether its escalation is still open.
+            if before_done_ran_at:
+                pending = self.escalation_queue.get_by_task(task_id, status='pending')
+                if pending:
+                    # Pending infra_issue → quiescent BLOCKED (B7 reaper / I1 no-rerun)
+                    logger.debug(
+                        'DeterministicRunner: task %s before_done already ran, '
+                        'pending escalation — quiescent BLOCKED (B7/I1)',
+                        task_id,
+                    )
+                    return WorkflowOutcome.BLOCKED
+                # No pending escalation → resume-after-resolution path (step-10)
+                # Fall through to set done without re-running the deploy (step-10 adds this).
 
             # Stamp before_done_ran_at FIRST (crash-safe I1: stamp-before-run means a
             # crash mid-deploy leaves the stamp set → re-dispatch does NOT re-run).
