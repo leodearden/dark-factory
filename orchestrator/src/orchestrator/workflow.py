@@ -1911,6 +1911,50 @@ class TaskWorkflow:
             self._last_block_detail = str(e)
             return WorkflowOutcome.REQUEUED
 
+        except VerifyInfraError as e:
+            # Infra-typed exception from the verify path that escaped the
+            # in-process retry wrapper (e.g. raised outside
+            # _run_scoped_verification_with_infra_retry).  Route to
+            # infra_issue with escalate_to_human rather than the generic
+            # 'Workflow error:' task_failure block below.
+            logger.warning(
+                'Task %s: VerifyInfraError escaped run() (phase=%r errno=%r) '
+                '— routing to infra_issue',
+                self.task_id, e.phase, e.errno,
+            )
+            reason = (
+                f'Verify infra failure (phase={e.phase!r} errno={e.errno}): {e}'
+            )
+            return await self._mark_blocked(
+                reason,
+                category='infra_issue',
+                escalate_to_human=True,
+            )
+
+        except OSError as e:
+            # Bare infra-class OSError (ENOSPC/EDQUOT/EROFS/EIO/EMFILE/ENFILE)
+            # escaping the verify path outside the VerifyInfraError wrapper
+            # (e.g. a log or marker write).  Route to infra_issue.
+            # Non-infra OSErrors (EACCES, ENOENT, etc.) fall through to the
+            # same generic handler as except Exception below — Python's
+            # exception model does not allow re-raise into a sibling except
+            # clause, so we duplicate the generic path here.
+            if _is_infra_oserror(e):
+                logger.warning(
+                    'Task %s: bare infra OSError escaped run() (errno=%r) '
+                    '— routing to infra_issue',
+                    self.task_id, e.errno,
+                )
+                reason = f'Verify infra OSError (errno={e.errno}): {e}'
+                return await self._mark_blocked(
+                    reason,
+                    category='infra_issue',
+                    escalate_to_human=True,
+                )
+            # Non-infra OSError — treat the same as the broad except below.
+            logger.exception(f'Task {self.task_id} workflow error: {e}')
+            return await self._mark_blocked(f'Workflow error: {e}')
+
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
             return await self._mark_blocked(f'Workflow error: {e}')
