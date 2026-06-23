@@ -11,7 +11,6 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
-    ConflictProbe,
     GitOps,
     ScrubOutcome,
     ScrubResult,
