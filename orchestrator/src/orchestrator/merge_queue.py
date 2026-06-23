@@ -5023,6 +5023,10 @@ class MergeMetrics:
 
     * **retries_per_landing** — (merge re-attempts) / (clean landings).
       Returns ``None`` while ``landings == 0`` to avoid division by zero.
+      A "retry" is any CAS round that did not immediately advance main:
+      ``cas_failed`` (transient atomic-swap loss) and
+      ``rebased_pending_reverify`` (main advanced, fresh re-verify needed)
+      both count.  See ``_note_merge_retry`` for the rationale.
     * **drift_at_detection** — how far main advanced (in landed-merge units)
       between when a request was based and when its conflict was caught.
       Stored as a bounded ring of samples; summary exposes count/last/mean/max.
@@ -6159,6 +6163,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Called at the ``result == 'rebased_pending_reverify'`` branch and at
         the ``result == 'cas_failed'`` retry path.
+
+        **Retry definition**: ``retries_per_landing`` counts every incremental
+        CAS or gate round: both ``cas_failed`` (transient atomic-swap loss) and
+        ``rebased_pending_reverify`` (main advanced under the request; needs a
+        fresh re-verify against the new tip).  Both represent additional merge
+        work driven by contention and map naturally to the operator's question
+        "how often does this queue re-attempt merges?"  If you need to
+        distinguish rebase-rebounded reverifies from pure CAS races, use
+        ``retries_total`` (the raw counter) alongside the two
+        :attr:`MergeMetrics._gate_retries`/:attr:`_cas_retries` per-task dicts
+        already maintained by the worker.
         """
         self._merge_metrics.record_retry()
 
@@ -7547,6 +7562,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         held_spec_permit = False
                     spec_base = None
                     self._inflight_req = None
+                    # ι=1894 amend: drop stashed drift base — request retired without
+                    # landing or conflict detection, so it would otherwise leak forever.
+                    self._drift_base.pop(req.request_id, None)
                     continue
                 if self._event_store is not None:
                     self._event_store.emit(
@@ -9277,7 +9295,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return True
 
                 if result == 'rebased_pending_reverify':
-                    # ι=1894: count this as a merge retry
+                    # ι=1894: count this as a merge retry — main advanced under the
+                    # request, so a fresh re-verify is required.  Both cas_failed and
+                    # rebased_pending_reverify are included in retries_per_landing (see
+                    # _note_merge_retry docstring for the rationale).
                     self._note_merge_retry()
                     rebased_sha = getattr(self._git_ops, '_last_advanced_sha', None)
                     rebased_from = getattr(self._git_ops, '_rebased_from', None)
@@ -9436,6 +9457,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._n_failed = _n_failed_val if _n_failed_val is not None else not advanced
             # Clear finalize-head observability window — covers all return/exception paths.
             self._finalizing_head = None
+            # ι=1894 amend: defensive _drift_base cleanup — idempotent pop that covers
+            # all terminal exit paths (blocked/error/halt/wip_halted/cas-exhausted/
+            # rebased-gate-failure).  _note_merge_landing and _note_conflict_detected
+            # both use pop(key, None), so re-popping an already-cleared entry is a no-op.
+            self._drift_base.pop(req.request_id, None)
 
     async def _dispatch_item(
         self,
