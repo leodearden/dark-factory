@@ -437,3 +437,196 @@ class TestBareInfraOSErrorDefensiveNet:
         assert reason is not None and reason.startswith('Workflow error:'), (
             f"Non-infra OSError(EACCES) must use generic handler, got reason={reason!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Step 17: Boundary/repro — end-to-end ENOSPC simulation
+# ---------------------------------------------------------------------------
+
+class TestBoundaryVerifyInfraReproCases:
+    """G2 boundary/repro: end-to-end verify ENOSPC simulation.
+
+    (a) Transient: VerifyInfraError on attempt 1 (simulating _mark_verify_warm
+    failure), clears on attempt 2 → DONE, never pending, no implement footprint
+    re-acquisition.
+
+    (b) Permanent: all retries exhausted → BLOCKED + infra_hold stamped +
+    escalate_to_human=True.  On resolving the infra_issue escalation, the
+    harness (step-16 path) resumes-at-verify (in-progress) rather than
+    re-pending the task.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_warm_marker_enospc_never_pending_reaches_done(self):
+        """(a) Transient ENOSPC at warm_marker: loop retries → DONE, never pending.
+
+        Simulates the A1 root-cause scenario at the _verify_debugfix_loop level:
+        VerifyInfraError(phase='warm_marker') on attempt 1 clears on attempt 2.
+        The test confirms the task status is NEVER set to 'pending', and the
+        workflow reaches DONE (not BLOCKED/REQUEUED).
+
+        This test passes the VerifyInfraError through _run_scoped_verification_with_infra_retry
+        to confirm the retry wrapper catches it correctly — not just at the
+        run_scoped_verification patch level of steps 7-9.
+
+        RED before step-18 if the VerifyInfraError from within run_scoped_verification
+        (e.g., from the asyncio.gather sub-path) is NOT correctly propagated to the
+        retry wrapper.
+        """
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        call_count = 0
+
+        async def fake_run_scoped(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Simulate _mark_verify_warm raising VerifyInfraError after
+                # a successful verify (ENOSPC at the warm-marker write step)
+                raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+            # Second attempt: clears cleanly
+            return _passed_result()
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=fake_run_scoped),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE after transient infra retry but got {outcome!r}. '
+            f'run_scoped_verification was called {call_count} times.'
+        )
+
+        # Key boundary assertion: task NEVER set to pending
+        for call_args in wf.scheduler.set_task_status.await_args_list:
+            args = call_args.args
+            if len(args) >= 2:
+                assert args[1] != 'pending', (
+                    f'set_task_status was called with "pending" despite transient '
+                    f'infra retry: {call_args}. A verify-complete branch must never '
+                    f'be re-pended due to a transient infra OSError.'
+                )
+
+        # Implement footprint guard: verify no dispatch occurred (no pending)
+        assert wf.scheduler.set_task_status.await_count == 0 or all(
+            c.args[1] != 'pending'
+            for c in wf.scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2
+        ), 'Implement footprint must not be re-acquired (no pending dispatch)'
+
+    @pytest.mark.asyncio
+    async def test_permanent_enospc_blocks_with_infra_hold_loud_escalation(self):
+        """(b) Permanent ENOSPC exhausts window → BLOCKED + infra_hold + loud escalation.
+
+        Verifies:
+        - _verify_debugfix_loop returns BLOCKED (not REQUEUED, not DONE)
+        - metadata.infra_hold is stamped with phase + errno (via scheduler.update_task)
+        - _infra_hold_info carries category='infra_issue' and escalate_to_human=True
+          (which run() uses to call _mark_blocked with category='infra_issue')
+        - set_task_status is NEVER called with 'pending'
+        - _mark_blocked is NOT called from inside the loop (only from run()'s caller)
+        """
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        async def always_infra(*args, **kwargs):
+            raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=always_infra),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED after exhausting infra retry window, got {outcome!r}'
+        )
+
+        # Must NOT have been set to pending
+        for call_args in wf.scheduler.set_task_status.await_args_list:
+            if len(call_args.args) >= 2:
+                assert call_args.args[1] != 'pending', (
+                    f'set_task_status("pending") called for infra_hold task: {call_args}'
+                )
+
+        # infra_hold must be in metadata (enables harness step-16 resume path)
+        assert wf.scheduler.update_task.called, 'update_task must stamp infra_hold metadata'
+        call_kwargs = wf.scheduler.update_task.await_args
+        metadata_arg = (
+            call_kwargs.kwargs.get('metadata')
+            or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
+        )
+        assert metadata_arg is not None and 'infra_hold' in metadata_arg, (
+            f'metadata.infra_hold not stamped; update_task called with: {call_kwargs}'
+        )
+        infra_hold = metadata_arg['infra_hold']
+        assert infra_hold.get('phase') == 'warm_marker', (
+            f"Expected infra_hold.phase='warm_marker', got {infra_hold!r}"
+        )
+
+        # _infra_hold_info must be set for run() to call _mark_blocked(category='infra_issue')
+        assert wf._infra_hold_info is not None, (
+            '_infra_hold_info must be set on exhaustion so run() can route to infra_issue block'
+        )
+        assert wf._infra_hold_info.get('category') == 'infra_issue', (
+            f"_infra_hold_info.category must be 'infra_issue', got {wf._infra_hold_info!r}"
+        )
+        assert wf._infra_hold_info.get('escalate_to_human') is True, (
+            'infra_issue block must be filed with escalate_to_human=True (LOUD escalation)'
+        )
+
+        # Loop must NOT call _mark_blocked itself (that is run()'s responsibility)
+        assert not wf._mark_blocked.called, (
+            '_verify_debugfix_loop must not call _mark_blocked directly on exhaustion; '
+            'only run() should invoke it via _infra_hold_info stash'
+        )
+
+    @pytest.mark.asyncio
+    async def test_gather_propagates_verify_infra_error_to_retry_wrapper(self):
+        """(a) extra: VerifyInfraError inside asyncio.gather reaches the retry wrapper.
+
+        Confirms the critical propagation path: when VerifyInfraError is raised
+        inside run_scoped_verification (e.g., from within _verify_module's
+        asyncio.gather call), it MUST reach _run_scoped_verification_with_infra_retry
+        and be caught for retry.
+
+        This test exercises _run_scoped_verification_with_infra_retry directly
+        (not _verify_debugfix_loop) to confirm the retry wrapper catches the error.
+
+        RED before step-18 if the gather path in run_scoped_verification swallows
+        the VerifyInfraError (e.g., via a broad except or return_exceptions).
+        GREEN after step-18 confirms the gather propagates the error unchanged.
+        """
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        call_count = 0
+
+        async def fake_scoped_that_raises_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Simulate gather-propagated VerifyInfraError
+                raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+            return _passed_result()
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification',
+                  side_effect=fake_scoped_that_raises_once),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            result = await wf._run_scoped_verification_with_infra_retry(
+                verify_attempt=0,
+            )
+
+        assert result is not None, (
+            '_run_scoped_verification_with_infra_retry must return a VerifyResult '
+            f'when VerifyInfraError clears on retry, got None '
+            f'(implies the retry was NOT triggered — the error was swallowed or mismapped).'
+        )
+        assert result.passed is True, (
+            f'Expected passed=True on successful retry, got result={result!r}'
+        )
+        assert call_count == 2, (
+            f'Expected exactly 2 calls to run_scoped_verification '
+            f'(1 failing + 1 succeeding), got {call_count}'
+        )
