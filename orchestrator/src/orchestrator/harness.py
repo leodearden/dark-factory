@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, TypeGuard
+from typing import IO, TYPE_CHECKING, Any, TypeGuard, cast
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
@@ -3176,7 +3176,13 @@ Output JSON matching the schema. Every task must appear in the output.
         if self._merge_worker is None:
             return
 
-        snapshot = self._merge_worker.snapshot()
+        # Runtime worker is always SpeculativeMergeWorker (the only type
+        # instantiated in _start_merge_worker); snapshot() lives on it, not on
+        # the legacy MergeWorker arm of the union annotation.  cast with a
+        # string forward-ref keeps this runtime-safe (the import is
+        # TYPE_CHECKING-only) while satisfying pyright.
+        worker = cast('SpeculativeMergeWorker', self._merge_worker)
+        snapshot = worker.snapshot()
         metrics = snapshot.get('metrics')
         if metrics is None:
             return
