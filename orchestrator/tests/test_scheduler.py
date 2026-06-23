@@ -781,22 +781,32 @@ class TestAcquireNextNoDuplicates:
 
     @pytest.mark.asyncio
     async def test_acquire_next_lock_conflict_plus_dispatch_guard(
-        self, scheduler: Scheduler
+        self
     ):
-        """Two tasks on the same module: dispatch A, B blocked; release A, B dispatches."""
+        """Two tasks on the same module: dispatch A, B blocked; release A, B dispatches.
+
+        Updated for α strip: the fixture previously used 'backend' (an
+        extension-less directory entry) which is now stripped by the α filter,
+        making both tasks fall through to distinct task-<id> fallbacks that
+        don't conflict with each other.  Replaced with co-located real files
+        that normalize to the same depth-2 module ('backend/src') so the
+        lock conflict is preserved.  lock_depth=2 is set explicitly because
+        the default may be overridden by a config.yaml or env var in this env.
+        """
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1, lock_depth=2))
         task_a = {
             'id': 'A',
             'title': 'Task A',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['backend']},
+            'metadata': {'files': ['backend/src/app.py']},
         }
         task_b = {
             'id': 'B',
             'title': 'Task B',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['backend']},
+            'metadata': {'files': ['backend/src/routes.py']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
 
@@ -1099,10 +1109,17 @@ class TestGetModulesJsonStringMetadata:
     def test_get_modules_extracts_modules_from_dict_metadata(
         self, scheduler: Scheduler
     ):
-        """_get_modules returns normalized module list from dict metadata."""
+        """_get_modules returns normalized module list from real file paths in dict metadata.
+
+        Updated for α strip: the fixture previously used extension-less paths
+        ('backend', 'server') which are now classified as directory entries and
+        stripped, falling through to the task-<id> fallback.  The test is
+        updated to use real file paths so it still exercises the
+        files-→-modules derivation path.
+        """
         task = {
             'id': '5',
-            'metadata': {'files': ['backend', 'server']},
+            'metadata': {'files': ['backend/app.py', 'server/main.py']},
         }
         result = scheduler._get_modules(task)
         assert result != ['task-5'], (
