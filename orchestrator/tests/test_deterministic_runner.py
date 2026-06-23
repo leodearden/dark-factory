@@ -1891,3 +1891,237 @@ class TestSelfRestartSchedulingFailure:
             if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
         ]
         assert stamp_calls, 'update_task must stamp before_done_ran_at even on scheduling failure (I1)'
+
+
+# ---------------------------------------------------------------------------
+# Step-7 (ε): _default_schedule_detached_restart argv shape / OnFailure wiring
+# (RED until step-8 implements the real systemd-run spawn)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDefaultScheduleDetachedRestart:
+    """_default_schedule_detached_restart produces correct systemd-run argv and
+    OnFailure wiring to the δ escalation-submit CLI."""
+
+    def _make_mock_proc(self, returncode: int = 0) -> object:
+        """Return a mock proc with communicate() → (b'', b'') and returncode."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+        mock_proc.returncode = returncode
+        return mock_proc
+
+    async def test_argv_contains_systemd_run_user(self, tmp_path: Path):
+        """systemd-run --user must appear in the spawn argv."""
+        from unittest.mock import patch
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert 'systemd-run' in all_argv, f'systemd-run must appear in argv: {all_argv!r}'
+        assert '--user' in all_argv, f'--user must appear in argv: {all_argv!r}'
+
+    async def test_argv_contains_on_active_and_transient_unit(self, tmp_path: Path):
+        """--on-active and the transient unit name must appear in the spawn argv."""
+        from unittest.mock import patch
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--on-active' in all_argv or 'on-active=60' in all_argv, (
+            f'--on-active must appear in argv: {all_argv!r}'
+        )
+        assert 'orch-redeploy-restart-900.service' in all_argv, (
+            f'transient unit name must appear in argv: {all_argv!r}'
+        )
+
+    async def test_argv_contains_collect_and_payload_script(self, tmp_path: Path):
+        """--collect and the payload script path must appear in the spawn argv."""
+        from unittest.mock import patch
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--collect' in all_argv, f'--collect must appear in argv: {all_argv!r}'
+        assert '/usr/local/bin/restart-deploy.sh' in all_argv, (
+            f'payload script must appear in argv: {all_argv!r}'
+        )
+
+    async def test_argv_contains_on_failure_wiring(self, tmp_path: Path):
+        """OnFailure wiring token must appear in the spawn argv (--on-failure or OnFailure=)."""
+        from unittest.mock import patch
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert 'OnFailure' in all_argv or '--on-failure' in all_argv, (
+            f'OnFailure wiring must appear in argv: {all_argv!r}'
+        )
+
+    async def test_argv_contains_escalation_submit_cli(self, tmp_path: Path):
+        """escalation submit CLI must appear in the spawn argv for OnFailure handling."""
+        from unittest.mock import patch
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert 'escalation' in all_argv, f"'escalation' must appear in argv: {all_argv!r}"
+        assert 'submit' in all_argv, f"'submit' must appear in argv: {all_argv!r}"
+
+    async def test_argv_contains_queue_dir(self, tmp_path: Path):
+        """--queue-dir with the EscalationQueue.queue_dir path must appear in argv."""
+        from unittest.mock import patch
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--queue-dir' in all_argv, f'--queue-dir must appear in argv: {all_argv!r}'
+        assert str(queue.queue_dir) in all_argv, (
+            f'queue_dir path {queue.queue_dir!r} must appear in argv: {all_argv!r}'
+        )
+
+    async def test_argv_contains_task_id_severity_category(self, tmp_path: Path):
+        """--task, --severity critical, --category infra_issue must appear in escalation argv."""
+        from unittest.mock import patch
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-900.service',
+                on_active_secs=60,
+                task_id='900',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert '--task' in all_argv, f'--task must appear in argv: {all_argv!r}'
+        assert '900' in all_argv, f"task id '900' must appear in argv: {all_argv!r}"
+        assert '--severity' in all_argv, f'--severity must appear in argv: {all_argv!r}'
+        assert 'critical' in all_argv, f"'critical' must appear in argv: {all_argv!r}"
+        assert '--category' in all_argv, f'--category must appear in argv: {all_argv!r}'
+        assert 'infra_issue' in all_argv, f"'infra_issue' must appear in argv: {all_argv!r}"

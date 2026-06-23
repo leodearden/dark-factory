@@ -133,11 +133,96 @@ class DeterministicRunner:
     ) -> tuple[int, str]:
         """Schedule a detached systemd-run transient unit for a self-restart.
 
-        Stub implementation — full argv construction (OnFailure wiring to δ CLI)
-        is added in step-8.  Returns (0, '') to indicate scheduling success.
+        Uses two systemd-run registrations:
+        1. A companion failure-handler transient unit that runs δ's escalation-
+           submit CLI if the restart fires and fails.
+        2. The main restart transient unit (--on-active) wired with
+           ``--property=OnFailure=<failure-unit>`` so systemd routes fire-time
+           failures to the handler.
+
+        systemd-run returns immediately after registering the transient unit;
+        the orchestrator is NEVER blocked or killed — the payload fires later
+        under the user systemd manager.
+
+        Returns:
+            (rc, tail) — rc=0 on successful registration; rc≠0 if either
+            registration fails (tail carries the error output).
         """
-        # Step-8 will implement the real systemd-run spawn; for now return success.
-        return 0, ''
+        import sys
+
+        queue_dir = str(self.escalation_queue.queue_dir)
+        target_unit = before_done.get('target_unit', 'unknown')
+        script = before_done['script']
+        args = before_done.get('args') or []
+
+        # Derive companion failure-handler unit name from the transient unit name
+        if transient_unit.endswith('.service'):
+            failure_unit = transient_unit[:-len('.service')] + '-failure.service'
+        else:
+            failure_unit = transient_unit + '-failure.service'
+
+        esc_summary = summary or (
+            f'Self-restart fire-time failure: {target_unit}'
+        )
+
+        # ── 1. Register the OnFailure handler unit ───────────────────────────
+        # Runs δ's escalation-submit CLI if the restart fails at fire time.
+        # sys.executable → python -m escalation submit (robust against PATH in
+        # the detached systemd user environment).
+        failure_argv = [
+            'systemd-run', '--user',
+            f'--unit={failure_unit}',
+            '--remain-after-exit',
+            '--collect',
+            sys.executable, '-m', 'escalation', 'submit',
+            '--queue-dir', queue_dir,
+            '--task', task_id,
+            '--severity', 'critical',
+            '--category', 'infra_issue',
+            '--summary', esc_summary[:200],
+        ]
+        proc1 = await asyncio.create_subprocess_exec(
+            *failure_argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout1, _ = await proc1.communicate()
+        rc1 = proc1.returncode or 0
+        if rc1 != 0:
+            tail1 = (stdout1 or b'').decode(errors='replace')[-2000:]
+            logger.warning(
+                'DeterministicRunner: failed to register OnFailure handler unit %s '
+                '(rc=%d) for task %s',
+                failure_unit, rc1, task_id,
+            )
+            return rc1, tail1
+
+        # ── 2. Register the main restart transient unit ──────────────────────
+        # --on-active=<N>: fires N seconds after this run() returns (manifest §53).
+        # --property=OnFailure=: wires δ's failure-handler unit.
+        main_argv = [
+            'systemd-run', '--user',
+            f'--on-active={on_active_secs}',
+            f'--unit={transient_unit}',
+            '--collect',
+            f'--property=OnFailure={failure_unit}',
+            script, *args,
+        ]
+        proc2 = await asyncio.create_subprocess_exec(
+            *main_argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout2, _ = await proc2.communicate()
+        rc2 = proc2.returncode or 0
+        tail2 = (stdout2 or b'').decode(errors='replace')[-2000:]
+        if rc2 != 0:
+            logger.warning(
+                'DeterministicRunner: failed to register restart transient unit %s '
+                '(rc=%d) for task %s',
+                transient_unit, rc2, task_id,
+            )
+        return rc2, tail2
 
     async def _default_inspect_unit(self, unit: str) -> dict:
         """Query systemctl for unit state fields needed for fresh-PID verify.
