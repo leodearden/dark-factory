@@ -1479,3 +1479,174 @@ class TestBeforeDoneVerifiedResume:
         provenance = done_calls[0].kwargs.get('done_provenance', {})
         assert provenance.get('kind') == 'deterministic-deploy'
         assert provenance.get('pid') == 200
+
+
+# ---------------------------------------------------------------------------
+# Step-1 (ε): B8 core — self-target deploy: detached restart, done=scheduled
+# (RED until step-2 adds own_unit_resolver + restart_scheduler seams)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartScheduled:
+    """DeterministicRunner — self-target deploy: scheduling deferred restart, done=scheduled (B8)."""
+
+    async def test_b8_outcome_is_done(self, tmp_path: Path):
+        """Self-target deploy schedules restart and returns DONE immediately (B8)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+    async def test_b8_restart_scheduler_called_once(self, tmp_path: Path):
+        """restart_scheduler awaited exactly once (the detached systemd-run call)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        restart_scheduler.assert_awaited_once()
+
+    async def test_b8_script_runner_not_called(self, tmp_path: Path):
+        """script_runner must NOT be awaited on self-target path (no blocking cross-unit deploy)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_b8_unit_inspector_not_called(self, tmp_path: Path):
+        """unit_inspector must NOT be awaited on self-target path (no baseline/verify)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        unit_inspector.assert_not_awaited()
+
+    async def test_b8_stamps_before_done_ran_at(self, tmp_path: Path):
+        """update_task must stamp before_done_ran_at with a truthy value (I1 crash-safe)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must be called with a truthy before_done_ran_at stamp'
+
+    async def test_b8_set_task_status_done_with_scheduled_kind(self, tmp_path: Path):
+        """set_task_status awaited with ('850', 'done', done_provenance.kind='deterministic-deploy-scheduled')."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='850', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[0] == '850'
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance is not None, 'done_provenance must be passed as a kwarg'
+        assert provenance['kind'] == 'deterministic-deploy-scheduled'

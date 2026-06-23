@@ -99,15 +99,45 @@ class DeterministicRunner:
         escalation_queue: EscalationQueue,
         unit_inspector=None,
         script_runner=None,
+        own_unit_resolver=None,
+        restart_scheduler=None,
     ):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
         self._unit_inspector = unit_inspector
         self._script_runner = script_runner
+        self._own_unit_resolver = own_unit_resolver
+        self._restart_scheduler = restart_scheduler
 
     # ------------------------------------------------------------------
     # Default injectable seam implementations
     # ------------------------------------------------------------------
+
+    def _default_resolve_own_unit(self) -> str:
+        """Return the orchestrator's own systemd unit name from ORCH_UNIT env var.
+
+        Returns an empty string if ORCH_UNIT is not set (fail-open to cross-unit
+        path so existing CI tests with ORCH_UNIT unset stay on the cross-unit path).
+        Operators set ORCH_UNIT in the [Service] Environment of the orchestrator unit.
+        """
+        return os.environ.get('ORCH_UNIT', '')
+
+    async def _default_schedule_detached_restart(
+        self,
+        before_done: dict,
+        *,
+        transient_unit: str,
+        on_active_secs: int,
+        task_id: str,
+        summary: str = '',
+    ) -> tuple[int, str]:
+        """Schedule a detached systemd-run transient unit for a self-restart.
+
+        Stub implementation — full argv construction (OnFailure wiring to δ CLI)
+        is added in step-8.  Returns (0, '') to indicate scheduling success.
+        """
+        # Step-8 will implement the real systemd-run spawn; for now return success.
+        return 0, ''
 
     async def _default_inspect_unit(self, unit: str) -> dict:
         """Query systemctl for unit state fields needed for fresh-PID verify.
@@ -402,6 +432,8 @@ class DeterministicRunner:
 
             # Stamp before_done_ran_at FIRST (crash-safe I1: stamp-before-run means a
             # crash mid-deploy leaves the stamp set → re-dispatch does NOT re-run).
+            # This stamp is SHARED for both self-target and cross-unit paths so I1
+            # holds for both (ε design decision 5).
             now_iso = datetime.now(UTC).isoformat()
             await self.scheduler.update_task(
                 task_id,
@@ -409,6 +441,65 @@ class DeterministicRunner:
                 metadata_mode='merge',
             )
 
+            # ── ε: self-target detection ─────────────────────────────────────
+            # If target_unit IS the orchestrator's own unit, running the blocking
+            # cross-unit deploy would kill this runner mid-execution (self-kill risk).
+            # Instead, schedule a detached transient unit via systemd-run so the
+            # restart fires AFTER run() returns, and set the task done immediately
+            # with kind='deterministic-deploy-scheduled' (done = scheduled, not
+            # verified).  See PRD §3, §4 decisions 8/9.
+            own_unit = (self._own_unit_resolver or self._default_resolve_own_unit)()
+            self_target = bool(own_unit) and (target_unit == own_unit)
+            if self_target:
+                transient_unit = f'orch-redeploy-restart-{task_id}.service'
+                on_active_secs = int(before_done.get('on_active_delay_secs', 60))
+                restart_fn = self._restart_scheduler or self._default_schedule_detached_restart
+                rc, tail = await restart_fn(
+                    before_done,
+                    transient_unit=transient_unit,
+                    on_active_secs=on_active_secs,
+                    task_id=task_id,
+                    summary=f'Self-restart scheduling failed: {target_unit}',
+                )
+                if rc != 0:
+                    detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Transient unit: {transient_unit}',
+                        f'systemd-run exit code: rc={rc}',
+                        f'Output:\n{tail}',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Self-restart scheduling failed: {target_unit}',
+                        detail=detail,
+                    )
+                if not always_escalates:
+                    logger.info(
+                        'DeterministicRunner: task %s self-restart scheduled — '
+                        'transient_unit=%s on_active_secs=%d — setting done',
+                        task_id, transient_unit, on_active_secs,
+                    )
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance={
+                            'kind': 'deterministic-deploy-scheduled',
+                            'unit': target_unit,
+                            'transient_unit': transient_unit,
+                            'fire_delay_secs': on_active_secs,
+                        },
+                    )
+                    return WorkflowOutcome.DONE
+                # always_escalates=True (act-then-ask, non-exemplar): fall through
+                # to the gate below (mirrors γ line 495 behaviour).
+                logger.info(
+                    'DeterministicRunner: task %s self-restart scheduled with '
+                    'always_escalates=True — falling through to gate',
+                    task_id,
+                )
+
+            # ── end ε self-target branch ─────────────────────────────────────
             # Capture baseline unit state before the deploy fires
             inspect_fn = self._unit_inspector or self._default_inspect_unit
             baseline = await inspect_fn(target_unit)
