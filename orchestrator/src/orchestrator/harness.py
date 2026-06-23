@@ -384,7 +384,38 @@ def build_train_callback_factory(scheduler: Any) -> TrainCallbackFactory:
                 return
             await scheduler.mark_done(mid, kind='merged', sha=sha, note=f'train {train_id}')
 
-        return TrainCallbacks(status_check=status_check, mark_member_done=mark_member_done)
+        async def redrive_member(mid: str, found_on_main: bool, sha: str | None) -> None:
+            # Existence check (mirrors mark_member_done): non-task members
+            # (absent from the scheduler) are no-op'd without raising.
+            # status_check synthesises 'merge-deferred' for them, so the worker
+            # would otherwise attempt to re-drive a non-task member spuriously.
+            statuses, err = await scheduler.get_statuses([mid])
+            if err is None and mid not in statuses:
+                logger.info(
+                    'train %s: member %s has no scheduler task — redrive_member no-op',
+                    train_id, mid,
+                )
+                return
+            if found_on_main:
+                # Double-landing guard: a partner's merge already brought this
+                # branch into main, so we mark it done directly.
+                await scheduler.mark_done(
+                    mid,
+                    kind='found_on_main',
+                    sha=sha,
+                    note=f'coalesce-derail re-drive: branch already on main (train {train_id})',
+                )
+            else:
+                # Flip to pending so the scheduler re-dispatches a fresh solo
+                # merge workflow that will own the merge-deferred→done transition.
+                await scheduler.set_task_status(mid, 'pending')
+                scheduler.clear_requeue_count(mid)
+
+        return TrainCallbacks(
+            status_check=status_check,
+            mark_member_done=mark_member_done,
+            redrive_member=redrive_member,
+        )
 
     return factory
 

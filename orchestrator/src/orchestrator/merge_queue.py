@@ -3438,7 +3438,7 @@ class MergeRequest:
 class TrainCallbacks:
     """Scheduler-backed callbacks for a single train, built in the harness.
 
-    Holds two async callables captured over a live scheduler + train_id so
+    Holds async callables captured over a live scheduler + train_id so
     the merge worker (a pure git engine with no scheduler import) can flip
     member tasks done after a train advance.  Built by
     :func:`harness.build_train_callback_factory` and consumed by task γ when
@@ -3450,6 +3450,14 @@ class TrainCallbacks:
 
     mark_member_done: Callable[[str, str], Awaitable[None]]
     """Async callback: mark a single member task done with the merge SHA."""
+
+    redrive_member: Callable[[str, bool, 'str | None'], Awaitable[None]] | None = None
+    """Async callback: re-drive an absorbed member that is still merge-deferred
+    after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
+    found_on_main=True → mark done with found_on_main provenance (double-landing
+    guard); False → flip to pending so the scheduler re-dispatches a solo merge.
+    None when the callback is not available (back-compat with existing callers
+    that build TrainCallbacks with only status_check/mark_member_done)."""
 
 
 # Type alias for the factory that produces per-train callbacks.
