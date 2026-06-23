@@ -105,10 +105,10 @@ def _make(
 def _passed_result() -> VerifyResult:
     return VerifyResult(
         passed=True,
-        failure_report_lines=[],
-        category=None,
-        cause_hint=None,
-        timed_out=False,
+        test_output='',
+        lint_output='',
+        type_output='',
+        summary='All checks passed',
     )
 
 
