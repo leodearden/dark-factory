@@ -363,22 +363,37 @@ class TestB2GateDepsOk:
         assert stamp is not None, 'gate_escalated_at must be stamped after first dispatch'
 
     async def test_no_worktree_or_branch_created(self, det_harness: Harness) -> None:
-        """No worktree/branch/agent is created — runner is built without git_ops (I4/B2)."""
+        """No worktree/branch/agent is created — runner is built without git_ops (I4/B2).
+
+        The structural guarantee is that _run_deterministic_slot passes ONLY
+        ``scheduler`` and ``escalation_queue`` to DeterministicRunner — there
+        is no ``git_ops`` kwarg, so worktree creation is impossible by
+        construction.
+
+        We make this observable by wrapping DeterministicRunner and capturing
+        the actual kwargs passed at construction time.  Asserting on call_count
+        of a MagicMock attribute (git_ops.create_worktree) would be tautological
+        because the harness git_ops mock is never reachable from inside
+        _run_deterministic_slot — the wrapper captures the REAL constructor
+        boundary instead.
+        """
         store: _StoreScheduler = det_harness.scheduler  # type: ignore[assignment]
-        task = _gate_task(task_id='gate-b2', title='Ship v2 gate')
+        task = _gate_task(task_id='gate-b2-wt', title='Ship v2 gate (wt check)')
         store.seed(task)
 
-        await _dispatch(det_harness, 'gate-b2')
+        # Patch DeterministicRunner at the harness module level so we can
+        # inspect the kwargs passed by _run_deterministic_slot.
+        with patch('orchestrator.harness.DeterministicRunner',
+                   wraps=DeterministicRunner) as MockRunner:
+            await _dispatch(det_harness, 'gate-b2-wt')
 
-        # git_ops is a MagicMock; the runner is constructed without git_ops
-        # so none of the worktree-creation methods should be called.
-        git_ops = det_harness.git_ops
-        for method_name in ('create_worktree', 'checkout', 'clone_worktree'):
-            mock_attr = getattr(git_ops, method_name, None)
-            if mock_attr is not None and hasattr(mock_attr, 'call_count'):
-                assert mock_attr.call_count == 0, (
-                    f'git_ops.{method_name} must not be called for a deterministic gate'
-                )
+        assert MockRunner.called, 'DeterministicRunner must be instantiated by _run_deterministic_slot'
+        call_kwargs = MockRunner.call_args.kwargs
+        assert 'git_ops' not in call_kwargs, (
+            'DeterministicRunner was constructed WITH a git_ops kwarg — '
+            '_run_deterministic_slot must not pass git_ops (structural no-branch proof, I4/B2). '
+            f'Got kwargs: {set(call_kwargs)!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +924,18 @@ class TestB6CrossUnitDeploy:
     Constructs the real DeterministicRunner directly with injected systemd seams
     (own_unit_resolver, unit_inspector, script_runner).  The only fake is the
     systemd edge — scheduler and EscalationQueue are real.
+
+    **Harness→deploy wiring gap (documented):**
+    The production harness path (_run_deterministic_slot, harness.py:3663)
+    instantiates DeterministicRunner with ONLY ``scheduler + escalation_queue``
+    — there is no seam-injection point for systemd callables (unit_inspector,
+    script_runner, own_unit_resolver, restart_scheduler).  Therefore a deploy
+    task dispatched through ``_run_slot`` would hit the real systemd defaults,
+    making harness-level deploy integration-tests impractical without adding an
+    injection hook to ``_run_deterministic_slot``.  That hook would require
+    editing ``harness.py`` (outside this task's locked scope) and is deferred.
+    B6–B8 instead construct the runner directly, which is the only deterministic
+    path for deploy rows.
     """
 
     def _setup(self, tmp_path: Path):
@@ -1368,10 +1395,16 @@ def _validate(task_kind: str, metadata: dict, project_root: str | None = None) -
     """Invoke α's deterministic_task_error validator.
 
     Tries in-process import first (succeeds in workspace-root venv).
-    Falls back to subprocess ``uv run --project fused-memory`` if
+    Falls back to ``uv run --project fused-memory`` subprocess if
     ModuleNotFoundError (e.g. orchestrator-only venv).
 
     Returns the error dict or None (valid).
+
+    Subprocess fallback notes:
+    - metadata is serialised as JSON and re-parsed inside the child process
+      with ``json.loads(...)`` so both paths receive a ``dict``, not a string.
+    - ``uv`` is invoked as a standalone binary (``['uv', 'run', ...]``), NOT
+      via ``python -m uv`` (uv is not an importable Python module).
     """
     if project_root is None:
         import tempfile
@@ -1384,20 +1417,23 @@ def _validate(task_kind: str, metadata: dict, project_root: str | None = None) -
     except ModuleNotFoundError:
         import json
         import subprocess
-        import sys
         from pathlib import Path as _Path
         repo_root = _Path(__file__).parents[3]  # .worktrees/1903/
+        # Embed metadata as a JSON string literal and parse it back to a dict
+        # inside the subprocess — both paths therefore pass a dict to
+        # deterministic_task_error, not a string.
         code = (
             'import json, sys;'
             'from fused_memory.middleware.deterministic_task_guard'
             ' import deterministic_task_error;'
+            f'metadata = json.loads({json.dumps(metadata)!r});'
             f'result = deterministic_task_error('
-            f'{task_kind!r}, {json.dumps(metadata)!r}, {project_root!r});'
+            f'{task_kind!r}, metadata, {project_root!r});'
             'print(json.dumps(result))'
         )
         try:
             out = subprocess.check_output(
-                [sys.executable, '-m', 'uv', 'run', '--project',
+                ['uv', 'run', '--project',
                  str(repo_root / 'fused-memory'), 'python', '-c', code],
                 text=True,
                 timeout=30,
