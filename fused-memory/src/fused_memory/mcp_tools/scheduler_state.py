@@ -27,6 +27,7 @@ def _empty_skeleton() -> dict:
     return {
         'skip_counts': {},
         'parks': {},
+        'park_stacks': {},
         'effective_priorities': {},
         'pin_queue': [],
         'overrides': {},
