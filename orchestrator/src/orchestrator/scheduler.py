@@ -2115,53 +2115,84 @@ class Scheduler:
         Called ONCE per ``acquire_next`` tick right after the candidate list is
         built and BEFORE ``if not candidates: return None``.  Any exception is
         caught by the caller's try/except so a watchdog failure can NEVER abort
-        the tick or gate dispatch (PROPERTY 1).
+        the tick or gate dispatch (PROPERTY 1 — mirrors the
+        ``_apply_external_dep_policy`` wrapper at the call site).
 
-        MINIMAL IMPL (task 1880 step-4): skip-gate only.
-        The idle-secs gate and ``enabled`` short-circuit land in step-6 so that
-        step-5's negative tests are genuinely RED against this version.
+        FULL IMPL (task 1880 step-6): skip-gate + idle-secs gate + enabled check.
+
+        Short-circuits immediately when ``starvation_watchdog.enabled`` is False.
 
         For each candidate task:
-        1. Stamp ``_starvation_first_seen[tid]`` the first time it appears
-           (idle anchor; used by the full impl in step-6).
-        2. Fire ``_on_starvation_warn`` when ALL of:
+        1. Continuity reset — drop ``_starvation_first_seen`` for tasks whose tid
+           is no longer in the candidate id set (so idle measures CONTINUOUS
+           dispatch-eligibility; gaps reset the anchor).
+        2. Stamp ``_starvation_first_seen[tid]`` on the first tick the task
+           appears as a candidate.
+        3. Fire ``_on_starvation_warn`` when ALL of:
            - ``_skip_count[tid] >= starvation_watchdog.skip_threshold``
+           - ``(now - first_seen) >= starvation_watchdog.idle_secs``
            - ``tid`` is NOT already in ``_starvation_escalated``
            - ``_on_starvation_warn`` is not None (callback installed)
         """
         cfg = self.config.starvation_watchdog
+
+        # Short-circuit: watchdog is administratively disabled.
+        if not cfg.enabled:
+            return
+
         now = self._time_source()
         candidate_ids: set[str] = set()
 
-        for t in candidates:
-            tid = str(t.get('id', ''))
+        # Collect current candidate ids for continuity-reset step below.
+        for task in candidates:
+            tid = str(task.get('id', ''))
+            if tid:
+                candidate_ids.add(tid)
+
+        # Continuity reset: drop first_seen anchors for tasks that are no longer
+        # candidates this tick.  Gaps in candidacy mean the task was gated (deps
+        # became unsatisfied, cooldown re-armed, etc.) — the idle clock resets.
+        stale_anchors = [
+            tid for tid in list(self._starvation_first_seen)
+            if tid not in candidate_ids
+        ]
+        for tid in stale_anchors:
+            del self._starvation_first_seen[tid]
+
+        for task in candidates:
+            tid = str(task.get('id', ''))
             if not tid:
                 continue
-            candidate_ids.add(tid)
 
-            # Stamp first_seen anchor (used by idle-secs gate in step-6).
+            # Stamp first_seen anchor on the first tick this task appears.
             if tid not in self._starvation_first_seen:
                 self._starvation_first_seen[tid] = now
 
-            # Fire when skip_count >= threshold AND not already escalated.
+            first_seen = self._starvation_first_seen[tid]
             skip = self._skip_count.get(tid, 0)
+            idle_elapsed = now - first_seen
+
+            # Fire when BOTH gates are crossed AND not already escalated.
             if (
                 skip >= cfg.skip_threshold
+                and idle_elapsed >= cfg.idle_secs
                 and tid not in self._starvation_escalated
                 and self._on_starvation_warn is not None
             ):
                 summary = (
                     f'STARVATION_WATCHDOG: task {tid} skipped {skip}× as top '
-                    f'candidate (threshold={cfg.skip_threshold}) — '
+                    f'candidate (threshold={cfg.skip_threshold}) for '
+                    f'{idle_elapsed:.0f}s (idle_secs={cfg.idle_secs}) — '
                     f'dispatch-eligible but unable to acquire locks'
                 )
                 detail = (
                     f'Task {tid} has been the highest-scored dispatch-eligible '
                     f'candidate (all deps satisfied, no live claimant) for '
-                    f'{skip} consecutive top-skips without acquiring its module '
-                    f'locks.  This typically indicates persistent lock contention '
-                    f'(broad-footprint task vs. a long-running narrow task) that '
-                    f'has not been resolved by the fairness parks.\n\n'
+                    f'{skip} consecutive top-skips over {idle_elapsed:.0f}s '
+                    f'without acquiring its module locks.  This typically indicates '
+                    f'persistent lock contention (broad-footprint task vs. a '
+                    f'long-running narrow task) that has not been resolved by the '
+                    f'fairness parks.\n\n'
                     f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
                 )
                 await self._on_starvation_warn(tid, summary=summary, detail=detail)
