@@ -300,7 +300,7 @@ def _normalize_lane(lane: str) -> str:
     return lane if lane in MERGE_LANES else 'normal'
 
 
-def _aging_key(req: 'MergeRequest') -> tuple[float, str]:
+def _aging_key(req: MergeRequest) -> tuple[float, str]:
     """Aging sort key for a merge request (ζ=1891).
 
     Returns a ``(wall_clock, request_id)`` tuple:
