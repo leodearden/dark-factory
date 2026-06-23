@@ -517,16 +517,16 @@ class TestEffectivePrioritiesCache:
 # ===========================================================================
 
 _SNAPSHOT_KEYS = frozenset({
-    'skip_counts', 'parks', 'effective_priorities',
+    'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
     'is_paused', 'pause_reason',
 })
 
 
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns the correct ten-key dict."""
+    """get_state_snapshot() returns the correct eleven-key dict."""
 
-    def test_snapshot_returns_ten_top_level_keys(self):
+    def test_snapshot_returns_eleven_top_level_keys(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         snap = scheduler.get_state_snapshot()
         assert set(snap.keys()) == _SNAPSHOT_KEYS
@@ -536,6 +536,7 @@ class TestGetStateSnapshotShape:
         snap = scheduler.get_state_snapshot()
         assert snap['skip_counts'] == {}
         assert snap['parks'] == {}
+        assert snap['park_stacks'] == {}
         assert snap['effective_priorities'] == {}
         assert snap['pin_queue'] == []
         assert snap['overrides'] == {}
@@ -545,6 +546,35 @@ class TestGetStateSnapshotShape:
         # Pause state defaults — scheduler is not paused at construction.
         assert snap['is_paused'] is False
         assert snap['pause_reason'] is None
+
+    def test_snapshot_exposes_park_stacks_with_shadowed_owner(self):
+        """park_stacks surfaces buried owners that parks omits (user-observable signal).
+
+        install low then high on the same module; get_state_snapshot() must
+        return park_stacks with BOTH owners while parks contains only the
+        active-top owner — pinning the backward-compatible additive key.
+        """
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        lt = scheduler.lock_table
+        lt.install_parks('L', ['mod/a'], 'low')   # becomes bottom (shadowed)
+        lt.install_parks('H', ['mod/a'], 'high')  # becomes active top
+
+        snap = scheduler.get_state_snapshot()
+
+        # parks: only active top (INV-7 backward-compat shape unchanged)
+        assert 'H' in snap['parks'], 'Active-top H must appear in parks'
+        assert 'L' not in snap['parks'], 'Buried L must NOT appear in parks'
+
+        # park_stacks: full stack, both owners present
+        assert 'mod/a' in snap['park_stacks'], 'mod/a must appear in park_stacks'
+        entries = snap['park_stacks']['mod/a']
+        assert len(entries) == 2, f'Expected 2-deep stack in park_stacks, got {entries}'
+        owners = [e['owner'] for e in entries]
+        assert 'L' in owners, 'Buried L must appear in park_stacks'
+        assert 'H' in owners, 'Active H must appear in park_stacks'
+        # shadowed flags
+        assert entries[0]['shadowed'] is True   # L at bottom
+        assert entries[1]['shadowed'] is False  # H at top
 
     def test_snapshot_exposes_lock_depth(self):
         # lock_depth lets the dashboard normalize footprints the same way the
