@@ -647,6 +647,14 @@ class Harness:
         # verify when main has not advanced since the previous pass.
         self._last_swept_main_sha: str | None = None
 
+        # No-landings circuit-breaker — θ=1893, PRD §5.5.
+        # Pure detection logic lives in merge_queue.NoLandingsCircuitBreaker;
+        # I/O wiring (disk-stat, halt/resume, escalation file/resolve) lives
+        # here, in a periodic loop mirroring the main-tip-sweep lifecycle.
+        from orchestrator.merge_queue import NoLandingsCircuitBreaker as _NLCB  # noqa: PLC0415
+        self._no_landings_breaker: _NLCB = _NLCB()
+        self._no_landings_breaker_task: asyncio.Task | None = None
+
         # Per-task consecutive-failure counter for the reconcile sweep —
         # cleared on any successful mark_done, used to gate L1 escalation.
         self._reconcile_failure_counts: dict[str, int] = {}
@@ -2818,6 +2826,11 @@ Output JSON matching the schema. Every task must appear in the output.
     # and reconcile (no such task) all leave it alone.
     _SCHEDULER_PAUSE_SENTINEL: str = '__scheduler__'
 
+    # Synthetic task_id for the no-landings circuit-breaker INFO escalation.
+    # Deduped to one open at a time (via get_by_task + agent_role filter).
+    # Same class-level immutability guarantees as _SCHEDULER_PAUSE_SENTINEL.
+    _NO_LANDINGS_SENTINEL: str = '__no_landings_breaker__'
+
     def _file_scheduler_pause_escalation(self, reason: str) -> None:
         """File an L1 escalation when scheduler dispatch is paused.
 
@@ -3026,6 +3039,164 @@ Output JSON matching the schema. Every task must appear in the output.
                 esc.id,
                 task_id,
             )
+
+    # ── No-landings circuit-breaker helpers (θ=1893, PRD §5.5) ──────────────
+
+    def _file_no_landings_info_escalation(self, trip) -> None:
+        """File a non-blocking INFO escalation for the no-landings circuit-breaker.
+
+        Mirrors ``_file_starvation_info`` (pure operator-signal INFO, level=0)
+        and uses the ``_NO_LANDINGS_SENTINEL`` sentinel task_id (mirroring
+        ``_SCHEDULER_PAUSE_SENTINEL``) so the escalation is global / not tied
+        to a specific task.
+
+        Deduped: if an open breaker INFO escalation already exists (pending,
+        agent_role=``orchestrator-no-landings-breaker``), this is a no-op.
+        Best-effort: any submit failure is swallowed and logged.
+
+        **Routing note:** ``severity='info', level=0``.  Level-0 INFO is
+        surfaced via the steward's pending-escalation view and external monitors/
+        dashboards/webhooks.  Does NOT auto-promote and does NOT additionally
+        halt the scheduler (``force_halt_scheduler`` already handles the halt;
+        ``file_escalation=False`` was passed there to avoid the auto-watcher
+        resolving the scheduler-pause L1 and silently undoing the halt).
+        """
+        if not self._escalation_queue:
+            return
+        try:
+            existing = [
+                e
+                for e in self._escalation_queue.get_by_task(
+                    self._NO_LANDINGS_SENTINEL, status='pending'
+                )
+                if e.agent_role == 'orchestrator-no-landings-breaker'
+            ]
+            if existing:
+                return  # dedup: one open INFO at a time
+            from escalation.models import Escalation  # noqa: PLC0415
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._NO_LANDINGS_SENTINEL),
+                task_id=self._NO_LANDINGS_SENTINEL,
+                agent_role='orchestrator-no-landings-breaker',
+                severity='info',
+                category='risk_identified',
+                summary=(
+                    f'No-landings circuit-breaker tripped: '
+                    f'{trip.window_samples} samples, 0 landings, '
+                    f'disk {trip.free_start:,}→{trip.free_end:,} bytes'
+                )[:200],
+                detail=(
+                    'The merge-queue no-landings circuit-breaker detected a '
+                    'potential churn spiral and has halted scheduler dispatch.\n\n'
+                    f'Window: {trip.window_samples} consecutive samples\n'
+                    f'Landings in window: {trip.landings_in_window} (expected 0 to trip)\n'
+                    f'Disk free-bytes: {trip.free_start:,} → {trip.free_end:,} '
+                    f'(strictly falling)\n\n'
+                    f'Trip reason: {trip.reason}\n\n'
+                    'Auto-resume will occur on the next clean landing or when disk '
+                    'free-bytes recover above the trip level + margin.  If the '
+                    'scheduler does not auto-resume, investigate disk usage under '
+                    'the warm-lane worktree volume and call '
+                    'force_resume_scheduler() to manually un-pause dispatch.'
+                ),
+                suggested_action='manual_investigation',
+                level=0,
+            )
+            self._escalation_queue.submit(esc)
+            logger.info(
+                'No-landings breaker: filed INFO escalation %s '
+                '(window=%d, disk %d→%d)',
+                esc.id, trip.window_samples, trip.free_start, trip.free_end,
+            )
+        except Exception:
+            logger.warning(
+                'No-landings breaker: failed to file INFO escalation',
+                exc_info=True,
+            )
+
+    def _resolve_no_landings_info_escalation(self, trip) -> None:
+        """Resolve an open no-landings breaker INFO escalation.
+
+        Called on resume; idempotent (EscalationQueue.resolve is a no-op if
+        already resolved).  Best-effort: no-op when ``_escalation_queue`` is
+        None or resolve raises.  Mirrors ``_resolve_starvation_info``.
+        """
+        if not self._escalation_queue:
+            return
+        try:
+            pending = [
+                e
+                for e in self._escalation_queue.get_by_task(
+                    self._NO_LANDINGS_SENTINEL, status='pending'
+                )
+                if e.agent_role == 'orchestrator-no-landings-breaker'
+            ]
+            for esc in pending:
+                self._escalation_queue.resolve(
+                    esc.id,
+                    f'auto-resolved: {trip.reason}',
+                    resolved_by='orchestrator-no-landings-breaker',
+                )
+                logger.info(
+                    'No-landings breaker: auto-resolved INFO escalation %s', esc.id
+                )
+        except Exception:
+            logger.warning(
+                'No-landings breaker: failed to resolve INFO escalation',
+                exc_info=True,
+            )
+
+    async def _run_no_landings_breaker_pass(self) -> None:
+        """Single testable pass of the no-landings circuit-breaker.
+
+        Reads ``landings_total`` from the merge-worker snapshot, samples disk
+        free-bytes from ``git_ops.worktree_base`` (fail-open on OSError), feeds
+        the breaker, and reacts to any ``BreakerTrip`` decision:
+
+        * ``action='halt'``:  ``force_halt_scheduler(reason)`` +
+          ``_file_no_landings_info_escalation(trip)``
+        * ``action='resume'``: ``force_resume_scheduler(reason)`` +
+          ``_resolve_no_landings_info_escalation(trip)``
+
+        No-op when ``_merge_worker`` is None (bare harness / unit tests).
+        Fail-open on ``OSError`` from ``shutil.disk_usage`` so a transient
+        stat failure (or not-yet-created ``worktree_base``) never halts dispatch.
+        Mirrors ``_run_main_tip_sweep`` as the single-pass testable entry point.
+        """
+        import shutil as _shutil  # noqa: PLC0415
+
+        if self._merge_worker is None:
+            return
+
+        landings_total: int = (
+            self._merge_worker.snapshot()['metrics']['landings_total']
+        )
+
+        try:
+            free_bytes: int = _shutil.disk_usage(
+                self.git_ops.worktree_base
+            ).free
+        except OSError:
+            # Fail-open: stat failure (e.g. worktree_base not yet created on a
+            # fresh host) must never halt dispatch.  Mirror
+            # _ensure_verify_disk_space (merge_queue.py:558-606).
+            logger.debug(
+                'No-landings breaker: disk_usage(%s) raised OSError — fail-open skip',
+                self.git_ops.worktree_base,
+                exc_info=True,
+            )
+            return
+
+        trip = self._no_landings_breaker.observe(landings_total, free_bytes)
+        if trip is None:
+            return
+
+        if trip.action == 'halt':
+            await self.force_halt_scheduler(reason=trip.reason)
+            self._file_no_landings_info_escalation(trip)
+        elif trip.action == 'resume':
+            await self.force_resume_scheduler(reason=trip.reason)
+            self._resolve_no_landings_info_escalation(trip)
 
     async def _block_and_escalate_substrate_flip(
         self,
