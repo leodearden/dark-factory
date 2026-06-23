@@ -3438,7 +3438,7 @@ class MergeRequest:
 class TrainCallbacks:
     """Scheduler-backed callbacks for a single train, built in the harness.
 
-    Holds two async callables captured over a live scheduler + train_id so
+    Holds async callables captured over a live scheduler + train_id so
     the merge worker (a pure git engine with no scheduler import) can flip
     member tasks done after a train advance.  Built by
     :func:`harness.build_train_callback_factory` and consumed by task γ when
@@ -3450,6 +3450,14 @@ class TrainCallbacks:
 
     mark_member_done: Callable[[str, str], Awaitable[None]]
     """Async callback: mark a single member task done with the merge SHA."""
+
+    redrive_member: Callable[[str, bool, str | None], Awaitable[None]] | None = None
+    """Async callback: re-drive an absorbed member that is still merge-deferred
+    after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
+    found_on_main=True → mark done with found_on_main provenance (double-landing
+    guard); False → flip to pending so the scheduler re-dispatches a solo merge.
+    None when the callback is not available (back-compat with existing callers
+    that build TrainCallbacks with only status_check/mark_member_done)."""
 
 
 # Type alias for the factory that produces per-train callbacks.
@@ -3507,6 +3515,13 @@ class GroupMergeRequest(MergeRequest):
 
     mark_member_done: Callable[[str, str], Awaitable[None]]
     """Async callback: mark a single member task done with the merge SHA."""
+
+    redrive_member: Callable[[str, bool, str | None], Awaitable[None]] | None = field(
+        default=None, kw_only=True,
+    )
+    """Optional async callback: re-drive an absorbed member still merge-deferred
+    after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
+    None when not wired (back-compat with existing test constructions)."""
 
 
 @dataclass
@@ -6523,6 +6538,67 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             len(member_task_ids), member_task_ids,
         )
 
+    async def _redrive_coalesce_members(
+        self, req: GroupMergeRequest, main_sha: str,
+    ) -> None:
+        """Re-drive absorbed members still merge-deferred after a coalesce-train derail.
+
+        For each member task still in 'merge-deferred' status (per req.status_check):
+          - If the member's branch is already an ancestor of main (double-landing
+            guard: a partner's merge brought it in), mark it done with
+            found_on_main provenance via req.redrive_member(mid, True, sha).
+          - Otherwise flip it to 'pending' via req.redrive_member(mid, False, None)
+            so the scheduler re-dispatches a fresh solo-merge workflow that owns
+            the merge-deferred→done transition.
+
+        Members not in 'merge-deferred' (e.g. raced to 'in-progress' by a sibling)
+        are left alone — the live workflow owns their done-transition.
+
+        Per-member try/except ensures one member failure never aborts the rest or
+        kills the merger loop.  req.redrive_member=None is a back-compat no-op.
+        """
+        if req.redrive_member is None:
+            logger.warning(
+                'Coalesce train %s: _redrive_coalesce_members called but '
+                'req.redrive_member is None — cannot re-drive stranded members',
+                req.train_id,
+            )
+            return
+
+        statuses = await req.status_check(req.member_task_ids)
+        deferred_mids = [
+            mid for mid in req.member_task_ids
+            if statuses.get(mid) == 'merge-deferred'
+        ]
+
+        for mid in deferred_mids:
+            try:
+                branch = f'{self._git_ops.config.branch_prefix}{mid}'
+                on_main = await self._git_ops.is_ancestor(
+                    branch, self._git_ops.config.main_branch,
+                )
+                if on_main:
+                    sha = await self._git_ops.resolve_branch_sha(branch) or main_sha
+                    await req.redrive_member(mid, True, sha)
+                    logger.info(
+                        'Coalesce train %s: member %s already on main — '
+                        'marked done (found_on_main, sha=%s)',
+                        req.train_id, mid, sha,
+                    )
+                else:
+                    await req.redrive_member(mid, False, None)
+                    logger.info(
+                        'Coalesce train %s: member %s not on main — '
+                        'flipped to pending for solo-merge re-dispatch',
+                        req.train_id, mid,
+                    )
+            except Exception:
+                logger.exception(
+                    'Coalesce train %s: re-drive failed for member %s — '
+                    'continuing with remaining members',
+                    req.train_id, mid,
+                )
+
     def _default_coalesce_exclusion_reason(self, req: MergeRequest) -> str | None:
         """Built-in merge-ready predicate (δ/1720 confidence gate).
 
@@ -6762,6 +6838,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             tip_task_id=tip_id,
             status_check=callbacks.status_check,
             mark_member_done=callbacks.mark_member_done,
+            redrive_member=callbacks.redrive_member,
         )
 
         # QUEUE SURGERY: rebuild _lane_buffers['normal'] preserving FIFO order for
@@ -6981,22 +7058,55 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 req.train_id, spec_base[:12],
                             )
                         outcome = await _do_train_merge(self, req)
-                        # δ/1720: if a coalesce-formed train derailed with a
-                        # risky terminal outcome, mark all its members one-strike
-                        # so they are excluded from the next coalescing pass and
-                        # left to merge solo.  We use _COALESCE_RISKY_TERMINAL_STATES
-                        # (frozenset{'blocked','error'}) to align the recording
-                        # trigger with the exclusion predicate — both 'blocked'
-                        # (verify failure) and 'error' (unexpected git/infra error)
-                        # are deterministic enough to warrant solo-merge.
-                        # 'conflict' and 'wip_halted' are intentionally excluded:
-                        # a conflict may resolve after the partner task lands, and
-                        # wip_halted is policy-driven rather than a task failure.
-                        if (
-                            outcome.status in _COALESCE_RISKY_TERMINAL_STATES
-                            and req.train_id.startswith(_COALESCE_TRAIN_ID_PREFIX)
-                        ):
-                            self._mark_coalesce_derailed(req.member_task_ids)
+                        # 1867: coalesce-train derail recovery.
+                        # Both hooks below are gated on the coalesce prefix so
+                        # declared trains (kept alive by the tip workflow's re-fire)
+                        # are never touched.
+                        if req.train_id.startswith(_COALESCE_TRAIN_ID_PREFIX):
+                            # δ/1720: one-strike exclusion on risky outcomes so
+                            # derailed members are not immediately re-coalesced.
+                            # Kept on the narrower _COALESCE_RISKY_TERMINAL_STATES
+                            # set ('blocked','error') — conflicts and wip_halted are
+                            # excluded intentionally (conflict may resolve, wip_halted
+                            # is policy-driven).
+                            if outcome.status in _COALESCE_RISKY_TERMINAL_STATES:
+                                self._mark_coalesce_derailed(req.member_task_ids)
+                            # 1867: durable re-drive — re-drive any absorbed members
+                            # that are still merge-deferred to solo merge.  Gated on
+                            # outcome != 'done' (success path owns all member flips).
+                            # Broader than _COALESCE_RISKY_TERMINAL_STATES: the
+                            # per-member is_ancestor guard makes all non-done outcomes
+                            # safe (already-landed members flip done, genuinely-
+                            # unlanded members flip pending for solo re-dispatch).
+                            #
+                            # Note — wip_halted IS included here (unlike one-strike
+                            # exclusion).  A coalesce GroupMergeRequest with
+                            # wip_halted has no awaiter to re-fire it, so absorbed
+                            # members would be permanently stranded in merge-deferred
+                            # if we skipped re-drive.  Re-pending sends them back to
+                            # the scheduler as solo candidates; each fresh workflow
+                            # will hit the WIP-halt barrier independently and wait
+                            # correctly.  The one-strike exclusion rationale (wip_halted
+                            # is "policy-driven") governs whether to EXCLUDE members
+                            # from the NEXT coalescing pass, which is a separate gate.
+                            #
+                            # Known gap (out of scope): if _do_train_merge returns
+                            # 'done' but mark_member_done suffers a transient
+                            # get_statuses error, one or more members may be left
+                            # un-flipped in merge-deferred.  The re-drive below is
+                            # intentionally excluded for the 'done' path because the
+                            # success flow already logs "manual cleanup required" for
+                            # TRAIN_PARTIAL_FLIP.  Covering the done-path gap is a
+                            # follow-up task.
+                            if outcome.status != 'done':
+                                try:
+                                    await self._redrive_coalesce_members(req, actual_main)
+                                except Exception:
+                                    logger.exception(
+                                        'Coalesce train %s: _redrive_coalesce_members '
+                                        'raised unexpectedly — members may remain stranded',
+                                        req.train_id,
+                                    )
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=False,
