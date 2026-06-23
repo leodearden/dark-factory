@@ -22,7 +22,6 @@ from orchestrator.overlap_footprint import (
     register_overlap_detector,
 )
 
-
 # ---------------------------------------------------------------------------
 # Step 1: DefaultPathOverlapDetector contract tests
 # ---------------------------------------------------------------------------
@@ -231,20 +230,44 @@ class TestMergeQueueReExports:
     def test_reexport_imports_succeed_and_are_same_objects(self) -> None:
         from orchestrator.merge_queue import (  # noqa: F401
             DEFAULT_OVERLAP_DETECTOR as mq_DEFAULT,
+        )
+        from orchestrator.merge_queue import (
             DefaultPathOverlapDetector as mq_DefaultPathOverlapDetector,
+        )
+        from orchestrator.merge_queue import (
             Footprint as mq_Footprint,
+        )
+        from orchestrator.merge_queue import (
             OverlapFootprintDetector as mq_OverlapFootprintDetector,
+        )
+        from orchestrator.merge_queue import (
             changesets_overlap as mq_changesets_overlap,
+        )
+        from orchestrator.merge_queue import (
             get_overlap_detector as mq_get_overlap_detector,
+        )
+        from orchestrator.merge_queue import (
             register_overlap_detector as mq_register_overlap_detector,
         )
         from orchestrator.overlap_footprint import (
             DEFAULT_OVERLAP_DETECTOR as ov_DEFAULT,
+        )
+        from orchestrator.overlap_footprint import (
             DefaultPathOverlapDetector as ov_DefaultPathOverlapDetector,
+        )
+        from orchestrator.overlap_footprint import (
             Footprint as ov_Footprint,
+        )
+        from orchestrator.overlap_footprint import (
             OverlapFootprintDetector as ov_OverlapFootprintDetector,
+        )
+        from orchestrator.overlap_footprint import (
             changesets_overlap as ov_changesets_overlap,
+        )
+        from orchestrator.overlap_footprint import (
             get_overlap_detector as ov_get_overlap_detector,
+        )
+        from orchestrator.overlap_footprint import (
             register_overlap_detector as ov_register_overlap_detector,
         )
 
