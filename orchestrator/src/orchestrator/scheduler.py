@@ -3092,6 +3092,11 @@ class Scheduler:
                                         _dep_id,
                                     )
 
+        # Operator-issued eviction drain: process any queued force-evict
+        # requests BEFORE the automatic park-GC sweep so that operator-lever
+        # evictions emit reservation_force_evicted (not reservation_expired).
+        self._drain_park_eviction_requests(status_map, tasks_by_id)
+
         # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
         # a park whose owner is terminal / missing / deps-unsatisfied has no
         # reason to keep blocking other tasks, so it's evicted now.
