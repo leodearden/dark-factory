@@ -148,6 +148,10 @@ class EscalationQueue:
         # None = not yet built; dict = {dated-subdir-name: set-of-esc-id-stems}.
         # Lazy-built on first archive lookup; incrementally updated in _archive_resolved.
         self._archive_listing: dict[str, set[str]] | None = None
+        # Cache 2 — max_seq per task_id (serves make_id()).
+        # {task_id: max archived seq} — absent key means "not yet scanned".
+        # Upward-only updates in _archive_resolved guarantee no under-estimate.
+        self._archive_max_seq_cache: dict[str, int] = {}
 
     def set_notify_callback(self, callback: Callable[[Escalation], None]) -> None:
         self._notify_callback = callback
@@ -178,6 +182,20 @@ class EscalationQueue:
         if self._archive_listing is None:
             self._archive_listing = self._scan_archive_listing()
         return self._archive_listing
+
+    def _scan_archive_max_seq(self, prefix: str) -> int:
+        """Scan the archive for the maximum sequence number for *prefix*.
+
+        Iterates _iter_archive_paths(f'{prefix}*.json'), parses the trailing
+        integer from each matching stem, and returns the max found (0 if none).
+        Used by make_id() on a per-task_id cache miss to seed the cache.
+        """
+        max_seq = 0
+        for path in self._iter_archive_paths(f'{prefix}*.json'):
+            suffix = path.stem[len(prefix):]
+            with contextlib.suppress(ValueError):
+                max_seq = max(max_seq, int(suffix))
+        return max_seq
 
     def _iter_archive_paths(self, pattern: str) -> Iterator[Path]:
         """Yield escalation JSON files from the archive subtree matching *pattern*.
@@ -958,10 +976,13 @@ class EscalationQueue:
         that have been archived after resolution (the in-memory counter
         resets on process restart, so we must re-derive max_seq from disk).
 
-        Note: the archive scan is O(|archive files for task_id|) on every call.
-        make_id() is a slow path (invoked only at submission), so this is
-        acceptable within a 30-day retention window.
-        TODO: cache max_seq per task_id to eliminate repeated archive scans.
+        The queue root is always scanned fresh each call (cheap; reflects
+        just-submitted pending ids and cross-process root writes).  The
+        archive contribution is cached per task_id in _archive_max_seq_cache:
+        on a cache miss, _scan_archive_max_seq() scans the archive once and
+        stores the result; subsequent calls for the same task_id are O(1).
+        _archive_resolved() bumps the cache upward on each archive write so
+        make_id() always observes the correct max without a rescan.
         """
         prefix = f'esc-{task_id}-'
         max_seq = 0
@@ -969,11 +990,11 @@ class EscalationQueue:
             suffix = path.stem[len(prefix):]
             with contextlib.suppress(ValueError):
                 max_seq = max(max_seq, int(suffix))
-        # Also scan the archive so post-restart calls don't return IDs
-        # already used by archived escalations for the same task.
-        for path in self._iter_archive_paths(f'{prefix}*.json'):
-            suffix = path.stem[len(prefix):]
-            with contextlib.suppress(ValueError):
-                max_seq = max(max_seq, int(suffix))
+        # Obtain the archive contribution from the per-task_id cache.
+        # Scan the archive exactly once per task_id per instance (cache miss only).
+        if task_id not in self._archive_max_seq_cache:
+            self._archive_max_seq_cache[task_id] = self._scan_archive_max_seq(prefix)
+        archive_max = self._archive_max_seq_cache[task_id]
+        max_seq = max(max_seq, archive_max)
         seq = max(max_seq + 1, self._next_seq())
         return f'{prefix}{seq}'
