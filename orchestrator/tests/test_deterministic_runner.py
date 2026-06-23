@@ -64,6 +64,55 @@ def _mock_scheduler(task: dict):
     return scheduler
 
 
+def _deploy_task(
+    task_id: str = '200',
+    target_unit: str = 'orchestrator-reify.service',
+    script: str = '/tmp/test-deploy.sh',
+    args: list | None = None,
+    env: dict | None = None,
+    cwd: str = '/tmp',
+    timeout_secs: int = 30,
+    before_done_ran_at: str | None = None,
+) -> dict:
+    """Build a deterministic deploy task dict (before_done set, always_escalates=False)."""
+    before_done: dict = {
+        'script': script,
+        'args': args if args is not None else [],
+        'env': env if env is not None else {},
+        'cwd': cwd,
+        'timeout_secs': timeout_secs,
+        'target_unit': target_unit,
+    }
+    metadata: dict = {
+        'task_kind': 'deterministic',
+        'always_escalates': False,
+        'before_done': before_done,
+    }
+    if before_done_ran_at is not None:
+        metadata['before_done_ran_at'] = before_done_ran_at
+    return {
+        'id': task_id,
+        'title': 'Deploy orchestrator-reify',
+        'description': 'Cross-unit deploy of the reify worker',
+        'metadata': metadata,
+    }
+
+
+# Unit states used across B6/B7 deploy tests
+_BASELINE_UNIT_STATE: dict = {
+    'MainPID': 100,
+    'ActiveState': 'active',
+    'ActiveEnterTimestamp': 'Mon 2026-06-23 10:00:00 UTC',
+    'ActiveEnterTimestampMonotonic': 1_000_000,
+}
+_FRESH_UNIT_STATE: dict = {
+    'MainPID': 200,
+    'ActiveState': 'active',
+    'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC',
+    'ActiveEnterTimestampMonotonic': 2_000_000,
+}
+
+
 # ---------------------------------------------------------------------------
 # Step-5: pure-gate path (B2/I3)
 # (RED until step-6 creates deterministic_runner.py)
@@ -277,20 +326,6 @@ class TestPureGatePath:
 
         assert outcome == WorkflowOutcome.BLOCKED
 
-    async def test_before_done_present_raises_not_implemented(self, tmp_path: Path):
-        """before_done is not None → NotImplementedError (delivered by task γ)."""
-        from orchestrator.deterministic_runner import DeterministicRunner
-
-        task = _gate_task(task_id='99')
-        task['metadata']['before_done'] = 'run_tests'  # non-None
-        assignment = _make_assignment(task)
-        queue = EscalationQueue(tmp_path)
-        scheduler = _mock_scheduler(task)
-
-        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
-        with pytest.raises(NotImplementedError):
-            await runner.run(assignment)
-
     async def test_always_escalates_false_before_done_none_raises_value_error(self, tmp_path: Path):
         """always_escalates=False with before_done=None → ValueError (unsupported in β)."""
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -445,3 +480,190 @@ class TestIdempotentResumeAndQuiescence:
 
         # Must NOT have been driven to done
         scheduler.set_task_status.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Step-1: cross-unit deploy success (B6)
+# (RED until step-2 adds the before_done execution path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneCrossUnitDeploy:
+    """DeterministicRunner — before_done blocking cross-unit deploy success (B6)."""
+
+    async def test_b6_script_runner_called_once_with_before_done(self, tmp_path: Path):
+        """script_runner invoked exactly once and receives the full before_done dict (B6)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        before_done = task['metadata']['before_done']
+        script_runner.assert_awaited_once_with(before_done)
+
+    async def test_b6_set_task_done_with_provenance_kind(self, tmp_path: Path):
+        """set_task_status awaited once with 'done' + done_provenance.kind='deterministic-deploy' (B6)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[0] == '200'
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance is not None, 'done_provenance must be passed as a kwarg'
+        assert provenance['kind'] == 'deterministic-deploy'
+
+    async def test_b6_done_provenance_pid_is_fresh_non_sentinel_int(self, tmp_path: Path):
+        """done_provenance.pid is the post-run MainPID — a real non-sentinel int > 0 (B6)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        call = scheduler.set_task_status.call_args
+        provenance = call.kwargs.get('done_provenance')
+        assert isinstance(provenance['pid'], int), 'pid must be an int'
+        assert provenance['pid'] > 0, 'pid must be a real (non-sentinel) PID'
+        assert provenance['pid'] == _FRESH_UNIT_STATE['MainPID'], (
+            'pid must be the post-run (fresh) PID, not the baseline'
+        )
+
+    async def test_b6_done_provenance_has_active_enter_timestamp(self, tmp_path: Path):
+        """done_provenance.active_enter_timestamp present and from post-run inspect (B6)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        call = scheduler.set_task_status.call_args
+        provenance = call.kwargs.get('done_provenance')
+        assert 'active_enter_timestamp' in provenance, 'active_enter_timestamp must be in provenance'
+        assert provenance['active_enter_timestamp'] == _FRESH_UNIT_STATE['ActiveEnterTimestamp']
+
+    async def test_b6_outcome_is_done(self, tmp_path: Path):
+        """Successful cross-unit deploy returns WorkflowOutcome.DONE (B6)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+    async def test_b6_stamps_before_done_ran_at(self, tmp_path: Path):
+        """update_task stamps before_done_ran_at with a truthy ISO timestamp (B6 / I1)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        # At least one update_task call must carry before_done_ran_at (truthy)
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must be called with a truthy before_done_ran_at stamp'
+
+    async def test_b6_no_escalation_filed_on_success(self, tmp_path: Path):
+        """No escalation is filed on a successful deploy (failures file escalations, not success)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('200', status='pending')
+        assert len(pending) == 0, f'No escalation should be filed on success; got {pending}'
