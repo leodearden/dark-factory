@@ -300,19 +300,25 @@ def _normalize_lane(lane: str) -> str:
     return lane if lane in MERGE_LANES else 'normal'
 
 
-def _aging_key(req: 'MergeRequest') -> float:
+def _aging_key(req: 'MergeRequest') -> tuple[float, str]:
     """Aging sort key for a merge request (ζ=1891).
 
-    Returns the wall-clock epoch of the request's *first* merge submission
-    (``merge_first_enqueued_at``), falling back to the in-memory
-    ``enqueued_at`` for legacy requests created before α was deployed
-    (field is None).
+    Returns a ``(wall_clock, request_id)`` tuple:
 
-    Used by ``SpeculativeMergeWorker._pop_next_pickable`` to pick the
-    clique-minimal item — the buffered item whose footprint-clique peers
-    all have an equal-or-larger aging key.  Older (smaller key) wins.
+    * **wall_clock** — ``merge_first_enqueued_at`` (persisted epoch of the
+      *first* merge submission, survives restart) with ``enqueued_at`` as
+      the legacy fallback for requests created before α=1886 was deployed
+      (field is ``None``).  Smaller = older = higher priority.
+
+    * **request_id** — lexical tie-break for equal timestamps (PRD §5.4 /
+      §11.3).  Lexically smaller wins.
+
+    Used by ``SpeculativeMergeWorker._pop_next_pickable`` to identify the
+    clique-minimal item within a footprint clique — the buffered item whose
+    footprint-clique peers all have an equal-or-larger aging key.
     """
-    return req.merge_first_enqueued_at if req.merge_first_enqueued_at is not None else req.enqueued_at
+    ts = req.merge_first_enqueued_at if req.merge_first_enqueued_at is not None else req.enqueued_at
+    return (ts, req.request_id)
 
 
 TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
@@ -6183,8 +6189,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         no footprint-neighbor of *x* (per ``self._suffix_conflict_graph``) in
         the same lane has a strictly smaller :func:`_aging_key`.
 
-        Aging key = ``(merge_first_enqueued_at or enqueued_at)`` — older
-        (smaller value) wins; FIFO is the tie-break within equal ages.
+        Aging key = ``(merge_first_enqueued_at or enqueued_at, request_id)`` —
+        older (smaller timestamp) wins; lexically-smaller request_id breaks ties.
 
         Degrades to pure FIFO when the conflict graph is empty or the
         request_id is absent from the graph (``footprint_neighbors`` returns
