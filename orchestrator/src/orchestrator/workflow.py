@@ -298,6 +298,7 @@ class WorkflowState(enum.Enum):
     DONE = 'done'
     BLOCKED = 'blocked'
     ESCALATED = 'escalated'
+    CANCELLED = 'cancelled'
 
 
 class WorkflowOutcome(enum.Enum):
