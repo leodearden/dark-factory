@@ -101,6 +101,13 @@ The gate lives in the **dependent's** scheduler only — it does not affect the 
 
 A task is dispatched only when **all** local deps **and** all `metadata.external_deps` are `done`.
 
+**Deterministic deploy and gate tasks use this same dep mechanism** — including
+cross-project `"project_id:task_id"` deps. The older convention of filing
+deploy capstones in `dark_factory` with a `dark_factory`-internal dependency
+— a workaround for an external-dep gate bug fixed by tasks 1854/1855/1799 — is
+**retired**. Use a `task_kind='deterministic'` deploy or gate task with normal
+deps instead. See "Deterministic task kind" below.
+
 ### Simple-task fast path (`metadata.complexity`)
 
 Set `metadata.complexity = "simple"` to route a task to the single-agent
