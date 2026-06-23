@@ -28,6 +28,7 @@ Mapping:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 from pathlib import Path
 from typing import Literal
@@ -929,9 +930,11 @@ class TestDispatchItemGuardWiring:
         async def _noop_verify(_item, _lease):
             return None
 
-        with mock.patch.object(git_ops, 'get_main_sha', side_effect=_raise_on_get_main):
-            with mock.patch.object(worker, '_run_inflight_verify', _noop_verify):
-                result = await worker._dispatch_item(item)
+        with (
+            mock.patch.object(git_ops, 'get_main_sha', side_effect=_raise_on_get_main),
+            mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
+        ):
+            result = await worker._dispatch_item(item)
 
         # Fail-open: dispatch must return a verifying InflightEntry, not None.
         assert result is not None, (
@@ -944,10 +947,8 @@ class TestDispatchItemGuardWiring:
         # Clean up the background verify task to prevent event-loop warnings.
         if result.verify_task is not None:
             result.verify_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await result.verify_task
-            except (asyncio.CancelledError, Exception):
-                pass
 
     async def test_dispatch_guard_warns_on_non_tip_base(
         self,
@@ -991,10 +992,12 @@ class TestDispatchItemGuardWiring:
         async def _noop_verify(_item, _lease):
             return None
 
-        with mock.patch.object(git_ops, 'get_main_sha', side_effect=_return_main):
-            with mock.patch.object(worker, '_run_inflight_verify', _noop_verify):
-                with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-                    result = await worker._dispatch_item(item_e)
+        with (
+            mock.patch.object(git_ops, 'get_main_sha', side_effect=_return_main),
+            mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        ):
+            result = await worker._dispatch_item(item_e)
 
         # Guard must have fired at least one WARNING naming the dispatched rid.
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1021,7 +1024,5 @@ class TestDispatchItemGuardWiring:
         # Clean up the background verify task.
         if result.verify_task is not None:
             result.verify_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await result.verify_task
-            except (asyncio.CancelledError, Exception):
-                pass
