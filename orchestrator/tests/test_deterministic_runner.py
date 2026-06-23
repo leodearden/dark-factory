@@ -704,10 +704,12 @@ class TestDefaultRunScriptEnv:
         in a sane environment while callers can still override individual variables.
         """
         import os
-        from unittest.mock import patch, AsyncMock as _AsyncMock
+        from unittest.mock import AsyncMock as _AsyncMock
+        from unittest.mock import patch
+
+        from escalation.queue import EscalationQueue
 
         from orchestrator.deterministic_runner import DeterministicRunner
-        from escalation.queue import EscalationQueue
 
         queue = EscalationQueue(tmp_path)
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
