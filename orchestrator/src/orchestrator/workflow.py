@@ -1494,7 +1494,7 @@ class TaskWorkflow:
                 cwd=self.worktree,
             )
 
-    async def run(self) -> WorkflowOutcome:
+    async def run(self) -> WorkflowOutcome:  # pyright: ignore[reportGeneralTypeIssues]
         """Execute the full state machine."""
         branch_name = self.task_id
         try:
@@ -4559,6 +4559,9 @@ class TaskWorkflow:
                 await asyncio.sleep(delay)
 
         # Window exhausted — stamp infra_hold and signal caller to BLOCK
+        # last_infra_exc is guaranteed non-None: the loop only reaches here
+        # after catching at least one VerifyInfraError (max_attempts >= 1).
+        assert last_infra_exc is not None
         reason = (
             f'Verify infra failure not resolved after {max_attempts} in-process '
             f'retries (phase={last_infra_exc.phase!r} errno={last_infra_exc.errno})'

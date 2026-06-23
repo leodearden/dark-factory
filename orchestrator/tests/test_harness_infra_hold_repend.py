@@ -17,11 +17,10 @@ import json
 import os
 import shutil
 from pathlib import Path
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.harness import Harness
 
 # ---------------------------------------------------------------------------
@@ -128,7 +127,7 @@ class TestRevertInProgressInfraHoldGuard:
             f'despite metadata.infra_hold being set and branch being non-degenerate. '
             f'An infra_hold hold must survive the stranded recovery sweep.'
         )
-        for call in harness.scheduler.set_task_status.await_args_list:
+        for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             assert call.args[1] != 'pending', (
                 f'set_task_status({tid!r}, "pending") was called despite infra_hold: '
                 f'{call}'
@@ -156,7 +155,7 @@ class TestRevertInProgressInfraHoldGuard:
         assert result == 'reverted', (
             f'Task without infra_hold should be reverted to pending; got {result!r}'
         )
-        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
 
     async def test_infra_hold_degenerate_branch_still_reverts(
         self, harness: Harness, monkeypatch
@@ -260,7 +259,7 @@ class TestInfraHoldEscalationResolution:
 
         # Must NOT flip to 'pending'
         pending_calls = [
-            c for c in harness.scheduler.set_task_status.await_args_list
+            c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
             if c.args[1] == 'pending'
         ]
         assert not pending_calls, (
@@ -271,13 +270,13 @@ class TestInfraHoldEscalationResolution:
 
         # Must flip to 'in-progress' (resume-at-verify)
         inprog_calls = [
-            c for c in harness.scheduler.set_task_status.await_args_list
+            c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
             if c.args[1] == 'in-progress'
         ]
         assert inprog_calls, (
             f'set_task_status("in-progress") was never called for infra_hold task. '
             f'Expected resume-at-verify but got: '
-            f'{[c.args for c in harness.scheduler.set_task_status.await_args_list]}'
+            f'{[c.args for c in harness.scheduler.set_task_status.await_args_list]}'  # type: ignore[attr-defined]
         )
 
     async def test_no_infra_hold_still_repends(self, harness: Harness):
@@ -303,4 +302,4 @@ class TestInfraHoldEscalationResolution:
         await asyncio.gather(*list(harness._background_tasks))
 
         # Normal resume → flip to 'pending'
-        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]

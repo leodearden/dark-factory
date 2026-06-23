@@ -15,7 +15,6 @@ Step 17: Boundary/repro tests end-to-end.
 
 from __future__ import annotations
 
-import asyncio
 import errno as errno_module
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,11 +22,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec
 
-from orchestrator import verify as verify_module
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyInfraError, VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-
 
 # ---------------------------------------------------------------------------
 # Test-fixture factory
@@ -169,7 +166,7 @@ class TestVerifyInfraTransientRetry:
             await wf._verify_debugfix_loop()
 
         # Verify set_task_status was never called with 'pending'
-        for call_args in wf.scheduler.set_task_status.await_args_list:
+        for call_args in wf.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             args = call_args.args
             # args[1] is the status argument
             if len(args) >= 2:
@@ -226,7 +223,7 @@ class TestVerifyInfraTransientRetry:
         ):
             await wf._verify_debugfix_loop()
 
-        assert not wf._mark_blocked.called, (
+        assert not wf._mark_blocked.called, (  # type: ignore[attr-defined]
             '_mark_blocked must NOT be called when the transient infra error is retried successfully'
         )
 
@@ -269,8 +266,8 @@ class TestVerifyInfraPermanentExhaustion:
             await wf._verify_debugfix_loop()
 
         # update_task must have been called with metadata containing infra_hold
-        assert wf.scheduler.update_task.called, 'update_task must be called to stamp infra_hold'
-        call_kwargs = wf.scheduler.update_task.await_args
+        assert wf.scheduler.update_task.called, 'update_task must be called to stamp infra_hold'  # type: ignore[attr-defined]
+        call_kwargs = wf.scheduler.update_task.await_args  # type: ignore[attr-defined]
         metadata_arg = call_kwargs.kwargs.get('metadata') or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
         assert metadata_arg is not None, 'update_task must receive metadata kwarg'
         assert 'infra_hold' in metadata_arg, f'infra_hold missing from metadata: {metadata_arg}'
@@ -310,7 +307,7 @@ class TestVerifyInfraPermanentExhaustion:
         ):
             await wf._verify_debugfix_loop()
 
-        for call_args in wf.scheduler.set_task_status.await_args_list:
+        for call_args in wf.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             args = call_args.args
             if len(args) >= 2:
                 assert args[1] != 'pending', f'set_task_status called with pending: {call_args}'
@@ -329,7 +326,7 @@ class TestVerifyInfraPermanentExhaustion:
         ):
             await wf._verify_debugfix_loop()
 
-        assert not wf._mark_blocked.called, (
+        assert not wf._mark_blocked.called, (  # type: ignore[attr-defined]
             '_verify_debugfix_loop must NOT call _mark_blocked directly on exhaustion; '
             'that is run()\'s job via _infra_hold_info stash'
         )
@@ -385,8 +382,8 @@ class TestBareInfraOSErrorDefensiveNet:
 
         # Key assertion: _mark_blocked must be called with category='infra_issue'
         # (NOT the default 'task_failure' from the broad except Exception handler)
-        wf._mark_blocked.assert_awaited_once()
-        call_kwargs = wf._mark_blocked.await_args.kwargs
+        wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        call_kwargs = wf._mark_blocked.await_args.kwargs  # type: ignore[attr-defined]
         assert call_kwargs.get('category') == 'infra_issue', (
             f"Expected _mark_blocked(category='infra_issue') but got "
             f"category={call_kwargs.get('category')!r}. "
@@ -430,9 +427,9 @@ class TestBareInfraOSErrorDefensiveNet:
             outcome = await wf.run()
 
         assert outcome == WorkflowOutcome.BLOCKED
-        wf._mark_blocked.assert_awaited_once()
+        wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
         # Non-infra OSError → broad handler → reason starts with 'Workflow error:'
-        call_args = wf._mark_blocked.await_args
+        call_args = wf._mark_blocked.await_args  # type: ignore[attr-defined]
         reason = call_args.args[0] if call_args.args else None
         assert reason is not None and reason.startswith('Workflow error:'), (
             f"Non-infra OSError(EACCES) must use generic handler, got reason={reason!r}"
@@ -499,7 +496,7 @@ class TestBoundaryVerifyInfraReproCases:
         )
 
         # Key boundary assertion: task NEVER set to pending
-        for call_args in wf.scheduler.set_task_status.await_args_list:
+        for call_args in wf.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             args = call_args.args
             if len(args) >= 2:
                 assert args[1] != 'pending', (
@@ -509,9 +506,9 @@ class TestBoundaryVerifyInfraReproCases:
                 )
 
         # Implement footprint guard: verify no dispatch occurred (no pending)
-        assert wf.scheduler.set_task_status.await_count == 0 or all(
+        assert wf.scheduler.set_task_status.await_count == 0 or all(  # type: ignore[attr-defined]
             c.args[1] != 'pending'
-            for c in wf.scheduler.set_task_status.await_args_list
+            for c in wf.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
             if len(c.args) >= 2
         ), 'Implement footprint must not be re-acquired (no pending dispatch)'
 
@@ -543,15 +540,15 @@ class TestBoundaryVerifyInfraReproCases:
         )
 
         # Must NOT have been set to pending
-        for call_args in wf.scheduler.set_task_status.await_args_list:
+        for call_args in wf.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             if len(call_args.args) >= 2:
                 assert call_args.args[1] != 'pending', (
                     f'set_task_status("pending") called for infra_hold task: {call_args}'
                 )
 
         # infra_hold must be in metadata (enables harness step-16 resume path)
-        assert wf.scheduler.update_task.called, 'update_task must stamp infra_hold metadata'
-        call_kwargs = wf.scheduler.update_task.await_args
+        assert wf.scheduler.update_task.called, 'update_task must stamp infra_hold metadata'  # type: ignore[attr-defined]
+        call_kwargs = wf.scheduler.update_task.await_args  # type: ignore[attr-defined]
         metadata_arg = (
             call_kwargs.kwargs.get('metadata')
             or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
@@ -576,7 +573,7 @@ class TestBoundaryVerifyInfraReproCases:
         )
 
         # Loop must NOT call _mark_blocked itself (that is run()'s responsibility)
-        assert not wf._mark_blocked.called, (
+        assert not wf._mark_blocked.called, (  # type: ignore[attr-defined]
             '_verify_debugfix_loop must not call _mark_blocked directly on exhaustion; '
             'only run() should invoke it via _infra_hold_info stash'
         )
@@ -620,8 +617,8 @@ class TestBoundaryVerifyInfraReproCases:
 
         assert result is not None, (
             '_run_scoped_verification_with_infra_retry must return a VerifyResult '
-            f'when VerifyInfraError clears on retry, got None '
-            f'(implies the retry was NOT triggered — the error was swallowed or mismapped).'
+            'when VerifyInfraError clears on retry, got None '
+            '(implies the retry was NOT triggered — the error was swallowed or mismapped).'
         )
         assert result.passed is True, (
             f'Expected passed=True on successful retry, got result={result!r}'

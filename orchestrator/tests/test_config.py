@@ -1657,17 +1657,8 @@ class TestVerifyInfraRetryConfig:
 
     def test_verify_infra_retry_fields_override_from_yaml(self, monkeypatch, tmp_path):
         """Fields load and override correctly from a YAML mapping via load_config."""
-        from io import StringIO
-        from orchestrator.config import load_config
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
-
-        yaml_content = (
-            'verify_infra_retry_max_attempts: 10\n'
-            'verify_infra_retry_backoff_secs: 5.0\n'
-            'verify_infra_retry_max_backoff_secs: 120.0\n'
-        )
-        project_cfg = load_config.__wrapped__ if hasattr(load_config, '__wrapped__') else None
         # Use direct OrchestratorConfig construction with dict (avoids file path)
         cfg = OrchestratorConfig(
             verify_infra_retry_max_attempts=10,
