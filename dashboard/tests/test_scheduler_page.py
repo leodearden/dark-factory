@@ -2100,7 +2100,7 @@ def test_module_contention_counts_attaches_parked_by_and_stack():
         f"Expected parked_by=None for unparked module, got {other_entry['parked_by']!r}"
     )
     assert other_entry['parked_by_project'] is None, (
-        f"Expected parked_by_project=None for unparked module"
+        "Expected parked_by_project=None for unparked module"
     )
     assert other_entry['park_stack'] == [], (
         f"Expected park_stack=[] for unparked module, got {other_entry['park_stack']!r}"
