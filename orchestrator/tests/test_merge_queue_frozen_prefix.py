@@ -669,3 +669,156 @@ class TestSnapshotFrozenPrefixKey:
         snap = worker.snapshot()
         assert 'metrics' in snap
         assert snap['metrics'] == worker._merge_metrics.as_snapshot()
+
+
+# ── step-11 RED: _warn_if_verify_base_not_frozen_tip log-only guard ───────────
+
+
+@pytest.mark.asyncio
+class TestWarnIfVerifyBaseNotFrozenTip:
+    """_warn_if_verify_base_not_frozen_tip warns when verify base != frozen tip.
+
+    The method is log-only: it never mutates state, never raises, returns None.
+
+    RED until step-12 GREEN adds _warn_if_verify_base_not_frozen_tip.
+    """
+
+    async def test_speculative_only_base_logs_warning(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Candidate base_sha != frozen_prefix_tip → exactly one WARNING logged."""
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        # Frozen predecessor: merge_commit == 'sha-Dc'
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        # Candidate item: base_sha is a speculative-only SHA (not the frozen tip)
+        req_e, item_e = _make_fake_item(
+            't-e', base_sha='wrong-speculative-base', merge_commit='sha-Ec',
+            config=config, git_repo=git_repo,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+
+        # Returns None (log-only, no side effect)
+        assert result is None
+
+        # Exactly one WARNING mentioning the rid and 'frozen'
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert len(warnings) == 1, (
+            f'expected exactly 1 WARNING, got {len(warnings)}: {[r.message for r in warnings]}'
+        )
+        warning_text = warnings[0].getMessage()
+        assert req_e.request_id in warning_text or item_e.request.request_id in warning_text, (
+            f'WARNING does not mention the candidate rid: {warning_text!r}'
+        )
+        assert 'frozen' in warning_text.lower(), (
+            f'WARNING does not mention "frozen": {warning_text!r}'
+        )
+
+    async def test_base_matches_frozen_tip_no_warning(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Candidate base_sha == frozen_prefix_tip(main) → NO warning logged."""
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        # Frozen predecessor: merge_commit == 'sha-Dc'
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        # Candidate item: base_sha == frozen_prefix_tip (correct)
+        _, item_e = _make_fake_item(
+            't-e', base_sha='sha-Dc', merge_commit='sha-Ec',
+            config=config, git_repo=git_repo,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 0, (
+            f'expected no WARNINGs, got: {[r.message for r in warnings]}'
+        )
+
+    async def test_empty_frozen_prefix_base_matches_main_no_warning(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Empty frozen prefix, candidate base_sha == main_sha → NO warning."""
+        import logging
+
+        worker = _make_worker(git_ops)
+        # No in-flight entries → frozen_prefix_tip('main0') == 'main0'
+
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._warn_if_verify_base_not_frozen_tip(item_d, 'main0')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 0, (
+            f'expected no WARNINGs, got: {[r.message for r in warnings]}'
+        )
+
+    async def test_method_does_not_mutate_state(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """_warn_if_verify_base_not_frozen_tip never mutates worker state."""
+        worker = _make_worker(git_ops)
+        _, item_d = _make_fake_item(
+            't-d', base_sha='main0', merge_commit='sha-Dc',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+
+        # Candidate with wrong base (triggers warning path)
+        _, item_e = _make_fake_item(
+            't-e', base_sha='wrong-base', merge_commit='sha-Ec',
+            config=config, git_repo=git_repo,
+        )
+
+        # Capture state before
+        pre_frozen = worker.frozen_prefix()
+        pre_inflight_len = len(worker._inflight)
+        pre_tip = worker.frozen_prefix_tip('main0')
+
+        worker._warn_if_verify_base_not_frozen_tip(item_e, 'main0')
+
+        # State must be entirely unchanged
+        assert worker.frozen_prefix() == pre_frozen
+        assert len(worker._inflight) == pre_inflight_len
+        assert worker.frozen_prefix_tip('main0') == pre_tip
