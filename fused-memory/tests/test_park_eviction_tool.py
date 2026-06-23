@@ -144,3 +144,98 @@ async def test_request_park_eviction_happy_path(tmp_path, mcp_server):
         f'requested_at {requested_at_col!r} is not tz-aware; '
         'δ drain relies on ISO8601 UTC timestamps for ordering'
     )
+
+
+# ===========================================================================
+# Validation guards — invalid project_root
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_root,label', [
+    ('', 'empty string'),
+    ('relative/root', 'relative path'),
+])
+async def test_request_park_eviction_rejects_invalid_project_root(
+    tmp_path, mcp_server, bad_root, label,
+):
+    """Invalid project_root (empty or relative) returns ValidationError; no row written.
+
+    _normalize_project_root in tools.py rejects non-absolute paths, so this
+    guard is free — just asserting the contract holds for this tool too.
+    """
+    result = await mcp_server._tool_manager.call_tool(
+        'request_park_eviction',
+        {'task_id': '42', 'project_root': bad_root},
+    )
+    assert result.get('error_type') == 'ValidationError', (
+        f'{label!r}: expected ValidationError, got {result!r}'
+    )
+
+    # No row must be written (DB may not even exist yet).
+    assert _row_count(tmp_path) == 0, (
+        f'{label!r}: expected 0 rows after validation failure, found rows'
+    )
+
+
+# ===========================================================================
+# Validation guards — empty / whitespace task_id
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_task_id,label', [
+    ('', 'empty string'),
+    ('   ', 'whitespace only'),
+])
+async def test_request_park_eviction_rejects_empty_task_id(
+    tmp_path, mcp_server, bad_task_id, label,
+):
+    """Empty or whitespace-only task_id returns ValidationError; no row written.
+
+    The NOT NULL task_id column must never receive a blank value — this guard
+    enforces that at the tool boundary so the DB constraint is never exercised.
+    """
+    result = await mcp_server._tool_manager.call_tool(
+        'request_park_eviction',
+        {'task_id': bad_task_id, 'project_root': str(tmp_path)},
+    )
+    assert result.get('error_type') == 'ValidationError', (
+        f'{label!r}: expected ValidationError, got {result!r}'
+    )
+
+    # No row must be written (DB may not even exist yet).
+    assert _row_count(tmp_path) == 0, (
+        f'{label!r}: expected 0 rows after validation failure, found rows'
+    )
+
+
+# ===========================================================================
+# Append-only — two calls produce two rows
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_request_park_eviction_append_only(tmp_path, mcp_server):
+    """Two calls with the same task_id produce TWO rows (plain INSERT, no dedupe).
+
+    δ's drain reads ALL rows then deletes them; deduplication is the drain's
+    responsibility, not the enqueue tool's.  If this tool used upsert/dedupe
+    the second operator request would be silently swallowed.
+    """
+    r1 = await mcp_server._tool_manager.call_tool(
+        'request_park_eviction',
+        {'task_id': '99', 'project_root': str(tmp_path)},
+    )
+    assert r1 == {'requested': True, 'task_id': '99'}
+
+    r2 = await mcp_server._tool_manager.call_tool(
+        'request_park_eviction',
+        {'task_id': '99', 'project_root': str(tmp_path)},
+    )
+    assert r2 == {'requested': True, 'task_id': '99'}
+
+    count = _row_count(tmp_path)
+    assert count == 2, (
+        f'expected 2 rows after two enqueues (plain INSERT, no dedupe), got {count}'
+    )
