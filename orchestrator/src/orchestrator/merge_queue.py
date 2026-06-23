@@ -5783,6 +5783,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Per-item: (head_sha | None, changed_paths | None)
         heads: list[str | None] = []
         changed_paths_list: list[list[str] | None] = []
+        # Initialised exactly once here so that a get_changed_files failure
+        # (set to True below) survives into the signature-caching gate at the
+        # end of this method.  Do NOT re-initialise this flag in later steps.
+        _any_probe_error = False
 
         for req in suffix:
             ref = f'{branch_prefix}{req.branch}'
@@ -5817,7 +5821,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # ── 5. Build footprint_edges via path-set intersection ────────────────
         detector = get_overlap_detector(None)
         footprint_edges: set[frozenset[str]] = set()
-        _any_probe_error = False  # tracks transient errors; gates signature caching
 
         # Precompute footprints once per item — avoids O(E·n) recomputation
         # inside the O(n²) pairwise loop (each detector.footprint() call
