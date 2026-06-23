@@ -238,6 +238,7 @@ class EscalationQueue:
             archive_root / subdir / f'{escalation_id}.json'
             for subdir, stems in listing.items()
             if escalation_id in stems
+            and (archive_root / subdir / f'{escalation_id}.json').exists()
         ]
         if not candidates:
             return None
