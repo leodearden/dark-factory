@@ -2186,3 +2186,132 @@ def test_stranded_park_rows_flags_dead_owner():
     assert sorted(r2['lock_set']) == ['m1', 'm2'], (
         f"lock_set must list both modules, got {r2['lock_set']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1870 step-5: integration — collect_scheduler_state surfaces stranded
+#   row + modules[].parked_by
+# ---------------------------------------------------------------------------
+
+
+async def test_collect_scheduler_state_surfaces_stranded_and_parked_by(
+    dummy_client, dummy_config,
+):
+    """Integration: collect_scheduler_state populates park fields and emits stranded rows.
+
+    Snapshot carries:
+      - 'mlive': 2-deep live park (owners 'low'+'high', both in active_tasks → B1)
+      - 'mdead': orphaned dead park (owner '99' NOT in active_tasks → B2)
+    active_tasks lists 'low'/'high' with meta_files=['mlive'].
+
+    Assertions:
+      (a) A row with task_id=='99' and stranded is True exists (B2 not dropped).
+      (b) The 'mlive' module has parked_by=='high', parked_owner_live is True,
+          len(park_stack)==2.
+      (c) The 'mdead' module has parked_by=='99', parked_owner_live is False.
+      (d) The synthetic stranded row did NOT inflate any module's contention
+          (contention counts reflect live waiters only).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+    iso = '2026-01-01T10:00:00+00:00'
+
+    snapshot = _scheduler_snapshot(
+        park_stacks={
+            'mlive': [
+                {'owner': 'low', 'rank': 10, 'shadowed': True, 'installed_at': iso},
+                {'owner': 'high', 'rank': 5, 'shadowed': False, 'installed_at': iso},
+            ],
+            'mdead': [
+                {'owner': '99', 'rank': 3, 'shadowed': False, 'installed_at': iso},
+            ],
+        },
+        snapshot_at='2026-01-01T10:00:00+00:00',
+    )
+
+    # 'low' and 'high' are live; '99' is NOT in active_tasks (dead/stranded)
+    # meta_files=['mlive'] → lock_set=['mlive'] at depth=2 (single-component path)
+    active_tasks = [
+        {
+            'id': f'{project}/T-low',
+            'project': project,
+            'title': 'Low task',
+            'priority': 'low',
+            'status': 'in-progress',
+            'started': 1,
+            'meta_files': ['mlive'],
+        },
+        {
+            'id': f'{project}/T-high',
+            'project': project,
+            'title': 'High task',
+            'priority': 'high',
+            'status': 'in-progress',
+            'started': 1,
+            'meta_files': ['mlive'],
+        },
+    ]
+
+    mock_mcp = AsyncMock(side_effect=[snapshot, []])
+    mock_active = AsyncMock(return_value=(active_tasks, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        rows, modules, _pins, _events, offline, _paused = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert offline == [], f'Expected no offline projects, got {offline!r}'
+
+    # (a) B2: stranded row for dead owner '99' must appear in rows
+    stranded = [r for r in rows if r.get('task_id') == '99']
+    assert len(stranded) == 1, (
+        f"Expected 1 stranded row for owner '99', got {len(stranded)}: {stranded!r}"
+    )
+    assert stranded[0].get('stranded') is True, (
+        f"Row for owner '99' must have stranded=True, got {stranded[0]!r}"
+    )
+
+    # (b) B1: 'mlive' module has parked_by='high', parked_owner_live=True, stack depth=2
+    by_path = {m['path']: m for m in modules}
+    assert 'mlive' in by_path, (
+        f"Module 'mlive' must be in modules; got paths: {list(by_path)!r}"
+    )
+    mlive = by_path['mlive']
+    assert mlive['parked_by'] == 'high', (
+        f"mlive.parked_by must be 'high' (active top), got {mlive.get('parked_by')!r}"
+    )
+    assert mlive['parked_owner_live'] is True, (
+        f"mlive.parked_owner_live must be True, got {mlive.get('parked_owner_live')!r}"
+    )
+    assert len(mlive.get('park_stack', [])) == 2, (
+        f"mlive.park_stack must have 2 entries, got {mlive.get('park_stack')!r}"
+    )
+
+    # (c) 'mdead' module has parked_by='99', parked_owner_live=False (dead park)
+    assert 'mdead' in by_path, (
+        f"Module 'mdead' must be in modules (park-only, contention=0); "
+        f"got paths: {list(by_path)!r}"
+    )
+    mdead = by_path['mdead']
+    assert mdead['parked_by'] == '99', (
+        f"mdead.parked_by must be '99', got {mdead.get('parked_by')!r}"
+    )
+    assert mdead['parked_owner_live'] is False, (
+        f"mdead.parked_owner_live must be False, got {mdead.get('parked_owner_live')!r}"
+    )
+
+    # (d) Contention must reflect live waiters only — stranded row must NOT inflate it
+    assert mlive['contention'] == 2, (
+        f"mlive.contention must be 2 (live waiters 'low'+'high'), "
+        f"got {mlive.get('contention')!r}"
+    )
+    assert mdead['contention'] == 0, (
+        f"mdead.contention must be 0 (no live waiters); "
+        f"stranded row for '99' must NOT inflate contention, "
+        f"got {mdead.get('contention')!r}"
+    )
