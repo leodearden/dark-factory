@@ -39,6 +39,15 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _run,
 )
+from orchestrator.overlap_footprint import (  # noqa: F401  re-export seam for δ/ζ consumers
+    DEFAULT_OVERLAP_DETECTOR,
+    DefaultPathOverlapDetector,
+    Footprint,
+    OverlapFootprintDetector,
+    changesets_overlap,
+    get_overlap_detector,
+    register_overlap_detector,
+)
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
