@@ -2143,7 +2143,7 @@ class TaskKnowledgeSync(BaseStage):
         # automatically flows through to this counter without drift.
         self._rescued_in_window_markers = len(partition.rescued_ids)
 
-        surviving = active_flags
+        surviving = active_flags  # active-query path is pass-through (no scope filter)
 
         # FIX D — stale-flag persistence tracking.
         # Track how many cycles each surviving flag has survived without being
