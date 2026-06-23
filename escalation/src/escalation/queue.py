@@ -289,6 +289,13 @@ class EscalationQueue:
         scan the archive at most once per instance lifetime.  The listing
         is lazily built on the first archive miss and incrementally updated
         by _archive_resolved() when this instance archives a new escalation.
+
+        Per-instance freshness: escalations resolved by another
+        EscalationQueue instance (e.g. a concurrent process) after this
+        instance's listing was built are not visible until this instance
+        next calls _archive_resolved().  get() returns None in that window,
+        degrading gracefully rather than raising.  This is consistent with
+        the single-writer production model (one harness process per queue).
         """
         path = self._locate_path(escalation_id)
         if path is None:
@@ -946,8 +953,13 @@ class EscalationQueue:
                 archived_task_id = head[len('esc-'):]
                 archived_seq = int(tail)
             except (ValueError, IndexError):
-                # Non-conforming id: clear the whole cache to force fresh scans.
-                self._archive_max_seq_cache.clear()
+                # Non-conforming id: cannot identify which task_id to update,
+                # so leave all other cached entries intact.  Log a warning so a
+                # genuinely malformed escalation_id is observable.
+                logger.warning(
+                    f'Could not parse task_id/seq from escalation_id {escalation_id!r}; '
+                    'max_seq cache not updated for this archive write'
+                )
             else:
                 if archived_task_id in self._archive_max_seq_cache:
                     self._archive_max_seq_cache[archived_task_id] = max(
@@ -999,8 +1011,17 @@ class EscalationQueue:
         archive contribution is cached per task_id in _archive_max_seq_cache:
         on a cache miss, _scan_archive_max_seq() scans the archive once and
         stores the result; subsequent calls for the same task_id are O(1).
-        _archive_resolved() bumps the cache upward on each archive write so
-        make_id() always observes the correct max without a rescan.
+        _archive_resolved() bumps the cache upward on each archive write.
+
+        Per-instance freshness: the cache is correct only for the
+        single-writer model (one EscalationQueue instance owns a given
+        task_id's escalations).  If a concurrent process archives an
+        escalation for a task_id whose entry is already seeded in this
+        instance's cache, the cache will not reflect that higher seq until
+        this instance's _archive_resolved() runs for that task_id.  In
+        production, harness.py owns a single long-lived EscalationQueue
+        per process and sentinel task_ids are not shared across processes,
+        so this invariant holds.
         """
         prefix = f'esc-{task_id}-'
         max_seq = 0

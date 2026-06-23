@@ -2653,13 +2653,14 @@ class TestArchiveListingMemoisation:
         """Calling get(id) three times on a FRESH instance must scan the archive <=1x.
 
         Instance A: submit + resolve 'esc-1-1' (moves it to archive).
-        Instance B: fresh, cache unbuilt.  Spy _iter_archive_paths (wraps).
+        Instance B: fresh, cache unbuilt.  Spy _scan_archive_listing (wraps).
         Three sequential B.get('esc-1-1') calls.
         (a) all calls return status='resolved'.
-        (b) spy.call_count <= 1 (archive scanned at most once total).
+        (b) spy.call_count <= 1 (_scan_archive_listing called at most once total).
 
-        RED on current main: _locate_path calls _iter_archive_paths on every
-        root-miss → call_count == 3 → assertion (<=1) fails.
+        The listing is built by _scan_archive_listing (a single rglob); subsequent
+        gets use the cached dict.  Spying _iter_archive_paths would always show 0
+        calls because the new code path never calls it for get() lookups.
         """
         queue_dir = tmp_path / 'queue'
 
@@ -2672,7 +2673,7 @@ class TestArchiveListingMemoisation:
         instance_b = EscalationQueue(queue_dir)
 
         with patch.object(
-            instance_b, '_iter_archive_paths', wraps=instance_b._iter_archive_paths,
+            instance_b, '_scan_archive_listing', wraps=instance_b._scan_archive_listing,
         ) as spy:
             result1 = instance_b.get('esc-1-1')
             result2 = instance_b.get('esc-1-1')
@@ -2687,7 +2688,7 @@ class TestArchiveListingMemoisation:
 
         # (b) Archive must be scanned at most once (memoised listing).
         assert spy.call_count <= 1, (
-            f'Expected archive scanned <=1x but _iter_archive_paths called '
+            f'Expected _scan_archive_listing called <=1x but got '
             f'{spy.call_count}x across three get() calls'
         )
 
@@ -2697,12 +2698,17 @@ class TestArchiveListingMemoisation:
         Sequence on a SINGLE instance:
         1. Submit + resolve 'esc-1-1' (archives it).
         2. Call get('esc-1-1') to force the listing cache to build (snapshot captured).
-        3. Spy _iter_archive_paths AFTER the cache is built.
+        3. Spy _scan_archive_listing AFTER the cache is built.
         4. Submit + resolve 'esc-2-1' (must update the cache incrementally).
         5. Call get('esc-2-1').
         Assert:
         (a) get('esc-2-1') returns the resolved escalation (not None).
-        (b) spy.call_count == 0 — the new id was found via incremental update, not rescan.
+        (b) spy.call_count == 0 — the new id was found via incremental update, not a
+            second _scan_archive_listing call.
+
+        Spying _scan_archive_listing (not _iter_archive_paths) is correct because
+        the listing is built by _scan_archive_listing's rglob; incremental updates
+        mutate the cached dict directly without calling any scan helper.
 
         RED on main-with-only-step-2: cache built after step 2 (snapshot lacks esc-2-1)
         → get('esc-2-1') returns None → assertion (a) fails.
@@ -2720,7 +2726,7 @@ class TestArchiveListingMemoisation:
 
         # Step 3: spy AFTER the cache is already populated.
         with patch.object(
-            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+            queue, '_scan_archive_listing', wraps=queue._scan_archive_listing,
         ) as spy:
             # Step 4: archive a NEW escalation.
             queue.submit(_make_escalation('esc-2-1', task_id='2'))
@@ -2739,7 +2745,8 @@ class TestArchiveListingMemoisation:
 
         # (b) No rescan occurred — the new id was in the updated cache.
         assert spy.call_count == 0, (
-            f'Expected 0 archive rescans but _iter_archive_paths called {spy.call_count}x'
+            f'Expected 0 _scan_archive_listing calls (incremental update used instead) '
+            f'but got {spy.call_count}x'
         )
 
     def test_pruned_archive_file_returns_none_not_raise(self, tmp_path: Path):
