@@ -1516,42 +1516,47 @@ class TaskWorkflow:
                 return recovery
 
             # ── Lever C: SIMPLE_TASK optimistic path ──────────────────
-            # When the task title matches a small/well-bounded change and
-            # auto_eval_redo metadata is absent, dispatch a single Sonnet
-            # agent that explores, plans (via plan-tools MCP), and
-            # implements end-to-end. Falls through to the architect path
-            # on any failure (no plan written, unactionable artifact,
-            # no steps marked done).
+            # Dispatch a single Sonnet agent that explores, plans (via
+            # plan-tools MCP), and implements end-to-end when the task's
+            # author declared metadata.complexity='simple' and no
+            # hard-blocker token in the description contradicts that
+            # declaration.  The priority guard and file/lock-footprint
+            # caps are intentionally absent — a simple task may be
+            # high-priority or span several files as long as the change is
+            # mechanically simple.  Falls through to the architect path on
+            # any failure (no plan written, unactionable artifact, no steps
+            # marked done).  metadata.force_full_path is the hard escape
+            # that always forces the full path.
+            from orchestrator.agents.triage import is_declared_simple_task
             if (
                 not self.initial_plan
                 and self.config.simple_task_enabled
                 and not (self.task.get('metadata') or {}).get('auto_eval_redo')
                 and not (self.task.get('metadata') or {}).get('force_full_path')
+                and is_declared_simple_task(self.task)
             ):
-                from orchestrator.agents.triage import classify_simple_task
-                if classify_simple_task(self.task):
-                    self._enter_phase(WorkflowState.PLAN)
-                    simple_outcome = await self._run_simple_task()
-                    if simple_outcome == WorkflowOutcome.PLANNED:
-                        # Plan written + step(s) marked done by SIMPLE_TASK.
-                        # _execute_iterations will see no pending steps and
-                        # return cleanly, allowing VERIFY to take over.
-                        pass  # fall through to the post-PLAN section below
-                    elif simple_outcome == WorkflowOutcome.DONE:
-                        # SIMPLE_TASK reported task_already_done.
-                        return simple_outcome
-                    elif simple_outcome == WorkflowOutcome.BLOCKED:
-                        # SIMPLE_TASK reported unactionable_task — terminal.
-                        return simple_outcome
-                    else:
-                        # Fallthrough sentinel — drop the plan so the
-                        # architect path runs cleanly.
-                        if self.artifacts is not None:
-                            plan_path = self.artifacts.root / 'plan.json'
-                            plan_path.unlink(missing_ok=True)
-                            (self.artifacts.root / 'plan.lock').unlink(
-                                missing_ok=True,
-                            )
+                self._enter_phase(WorkflowState.PLAN)
+                simple_outcome = await self._run_simple_task()
+                if simple_outcome == WorkflowOutcome.PLANNED:
+                    # Plan written + step(s) marked done by SIMPLE_TASK.
+                    # _execute_iterations will see no pending steps and
+                    # return cleanly, allowing VERIFY to take over.
+                    pass  # fall through to the post-PLAN section below
+                elif simple_outcome == WorkflowOutcome.DONE:
+                    # SIMPLE_TASK reported task_already_done.
+                    return simple_outcome
+                elif simple_outcome == WorkflowOutcome.BLOCKED:
+                    # SIMPLE_TASK reported unactionable_task — terminal.
+                    return simple_outcome
+                else:
+                    # Fallthrough sentinel — drop the plan so the
+                    # architect path runs cleanly.
+                    if self.artifacts is not None:
+                        plan_path = self.artifacts.root / 'plan.json'
+                        plan_path.unlink(missing_ok=True)
+                        (self.artifacts.root / 'plan.lock').unlink(
+                            missing_ok=True,
+                        )
 
             # PLAN (skip if initial_plan was provided — eval mode, or if
             # the SIMPLE_TASK path above already populated self.plan)
