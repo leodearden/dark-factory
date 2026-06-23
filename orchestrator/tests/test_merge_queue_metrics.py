@@ -212,3 +212,96 @@ class TestWorkerSnapshotMetricsKey:
         snap = worker.snapshot()
         for key in ('entries', 'depth', 'head_of_line', 'suffix_conflict_graph'):
             assert key in snap, f"pre-existing key '{key}' missing from snapshot"
+
+
+# ---------------------------------------------------------------------------
+# step-05: worker wiring helpers
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerWiringHelpers:
+    """Worker helper methods delegate to _merge_metrics and _drift_base.
+
+    RED until step-06 GREEN adds the four helper methods to SpeculativeMergeWorker.
+    """
+
+    def test_note_merge_started_stashes_main_position(self):
+        """_note_merge_started(rid) stores current main_position into _drift_base."""
+        worker = _make_bare_worker()
+        # Advance main_position via 2 landings, then start a request
+        worker._merge_metrics.record_landing()
+        worker._merge_metrics.record_landing()
+        worker._note_merge_started('req-abc')
+        assert worker._drift_base['req-abc'] == 2
+
+    def test_note_merge_started_at_zero(self):
+        """_note_merge_started stashes position 0 on a fresh worker."""
+        worker = _make_bare_worker()
+        worker._note_merge_started('req-zero')
+        assert worker._drift_base['req-zero'] == 0
+
+    def test_note_merge_landing_increments_landings_and_pops_drift_base(self):
+        """_note_merge_landing increments landings and pops _drift_base entry."""
+        worker = _make_bare_worker()
+        worker._note_merge_started('req-land')
+        assert 'req-land' in worker._drift_base
+
+        worker._note_merge_landing('req-land')
+
+        assert worker._merge_metrics.landings == 1
+        assert 'req-land' not in worker._drift_base
+
+    def test_note_merge_landing_pops_only_own_entry(self):
+        """_note_merge_landing only pops its own request_id from _drift_base."""
+        worker = _make_bare_worker()
+        worker._note_merge_started('req-a')
+        worker._note_merge_started('req-b')
+        worker._note_merge_landing('req-a')
+        assert 'req-b' in worker._drift_base
+        assert 'req-a' not in worker._drift_base
+
+    def test_note_merge_retry_increments_retries(self):
+        """_note_merge_retry() increments the retries counter."""
+        worker = _make_bare_worker()
+        assert worker._merge_metrics.retries == 0
+        worker._note_merge_retry()
+        assert worker._merge_metrics.retries == 1
+        worker._note_merge_retry()
+        assert worker._merge_metrics.retries == 2
+
+    def test_note_conflict_detected_records_drift_and_pops(self):
+        """_note_conflict_detected(rid) records drift = (main_position - base) and pops."""
+        worker = _make_bare_worker()
+        # Start req-c at position 0
+        worker._note_merge_started('req-c')
+        # Simulate 3 clean landings (main advances by 3)
+        worker._merge_metrics.record_landing()
+        worker._merge_metrics.record_landing()
+        worker._merge_metrics.record_landing()
+        # Detect conflict → drift should be 3 - 0 = 3
+        worker._note_conflict_detected('req-c')
+
+        snap = worker.snapshot()
+        dd = snap['metrics']['drift_at_detection']
+        assert dd['count'] == 1
+        assert dd['last'] == 3
+        assert 'req-c' not in worker._drift_base
+
+    def test_concrete_scenario_drift_equals_intervening_landings(self):
+        """Full scenario: start A at pos 0, land 3 times, conflict A → drift=3."""
+        worker = _make_bare_worker()
+        worker._note_merge_started('req-A')
+        # 3 clean landings by other requests
+        worker._note_merge_landing('req-X')
+        worker._note_merge_landing('req-Y')
+        worker._note_merge_landing('req-Z')
+        # conflict on req-A
+        worker._note_conflict_detected('req-A')
+        snap = worker.snapshot()
+        assert snap['metrics']['drift_at_detection']['last'] == 3
+
+    def test_note_conflict_detected_noop_when_not_started(self):
+        """_note_conflict_detected for unknown rid doesn't raise (defensive)."""
+        worker = _make_bare_worker()
+        # Should not raise even if req was never started
+        worker._note_conflict_detected('req-missing')
