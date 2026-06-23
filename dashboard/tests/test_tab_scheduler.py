@@ -324,6 +324,49 @@ def test_index_html_cache_buster_bumped(index_html_body):
     )
 
 
+# ---------------------------------------------------------------------------
+# step-3 (task 1873): evict-park guarded button — JSX source-structure tests
+# ---------------------------------------------------------------------------
+
+
+def test_evict_park_endpoint_referenced_in_jsx(tab_scheduler_jsx_body):
+    """tab_scheduler.jsx must reference the evict-park POST endpoint URL."""
+    assert '/api/v2/dashboard/scheduler/evict-park' in tab_scheduler_jsx_body, (
+        'tab_scheduler.jsx must reference /api/v2/dashboard/scheduler/evict-park '
+        '(the evict POST target)'
+    )
+
+
+def test_handle_evict_and_on_evict_wired(tab_scheduler_jsx_body):
+    """handleEvict callback must be defined and onEvict must be passed to ParkStacksSection."""
+    assert re.search(r'\bhandleEvict\b', tab_scheduler_jsx_body), (
+        'tab_scheduler.jsx must define a handleEvict callback'
+    )
+    assert re.search(r'onEvict\s*=\s*\{handleEvict\}', tab_scheduler_jsx_body), (
+        'tab_scheduler.jsx must pass onEvict={handleEvict} to <ParkStacksSection'
+    )
+
+
+def test_evict_button_guard_is_per_entry_live(tab_scheduler_jsx_body):
+    """The evict button's disabled guard must be per-entry liveness: disabled={entry.live}.
+
+    A bare `entry.live` already appears at line ~162 for the isDead variable;
+    the discriminating assertion pins the `disabled={entry.live}` attribute form,
+    which is absent until the evict button is implemented.
+    """
+    assert re.search(r'disabled\s*=\s*\{\s*entry\.live\s*\}', tab_scheduler_jsx_body), (
+        'tab_scheduler.jsx evict button must be guarded with disabled={entry.live} '
+        '(enabled only for non-live owners; defense-in-depth UI guard)'
+    )
+
+
+def test_evict_button_label_present(tab_scheduler_jsx_body):
+    """An evict button label or title must be present in ParkStacksSection."""
+    assert re.search(r'evict', tab_scheduler_jsx_body, re.IGNORECASE), (
+        'tab_scheduler.jsx must render an evict button/label in ParkStacksSection'
+    )
+
+
 def test_styles_css_widens_scheduler_title_column(styles_css_body):
     """styles.css must widen the scheduler title column to readable widths.
 
