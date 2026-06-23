@@ -279,6 +279,111 @@ def _module_contention_counts(
     return sorted(result, key=lambda m: (-m['contention'], m['path']))
 
 
+def _park_age_seconds(installed_at) -> int:
+    """Compute elapsed seconds from an installed_at value (ISO-8601 string or empty).
+
+    Mirrors the age-calculation logic in ``_compose_rows`` so stranded-row age
+    is computed identically and the tolerate-non-string guard is preserved.
+
+    Args:
+        installed_at: Raw value from a park-stack entry (str, int, None, …).
+                      Non-string values are coerced via ``str(...)``; empty or
+                      unparseable values fall back to 0.
+
+    Returns:
+        Non-negative integer seconds elapsed since *installed_at*, or 0 on
+        parse failure.
+    """
+    installed_at_str = str(installed_at or '')
+    try:
+        ts = datetime.fromisoformat(installed_at_str.replace('Z', '+00:00'))
+        return max(0, int((datetime.now(UTC) - ts).total_seconds()))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _stranded_park_rows(
+    park_stacks: dict,
+    live_task_ids: set[str],
+    *,
+    project: str | None = None,
+    project_root: str | None = None,
+) -> list[dict]:
+    """Emit one synthetic row for each distinct park owner absent from live_task_ids.
+
+    This is the orphan/stranded pass — it closes the gap left by the
+    ``_compose_rows`` loop which only visits owners present in active_tasks.
+    A park owner not in active_tasks (dead owner) would otherwise be silently
+    dropped, hiding eviction candidates from the UI.
+
+    The synthetic rows carry ``stranded=True`` so the JSX can render a
+    stranded-parks alert banner and (in future task ζ) host an evict button.
+    They are appended to ``all_rows`` AFTER ``_module_contention_counts`` is
+    called, so they do not inflate contention counts.
+
+    Args:
+        park_stacks:   ``{module_key: [entry, ...]}`` from the scheduler
+                       snapshot.  Each stack entry has ``owner``, ``rank``,
+                       ``shadowed``, and ``installed_at`` fields.
+        live_task_ids: Set of task_ids present in the active-tasks snapshot
+                       (``{r['task_id'] for r in rows}``).  Owners in this
+                       set are live and are skipped.
+        project:       Project display label (propagated verbatim to the row).
+        project_root:  Absolute project path (propagated verbatim to the row).
+
+    Returns:
+        One synthetic row dict per distinct dead owner, with the standard
+        row shape defaulted and the following extra markers:
+          stranded=True, parked_owner_live=False,
+          park_state={'modules': sorted(mods), 'installed_at': str},
+          lock_set=sorted(mods), age_seconds=int.
+    """
+    # Build {owner: {'mods': [module, ...], 'installed_at': str}} across all stacks.
+    owner_data: dict[str, dict] = {}
+    for mod, stack in (park_stacks or {}).items():
+        for entry in stack:
+            owner = entry.get('owner') or ''
+            if not owner:
+                continue
+            if owner not in owner_data:
+                owner_data[owner] = {'mods': [], 'installed_at': ''}
+            owner_data[owner]['mods'].append(mod)
+            # Keep first non-empty installed_at encountered across all modules.
+            if not owner_data[owner]['installed_at']:
+                ia = entry.get('installed_at') or ''
+                if ia:
+                    owner_data[owner]['installed_at'] = str(ia)
+
+    rows: list[dict] = []
+    for owner, data in owner_data.items():
+        if owner in (live_task_ids or set()):
+            continue  # live owner — not stranded
+        mods = sorted(data['mods'])
+        installed_at = data['installed_at']
+        rows.append({
+            # Standard row shape (required fields defaulted)
+            'task_id': owner,
+            'title': '(stranded park)',
+            'declared_priority': None,
+            'effective_priority': None,
+            'priority_differs': False,
+            'skip_count': 0,
+            'park_state': {'modules': mods, 'installed_at': installed_at},
+            'age_seconds': _park_age_seconds(installed_at),
+            'lock_set': mods,
+            'pinned': False,
+            'reserve_now': False,
+            'boost_tier': None,
+            'ttl_until': None,
+            'project': project,
+            'project_root': project_root,
+            # Stranded markers — consumed by the JSX alert banner + future evict button
+            'stranded': True,
+            'parked_owner_live': False,
+        })
+    return rows
+
+
 def _compose_rows(
     active_tasks: list[dict],
     snapshot: dict,
