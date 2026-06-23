@@ -5261,6 +5261,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._lane_buffers: dict[str, collections.deque[MergeRequest]] = {
             ln: collections.deque() for ln in MERGE_LANES
         }
+        # δ/1889 — conflict-graph over the unfrozen suffix (see SuffixConflictGraph).
+        # Populated by recompute_suffix_conflict_graph(); read synchronously by
+        # snapshot().  Initialised to the sentinel empty graph so snapshot() is
+        # always valid even before the first recompute.
+        self._suffix_conflict_graph: SuffixConflictGraph = EMPTY_SUFFIX_CONFLICT_GRAPH
+        # Debounce signature for recompute_suffix_conflict_graph() — see step-12.
+        # None means "no prior compute"; a non-None value is (tuple_of_rids, main_sha).
+        self._suffix_conflict_signature: tuple[tuple[str, ...], str] | None = None
         # Resume signal: set by every unhalt method so a blocked merger
         # (waiting with no pickable item) wakes up to re-check lanes.
         # Cleared by the merger before each wait; never cancelled.
@@ -5967,6 +5975,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'is_wip_halted': self.is_wip_halted,
             'halt_owner_esc_id': self.halt_owner_esc_id,
             'occupancy': occupancy,
+            # δ/1889 additive key: per-suffix conflict relation (backward-compatible).
+            # Populated by recompute_suffix_conflict_graph() after each drain.
+            # Read here synchronously — no await; the expensive async build is
+            # decoupled from the read (snapshot() stays non-blocking).
+            'suffix_conflict_graph': self._suffix_conflict_graph.to_snapshot_dict(),
         }
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
