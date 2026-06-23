@@ -3455,9 +3455,12 @@ class Scheduler:
     def get_state_snapshot(self) -> dict:
         """Return a deep-copy snapshot of current in-memory scheduler state.
 
-        Contains ten top-level keys:
+        Contains eleven top-level keys:
         - skip_counts: {task_id: int}
         - parks: {task_id: {modules: [...], installed_at: str}}
+        - park_stacks: {module: [{owner, rank, shadowed, installed_at}, ...]} —
+          full LIFO stack bottom→top per module (active top + shadowed owners);
+          additive sibling to the INV-7 top-only ``parks`` key
         - effective_priorities: {task_id: str}
         - pin_queue: [{task_id: str, order: int}, ...]
         - overrides: {task_id: {boost_tier, pinned, reserve_now, ttl_until}}
@@ -3475,6 +3478,9 @@ class Scheduler:
         # parks — delegate to the public accessor so ModuleLockTable owns its
         # own representation (no private-attribute access from Scheduler).
         parks = self.lock_table.snapshot_parks()
+
+        # park_stacks — full LIFO stack per module (additive sibling to parks).
+        park_stacks = self.lock_table.snapshot_park_stacks()
 
         # effective_priorities — already a shallow dict of str→str.
         effective_priorities = dict(self._last_effective_priorities)
@@ -3520,6 +3526,7 @@ class Scheduler:
         return {
             'skip_counts': skip_counts,
             'parks': parks,
+            'park_stacks': park_stacks,
             'effective_priorities': effective_priorities,
             'pin_queue': pin_queue,
             'overrides': overrides,
