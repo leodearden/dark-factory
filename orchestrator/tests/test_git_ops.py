@@ -6501,3 +6501,70 @@ class TestMergeTreeConflicts:
         clean, paths = probe
         assert clean is True
         assert paths == []
+
+    async def test_single_file_conflict(self, git_ops: GitOps) -> None:
+        """CONFLICT case: both branches rewrite the same line of shared.py.
+
+        Asserts probe.clean is False and probe.conflicted_paths == ['shared.py']
+        (EXACT list — forces the parser to stop at the blank-line section
+        boundary and exclude informational messages like "CONFLICT (content):…").
+        """
+        # shared.py must exist on main before branching (merge-tree needs a
+        # common ancestor that already has the file).
+        (git_ops.project_root / 'shared.py').write_text('value = 0\n')
+        await _run(['git', 'add', 'shared.py'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Add shared.py on main'], cwd=git_ops.project_root)
+
+        # Branch mt-c: change shared.py to "A"
+        wt_c = await git_ops.create_worktree('mt-c')
+        (wt_c.path / 'shared.py').write_text('value = "A"\n')
+        await git_ops.commit(wt_c.path, 'Branch mt-c: value = A')
+
+        # Branch mt-d: change shared.py to "B" (conflicts with A)
+        wt_d = await git_ops.create_worktree('mt-d')
+        (wt_d.path / 'shared.py').write_text('value = "B"\n')
+        await git_ops.commit(wt_d.path, 'Branch mt-d: value = B')
+
+        probe = await git_ops.merge_tree_conflicts('task/mt-c', 'task/mt-d')
+
+        assert probe.clean is False
+        assert probe.conflicted_paths == ['shared.py'], (
+            f'Expected [\"shared.py\"], got {probe.conflicted_paths!r}'
+        )
+
+    async def test_multiple_file_conflicts(self, git_ops: GitOps) -> None:
+        """CONFLICT case: two files both conflict.
+
+        Asserts probe.clean is False and the set of conflicted_paths matches
+        exactly {f1.txt, f2.txt}, with NO informational text leaked in
+        (no 'CONFLICT' or 'Auto-merging' substrings in any path).
+        """
+        # Seed both files on main
+        for fname, content in [('f1.txt', 'line1\n'), ('f2.txt', 'line2\n')]:
+            (git_ops.project_root / fname).write_text(content)
+        await _run(['git', 'add', 'f1.txt', 'f2.txt'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Add f1.txt and f2.txt on main'], cwd=git_ops.project_root)
+
+        # Branch mt-e: change both files to "X"
+        wt_e = await git_ops.create_worktree('mt-e')
+        (wt_e.path / 'f1.txt').write_text('X\n')
+        (wt_e.path / 'f2.txt').write_text('X\n')
+        await git_ops.commit(wt_e.path, 'Branch mt-e: both X')
+
+        # Branch mt-f: change both files to "Y" (conflicts with X on both)
+        wt_f = await git_ops.create_worktree('mt-f')
+        (wt_f.path / 'f1.txt').write_text('Y\n')
+        (wt_f.path / 'f2.txt').write_text('Y\n')
+        await git_ops.commit(wt_f.path, 'Branch mt-f: both Y')
+
+        probe = await git_ops.merge_tree_conflicts('task/mt-e', 'task/mt-f')
+
+        assert probe.clean is False
+        assert set(probe.conflicted_paths) == {'f1.txt', 'f2.txt'}, (
+            f'Expected {{f1.txt, f2.txt}}, got {probe.conflicted_paths!r}'
+        )
+        # No informational text should leak into the paths list
+        assert all(
+            'CONFLICT' not in p and 'Auto-merging' not in p
+            for p in probe.conflicted_paths
+        ), f'Informational text leaked into conflicted_paths: {probe.conflicted_paths!r}'
