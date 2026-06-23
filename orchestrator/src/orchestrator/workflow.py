@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sys
+import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -915,6 +916,12 @@ class TaskWorkflow:
             union_task_files, union_module_configs = self._union_train_scope(members)
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        # NOTE: merge_first_enqueued_at is intentionally NOT stamped here.
+        # Train/group merges are out of α's scope (PRD §11.3/§11.4 open
+        # questions on tie-break among coalesced members); ζ (task 1887) will
+        # decide whether and how to stamp train members.  GroupMergeRequest
+        # therefore inherits the None default from the base MergeRequest field,
+        # and ζ's aging comparator falls back to enqueued_at for legacy/None.
         req = GroupMergeRequest(
             task_id=self.task_id,
             branch=branch_name,
@@ -3315,6 +3322,71 @@ class TaskWorkflow:
             )
         return None
 
+    async def _stamp_first_merge_enqueue(self) -> float:
+        """Stamp the write-once first-submission wall-clock epoch into task metadata.
+
+        Returns the (possibly pre-existing) ``metadata.merge_first_enqueued_at``
+        value as a float, ensuring:
+
+        * The value is written exactly once — subsequent calls on the same task
+          (resubmit, post-restart re-dispatch) return the original value unchanged.
+        * The value is persisted to the backend so it survives process restart.
+        * Persistence failure is non-fatal (logged, does not block the merge).
+
+        Algorithm:
+        1. **Fast-path (in-memory)** — if the in-memory metadata already carries a
+           numeric ``merge_first_enqueued_at``, return it immediately (no I/O).
+        2. **Slow-path (backend read)** — call :meth:`_merge_fresh_metadata` to
+           overlay backend-persisted keys; if the backend already carries the value,
+           adopt it into the in-memory copy and return (no persist needed).
+        3. **Stamp** — call ``time.time()``, write into the merged metadata dict,
+           update the in-memory task, and best-effort persist via
+           ``scheduler.update_task`` (wrapped in a logged try/except).
+
+        ζ (task 1887) consumes this value at ``_pop_next_pickable`` for aging-
+        priority ordering and owns the ``enqueued_at`` fallback for legacy
+        ``None`` values.
+
+        **Single-writer assumption** — per-task workflows are serialised by
+        design, so only one coroutine calls this helper for a given task at
+        any moment.  If that assumption ever changes (e.g. parallel submit
+        paths for the same task), the slow-path check-then-stamp sequence
+        would need an explicit per-task lock to remain strictly write-once.
+        """
+        metadata = self.task.get('metadata') or {}
+
+        # Fast-path: in-memory value already present (resubmit / post-restart
+        # reload where the scheduler populated the in-memory task from the backend).
+        existing = metadata.get('merge_first_enqueued_at')
+        if isinstance(existing, (int, float)):
+            return float(existing)
+
+        # Slow-path: consult backend to adopt a persisted value and protect
+        # memory_hints on the subsequent write.
+        fresh = await self._merge_fresh_metadata(
+            metadata, log_context='merge_first_enqueued_at stamp',
+        )
+        backend_existing = fresh.get('merge_first_enqueued_at')
+        if isinstance(backend_existing, (int, float)):
+            # Backend already has the value; adopt into in-memory copy, no persist.
+            self.task['metadata'] = fresh
+            return float(backend_existing)
+
+        # Neither in-memory nor backend carries the value — this is the first submit.
+        stamped = time.time()
+        fresh['merge_first_enqueued_at'] = stamped
+        self.task['metadata'] = fresh
+        try:
+            await self.scheduler.update_task(
+                self.task_id, metadata=fresh,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+            logger.warning(
+                'Task %s: failed to persist merge_first_enqueued_at: %s',
+                self.task_id, exc,
+            )
+        return stamped
+
     def _merge_outcome_signature(self) -> str:
         """Return a 16-hex-char signature for the current merge-block fingerprint.
 
@@ -4896,6 +4968,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         'plan_files_narrowed',
                     )
 
+        # Stamp write-once first-submission epoch before construction so every
+        # submit path (including coalesced/attached) records the lineage's age.
+        # The stamp is a no-op (fast-path return) when metadata already carries
+        # the value (resubmit / post-restart re-dispatch).
+        first_enqueued_at = await self._stamp_first_merge_enqueue()
+
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
         from orchestrator.merge_queue import lane_for_task_metadata
         merge_request = MergeRequest(
@@ -4908,6 +4986,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             config=self.config,
             result=future,
             lane=lane_for_task_metadata(self.task.get('metadata')),
+            merge_first_enqueued_at=first_enqueued_at,
         )
 
         attached = False
