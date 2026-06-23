@@ -1825,7 +1825,20 @@ def _mark_verify_warm(worktree: Path, module_prefix: str | None = None) -> None:
     if not task_dir.is_dir():
         return
     marker_path = task_dir / _warm_marker_name(module_prefix)
-    marker_path.touch(exist_ok=True)
+    try:
+        marker_path.touch(exist_ok=True)
+    except OSError as exc:
+        if _is_infra_oserror(exc):
+            raise VerifyInfraError(phase='warm_marker', errno=exc.errno) from exc
+        # Non-infra OSError — the warm marker is advisory; a passing verify
+        # must not be sunk by a failed marker write.  Log and swallow.
+        # Precedent: _write_run_log / _persist_attempt_logs do the same.
+        logger.warning(
+            'verify warm marker write failed (non-infra, swallowed): %s: %s',
+            marker_path,
+            exc,
+        )
+        return
     logger.debug('verify warm marker set: %s', marker_path)
 
 
