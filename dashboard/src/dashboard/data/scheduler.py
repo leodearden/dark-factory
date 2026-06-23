@@ -161,16 +161,21 @@ def _module_contention_counts(
     current_holders: dict[str, str],
     *,
     project: str | None = None,
+    park_stacks: dict | None = None,
+    live_task_ids: set[str] | None = None,
 ) -> list[dict]:
     """Build a sorted module-contention list from task rows and current holders.
 
-    For each module path that appears in any task's ``lock_set``, count how many
-    tasks include it.  Attach the current holder (from *current_holders*) if any.
+    For each module path that appears in any task's ``lock_set`` **or** in
+    ``park_stacks`` keys, count how many live tasks include it and attach park
+    ownership data.
 
     The holder for a module is resolved via the shared hierarchical prefix rule
     (``modules_conflict``), not dict-equality, so a holder key that is a
     sub-``lock_depth`` parent of the module still matches.  Both *rows*'
     ``lock_set`` and *current_holders* keys are normalized module locks.
+    The same rule is used to match *park_stacks* keys to contended paths so
+    park and holder resolution stay consistent.
 
     Args:
         rows:            Task row dicts, each with ``task_id`` and ``lock_set``
@@ -186,20 +191,48 @@ def _module_contention_counts(
                          ``holder_project`` is also populated — the snapshot's
                          ``current_holders`` map only contains task_ids from
                          the same project root.
+        park_stacks:     Optional ``{module_key: [entry, ...]}`` from
+                         ``snapshot['park_stacks']``.  Each stack is in
+                         bottom→top order (``stack[-1]`` is the active top).
+                         When provided, every path in *park_stacks* is included
+                         even if it has no live waiters (contention: 0), so a
+                         fully-stranded module still gets a module entry.
+                         ``None`` (default) leaves all callers unaffected.
+        live_task_ids:   Optional set of task_ids currently in ``rows``
+                         (i.e. present in active_tasks).  Used to flag the
+                         per-entry ``live`` key in ``park_stack`` and to set
+                         ``parked_owner_live``.  ``None`` (default) treats all
+                         park owners as non-live, which is inert when
+                         ``park_stacks`` is also ``None``.
 
     Returns:
-        ``[{path, holder, contention, project, holder_project}, ...]`` sorted
-        by contention descending, ties broken alphabetically by path.  Each
-        entry's ``holder`` is the task_id string from *current_holders*, or
-        ``None`` if no task currently holds that module.
+        ``[{path, holder, contention, project, holder_project,
+            parked_by, parked_by_project, parked_owner_live, park_stack}, ...]``
+        sorted by contention descending, ties broken alphabetically by path.
+
+        New additive fields (inert when *park_stacks* is ``None``):
+          parked_by        str | None  active-top park owner (stack[-1]) if any
+          parked_by_project str | None project label iff parked
+          parked_owner_live bool       True iff parked_by is in live_task_ids
+          park_stack       list[dict]  stack entries each enriched with ``live``
     """
     counts: dict[str, int] = {}
     for row in rows:
         for path in row.get('lock_set') or []:
             counts[path] = counts.get(path, 0) + 1
 
+    # All paths to produce entries for: contended paths ∪ park_stacks keys.
+    # A fully-stranded module (dead park, no live waiters) has no entry in
+    # counts but still needs a module entry with contention: 0 so the JSX
+    # can render its park_stack and stranded flag.
+    _stacks = park_stacks or {}
+    _live = live_task_ids or set()
+
+    all_paths = set(counts.keys()) | set(_stacks.keys())
+
     result: list[dict] = []
-    for path, count in counts.items():
+    for path in all_paths:
+        count = counts.get(path, 0)
         # Resolve the holder via the shared hierarchical prefix rule rather than
         # dict-equality.  Both *path* (a normalized module key) and the
         # current_holders keys are normalized to lock_depth, so the common case
@@ -210,6 +243,25 @@ def _module_contention_counts(
             (tid for mod, tid in current_holders.items() if modules_conflict(mod, path)),
             None,
         )
+        # Resolve the matching park stack via the same hierarchical prefix rule
+        # so park and holder resolution stay consistent across sub-depth keys.
+        stack = next(
+            (_stacks[mod] for mod in _stacks if modules_conflict(mod, path)),
+            None,
+        )
+        if stack:
+            parked_by: str | None = stack[-1]['owner']  # active top (bottom→top)
+            parked_by_project: str | None = project
+            parked_owner_live: bool = parked_by in _live
+            park_stack_out: list[dict] = [
+                {**e, 'live': e['owner'] in _live} for e in stack
+            ]
+        else:
+            parked_by = None
+            parked_by_project = None
+            parked_owner_live = False
+            park_stack_out = []
+
         result.append({
             'path': path,
             'holder': holder,
@@ -218,6 +270,11 @@ def _module_contention_counts(
             # the holder task_id since taskmaster ids are project-scoped.
             'project': project,
             'holder_project': project if holder else None,
+            # Park ownership — additive fields; inert when park_stacks is None.
+            'parked_by': parked_by,
+            'parked_by_project': parked_by_project,
+            'parked_owner_live': parked_owner_live,
+            'park_stack': park_stack_out,
         })
     return sorted(result, key=lambda m: (-m['contention'], m['path']))
 
