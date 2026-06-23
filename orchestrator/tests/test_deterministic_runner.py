@@ -73,6 +73,8 @@ def _deploy_task(
     cwd: str = '/tmp',
     timeout_secs: int = 30,
     before_done_ran_at: str | None = None,
+    before_done_verified_at: str | None = None,
+    before_done_verified_pid: int | None = None,
 ) -> dict:
     """Build a deterministic deploy task dict (before_done set, always_escalates=False)."""
     before_done: dict = {
@@ -90,6 +92,10 @@ def _deploy_task(
     }
     if before_done_ran_at is not None:
         metadata['before_done_ran_at'] = before_done_ran_at
+    if before_done_verified_at is not None:
+        metadata['before_done_verified_at'] = before_done_verified_at
+    if before_done_verified_pid is not None:
+        metadata['before_done_verified_pid'] = before_done_verified_pid
     return {
         'id': task_id,
         'title': 'Deploy orchestrator-reify',
@@ -1175,15 +1181,37 @@ class TestBeforeDoneOnceOnlyIdempotency:
 
 @pytest.mark.asyncio
 class TestBeforeDoneResumeAfterResolution:
-    """DeterministicRunner — before_done_ran_at set + no pending escalation → done (resume)."""
+    """DeterministicRunner — before_done ran, a human resolved the failure
+    escalation (archived, no longer pending) → drive to done (act-then-ask).
+
+    The distinguishing signal vs the crash-window is that an escalation was
+    *ever* filed (it now lives in the archive).  These tests seed a resolved
+    escalation so ``get_by_task(status=None)`` finds it while
+    ``get_by_task(status='pending')`` is empty.
+    """
+
+    def _seed_resolved_escalation(self, queue: EscalationQueue, task_id: str) -> None:
+        """Submit then resolve an infra_issue escalation (archived, not pending)."""
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-deterministic',
+            severity='critical',
+            category='infra_issue',
+            summary='Deploy failed: orchestrator-reify.service',
+            level=2,
+        )
+        queue.submit(esc)
+        queue.resolve(esc.id, 'human verified the unit manually')
 
     async def test_resume_script_runner_not_called(self, tmp_path: Path):
-        """before_done_ran_at set + empty queue → script_runner NOT called (I1 no re-run)."""
+        """before_done_ran_at set + resolved escalation → script_runner NOT called (I1 no re-run)."""
         from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _deploy_task(task_id='600', before_done_ran_at='2026-06-23T10:00:00+00:00')
         assignment = _make_assignment(task)
-        queue = EscalationQueue(tmp_path)  # empty — prior escalation resolved
+        queue = EscalationQueue(tmp_path)
+        self._seed_resolved_escalation(queue, '600')  # prior escalation resolved
         scheduler = _mock_scheduler(task)
 
         # unit_inspector returns same state both calls (non-fresh) so re-run would → blocked
@@ -1201,12 +1229,13 @@ class TestBeforeDoneResumeAfterResolution:
         script_runner.assert_not_awaited()
 
     async def test_resume_drives_to_done(self, tmp_path: Path):
-        """before_done_ran_at set + empty queue → set_task_status('done') with resume provenance."""
+        """before_done_ran_at set + resolved escalation → set_task_status('done') with resume provenance."""
         from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _deploy_task(task_id='600', before_done_ran_at='2026-06-23T10:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
+        self._seed_resolved_escalation(queue, '600')
         scheduler = _mock_scheduler(task)
 
         unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
@@ -1228,11 +1257,91 @@ class TestBeforeDoneResumeAfterResolution:
         assert provenance.get('note') == 'resumed after human resolution'
 
     async def test_resume_outcome_is_done(self, tmp_path: Path):
-        """before_done_ran_at set + empty queue → outcome is WorkflowOutcome.DONE."""
+        """before_done_ran_at set + resolved escalation → outcome is WorkflowOutcome.DONE."""
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
         task = _deploy_task(task_id='600', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._seed_resolved_escalation(queue, '600')
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+
+# ---------------------------------------------------------------------------
+# Crash-window phantom-done guard (review esc-1900-17)
+# A crash between stamping before_done_ran_at and recording a terminal outcome
+# (verify stamp OR failure escalation) must NOT drive the task to done.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneCrashWindow:
+    """before_done_ran_at set, but neither verified nor ever escalated → re-escalate."""
+
+    async def test_crash_window_does_not_drive_to_done(self, tmp_path: Path):
+        """Stamped + empty queue + no verified marker → set_task_status NEVER 'done'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='700', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # truly empty — no escalation ever filed
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, 'crash-window must NOT phantom-complete the task'
+
+    async def test_crash_window_script_runner_not_called(self, tmp_path: Path):
+        """Crash window must NOT re-run the deploy (I1 once-only)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='700', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_crash_window_files_infra_escalation_and_blocks(self, tmp_path: Path):
+        """Crash window → files one infra_issue escalation, outcome BLOCKED."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='700', before_done_ran_at='2026-06-23T10:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
         scheduler = _mock_scheduler(task)
@@ -1248,4 +1357,53 @@ class TestBeforeDoneResumeAfterResolution:
         )
         outcome = await runner.run(assignment)
 
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('700', status='pending')
+        assert len(pending) == 1, f'crash-window must re-escalate exactly once, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        blocked_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'blocked']
+        assert blocked_calls, 'crash-window must leave the task blocked'
+
+
+# ---------------------------------------------------------------------------
+# Verified-marker resume: crash between verify stamp and the done write.
+# before_done_verified_at present → safe to drive to done (no re-run).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneVerifiedResume:
+    """before_done_ran_at + before_done_verified_at set, empty queue → done."""
+
+    async def test_verified_resume_drives_to_done(self, tmp_path: Path):
+        """Verified marker present → done with the recorded PID, no re-run."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='800',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_verified_at='2026-06-23T10:00:05+00:00',
+            before_done_verified_pid=200,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — no escalation needed on this path
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
         assert outcome == WorkflowOutcome.DONE
+        script_runner.assert_not_awaited()
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(done_calls) == 1
+        provenance = done_calls[0].kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy'
+        assert provenance.get('pid') == 200

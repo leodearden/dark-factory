@@ -21,8 +21,15 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
    If ``metadata.before_done_ran_at`` is already set (γ):
    - If a pending infra_issue escalation exists → return BLOCKED (B7: reaper
      no-rerun, I1 once-only).
-   - Else (escalation resolved) → drive to ``done`` and return DONE (resume
-     after human resolution, no re-run).
+   - Else (no pending escalation) → require POSITIVE proof of a terminal
+     outcome before completing (phantom-done guard for the crash window
+     between stamping ``before_done_ran_at`` and recording a terminal result):
+     * ``before_done_verified_at`` set → verify passed (crash before the done
+       write) → drive to ``done``.
+     * an escalation was filed and resolved → human acted (act-then-ask) →
+       drive to ``done``, no re-run.
+     * neither → crash mid-deploy before any terminal decision → re-escalate
+       (infra_issue, blocked); never phantom-done, never re-run (I1).
 
 2. **before_done execution** (γ: ``before_done`` is not None):
    - Stamp ``metadata.before_done_ran_at`` FIRST (crash-safe I1: never re-run
@@ -33,7 +40,8 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      (B7a).
    - Re-inspect and verify a fresh ``MainPID`` (>0, non-sentinel) and a
      strictly-later ``ActiveEnterTimestampMonotonic`` (B7b).
-   - If ``always_escalates=False``: set task to ``done`` with
+   - If ``always_escalates=False``: stamp ``before_done_verified_at`` (the
+     positive proof the resume path requires), then set task to ``done`` with
      ``done_provenance.kind='deterministic-deploy'`` carrying the fresh PID
      and timestamp (B6); return DONE.
    - If ``always_escalates=True``: fall through to gate (act-then-ask).
@@ -291,22 +299,89 @@ class DeterministicRunner:
                         task_id,
                     )
                     return WorkflowOutcome.BLOCKED
-                # No pending escalation → resume-after-resolution: drive to done (I1 no re-run)
-                logger.info(
-                    'DeterministicRunner: task %s before_done ran + escalation resolved — '
-                    'resume-after-resolution, setting done (no re-run)',
+
+                # No pending escalation.  Before driving to done we MUST have
+                # POSITIVE proof the deploy reached a terminal decision —
+                # otherwise a crash in the window between stamping
+                # ``before_done_ran_at`` (above) and recording a terminal outcome
+                # (verify-success stamp, or the failure escalation) lands us here
+                # with neither verification nor a human in the loop, producing a
+                # phantom-done.  The bare "stamp set + empty queue → done" rule
+                # conflated 'crashed mid-deploy' with 'human resolved escalation'.
+                # Three sub-states are distinguished:
+                #   (a) before_done_verified_at set → the fresh-PID check passed
+                #       (crash between the verify stamp and the done write) →
+                #       safe to drive to done.
+                #   (b) an escalation was filed for this task and later resolved →
+                #       a human acted on the failure (act-then-ask resume) →
+                #       drive to done, no re-run (I1).
+                #   (c) neither → crash mid-deploy before any terminal decision →
+                #       re-escalate.  NEVER phantom-done; NEVER re-run (I1).
+                before_done_verified_at = metadata.get('before_done_verified_at')
+                # status=None scans the archive too → detects a resolved/dismissed
+                # escalation, i.e. proof a human was in the loop on a prior failure.
+                ever_escalated = bool(self.escalation_queue.get_by_task(task_id))
+
+                if before_done_verified_at:
+                    # (a) Deploy verified OK; crash before the done write.
+                    logger.info(
+                        'DeterministicRunner: task %s before_done verified (%s) — '
+                        'resume after crash-before-done-write, setting done',
+                        task_id, before_done_verified_at,
+                    )
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance={
+                            'kind': 'deterministic-deploy',
+                            'pid': metadata.get('before_done_verified_pid'),
+                            'note': 'resumed after verified deploy (crash before done write)',
+                            'unit': target_unit,
+                        },
+                    )
+                    return WorkflowOutcome.DONE
+
+                if ever_escalated:
+                    # (b) A failure escalation was filed and resolved by a human.
+                    logger.info(
+                        'DeterministicRunner: task %s before_done ran + escalation '
+                        'resolved — resume-after-resolution, setting done (no re-run)',
+                        task_id,
+                    )
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance={
+                            'kind': 'deterministic-deploy',
+                            'note': 'resumed after human resolution',
+                            'unit': target_unit,
+                        },
+                    )
+                    return WorkflowOutcome.DONE
+
+                # (c) Crash window: stamped but never verified and never escalated.
+                # Re-escalate instead of phantom-completing; the deploy is NOT
+                # re-run (I1 once-only) — a human must verify the unit state.
+                logger.warning(
+                    'DeterministicRunner: task %s before_done_ran_at set but neither '
+                    'verified nor escalated — crash-window detected; re-escalating '
+                    'instead of phantom-done',
                     task_id,
                 )
-                await self.scheduler.set_task_status(
+                crash_detail = '\n'.join([
+                    description,
+                    f'Target unit: {target_unit}',
+                    'before_done_ran_at is stamped but the deploy recorded neither a '
+                    'verification (before_done_verified_at unset) nor a failure '
+                    'escalation — the orchestrator crashed mid-deploy between '
+                    'stamping and completing.  The deploy is NOT re-run (I1 '
+                    'once-only); a human must inspect the unit and resolve.',
+                ])
+                return await self._file_infra_issue_and_block(
                     task_id,
-                    'done',
-                    done_provenance={
-                        'kind': 'deterministic-deploy',
-                        'note': 'resumed after human resolution',
-                        'unit': target_unit,
-                    },
+                    summary=f'Deploy state unknown after crash: {target_unit}',
+                    detail=crash_detail,
                 )
-                return WorkflowOutcome.DONE
 
             # Stamp before_done_ran_at FIRST (crash-safe I1: stamp-before-run means a
             # crash mid-deploy leaves the stamp set → re-dispatch does NOT re-run).
@@ -370,7 +445,19 @@ class DeterministicRunner:
                 )
 
             if not always_escalates:
-                # Pure cross-unit deploy (B6): verified → set done with provenance
+                # Pure cross-unit deploy (B6): verified → set done with provenance.
+                # Stamp before_done_verified_at FIRST: it is the positive proof a
+                # later resume (after a crash in the window before the done write)
+                # requires to drive to done rather than re-escalate as a crash-window.
+                verified_iso = datetime.now(UTC).isoformat()
+                await self.scheduler.update_task(
+                    task_id,
+                    {
+                        'before_done_verified_at': verified_iso,
+                        'before_done_verified_pid': pid,
+                    },
+                    metadata_mode='merge',
+                )
                 logger.info(
                     'DeterministicRunner: task %s before_done deploy verified — '
                     'pid=%d unit=%s — setting done',
