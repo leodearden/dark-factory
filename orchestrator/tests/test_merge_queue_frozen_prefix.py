@@ -466,3 +466,79 @@ class TestCheckFrozenPrefixInvariant:
         violations = worker.check_frozen_prefix_invariant(main_sha)
         assert len(violations) > 0, 'expected a disjointness violation'
         assert req.request_id in ' '.join(violations)
+
+
+# ── step-07 RED: snapshot() exposes additive 'frozen_prefix' key ─────────────
+
+
+@pytest.mark.asyncio
+class TestSnapshotFrozenPrefixKey:
+    """snapshot() grows an additive 'frozen_prefix' key; existing keys unchanged.
+
+    RED until step-08 GREEN adds the key to snapshot().
+    """
+
+    async def test_bare_worker_frozen_prefix_key_shape(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Bare worker snapshot() contains frozen_prefix with empty/zero values."""
+        worker = _make_worker(git_ops)
+        snap = worker.snapshot()
+        assert 'frozen_prefix' in snap, "snapshot() is missing 'frozen_prefix' key"
+        fp = snap['frozen_prefix']
+        assert fp == {
+            'request_ids': [],
+            'tip_merge_commit': None,
+            'verify_depth': 0,
+        }, f"unexpected frozen_prefix shape: {fp}"
+
+    async def test_two_verifying_inflight_snapshot_shape(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Two verifying in-flight items → frozen_prefix reflects them."""
+        worker = _make_worker(git_ops)
+        _, item_d = _make_fake_item('t-d', base_sha='main0', merge_commit='Dc',
+                                    config=config, git_repo=git_repo)
+        _, item_e = _make_fake_item('t-e', base_sha='Dc', merge_commit='Ec',
+                                    config=config, git_repo=git_repo)
+        worker._inflight.append(_make_inflight_entry(item_d, verifying=True))
+        worker._inflight.append(_make_inflight_entry(item_e, verifying=True))
+
+        snap = worker.snapshot()
+        fp = snap['frozen_prefix']
+        assert fp['request_ids'] == [
+            item_d.request.request_id,
+            item_e.request.request_id,
+        ]
+        assert fp['tip_merge_commit'] == 'Ec'
+        assert fp['verify_depth'] == 2
+
+    async def test_snapshot_backward_compat_all_prior_keys_present(
+        self, git_ops: GitOps,
+    ) -> None:
+        """All pre-existing snapshot keys are still present (backward-compatible)."""
+        worker = _make_worker(git_ops)
+        snap = worker.snapshot()
+        required_keys = {
+            'entries',
+            'depth',
+            'head_of_line',
+            'verify_in_progress',
+            'occupancy',
+            'is_wip_halted',
+            'halt_owner_esc_id',
+            'suffix_conflict_graph',  # δ/1889
+            'metrics',               # ι/1894
+            'frozen_prefix',         # ε/1890 — the new key
+        }
+        missing = required_keys - snap.keys()
+        assert not missing, f'snapshot() is missing keys: {missing}'
+
+    async def test_metrics_key_unaffected_by_frozen_prefix(
+        self, git_ops: GitOps,
+    ) -> None:
+        """'metrics' key is present and equals _merge_metrics.as_snapshot()."""
+        worker = _make_worker(git_ops)
+        snap = worker.snapshot()
+        assert 'metrics' in snap
+        assert snap['metrics'] == worker._merge_metrics.as_snapshot()
