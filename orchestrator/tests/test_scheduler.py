@@ -9692,3 +9692,85 @@ class TestStarvationWatchdog:
         assert 'starved' in scheduler._starvation_escalated, (
             '_starvation_escalated must contain task_id after the watchdog fires'
         )
+
+    @pytest.mark.asyncio
+    async def test_below_skip_threshold_no_callback(self):
+        """(a) Below skip_threshold: fewer skips than threshold → callback NOT called.
+
+        skip_threshold=3, only 2 ticks (skip_count=2 < 3).  Clock advanced well
+        past idle_secs (100s) to prove the skip-count gate blocks firing.
+        """
+        scheduler, t = self._make_scheduler()
+        callback = AsyncMock()
+        scheduler._on_starvation_warn = callback
+
+        scheduler.lock_table.try_acquire('seed', ['backend'])
+        scheduler._dispatched.add('seed')
+        task = self._starved_task()
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # 2 ticks → skip_count = 2 < threshold=3.
+        for _ in range(2):
+            await scheduler.acquire_next()
+
+        # Advance clock well past idle_secs.
+        t[0] = 500.0
+        await scheduler.acquire_next()
+
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_idle_gate_below_idle_secs_no_callback(self):
+        """(b) Idle gate: skip_count >= threshold but clock < idle_secs → NOT called.
+
+        Proves BOTH conditions are required — the skip-gate alone is not sufficient.
+        Clock advances only to 50s < idle_secs=100s.
+        """
+        scheduler, t = self._make_scheduler()
+        callback = AsyncMock()
+        scheduler._on_starvation_warn = callback
+
+        scheduler.lock_table.try_acquire('seed', ['backend'])
+        scheduler._dispatched.add('seed')
+        task = self._starved_task()
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # Drive 3+ ticks to cross skip_threshold.
+        for _ in range(4):
+            await scheduler.acquire_next()
+
+        assert scheduler._skip_count.get('starved', 0) >= 3, (
+            'Precondition: skip_count must be >= 3 for this test to be meaningful'
+        )
+
+        # Clock below idle_secs (50s < 100s) — callback must NOT fire.
+        t[0] = 50.0
+        await scheduler.acquire_next()
+
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disabled_no_callback(self):
+        """(c) Disabled: starvation_watchdog.enabled=False → NOT called even when both thresholds crossed.
+
+        Set enabled=False, drive skip_count >= threshold, advance clock past
+        idle_secs → callback must never fire.
+        """
+        scheduler, t = self._make_scheduler(enabled=False)
+        callback = AsyncMock()
+        scheduler._on_starvation_warn = callback
+
+        scheduler.lock_table.try_acquire('seed', ['backend'])
+        scheduler._dispatched.add('seed')
+        task = self._starved_task()
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # Drive 5 ticks to clearly cross skip_threshold=3.
+        for _ in range(5):
+            await scheduler.acquire_next()
+
+        # Advance clock well past idle_secs=100s.
+        t[0] = 500.0
+        await scheduler.acquire_next()
+
+        callback.assert_not_called()
