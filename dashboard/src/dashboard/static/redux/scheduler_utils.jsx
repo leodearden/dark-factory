@@ -3,7 +3,9 @@
    Loaded early in index.html (before tabs.jsx and tab_tasks.jsx) so all
    consumers can destructure from the global.
 
-   Exports: window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo }
+   Exports: window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo,
+             disambiguateLabels, labelFor, lockChipState }
+   (Canonical list: the window.DF_SCHED_UTILS assignment at the bottom of this file.)
 */
 
 // Format seconds into a human-readable elapsed string.
