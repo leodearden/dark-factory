@@ -2251,7 +2251,7 @@ class TestFairness:
             'status': 'pending',
             'priority': 'high',
             'dependencies': [],
-            'metadata': {'files': ['compiler/src', 'eval/src']},
+            'metadata': {'files': ['compiler/src/main.py', 'eval/src/main.py']},
         }
 
     @staticmethod
@@ -2262,7 +2262,7 @@ class TestFairness:
             'status': 'pending',
             'priority': priority,
             'dependencies': [],
-            'metadata': {'files': [module]},
+            'metadata': {'files': [f'{module}/main.py']},
         }
 
     @pytest.mark.asyncio
@@ -2438,7 +2438,7 @@ class TestFairness:
             'status': 'pending',
             'priority': 'high',
             'dependencies': [],
-            'metadata': {'files': ['compiler/src', 'eval/src', 'tools/src']},
+            'metadata': {'files': ['compiler/src/main.py', 'eval/src/main.py', 'tools/src/main.py']},
         }
         b = self._narrow_task('D', 'tools/src', priority='low')
         scheduler.get_tasks = AsyncMock(return_value=[a, b])
@@ -2631,7 +2631,7 @@ class TestFairness:
         l_task = {
             'id': 'L', 'title': 'l', 'status': 'pending',
             'priority': 'medium', 'dependencies': [],
-            'metadata': {'files': ['other']},
+            'metadata': {'files': ['other/main.py']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[h_task, l_task])
 
@@ -2783,12 +2783,12 @@ class TestFairness:
             'id': 'A', 'title': 'a', 'status': 'pending',
             'priority': 'high',
             'dependencies': [{'id': '7'}],
-            'metadata': {'files': ['m1']},
+            'metadata': {'files': ['m1/main.py']},
         }
         seven = {
             'id': '7', 'title': 'seven', 'status': 'done',
             'priority': 'high', 'dependencies': [],
-            'metadata': {'files': ['other/src']},
+            'metadata': {'files': ['other/src/main.py']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[a, seven])
 
@@ -2851,17 +2851,17 @@ class TestFairness:
         c_task = {
             'id': 'C', 'title': 'c', 'status': 'pending',
             'priority': 'critical', 'dependencies': [],
-            'metadata': {'files': ['m1']},
+            'metadata': {'files': ['m1/main.py']},
         }
         h_task = {
             'id': 'H', 'title': 'h', 'status': 'pending',
             'priority': 'high', 'dependencies': [],
-            'metadata': {'files': ['m1', 'm2']},
+            'metadata': {'files': ['m1/main.py', 'm2/main.py']},
         }
         m_task = {
             'id': 'M', 'title': 'm', 'status': 'pending',
             'priority': 'medium', 'dependencies': [],
-            'metadata': {'files': ['m1']},
+            'metadata': {'files': ['m1/main.py']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[c_task, h_task, m_task])
 
@@ -4687,7 +4687,7 @@ class TestReserveNowShortCircuit:
         """
         from orchestrator.overrides import OverrideStore
 
-        config = OrchestratorConfig(max_per_module=1)
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         store = OverrideStore(tmp_path / 'o.db')
         store.set_override('/proj', 'A', reserve_now=True)
 
@@ -4703,7 +4703,7 @@ class TestReserveNowShortCircuit:
             'title': 'Task A',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['compiler/src', 'eval/src']},
+            'metadata': {'files': ['compiler/src/main.py', 'eval/src/main.py']},
             'priority': 'medium',
         }
         task_b = {
@@ -4711,7 +4711,7 @@ class TestReserveNowShortCircuit:
             'title': 'Task B',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['other/module']},
+            'metadata': {'files': ['other/module/main.py']},
             'priority': 'medium',
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
@@ -5071,7 +5071,7 @@ class TestPinDispatch:
             'title': 'Task A (pinned 1, locked out)',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['compiler/src']},
+            'metadata': {'files': ['compiler/src/main.py']},
             'priority': 'medium',
         }
         task_b = {
@@ -5079,7 +5079,7 @@ class TestPinDispatch:
             'title': 'Task B (pinned 2, free)',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['eval/src']},
+            'metadata': {'files': ['eval/src/main.py']},
             'priority': 'medium',
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
@@ -9640,7 +9640,7 @@ class TestStarvationWatchdog:
             'status': 'pending',
             'priority': 'medium',
             'dependencies': [],
-            'metadata': {'files': ['backend']},
+            'metadata': {'files': ['backend/main.py']},
         }
 
     @pytest.mark.asyncio
