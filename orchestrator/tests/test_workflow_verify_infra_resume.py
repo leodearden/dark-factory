@@ -333,3 +333,107 @@ class TestVerifyInfraPermanentExhaustion:
             '_verify_debugfix_loop must NOT call _mark_blocked directly on exhaustion; '
             'that is run()\'s job via _infra_hold_info stash'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step 11: Defensive net — bare infra OSError escaping verify loop →
+#          _mark_blocked(category='infra_issue'), not generic 'Workflow error:'
+# ---------------------------------------------------------------------------
+
+class TestBareInfraOSErrorDefensiveNet:
+    """run(): bare infra-class OSError escaping verify → infra_issue, not task_failure."""
+
+    @pytest.mark.asyncio
+    async def test_bare_oserror_enospc_from_verify_routed_to_infra_issue(self):
+        """An OSError(ENOSPC) that escapes _execute_verify_review_loop reaches
+        _mark_blocked with category='infra_issue', not the generic task_failure
+        produced by run()'s broad except Exception handler.
+
+        RED before step-12 (no dedicated except OSError in run).
+        GREEN after step-12 (explicit except OSError routes infra errnos to infra_issue).
+        """
+        wf = _make()
+
+        # Pre-set plan so run() skips the plan phase (if self.plan: pass branch)
+        wf.plan = {'task_id': '1883', 'steps': []}
+        # Pre-set initial_plan to suppress the simple_task optimistic path
+        # (not self.initial_plan would be False → simple task path is skipped)
+        wf.initial_plan = {'task_id': '1883', 'steps': []}
+
+        async def fake_setup(*args, **kwargs):
+            # worktree and artifacts already set by _make(); just return.
+            pass
+
+        with (
+            # Bypass the real worktree setup (worktree/artifacts already set)
+            patch.object(wf, '_setup_worktree_and_artifacts', side_effect=fake_setup),
+            # Pre-PLAN ghost-loop: not already merged
+            patch.object(wf, '_recover_if_already_merged',
+                         new=AsyncMock(return_value=None)),
+            # Ghost-loop before EXECUTE: branch is not on main
+            patch.object(wf, '_check_branch_on_main',
+                         new=AsyncMock(return_value=None)),
+            # Simulate a bare infra OSError escaping the execute/verify loop
+            patch.object(
+                wf, '_execute_verify_review_loop',
+                side_effect=OSError(errno_module.ENOSPC, 'No space left on device'),
+            ),
+        ):
+            outcome = await wf.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # Key assertion: _mark_blocked must be called with category='infra_issue'
+        # (NOT the default 'task_failure' from the broad except Exception handler)
+        wf._mark_blocked.assert_awaited_once()
+        call_kwargs = wf._mark_blocked.await_args.kwargs
+        assert call_kwargs.get('category') == 'infra_issue', (
+            f"Expected _mark_blocked(category='infra_issue') but got "
+            f"category={call_kwargs.get('category')!r}. "
+            f"A bare OSError(ENOSPC) from the verify path must be classified as "
+            f"infra_issue, not routed through the generic 'Workflow error:' handler."
+        )
+        assert call_kwargs.get('escalate_to_human') is True, (
+            "infra_issue from verify must set escalate_to_human=True"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_infra_oserror_still_uses_generic_handler(self):
+        """An OSError with a non-infra errno (EACCES) is NOT infra-classified.
+
+        It should re-raise and be caught by the broad except Exception handler
+        → _mark_blocked with 'Workflow error: ...' (task_failure, the safe default).
+        This ensures the infra guard is NARROW and doesn't swallow permission errors.
+
+        Note: This test asserts CURRENT expected behaviour — the broad except
+        catches the re-raised non-infra OSError. If this test is GREEN, step-12's
+        implementation correctly re-raises non-infra OSErrors.
+        """
+        wf = _make()
+        wf.plan = {'task_id': '1883', 'steps': []}
+        wf.initial_plan = {'task_id': '1883', 'steps': []}
+
+        async def fake_setup(*args, **kwargs):
+            pass
+
+        with (
+            patch.object(wf, '_setup_worktree_and_artifacts', side_effect=fake_setup),
+            patch.object(wf, '_recover_if_already_merged',
+                         new=AsyncMock(return_value=None)),
+            patch.object(wf, '_check_branch_on_main',
+                         new=AsyncMock(return_value=None)),
+            patch.object(
+                wf, '_execute_verify_review_loop',
+                side_effect=OSError(errno_module.EACCES, 'Permission denied'),
+            ),
+        ):
+            outcome = await wf.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        wf._mark_blocked.assert_awaited_once()
+        # Non-infra OSError → broad handler → reason starts with 'Workflow error:'
+        call_args = wf._mark_blocked.await_args
+        reason = call_args.args[0] if call_args.args else None
+        assert reason is not None and reason.startswith('Workflow error:'), (
+            f"Non-infra OSError(EACCES) must use generic handler, got reason={reason!r}"
+        )
