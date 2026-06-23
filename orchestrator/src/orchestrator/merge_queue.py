@@ -3428,6 +3428,18 @@ class MergeRequest:
     config: OrchestratorConfig
     result: asyncio.Future[MergeOutcome] = field(repr=False)
     enqueued_at: float = field(default_factory=time.time, kw_only=True)
+    merge_first_enqueued_at: float | None = field(default=None, kw_only=True)
+    """Wall-clock epoch of the FIRST merge submission of this branch's lineage.
+
+    Sourced from ``metadata.merge_first_enqueued_at`` (persisted, survives
+    restart) and populated by :meth:`TaskWorkflow._stamp_first_merge_enqueue`
+    at the per-task merge-submit chokepoint (workflow.py α-substrate, task 1886).
+
+    Contrast with :attr:`enqueued_at`, which is re-stamped on every resubmission
+    and held in-memory only (lost on restart).  ζ's aging comparator at
+    ``_pop_next_pickable`` reads this field; ``None`` for legacy in-flight requests
+    created before α was deployed (ζ owns the ``enqueued_at`` fallback for those).
+    """
     request_id: str = field(
         default_factory=lambda: f'mr-{uuid.uuid4().hex[:8]}',
         kw_only=True,
