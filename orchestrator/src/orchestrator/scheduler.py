@@ -16,7 +16,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from shared.locking import files_to_modules, modules_conflict, normalize_lock
+from shared.locking import (
+    directory_locks,
+    files_to_modules,
+    modules_conflict,
+    normalize_lock,
+    strip_directory_locks,
+)
 from shared.mcp_envelope import parse_tool_result, resolver_failed
 
 from orchestrator.config import (
@@ -4456,7 +4462,23 @@ class Scheduler:
         if isinstance(metadata, dict):
             files = metadata.get('files', [])
             if isinstance(files, list) and files:
-                derived = files_to_modules(files, depth)
+                # α strip: remove directory-shaped entries before lock derivation.
+                # A directory entry (no recognised file extension) would produce a
+                # subtree-wide prefix lock that blocks every task touching any file
+                # under that subtree (reify-3468).  Strip them so only real file
+                # siblings derive locks.  When ALL entries are directories the
+                # stripped list is empty → files_to_modules returns [] → we fall
+                # through to the task-<id> synthetic fallback (conflicts with
+                # nothing).  Diagnostic names the stripped directories.
+                dirs = directory_locks(files)
+                if dirs:
+                    logger.info(
+                        'Task %s: α strip — rejected directory charter entries: %s',
+                        task_id,
+                        dirs,
+                    )
+                file_only = strip_directory_locks(files)
+                derived = files_to_modules(file_only, depth)
                 if derived:
                     return derived
         # Fallback: use a generic module name based on task id

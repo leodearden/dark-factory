@@ -290,3 +290,83 @@ async def test_tag_task_modules_forwards_merge_mode_on_wire(harness, monkeypatch
     # The wire call for update_task (payload['name']=='update_task') should carry
     # metadata_mode='merge' so sibling keys survive the partial-key re-tag.
     assert_update_wire_mode(captured_args, 'merge')
+
+
+# ---------------------------------------------------------------------------
+# α strip: harness cache-population site (task 1906 step-5/6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_task_modules_does_not_cache_directory_wide_module(tmp_path):
+    """Module tagger must NOT populate _module_cache with directory-derived wide modules.
+
+    The α strip (task 1906) coerces directory entries to empty before lock
+    derivation in _get_modules. The harness cache-population site (harness.py:1477)
+    must apply the same strip so a directory charter cannot poison the in-memory
+    cache and bypass the α strip (cache is checked first in _get_modules).
+
+    Fails under current code: files_to_modules(['crates/reify-eval/src'], depth)
+    → ['crates/reify-eval'] (a subtree-wide prefix lock) is cached for task 1.
+    Passes after step-6 adds strip_directory_locks at the cache-write site.
+    """
+    config = OrchestratorConfig(project_root=tmp_path, lock_depth=2)
+    h = Harness(config)
+
+    tasks = [
+        {
+            'id': '1',
+            'title': 'Directory-charter task',
+            'description': 'Has a directory entry only',
+            'status': 'pending',
+            'metadata': {},
+            'dependencies': [],
+        },
+        {
+            'id': '2',
+            'title': 'File task',
+            'description': 'Has a real file entry',
+            'status': 'pending',
+            'metadata': {},
+            'dependencies': [],
+        },
+    ]
+    # Agent returns a directory entry for task 1, a real file for task 2.
+    agent_response = {
+        'tasks': [
+            {'id': '1', 'files': ['crates/reify-eval/src']},   # directory — no extension
+            {'id': '2', 'files': ['src/config/schema.py']},    # real file
+        ],
+    }
+
+    h.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    h.scheduler.update_task = AsyncMock()
+
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await h._tag_task_modules()
+
+    # Task 1: directory entry must NOT produce a cached wide module.
+    # Before fix: cache['1'] = ['crates/reify-eval'] — subtree-wide prefix lock.
+    cached_1 = h.scheduler._module_cache.get('1', [])
+    assert cached_1 == [], (
+        f'Directory charter must NOT be cached as a wide module; '
+        f'got _module_cache["1"]={cached_1!r}. '
+        f'Expected empty (directory entry stripped → no derived module → cache skipped).'
+    )
+
+    # Task 2: real file IS cached (strip keeps it, files_to_modules derives a module).
+    # At lock_depth=2, src/config/schema.py → 'src/config'.
+    cached_2 = h.scheduler._module_cache.get('2', [])
+    assert cached_2 != [], (
+        f'Real file must produce a cached module; got _module_cache["2"]={cached_2!r}.'
+    )
+    assert cached_2 == ['src/config'], (
+        f'Expected [\"src/config\"] for src/config/schema.py at depth=2; got {cached_2!r}.'
+    )

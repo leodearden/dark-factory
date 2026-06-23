@@ -26,7 +26,15 @@ from shared.cli_invoke import (
 )
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
-from shared.locking import files_to_modules, modules_conflict, normalize_lock
+from shared.locking import (
+    CODE_EXTENSIONS,
+    directory_locks,
+    files_to_modules,
+    is_file_path,
+    modules_conflict,
+    normalize_lock,
+    strip_directory_locks,
+)
 from shared.safe_io import load_json_or_warn
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.usage_gate import AccountState, InvokeSlot, SessionBudgetExhausted, UsageGate
@@ -66,5 +74,9 @@ __all__ = [
     'normalize_lock',
     'files_to_modules',
     'modules_conflict',
+    'CODE_EXTENSIONS',
+    'is_file_path',
+    'directory_locks',
+    'strip_directory_locks',
     'load_json_or_warn',
 ]

@@ -781,22 +781,32 @@ class TestAcquireNextNoDuplicates:
 
     @pytest.mark.asyncio
     async def test_acquire_next_lock_conflict_plus_dispatch_guard(
-        self, scheduler: Scheduler
+        self
     ):
-        """Two tasks on the same module: dispatch A, B blocked; release A, B dispatches."""
+        """Two tasks on the same module: dispatch A, B blocked; release A, B dispatches.
+
+        Updated for α strip: the fixture previously used 'backend' (an
+        extension-less directory entry) which is now stripped by the α filter,
+        making both tasks fall through to distinct task-<id> fallbacks that
+        don't conflict with each other.  Replaced with co-located real files
+        that normalize to the same depth-2 module ('backend/src') so the
+        lock conflict is preserved.  lock_depth=2 is set explicitly because
+        the default may be overridden by a config.yaml or env var in this env.
+        """
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1, lock_depth=2))
         task_a = {
             'id': 'A',
             'title': 'Task A',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['backend']},
+            'metadata': {'files': ['backend/src/app.py']},
         }
         task_b = {
             'id': 'B',
             'title': 'Task B',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['backend']},
+            'metadata': {'files': ['backend/src/routes.py']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
 
@@ -1099,10 +1109,17 @@ class TestGetModulesJsonStringMetadata:
     def test_get_modules_extracts_modules_from_dict_metadata(
         self, scheduler: Scheduler
     ):
-        """_get_modules returns normalized module list from dict metadata."""
+        """_get_modules returns normalized module list from real file paths in dict metadata.
+
+        Updated for α strip: the fixture previously used extension-less paths
+        ('backend', 'server') which are now classified as directory entries and
+        stripped, falling through to the task-<id> fallback.  The test is
+        updated to use real file paths so it still exercises the
+        files-→-modules derivation path.
+        """
         task = {
             'id': '5',
-            'metadata': {'files': ['backend', 'server']},
+            'metadata': {'files': ['backend/app.py', 'server/main.py']},
         }
         result = scheduler._get_modules(task)
         assert result != ['task-5'], (
@@ -2234,7 +2251,7 @@ class TestFairness:
             'status': 'pending',
             'priority': 'high',
             'dependencies': [],
-            'metadata': {'files': ['compiler/src', 'eval/src']},
+            'metadata': {'files': ['compiler/src/main.py', 'eval/src/main.py']},
         }
 
     @staticmethod
@@ -2245,7 +2262,7 @@ class TestFairness:
             'status': 'pending',
             'priority': priority,
             'dependencies': [],
-            'metadata': {'files': [module]},
+            'metadata': {'files': [f'{module}/main.py']},
         }
 
     @pytest.mark.asyncio
@@ -2421,7 +2438,7 @@ class TestFairness:
             'status': 'pending',
             'priority': 'high',
             'dependencies': [],
-            'metadata': {'files': ['compiler/src', 'eval/src', 'tools/src']},
+            'metadata': {'files': ['compiler/src/main.py', 'eval/src/main.py', 'tools/src/main.py']},
         }
         b = self._narrow_task('D', 'tools/src', priority='low')
         scheduler.get_tasks = AsyncMock(return_value=[a, b])
@@ -2614,7 +2631,7 @@ class TestFairness:
         l_task = {
             'id': 'L', 'title': 'l', 'status': 'pending',
             'priority': 'medium', 'dependencies': [],
-            'metadata': {'files': ['other']},
+            'metadata': {'files': ['other/main.py']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[h_task, l_task])
 
@@ -2766,12 +2783,12 @@ class TestFairness:
             'id': 'A', 'title': 'a', 'status': 'pending',
             'priority': 'high',
             'dependencies': [{'id': '7'}],
-            'metadata': {'files': ['m1']},
+            'metadata': {'files': ['m1/main.py']},
         }
         seven = {
             'id': '7', 'title': 'seven', 'status': 'done',
             'priority': 'high', 'dependencies': [],
-            'metadata': {'files': ['other/src']},
+            'metadata': {'files': ['other/src/main.py']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[a, seven])
 
@@ -2834,17 +2851,17 @@ class TestFairness:
         c_task = {
             'id': 'C', 'title': 'c', 'status': 'pending',
             'priority': 'critical', 'dependencies': [],
-            'metadata': {'files': ['m1']},
+            'metadata': {'files': ['m1/main.py']},
         }
         h_task = {
             'id': 'H', 'title': 'h', 'status': 'pending',
             'priority': 'high', 'dependencies': [],
-            'metadata': {'files': ['m1', 'm2']},
+            'metadata': {'files': ['m1/main.py', 'm2/main.py']},
         }
         m_task = {
             'id': 'M', 'title': 'm', 'status': 'pending',
             'priority': 'medium', 'dependencies': [],
-            'metadata': {'files': ['m1']},
+            'metadata': {'files': ['m1/main.py']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[c_task, h_task, m_task])
 
@@ -4670,7 +4687,7 @@ class TestReserveNowShortCircuit:
         """
         from orchestrator.overrides import OverrideStore
 
-        config = OrchestratorConfig(max_per_module=1)
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         store = OverrideStore(tmp_path / 'o.db')
         store.set_override('/proj', 'A', reserve_now=True)
 
@@ -4686,7 +4703,7 @@ class TestReserveNowShortCircuit:
             'title': 'Task A',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['compiler/src', 'eval/src']},
+            'metadata': {'files': ['compiler/src/main.py', 'eval/src/main.py']},
             'priority': 'medium',
         }
         task_b = {
@@ -4694,7 +4711,7 @@ class TestReserveNowShortCircuit:
             'title': 'Task B',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['other/module']},
+            'metadata': {'files': ['other/module/main.py']},
             'priority': 'medium',
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
@@ -5054,7 +5071,7 @@ class TestPinDispatch:
             'title': 'Task A (pinned 1, locked out)',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['compiler/src']},
+            'metadata': {'files': ['compiler/src/main.py']},
             'priority': 'medium',
         }
         task_b = {
@@ -5062,7 +5079,7 @@ class TestPinDispatch:
             'title': 'Task B (pinned 2, free)',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'files': ['eval/src']},
+            'metadata': {'files': ['eval/src/main.py']},
             'priority': 'medium',
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
@@ -9623,7 +9640,7 @@ class TestStarvationWatchdog:
             'status': 'pending',
             'priority': 'medium',
             'dependencies': [],
-            'metadata': {'files': ['backend']},
+            'metadata': {'files': ['backend/main.py']},
         }
 
     @pytest.mark.asyncio
@@ -10004,4 +10021,119 @@ class TestStarvationWatchdog:
         assert 'starved' not in scheduler._starvation_first_seen, (
             '_starvation_first_seen must be cleared by the continuity reset '
             'when the task is no longer a dispatch-eligible candidate'
+        )
+
+
+# ---------------------------------------------------------------------------
+# α dispatch-time directory-lock strip tests (PRD α, task 1906)
+# ---------------------------------------------------------------------------
+
+class TestGetModulesAlphaDirectoryStrip:
+    """_get_modules must strip directory entries (α strip) before lock derivation.
+
+    A directory entry like 'crates/reify-eval/src' (no recognised file extension)
+    must NOT produce a subtree-wide prefix lock.  When ALL entries are directories
+    the result must fall through to the existing task-<id> synthetic fallback.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        # lock_depth=2 is pinned explicitly: the default may be overridden by a
+        # config.yaml or env var in this environment, and test assertions in this
+        # class are depth-sensitive (file-path normalization collapses at depth=1).
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        return Scheduler(config)
+
+    def test_directory_only_files_returns_task_fallback(self, scheduler: Scheduler):
+        """directory-only metadata.files → task-<id> fallback, not a wide module."""
+        task = {
+            'id': 'D',
+            'metadata': {'files': ['crates/reify-eval/src', 'crates/reify-eval/tests']},
+        }
+        result = scheduler._get_modules(task)
+        assert result == ['task-D'], (
+            f'Expected task-D fallback for directory-only files, got: {result}'
+        )
+
+    def test_mixed_files_strips_directory_keeps_file_module(self, scheduler: Scheduler):
+        """Mixed files: directory stripped, file sibling's module kept."""
+        task = {
+            'id': 'M',
+            'metadata': {'files': ['crates/reify-eval/src', 'crates/reify-eval/src/foo.rs']},
+        }
+        result = scheduler._get_modules(task)
+        # The file 'crates/reify-eval/src/foo.rs' should produce a module;
+        # the bare directory 'crates/reify-eval/src' must NOT appear as a module entry.
+        assert 'crates/reify-eval/src' not in result, (
+            f'Directory entry must not appear as a derived module: {result}'
+        )
+        assert len(result) > 0, f'Expected at least one module from file sibling, got: {result}'
+
+    def test_no_derived_module_equals_stripped_directory(self, scheduler: Scheduler):
+        """Directory entry stripped; file sibling normalizes to its own lock key.
+
+        At lock_depth=2 (pinned in fixture): 'backend/app.py' normalizes to
+        'backend/app.py' (two path components), NOT to bare 'backend' — so the
+        stripped directory name does not collide with any derived module.
+
+        Note: the property "no derived module equals a stripped directory" is
+        NOT depth-invariant.  At depth=1 'backend/app.py' → 'backend', which
+        would equal the stripped directory.  This test pins depth=2 via the
+        class fixture and asserts the precise expected module list, not just
+        substring absence.
+        """
+        task = {
+            'id': 'S',
+            'metadata': {'files': ['backend', 'backend/app.py']},
+        }
+        result = scheduler._get_modules(task)
+        # At depth=2 the file derives ['backend/app.py'], not ['backend'].
+        assert result == ['backend/app.py'], (
+            f'Expected ["backend/app.py"] (depth=2 module), got: {result}'
+        )
+
+
+@pytest.mark.asyncio
+class TestAcquireNextDirectoryCharterBoundary:
+    """G2 boundary / repro (reify-3468): a directory-charter task must NOT block
+    an unrelated sibling that edits a file inside the same directory.
+
+    This test reproduces the exact failure: at lock_depth=10, a directory entry
+    like 'crates/reify-eval/src' previously survived normalize_lock unchanged and
+    became a prefix lock that modules_conflict treated as conflicting with EVERY
+    file under that subtree — so the sibling was blocked.
+
+    After the α strip the directory charter yields no subtree lock (or the
+    task-<id> synthetic fallback, which conflicts with nothing), so BOTH tasks
+    are dispatchable.
+    """
+
+    async def test_directory_charter_does_not_block_sibling_file_task(self):
+        """Both a directory-charter task and a file sibling are dispatchable."""
+        config = OrchestratorConfig(lock_depth=10, max_per_module=1)
+        scheduler = Scheduler(config)
+
+        task_dir = {
+            'id': 'dir',
+            'title': 'Directory charter task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['crates/reify-eval/src', 'crates/reify-eval/tests']},
+        }
+        task_sib = {
+            'id': 'sib',
+            'title': 'Sibling file task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['crates/reify-eval/src/unrelated.rs']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_dir, task_sib])
+
+        first = await scheduler.acquire_next()
+        assert first is not None, 'First acquire_next() must dispatch a task'
+
+        second = await scheduler.acquire_next()
+        assert second is not None, (
+            'Directory charter must NOT block the sibling: both should be dispatchable. '
+            f'First dispatched: {first.task_id}; second was None (blocked).'
         )

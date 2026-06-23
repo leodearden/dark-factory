@@ -4,17 +4,127 @@ The orchestrator's scheduler uses fixed-depth path prefixes as lock keys so that
 tasks touching `crates/reify-compiler/src/foo.rs` and `crates/reify-compiler/src/bar.rs`
 serialize on the same lock. The task curator reuses the same normalization to find
 tasks whose module footprint overlaps a candidate.
+
+Directory/file path classifier (α/γ shared predicate)
+------------------------------------------------------
+``CODE_EXTENSIONS``, ``is_file_path``, ``directory_locks``, and
+``strip_directory_locks`` live here so the orchestrator scheduler (α
+enforcement point) can import them without a ``fused_memory`` dependency
+(the orchestrator must not import fused_memory; see
+``agents/triage.py:78-95``).
+
+``lock_charter_guard.py`` keeps **verbatim duplicate definitions** of these
+names so it remains self-contained in the fused-memory virtual environment
+(the editable shared package in ``.venv`` may be pinned to a release that
+predates this relocation).  The two copies are **not** connected by a
+re-export; drift between them is caught by explicit equality tests:
+
+- ``shared/tests/test_locking.py::TestCodeExtensionsDriftGuard``
+  (pins this copy)
+- ``fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard``
+  (pins the lock_charter_guard.py copy)
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any
 
 __all__ = [
-    'normalize_lock',
+    'CODE_EXTENSIONS',
+    'directory_locks',
     'files_to_modules',
+    'is_file_path',
     'modules_conflict',
+    'normalize_lock',
+    'strip_directory_locks',
 ]
+
+# ---------------------------------------------------------------------------
+# Canonical extension allowlist — authoritative Python copy for the α enforcement point.
+# Copied verbatim from reify's scripts/lock-charter-guard.sh _EXTS (reify:4676).
+# Drift guard (this shared copy): shared/tests/test_locking.py::TestCodeExtensionsDriftGuard
+# Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
+# ---------------------------------------------------------------------------
+
+CODE_EXTENSIONS: frozenset[str] = frozenset({
+    'c', 'cc', 'cjs', 'cpp', 'css', 'cts', 'cxx', 'gcode',
+    'h', 'hh', 'hpp', 'html',
+    'js', 'json', 'jsonc', 'jsx',
+    'lock', 'md', 'mjs', 'mts', 'png', 'py',
+    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'toml', 'ts', 'tsx', 'txt',
+    'yaml', 'yml',
+})
+
+
+def is_file_path(path: str) -> bool:
+    """Return True iff *path* is a file-level declaration (not a directory).
+
+    Mirrors ``_is_file_path`` in reify's ``scripts/lock-charter-guard.sh``
+    exactly — pure string, no filesystem access, no model call (C-P3).
+
+    Algorithm (C-P1..C-P3):
+    1. Strip ALL trailing ``/`` from *path*.
+    2. Final segment = substring after last ``/``.
+       Empty segment (path was all slashes) → directory → return False.
+    3. If the segment contains no ``.`` → extension-less → return False.
+    4. ext = substring after the last ``.`` in the segment.
+       Return ``ext in CODE_EXTENSIONS`` (case-sensitive, matching α's
+       ``[ "$ext" = "$e" ]`` against a lowercase allowlist).
+    """
+    # Strip all trailing slashes.
+    p = path
+    while p.endswith('/'):
+        p = p[:-1]
+
+    # Final segment (everything after the last '/').
+    seg = p.rsplit('/', 1)[-1] if '/' in p else p
+
+    # Empty segment → path was all slashes → directory.
+    if not seg:
+        return False
+
+    # No dot in segment → extension-less → treat as directory (REJECT).
+    if '.' not in seg:
+        return False
+
+    # Extension = substring after the last dot.
+    ext = seg.rsplit('.', 1)[1]
+
+    # Dotfiles: seg == '' after split when the dot is the first char.
+    # e.g. '.gitignore' → seg='.gitignore', ext='gitignore' — not in allowlist → False.
+    # 'f.PY' → ext='PY' — not in (lowercase) allowlist → False.  Correct.
+    return ext in CODE_EXTENSIONS
+
+
+def directory_locks(files: list[Any]) -> list[str]:
+    """Return the ordered, de-duplicated list of directory-like entries in *files*.
+
+    Non-string, empty, and whitespace-only tokens are silently skipped
+    (mirrors ``_extract_metadata_files`` benign-absent convention).
+    Order is preserved from the input; duplicates are collapsed to the first
+    occurrence.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for f in files:
+        if not isinstance(f, str) or not f.strip():
+            continue
+        if not is_file_path(f) and f not in seen:
+            seen.add(f)
+            result.append(f)
+    return result
+
+
+def strip_directory_locks(files: list[Any]) -> list[str]:
+    """Return only the file-level entries from *files* (inverse of directory_locks).
+
+    Non-string, empty, and whitespace-only tokens are silently skipped.
+    Used as a pre-filter before lock derivation so directory charters do not
+    produce subtree-wide prefix locks.
+    """
+    return [f for f in files if isinstance(f, str) and f.strip() and is_file_path(f)]
 
 
 def modules_conflict(a: str, b: str) -> bool:

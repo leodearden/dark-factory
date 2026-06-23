@@ -3,7 +3,35 @@ orchestrator scheduler and the task curator."""
 
 from __future__ import annotations
 
-from shared.locking import files_to_modules, modules_conflict, normalize_lock
+from shared.locking import (
+    CODE_EXTENSIONS,
+    directory_locks,
+    files_to_modules,
+    is_file_path,
+    modules_conflict,
+    normalize_lock,
+    strip_directory_locks,
+)
+
+# ---------------------------------------------------------------------------
+# Drift guard — pins shared.locking.CODE_EXTENSIONS to the canonical vector.
+#
+# Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the allowlist
+# changes.  Also update the verbatim copy in
+# fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND its
+# corresponding _CANONICAL_EXTENSIONS in
+# fused-memory/tests/test_lock_charter_guard.py.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_EXTENSIONS = [
+    'c', 'cc', 'cjs', 'cpp', 'css', 'cts', 'cxx', 'gcode',
+    'h', 'hh', 'hpp', 'html',
+    'js', 'json', 'jsonc', 'jsx',
+    'lock', 'md', 'mjs', 'mts', 'png', 'py',
+    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'toml', 'ts', 'tsx', 'txt',
+    'yaml', 'yml',
+]
 
 
 class TestNormalizeLock:
@@ -101,3 +129,113 @@ class TestModulesConflict:
 
     def test_disjoint_paths_do_not_conflict(self):
         assert not modules_conflict('a/b', 'c/d')
+
+
+class TestIsFilePath:
+    """is_file_path — pure-string file vs directory classifier."""
+
+    def test_py_file_is_file(self):
+        assert is_file_path('src/app.py')
+
+    def test_rs_file_is_file(self):
+        assert is_file_path('foo/bar.rs')
+
+    def test_extension_less_segment_is_directory(self):
+        assert not is_file_path('backend')
+
+    def test_directory_path_no_extension_is_directory(self):
+        assert not is_file_path('crates/reify-eval/src')
+
+    def test_trailing_slash_is_directory(self):
+        assert not is_file_path('src/server/')
+
+    def test_uppercase_extension_is_not_file_case_sensitive(self):
+        # Case-sensitive allowlist: 'MD' not in CODE_EXTENSIONS
+        assert not is_file_path('README.MD')
+
+    def test_code_extensions_is_frozenset(self):
+        assert isinstance(CODE_EXTENSIONS, frozenset)
+        # Spot-check canonical members
+        assert 'py' in CODE_EXTENSIONS
+        assert 'rs' in CODE_EXTENSIONS
+        assert 'ts' in CODE_EXTENSIONS
+        assert 'md' in CODE_EXTENSIONS
+
+
+class TestDirectoryLocks:
+    """directory_locks — returns ordered directory-like entries, drops files."""
+
+    def test_returns_directory_entries_only(self):
+        files = ['crates/reify-eval/src', 'a/b.py', 'crates/reify-eval/tests']
+        assert directory_locks(files) == ['crates/reify-eval/src', 'crates/reify-eval/tests']
+
+    def test_preserves_order(self):
+        files = ['z/dir', 'a/dir', 'm/dir']
+        assert directory_locks(files) == ['z/dir', 'a/dir', 'm/dir']
+
+    def test_deduplicates(self):
+        files = ['dir', 'dir', 'a/b.py']
+        assert directory_locks(files) == ['dir']
+
+    def test_skips_non_str_tokens(self):
+        files = [None, 42, 'backend', 'src/foo.py']  # type: ignore[list-item]
+        assert directory_locks(files) == ['backend']
+
+    def test_skips_empty_and_whitespace(self):
+        files = ['', '   ', 'backend']
+        assert directory_locks(files) == ['backend']
+
+    def test_empty_input(self):
+        assert directory_locks([]) == []
+
+
+class TestStripDirectoryLocks:
+    """strip_directory_locks — inverse of directory_locks; keeps only file entries."""
+
+    def test_strips_directories_keeps_files(self):
+        files = ['crates/reify-eval/src', 'a/b.py', 'crates/reify-eval/tests', 'c.rs']
+        assert strip_directory_locks(files) == ['a/b.py', 'c.rs']
+
+    def test_empty_input(self):
+        assert strip_directory_locks([]) == []
+
+    def test_all_directories_returns_empty(self):
+        assert strip_directory_locks(['backend', 'crates/reify-eval/src']) == []
+
+    def test_all_files_returns_all(self):
+        files = ['src/foo.py', 'src/bar.rs']
+        assert strip_directory_locks(files) == ['src/foo.py', 'src/bar.rs']
+
+    def test_skips_non_str_tokens(self):
+        files = [None, 42, 'backend', 'src/foo.py']  # type: ignore[list-item]
+        assert strip_directory_locks(files) == ['src/foo.py']
+
+    def test_skips_empty_and_whitespace(self):
+        files = ['', '   ', 'src/foo.py']
+        assert strip_directory_locks(files) == ['src/foo.py']
+
+
+class TestCodeExtensionsDriftGuard:
+    """Pin shared.locking.CODE_EXTENSIONS to the canonical extension vector.
+
+    This is the α-copy drift guard for the shared.locking canonical source.
+    The corresponding γ-copy guard lives in
+    fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
+    and uses the same ``_CANONICAL_EXTENSIONS`` vector.  Both must be updated
+    together whenever the allowlist changes.
+    """
+
+    def test_extension_drift_guard(self):
+        """sorted(CODE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
+
+        Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the
+        allowlist changes.  Also update the verbatim copy in
+        lock_charter_guard.py and its _CANONICAL_EXTENSIONS list.
+        """
+        assert sorted(CODE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
+            f'shared.locking.CODE_EXTENSIONS has drifted from the canonical vector.\n'
+            f'  canonical : {_CANONICAL_EXTENSIONS!r}\n'
+            f'  actual    : {sorted(CODE_EXTENSIONS)!r}\n'
+            f'Update CODE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
+            f'lock_charter_guard.py.'
+        )
