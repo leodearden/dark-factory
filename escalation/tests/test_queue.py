@@ -2644,3 +2644,248 @@ class TestSubmitResolveAdoptLock:
         assert any(eid == 'esc-3-1' for _, eid in acquired), (
             f'Expected lock acquisition for esc-3-1; got {acquired}'
         )
+
+
+class TestArchiveListingMemoisation:
+    """get() must memoise the archive listing so repeated calls scan at most once."""
+
+    def test_archive_scanned_at_most_once_across_repeated_gets(self, tmp_path: Path):
+        """Calling get(id) three times on a FRESH instance must scan the archive <=1x.
+
+        Instance A: submit + resolve 'esc-1-1' (moves it to archive).
+        Instance B: fresh, cache unbuilt.  Spy _scan_archive_listing (wraps).
+        Three sequential B.get('esc-1-1') calls.
+        (a) all calls return status='resolved'.
+        (b) spy.call_count <= 1 (_scan_archive_listing called at most once total).
+
+        The listing is built by _scan_archive_listing (a single rglob); subsequent
+        gets use the cached dict.  Spying _iter_archive_paths would always show 0
+        calls because the new code path never calls it for get() lookups.
+        """
+        queue_dir = tmp_path / 'queue'
+
+        # Instance A: submit and resolve so the file moves to archive.
+        instance_a = EscalationQueue(queue_dir)
+        instance_a.submit(_make_escalation('esc-1-1'))
+        instance_a.resolve('esc-1-1', 'archived by instance A')
+
+        # Instance B: fresh, no cache yet.
+        instance_b = EscalationQueue(queue_dir)
+
+        with patch.object(
+            instance_b, '_scan_archive_listing', wraps=instance_b._scan_archive_listing,
+        ) as spy:
+            result1 = instance_b.get('esc-1-1')
+            result2 = instance_b.get('esc-1-1')
+            result3 = instance_b.get('esc-1-1')
+
+        # (a) Every call must return the resolved escalation.
+        for i, result in enumerate([result1, result2, result3], start=1):
+            assert result is not None, f'Call {i}: expected Escalation, got None'
+            assert result.status == 'resolved', (
+                f'Call {i}: expected status=resolved, got {result.status!r}'
+            )
+
+        # (b) Archive must be scanned at most once (memoised listing).
+        assert spy.call_count <= 1, (
+            f'Expected _scan_archive_listing called <=1x but got '
+            f'{spy.call_count}x across three get() calls'
+        )
+
+    def test_newly_resolved_id_visible_without_rescan(self, tmp_path: Path):
+        """After resolving a NEW id, get() finds it via incremental cache update, not rescan.
+
+        Sequence on a SINGLE instance:
+        1. Submit + resolve 'esc-1-1' (archives it).
+        2. Call get('esc-1-1') to force the listing cache to build (snapshot captured).
+        3. Spy _scan_archive_listing AFTER the cache is built.
+        4. Submit + resolve 'esc-2-1' (must update the cache incrementally).
+        5. Call get('esc-2-1').
+        Assert:
+        (a) get('esc-2-1') returns the resolved escalation (not None).
+        (b) spy.call_count == 0 — the new id was found via incremental update, not a
+            second _scan_archive_listing call.
+
+        Spying _scan_archive_listing (not _iter_archive_paths) is correct because
+        the listing is built by _scan_archive_listing's rglob; incremental updates
+        mutate the cached dict directly without calling any scan helper.
+
+        RED on main-with-only-step-2: cache built after step 2 (snapshot lacks esc-2-1)
+        → get('esc-2-1') returns None → assertion (a) fails.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        # Step 1: archive esc-1-1.
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.resolve('esc-1-1', 'first resolve')
+
+        # Step 2: force the listing cache to build (snapshot excludes esc-2-1).
+        result = queue.get('esc-1-1')
+        assert result is not None, 'Setup: esc-1-1 must be found'
+
+        # Step 3: spy AFTER the cache is already populated.
+        with patch.object(
+            queue, '_scan_archive_listing', wraps=queue._scan_archive_listing,
+        ) as spy:
+            # Step 4: archive a NEW escalation.
+            queue.submit(_make_escalation('esc-2-1', task_id='2'))
+            queue.resolve('esc-2-1', 'second resolve')
+
+            # Step 5: look up the new id.
+            result2 = queue.get('esc-2-1')
+
+        # (a) Must return the resolved escalation (incremental update made it visible).
+        assert result2 is not None, (
+            'Expected esc-2-1 to be found via incremental listing update, got None'
+        )
+        assert result2.status == 'resolved', (
+            f'Expected status=resolved, got {result2.status!r}'
+        )
+
+        # (b) No rescan occurred — the new id was in the updated cache.
+        assert spy.call_count == 0, (
+            f'Expected 0 _scan_archive_listing calls (incremental update used instead) '
+            f'but got {spy.call_count}x'
+        )
+
+    def test_pruned_archive_file_returns_none_not_raise(self, tmp_path: Path):
+        """A stale listing entry whose file was pruned must return None, not raise.
+
+        Sequence on a SINGLE instance:
+        1. Submit + resolve 'esc-1-1' (archives it).
+        2. Call get('esc-1-1') to build the listing cache (entry present).
+        3. Delete the archived file directly from disk (simulates out-of-process prune).
+        4. Call get('esc-1-1').
+        Assert: returns None and does NOT raise.
+
+        RED on main-with-steps-2/4: cache still lists the id, _locate_path returns
+        the now-missing path, Escalation.from_json(path.read_text()) raises
+        FileNotFoundError (not in get()'s caught set) → clean RED.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        # Step 1: archive the escalation.
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.resolve('esc-1-1', 'to be pruned')
+
+        # Step 2: build the listing cache.
+        result = queue.get('esc-1-1')
+        assert result is not None, 'Setup: esc-1-1 must be found before pruning'
+
+        # Step 3: simulate out-of-process pruning by deleting the archive file.
+        archive_files = list((queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files) == 1, 'Setup: exactly one archive file expected'
+        archive_files[0].unlink()
+
+        # Step 4: get() must return None gracefully, not raise.
+        result_after_prune = queue.get('esc-1-1')
+        assert result_after_prune is None, (
+            f'Expected None after pruning but got {result_after_prune!r}'
+        )
+
+
+class TestMakeIdMaxSeqCache:
+    """make_id() must memoise the archive max_seq per task_id to avoid repeated scans."""
+
+    def _seed_archive_file(self, queue_dir: Path, esc_id: str, task_id: str, date: str) -> None:
+        """Write a resolved escalation directly into the archive (bypasses queue)."""
+        archive_dir = queue_dir / 'archive' / date
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        esc = _make_escalation(esc_id, task_id=task_id, status='resolved')
+        (archive_dir / f'{esc_id}.json').write_text(esc.to_json())
+
+    def test_archive_scanned_at_most_once_per_task_id(self, tmp_path: Path):
+        """make_id() scans the archive at most once per distinct task_id per instance.
+
+        Pre-seed archive: esc-42-5.json (task '42'), esc-99-2.json (task '99').
+        Fresh instance. Spy _iter_archive_paths (wraps).
+        Call make_id('42'), make_id('42'), make_id('99').
+        (a) both make_id('42') return 'esc-42-6' (archive max=5, root empty).
+        (b) make_id('99') returns 'esc-99-3'.
+        (c) spy.call_count <= 2 across all three calls (one scan per distinct task_id).
+
+        RED on main: make_id scans archive on every call → call_count == 3 → fails (c).
+        Note: the SECOND make_id('42') must ALSO return 'esc-42-6' because the first
+        call incremented _seq (via _next_seq), so max(archive_max+1=6, _next_seq()=2)=6.
+        """
+        queue_dir = tmp_path / 'queue'
+
+        # Pre-seed the archive with two files for different task ids.
+        self._seed_archive_file(queue_dir, 'esc-42-5', '42', '2025-06-10')
+        self._seed_archive_file(queue_dir, 'esc-99-2', '99', '2025-06-10')
+
+        # Fresh instance: cache unbuilt.
+        queue = EscalationQueue(queue_dir)
+
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            id1 = queue.make_id('42')
+            id2 = queue.make_id('42')
+            id3 = queue.make_id('99')
+
+        # (a) Both make_id('42') calls must return esc-42-6.
+        assert id1 == 'esc-42-6', f'First make_id("42") expected esc-42-6, got {id1!r}'
+        assert id2 == 'esc-42-6', (
+            f'Second make_id("42") expected esc-42-6 (cache hit), got {id2!r}'
+        )
+
+        # (b) make_id('99') must return esc-99-3.
+        assert id3 == 'esc-99-3', f'make_id("99") expected esc-99-3, got {id3!r}'
+
+        # (c) Archive scanned at most once per distinct task_id (2 total).
+        assert spy.call_count <= 2, (
+            f'Expected archive scanned <=2x (once per task_id) but '
+            f'_iter_archive_paths called {spy.call_count}x across three make_id() calls'
+        )
+
+    def test_max_seq_cache_bumped_upward_on_archive_write(self, tmp_path: Path):
+        """_archive_resolved must bump the max_seq cache upward for the archived task_id.
+
+        Sequence on a SINGLE instance:
+        1. Pre-seed archive 'esc-42-3' (via direct write; task '42').
+        2. Call make_id('42') to seed the cache (archive_max=3 → returns 'esc-42-4').
+        3. Spy _iter_archive_paths AFTER the cache is seeded.
+        4. Submit 'esc-42-7' (high seq) and resolve it (archives it → bumps cache to 7).
+        5. Call make_id('42').
+        Assert:
+        (a) returns 'esc-42-8' (cache bumped to 7 → next 8).
+        (b) spy.call_count == 0 — value came from bumped cache, not a rescan.
+
+        RED on main-with-step-8 (no bump): cache still holds 3 → make_id returns 'esc-42-4'
+        (stale / would collide with just-archived esc-42-7) → assertion (a) fails.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        # Step 1: pre-seed archive with esc-42-3.
+        self._seed_archive_file(queue_dir, 'esc-42-3', '42', '2025-06-10')
+
+        # Step 2: seed the cache with make_id('42'); must return 'esc-42-4'.
+        initial_id = queue.make_id('42')
+        assert initial_id == 'esc-42-4', (
+            f'Setup: expected esc-42-4 to seed cache, got {initial_id!r}'
+        )
+
+        # Step 3: spy _iter_archive_paths AFTER cache is seeded.
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            # Step 4: submit esc-42-7 (higher seq) and archive it.
+            queue.submit(_make_escalation('esc-42-7', task_id='42'))
+            queue.resolve('esc-42-7', 'high seq resolve')
+
+            # Step 5: make_id('42') must see the newly-archived seq 7.
+            next_id = queue.make_id('42')
+
+        # (a) Must return 'esc-42-8' (bumped cache holds 7 → next 8).
+        assert next_id == 'esc-42-8', (
+            f'Expected esc-42-8 (cache bumped to 7 → next 8), got {next_id!r}'
+        )
+
+        # (b) No rescan: bumped cache was used.
+        assert spy.call_count == 0, (
+            f'Expected 0 archive rescans but _iter_archive_paths called {spy.call_count}x'
+        )

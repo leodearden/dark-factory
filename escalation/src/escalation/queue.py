@@ -144,6 +144,14 @@ class EscalationQueue:
         self._seq = 0
         self._notify_callback: Callable[[Escalation], None] | None = None
         self._resolve_callback: Callable[[Escalation], None] | None = None
+        # Cache 1 — archive listing (serves get()/_locate_path).
+        # None = not yet built; dict = {dated-subdir-name: set-of-esc-id-stems}.
+        # Lazy-built on first archive lookup; incrementally updated in _archive_resolved.
+        self._archive_listing: dict[str, set[str]] | None = None
+        # Cache 2 — max_seq per task_id (serves make_id()).
+        # {task_id: max archived seq} — absent key means "not yet scanned".
+        # Upward-only updates in _archive_resolved guarantee no under-estimate.
+        self._archive_max_seq_cache: dict[str, int] = {}
 
     def set_notify_callback(self, callback: Callable[[Escalation], None]) -> None:
         self._notify_callback = callback
@@ -154,6 +162,40 @@ class EscalationQueue:
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
+
+    def _scan_archive_listing(self) -> dict[str, set[str]]:
+        """Build the archive listing from a single rglob scan.
+
+        Returns a dict mapping dated-subdir-name (e.g. '2025-06-15') to a set
+        of esc-id stems (e.g. {'esc-1-1', 'esc-1-2'}) for all files under the
+        archive root.  Returns an empty dict when the archive root does not exist.
+        """
+        archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
+        listing: dict[str, set[str]] = {}
+        if archive_root.exists():
+            for path in archive_root.rglob('esc-*.json'):
+                listing.setdefault(path.parent.name, set()).add(path.stem)
+        return listing
+
+    def _get_archive_listing(self) -> dict[str, set[str]]:
+        """Return the memoised archive listing, building it on first access."""
+        if self._archive_listing is None:
+            self._archive_listing = self._scan_archive_listing()
+        return self._archive_listing
+
+    def _scan_archive_max_seq(self, prefix: str) -> int:
+        """Scan the archive for the maximum sequence number for *prefix*.
+
+        Iterates _iter_archive_paths(f'{prefix}*.json'), parses the trailing
+        integer from each matching stem, and returns the max found (0 if none).
+        Used by make_id() on a per-task_id cache miss to seed the cache.
+        """
+        max_seq = 0
+        for path in self._iter_archive_paths(f'{prefix}*.json'):
+            suffix = path.stem[len(prefix):]
+            with contextlib.suppress(ValueError):
+                max_seq = max(max_seq, int(suffix))
+        return max_seq
 
     def _iter_archive_paths(self, pattern: str) -> Iterator[Path]:
         """Yield escalation JSON files from the archive subtree matching *pattern*.
@@ -206,8 +248,16 @@ class EscalationQueue:
         path = self.queue_dir / f'{escalation_id}.json'
         if path.exists():
             return path
-        # Fall back to archive: search all dated subdirs.
-        candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
+        # Fall back to archive using the memoised per-subdir listing.
+        # Reconstruct candidate paths from the listing without re-rglob-ing.
+        archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
+        listing = self._get_archive_listing()
+        candidates = [
+            archive_root / subdir / f'{escalation_id}.json'
+            for subdir, stems in listing.items()
+            if escalation_id in stems
+            and (archive_root / subdir / f'{escalation_id}.json').exists()
+        ]
         if not candidates:
             return None
         if len(candidates) > 1:
@@ -234,10 +284,18 @@ class EscalationQueue:
         Falls back to the archive directory when the file is not in the
         queue root (i.e. the escalation has been resolved and archived).
 
-        Note: the archive fallback performs an O(|archive|) rglob on every miss.
-        For a 30-day retention window this is bounded, but callers on hot paths
-        should avoid repeated get() calls for ids known to be archived.
-        TODO: memoise the archive listing per dated subdir to reduce repeated scans.
+        The archive fallback uses a memoised per-dated-subdir listing
+        (_archive_listing) so that repeated get() calls for archived ids
+        scan the archive at most once per instance lifetime.  The listing
+        is lazily built on the first archive miss and incrementally updated
+        by _archive_resolved() when this instance archives a new escalation.
+
+        Per-instance freshness: escalations resolved by another
+        EscalationQueue instance (e.g. a concurrent process) after this
+        instance's listing was built are not visible until this instance
+        next calls _archive_resolved().  get() returns None in that window,
+        degrading gracefully rather than raising.  This is consistent with
+        the single-writer production model (one harness process per queue).
         """
         path = self._locate_path(escalation_id)
         if path is None:
@@ -880,6 +938,33 @@ class EscalationQueue:
             archive_dir = archive.archive_dir_for_date(self.queue_dir, resolved_at)
             archive_dir.mkdir(parents=True, exist_ok=True)
             os.replace(str(path), str(archive_dir / f'{escalation_id}.json'))
+            # Incrementally update the listing cache so get() finds the newly-archived
+            # id without a full rescan.  Only update if the cache has already been built.
+            if self._archive_listing is not None:
+                self._archive_listing.setdefault(archive_dir.name, set()).add(escalation_id)
+            # Upward-bump the max_seq cache for the archived task_id so make_id()
+            # sees the newly-archived seq without a rescan.  Upward-only guarantee:
+            # never lower the cached value (external pruning can only reduce the
+            # true on-disk max, so an over-estimate is always safe; an under-estimate
+            # would cause id reuse/collision).
+            try:
+                # escalation_id is 'esc-<task_id>-<seq>'; strip the 'esc-' prefix.
+                head, tail = escalation_id.rsplit('-', 1)
+                archived_task_id = head[len('esc-'):]
+                archived_seq = int(tail)
+            except (ValueError, IndexError):
+                # Non-conforming id: cannot identify which task_id to update,
+                # so leave all other cached entries intact.  Log a warning so a
+                # genuinely malformed escalation_id is observable.
+                logger.warning(
+                    f'Could not parse task_id/seq from escalation_id {escalation_id!r}; '
+                    'max_seq cache not updated for this archive write'
+                )
+            else:
+                if archived_task_id in self._archive_max_seq_cache:
+                    self._archive_max_seq_cache[archived_task_id] = max(
+                        self._archive_max_seq_cache[archived_task_id], archived_seq
+                    )
         except OSError as exc:
             logger.warning(
                 f'Failed to archive escalation {escalation_id}: {exc}; '
@@ -921,10 +1006,22 @@ class EscalationQueue:
         that have been archived after resolution (the in-memory counter
         resets on process restart, so we must re-derive max_seq from disk).
 
-        Note: the archive scan is O(|archive files for task_id|) on every call.
-        make_id() is a slow path (invoked only at submission), so this is
-        acceptable within a 30-day retention window.
-        TODO: cache max_seq per task_id to eliminate repeated archive scans.
+        The queue root is always scanned fresh each call (cheap; reflects
+        just-submitted pending ids and cross-process root writes).  The
+        archive contribution is cached per task_id in _archive_max_seq_cache:
+        on a cache miss, _scan_archive_max_seq() scans the archive once and
+        stores the result; subsequent calls for the same task_id are O(1).
+        _archive_resolved() bumps the cache upward on each archive write.
+
+        Per-instance freshness: the cache is correct only for the
+        single-writer model (one EscalationQueue instance owns a given
+        task_id's escalations).  If a concurrent process archives an
+        escalation for a task_id whose entry is already seeded in this
+        instance's cache, the cache will not reflect that higher seq until
+        this instance's _archive_resolved() runs for that task_id.  In
+        production, harness.py owns a single long-lived EscalationQueue
+        per process and sentinel task_ids are not shared across processes,
+        so this invariant holds.
         """
         prefix = f'esc-{task_id}-'
         max_seq = 0
@@ -932,11 +1029,11 @@ class EscalationQueue:
             suffix = path.stem[len(prefix):]
             with contextlib.suppress(ValueError):
                 max_seq = max(max_seq, int(suffix))
-        # Also scan the archive so post-restart calls don't return IDs
-        # already used by archived escalations for the same task.
-        for path in self._iter_archive_paths(f'{prefix}*.json'):
-            suffix = path.stem[len(prefix):]
-            with contextlib.suppress(ValueError):
-                max_seq = max(max_seq, int(suffix))
+        # Obtain the archive contribution from the per-task_id cache.
+        # Scan the archive exactly once per task_id per instance (cache miss only).
+        if task_id not in self._archive_max_seq_cache:
+            self._archive_max_seq_cache[task_id] = self._scan_archive_max_seq(prefix)
+        archive_max = self._archive_max_seq_cache[task_id]
+        max_seq = max(max_seq, archive_max)
         seq = max(max_seq + 1, self._next_seq())
         return f'{prefix}{seq}'
