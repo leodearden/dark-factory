@@ -2231,3 +2231,136 @@ class TestResolveOwnUnit:
         call = scheduler.set_task_status.call_args
         provenance = call.kwargs.get('done_provenance', {})
         assert provenance.get('kind') == 'deterministic-deploy'
+
+
+# ---------------------------------------------------------------------------
+# Step-11 (ε): B8 robustness — self-target + always_escalates=True gates WITHOUT
+# running the blocking cross-unit deploy (reviewer: robustness_self_kill).
+# (RED until step-12 guards cross-unit deploy with `if not self_target:`)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfRestartActThenAskGate:
+    """DeterministicRunner — self-target deploy with always_escalates=True: gates WITHOUT blocking deploy."""
+
+    def _make_runner(self, scheduler, queue, unit_inspector, script_runner, restart_scheduler):
+        from orchestrator.deterministic_runner import DeterministicRunner
+        return DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+
+    def _act_then_ask_task(self):
+        task = _deploy_task(task_id='870', target_unit='orchestrator-reify.service')
+        task['metadata']['always_escalates'] = True
+        return task
+
+    async def test_script_runner_not_awaited(self, tmp_path: Path):
+        """Self-kill prevention: script_runner MUST NOT be awaited on self-target path."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        script_runner.assert_not_awaited()
+
+    async def test_unit_inspector_not_awaited(self, tmp_path: Path):
+        """No baseline/verify on self-target path: unit_inspector MUST NOT be awaited."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        unit_inspector.assert_not_awaited()
+
+    async def test_restart_scheduler_called_once(self, tmp_path: Path):
+        """Detached restart is scheduled exactly once (no double-deploy)."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        restart_scheduler.assert_awaited_once()
+
+    async def test_outcome_is_blocked(self, tmp_path: Path):
+        """Self-target act-then-ask falls through to gate and returns BLOCKED."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_set_task_status_never_done(self, tmp_path: Path):
+        """set_task_status must NEVER be called with 'done' on act-then-ask self-target path."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        for call in scheduler.set_task_status.await_args_list:
+            status = call.args[1] if len(call.args) > 1 else call.kwargs.get('status')
+            assert status != 'done', (
+                f'set_task_status was called with "done" but must not be on act-then-ask self-target path: {call}'
+            )
+
+    async def test_gate_escalation_category_milestone_gate(self, tmp_path: Path):
+        """The escalation filed must have category=='milestone_gate' (NOT 'infra_issue')."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('870', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'milestone_gate', (
+            f'Expected category "milestone_gate", got "{pending[0].category}"'
+        )
