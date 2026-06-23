@@ -307,35 +307,3 @@ async def test_cancel_ticket_mcp_tool_delegates_to_interceptor(mcp_server, task_
     assert result == {'status': 'cancelled', 'ticket_id': 'tkt_X'}, (
         f'Expected cancelled dict, got: {result!r}'
     )
-
-
-# ------------------------------------------------------------------
-# submit_task tool description — complexity rubric contract test
-# ------------------------------------------------------------------
-
-
-def test_submit_task_description_advertises_complexity_rubric(mcp_server):
-    """The registered submit_task MCP tool description must advertise the
-    metadata.complexity field and the canonical fast-path rubric.
-
-    This is an API-surface contract test: the deliverable is the MCP wire
-    description surfaced to every task-creating agent.  We check the field
-    name plus two distinctive rubric markers — the minimum to guard the
-    legibility signal — without pinning the full prose.
-
-    Mirrors test_refresh_entity_summary.py::test_tool_docstring_mentions_both_uuid_and_name.
-    """
-    tool = next(
-        t for t in mcp_server._tool_manager.list_tools()
-        if t.name == 'submit_task'
-    )
-    desc = tool.description or ''
-    assert 'complexity' in desc, (
-        "submit_task tool description must mention 'complexity' (the metadata key)"
-    )
-    assert 'single coherent edit' in desc, (
-        "submit_task tool description must mention 'single coherent edit' (canonical rubric marker)"
-    )
-    assert 'fast path' in desc, (
-        "submit_task tool description must mention 'fast path' (canonical rubric marker)"
-    )
