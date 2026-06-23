@@ -29,18 +29,17 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
-    EMPTY_SUFFIX_CONFLICT_GRAPH,
     InflightEntry,
     MergeRequest,
     SpeculativeItem,
     SpeculativeMergeWorker,
-    SuffixConflictGraph,
 )
 
 # ── Module-level sentinel for verify_task in pure unit tests ─────────────────
@@ -103,7 +102,7 @@ def _make_req(
     branch: str,
     config: OrchestratorConfig,
     git_repo: Path,
-    lane: str = 'normal',
+    lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
     """Build a minimal MergeRequest with a fresh event-loop future.
 
