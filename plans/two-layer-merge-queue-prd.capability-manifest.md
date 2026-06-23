@@ -158,15 +158,27 @@ All six §8λ prereqs (δ, ε, ζ, η, θ, ι) are upstream — no producer is d
 |---|---|---|
 | the two-layer behaviour to document | `producer:λ upstream` (μ depends_on λ — load-bearing wiring proven by λ; μ is a legitimate doc leaf, not a docs-only close of unbuilt wiring) | PASS |
 
-## ν (DF, **leaf**) — DEPLOY: restart orchestrator-reify
+## ν (DF, intermediate → ξ) — DEPLOY: restart orchestrator-reify (load the pipeline)
 
 *Signal:* post-restart heartbeat shows aging order + bounce outcomes live.
 
 | Capability asserted | Evidence | Verdict |
 |---|---|---|
 | pipeline merged to main | `producer:λ upstream` (ν depends_on λ) | PASS |
-| reify detector on reify main (soft, deploy-time) | κ on reify main — **NOT a wired DF→κ edge** (one-directional cross-project policy; ν falls back to the §5.1 default detector if κ has not yet landed). Documented soft prerequisite only. | PASS (fail-open default) |
+| reify detector on reify main (soft, deploy-time) | κ on reify main — **NOT a wired DF→κ edge** (one-directional cross-project policy; ν falls back to the §5.1 default detector if κ has not yet landed). The crate-graph detector is activated by the reify-side capstone ξ, not ν. | PASS (fail-open default) |
 | (G6 branch-3) live heartbeat shows new order/outcomes | delivered by λ upstream + the restart action ν performs | PASS |
+
+## ξ (RF, **leaf** — capstone auto-deploy, added 2026-06-23 post-decompose) — restart orchestrator-reify to activate the crate-graph detector
+
+*Signal:* post-restart orchestrator-reify heartbeat shows the crate-graph detector ACTIVE — a same-crate/different-file reify changeset pair is sequenced by crate-overlap (the path default would miss it), live in the running merge queue.
+
+| Capability asserted | Evidence | Verdict |
+|---|---|---|
+| crate-graph detector on reify main | `producer:κ upstream` (ξ depends_on reify 4750, integer reify→reify edge) — **DAG-direction OK** | PASS |
+| DF two-layer pipeline deployed (running on orchestrator-reify) | `producer:dark_factory:ν upstream` (external dep `dark_factory:1897`; allowed reify→dark_factory direction) | PASS |
+| (G6 branch-3) live heartbeat shows crate-graph sequencing | delivered by κ + ν upstream + the restart action ξ performs; no downstream owner | PASS |
+
+Filed in reify (not dark-factory) so it can depend on κ via a reify-internal integer edge — **no dark-factory task depends on κ**. Migrate to `task_kind=deterministic` once df 1898–1904 (deterministic auto-deploy infra) lands+deploys.
 
 ---
 
@@ -174,7 +186,10 @@ All six §8λ prereqs (δ, ε, ζ, η, θ, ι) are upstream — no producer is d
 
 | Edge | Form | Wired? |
 |---|---|---|
-| κ (reify) → γ (dark-factory) | qualified external dep `dark_factory:<γ_id>` on κ, filed with `project_root=/home/leo/src/reify` | **YES** |
-| ν (dark-factory) → κ (reify) | §8 prose "(+ κ on reify main)" | **NO** — one-directional policy: no dark-factory task depends on κ. ν falls back to the default detector; κ landing is a documented deploy-time soft prerequisite, not a DAG edge |
+| κ (reify) → γ (dark-factory) | qualified external dep `dark_factory:1888` on κ (4750), filed with `project_root=/home/leo/src/reify` | **YES** |
+| ξ (reify) → κ (reify) | integer reify→reify dep on ξ (4751) | **YES** |
+| ξ (reify) → ν (dark-factory) | qualified external dep `dark_factory:1897` on ξ (4751) | **YES** |
+| ν (dark-factory) → κ (reify) | §8 prose "(+ κ on reify main)" | **NO** — one-directional policy: no dark-factory task depends on κ. ν falls back to the default detector; the crate-graph detector is instead activated by the reify-side capstone ξ |
 
-No dark-factory task depends on κ. The only cross-project edge points reify → dark-factory.
+Every cross-project edge points **reify → dark-factory** (κ→γ, ξ→ν) or is reify-internal (ξ→κ).
+**No dark-factory task depends on κ** — the reason ξ (which must depend on κ) is filed in reify, not dark-factory.
