@@ -6,12 +6,16 @@ max_concurrent_tasks when git.warm_lane_pool=True, and with size=0
 
 Step-17: RED — Harness constructs GitOps without warm_lane_pool_size.
 Step-18: GREEN — Harness passes warm_lane_pool_size from max_concurrent_tasks.
+Step-5 (1881): RED — B1 cancelled workflow must free lane via run() finally.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
@@ -239,3 +243,109 @@ class TestHarnessSpecPoolWiring:
         assert harness.git_ops.spec_warm_lane_pool is None, (
             'spec_warm_lane_pool must be None when knob off'
         )
+
+
+# ===========================================================================
+# Step-5 (1881): RED — B1: workflow.run() finally releases lane on CANCELLED exit
+# ===========================================================================
+
+
+async def _init_git_repo(repo: Path) -> None:
+    from orchestrator.git_ops import _run
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'init'], cwd=repo)
+
+
+@pytest.mark.asyncio
+class TestCancelledWorkflowLaneRelease:
+    """B1 (T4): workflow.run() finally must release the warm lane on CANCELLED exit.
+
+    Diff 3, sub-parts (i) and (ii):
+    (i) _handle_cancelled_terminal_exit must call self._enter_phase(CANCELLED)
+        so that workflow.state == WorkflowState.CANCELLED after the run.
+    (ii) run() finally must call git_ops.release_lane_for_terminal_task(self.task_id)
+         when self.state in (DONE, CANCELLED) and not _worktree_external.
+
+    RED: neither behaviour is present; state stays PLAN and lane stays ASSIGNED.
+    """
+
+    async def test_cancelled_workflow_frees_lane(self, tmp_path: Path):
+        """Cancelled terminal exit: (a) state==CANCELLED, (b) lane freed via primitive."""
+        from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.git_ops import GitOps
+        from orchestrator.scheduler import TaskAssignment
+        from orchestrator.warm_lane_pool import LaneState
+        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+
+        # ── Setup: minimal git repo ─────────────────────────────────────────
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        # ── GitOps with warm lane pool ──────────────────────────────────────
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Pre-assign a lane for task '42' (simulates harness having acquired it
+        # before dispatching the workflow; T4 scenario)
+        result = await pool.acquire_for('42')
+        assert result is not None
+        lane = pool.assignment_for('42')
+        assert lane is not None, 'setup: lane must be ASSIGNED for task 42'
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        # ── FakeScheduler returning 'cancelled' ─────────────────────────────
+        scheduler = FakeScheduler()
+        scheduler.statuses['42'] = ['cancelled']  # triggers TerminalExitRejection
+
+        # ── Build workflow ──────────────────────────────────────────────────
+        assignment = TaskAssignment(
+            task_id='42',
+            task={
+                'id': '42', 'title': 'Test task', 'status': 'pending',
+                'metadata': {}, 'dependencies': [],
+            },
+            modules=[],
+        )
+        workflow = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=scheduler,
+            briefing=FakeBriefing(),
+            mcp=FakeMcp(),
+            escalation_queue=EscalationQueue(tmp_path / 'esc'),
+            merge_queue=asyncio.Queue(),
+            merge_worker=None,
+        )
+
+        # ── Run ─────────────────────────────────────────────────────────────
+        outcome = await workflow.run()
+
+        # (a) state must be CANCELLED (RED: _handle_cancelled_terminal_exit
+        #     doesn't call _enter_phase(CANCELLED))
+        assert workflow.state == WorkflowState.CANCELLED, (
+            f'Expected WorkflowState.CANCELLED after cancelled run, got {workflow.state!r}'
+        )
+        # (b) lane must be freed (RED: run() finally doesn't call
+        #     release_lane_for_terminal_task)
+        assert pool.assignment_for('42') is None, (
+            'run() finally must release the lane for a CANCELLED workflow exit'
+        )
+        assert pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after CANCELLED exit, got {pool.state(lane)!r}'
+        )
+        # Sanity: correct outcome returned
+        assert outcome == WorkflowOutcome.CANCELLED
