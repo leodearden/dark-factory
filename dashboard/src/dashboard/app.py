@@ -678,6 +678,8 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     for pid, data, titles in zip(pids, projects_raw.values(), title_maps, strict=True):
         label = _project_label(pid)
         resolved = resolve_active(label, live_map, data.get('active', []))
+        # ι=1894: extract live metrics from the snapshot and stash for shaping
+        live_metrics = live_map.get(label, {}).get('metrics')
         enriched[pid] = {
             **data,
             'depth_timeseries': trim_leading_zero_buckets(
@@ -686,6 +688,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
             'recent': enrich_merges_with_titles(data['recent'], titles),
             'active': enrich_merges_with_titles(resolved['entries'], titles),
             'active_approximate': resolved['approximate'],
+            'live_metrics': live_metrics,
         }
     metrics_db = await pool.get(config.metrics_db)
     active_sparks: dict[str, dict] = {}
