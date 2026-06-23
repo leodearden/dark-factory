@@ -438,3 +438,159 @@ class TestHardCancelLaneRelease:
         assert pool.state(lane) == LaneState.FREE, (
             f'Lane must be FREE after hard-cancel, got {pool.state(lane)!r}'
         )
+
+
+# ===========================================================================
+# Step-9 (1881): RED — B3: train callbacks + redrive release lane on done-flip
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestTrainCallbackLaneRelease:
+    """B3 (T6/T7/T8): build_train_callback_factory must accept git_ops and
+    release the warm lane when mark_member_done or redrive_member flips the task done.
+
+    Diff 5a: widen build_train_callback_factory(scheduler) → (scheduler, git_ops)
+    Diff 5b: after mark_done inside mark_member_done and redrive_member, call
+             await git_ops.release_lane_for_terminal_task(mid)
+
+    RED: factory takes only `scheduler`; closures never release the lane.
+    """
+
+    async def test_merge_train_member_done_frees_lane(self, tmp_path: Path):
+        """(12) mark_member_done fires mark_done AND releases the lane."""
+        from _workflow_helpers import FakeScheduler
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.warm_lane_pool import LaneState
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        mid = '3459'
+        # Pre-assign lane for the member task
+        await pool.acquire_for(mid)
+        lane = pool.assignment_for(mid)
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        scheduler = FakeScheduler()
+        scheduler.statuses[mid] = ['merge-deferred']  # task exists in scheduler
+
+        # RED: build_train_callback_factory takes only scheduler → TypeError
+        factory = build_train_callback_factory(scheduler, git_ops)
+        callbacks = factory('train-1')
+
+        await callbacks.mark_member_done(mid, 'abc123')
+
+        # scheduler.mark_done must have been called
+        assert scheduler.statuses.get(mid, [])[-1] == 'done', (
+            'mark_member_done must flip the task to done'
+        )
+        # Lane must be freed (RED: closures don't call release_lane_for_terminal_task)
+        assert pool.assignment_for(mid) is None, (
+            'mark_member_done must release the warm lane after mark_done'
+        )
+        assert pool.state(lane) == LaneState.FREE
+
+    async def test_merge_deferred_to_done_lane_freed_at_flip(self, tmp_path: Path):
+        """(13) Lane stays ASSIGNED while MERGE_DEFERRED, freed only at the done-flip."""
+        from _workflow_helpers import FakeScheduler
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.warm_lane_pool import LaneState
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        mid = '7777'
+        await pool.acquire_for(mid)
+        lane = pool.assignment_for(mid)
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        scheduler = FakeScheduler()
+        scheduler.statuses[mid] = ['merge-deferred']
+
+        factory = build_train_callback_factory(scheduler, git_ops)
+        callbacks = factory('train-2')
+
+        # Lane is still ASSIGNED before the done-flip
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'lane must stay ASSIGNED while task is MERGE_DEFERRED (not yet done)'
+        )
+
+        # Trigger the done-flip
+        await callbacks.mark_member_done(mid, 'def456')
+
+        # Lane must be freed exactly at the done-flip (RED: not freed)
+        assert pool.assignment_for(mid) is None, (
+            'lane must be freed when mark_member_done flips to done'
+        )
+        assert pool.state(lane) == LaneState.FREE
+
+    async def test_async_merge_queue_done_frees_lane(self, tmp_path: Path):
+        """(14) redrive_member(found_on_main=True) fires mark_done AND releases the lane.
+
+        This covers T6: merge_queue has no task-pool release, so B3 (redrive_member
+        inside the factory) is the primary release path for async-merge-queue done events.
+        """
+        from _workflow_helpers import FakeScheduler
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.warm_lane_pool import LaneState
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        from orchestrator.git_ops import GitOps
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        mid = '3459'
+        await pool.acquire_for(mid)
+        lane = pool.assignment_for(mid)
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        scheduler = FakeScheduler()
+        scheduler.statuses[mid] = ['merge-deferred']  # member exists
+
+        factory = build_train_callback_factory(scheduler, git_ops)
+        callbacks = factory('train-3')
+
+        # found_on_main=True triggers the mark_done path (T6 canonical scenario)
+        await callbacks.redrive_member(mid, found_on_main=True, sha='ghi789')
+
+        # scheduler.mark_done must have been called
+        assert scheduler.statuses.get(mid, [])[-1] == 'done', (
+            'redrive_member(found_on_main=True) must flip to done'
+        )
+        # Lane must be freed (RED: redrive_member closure never releases)
+        assert pool.assignment_for(mid) is None, (
+            'redrive_member must release the warm lane after mark_done(found_on_main)'
+        )
+        assert pool.state(lane) == LaneState.FREE
