@@ -803,3 +803,95 @@ class TestRecomputeFailOpen:
         # Graph should be produced (empty or with empty edges)
         g = worker._suffix_conflict_graph
         assert isinstance(g, SuffixConflictGraph)
+
+
+# ── step-17: regression test for masked transient-error bug ──────────────────
+
+
+@pytest.mark.asyncio
+class TestRecomputeTransientErrorGatesSignature:
+    """A get_changed_files failure (step-4) must leave the debounce signature
+    un-stored so the next tick re-probes instead of short-circuiting on a
+    stale/degraded graph.
+
+    Bug: merge_queue.py step-5 previously re-initialised ``_any_probe_error =
+    False`` (line 5820) AFTER step-4 set it to True on a get_changed_files
+    failure, masking the error and allowing the signature to be cached.
+
+    RED until step-18 GREEN removes the re-initialisation.
+    """
+
+    async def test_signature_not_cached_on_get_changed_files_error(
+        self, git_ops, config, git_repo
+    ):
+        """get_changed_files failure → signature stays None → second call re-probes.
+
+        Isolation: ALL merge_tree_conflicts calls SUCCEED (counting spy wraps the
+        real method).  The ONLY error source is get_changed_files (step-4 footprint
+        resolve).  This verifies that the error flag set in step-4 is not silently
+        reset at the start of step-5.
+        """
+        # Create one real branch so that:
+        #   - resolve_branch_sha succeeds (head is valid)
+        #   - get_changed_files can be made to fail independently
+        #   - merge_tree_conflicts(main_sha, head) still runs (vs-main probe)
+        await _run(['git', 'checkout', '-b', 'task/transient-err'], cwd=git_repo)
+        (git_repo / 'README.md').write_text('transient-error-test\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'transient-err branch'], cwd=git_repo)
+        await _run(['git', 'checkout', 'main'], cwd=git_repo)
+
+        worker = _make_worker(git_ops)
+        req = _make_req('task-transient', 'transient-err', config, git_repo)
+        worker._lane_buffers['normal'].append(req)
+
+        # Counting spy: wraps the REAL merge_tree_conflicts so it still succeeds;
+        # we just want to observe how many times it is called.
+        call_count = 0
+        original_probe = git_ops.merge_tree_conflicts
+
+        async def counting_probe(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return await original_probe(*args, **kwargs)
+
+        git_ops.merge_tree_conflicts = counting_probe
+
+        # Inject a transient footprint-probe failure: get_changed_files raises.
+        # This is the ONLY error source; merge_tree_conflicts will still succeed.
+        async def failing_changed_files(*args, **kwargs):
+            raise RuntimeError('transient get_changed_files failure')
+
+        git_ops.get_changed_files = failing_changed_files
+
+        # First call: must NOT raise
+        await worker.recompute_suffix_conflict_graph()
+
+        # The vs-main probe must have run (resolve_branch_sha succeeded → valid head)
+        assert call_count >= 1, (
+            'Expected merge_tree_conflicts to be called at least once '
+            '(vs-main probe) but got zero calls'
+        )
+
+        # CRITICAL: signature must NOT be cached when a probe error occurred.
+        # A transient error leaves the signature un-stored so the next tick
+        # re-probes instead of serving a degraded/incomplete graph behind the
+        # debounce.
+        assert worker._suffix_conflict_signature is None, (
+            'Expected _suffix_conflict_signature to be None after a '
+            'get_changed_files failure (transient error must not be cached), '
+            f'but got {worker._suffix_conflict_signature!r}'
+        )
+
+        count_after_first = call_count
+
+        # Second call with same suffix + same main_sha (neither changed).
+        # The signature was NOT cached, so the debounce MUST NOT short-circuit;
+        # re-probing is required.
+        await worker.recompute_suffix_conflict_graph()
+
+        assert call_count > count_after_first, (
+            f'Expected re-probe on second call (transient error leaves signature '
+            f'un-stored), but call_count stayed at {count_after_first} '
+            f'(debounce incorrectly short-circuited on a stale signature)'
+        )
