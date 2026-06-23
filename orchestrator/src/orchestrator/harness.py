@@ -483,6 +483,14 @@ class Harness:
         # Mirrors the _on_park_stop_trip pattern (declared in scheduler.py, installed
         # here so the harness EscalationQueue and set_task_status are available).
         self.scheduler._on_external_dep_block = self._block_and_escalate_external_dep
+        # Wire the starvation-watchdog callbacks (task 1880): when a
+        # deps-satisfied pending task is starved past both thresholds, the
+        # scheduler calls _on_starvation_warn to file a non-blocking INFO
+        # escalation; it calls _on_starvation_resolve when the task dispatches
+        # (or is GC'd as terminal).  Same declare-in-scheduler / install-in-
+        # harness pattern as _on_park_stop_trip / _on_external_dep_block.
+        self.scheduler._on_starvation_warn = self._file_starvation_info
+        self.scheduler._on_starvation_resolve = self._resolve_starvation_info
         # --- Action-teardown suppression (task 1620, β Pair F / C3.2) ---
         # Counter of task_ids currently undergoing action-teardown (park/restart/abandon).
         # Stamped (incremented) before the status write + kill; decremented in the
@@ -2759,6 +2767,90 @@ Output JSON matching the schema. Every task must appear in the output.
             esc.id,
             task_id,
         )
+
+    async def _file_starvation_info(
+        self,
+        task_id: str,
+        *,
+        summary: str,
+        detail: str,
+    ) -> None:
+        """File a non-blocking INFO escalation for a scheduler-starved task.
+
+        Installed on ``self.scheduler._on_starvation_warn`` right after
+        Scheduler construction, mirroring the ``_on_external_dep_block`` pattern.
+
+        Deliberately does NOT call ``set_task_status`` — this is a pure
+        observation signal (PROPERTY 1: must never gate/halt the scheduler or
+        the task).  One open INFO escalation per task; subsequent calls are
+        deduped while a pending watchdog escalation already exists.  No-ops
+        gracefully when no escalation queue is attached.
+        """
+        if not self._escalation_queue:
+            return
+
+        existing = [
+            e
+            for e in self._escalation_queue.get_by_task(task_id, status='pending')
+            if e.agent_role == 'orchestrator-starvation-watchdog'
+        ]
+        if existing:
+            logger.debug(
+                'Starvation watchdog: open INFO escalation already exists for '
+                'task %s — skipping duplicate file',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-starvation-watchdog',
+            severity='info',
+            category='risk_identified',
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_investigation',
+            level=0,
+        )
+        self._escalation_queue.submit(esc)
+        logger.info(
+            'Starvation watchdog: filed INFO escalation %s for task %s',
+            esc.id,
+            task_id,
+        )
+
+    async def _resolve_starvation_info(self, task_id: str) -> None:
+        """Resolve an open starvation-watchdog INFO escalation for a task.
+
+        Installed on ``self.scheduler._on_starvation_resolve``.  Called at both
+        dispatch sites and from the GC backstop when the task is terminal.
+
+        Uses ``EscalationQueue.resolve`` which is idempotent (no-op if already
+        resolved), so double-resolve from the dispatch site and the GC backstop
+        is safe.  No-ops gracefully when no escalation queue is attached.
+        """
+        if not self._escalation_queue:
+            return
+
+        pending = [
+            e
+            for e in self._escalation_queue.get_by_task(task_id, status='pending')
+            if e.agent_role == 'orchestrator-starvation-watchdog'
+        ]
+        for esc in pending:
+            self._escalation_queue.resolve(
+                esc.id,
+                'auto-resolved: task dispatched (starvation watchdog)',
+                resolved_by='orchestrator-starvation-watchdog',
+            )
+            logger.info(
+                'Starvation watchdog: auto-resolved INFO escalation %s for task %s',
+                esc.id,
+                task_id,
+            )
 
     async def _block_and_escalate_substrate_flip(
         self,
