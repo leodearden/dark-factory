@@ -5739,9 +5739,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         **Fail-open** — any probe error → conservative (treat as conflict/edge);
         items with missing branch refs are skipped without aborting.  Never raises.
 
-        **Textual pruning** — the β/γ contract guarantees textual-conflict ⇒
-        footprint-overlap.  Only footprint-overlapping pairs are probed via
-        merge_tree_conflicts, collapsing the O(n²) forks to the overlap subset.
+        **Textual pruning** — the β/γ contract idealises textual-conflict ⇒
+        footprint-overlap.  The footprint is approximated via
+        ``get_changed_files(main_sha, head)`` (current-main..head delta) rather
+        than the true merge-base..head delta; this can under-report a branch's
+        footprint when main has since converged to identical content.
+        Downstream ζ/η consumers should treat ``footprint_edges`` as a
+        best-effort (not guaranteed-complete) superset.  Only
+        footprint-overlapping pairs are probed via merge_tree_conflicts,
+        collapsing the O(n²) forks to the overlap subset; a missed footprint
+        edge means the textual probe is skipped, so a genuine textual conflict
+        could be silently omitted from ``textual_edges``.
 
         This method is async (forks git subprocesses) while snapshot() stays
         synchronous and cheap (reads the stored graph; no await).
@@ -5803,25 +5811,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'treating footprint as unknown', ref, exc_info=True,
                 )
                 paths = None
+                _any_probe_error = True
             changed_paths_list.append(paths)
 
         # ── 5. Build footprint_edges via path-set intersection ────────────────
         detector = get_overlap_detector(None)
         footprint_edges: set[frozenset[str]] = set()
+        _any_probe_error = False  # tracks transient errors; gates signature caching
+
+        # Precompute footprints once per item — avoids O(E·n) recomputation
+        # inside the O(n²) pairwise loop (each detector.footprint() call
+        # allocates a fresh frozenset; hoisting it drops that to O(n)).
+        footprints_list: list[Footprint | None] = [
+            detector.footprint(p) if p is not None else None
+            for p in changed_paths_list
+        ]
 
         for i in range(len(suffix)):
-            paths_i = changed_paths_list[i]
-            if paths_i is None:
+            fp_i = footprints_list[i]
+            if fp_i is None:
                 continue  # missing ref — skip pairwise comparison for this item
             for j in range(i + 1, len(suffix)):
-                paths_j = changed_paths_list[j]
-                if paths_j is None:
+                fp_j = footprints_list[j]
+                if fp_j is None:
                     continue
                 try:
-                    overlap = detector.overlaps(
-                        detector.footprint(paths_i),
-                        detector.footprint(paths_j),
-                    )
+                    overlap = detector.overlaps(fp_i, fp_j)
                 except Exception:
                     logger.warning(
                         'recompute_suffix_conflict_graph: footprint overlap check '
@@ -5838,16 +5853,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # ── 6. Build textual_edges via merge_tree_conflicts (β) ──────────────
         # Only probe footprint-overlapping pairs (textual ⇒ footprint contract
-        # from γ lets us skip non-overlapping pairs soundly — saves forks).
+        # from γ; note footprint is an approximation — see docstring caveat —
+        # so a genuine textual conflict without a footprint edge is possible).
         # Memoize results by frozenset({head_a, head_b}) within this recompute
         # so a pair is probed at most once even when re-ordered.
         _probe_cache: dict[frozenset[str], bool] = {}
         textual_edges: set[frozenset[str]] = set()
 
+        # Build once — invariant across all footprint-edge iterations (O(n) vs O(E·n)).
+        idx_map = {req.request_id: k for k, req in enumerate(suffix)}
+
         for fp_edge in footprint_edges:
             rids = tuple(fp_edge)
-            # Map request_ids back to their indices in suffix
-            idx_map = {req.request_id: k for k, req in enumerate(suffix)}
             i_idx = idx_map.get(rids[0])
             j_idx = idx_map.get(rids[1])
             if i_idx is None or j_idx is None:
@@ -5873,6 +5890,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         exc_info=True,
                     )
                     has_conflict = True
+                    _any_probe_error = True
                 _probe_cache[cache_key] = has_conflict
             if has_conflict:
                 textual_edges.add(fp_edge)
@@ -5907,6 +5925,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         exc_info=True,
                     )
                     has_main_conflict = True
+                    _any_probe_error = True
                 _probe_cache[cache_key] = has_main_conflict
             if has_main_conflict:
                 conflicts_with_main.add(req.request_id)
@@ -5918,7 +5937,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             footprint_edges=frozenset(footprint_edges),
             conflicts_with_main=frozenset(conflicts_with_main),
         )
-        self._suffix_conflict_signature = sig
+        # Only cache the debounce signature when every probe succeeded.  A
+        # transient error leaves the signature un-stored so the next tick
+        # re-probes rather than serving a stale conservative result behind the
+        # debounce.
+        if not _any_probe_error:
+            self._suffix_conflict_signature = sig
 
     async def _acquire_next_request(self) -> MergeRequest | None:
         """Return the next pickable request, blocking if nothing is available.

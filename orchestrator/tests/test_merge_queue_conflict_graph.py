@@ -379,7 +379,6 @@ class TestRecomputeFootprintEdges:
         await self._create_branch_editing(git_repo, 'task/branch-n2', 'README.md', 'n2\n')
 
         worker = _make_worker(git_ops)
-        req_hi = _make_req('task-hi', 'branch-hi', config, git_repo)
         req_hi = MergeRequest(
             task_id='task-hi',
             branch='branch-hi',
