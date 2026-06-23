@@ -78,11 +78,15 @@ orchestrator-redeploy-restart.sh: scheduled restart of 'orchestrator-reify.servi
 
 ## Verification (out-of-band, post-restart)
 
-*(to be filled in step-3 after the transient unit fires and the service completes stop→start)*
+Live state read via `systemctl --user show orchestrator-reify.service -p MainPID -p ActiveState -p ActiveEnterTimestamp` after the transient unit fired and the service completed stop→start:
 
 | Criterion | Expected | Actual | Status |
 |---|---|---|---|
-| (a) ActiveState | `active` | *(pending)* | *(pending)* |
-| (b) MainPID | ≠ 937088 (fresh process) | *(pending)* | *(pending)* |
-| (c) ActiveEnterTimestamp | AFTER 2026-06-23 13:10:10 BST (#1867 merge) | *(pending)* | *(pending)* |
-| (d) Startup log | `"Speculative merge worker started"` in post-restart journal | *(pending)* | *(pending)* |
+| (a) ActiveState | `active` | `active` | ✅ GREEN |
+| (b) MainPID | ≠ 937088 (fresh process) | `244123` | ✅ GREEN |
+| (c) ActiveEnterTimestamp | AFTER 2026-06-23 13:10:10 BST (#1867 merge) | `Tue 2026-06-23 13:33:11 BST` | ✅ GREEN |
+| (d) Startup log | `"Speculative merge worker started"` in post-restart journal | Present at `13:33:14 BST` | ✅ GREEN |
+
+**Delta:** Service restarted **22 min 61 s AFTER** the #1867 merge (13:33:11 BST vs 13:10:10 BST merge) — new process loads post-#1867 merge_queue.py with the coalesce-derail re-drive fix.
+
+**Result: #1867 coalesce-derail re-drive fix is DEPLOYED (all criteria a–d GREEN).** orchestrator-reify.service PID 244123 loads the `redrive_member` callback and `_redrive_coalesce_members` method from dark-factory main @ fc2f8ec08f. Absorbed coalesce-train members that derail are now re-dispatched as solo merges instead of being stranded in merge-deferred.
