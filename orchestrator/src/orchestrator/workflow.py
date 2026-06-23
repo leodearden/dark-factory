@@ -3731,6 +3731,20 @@ class TaskWorkflow:
             if verify_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
             if verify_outcome == WorkflowOutcome.BLOCKED:
+                # Infra hold takes priority: route to infra_issue with
+                # escalate_to_human so the open L1 keeps this branch OUT of
+                # pending/footprint-dispatch until the infra clears.
+                # Must be checked BEFORE _inherited_break_info to prevent the
+                # generic 'Verification attempts exhausted' task_failure block
+                # from clobbering the infra_issue category.
+                if self._infra_hold_info is not None:
+                    info = self._infra_hold_info
+                    return await self._mark_blocked(
+                        info['reason'],
+                        detail=info.get('detail', ''),
+                        category='infra_issue',
+                        escalate_to_human=True,
+                    )
                 if self._inherited_break_info is not None:
                     info = self._inherited_break_info
                     return await self._mark_blocked(
