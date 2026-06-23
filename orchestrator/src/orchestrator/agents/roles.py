@@ -587,6 +587,24 @@ git add -- . ':!.task'
 )
 
 
+# Canonical complexity rubric — published verbatim at both submit_task
+# instruction chokepoints so every task-creating role advertises the field.
+# Source of truth: plans/author-declared-complexity-prd.md:90-99.
+_COMPLEXITY_RUBRIC = """\
+complexity (optional): set to "simple" to route this task to the
+single-agent fast path (one Sonnet agent explores, plans, edits, and
+commits; the architect+implementer pair is skipped, but verify/review/merge
+still run). Declare "simple" only when the change is a single coherent edit
+— docs or comments, a rename, a localized behaviour-preserving refactor, a
+typo/wording fix, a one-spot bug fix — that needs no new abstraction and no
+cross-module design, and you can name the target file(s). It is fine for a
+simple task to be high priority or to touch several files/modules, as long
+as the change is mechanically simple. When unsure, omit it — the full path
+is the safe default, and a mis-declared task simply falls back to the
+architect.\
+"""
+
+
 def submit_resolve_instructions(
     metadata_template: str,
     *,
@@ -647,6 +665,8 @@ def submit_resolve_instructions(
         '     at that task. Record it the same way as `created` (the candidate was\n'
         '     absorbed, not lost).\n'
         f'   - `failed` — report the `reason` in your {outcome_target}.'
+        + '\n\n'
+        + _COMPLEXITY_RUBRIC
     )
     return textwrap.indent(raw, caller_indent)
 
@@ -701,6 +721,8 @@ def submit_only_instructions(
         '   any tickets that fail or expire as a follow-up `ticket_failure`\n'
         '   escalation; the curator\'s create/combine/drop decisions land in\n'
         '   `tasks.json` asynchronously.'
+        + '\n\n'
+        + _COMPLEXITY_RUBRIC
     )
     return textwrap.indent(raw, caller_indent)
 
