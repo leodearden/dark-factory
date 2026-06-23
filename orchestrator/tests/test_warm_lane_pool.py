@@ -2430,3 +2430,162 @@ class TestReleaseLaneForTerminalTask:
 
         freed = await git_ops.release_lane_for_terminal_task('3459')
         assert freed is False, 'cleanup error must be swallowed and return False'
+
+    # ------------------------------------------------------------------
+    # Step-17 (1881): disk-backstop opt-in + theft guard
+    # ------------------------------------------------------------------
+
+    async def test_release_default_skips_disk_backstop(
+        self,
+        wl_git_repo: Path,
+        wl_git_config_on: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Default call (no kwarg): disk backstop must NOT be consulted.
+
+        Simulates the common done-exit path where _maybe_cleanup_done_worktree
+        already released the lane and dropped the in-memory assignment. A stale
+        plan.json remains on disk, but the default (allow_disk_backstop=False)
+        call must be a true no-op — no disk scan, no redundant cleanup_worktree /
+        git branch -D retry.
+
+        Pins consequences 1+2 from design_decision #8:
+        (1) no spurious 'branch -D ... failed' WARNING on every DONE exit;
+        (2) primitive returns False (true no-op, matching B1/B2/A comments).
+
+        RED: current impl unconditionally calls _find_lane_by_plan_task_id
+        (TypeError on the kwarg in (b); disk scan in (a)). Fails because:
+        (a) returns True instead of False, (b) lane is freed not ASSIGNED,
+        (c) disk_scanned and cleanup_called are non-empty.
+        """
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # try_acquire: marks _lane-0 ASSIGNED but does NOT add a _assignments entry
+        lane = await pool.try_acquire()
+        assert lane is not None
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        # Write stale plan.json (as if task '3459' had previously used this lane;
+        # plan.json survives release_warm_lane since that only detaches + deletes branch)
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+
+        # Spy on both disk-touching methods — neither must be called
+        disk_scanned: list[object] = []
+        cleanup_called: list[object] = []
+
+        orig_find = git_ops._find_lane_by_plan_task_id
+
+        def spy_find(task_id: str) -> object:
+            disk_scanned.append(task_id)
+            return orig_find(task_id)
+
+        monkeypatch.setattr(git_ops, '_find_lane_by_plan_task_id', spy_find)
+
+        orig_cleanup = git_ops.cleanup_worktree
+
+        async def spy_cleanup(*args: object, **kwargs: object) -> object:
+            cleanup_called.append(args)
+            return await orig_cleanup(*args, **kwargs)
+
+        monkeypatch.setattr(git_ops, 'cleanup_worktree', spy_cleanup)
+
+        freed = await git_ops.release_lane_for_terminal_task('3459')
+
+        assert freed is False, (
+            'default call must return False when no in-memory assignment '
+            '(disk backstop must NOT be consulted)'
+        )
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'lane must remain ASSIGNED — default must not consult disk backstop'
+        )
+        assert not disk_scanned, (
+            '_find_lane_by_plan_task_id must NOT be called (no disk scan on default path)'
+        )
+        assert not cleanup_called, (
+            'cleanup_worktree must NOT be called (no redundant cleanup on default path)'
+        )
+
+    async def test_release_allow_disk_backstop_opt_in_uses_disk(
+        self,
+        wl_git_repo: Path,
+        wl_git_config_on: GitConfig,
+    ):
+        """allow_disk_backstop=True: disk backstop resolves lane and frees it.
+
+        Lost-map / post-restart path: the in-memory assignment was dropped but
+        the plan.json still carries the task id.  Explicit opt-in is required.
+
+        RED: release_lane_for_terminal_task has no allow_disk_backstop param
+        (TypeError on the call).
+        """
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # try_acquire: ASSIGNED, no _assignments entry (in-memory map lost)
+        lane = await pool.try_acquire()
+        assert lane is not None
+
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+
+        freed = await git_ops.release_lane_for_terminal_task('3459', allow_disk_backstop=True)
+
+        assert freed is True, (
+            'allow_disk_backstop=True must resolve via disk backstop and free the lane'
+        )
+        assert pool.state(lane) == LaneState.FREE
+
+    async def test_release_disk_backstop_refuses_lane_held_by_other_task(
+        self,
+        wl_git_repo: Path,
+        wl_git_config_on: GitConfig,
+    ):
+        """Theft guard: disk backstop resolves lane but it's held by a DIFFERENT live task.
+
+        Race window: task '3459' completes → its lane freed → a concurrent
+        dispatch assigns _lane-0 to '9000' → before the stale plan.json is
+        rewritten, a reconciler fires release_lane_for_terminal_task('3459',
+        allow_disk_backstop=True).  The theft guard must detect that _lane-0 is
+        now assigned to '9000' (holder != '3459') and refuse the release.
+
+        Pins consequence 3 from design_decision #8: no cross-task lane-theft.
+
+        RED: no theft guard — the current impl frees _lane-0, stealing task
+        9000's lane (returns True); test fails at assert freed is False.
+        """
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Write stale plan.json for '3459' on _lane-0 (task 3459's old lane)
+        lane_0 = git_ops.worktree_base / '_lane-0'
+        task_dir = lane_0 / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+
+        # A DIFFERENT live task acquires _lane-0 (the first FREE lane)
+        result = await pool.acquire_for('9000')
+        assert result is not None
+        lane, _ = result
+        assert lane == lane_0, 'acquire_for must have assigned _lane-0 to 9000'
+        assert pool.assignment_for('9000') == lane_0
+
+        # Try to release '3459' via disk backstop — theft guard must refuse
+        freed = await git_ops.release_lane_for_terminal_task('3459', allow_disk_backstop=True)
+
+        assert freed is False, (
+            'theft guard must refuse: disk found _lane-0 for 3459 but it is '
+            'now held by the live task 9000'
+        )
+        assert pool.assignment_for('9000') == lane_0, (
+            "task 9000's lane assignment must be preserved"
+        )
+        assert pool.state(lane_0) == LaneState.ASSIGNED, (
+            "task 9000's lane must remain ASSIGNED (not stolen)"
+        )

@@ -995,3 +995,59 @@ class TestRecoveryTerminalTaskLaneRelease:
         assert '3459' in harness._recovered_plans, (
             'task with None status must fall through to restore (safe default; A self-heals)'
         )
+
+
+# ===========================================================================
+# Step-17 (1881): RED — disk-backstop opt-in wiring in _mark_in_progress_done
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestMarkInProgressDoneDiskBackstopWiring:
+    """_mark_in_progress_done must call release_lane_for_terminal_task with
+    allow_disk_backstop=True — it is the ONE legitimate disk-backstop caller
+    (the lost-map / post-restart T9 path) after the default flips to in-memory-only.
+
+    Diff 18(ii): harness._mark_in_progress_done calls
+        await self.git_ops.release_lane_for_terminal_task(tid, allow_disk_backstop=True)
+
+    RED: current _mark_in_progress_done calls without allow_disk_backstop kwarg;
+    spy sees a call without the kwarg → assert_called_once_with fails.
+    """
+
+    async def test_mark_in_progress_done_opts_into_disk_backstop(
+        self, tmp_path: Path,
+    ):
+        """_mark_in_progress_done must pass allow_disk_backstop=True to the primitive."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.git_ops import GitOps
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        harness.scheduler.mark_done = AsyncMock()
+
+        # Replace the primitive with a spy so we can inspect the kwargs
+        release_spy: AsyncMock = AsyncMock(return_value=True)
+        git_ops.release_lane_for_terminal_task = release_spy  # type: ignore[method-assign]
+
+        # Also stub cleanup_worktree to avoid real git subprocess calls
+        git_ops.cleanup_worktree = AsyncMock()  # type: ignore[method-assign]
+
+        await harness._mark_in_progress_done(
+            '3459', sha='abc123', note='found-on-main', reason='found-on-main',
+        )
+
+        # Must have been called EXACTLY once with allow_disk_backstop=True
+        release_spy.assert_called_once_with('3459', allow_disk_backstop=True)
