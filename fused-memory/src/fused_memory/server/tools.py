@@ -229,6 +229,60 @@ async def _checkpoint_overrides_db_if_exists(project_root: str) -> CheckpointRes
     return await _checkpoint_overrides_db(project_root)
 
 
+# ---------------------------------------------------------------------------
+# Park-eviction request constants
+#
+# Intentional duplicate of orchestrator.park_eviction_requests._SCHEMA and
+# orchestrator.config.park_eviction_requests_db_path.  fused-memory has no
+# orchestrator dependency in pyproject.toml; adding one would invert the
+# dependency graph (park_eviction_requests.py documents this at the module level).
+# Hand-mirroring with a source-of-truth comment is the accepted convention —
+# the same pattern used for _OVERRIDE_SCHEMA above.
+# ---------------------------------------------------------------------------
+
+_PARK_EVICTION_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS park_eviction_requests (
+    task_id       TEXT NOT NULL,
+    project_root  TEXT NOT NULL,
+    requested_at  TEXT NOT NULL
+);
+"""  # Source of truth: orchestrator/src/orchestrator/park_eviction_requests.py:46-52
+
+
+def _park_eviction_db_path(project_root: str) -> Path:
+    """Return the canonical path to ``park_eviction_requests.db`` for *project_root*.
+
+    Mirrors ``orchestrator.config.park_eviction_requests_db_path`` — a SEPARATE
+    file from ``scheduler_overrides.db`` (see PRD §D3 separate-file pattern).
+
+    Source of truth: orchestrator/src/orchestrator/config.py:1971-1977.
+    """
+    return Path(project_root) / 'data' / 'orchestrator' / 'park_eviction_requests.db'
+
+
+async def _open_park_eviction_db(project_root: str) -> aiosqlite.Connection:
+    """Open (and initialise) the park_eviction_requests.db for *project_root*.
+
+    Creates parent directories on first call, applies the full Phase-3 durability
+    pragma triad (journal_mode=WAL, busy_timeout=5000ms, synchronous=FULL,
+    wal_autocheckpoint=100, journal_size_limit=64MiB), and runs idempotent DDL.
+
+    WAL growth is bounded by ``wal_autocheckpoint=100`` combined with the
+    scheduler draining (DELETE) every tick — no periodic-checkpoint wiring
+    is needed for this low-volume table.
+
+    Non-autocommit variant: a single INSERT has no read-modify-write race, so
+    the BEGIN IMMEDIATE pattern used by ``_open_overrides_db`` for pin-order
+    serialization is unnecessary here.
+    """
+    db_path = _park_eviction_db_path(project_root)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db = await connect_daemon(str(db_path))
+    await apply_full_durability_pragmas(db, busy_timeout_ms=5000)
+    await db.executescript(_PARK_EVICTION_SCHEMA)
+    return db
+
+
 FUSED_MEMORY_INSTRUCTIONS = """\
 Fused Memory is a unified memory system that combines Graphiti (temporal knowledge graph)
 and Mem0 (vector memory store) behind a single interface. It also provides proxied access
@@ -3564,5 +3618,71 @@ def create_mcp_server(
         except Exception as e:
             logger.exception(f'get_scheduler_events error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def request_park_eviction(
+        task_id: str,
+        project_root: str,
+    ) -> dict[str, Any]:
+        """Enqueue a park-eviction request for a stranded module-lock owner.
+
+        Inserts one row into ``<project_root>/data/orchestrator/park_eviction_requests.db``.
+        The scheduler-tick consumer (task δ/1871) drains the table each tick and
+        owns the authoritative D4 live-owner guard before calling
+        ``ModuleLockTable.force_clear``.  This tool performs NO eviction and NO
+        guard — it is a pure enqueue.
+
+        Append-only: two calls for the same task_id produce two rows (the drain
+        reads ALL rows then deletes them, so deduplication is unnecessary here).
+
+        *project_root* is canonicalized to ``str(Path(resolve_main_checkout(project_root)).resolve())``
+        before storage — the same form the scheduler drain matches on via
+        ``WHERE project_root = str(Path(config.project_root).resolve())``.
+        A non-canonical stored value would cause the scheduler to silently never
+        drain the row (explicit interop contract documented in
+        orchestrator/src/orchestrator/park_eviction_requests.py _canonical_root).
+
+        Args:
+            task_id: The task id that currently holds a stranded module lock.
+            project_root: Absolute path to the project root (worktree paths are
+                redirected to the main checkout automatically).
+
+        Returns:
+            ``{'requested': True, 'task_id': task_id}`` on success, or
+            ``{'error': ..., 'error_type': ...}`` on failure.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        # Additional guard: task_id must be non-empty — the NOT NULL column
+        # must never receive a blank value.
+        if not task_id or not task_id.strip():
+            return {
+                'error': 'task_id is required and must be non-empty',
+                'error_type': 'ValidationError',
+            }
+        # Canonicalize to the resolved main-checkout form that δ's drain
+        # matches on: str(Path(config.project_root).resolve()).  _normalized
+        # is already the main checkout (worktree redirect applied); .resolve()
+        # makes it the stable canonical string.
+        canonical_root = str(Path(_normalized).resolve())
+        db = None
+        try:
+            db = await _open_park_eviction_db(canonical_root)
+            await db.execute(
+                'INSERT INTO park_eviction_requests (task_id, project_root, requested_at) '
+                'VALUES (?, ?, ?)',
+                (task_id, canonical_root, datetime.now(UTC).isoformat()),
+            )
+            await db.commit()
+            return {'requested': True, 'task_id': task_id}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'request_park_eviction error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+        finally:
+            if db is not None:
+                await db.close()
 
     return mcp
