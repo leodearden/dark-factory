@@ -101,6 +101,30 @@ The gate lives in the **dependent's** scheduler only — it does not affect the 
 
 A task is dispatched only when **all** local deps **and** all `metadata.external_deps` are `done`.
 
+### Simple-task fast path (`metadata.complexity`)
+
+Set `metadata.complexity = "simple"` to route a task to the single-agent
+SIMPLE_TASK fast path (one Sonnet agent explores, plans, edits, and commits;
+the architect+implementer pair is skipped, but verify/review/merge still run).
+The only meaningful value is `"simple"` — absent or any other value routes to
+the full architect path.
+
+**When to declare `"simple"`:** the change is a single coherent edit — docs or
+comments, a rename, a localized behaviour-preserving refactor, a typo/wording
+fix, a one-spot bug fix — that needs **no new abstraction and no cross-module
+design**, and you can name the target file(s). A `simple` task may be
+high-priority and may touch several files/modules, as long as the *change* is
+mechanically simple. **When unsure, omit it** — the full path is the safe
+default, and a mis-declared task simply falls back to the architect.
+
+**Hard-blocker veto:** if the task description contains a hard-blocker token
+(`migration`, `architecture`, `integration test`, `design ... new`,
+`implement ... new feature`), the fast path is vetoed even if
+`complexity='simple'` is set.
+
+**Hard escape:** `metadata.force_full_path = true` always forces the full
+architect path regardless of `complexity`.
+
 ## Session Lifecycle
 
 ### Starting a session
