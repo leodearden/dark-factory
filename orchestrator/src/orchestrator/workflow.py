@@ -916,6 +916,12 @@ class TaskWorkflow:
             union_task_files, union_module_configs = self._union_train_scope(members)
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        # NOTE: merge_first_enqueued_at is intentionally NOT stamped here.
+        # Train/group merges are out of α's scope (PRD §11.3/§11.4 open
+        # questions on tie-break among coalesced members); ζ (task 1887) will
+        # decide whether and how to stamp train members.  GroupMergeRequest
+        # therefore inherits the None default from the base MergeRequest field,
+        # and ζ's aging comparator falls back to enqueued_at for legacy/None.
         req = GroupMergeRequest(
             task_id=self.task_id,
             branch=branch_name,
@@ -3340,6 +3346,12 @@ class TaskWorkflow:
         ζ (task 1887) consumes this value at ``_pop_next_pickable`` for aging-
         priority ordering and owns the ``enqueued_at`` fallback for legacy
         ``None`` values.
+
+        **Single-writer assumption** — per-task workflows are serialised by
+        design, so only one coroutine calls this helper for a given task at
+        any moment.  If that assumption ever changes (e.g. parallel submit
+        paths for the same task), the slow-path check-then-stamp sequence
+        would need an explicit per-task lock to remain strictly write-once.
         """
         metadata = self.task.get('metadata') or {}
 

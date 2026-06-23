@@ -11,7 +11,6 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -117,11 +116,9 @@ def test_merge_request_carries_first_enqueued_at_field():
     GREEN after step-2 adds the carrier field.
     """
     config = MagicMock()
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-    future: asyncio.Future[MergeOutcome] = loop.create_future()
+    # Use a MagicMock stand-in for result — the dataclass stores it but never
+    # awaits it during construction, so no real asyncio.Future is needed.
+    result_mock = MagicMock()
 
     # Round-trip an explicit value
     req_explicit = MergeRequest(
@@ -132,7 +129,7 @@ def test_merge_request_carries_first_enqueued_at_field():
         task_files=None,
         module_configs=[],
         config=config,
-        result=future,
+        result=result_mock,
         merge_first_enqueued_at=123.0,
     )
     assert req_explicit.merge_first_enqueued_at == 123.0
@@ -146,7 +143,7 @@ def test_merge_request_carries_first_enqueued_at_field():
         task_files=None,
         module_configs=[],
         config=config,
-        result=future,
+        result=result_mock,
     )
     assert req_default.merge_first_enqueued_at is None
 
@@ -289,12 +286,19 @@ async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
 
     captured: list[MergeRequest] = []
 
-    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
+    async def fake_register_and_enqueue(
+        queue, req: MergeRequest, event_store, registry, *, retention=None,
+    ):
+        # Intercept the function actually called on this path so the patch
+        # stays valid even if register_and_enqueue_merge_request is ever
+        # refactored to stop delegating to enqueue_merge_request internally.
         captured.append(req)
         req.result.set_result(MergeOutcome('blocked', reason='generic'))
+        return True
 
     monkeypatch.setattr(
-        'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
+        'orchestrator.merge_queue.register_and_enqueue_merge_request',
+        fake_register_and_enqueue,
     )
 
     await wf._submit_to_merge_queue('99', pre_rebased=False)
