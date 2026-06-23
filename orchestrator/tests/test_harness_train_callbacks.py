@@ -227,6 +227,86 @@ class TestNonTaskToleranceAndSyntheticStatus:
 
 
 # ---------------------------------------------------------------------------
+# Step-1867-1 / Step-1867-2 — redrive_member callback
+# ---------------------------------------------------------------------------
+
+
+class TestRedriveMember:
+    """build_train_callback_factory returns a redrive_member callback that drives
+    absorbed coalesce members to pending (re-dispatch) or done (found_on_main)."""
+
+    @pytest.mark.asyncio
+    async def test_redrive_not_on_main_flips_to_pending(self) -> None:
+        """redrive_member(mid, False, None) flips a merge-deferred member to pending."""
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = FakeScheduler()
+        await sched.set_task_status('5001', 'merge-deferred')
+
+        factory = build_train_callback_factory(sched)
+        cbs = factory('train-xyz')
+
+        await cbs.redrive_member('5001', False, None)
+
+        assert sched.statuses['5001'][-1] == 'pending', (
+            f"expected 'pending', got {sched.statuses['5001'][-1]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_redrive_on_main_marks_done_found_on_main(self) -> None:
+        """redrive_member(mid, True, sha) marks seeded member done with found_on_main provenance."""
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = FakeScheduler()
+        await sched.set_task_status('5002', 'merge-deferred')
+
+        factory = build_train_callback_factory(sched)
+        cbs = factory('train-abc')
+
+        await cbs.redrive_member('5002', True, 'cafe1234beef')
+
+        assert sched.statuses['5002'][-1] == 'done', (
+            f"expected 'done', got {sched.statuses['5002'][-1]!r}"
+        )
+        prov = sched.provenance.get('5002', {})
+        assert prov.get('kind') == 'found_on_main', f"kind mismatch: {prov!r}"
+        assert prov.get('commit') == 'cafe1234beef', f"commit mismatch: {prov!r}"
+        note = prov.get('note', '')
+        assert 'on main' in note, f"note missing 'on main': {note!r}"
+        assert 'train-abc' in note, f"note missing train_id: {note!r}"
+
+    @pytest.mark.asyncio
+    async def test_redrive_noop_for_nontask_member(self) -> None:
+        """redrive_member for a non-seeded member must NOT raise and must NOT write status."""
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = FakeScheduler()
+        factory = build_train_callback_factory(sched)
+        cbs = factory('train-xyz')
+
+        # Must not raise.
+        await cbs.redrive_member('nonexistent-9999', False, None)
+
+        # No scheduler state was written.
+        assert 'nonexistent-9999' not in sched.statuses
+        assert 'nonexistent-9999' not in sched.provenance
+
+    @pytest.mark.asyncio
+    async def test_factory_built_redrive_member_is_callable(self) -> None:
+        """Factory-built TrainCallbacks.redrive_member is callable (not None)."""
+        from orchestrator.harness import build_train_callback_factory
+        from orchestrator.merge_queue import TrainCallbacks
+
+        sched = FakeScheduler()
+        factory = build_train_callback_factory(sched)
+        cbs = factory('train-xyz')
+
+        assert isinstance(cbs, TrainCallbacks)
+        assert cbs.redrive_member is not None, "redrive_member must not be None"
+        assert callable(cbs.redrive_member), "redrive_member must be callable"
+
+
+# ---------------------------------------------------------------------------
 # Step 7 / Step 8 — harness wiring
 # ---------------------------------------------------------------------------
 
