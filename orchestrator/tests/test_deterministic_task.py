@@ -1163,3 +1163,120 @@ class TestB7DeployFailure:
         assert outcome2 == WorkflowOutcome.BLOCKED
         pending = queue.get_by_task(task_id, status='pending')
         assert len(pending) == 1
+
+
+# ---------------------------------------------------------------------------
+# B8 — self-restart scheduled (orchestrator not killed) (step-11)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestB8SelfRestart:
+    """B8: target_unit == own_unit → restart_scheduler called, no blocking deploy.
+
+    The self-target guard prevents self-kill: when the deploy would replace the
+    orchestrator itself, a detached transient unit is scheduled via restart_scheduler
+    and the task is driven to done immediately with kind='deterministic-deploy-scheduled'.
+    Neither script_runner nor unit_inspector is invoked (cross-unit deploy skipped).
+    """
+
+    def _setup(self, tmp_path: Path, own_unit: str):
+        """Build store, queue, deploy task whose target == own_unit."""
+        store = _StoreScheduler()
+        queue = EscalationQueue(tmp_path / 'queue')
+        task = _deploy_task(
+            task_id='deploy-b8',
+            target_unit=own_unit,  # self-target
+        )
+        store.seed(task)
+        return store, queue, task
+
+    async def test_b8_restart_scheduler_called_once(self, tmp_path: Path) -> None:
+        """restart_scheduler is awaited exactly once (schedule the detached unit)."""
+        own_unit = 'orchestrator.service'
+        store, queue, task = self._setup(tmp_path, own_unit)
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+        script_runner = AsyncMock(name='script_runner')
+        unit_inspector = AsyncMock(name='unit_inspector')
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: own_unit,
+            restart_scheduler=restart_scheduler,
+            script_runner=script_runner,
+            unit_inspector=unit_inspector,
+        )
+        assignment = _make_assignment(task)
+        await runner.run(assignment)
+        restart_scheduler.assert_awaited_once()
+
+    async def test_b8_no_blocking_deploy(self, tmp_path: Path) -> None:
+        """script_runner and unit_inspector are NOT invoked (no blocking deploy, I4)."""
+        own_unit = 'orchestrator.service'
+        store, queue, task = self._setup(tmp_path, own_unit)
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+        script_runner = AsyncMock(name='script_runner')
+        unit_inspector = AsyncMock(name='unit_inspector')
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: own_unit,
+            restart_scheduler=restart_scheduler,
+            script_runner=script_runner,
+            unit_inspector=unit_inspector,
+        )
+        assignment = _make_assignment(task)
+        await runner.run(assignment)
+        script_runner.assert_not_awaited()
+        unit_inspector.assert_not_awaited()
+
+    async def test_b8_store_status_done(self, tmp_path: Path) -> None:
+        """Store status is 'done' after self-restart scheduled (done-immediately)."""
+        own_unit = 'orchestrator.service'
+        store, queue, task = self._setup(tmp_path, own_unit)
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: own_unit,
+            restart_scheduler=restart_scheduler,
+        )
+        assignment = _make_assignment(task)
+        outcome = await runner.run(assignment)
+        assert outcome == WorkflowOutcome.DONE
+        assert await store.get_status('deploy-b8') == 'done'
+
+    async def test_b8_done_provenance_kind_scheduled(self, tmp_path: Path) -> None:
+        """done_provenance.kind == 'deterministic-deploy-scheduled'."""
+        own_unit = 'orchestrator.service'
+        store, queue, task = self._setup(tmp_path, own_unit)
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: own_unit,
+            restart_scheduler=restart_scheduler,
+        )
+        assignment = _make_assignment(task)
+        await runner.run(assignment)
+        retrieved = await store.get_task('deploy-b8')
+        provenance = retrieved['metadata'].get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy-scheduled'
+        assert 'transient_unit' in provenance
+        assert 'fire_delay_secs' in provenance
+
+    async def test_b8_stamps(self, tmp_path: Path) -> None:
+        """before_done_ran_at and before_done_scheduled_at are stamped."""
+        own_unit = 'orchestrator.service'
+        store, queue, task = self._setup(tmp_path, own_unit)
+        restart_scheduler = AsyncMock(return_value=(0, 'ok'))
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: own_unit,
+            restart_scheduler=restart_scheduler,
+        )
+        assignment = _make_assignment(task)
+        await runner.run(assignment)
+        retrieved = await store.get_task('deploy-b8')
+        meta = retrieved['metadata']
+        assert meta.get('before_done_ran_at') is not None, (
+            'before_done_ran_at must be stamped (crash-safe I1)'
+        )
+        assert meta.get('before_done_scheduled_at') is not None, (
+            'before_done_scheduled_at must be stamped after restart scheduled'
+        )
