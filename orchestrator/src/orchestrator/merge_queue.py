@@ -5849,6 +5849,62 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return buf.popleft()
         return None
 
+    # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
+
+    def _frozen_inflight_entries(self) -> list[InflightEntry]:
+        """Return ordered list of frozen InflightEntry objects (ε=1890).
+
+        Frozen = currently verifying.  The frozen prefix is the immutable
+        head of the pipeline; items here must never be reordered or re-based
+        while verification is in flight.
+
+        Definition (§5.3):
+          frozen = (self._finalizing_head if its phase is a verify/finalize phase)
+                   + [e for e in self._inflight if e.verify_task is not None]
+
+        Passthroughs (verify_task=None: conflict/already_merged/skip) are NOT
+        frozen — they carry no merge_commit and are not part of the verify
+        frontier.
+
+        Pure/synchronous — mirrors _pop_next_pickable.
+        """
+        entries: list[InflightEntry] = []
+        if (
+            self._finalizing_head is not None
+            and self._finalizing_head.phase in {'verifying', 'gate_reverify', 'finalizing'}
+        ):
+            entries.append(self._finalizing_head)
+        for e in self._inflight:
+            if e.verify_task is not None:
+                entries.append(e)
+        return entries
+
+    def frozen_prefix(self) -> tuple[str, ...]:
+        """Return request_ids of the frozen prefix in submission order (ε=1890).
+
+        The frozen prefix is the immutable head of the pipeline: items that
+        are currently in a verify / finalize phase.  Submission order matches
+        the finalizing_head (if any) followed by _inflight left-to-right.
+
+        Pure/synchronous (no await).
+        """
+        return tuple(e.item.request.request_id for e in self._frozen_inflight_entries())
+
+    def unfrozen_suffix(self) -> tuple[str, ...]:
+        """Return request_ids of the unfrozen suffix in pick order (ε=1890).
+
+        The unfrozen suffix is the lane-buffer region: items in _lane_buffers
+        (high lane before normal, FIFO within each lane).  These may be
+        reordered / inserted freely; any reorder triggers a suffix-only
+        recompute (recompute_suffix_conflict_graph).
+
+        Pure/synchronous (no await).
+        """
+        rids: list[str] = []
+        for lane in MERGE_LANES:  # high → normal, FIFO within lane
+            rids.extend(req.request_id for req in self._lane_buffers[lane])
+        return tuple(rids)
+
     async def recompute_suffix_conflict_graph(self) -> None:
         """Recompute and store the conflict-graph over the unfrozen suffix (task δ=1889).
 
