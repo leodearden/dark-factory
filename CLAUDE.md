@@ -125,6 +125,71 @@ default, and a mis-declared task simply falls back to the architect.
 **Hard escape:** `metadata.force_full_path = true` always forces the full
 architect path regardless of `complexity`.
 
+### Deterministic task kind (`task_kind='deterministic'`)
+
+Set `task_kind='deterministic'` on `submit_task` to skip the LLM pipeline
+entirely (no worktree, no branch, no agent, no diff) and route to the
+**`DeterministicRunner`** — a small state machine that runs an optional
+committed action, escalates born-at-L2 when required, and marks the task
+`done` once both are satisfied. Dispatch eligibility uses the same dep-gate as
+every other task.
+
+**`task_kind`** is a first-class `submit_task` parameter (`'normal'` default
+| `'deterministic'`), persisted to `metadata.task_kind`.
+
+**`metadata.before_done`** — committed-script reference (set at `submit_task`):
+
+```
+{
+  script: "<repo-relative path>",  # must exist & be executable
+  args: [],                         # list[str], default []
+  env: {},                          # dict[str,str], default {}
+  cwd: "<project_root>",            # default: project_root
+  timeout_secs: 120,                # int, required; runner kills + escalates on timeout
+  target_unit: None                 # str|None; None → cross-unit (no self-kill)
+}
+```
+
+**`metadata.always_escalates`** (`bool`, default `false`) — file a born-at-L2
+escalation after the action completes (or immediately if no action); task goes
+`blocked` until resolved via `resolve_issue`.
+
+**Field-combo presets:**
+
+| `before_done` | `always_escalates` | Behaviour | Use for |
+|---|---|---|---|
+| present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
+| present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask |
+| absent | `true` | escalate born-at-L2 immediately; `done` after `resume` | **pure gate** |
+| absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
+
+**Validation (enforced at `submit_task`):** `task_kind='deterministic'` with
+`before_done=None` and `always_escalates=false` is **rejected** ("ill-formed
+no-op"). `before_done` set on a `normal` task is also **rejected** ("before_done
+is only valid on deterministic tasks").
+
+**Born-at-L2 escalations:** all filed with `severity ∈ {critical, urgent}` and
+sentinel `agent_role='orchestrator-deterministic'`; the server retains `level=2`
+(no L0→L1→L2 climb). The task goes `blocked` while the L2 is open (quiescence
+guard — no re-dispatch, no churn).
+
+**Blocking vs detached self-kill — *determined*, not a knob:**
+- `before_done.target_unit` equals this orchestrator's own unit → detached
+  `systemd-run --user` with `--on-failure` (done = `scheduled`; the dispatching
+  orchestrator is **not** killed).
+- `before_done.target_unit` differs from own unit (or is `None`) → blocking
+  subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify against a
+  pre-run baseline (done = `deployed-and-verified`).
+
+**Runner stamps** (written by `DeterministicRunner`, never author-supplied):
+`before_done_ran_at`, `before_done_verified_at`, `gate_escalated_at`,
+`done_provenance` (`kind='deterministic-deploy'` cross-unit;
+`kind='deterministic-deploy-scheduled'` self-restart).
+
+**Dep convention:** deterministic deploys and gates use **normal** deps —
+including cross-project `project_id:task_id` deps. See "Cross-project task
+dependencies" above.
+
 ## Session Lifecycle
 
 ### Starting a session
