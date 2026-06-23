@@ -17608,6 +17608,53 @@ class TestAgingPickOrder:
             loop.close()
 
 
+    def test_aging_tiebreak_equal_timestamp_request_id_lexical(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """Equal mfea: lexically-smaller request_id wins the tie-break.
+
+        Both items share the same merge_first_enqueued_at=100.0.  Buffer order
+        puts the lexically-LARGER 'mr-zzzz' first (idx0) and the lexically-
+        SMALLER 'mr-aaaa' second (idx1).  They share a footprint edge.
+
+        Expected: 'mr-aaaa' is picked first (lexically smaller request_id beats
+        FIFO position on equal timestamps).
+
+        Fails against S4 because the scalar _aging_key makes both items equal
+        under strict ``<`` → both are clique-minimal → FIFO-earliest 'mr-zzzz'
+        is returned.
+        """
+        worker, loop = self._setup(git_ops, config)
+        try:
+            req_zzzz = _make_request(
+                't-zzzz', 't-zzzz', git_repo, config,
+                merge_first_enqueued_at=100.0, request_id='mr-zzzz',
+            )
+            req_aaaa = _make_request(
+                't-aaaa', 't-aaaa', git_repo, config,
+                merge_first_enqueued_at=100.0, request_id='mr-aaaa',
+            )
+            # Lexically larger 'mr-zzzz' is FIFO head (idx0)
+            worker._queue.put_nowait(req_zzzz)
+            worker._queue.put_nowait(req_aaaa)
+            worker._drain_queue_into_lanes()
+
+            worker._suffix_conflict_graph = SuffixConflictGraph(
+                nodes=('mr-zzzz', 'mr-aaaa'),
+                textual_edges=frozenset(),
+                footprint_edges=frozenset({frozenset({'mr-zzzz', 'mr-aaaa'})}),
+                conflicts_with_main=frozenset(),
+            )
+
+            # Lexically smaller 'mr-aaaa' must win despite being the FIFO tail
+            assert worker._pop_next_pickable() is req_aaaa, (
+                "request_id lexical tie-break must beat FIFO position on equal mfea"
+            )
+            assert worker._pop_next_pickable() is req_zzzz
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
     def test_aging_is_clique_scoped_and_allows_disjoint_bypass(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ):
