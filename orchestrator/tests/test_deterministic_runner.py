@@ -667,3 +667,193 @@ class TestBeforeDoneCrossUnitDeploy:
 
         pending = queue.get_by_task('200', status='pending')
         assert len(pending) == 0, f'No escalation should be filed on success; got {pending}'
+
+
+# ---------------------------------------------------------------------------
+# Step-3: B7a — script rc ≠ 0 failure (RED until step-4 implements the path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneRcNonZero:
+    """DeterministicRunner — before_done deploy script fails (rc ≠ 0, B7a)."""
+
+    async def test_b7a_files_infra_issue_escalation(self, tmp_path: Path):
+        """rc ≠ 0 → exactly one pending infra_issue escalation for the task (B7a)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='300')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('300', status='pending')
+        assert len(pending) == 1, f'Expected 1 pending escalation, got {len(pending)}'
+
+    async def test_b7a_escalation_is_level_2_critical(self, tmp_path: Path):
+        """Filed escalation must be level=2, severity='critical' (born-at-L2, B7a)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='300')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('300', status='pending')
+        assert escs[0].level == 2
+        assert escs[0].severity == 'critical'
+
+    async def test_b7a_escalation_sentinel_role_and_category(self, tmp_path: Path):
+        """agent_role='orchestrator-deterministic', category='infra_issue' (B7a)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='300')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('300', status='pending')
+        assert escs[0].agent_role == 'orchestrator-deterministic'
+        assert escs[0].category == 'infra_issue'
+
+    async def test_b7a_escalation_detail_contains_output_tail_and_unit(self, tmp_path: Path):
+        """Escalation detail contains the failing output tail and target_unit (B7a)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='300', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        failing_output = 'boom: unit failed to start'
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, failing_output))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('300', status='pending')
+        detail = escs[0].detail
+        assert failing_output in detail, f'Output tail must appear in detail: {detail!r}'
+        assert 'orchestrator-reify.service' in detail, (
+            f'target_unit must appear in detail: {detail!r}'
+        )
+
+    async def test_b7a_sets_task_blocked_never_done(self, tmp_path: Path):
+        """set_task_status called with 'blocked' and NEVER with 'done' (B7a)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='300')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        # Must have been called with 'blocked'
+        blocked_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'blocked'
+        ]
+        assert len(blocked_calls) == 1, 'set_task_status must be called once with blocked'
+        # Must NEVER have been called with 'done'
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 0, 'set_task_status must NOT be called with done on failure'
+
+    async def test_b7a_stamps_before_done_ran_at(self, tmp_path: Path):
+        """update_task stamps before_done_ran_at even on failure (I1 crash-safe stamp)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='300')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must stamp before_done_ran_at even on rc ≠ 0'
+
+    async def test_b7a_outcome_is_blocked(self, tmp_path: Path):
+        """rc ≠ 0 → outcome is WorkflowOutcome.BLOCKED (B7a)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='300')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
