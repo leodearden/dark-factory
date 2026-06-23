@@ -1082,6 +1082,25 @@ class Scheduler:
         # Process-local; GC'd in the per-tick stale-id sweep alongside
         # _external_hold_streak / _external_hold_cause.
         self._external_resolver_degraded_counts: dict[str, int] = {}
+        # --- Starvation watchdog state (task 1880) ---
+        # Wall-clock timestamp (from _time_source) of the first tick a task appeared
+        # as a dispatch-eligible candidate.  Cleared when the task leaves the
+        # candidate pool for any tick (continuity reset) so idle measures uninterrupted
+        # dispatch-eligibility.  GC'd in the per-tick stale-id sweep.
+        self._starvation_first_seen: dict[str, float] = {}
+        # Tasks for which a STARVATION_WATCHDOG INFO escalation is currently open.
+        # Prevents re-filing per tick (belt-and-suspenders with the harness-side
+        # get_by_task dedup).  Cleared when the task dispatches or is GC'd.
+        self._starvation_escalated: set[str] = set()
+        # Callback installed by the Harness to file an INFO escalation when a
+        # starved task crosses both thresholds.  Signature:
+        #   (task_id: str, *, summary: str, detail: str) -> None (async)
+        # Default None so bare-Scheduler unit tests are unaffected.
+        self._on_starvation_warn: Callable[..., Any] | None = None
+        # Callback installed by the Harness to resolve the open INFO escalation
+        # when the task finally dispatches.  Signature: (task_id: str) -> None (async)
+        # Default None so bare-Scheduler unit tests are unaffected.
+        self._on_starvation_resolve: Callable[..., Any] | None = None
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -2089,6 +2108,64 @@ class Scheduler:
             else:
                 self._external_hold_streak.pop(task_id, None)
                 self._external_hold_cause.pop(task_id, None)
+
+    async def _apply_starvation_watchdog(self, candidates: list[dict]) -> None:
+        """Per-tick starvation watchdog over the dispatch-eligible candidate list.
+
+        Called ONCE per ``acquire_next`` tick right after the candidate list is
+        built and BEFORE ``if not candidates: return None``.  Any exception is
+        caught by the caller's try/except so a watchdog failure can NEVER abort
+        the tick or gate dispatch (PROPERTY 1).
+
+        MINIMAL IMPL (task 1880 step-4): skip-gate only.
+        The idle-secs gate and ``enabled`` short-circuit land in step-6 so that
+        step-5's negative tests are genuinely RED against this version.
+
+        For each candidate task:
+        1. Stamp ``_starvation_first_seen[tid]`` the first time it appears
+           (idle anchor; used by the full impl in step-6).
+        2. Fire ``_on_starvation_warn`` when ALL of:
+           - ``_skip_count[tid] >= starvation_watchdog.skip_threshold``
+           - ``tid`` is NOT already in ``_starvation_escalated``
+           - ``_on_starvation_warn`` is not None (callback installed)
+        """
+        cfg = self.config.starvation_watchdog
+        now = self._time_source()
+        candidate_ids: set[str] = set()
+
+        for t in candidates:
+            tid = str(t.get('id', ''))
+            if not tid:
+                continue
+            candidate_ids.add(tid)
+
+            # Stamp first_seen anchor (used by idle-secs gate in step-6).
+            if tid not in self._starvation_first_seen:
+                self._starvation_first_seen[tid] = now
+
+            # Fire when skip_count >= threshold AND not already escalated.
+            skip = self._skip_count.get(tid, 0)
+            if (
+                skip >= cfg.skip_threshold
+                and tid not in self._starvation_escalated
+                and self._on_starvation_warn is not None
+            ):
+                summary = (
+                    f'STARVATION_WATCHDOG: task {tid} skipped {skip}× as top '
+                    f'candidate (threshold={cfg.skip_threshold}) — '
+                    f'dispatch-eligible but unable to acquire locks'
+                )
+                detail = (
+                    f'Task {tid} has been the highest-scored dispatch-eligible '
+                    f'candidate (all deps satisfied, no live claimant) for '
+                    f'{skip} consecutive top-skips without acquiring its module '
+                    f'locks.  This typically indicates persistent lock contention '
+                    f'(broad-footprint task vs. a long-running narrow task) that '
+                    f'has not been resolved by the fairness parks.\n\n'
+                    f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
+                )
+                await self._on_starvation_warn(tid, summary=summary, detail=detail)
+                self._starvation_escalated.add(tid)
 
     async def update_task(
         self,
@@ -3439,6 +3516,18 @@ class Scheduler:
             # pool and can accumulate skips like any other task.
             candidates.append(t)
             candidate_signals[tid_str] = signal_label
+
+        # Starvation watchdog pass (task 1880): side-effecting scan over the
+        # dispatch-eligible candidate list.  Runs once per tick, wrapped in
+        # try/except so a watchdog/callback failure can NEVER abort the tick or
+        # gate dispatch (PROPERTY 1 — mirrors the _apply_external_dep_policy wrapper).
+        try:
+            await self._apply_starvation_watchdog(candidates)
+        except Exception:
+            logger.warning(
+                'Starvation watchdog pass raised — continuing tick normally',
+                exc_info=True,
+            )
 
         if not candidates:
             return None
