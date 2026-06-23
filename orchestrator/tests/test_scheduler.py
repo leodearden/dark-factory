@@ -9275,3 +9275,98 @@ class TestDrainParkEvictionRequests:
         assert evicted_events == []
         # Row consumed.
         assert store.drain(scheduler._project_root) == []
+
+
+# ---- B4 D4 live-owner guard (task 1871 step-7) ----
+
+class TestDrainParkEvictionGuard:
+    """B4 — the load-bearing safety test: live owners are REFUSED eviction.
+
+    Tests drive _drain_park_eviction_requests directly.
+    B4a: live owner T (pending + in tasks_by_id + deps satisfied) → REFUSAL.
+    B4b: pending task with an UNSATISFIED dep → NOT live-dispatchable → ALLOWED.
+    """
+
+    def _make_scheduler(self, tmp_path, event_store=None):
+        from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        eviction_store = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+        if event_store is None:
+            event_store = _RecordingEventStore()
+        scheduler = Scheduler(
+            config,
+            event_store=event_store,  # type: ignore[arg-type]
+            park_eviction_store=eviction_store,
+        )
+        return scheduler, eviction_store, event_store
+
+    def test_b4a_live_owner_eviction_refused(self, tmp_path):
+        """B4a: T is pending + in tasks_by_id + no deps → live → force_clear REFUSED."""
+        scheduler, store, event_store = self._make_scheduler(tmp_path)
+
+        scheduler.lock_table.install_parks('T', ['m1'], priority='high')
+        store.enqueue('T', scheduler._project_root)
+
+        # T is pending and live-dispatchable (no dependencies).
+        status_map = {'T': 'pending'}
+        tasks_by_id = {
+            'T': {
+                'id': 'T', 'status': 'pending', 'dependencies': [],
+                'priority': 'high', 'metadata': {'files': ['m1']},
+            },
+        }
+
+        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+
+        # T's park must be INTACT.
+        assert scheduler.lock_table.has_parks('T'), (
+            'force_clear must be REFUSED for a live dispatchable owner'
+        )
+        # No reservation_force_evicted event.
+        evicted_events = [
+            e for e in event_store.events
+            if 'reservation_force_evicted' in e[0]
+        ]
+        assert evicted_events == [], (
+            f'reservation_force_evicted must NOT be emitted for live owner; got {evicted_events}'
+        )
+        # Exactly one reservation_force_evict_refused event for T.
+        refused_events = [
+            e for e in event_store.events
+            if 'reservation_force_evict_refused' in e[0]
+        ]
+        assert len(refused_events) == 1
+        assert refused_events[0][1]['task_id'] == 'T'
+        assert refused_events[0][1]['data']['reason'] == 'live_owner'
+        # Row was still drained (one-shot, refuse does not retry).
+        assert store.drain(scheduler._project_root) == []
+
+    def test_b4b_unsatisfied_deps_not_live_eviction_allowed(self, tmp_path):
+        """B4b: pending task with an unsatisfied dep → NOT live → force_clear fires."""
+        scheduler, store, event_store = self._make_scheduler(tmp_path)
+
+        scheduler.lock_table.install_parks('T', ['m1'], priority='high')
+        store.enqueue('T', scheduler._project_root)
+
+        # T depends on dep '99' which is in-progress (not done → unsatisfied).
+        status_map = {'T': 'pending', '99': 'in-progress'}
+        tasks_by_id = {
+            'T': {
+                'id': 'T', 'status': 'pending',
+                'dependencies': ['99'],
+                'priority': 'high', 'metadata': {'files': ['m1']},
+            },
+        }
+
+        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+
+        # T's park must be gone — unsatisfied deps → not live-dispatchable → evict.
+        assert not scheduler.lock_table.has_parks('T'), (
+            'force_clear must FIRE for an owner with unsatisfied deps'
+        )
+        evicted_events = [
+            e for e in event_store.events
+            if 'reservation_force_evicted' in e[0]
+        ]
+        assert len(evicted_events) == 1
+        assert evicted_events[0][1]['task_id'] == 'T'
