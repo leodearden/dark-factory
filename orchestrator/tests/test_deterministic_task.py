@@ -255,3 +255,42 @@ class TestSmoke:
         retrieved = await store.get_task('smoke-2')
         assert retrieved is not None
         assert retrieved['metadata']['done_provenance'] == provenance
+
+
+# ---------------------------------------------------------------------------
+# B1 — gate, deps unsatisfied (step-2)
+# ---------------------------------------------------------------------------
+
+class TestB1DepsUnsatisfied:
+    """B1: a deterministic gate with unsatisfied deps is not dispatch-eligible.
+
+    Confirms that _deps_satisfied returns False for a gate whose dependency is
+    still pending, and that no escalation is filed while the gate waits.
+    """
+
+    def test_gate_not_deps_satisfied_when_dep_pending(self, tmp_path: Path) -> None:
+        """Scheduler._deps_satisfied returns False when a dep is pending."""
+        from orchestrator.config import OrchestratorConfig
+        config = OrchestratorConfig(project_root=tmp_path)
+        scheduler = Scheduler(config)
+
+        gate = _gate_task(task_id='gate-b1', deps=[10])
+        # Dep 10 is still pending
+        status_map = {'10': 'pending'}
+        assert scheduler._deps_satisfied(gate, status_map) is False
+
+    def test_no_escalation_filed_before_dispatch(self, tmp_path: Path) -> None:
+        """No escalation is filed for a gate that has never been dispatched."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        # Gate was never dispatched — queue is empty
+        assert queue.get_by_task('gate-b1', status='pending') == []
+
+    def test_gate_deps_satisfied_when_dep_done(self, tmp_path: Path) -> None:
+        """Once the dep is done, _deps_satisfied returns True (gate now eligible)."""
+        from orchestrator.config import OrchestratorConfig
+        config = OrchestratorConfig(project_root=tmp_path)
+        scheduler = Scheduler(config)
+
+        gate = _gate_task(task_id='gate-b1', deps=[10])
+        status_map = {'10': 'done'}
+        assert scheduler._deps_satisfied(gate, status_map) is True
