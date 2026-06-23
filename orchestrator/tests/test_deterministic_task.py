@@ -524,3 +524,123 @@ class TestB4Proceed:
         }
         status_map = {'gate-b4': 'done'}
         assert scheduler._deps_satisfied(dep_task, status_map) is True
+
+
+# ---------------------------------------------------------------------------
+# B5 — no-go re-pend with new deps: restart + re-fire (step-6)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestB5NoGo:
+    """B5: no-go restart clears stamps, re-deps the gate, re-fires when new task lands.
+
+    Production path (cross-phase no-go):
+    1. Dispatch → BLOCKED (B2 state).
+    2. Resolve L2 + add new design task N as dep + action='restart'
+       → gate_escalated_at cleared, gate re-pended.
+    3. With N pending: _deps_satisfied False (gate not re-dispatched).
+    4. Land N (done): _deps_satisfied True + re-dispatch → fresh L2 + BLOCKED (re-fires).
+
+    Design decision (plan §5): uses 'restart' (clears stamps) not 'resume' (preserves stamps),
+    because the re-depended gate must RE-ESCALATE on next dispatch, not drive to done.
+    """
+
+    async def _setup_b5_restart(
+        self, h: Harness, gate_id: str, n_id: str,
+    ) -> None:
+        """Reach B2 blocked state, then resolve + restart to clear stamps + add dep."""
+        store: _StoreScheduler = h.scheduler
+        task = _gate_task(task_id=gate_id, title='No-go gate')
+        store.seed(task)
+
+        # First dispatch → BLOCKED + L2 filed
+        await _dispatch(h, gate_id)
+
+        # Resolve the L2 (operator decides: no-go, re-examine)
+        queue: EscalationQueue = h._escalation_queue
+        pending = queue.get_by_task(gate_id, status='pending')
+        assert pending, 'Pre-condition: pending L2 must exist after first dispatch'
+        queue.resolve(pending[0].id, resolution='no-go')
+
+        # Add the new design task N into the store
+        n_task = {
+            'id': n_id,
+            'title': 'New design task',
+            'metadata': {'task_kind': 'normal'},
+            'status': 'pending',
+        }
+        store.seed(n_task)
+
+        # Add N as a dependency of the gate (operator updates deps during review)
+        gate_in_store = await store.get_task(gate_id)
+        assert gate_in_store is not None
+        gate_in_store.setdefault('dependencies', []).append({'id': str(n_id)})
+
+        # Restart: clears gate_escalated_at + sets gate status to 'pending'
+        await h._action_teardown_and_set_status(gate_id, 'pending', 'restart')
+
+    async def test_restart_clears_gate_escalated_at(self, det_harness: Harness) -> None:
+        """gate_escalated_at is cleared after restart (stamp-clear mechanism, I2/B5)."""
+        await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
+
+        store: _StoreScheduler = det_harness.scheduler
+        gate = await store.get_task('gate-b5')
+        assert gate is not None
+        assert gate['metadata'].get('gate_escalated_at') is None
+
+    async def test_gate_repended_after_restart(self, det_harness: Harness) -> None:
+        """Gate status is 'pending' after restart (line survives — not done/cancelled)."""
+        await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
+        store: _StoreScheduler = det_harness.scheduler
+        assert await store.get_status('gate-b5') == 'pending'
+
+    async def test_original_l2_no_longer_pending_after_restart(
+        self, det_harness: Harness
+    ) -> None:
+        """The original L2 is resolved before restart — no pending escalation remains."""
+        await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
+        queue: EscalationQueue = det_harness._escalation_queue
+        assert queue.get_by_task('gate-b5', status='pending') == []
+
+    async def test_deps_not_satisfied_while_n_pending(
+        self, det_harness: Harness, tmp_path: Path
+    ) -> None:
+        """Scheduler._deps_satisfied(gate, {N:'pending'}) is False (re-gated)."""
+        from orchestrator.config import OrchestratorConfig
+        config = OrchestratorConfig(project_root=tmp_path)
+        scheduler = Scheduler(config)
+        await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
+
+        store: _StoreScheduler = det_harness.scheduler
+        gate = await store.get_task('gate-b5')
+        assert gate is not None
+        assert scheduler._deps_satisfied(gate, {'N-1': 'pending'}) is False
+
+    async def test_re_escalates_when_n_lands(
+        self, det_harness: Harness, tmp_path: Path
+    ) -> None:
+        """When N lands (done), re-dispatch RE-ESCALATES (fresh L2) and status is blocked."""
+        from orchestrator.config import OrchestratorConfig
+        config = OrchestratorConfig(project_root=tmp_path)
+        scheduler = Scheduler(config)
+        await self._setup_b5_restart(det_harness, 'gate-b5', 'N-1')
+
+        store: _StoreScheduler = det_harness.scheduler
+        # Land N
+        await store.set_task_status('N-1', 'done')
+        gate = await store.get_task('gate-b5')
+        assert gate is not None
+        assert scheduler._deps_satisfied(gate, {'N-1': 'done'}) is True
+
+        # Re-dispatch: gate_escalated_at cleared + N done → runs section 3 → new L2
+        report = await _dispatch(det_harness, 'gate-b5')
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.BLOCKED
+
+        queue: EscalationQueue = det_harness._escalation_queue
+        pending = queue.get_by_task('gate-b5', status='pending')
+        assert len(pending) == 1, (
+            f'Expected fresh L2 after re-dispatch, got {len(pending)} pending'
+        )
+        assert pending[0].level == 2
+        assert await store.get_status('gate-b5') == 'blocked'
