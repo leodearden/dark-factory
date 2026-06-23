@@ -74,6 +74,15 @@ __all__ = [
 # benign side-effect of an idempotent terminal -> terminal write.
 _TERMINAL_STATUSES = frozenset({'done', 'cancelled'})
 
+# Non-terminal but non-candidate statuses for the starvation watchdog GC.
+# Tasks in these states leave the dispatch-eligible candidate pool without
+# going terminal, so the dispatch-site resolve and the _stale_ids sweep would
+# never fire for them.  The GC backstop uses this set to auto-resolve any open
+# starvation-watchdog INFO escalation when a task moves to one of these states.
+_STARVATION_NON_ELIGIBLE = frozenset(
+    {'blocked', 'deferred', 'review', 'merge-deferred'}
+)
+
 
 class SetTaskStatusRejected(Exception):
     """Base class for non-transient set_task_status rejections.
@@ -1082,6 +1091,25 @@ class Scheduler:
         # Process-local; GC'd in the per-tick stale-id sweep alongside
         # _external_hold_streak / _external_hold_cause.
         self._external_resolver_degraded_counts: dict[str, int] = {}
+        # --- Starvation watchdog state (task 1880) ---
+        # Wall-clock timestamp (from _time_source) of the first tick a task appeared
+        # as a dispatch-eligible candidate.  Cleared when the task leaves the
+        # candidate pool for any tick (continuity reset) so idle measures uninterrupted
+        # dispatch-eligibility.  GC'd in the per-tick stale-id sweep.
+        self._starvation_first_seen: dict[str, float] = {}
+        # Tasks for which a STARVATION_WATCHDOG INFO escalation is currently open.
+        # Prevents re-filing per tick (belt-and-suspenders with the harness-side
+        # get_by_task dedup).  Cleared when the task dispatches or is GC'd.
+        self._starvation_escalated: set[str] = set()
+        # Callback installed by the Harness to file an INFO escalation when a
+        # starved task crosses both thresholds.  Signature:
+        #   (task_id: str, *, summary: str, detail: str) -> None (async)
+        # Default None so bare-Scheduler unit tests are unaffected.
+        self._on_starvation_warn: Callable[..., Any] | None = None
+        # Callback installed by the Harness to resolve the open INFO escalation
+        # when the task finally dispatches.  Signature: (task_id: str) -> None (async)
+        # Default None so bare-Scheduler unit tests are unaffected.
+        self._on_starvation_resolve: Callable[..., Any] | None = None
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -2089,6 +2117,116 @@ class Scheduler:
             else:
                 self._external_hold_streak.pop(task_id, None)
                 self._external_hold_cause.pop(task_id, None)
+
+    async def _apply_starvation_watchdog(self, candidates: list[dict]) -> None:
+        """Per-tick starvation watchdog over the dispatch-eligible candidate list.
+
+        Called ONCE per ``acquire_next`` tick right after the candidate list is
+        built and BEFORE ``if not candidates: return None``.  Any exception is
+        caught by the caller's try/except so a watchdog failure can NEVER abort
+        the tick or gate dispatch (PROPERTY 1 — mirrors the
+        ``_apply_external_dep_policy`` wrapper at the call site).
+
+        FULL IMPL (task 1880 step-6): skip-gate + idle-secs gate + enabled check.
+
+        Short-circuits immediately when ``starvation_watchdog.enabled`` is False.
+
+        For each candidate task:
+        1. Continuity reset — drop ``_starvation_first_seen`` for tasks whose tid
+           is no longer in the candidate id set (so idle measures CONTINUOUS
+           dispatch-eligibility; gaps reset the anchor).
+        2. Stamp ``_starvation_first_seen[tid]`` on the first tick the task
+           appears as a candidate.
+        3. Fire ``_on_starvation_warn`` when ALL of:
+           - ``_skip_count[tid] >= starvation_watchdog.skip_threshold``
+           - ``(now - first_seen) >= starvation_watchdog.idle_secs``
+           - ``tid`` is NOT already in ``_starvation_escalated``
+           - ``_on_starvation_warn`` is not None (callback installed)
+        """
+        cfg = self.config.starvation_watchdog
+
+        # Short-circuit: watchdog is administratively disabled.
+        if not cfg.enabled:
+            return
+
+        now = self._time_source()
+        candidate_ids: set[str] = set()
+
+        # Collect current candidate ids for continuity-reset step below.
+        for task in candidates:
+            tid = str(task.get('id', ''))
+            if tid:
+                candidate_ids.add(tid)
+
+        # Continuity reset: drop first_seen anchors for tasks that are no longer
+        # candidates this tick.  Gaps in candidacy mean the task was gated (deps
+        # became unsatisfied, cooldown re-armed, etc.) — the idle clock resets.
+        stale_anchors = [
+            tid for tid in list(self._starvation_first_seen)
+            if tid not in candidate_ids
+        ]
+        for tid in stale_anchors:
+            del self._starvation_first_seen[tid]
+
+        for task in candidates:
+            tid = str(task.get('id', ''))
+            if not tid:
+                continue
+
+            # Stamp first_seen anchor on the first tick this task appears.
+            if tid not in self._starvation_first_seen:
+                self._starvation_first_seen[tid] = now
+
+            first_seen = self._starvation_first_seen[tid]
+            skip = self._skip_count.get(tid, 0)
+            idle_elapsed = now - first_seen
+
+            # Fire when BOTH gates are crossed AND not already escalated.
+            if (
+                skip >= cfg.skip_threshold
+                and idle_elapsed >= cfg.idle_secs
+                and tid not in self._starvation_escalated
+                and self._on_starvation_warn is not None
+            ):
+                summary = (
+                    f'STARVATION_WATCHDOG: task {tid} skip_count={skip} '
+                    f'(threshold={cfg.skip_threshold}), dispatch-eligible for '
+                    f'{idle_elapsed:.0f}s (idle_secs={cfg.idle_secs}) — '
+                    f'unable to acquire locks'
+                )
+                detail = (
+                    f'Task {tid} has been dispatch-eligible (all deps satisfied, '
+                    f'no live claimant) for {idle_elapsed:.0f}s and has '
+                    f'accumulated skip_count={skip} (tallied while this task is '
+                    f'the highest-scored candidate unable to acquire its module '
+                    f'locks; a task displaced by a higher-priority task retains '
+                    f'its accumulated count without incrementing).  This typically '
+                    f'indicates persistent lock contention (broad-footprint task '
+                    f'vs. a long-running narrow task) that has not been resolved '
+                    f'by the fairness parks.\n\n'
+                    f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
+                )
+                await self._on_starvation_warn(tid, summary=summary, detail=detail)
+                self._starvation_escalated.add(tid)
+
+    async def _resolve_starvation_escalation(self, task_id: str) -> None:
+        """Resolve the open starvation-watchdog INFO escalation for *task_id*.
+
+        Called at BOTH dispatch sites in ``acquire_next`` (pinned + scored paths)
+        right after the task is added to ``_dispatched``.  Idempotent: if the task
+        was never escalated (not in ``_starvation_escalated``), this is a no-op.
+        Always clears ``_starvation_escalated``/``_starvation_first_seen`` entries
+        unconditionally so state is bounded (PROPERTY 2 — no stale residue).
+
+        Callers wrap every call in try/except (log + continue) so a resolve
+        failure can NEVER abort a successful dispatch (PROPERTY 1).
+        """
+        in_escalated = task_id in self._starvation_escalated
+        if in_escalated and self._on_starvation_resolve is not None:
+            await self._on_starvation_resolve(task_id)
+        # Unconditionally clear both dicts so no stale residue survives.
+        self._starvation_escalated.discard(task_id)
+        self._starvation_first_seen.pop(task_id, None)
 
     async def update_task(
         self,
@@ -3221,6 +3359,39 @@ class Scheduler:
                 self._external_hold_cause.pop(tid, None)
                 self._external_resolver_degraded_counts.pop(tid, None)
 
+        # Starvation-watchdog GC (task 1880): for tasks that have gone terminal
+        # or been removed from the task list while a watchdog INFO escalation is
+        # still open, self-resolve the escalation and clear the watchdog state.
+        # Also resolves for tasks that transition to a non-terminal but
+        # non-eligible status (blocked/deferred/review/merge-deferred) — those
+        # leave the candidate pool without going terminal, so the dispatch-site
+        # resolve and the _stale_ids sweep would never fire.  'in-progress'
+        # tasks are already resolved at the dispatch site; 'pending' tasks may
+        # return to candidacy so we keep their escalation.
+        # Uses a SEPARATE guard (not merged with the _external_hold_streak block
+        # above) so it runs even when those external dicts are empty — mirrors
+        # the dedicated _external_unresolved_counts block.  The resolve callback
+        # is wrapped in try/except so a failure never aborts the GC sweep.
+        _starvation_gc_ids: set[str] = set(_stale_ids)
+        for _tid in self._starvation_escalated:
+            if status_map.get(_tid) in _STARVATION_NON_ELIGIBLE:
+                _starvation_gc_ids.add(_tid)
+        if _starvation_gc_ids and (self._starvation_escalated or self._starvation_first_seen):
+            for tid in _starvation_gc_ids:
+                if tid in self._starvation_escalated:
+                    if self._on_starvation_resolve is not None:
+                        try:
+                            await self._on_starvation_resolve(tid)
+                        except Exception:
+                            logger.warning(
+                                'Starvation watchdog GC resolve for tid=%s raised '
+                                '— continuing GC normally',
+                                tid,
+                                exc_info=True,
+                            )
+                    self._starvation_escalated.discard(tid)
+                self._starvation_first_seen.pop(tid, None)
+
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
         # both the scored-candidate loop and the pin-dispatch loop so both
@@ -3440,6 +3611,18 @@ class Scheduler:
             candidates.append(t)
             candidate_signals[tid_str] = signal_label
 
+        # Starvation watchdog pass (task 1880): side-effecting scan over the
+        # dispatch-eligible candidate list.  Runs once per tick, wrapped in
+        # try/except so a watchdog/callback failure can NEVER abort the tick or
+        # gate dispatch (PROPERTY 1 — mirrors the _apply_external_dep_policy wrapper).
+        try:
+            await self._apply_starvation_watchdog(candidates)
+        except Exception:
+            logger.warning(
+                'Starvation watchdog pass raised — continuing tick normally',
+                exc_info=True,
+            )
+
         if not candidates:
             return None
 
@@ -3475,6 +3658,19 @@ class Scheduler:
                 pin_modules = self._get_modules(pin_task)
                 if self.lock_table.try_acquire(pin_tid, pin_modules):
                     self._dispatched.add(pin_tid)
+                    # Starvation-watchdog resolve (task 1880): if a pinned task
+                    # had an open INFO escalation, self-resolve it now.
+                    # Wrapped in try/except so a resolve failure can NEVER abort
+                    # a successful dispatch (PROPERTY 1).
+                    try:
+                        await self._resolve_starvation_escalation(pin_tid)
+                    except Exception:
+                        logger.warning(
+                            'Starvation watchdog resolve for pin_tid=%s raised — '
+                            'dispatch continues normally',
+                            pin_tid,
+                            exc_info=True,
+                        )
                     if pin_signal is not None:
                         self._last_dispatch_at[pin_tid] = self._time_source()
                     pin_pri = effective_priorities.get(
@@ -3532,6 +3728,19 @@ class Scheduler:
             modules = self._get_modules(task)
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
+                # Starvation-watchdog resolve (task 1880): if this scored task
+                # had an open INFO escalation, self-resolve it now that it is
+                # dispatching.  Wrapped in try/except so a resolve failure can
+                # NEVER abort a successful dispatch (PROPERTY 1).
+                try:
+                    await self._resolve_starvation_escalation(task_id)
+                except Exception:
+                    logger.warning(
+                        'Starvation watchdog resolve for task_id=%s raised — '
+                        'dispatch continues normally',
+                        task_id,
+                        exc_info=True,
+                    )
                 # arm cooldown gate — only for signal-bearing dispatches.
                 # Steward signals that arrive *after* a signal-free dispatch
                 # will not retroactively suppress re-dispatch; the gate is

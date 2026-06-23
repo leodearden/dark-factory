@@ -203,6 +203,19 @@ fairness:
     low: 4
     polish: 9999
 
+# Starvation watchdog (task 1880).
+#
+# Files exactly ONE INFO-level escalation when a dispatch-eligible pending task
+# (all deps satisfied, no live claimant) is skipped as the TOP-scored candidate
+# past BOTH thresholds simultaneously:
+#   - skip_threshold: consecutive top-skips (reuses the fairness _skip_count)
+#   - idle_secs: continuous wall-clock eligibility in seconds
+# Auto-resolves when the task finally dispatches.  Set enabled: false to silence.
+starvation_watchdog:
+  enabled: true
+  skip_threshold: 50
+  idle_secs: 1800.0
+
 # Value/h scheduler scoring knobs.
 #   score(t) = TIER_BASE[eff_priority(t)]
 #            + min(age_alpha * age + cpm_beta * log1p(transitive_dependents),
