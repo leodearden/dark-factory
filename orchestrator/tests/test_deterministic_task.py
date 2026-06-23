@@ -1410,7 +1410,7 @@ def _validate(task_kind: str, metadata: dict, project_root: str | None = None) -
         import tempfile
         project_root = tempfile.mkdtemp()
     try:
-        from fused_memory.middleware.deterministic_task_guard import (
+        from fused_memory.middleware.deterministic_task_guard import (  # type: ignore[reportMissingImports]
             deterministic_task_error,
         )
         return deterministic_task_error(task_kind, metadata, project_root)
