@@ -114,17 +114,14 @@ function DepChip({ dep }) {
   );
 }
 
-function LockChip({ path, label, holder, holderProject, currentTaskId, currentProject }) {
-  let cls, hint;
+function LockChip({ path, label, holder, holderProject, currentTaskId, currentProject, parkedBy, parkedOwnerLive }) {
   const isOwn = holder && holder === currentTaskId && (holderProject || currentProject) === currentProject;
-  const holderDisplay = holder ? `T-${holder}` : null;
-  if (!holder) { cls = 'lock-free'; hint = 'available'; }
-  else if (isOwn) { cls = 'lock-mine'; hint = 'held by this task'; }
-  else { cls = 'lock-taken'; hint = `held by ${holderDisplay}`; }
+  const { cls, hint, ownerLabel } = window.DF_SCHED_UTILS.lockChipState({ holder, isMine: isOwn, parkedBy, parkedOwnerLive });
   return (
     <span className={`chip ${cls}`} title={`${path} · ${hint}`}>
       {label != null ? label : path.split('/').pop()}
-      {cls === 'lock-taken' && <span className="holder">⊘ {holderDisplay}</span>}
+      {cls === 'lock-parked' && <span className="holder">⏸ {ownerLabel}</span>}
+      {cls === 'lock-taken' && <span className="holder">⊘ {ownerLabel}</span>}
     </span>
   );
 }
@@ -176,7 +173,7 @@ function LocksCell({ task }) {
   const labelMap = disambiguateLabels ? disambiguateLabels(sorted) : null;
   return <ChipList items={sorted} renderChip={(modPath) => {
     const m = moduleByPath.get(modPath);
-    return <LockChip key={modPath} path={modPath} label={labelMap ? labelMap.get(modPath) : modPath.split('/').pop()} holder={m && m.holder} holderProject={m && m.holder_project} currentTaskId={rawTaskId} currentProject={task.project} />;
+    return <LockChip key={modPath} path={modPath} label={labelMap ? labelMap.get(modPath) : modPath.split('/').pop()} holder={m && m.holder} holderProject={m && m.holder_project} currentTaskId={rawTaskId} currentProject={task.project} parkedBy={m && m.parked_by} parkedOwnerLive={m && m.parked_owner_live} />;
   }} maxInline={2} persistKey={`df.locks.${task.id}`} expandLayout="column" alwaysToggle={true} />;
 }
 

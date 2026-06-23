@@ -3,7 +3,9 @@
    Loaded early in index.html (before tabs.jsx and tab_tasks.jsx) so all
    consumers can destructure from the global.
 
-   Exports: window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo }
+   Exports: window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo,
+             disambiguateLabels, labelFor, lockChipState }
+   (Canonical list: the window.DF_SCHED_UTILS assignment at the bottom of this file.)
 */
 
 // Format seconds into a human-readable elapsed string.
@@ -109,4 +111,22 @@ function labelFor(paths) {
   return disambiguateLabels(paths || []);
 }
 
-window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor };
+// Compute the visual state for a module-lock chip.
+// Encodes the holder > parked > free precedence so both LockChip (tabs.jsx)
+// and the inline Task-detail chip (tab_tasks.jsx) can call this pure helper
+// instead of duplicating the if/else-if chain.
+// Returns { cls, hint, ownerLabel } where ownerLabel is null when the chip has
+// no owner to display (lock-free or lock-mine without a counterpart label).
+function lockChipState({ holder, isMine, parkedBy, parkedOwnerLive }) {
+  if (holder) {
+    if (isMine) return { cls: 'lock-mine', hint: 'held by this task', ownerLabel: null };
+    return { cls: 'lock-taken', hint: `held by T-${holder}`, ownerLabel: `T-${holder}` };
+  }
+  if (parkedBy) {
+    const label = `T-${parkedBy}${parkedOwnerLive === false ? ' ⚠' : ''}`;
+    return { cls: 'lock-parked', hint: `parked by T-${parkedBy}`, ownerLabel: label };
+  }
+  return { cls: 'lock-free', hint: 'available', ownerLabel: null };
+}
+
+window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor, lockChipState };
