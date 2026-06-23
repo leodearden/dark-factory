@@ -912,6 +912,10 @@ class EscalationQueue:
             archive_dir = archive.archive_dir_for_date(self.queue_dir, resolved_at)
             archive_dir.mkdir(parents=True, exist_ok=True)
             os.replace(str(path), str(archive_dir / f'{escalation_id}.json'))
+            # Incrementally update the listing cache so get() finds the newly-archived
+            # id without a full rescan.  Only update if the cache has already been built.
+            if self._archive_listing is not None:
+                self._archive_listing.setdefault(archive_dir.name, set()).add(escalation_id)
         except OSError as exc:
             logger.warning(
                 f'Failed to archive escalation {escalation_id}: {exc}; '
