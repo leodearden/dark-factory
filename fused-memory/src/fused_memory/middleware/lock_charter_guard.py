@@ -28,6 +28,20 @@ Extension allowlist rationale (reify PRD §11 Q2):
 - PRD-explicit: rs ri toml cpp c h hpp md json yaml yml lock py sh ts tsx js txt step stl
 - Corpus-evidenced: css mjs html jsonc gcode service
 - Common source siblings: cc cxx hh mts cts cjs jsx scss svg png
+
+## Predicate canonical location
+
+The α/γ shared predicate (``CODE_EXTENSIONS``, ``is_file_path``,
+``directory_locks``) is now canonical in ``shared.locking`` so that
+``orchestrator.scheduler`` (α) can import it without a
+``fused_memory`` → ``orchestrator`` cross-package edge (no-cross-package-edge
+convention documented at ``agents/triage.py:78-95``; orchestrator's pyright
+``extraPaths`` does not include ``../fused-memory/src``).
+
+The definitions are kept here verbatim so this module remains self-contained
+in the fused-memory virtual environment (the editable shared package
+installed in .venv may be pinned to a release that predates the relocation).
+The drift-guard test (``test_extension_drift_guard``) catches any divergence.
 """
 
 from __future__ import annotations
@@ -36,9 +50,8 @@ import json
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Canonical extension allowlist — single source of truth for γ.
-# Copied verbatim from reify's scripts/lock-charter-guard.sh _EXTS (reify:4676).
-# α/γ drift guard: tests/test_lock_charter_guard.py::test_extension_drift_guard
+# Canonical extension allowlist — kept in sync with shared.locking.CODE_EXTENSIONS.
+# Drift guard: tests/test_lock_charter_guard.py::test_extension_drift_guard
 # ---------------------------------------------------------------------------
 
 __all__ = [
