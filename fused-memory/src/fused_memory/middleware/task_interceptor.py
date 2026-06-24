@@ -36,6 +36,11 @@ from fused_memory.middleware.dark_factory_path_guard import (
     check_candidate_for_dark_factory_paths,
     check_text_for_dark_factory_paths,
 )
+from fused_memory.middleware.lock_charter_guard import (
+    directory_locks,
+    extract_files,
+    lock_charter_error,
+)
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
     check_candidate_for_scope,
@@ -3143,6 +3148,11 @@ class TaskInterceptor:
             kwargs.get('metadata'),
         ):
             return err
+        if err := _reject_directory_locks_in_update_metadata(
+            task_id,
+            kwargs.get('metadata'),
+        ):
+            return err
         if err := await self._backlog_gate(project_root):
             return err
         tm = await self._ensure_taskmaster()
@@ -3883,6 +3893,27 @@ def _reject_done_provenance_in_update_metadata(
             'backstop on the merge sha.'
         ),
     }
+
+
+def _reject_directory_locks_in_update_metadata(
+    task_id: str,
+    metadata: object,
+) -> dict | None:
+    """Reject ``update_task`` calls that try to write directory paths to ``metadata.files``.
+
+    Defense-in-depth alongside the same check in ``server/tools.py``.
+    ``extract_files`` handles dict|str|None benign-absent → [].
+    Returns ``lock_charter_error(dirs, task_id=task_id)`` when directory
+    entries are detected, ``None`` otherwise.
+
+    The returned dict has a truthy ``'error'`` key so
+    :func:`interceptor_write_succeeded` correctly classifies it as a
+    write failure without any new success-detection logic.
+    """
+    dirs = directory_locks(extract_files(metadata))
+    if dirs:
+        return lock_charter_error(dirs, task_id=task_id)
+    return None
 
 
 def interceptor_write_succeeded(resp: object) -> bool:
