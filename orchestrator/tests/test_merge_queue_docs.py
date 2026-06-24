@@ -269,3 +269,30 @@ class TestDesignDocExistsAndMatchesCode:
     def test_merge_first_enqueued_at_in_code(self) -> None:
         """merge_first_enqueued_at must exist in merge_queue.py."""
         assert "merge_first_enqueued_at" in MERGE_QUEUE_SRC
+
+
+class TestPrdMarkedBuiltAndPointsToAsbuilt:
+    """plans/two-layer-merge-queue-prd.md must be marked built and point to as-built docs."""
+
+    _prd = _read("plans/two-layer-merge-queue-prd.md")
+
+    def test_stale_not_yet_decomposed_marker_absent(self) -> None:
+        """PRD must not still carry the stale 'not yet decomposed' marker."""
+        assert "not yet decomposed" not in self._prd, (
+            "plans/two-layer-merge-queue-prd.md still carries the stale "
+            "'not yet decomposed' marker — it should be updated to reflect "
+            "the built/landed status"
+        )
+
+    def test_asbuilt_pointer_present(self) -> None:
+        """PRD must contain a pointer to the as-built docs."""
+        has_pointer = (
+            "references/two-layer-model.md" in self._prd
+            or "As-built" in self._prd
+            or "as-built" in self._prd.lower()
+        )
+        assert has_pointer, (
+            "plans/two-layer-merge-queue-prd.md must contain a pointer to "
+            "the as-built documentation (e.g. 'As-built:' or "
+            "'references/two-layer-model.md')"
+        )
