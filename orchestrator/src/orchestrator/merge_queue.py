@@ -5728,6 +5728,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Debounce signature for recompute_suffix_conflict_graph() — see step-12.
         # None means "no prior compute"; a non-None value is (tuple_of_rids, main_sha).
         self._suffix_conflict_signature: tuple[tuple[str, ...], str] | None = None
+        # λ=1895 — real main SHA cached at each get_main_sha() resolution point
+        # (recompute_suffix_conflict_graph + finalize/advance path).  Used by
+        # snapshot() to pass the REAL main to two_layer_invariants() instead of
+        # _newest_frozen_commit() (the frozen-stack tip), which causes a spurious
+        # base-chain violation whenever any frozen entry carries a merge_commit.
+        # NOT cleared on a bounce (unlike _suffix_conflict_signature), so the
+        # post-bounce/pre-recompute window with a non-empty frozen prefix still
+        # retains a real main SHA — strictly more robust than reading sig[1].
+        self._last_known_main_sha: str | None = None
         # η/1892 — per-branch bounce counter for the needs-rebase cap.
         # Keyed by branch name (sha-independent so it survives rebase HEAD churn).
         self._bounce_registry: MergeBounceRegistry = MergeBounceRegistry()
@@ -6364,6 +6373,80 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
+    def two_layer_invariants(self, main_sha: str) -> list[str]:
+        """Return ALL §5.3 two-layer violations as human-readable strings (λ=1895).
+
+        Empty list → all §5.3 invariants hold.  Non-empty → each string names
+        the offending ``request_id`` (or pair) and the violated invariant.
+
+        Composes :meth:`check_frozen_prefix_invariant` (base-chain integrity +
+        frozen∩suffix disjointness) with three additional checks:
+
+        (i)  **textual⊆footprint contract**: every edge in
+             ``_suffix_conflict_graph.textual_edges`` must also be in
+             ``footprint_edges`` (β/γ contract: textual conflict ⇒ footprint
+             overlap).  A pair in ``textual_edges`` but not in
+             ``footprint_edges`` is a graph-consistency violation naming both
+             request_ids.
+
+        (ii) **conflicts_with_main ⊆ nodes**: every ``request_id`` in
+             ``_suffix_conflict_graph.conflicts_with_main`` must be a node in
+             ``_suffix_conflict_graph.nodes``.  A rid present in
+             ``conflicts_with_main`` but absent from nodes is a δ=1889
+             graph-consistency violation naming the stale rid.
+
+        Pure / synchronous (no await).  Fail-safe: never raises; any
+        unexpected exception inside a sub-check is caught and surfaced as a
+        violation string so the caller always receives a ``list[str]``.
+
+        Mirrors :meth:`check_frozen_prefix_invariant`'s ``-> list[str]``
+        idiom and gives the operator dashboard a single §5.3 health surface
+        (PRD §1).  Used by λ's integration test and the 'two_layer_invariants'
+        snapshot key.
+        """
+        try:
+            # ── inherited checks (base-chain + frozen∩suffix disjointness) ────
+            # Skip when main_sha is unavailable ('unknown' sentinel from
+            # snapshot()) to avoid spurious base-chain violations at startup
+            # or after a get_main_sha() failure.  Graph-consistency checks
+            # (i)+(ii) below still run — they don't need main_sha.
+            if main_sha and main_sha != 'unknown':
+                violations: list[str] = self.check_frozen_prefix_invariant(main_sha)
+            else:
+                violations = []
+        except Exception as exc:  # pragma: no cover — defensive
+            violations = [f'two_layer_invariants: check_frozen_prefix_invariant raised: {exc}']
+
+        graph = self._suffix_conflict_graph
+
+        # ── (i) textual_edges ⊆ footprint_edges ──────────────────────────────
+        try:
+            spurious = graph.textual_edges - graph.footprint_edges
+            for edge in sorted(sorted(e) for e in spurious):
+                rid_a, rid_b = edge[0], edge[1]
+                violations.append(
+                    f'textual⊈footprint contract violated: textual edge '
+                    f'{rid_a!r}↔{rid_b!r} has no footprint-overlap counterpart'
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(f'two_layer_invariants: textual⊆footprint check raised: {exc}')
+
+        # ── (ii) conflicts_with_main ⊆ nodes ─────────────────────────────────
+        try:
+            nodes_set = frozenset(graph.nodes)
+            stale_rids = sorted(graph.conflicts_with_main - nodes_set)
+            for rid in stale_rids:
+                violations.append(
+                    f'conflicts_with_main⊄nodes: {rid!r} is in conflicts_with_main '
+                    f'but absent from suffix graph nodes'
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(
+                f'two_layer_invariants: conflicts_with_main⊆nodes check raised: {exc}'
+            )
+
+        return violations
+
     def _warn_if_verify_base_not_frozen_tip(
         self,
         item: SpeculativeItem,
@@ -6456,6 +6539,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         except Exception:
             logger.warning('recompute_suffix_conflict_graph: get_main_sha failed; skipping')
             return
+
+        # λ=1895 — cache the real main SHA BEFORE the debounce early-return so
+        # it stays fresh even when the signature is unchanged and we return early.
+        # snapshot()'s two_layer_invariants() call reads this field, not
+        # _newest_frozen_commit() (the frozen-stack tip), to avoid a spurious
+        # base-chain violation during normal in-flight verify.
+        self._last_known_main_sha = main_sha
 
         sig = (ordered_rids, main_sha)
         if sig == self._suffix_conflict_signature:
@@ -7147,6 +7237,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'tip_merge_commit': self._newest_frozen_commit(),
                 'verify_depth': len(self.frozen_prefix()),
             },
+            # λ=1895 additive key: consolidated §5.3 health surface.
+            # Populated by two_layer_invariants() — pure synchronous read, no
+            # await.  Empty list = healthy; non-empty = violation strings.
+            # main_sha is best-effort: use the REAL main SHA cached at the last
+            # recompute_suffix_conflict_graph() or finalize call; fall back to
+            # 'unknown' when genuinely unavailable so the method is always
+            # callable without an event loop.  Do NOT use _newest_frozen_commit()
+            # here — that returns the frozen-stack tip (M1), not the real main
+            # (M0), causing a spurious base-chain violation during normal
+            # in-flight verify (λ=1895 fix).
+            # No collision with existing keys.
+            'two_layer_invariants': self.two_layer_invariants(
+                self._last_known_main_sha or 'unknown'
+            ),
         }
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
