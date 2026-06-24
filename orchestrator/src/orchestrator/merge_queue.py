@@ -6364,6 +6364,73 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
+    def two_layer_invariants(self, main_sha: str) -> list[str]:
+        """Return ALL §5.3 two-layer violations as human-readable strings (λ=1895).
+
+        Empty list → all §5.3 invariants hold.  Non-empty → each string names
+        the offending ``request_id`` (or pair) and the violated invariant.
+
+        Composes :meth:`check_frozen_prefix_invariant` (base-chain integrity +
+        frozen∩suffix disjointness) with three additional checks:
+
+        (i)  **textual⊆footprint contract**: every edge in
+             ``_suffix_conflict_graph.textual_edges`` must also be in
+             ``footprint_edges`` (β/γ contract: textual conflict ⇒ footprint
+             overlap).  A pair in ``textual_edges`` but not in
+             ``footprint_edges`` is a graph-consistency violation naming both
+             request_ids.
+
+        (ii) **conflicts_with_main ⊆ nodes**: every ``request_id`` in
+             ``_suffix_conflict_graph.conflicts_with_main`` must be a node in
+             ``_suffix_conflict_graph.nodes``.  A rid present in
+             ``conflicts_with_main`` but absent from nodes is a δ=1889
+             graph-consistency violation naming the stale rid.
+
+        Pure / synchronous (no await).  Fail-safe: never raises; any
+        unexpected exception inside a sub-check is caught and surfaced as a
+        violation string so the caller always receives a ``list[str]``.
+
+        Mirrors :meth:`check_frozen_prefix_invariant`'s ``-> list[str]``
+        idiom and gives the operator dashboard a single §5.3 health surface
+        (PRD §1).  Used by λ's integration test and the 'two_layer_invariants'
+        snapshot key.
+        """
+        try:
+            # ── inherited checks (base-chain + frozen∩suffix disjointness) ────
+            violations: list[str] = self.check_frozen_prefix_invariant(main_sha)
+        except Exception as exc:  # pragma: no cover — defensive
+            violations = [f'two_layer_invariants: check_frozen_prefix_invariant raised: {exc}']
+
+        graph = self._suffix_conflict_graph
+
+        # ── (i) textual_edges ⊆ footprint_edges ──────────────────────────────
+        try:
+            spurious = graph.textual_edges - graph.footprint_edges
+            for edge in sorted(sorted(e) for e in spurious):
+                rid_a, rid_b = edge[0], edge[1]
+                violations.append(
+                    f'textual⊈footprint contract violated: textual edge '
+                    f'{rid_a!r}↔{rid_b!r} has no footprint-overlap counterpart'
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(f'two_layer_invariants: textual⊆footprint check raised: {exc}')
+
+        # ── (ii) conflicts_with_main ⊆ nodes ─────────────────────────────────
+        try:
+            nodes_set = frozenset(graph.nodes)
+            stale_rids = sorted(graph.conflicts_with_main - nodes_set)
+            for rid in stale_rids:
+                violations.append(
+                    f'conflicts_with_main⊄nodes: {rid!r} is in conflicts_with_main '
+                    f'but absent from suffix graph nodes'
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(
+                f'two_layer_invariants: conflicts_with_main⊆nodes check raised: {exc}'
+            )
+
+        return violations
+
     def _warn_if_verify_base_not_frozen_tip(
         self,
         item: SpeculativeItem,
@@ -7147,6 +7214,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'tip_merge_commit': self._newest_frozen_commit(),
                 'verify_depth': len(self.frozen_prefix()),
             },
+            # λ=1895 additive key: consolidated §5.3 health surface.
+            # Populated by two_layer_invariants() — pure synchronous read, no
+            # await.  Empty list = healthy; non-empty = violation strings.
+            # main_sha is best-effort: use the frozen_prefix_tip's implicit
+            # main reference; fall back to 'unknown' when unavailable so the
+            # method is always callable without an event loop.
+            # No collision with existing keys.
+            'two_layer_invariants': self.two_layer_invariants(
+                self._newest_frozen_commit() or 'unknown'
+            ),
         }
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
