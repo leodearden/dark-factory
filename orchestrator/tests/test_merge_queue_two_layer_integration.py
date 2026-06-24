@@ -326,3 +326,240 @@ def _make_falling_disk_iter(
     while True:
         yield current
         current -= drop
+
+
+# ── step-01 RED: consolidated §5.3 health surface ────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestTwoLayerInvariants:
+    """worker.two_layer_invariants(main_sha) -> list[str] is a new consolidated
+    §5.3 health method.
+
+    Returns [] when all invariants hold; returns non-empty violation strings
+    naming the offending request_id for each broken invariant.
+
+    RED until step-02 GREEN adds the method + snapshot key to SpeculativeMergeWorker.
+    """
+
+    async def test_healthy_pipeline_returns_empty_list(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """A well-formed pipeline returns [] — no §5.3 violations detected.
+
+        Well-formed means:
+        - Frozen prefix base-chain is intact (base_sha == main_sha for the
+          first entry; each subsequent entry's base_sha == predecessor's
+          merge_commit).
+        - Frozen rids and suffix rids are disjoint.
+        - SuffixConflictGraph has textual_edges ⊆ footprint_edges.
+        - SuffixConflictGraph conflicts_with_main ⊆ nodes.
+        """
+        worker = _make_worker(git_ops)
+        main_sha = 'main-sha-001'
+
+        # Build a frozen entry chained correctly off main_sha.
+        _, item_a = _make_fake_item(
+            'task-a', base_sha=main_sha, merge_commit='merge-sha-a',
+            config=config, git_repo=git_repo,
+        )
+        entry_a = _make_inflight_entry(item_a, verifying=True)
+        worker._inflight.append(entry_a)
+
+        # Suffix req — different rid, not in frozen prefix.
+        req_b = _make_req('task-b', 'task/task-b', config, git_repo)
+        worker._lane_buffers['normal'].append(req_b)
+
+        # Build a valid graph: textual_edges ⊆ footprint_edges;
+        # conflicts_with_main ⊆ nodes.
+        edge_pair = frozenset({req_b.request_id, 'some-other-rid'})
+        worker._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=(req_b.request_id,),
+            textual_edges=frozenset(),      # empty ⊆ any set
+            footprint_edges=frozenset({edge_pair}),
+            conflicts_with_main=frozenset({req_b.request_id}),
+        )
+
+        violations = worker.two_layer_invariants(main_sha)
+
+        assert violations == [], (
+            f'Expected [] for a well-formed pipeline but got: {violations!r}'
+        )
+
+    async def test_violation_a_broken_base_chain_detected(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """(a) A broken base-chain in the frozen prefix produces a violation str
+        naming the offending request_id.
+        """
+        worker = _make_worker(git_ops)
+        main_sha = 'main-sha-001'
+
+        # Frozen entry whose base_sha does NOT match main_sha → chain broken.
+        _, item_a = _make_fake_item(
+            'task-a', base_sha='wrong-sha', merge_commit='merge-sha-a',
+            config=config, git_repo=git_repo,
+        )
+        entry_a = _make_inflight_entry(item_a, verifying=True)
+        worker._inflight.append(entry_a)
+
+        violations = worker.two_layer_invariants(main_sha)
+
+        assert violations, 'Expected a violation for broken base-chain but got []'
+        # At least one violation must name the offending rid.
+        joined = ' '.join(violations)
+        assert item_a.request.request_id in joined, (
+            f'Expected offending rid {item_a.request.request_id!r} in violations '
+            f'but got: {violations!r}'
+        )
+
+    async def test_violation_b_frozen_suffix_overlap_detected(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """(b) A rid present in BOTH the frozen prefix and the unfrozen suffix
+        is flagged as a disjointness violation naming that rid.
+        """
+        worker = _make_worker(git_ops)
+        main_sha = 'main-sha-001'
+
+        # Build frozen entry.
+        req_a = _make_req('task-a', 'task/task-a', config, git_repo)
+        item_a = SpeculativeItem(
+            request=req_a,
+            merge_result=MergeResult(success=True, merge_commit='merge-sha-a'),
+            merge_wt=None,
+            base_sha=main_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+        entry_a = _make_inflight_entry(item_a, verifying=True)
+        worker._inflight.append(entry_a)
+
+        # ALSO put req_a in the suffix — this violates frozen∩suffix disjointness.
+        worker._lane_buffers['normal'].append(req_a)
+
+        violations = worker.two_layer_invariants(main_sha)
+
+        assert violations, 'Expected a disjointness violation but got []'
+        joined = ' '.join(violations)
+        assert req_a.request_id in joined, (
+            f'Expected rid {req_a.request_id!r} named in disjointness violation '
+            f'but got: {violations!r}'
+        )
+
+    async def test_violation_c_textual_not_subset_of_footprint(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """(c) textual_edges containing an edge not in footprint_edges is flagged
+        with a violation naming the offending pair (request_ids).
+        """
+        worker = _make_worker(git_ops)
+        main_sha = 'main-sha-001'
+
+        req_x = _make_req('task-x', 'task/task-x', config, git_repo,
+                          request_id='rid-x')
+        req_y = _make_req('task-y', 'task/task-y', config, git_repo,
+                          request_id='rid-y')
+        worker._lane_buffers['normal'].extend([req_x, req_y])
+
+        # textual edge {rid-x, rid-y} NOT in footprint_edges → contract violated.
+        extra_edge = frozenset({'rid-x', 'rid-y'})
+        worker._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=('rid-x', 'rid-y'),
+            textual_edges=frozenset({extra_edge}),   # NOT a subset of footprint_edges
+            footprint_edges=frozenset(),              # empty → textual edge is spurious
+            conflicts_with_main=frozenset(),
+        )
+
+        violations = worker.two_layer_invariants(main_sha)
+
+        assert violations, (
+            'Expected a textual⊈footprint violation but got []'
+        )
+        joined = ' '.join(violations)
+        # At least one of the two rids should appear in the violation message.
+        assert 'rid-x' in joined or 'rid-y' in joined, (
+            f'Expected rid-x or rid-y in violation but got: {violations!r}'
+        )
+
+    async def test_violation_d_conflicts_with_main_missing_from_nodes(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """(d) conflicts_with_main containing a rid absent from nodes is flagged
+        as a consistency violation naming that rid.
+        """
+        worker = _make_worker(git_ops)
+        main_sha = 'main-sha-001'
+
+        req_x = _make_req('task-x', 'task/task-x', config, git_repo,
+                          request_id='rid-x')
+        worker._lane_buffers['normal'].append(req_x)
+
+        # 'rid-ghost' is in conflicts_with_main but NOT in nodes → inconsistency.
+        worker._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=('rid-x',),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({'rid-ghost'}),
+        )
+
+        violations = worker.two_layer_invariants(main_sha)
+
+        assert violations, (
+            'Expected a conflicts_with_main⊄nodes violation but got []'
+        )
+        joined = ' '.join(violations)
+        assert 'rid-ghost' in joined, (
+            f'Expected rid-ghost named in violation but got: {violations!r}'
+        )
+
+    async def test_snapshot_grows_two_layer_invariants_key(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """snapshot() exposes an additive 'two_layer_invariants' key (list).
+
+        All pre-existing snapshot keys must remain intact (entries, depth,
+        head_of_line, suffix_conflict_graph, frozen_prefix, metrics).
+        """
+        worker = _make_worker(git_ops)
+
+        snap = worker.snapshot()
+
+        # New additive key must be present and be a list.
+        assert 'two_layer_invariants' in snap, (
+            f"'two_layer_invariants' key not found in snapshot(). "
+            f'Keys present: {sorted(snap.keys())!r}'
+        )
+        assert isinstance(snap['two_layer_invariants'], list), (
+            f"Expected 'two_layer_invariants' to be a list, got "
+            f"{type(snap['two_layer_invariants'])!r}"
+        )
+
+        # All pre-existing keys must still be present (backward-compatible).
+        required_keys = {
+            'entries', 'depth', 'head_of_line',
+            'suffix_conflict_graph', 'frozen_prefix', 'metrics',
+        }
+        missing = required_keys - snap.keys()
+        assert not missing, (
+            f'Pre-existing snapshot keys missing after adding two_layer_invariants: '
+            f'{missing!r}'
+        )
