@@ -809,3 +809,142 @@ class TestScenario1And8:
             f'Expected two_layer_invariants == [] before bounce (frozen prefix is '
             f'well-formed) but got: {violations!r}'
         )
+
+
+# ── step-05 RED: §9 scenario 2 (clean speculative rebase re-queues) ──────────
+
+
+@pytest.mark.asyncio
+class TestScenario2CleanRebaseRequeues:
+    """§9 scenario 2: clean speculative rebase re-queues — work preserved, no agent.
+
+    Seed a frozen-tip entry + a suffix req flagged in conflicts_with_main;
+    stub rebase_onto_main → True (clean rebase onto frozen tip).  Call
+    _bounce_conflicting_suffix_items().
+
+    Assertions:
+      - rebase_onto_main awaited once with onto=frozen_tip_sha
+      - req REMAINS in _lane_buffers['normal'] (re-queued, work preserved)
+      - req.result is NOT done (no agent dispatched)
+      - req.merge_first_enqueued_at unchanged (== 9999.0)
+      - _bounce_registry.count(branch) == 1
+      - _suffix_conflict_signature invalidated to None
+      - a needs_rebase log line emitted
+
+    Integration delta: the graph is REAL (recomputed via recompute_suffix_conflict_graph
+    against a real branch) rather than hand-seeded.
+
+    RED until the suite lands.
+    """
+
+    async def test_clean_rebase_requeues_work_preserved(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Clean rebase → req stays in lane buffer; future untouched; registry++."""
+        import logging
+
+        # 1. Create the frozen-tip commit on a side branch (not main) so that
+        #    main stays at M0 and frozen_prefix_tip == frozen_tip_sha.
+        frozen_tip_sha = await _create_branch_editing(
+            git_repo, 'task/frozen-tip-s2', 'shared.txt',
+            'line1\nFROZEN-LINE2-S2\nline3\n',
+        )
+
+        # 2. Create suffix branch editing the SAME line → will conflict with frozen tip.
+        await _create_branch_editing(
+            git_repo, 'task/suffix-branch', 'shared.txt',
+            'line1\nSUFFIX-LINE2\nline3\n',
+        )
+
+        # 3. Build worker with frozen entry.
+        worker = _make_worker(git_ops)
+        _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        main_sha = main_sha_raw.strip()
+
+        _, item_frozen = _make_fake_item(
+            'frozen-s2', base_sha=main_sha, merge_commit=frozen_tip_sha,
+            config=config, git_repo=git_repo,
+        )
+        entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
+        worker._inflight.append(entry_frozen)
+
+        # 4. Build suffix req with a known merge_first_enqueued_at.
+        req = _make_req(
+            'suffix-branch', 'suffix-branch', config, git_repo,
+            merge_first_enqueued_at=9999.0,
+        )
+        worker._lane_buffers['normal'].append(req)
+
+        # 5. Recompute the real graph; the suffix branch conflicts with the frozen tip.
+        await worker.recompute_suffix_conflict_graph()
+
+        assert req.request_id in worker._suffix_conflict_graph.conflicts_with_main, (
+            'precondition: req must be in conflicts_with_main after recompute; '
+            'suffix branch edits the same line as the frozen tip'
+        )
+
+        # Store the debounce signature so we can assert it's cleared later.
+        assert worker._suffix_conflict_signature is not None, (
+            'precondition: debounce signature must be set after a successful recompute'
+        )
+
+        # 6. Stub rebase → True (clean rebase — no actual git op).
+        worker._git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.INFO):
+            await worker._bounce_conflicting_suffix_items()
+
+        # Assert: rebase_onto_main called with onto=frozen_tip_sha.
+        worker._git_ops.rebase_onto_main.assert_awaited_once()
+        call_kwargs = worker._git_ops.rebase_onto_main.call_args
+        onto_arg = call_kwargs.kwargs.get('onto') or (
+            call_kwargs.args[1] if len(call_kwargs.args) >= 2 else None
+        )
+        assert onto_arg == frozen_tip_sha, (
+            f'Expected rebase_onto_main called with onto={frozen_tip_sha!r} '
+            f'but got {onto_arg!r}'
+        )
+
+        # Assert: req REMAINS in lane buffer (re-queued, work preserved).
+        assert req in worker._lane_buffers['normal'], (
+            'Expected req to remain in lane buffer after a clean rebase (re-queue)'
+        )
+
+        # Assert: future NOT done (no agent dispatched).
+        assert not req.result.done(), (
+            'Expected req.result future to remain pending after a clean rebase'
+        )
+
+        # Assert: merge_first_enqueued_at unchanged.
+        assert req.merge_first_enqueued_at == 9999.0, (
+            f'Expected merge_first_enqueued_at == 9999.0 but got '
+            f'{req.merge_first_enqueued_at!r}'
+        )
+
+        # Assert: bounce registry incremented to 1.
+        branch = req.branch
+        assert worker._bounce_registry.count(branch) == 1, (
+            f'Expected bounce registry count for branch {branch!r} to be 1 '
+            f'after one clean rebase bounce'
+        )
+
+        # Assert: _suffix_conflict_signature invalidated to None.
+        assert worker._suffix_conflict_signature is None, (
+            'Expected _suffix_conflict_signature to be None after a bounce '
+            '(so next recompute re-probes reality)'
+        )
+
+        # Assert: a needs_rebase log line was emitted.
+        relevant = [
+            r for r in caplog.records
+            if 'needs_rebase' in r.message.lower()
+            or NEEDS_REBASE_REASON_PREFIX.lower()[:10] in r.message.lower()
+        ]
+        assert relevant, (
+            f'Expected a needs_rebase log line but none found. '
+            f'Log records: {[r.message for r in caplog.records]!r}'
+        )
