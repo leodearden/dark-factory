@@ -100,3 +100,71 @@ class TestSkillDocumentsNeedsRebaseBounce:
             "MERGE_BOUNCE_CAP not found in merge_queue.py — "
             "doc cites a symbol that doesn't exist in the code"
         )
+
+
+class TestSkillDocumentsAgingOrderAndCrossrefs:
+    """SKILL.md must describe aging order, frozen-prefix invariant, and cross-refs."""
+
+    _skill = _read("skills/merge-queue/SKILL.md")
+    _skill_lower = _skill.lower()
+
+    def test_age_of_first_submission_phrase(self) -> None:
+        """SKILL.md must describe the age-of-first-submission landing order."""
+        has_phrase = (
+            "age of first submission" in self._skill_lower
+            or "first submission" in self._skill_lower
+        )
+        assert has_phrase, (
+            "skills/merge-queue/SKILL.md must describe the age-of-first-submission "
+            "landing order (conflict-clique-scoped)"
+        )
+
+    def test_conflict_clique_phrase(self) -> None:
+        """SKILL.md must mention conflict cliques for the aging order."""
+        assert "clique" in self._skill_lower, (
+            "skills/merge-queue/SKILL.md must mention 'clique' (conflict-clique-scoped "
+            "aging order)"
+        )
+
+    def test_disjoint_throughput_bypass_phrase(self) -> None:
+        """SKILL.md must describe the disjoint throughput bypass."""
+        has_phrase = (
+            "disjoint" in self._skill_lower
+            or "throughput bypass" in self._skill_lower
+        )
+        assert has_phrase, (
+            "skills/merge-queue/SKILL.md must describe the disjoint-item throughput bypass"
+        )
+
+    def test_frozen_prefix_immutability_invariant(self) -> None:
+        """SKILL.md must describe the frozen-prefix/verify-frontier immutability invariant."""
+        has_frozen = (
+            "frozen prefix" in self._skill_lower
+            or "frozen-prefix" in self._skill_lower
+        )
+        has_immutable = (
+            "immutable" in self._skill_lower
+            or "immutability" in self._skill_lower
+            or "never reordered" in self._skill_lower
+        )
+        assert has_frozen, (
+            "skills/merge-queue/SKILL.md must describe the frozen-prefix concept"
+        )
+        assert has_immutable, (
+            "skills/merge-queue/SKILL.md must describe the immutability of "
+            "items in the frozen verify frontier"
+        )
+
+    def test_crossref_warm_lane_dp_batch(self) -> None:
+        """SKILL.md must reference the complementary warm-lane Δp space-safety batch (1859)."""
+        assert "1859" in self._skill, (
+            "skills/merge-queue/SKILL.md must cross-reference the warm-lane "
+            "Δp space-safety batch (task 1859)"
+        )
+
+    def test_crossref_enospc_failsoft_out_of_scope(self) -> None:
+        """SKILL.md must reference the ENOSPC fail-soft and mark it out of scope."""
+        assert "out of scope" in self._skill_lower, (
+            "skills/merge-queue/SKILL.md must reference the merge-verify ENOSPC "
+            "fail-soft and mark it as out of scope"
+        )
