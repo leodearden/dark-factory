@@ -604,3 +604,129 @@ class TestBounceEscalation:
 
         # Debounce signature invalidated.
         assert worker._suffix_conflict_signature is None
+
+
+# ── step-09 RED: _acquire_next_request() wires bounce at graph time ───────────
+
+
+@pytest.mark.asyncio
+class TestAcquireWiring:
+    """_acquire_next_request() must call _bounce_conflicting_suffix_items()
+    AFTER recompute_suffix_conflict_graph() and BEFORE _pop_next_pickable(),
+    so a conflicting item is diverted before consuming a verify slot.
+
+    RED until step-10 GREEN inserts the await into _acquire_next_request().
+    """
+
+    async def test_bounce_called_after_recompute_before_pop(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """ORDER: bounce is called after recompute and before _pop_next_pickable."""
+        worker = _make_worker(git_ops)
+        worker._shutdown_signaled = True  # exit after one cycle
+
+        call_order: list[str] = []
+
+        async def fake_recompute() -> None:
+            call_order.append('recompute')
+
+        async def fake_bounce() -> None:
+            call_order.append('bounce')
+
+        def fake_pop() -> MergeRequest | None:
+            call_order.append('pop')
+            return None  # nothing to pick; shutdown will return None
+
+        worker.recompute_suffix_conflict_graph = fake_recompute  # type: ignore[method-assign]
+        worker._bounce_conflicting_suffix_items = fake_bounce  # type: ignore[method-assign]
+        worker._pop_next_pickable = fake_pop  # type: ignore[method-assign]
+
+        result = await worker._acquire_next_request()
+
+        # Should have returned None (shutdown signaled, nothing pickable).
+        assert result is None
+
+        # Bounce must appear AFTER recompute and BEFORE pop.
+        assert 'bounce' in call_order, (
+            f'_bounce_conflicting_suffix_items was not called at all. '
+            f'call_order={call_order!r}. RED until step-10 wires the bounce.'
+        )
+        recompute_idx = call_order.index('recompute')
+        bounce_idx = call_order.index('bounce')
+        pop_idx = call_order.index('pop')
+        assert recompute_idx < bounce_idx < pop_idx, (
+            f'Expected recompute < bounce < pop but got call_order={call_order!r}.'
+        )
+
+    async def test_conflicting_item_diverted_before_verify_slot(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """NO VERIFY SLOT: a conflicting item is escalated before _pop_next_pickable
+        can return it for verify dispatch.
+
+        Setup: one conflicting req in lane buffer; rebase→False (escalate path);
+        _shutdown_signaled=True so the method exits without blocking.
+
+        Expected WITH wiring (GREEN): bounce removes req from lane buffer →
+        _pop_next_pickable returns None → _acquire_next_request() returns None.
+        req.result is done with status='blocked'.
+
+        Expected WITHOUT wiring (RED): bounce not called → _pop_next_pickable
+        returns req → _acquire_next_request() returns req (wrong!).
+        """
+        worker = _make_worker(git_ops)
+
+        # Build a frozen entry so frozen_prefix_tip is not bare main.
+        _, item_frozen = _make_fake_item(
+            'frozen-task', merge_commit='deadbeef1234', config=config, git_repo=git_repo,
+        )
+        entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
+        worker._inflight.append(entry_frozen)
+
+        # Put one conflicting req in lane buffer.
+        req = _make_req('591', '591', config, git_repo)
+        worker._lane_buffers['normal'].append(req)
+
+        # Seed the conflict graph so the bounce will process req.
+        worker._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=(req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({req.request_id}),
+        )
+
+        # Stub rebase → False (escalate; req removed + future resolved 'blocked').
+        worker._git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        # Signal shutdown so _acquire_next_request() exits instead of blocking.
+        worker._shutdown_signaled = True
+
+        # Override recompute to be a no-op (graph already seeded above).
+        async def _noop_recompute() -> None:
+            pass
+        worker.recompute_suffix_conflict_graph = _noop_recompute  # type: ignore[method-assign]
+
+        result = await worker._acquire_next_request()
+
+        # WITH wiring (GREEN): result is None (item diverted, nothing pickable).
+        # WITHOUT wiring (RED): result is req (item NOT diverted, picked by pop).
+        assert result is None, (
+            f'Expected _acquire_next_request() to return None (conflicting item '
+            f'diverted before verify slot) but got {result!r}. This is RED until '
+            f'step-10 wires _bounce_conflicting_suffix_items() into _acquire_next_request().'
+        )
+
+        # The item's future must be resolved as blocked.
+        assert req.result.done(), (
+            'Expected req.result to be resolved as blocked after graph-time bounce.'
+        )
+        outcome: MergeOutcome = req.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX)
