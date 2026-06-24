@@ -4937,6 +4937,7 @@ class MergeWorker(_WipHaltMixin):
             ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
         )
         main_sha = await self._git_ops.get_main_sha()
+        self._last_known_main_sha = main_sha  # λ=1895 cache for snapshot() health surface
         if await self._git_ops.is_ancestor(branch_head.strip(), main_sha):
             # Guard: if worktree has uncommitted changes, an agent may
             # have started work — don't skip.
@@ -5728,6 +5729,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Debounce signature for recompute_suffix_conflict_graph() — see step-12.
         # None means "no prior compute"; a non-None value is (tuple_of_rids, main_sha).
         self._suffix_conflict_signature: tuple[tuple[str, ...], str] | None = None
+        # λ=1895 — real main SHA cached at each get_main_sha() resolution point
+        # (recompute_suffix_conflict_graph + finalize/advance path).  Used by
+        # snapshot() to pass the REAL main to two_layer_invariants() instead of
+        # _newest_frozen_commit() (the frozen-stack tip), which causes a spurious
+        # base-chain violation whenever any frozen entry carries a merge_commit.
+        # NOT cleared on a bounce (unlike _suffix_conflict_signature), so the
+        # post-bounce/pre-recompute window with a non-empty frozen prefix still
+        # retains a real main SHA — strictly more robust than reading sig[1].
+        self._last_known_main_sha: str | None = None
         # η/1892 — per-branch bounce counter for the needs-rebase cap.
         # Keyed by branch name (sha-independent so it survives rebase HEAD churn).
         self._bounce_registry: MergeBounceRegistry = MergeBounceRegistry()
@@ -6524,6 +6534,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             logger.warning('recompute_suffix_conflict_graph: get_main_sha failed; skipping')
             return
 
+        # λ=1895 — cache the real main SHA BEFORE the debounce early-return so
+        # it stays fresh even when the signature is unchanged and we return early.
+        # snapshot()'s two_layer_invariants() call reads this field, not
+        # _newest_frozen_commit() (the frozen-stack tip), to avoid a spurious
+        # base-chain violation during normal in-flight verify.
+        self._last_known_main_sha = main_sha
+
         sig = (ordered_rids, main_sha)
         if sig == self._suffix_conflict_signature:
             return  # Suffix + main unchanged — prior graph is still valid
@@ -7217,12 +7234,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # λ=1895 additive key: consolidated §5.3 health surface.
             # Populated by two_layer_invariants() — pure synchronous read, no
             # await.  Empty list = healthy; non-empty = violation strings.
-            # main_sha is best-effort: use the frozen_prefix_tip's implicit
-            # main reference; fall back to 'unknown' when unavailable so the
-            # method is always callable without an event loop.
+            # main_sha is best-effort: use the REAL main SHA cached at the last
+            # recompute_suffix_conflict_graph() or finalize call; fall back to
+            # 'unknown' when genuinely unavailable so the method is always
+            # callable without an event loop.  Do NOT use _newest_frozen_commit()
+            # here — that returns the frozen-stack tip (M1), not the real main
+            # (M0), causing a spurious base-chain violation during normal
+            # in-flight verify (λ=1895 fix).
             # No collision with existing keys.
             'two_layer_invariants': self.two_layer_invariants(
-                self._newest_frozen_commit() or 'unknown'
+                self._last_known_main_sha or 'unknown'
             ),
         }
 
