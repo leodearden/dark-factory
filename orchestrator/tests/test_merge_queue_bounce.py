@@ -385,3 +385,103 @@ class TestBouncePrimitives:
         reg.record_bounce('task/592')
         assert reg.count('task/591') == 2
         assert reg.count('task/592') == 1
+
+
+# ── step-05 RED: _bounce_conflicting_suffix_items() clean-rebase path ─────────
+
+
+@pytest.mark.asyncio
+class TestBounceCleanRebase:
+    """_bounce_conflicting_suffix_items(): clean-rebase path re-queues the item.
+
+    A clean rebase (rebase_onto_main returns True) must:
+    - leave the request in _lane_buffers (work preserved, no agent)
+    - not resolve req.result (future untouched)
+    - not mutate merge_first_enqueued_at
+    - increment the bounce registry counter to 1
+    - set _suffix_conflict_signature to None (debounce invalidated)
+    - emit a needs_rebase log line
+
+    RED until step-06 GREEN implements _bounce_conflicting_suffix_items().
+    """
+
+    async def test_clean_rebase_requeues_item(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Clean rebase → item stays in lane buffer; future untouched; registry++."""
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        # Build a frozen InflightEntry with a fake merge_commit SHA.
+        frozen_mc = 'deadbeefcafe0000'
+        _, item_frozen = _make_fake_item(
+            'frozen-task', merge_commit=frozen_mc, config=config, git_repo=git_repo,
+        )
+        entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
+        worker._inflight.append(entry_frozen)
+
+        # Put a MergeRequest for branch '591' in the lane buffer.
+        req = _make_req('591', '591', config, git_repo, merge_first_enqueued_at=9999.0)
+        worker._lane_buffers['normal'].append(req)
+
+        # Seed the conflict graph: req is flagged as conflicting with the frozen tip.
+        worker._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=(req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({req.request_id}),
+        )
+        # Give the debounce signature a non-None value so we can assert it's cleared.
+        worker._suffix_conflict_signature = (('some-rid',), 'abc123')
+
+        # Stub rebase_onto_main → True (clean rebase, no actual git op needed).
+        worker._git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.INFO):
+            await worker._bounce_conflicting_suffix_items()
+
+        # rebase_onto_main was called with onto=frozen_mc.
+        worker._git_ops.rebase_onto_main.assert_awaited_once()
+        call_kwargs = worker._git_ops.rebase_onto_main.call_args
+        assert call_kwargs.kwargs.get('onto') == frozen_mc or (
+            len(call_kwargs.args) >= 2 and call_kwargs.args[1] == frozen_mc
+        ), f'Expected onto={frozen_mc!r}, got {call_kwargs}'
+
+        # Item is STILL in the lane buffer (re-queued, not removed).
+        assert req in worker._lane_buffers['normal'], (
+            'Expected req to remain in lane buffer after a clean rebase (re-queue).'
+        )
+
+        # Future is NOT resolved (no agent dispatched).
+        assert not req.result.done(), (
+            'Expected req.result future to remain pending after a clean rebase.'
+        )
+
+        # merge_first_enqueued_at is unchanged.
+        assert req.merge_first_enqueued_at == 9999.0, (
+            'merge_first_enqueued_at must not be mutated by the bounce.'
+        )
+
+        # Bounce registry is incremented.
+        assert worker._bounce_registry.count('591') == 1, (
+            'Expected bounce registry count for branch "591" to be 1 after one bounce.'
+        )
+
+        # Debounce signature was invalidated.
+        assert worker._suffix_conflict_signature is None, (
+            'Expected _suffix_conflict_signature to be None after a bounce '
+            '(so the next recompute re-probes reality).'
+        )
+
+        # A needs_rebase log line was emitted.
+        relevant = [r for r in caplog.records if 'needs_rebase' in r.message.lower()
+                    or NEEDS_REBASE_REASON_PREFIX.lower()[:10] in r.message.lower()]
+        assert relevant, (
+            f'Expected a needs_rebase log line but none found. '
+            f'Log records: {[r.message for r in caplog.records]}'
+        )
