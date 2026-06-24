@@ -70,6 +70,7 @@ from orchestrator.scheduler import (
     TerminalExitRejection,
     files_to_modules,
     normalize_lock,
+    strip_directory_locks,
 )
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
@@ -1321,6 +1322,14 @@ class TaskWorkflow:
         preserved via the ``_merge_fresh_metadata`` read-modify-write; a
         pre-fix bare ``{'files': files}`` write clobbered them under the
         default ``append=False``.
+
+        Directory-shaped entries from the merge diff (extension-less files like
+        ``Dockerfile``, or non-allowlisted dotfiles like ``.gitignore``) are
+        stripped via ``strip_directory_locks`` before persisting, so
+        ``metadata.files`` stays file-level and the done-reconcile
+        ``update_task`` is not rejected by the lock-charter guard (changes #2/#3).
+        The strip can only shrink the declared set (a file-level subset of what
+        landed), which keeps the phantom-done gate honest.
         """
         if self._merge_sha and self._base_commit:
             files, err = await self.git_ops.get_merge_diff_files(
@@ -1334,7 +1343,7 @@ class TaskWorkflow:
             self.task.get('metadata') or {},
             log_context='done metadata files reconcile',
         )
-        merged['files'] = files
+        merged['files'] = strip_directory_locks(files)
         # Optimistically update in-memory so downstream reads in this session
         # see the expected state.  In-memory is intentionally optimistic; the
         # backend is the authority and will be re-read on the next reconcile
