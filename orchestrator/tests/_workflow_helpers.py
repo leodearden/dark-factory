@@ -67,7 +67,13 @@ class FakeScheduler:
         )
 
     async def handle_blast_radius_expansion(
-        self, task_id: str, current: list[str], needed: list[str]
+        self,
+        task_id: str,
+        current: list[str],
+        needed: list[str],
+        /,
+        *,
+        persist_files: list[str] | None = None,
     ) -> bool:
         return True
 

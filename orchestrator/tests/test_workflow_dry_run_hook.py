@@ -53,7 +53,9 @@ class _Scheduler:
     async def mark_done(self, task_id, /, *, kind, sha, note=None):
         pass
 
-    async def handle_blast_radius_expansion(self, task_id, current, needed, /):
+    async def handle_blast_radius_expansion(
+        self, task_id, current, needed, /, *, persist_files=None
+    ):
         return False
 
     async def dispatch_tool(self, name, arguments, *, timeout=30.0):

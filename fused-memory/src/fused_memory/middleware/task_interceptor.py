@@ -3897,7 +3897,7 @@ def _reject_done_provenance_in_update_metadata(
 
 def _reject_directory_locks_in_update_metadata(
     task_id: str,
-    metadata: object,
+    metadata: str | dict[str, Any] | None,
 ) -> dict | None:
     """Reject ``update_task`` calls that try to write directory paths to ``metadata.files``.
 
