@@ -317,15 +317,101 @@ async def test_update_task_rejects_metadata_done_provenance_json_string(
 async def test_update_task_allows_unrelated_metadata(
     mcp_server_with_tasks, task_interceptor,
 ):
-    """Other metadata keys still pass through; the gate only blocks done_provenance."""
+    """Other metadata keys still pass through; the gate only blocks done_provenance
+    and directory-charter violations."""
     result = await mcp_server_with_tasks._tool_manager.call_tool(
         'update_task',
         {
             'id': '1', 'project_root': '/project',
-            'metadata': {'files': ['orchestrator/'], 'priority': 'high'},
+            'metadata': {'files': ['orchestrator/src/foo.py'], 'priority': 'high'},
         },
     )
     assert result == {'success': True}
+    task_interceptor.update_task.assert_called_once()
+
+
+# ------------------------------------------------------------------
+# update_task lock-charter guard (Change #2)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_directory_in_files_dict_metadata(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """update_task rejects metadata.files containing a directory entry (dict form).
+
+    Mirrors the submit_task guard: a directory path must not be written to
+    metadata.files via update_task either.
+    """
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': '/project',
+            'metadata': {'files': ['orchestrator/']},
+        },
+    )
+    assert result.get('error_type') == 'LockCharterViolation', (
+        f'Expected LockCharterViolation, got: {result}'
+    )
+    assert 'orchestrator/' in result.get('directory_paths', []), (
+        f'Expected orchestrator/ in directory_paths; got {result}'
+    )
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_directory_in_files_merge_mode_files_only(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """update_task (metadata_mode='merge', files-only payload) rejects directory entries.
+
+    Covers the REQUIRED merge-mode case where a caller supplies only
+    {'files': [...]} — this is the scheduler's writeback shape.
+    """
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': '/project',
+            'metadata': {'files': ['src']},
+            'metadata_mode': 'merge',
+        },
+    )
+    assert result.get('error_type') == 'LockCharterViolation', (
+        f'Expected LockCharterViolation, got: {result}'
+    )
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_task_accepts_file_level_files(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """update_task forwards when metadata.files contains only file-level paths."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': '/project',
+            'metadata': {'files': ['pkg/mod/foo.py']},
+        },
+    )
+    assert result == {'success': True}, f'Expected forwarded success; got {result}'
+    task_interceptor.update_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_update_task_accepts_empty_files_list(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """update_task forwards when metadata.files is [] (defer-to-architect value)."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': '/project',
+            'metadata': {'files': []},
+        },
+    )
+    assert result == {'success': True}, f'Expected forwarded success; got {result}'
     task_interceptor.update_task.assert_called_once()
 
 
