@@ -206,7 +206,13 @@ class _SchedulerLike(Protocol):
         note: str | None = ...,
     ) -> None: ...
     async def handle_blast_radius_expansion(
-        self, task_id: str, current: list[str], needed: list[str], /
+        self,
+        task_id: str,
+        current: list[str],
+        needed: list[str],
+        /,
+        *,
+        persist_files: list[str] | None = ...,
     ) -> bool: ...
     async def get_status(self, task_id: str, /) -> str | None: ...
     async def get_task(self, task_id: str, /) -> dict | None: ...
@@ -2616,7 +2622,8 @@ class TaskWorkflow:
 
         if set(plan_modules) != set(self.modules):
             expanded = await self.scheduler.handle_blast_radius_expansion(
-                self.task_id, self.modules, plan_modules
+                self.task_id, self.modules, plan_modules,
+                persist_files=plan_files,
             )
             if not expanded:
                 # Annotate the requeue so the per-task retry-cap report can
@@ -2731,6 +2738,7 @@ class TaskWorkflow:
         if set(plan_modules) != set(self.modules):
             expanded = await self.scheduler.handle_blast_radius_expansion(
                 self.task_id, self.modules, plan_modules,
+                persist_files=plan_files,
             )
             if not expanded:
                 logger.info(
@@ -2893,6 +2901,7 @@ class TaskWorkflow:
             if set(plan_modules) != set(self.modules):
                 expanded = await self.scheduler.handle_blast_radius_expansion(
                     self.task_id, self.modules, plan_modules,
+                    persist_files=plan_files,
                 )
                 if expanded:
                     # Persistence of the tightened lock set is centralized in

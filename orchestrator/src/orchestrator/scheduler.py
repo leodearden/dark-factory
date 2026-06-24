@@ -4097,19 +4097,21 @@ class Scheduler:
         """
         await self._write_snapshot_best_effort(force=True)
 
-    async def _persist_files_metadata(self, task_id: str, needed: list[str]) -> bool:
-        """Persist ``needed`` as ``metadata['files']`` via a Stage-2-preserving
-        read-modify-write.
+    async def _persist_files_metadata(self, task_id: str, files: list[str]) -> bool:
+        """Persist file-level paths as ``metadata['files']`` via a
+        Stage-2-preserving read-modify-write.
 
         Sibling keys attached by Stage-2 reconciliation (``memory_hints``,
         ``_causation_id``) survive because the merge policy is
-        ``{**fresh_md, 'files': needed}`` — existing keys win except ``files``.
+        ``{**fresh_md, 'files': honest}`` — existing keys win except ``files``.
 
-        ``needed`` is module-granularity (the output of ``files_to_modules``),
-        not raw file paths.  Writing module paths to ``metadata.files`` is
-        idempotent on restart because ``normalize_lock`` on an
-        already-depth-normalized path is identity, so the derived lock set is
-        unchanged after a reload.  This mirrors the failure-branch convention.
+        ``files`` must be file-level paths (not depth-coarsened module paths).
+        Directory entries are stripped via ``strip_directory_locks`` so that the
+        persisted ``metadata.files`` field always holds genuine file paths —
+        making it genuinely idempotent at all lock depths.  On restart
+        ``_get_modules`` can re-derive the correct module lock from a file-level
+        path; a coarsened directory path would be stripped by the α strip,
+        yield no derived modules, and fall back to ``task-<id>`` (under-locking).
 
         Returns ``True`` when ``update_task`` reports success, ``False``
         otherwise.  Logs a warning on failure but never raises — callers that
@@ -4118,7 +4120,8 @@ class Scheduler:
         """
         fresh = await self.get_task(task_id)
         fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
-        merged = {**fresh_md, 'files': needed}
+        honest = strip_directory_locks(files)
+        merged = {**fresh_md, 'files': honest}
         updated = bool(await self.update_task(task_id, merged))
         if not updated:
             logger.warning(
@@ -4133,6 +4136,8 @@ class Scheduler:
         task_id: str,
         current: list[str],
         needed: list[str],
+        *,
+        persist_files: list[str] | None = None,
     ) -> bool:
         """Handle plan refining blast radius (widening, narrowing, or shift).
 
@@ -4141,6 +4146,15 @@ class Scheduler:
            tasks can acquire modules the refined plan no longer touches
         3. On acquire failure: update task with new modules, reset to pending,
            release current locks
+
+        ``persist_files`` — optional list of raw file-level paths to store in
+        ``metadata.files`` when the persist branch fires.  If supplied, these
+        are written instead of ``needed`` (which is depth-coarsened and
+        therefore directory-shaped at depth<5).  When ``None`` the call falls
+        back to ``needed`` so callers that don't supply file-level paths keep
+        the prior behaviour.  Use ``persist_files if persist_files is not None
+        else needed`` (identity check, not truthiness) so an explicit empty
+        list persists [] rather than silently falling back to ``needed``.
         """
         depth = self.config.lock_depth
         current_set = {normalize_lock(m, depth) for m in current}
@@ -4149,6 +4163,13 @@ class Scheduler:
         stale = sorted(current_set - needed_set)
         if not additional and not stale:
             return True
+
+        # Determine what to write to metadata.files.  When the caller supplies
+        # raw file-level paths via persist_files, use those; otherwise fall back
+        # to needed (depth-coarsened).  The `is not None` guard (not truthiness)
+        # is intentional: an explicit [] means "no files declared / defer-to-
+        # architect" and must persist as [], not silently fall back to needed.
+        files_to_persist = persist_files if persist_files is not None else needed
 
         released: list[str] = []
         if not additional or self.lock_table.try_acquire_additional(task_id, additional):
@@ -4167,11 +4188,14 @@ class Scheduler:
                 # applied via release_subset; return True even on update failure.
                 # Shares the same read-modify-write logic as the requeue branch
                 # (see _persist_files_metadata below).
-                updated = await self._persist_files_metadata(task_id, needed)
+                updated = await self._persist_files_metadata(task_id, files_to_persist)
                 # Emit set_to_plan to signal the DURABLE persist (lock_released
                 # above signals the in-memory release; this signals durability).
                 # persisted=False lets the reify ζ gate distinguish a failed
                 # write from a successful one without a separate metadata read.
+                # The event payload carries `needed` (lock-level) — not the
+                # file-level persist set — to preserve the reify ζ-gate contract
+                # and existing event tests (set_to_plan.files == needed).
                 if self.event_store:
                     self.event_store.emit(
                         EventType.set_to_plan,
@@ -4195,12 +4219,11 @@ class Scheduler:
         # Read-modify-write so memory_hints / _causation_id attached by Stage-2
         # reconciliation survive the blast-radius-failure files write (task 1511).
         # get_task already swallows MCP errors → None, so the isinstance guard
-        # degrades gracefully to the prior {'files': needed} write (see
-        # _persist_files_metadata).  This is intentionally backend-only — the
-        # scheduler holds no per-task in-memory metadata to merge with (unlike
-        # workflow._reconcile_metadata_files_for_done which uses _merge_fresh_metadata).
-        # Merge policy: {**fresh_md, 'files': needed} — Stage-2 sibling keys survive.
-        await self._persist_files_metadata(task_id, needed)
+        # degrades gracefully to the prior {'files': files_to_persist} write
+        # (see _persist_files_metadata).  This is intentionally backend-only —
+        # the scheduler holds no per-task in-memory metadata to merge with.
+        # Merge policy: {**fresh_md, 'files': honest} — Stage-2 sibling keys survive.
+        await self._persist_files_metadata(task_id, files_to_persist)
         try:
             await self.set_task_status(task_id, 'pending')
         except RuntimeError as e:
