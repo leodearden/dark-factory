@@ -2321,15 +2321,18 @@ class Scheduler:
                 logger.error(f'Failed to update task {task_id}: {text}')
                 return False
             # Structured rejections (e.g. LockCharterViolation, ValidationError)
-            # come back as a plain {'error': ..., 'error_type': ...} dict with no
-            # 'isError' key. Treat these as failures too — otherwise a rejected
-            # write is silently reported as success.
-            if isinstance(content, dict) and content.get('error_type'):
+            # come back with rejection fields nested under result['structuredContent']
+            # (or, as a fallback, in a JSON text content block).  On the production
+            # HTTP/mcp_call wire path, content = result['result'] is the CallToolResult
+            # dict, so content.get('error_type') is always None — the fields are one
+            # level deeper.  Delegate to extract_structured_rejection(result) which
+            # correctly unwraps both shapes (mirrors set_task_status at :1608).
+            if (rej := extract_structured_rejection(result)) is not None:
                 logger.error(
                     'Failed to update task %s (%s): %s',
                     task_id,
-                    content.get('error_type'),
-                    content.get('error'),
+                    rej.get('error_type'),
+                    rej.get('error'),
                 )
                 return False
             return True
