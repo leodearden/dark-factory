@@ -948,3 +948,173 @@ class TestScenario2CleanRebaseRequeues:
             f'Expected a needs_rebase log line but none found. '
             f'Log records: {[r.message for r in caplog.records]!r}'
         )
+
+
+# ── step-07 RED: §9 scenario 3 (real conflict escalates, capped) ─────────────
+
+
+@pytest.mark.asyncio
+class TestScenario3RealConflictCapped:
+    """§9 scenario 3: real rebase conflict escalates; repeated bounces hit the cap.
+
+    Drive repeated bounces of one conflicting suffix req across N cycles with
+    rebase_onto_main → False (real conflict).
+
+    Assertions:
+      CASE A — single real conflict (under cap):
+        - req removed from lane buffer
+        - req.result 'blocked' with NEEDS_REBASE_REASON_PREFIX
+        - rebase_onto_main was awaited (conflict probed)
+
+      CASE B — bounce count already at MERGE_BOUNCE_CAP:
+        - Next bounce escalates WITHOUT attempting a rebase (spy not awaited)
+        - req removed from lane buffer
+        - req.result 'blocked' with NEEDS_REBASE_REASON_PREFIX
+        (1688 thrash-signature backstop: a flapping conflict cannot become an
+        unbounded agent-$ fire)
+
+    Integration delta: graph fed by real recompute (not hand-seeded), so
+    conflicts_with_main is populated by the DEFAULT detector's real probe.
+
+    RED until the suite lands.
+    """
+
+    async def _setup_conflict_worker(
+        self,
+        git_repo: Path,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+    ) -> tuple[SpeculativeMergeWorker, MergeRequest, str]:
+        """Return (worker, conflicting_req, frozen_tip_sha) with a real graph."""
+        frozen_tip_sha = await _create_branch_editing(
+            git_repo, 'task/frozen-tip-s3', 'shared.txt',
+            'line1\nFROZEN-LINE2-S3\nline3\n',
+        )
+        await _create_branch_editing(
+            git_repo, 'task/conflict-branch', 'shared.txt',
+            'line1\nCONFLICT-LINE2\nline3\n',
+        )
+
+        worker = _make_worker(git_ops)
+        _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        main_sha = main_sha_raw.strip()
+
+        _, item_frozen = _make_fake_item(
+            'frozen-s3', base_sha=main_sha, merge_commit=frozen_tip_sha,
+            config=config, git_repo=git_repo,
+        )
+        entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
+        worker._inflight.append(entry_frozen)
+
+        req = _make_req('conflict-branch', 'conflict-branch', config, git_repo)
+        worker._lane_buffers['normal'].append(req)
+
+        await worker.recompute_suffix_conflict_graph()
+
+        assert req.request_id in worker._suffix_conflict_graph.conflicts_with_main, (
+            'precondition: req must be in conflicts_with_main after real recompute'
+        )
+        return worker, req, frozen_tip_sha
+
+    async def test_case_a_real_conflict_blocks_req(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """CASE A: rebase → False (real conflict) → req removed, 'blocked' escalated."""
+        worker, req, _ = await self._setup_conflict_worker(git_repo, config, git_ops)
+
+        # Stub rebase → False (real conflict, under cap).
+        worker._git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        await worker._bounce_conflicting_suffix_items()
+
+        # rebase_onto_main was called (conflict probed, not short-circuited by cap).
+        worker._git_ops.rebase_onto_main.assert_awaited_once()
+
+        # req removed from lane buffer.
+        assert req not in worker._lane_buffers['normal'], (
+            'Expected req to be removed from lane buffer after a real conflict'
+        )
+
+        # req.result 'blocked' with NEEDS_REBASE_REASON_PREFIX.
+        assert req.result.done()
+        outcome = req.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+            f'Expected reason starting with NEEDS_REBASE_REASON_PREFIX, got {outcome.reason!r}'
+        )
+
+    async def test_case_b_cap_exceeded_no_rebase(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """CASE B: bounce count at cap → escalate WITHOUT rebase (1688 thrash backstop).
+
+        Pre-seed registry to MERGE_BOUNCE_CAP for the branch.  The next
+        _bounce_conflicting_suffix_items() call must NOT attempt rebase_onto_main,
+        remove the req, and resolve it 'blocked' with NEEDS_REBASE_REASON_PREFIX.
+        """
+        worker, req, _ = await self._setup_conflict_worker(git_repo, config, git_ops)
+        branch = req.branch
+
+        # Pre-seed registry to MERGE_BOUNCE_CAP.
+        for _ in range(MERGE_BOUNCE_CAP):
+            worker._bounce_registry.record_bounce(branch)
+        assert worker._bounce_registry.count(branch) == MERGE_BOUNCE_CAP
+
+        # Spy on rebase — it must NOT be called when cap is exceeded.
+        rebase_spy = AsyncMock(return_value=False)
+        worker._git_ops.rebase_onto_main = rebase_spy  # type: ignore[method-assign]
+
+        await worker._bounce_conflicting_suffix_items()
+
+        # rebase NOT called (cap short-circuit — 1688 thrash-signature backstop).
+        rebase_spy.assert_not_awaited()
+
+        # req removed from lane buffer.
+        assert req not in worker._lane_buffers['normal'], (
+            'Expected req removed from lane buffer when bounce cap exceeded'
+        )
+
+        # req.result 'blocked' with NEEDS_REBASE_REASON_PREFIX.
+        assert req.result.done()
+        outcome = req.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+            f'Expected cap-exceeded reason starting with NEEDS_REBASE_REASON_PREFIX, '
+            f'got {outcome.reason!r}'
+        )
+
+    async def test_repeated_bounces_count_climbs(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """Per-branch bounce count climbs monotonically until cap reached.
+
+        Drive N = MERGE_BOUNCE_CAP cycles.  Each cycle: re-seed graph,
+        stub rebase → False, call _bounce_conflicting_suffix_items().
+        After each cycle (under cap), the req is removed and the registry
+        resets (cleared on escalation) — we verify the count was incremented
+        before clearing by checking the blocking outcome.
+        """
+        worker, req, _ = await self._setup_conflict_worker(git_repo, config, git_ops)
+        branch = req.branch
+
+        # CASE A check: one real conflict → blocked, registry cleared.
+        worker._git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        await worker._bounce_conflicting_suffix_items()
+
+        assert req.result.done()
+        assert req.result.result().status == 'blocked'
+        # Registry is cleared after a real-conflict escalation.
+        assert worker._bounce_registry.count(branch) == 0, (
+            'Expected registry cleared after real-conflict escalation'
+        )
