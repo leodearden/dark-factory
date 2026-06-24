@@ -13,22 +13,21 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 from pathlib import Path
 from typing import Literal
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
-    InflightEntry,
     MERGE_BOUNCE_CAP,
+    NEEDS_REBASE_REASON_PREFIX,
+    InflightEntry,
     MergeBounceRegistry,
     MergeOutcome,
     MergeRequest,
-    NEEDS_REBASE_REASON_PREFIX,
     SpeculativeItem,
     SpeculativeMergeWorker,
     SuffixConflictGraph,
