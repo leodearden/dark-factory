@@ -1315,3 +1315,181 @@ class TestScenario4And5AgingAndDisjointBypass:
         # Invariant holds after picks.
         violations = worker.two_layer_invariants(main_sha)
         assert violations == [], f'two_layer_invariants after picks: {violations!r}'
+
+
+# ── step-11 RED: §9 scenario 6 (verify frontier immutable under reorder)
+#                + §5.3 invariants in one run ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestScenario6FrontierImmutableUnderReorder:
+    """§9 scenario 6: verify frontier immutable under suffix reorder.
+
+    Place in-flight verifying entries D, E (frozen, chained base→merge_commit)
+    and unfrozen suffix reqs F, G in _lane_buffers.
+
+    Steps:
+      1. Capture D/E base_sha, frozen_prefix(), frozen_prefix_tip(main).
+      2. Reorder the suffix (G before F) and call recompute_suffix_conflict_graph().
+      3. Assert:
+         a. D/E base_sha unchanged.
+         b. _inflight order/identity unchanged.
+         c. frozen_prefix() and frozen_prefix_tip(main) unchanged.
+         d. The suffix graph nodes reflect the NEW order (G before F) and
+            exclude every frozen rid.
+         e. worker.two_layer_invariants(main) == [] before AND after the reorder.
+
+    Integration delta: uses two_layer_invariants() (step-02 new method) as the
+    single §5.3 health surface; the reorder test exercises frozen-prefix
+    immutability (I1/I3) plus the disjointness check (I2/frozen∩suffix).
+
+    RED until the suite lands.
+    """
+
+    async def test_scenario_6_frontier_immutable_under_reorder(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """D/E inflight order/base_sha/frozen_prefix unchanged after suffix reorder."""
+        # 1. Get main_sha.
+        _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        main_sha = main_sha_raw.strip()
+
+        # 2. Create two frozen entries (D, E) with a chained base→merge_commit.
+        #    We use fake SHAs for the merge commits (they don't need to be real git
+        #    objects for the invariant check — only the frozen_prefix_tip is used
+        #    for recompute, which uses get_main_sha() independently).
+        #    To keep two_layer_invariants == [], we chain correctly:
+        #      D: base_sha=main_sha, merge_commit='merge-d-sha'
+        #      E: base_sha='merge-d-sha', merge_commit='merge-e-sha'
+
+        # For recompute to work (frozen_prefix_tip('merge-e-sha')), the SHA must
+        # exist in the repo.  Create side-branch commits for D and E tips.
+        merge_d_sha = await _create_branch_editing(
+            git_repo, 'task/frozen-d', 'README.md', '# Frozen D\n',
+        )
+        merge_e_sha = await _create_branch_editing(
+            git_repo, 'task/frozen-e', 'README.md', '# Frozen E\n',
+        )
+
+        # Create suffix branches (F and G, disjoint from each other and from D/E).
+        await _create_branch_editing(
+            git_repo, 'task/suffix-f', 'shared.txt', 'line1\nF-LINE2\nline3\n',
+        )
+        await _create_branch_editing(
+            git_repo, 'task/suffix-g', 'disjoint.txt', 'G-LINE1\ndisjoint-line2\n',
+        )
+
+        worker = _make_worker(git_ops)
+
+        # Populate frozen prefix: D chained off main, E chained off D.
+        req_d = _make_req('frozen-d', 'task/frozen-d', config, git_repo)
+        item_d = SpeculativeItem(
+            request=req_d,
+            merge_result=MergeResult(success=True, merge_commit=merge_d_sha),
+            merge_wt=None,
+            base_sha=main_sha,
+            speculative=False,
+            skip_verify=False,
+        )
+        entry_d = _make_inflight_entry(item_d, verifying=True)
+
+        req_e = _make_req('frozen-e', 'task/frozen-e', config, git_repo)
+        item_e = SpeculativeItem(
+            request=req_e,
+            merge_result=MergeResult(success=True, merge_commit=merge_e_sha),
+            merge_wt=None,
+            base_sha=merge_d_sha,  # chained off D
+            speculative=False,
+            skip_verify=False,
+        )
+        entry_e = _make_inflight_entry(item_e, verifying=True)
+
+        worker._inflight.extend([entry_d, entry_e])
+
+        # Suffix reqs: F then G (FIFO: F is head).
+        req_f = _make_req('suffix-f', 'suffix-f', config, git_repo, merge_first_enqueued_at=100.0)
+        req_g = _make_req('suffix-g', 'disjoint-c', config, git_repo, merge_first_enqueued_at=200.0)
+        worker._lane_buffers['normal'].extend([req_f, req_g])
+
+        # 3. Capture pre-reorder state.
+        pre_frozen_prefix = worker.frozen_prefix()
+        pre_frozen_tip = worker.frozen_prefix_tip(main_sha)
+        pre_d_base_sha = item_d.base_sha
+        pre_e_base_sha = item_e.base_sha
+        pre_inflight_ids = tuple(e.item.request.request_id for e in worker._inflight)
+
+        # Verify two_layer_invariants == [] BEFORE reorder.
+        violations_before = worker.two_layer_invariants(main_sha)
+        assert violations_before == [], (
+            f'two_layer_invariants before reorder: {violations_before!r}'
+        )
+
+        # 4. Reorder suffix (G before F) then recompute.
+        # Simulate reorder: swap F and G in the lane buffer.
+        worker._lane_buffers['normal'].remove(req_g)
+        worker._lane_buffers['normal'].appendleft(req_g)
+
+        # Invalidate signature so recompute runs.
+        worker._suffix_conflict_signature = None
+
+        await worker.recompute_suffix_conflict_graph()
+
+        # 5. Assert: frozen prefix unchanged.
+
+        # (a) D/E base_sha unchanged.
+        assert item_d.base_sha == pre_d_base_sha, (
+            f'D base_sha mutated by reorder: {item_d.base_sha!r} != {pre_d_base_sha!r}'
+        )
+        assert item_e.base_sha == pre_e_base_sha, (
+            f'E base_sha mutated by reorder: {item_e.base_sha!r} != {pre_e_base_sha!r}'
+        )
+
+        # (b) _inflight order/identity unchanged.
+        post_inflight_ids = tuple(e.item.request.request_id for e in worker._inflight)
+        assert post_inflight_ids == pre_inflight_ids, (
+            f'_inflight order changed after reorder: '
+            f'before={pre_inflight_ids!r}, after={post_inflight_ids!r}'
+        )
+
+        # (c) frozen_prefix() and frozen_prefix_tip unchanged.
+        assert worker.frozen_prefix() == pre_frozen_prefix, (
+            f'frozen_prefix() changed after suffix reorder: '
+            f'before={pre_frozen_prefix!r}, after={worker.frozen_prefix()!r}'
+        )
+        assert worker.frozen_prefix_tip(main_sha) == pre_frozen_tip, (
+            f'frozen_prefix_tip changed after suffix reorder: '
+            f'before={pre_frozen_tip!r}, after={worker.frozen_prefix_tip(main_sha)!r}'
+        )
+
+        # (d) suffix graph reflects NEW order (G before F) and excludes frozen rids.
+        graph = worker._suffix_conflict_graph
+        frozen_rids = set(worker.frozen_prefix())
+
+        # Frozen rids must not appear in graph nodes.
+        for frid in frozen_rids:
+            assert frid not in graph.nodes, (
+                f'Frozen rid {frid!r} appears in suffix graph nodes after reorder — '
+                f'violates frozen/suffix partition'
+            )
+
+        # Both F and G must be in graph nodes (they are the unfrozen suffix).
+        assert req_f.request_id in graph.nodes, (
+            f'req_f not in suffix graph nodes: nodes={graph.nodes!r}'
+        )
+        assert req_g.request_id in graph.nodes, (
+            f'req_g not in suffix graph nodes: nodes={graph.nodes!r}'
+        )
+
+        # G should come before F in nodes (reflecting the reordered buffer).
+        assert graph.nodes.index(req_g.request_id) < graph.nodes.index(req_f.request_id), (
+            f'Expected G before F in graph.nodes after reorder, got: {graph.nodes!r}'
+        )
+
+        # (e) two_layer_invariants == [] AFTER reorder.
+        violations_after = worker.two_layer_invariants(main_sha)
+        assert violations_after == [], (
+            f'two_layer_invariants after reorder: {violations_after!r}'
+        )
