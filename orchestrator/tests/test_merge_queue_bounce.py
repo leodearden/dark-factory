@@ -24,7 +24,11 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     InflightEntry,
+    MERGE_BOUNCE_CAP,
+    MergeBounceRegistry,
+    MergeOutcome,
     MergeRequest,
+    NEEDS_REBASE_REASON_PREFIX,
     SpeculativeItem,
     SpeculativeMergeWorker,
     SuffixConflictGraph,
@@ -315,3 +319,69 @@ class TestFrozenTipProbe:
             'frozen prefix, frozen_prefix_tip() == main_sha, so S must NOT be '
             'flagged in conflicts_with_main.'
         )
+
+
+# ── step-03 RED: bounce primitives exist ─────────────────────────────────────
+
+
+class TestBouncePrimitives:
+    """NEEDS_REBASE_REASON_PREFIX, MERGE_BOUNCE_CAP, MergeBounceRegistry exist.
+
+    RED until step-04 GREEN adds these to merge_queue.py.
+    """
+
+    def test_needs_rebase_reason_prefix_is_non_empty_str(self) -> None:
+        """NEEDS_REBASE_REASON_PREFIX is a non-empty string constant."""
+        assert isinstance(NEEDS_REBASE_REASON_PREFIX, str)
+        assert len(NEEDS_REBASE_REASON_PREFIX) > 0
+
+    def test_needs_rebase_reason_prefix_is_distinct(self) -> None:
+        """NEEDS_REBASE_REASON_PREFIX differs from the other *_REASON_PREFIX constants."""
+        from orchestrator.merge_queue import (
+            DROPPED_PLAN_TARGETS_REASON_PREFIX,
+            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+        )
+        others = {
+            DROPPED_PLAN_TARGETS_REASON_PREFIX,
+            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+        }
+        assert NEEDS_REBASE_REASON_PREFIX not in others
+
+    def test_merge_outcome_with_needs_rebase_prefix_round_trips(self) -> None:
+        """A blocked MergeOutcome carrying the prefix round-trips via startswith."""
+        outcome = MergeOutcome(
+            status='blocked',
+            reason=NEEDS_REBASE_REASON_PREFIX + ' branch task/591 bounced',
+        )
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX)
+
+    def test_merge_bounce_cap_is_positive_int(self) -> None:
+        """MERGE_BOUNCE_CAP is an int >= 1."""
+        assert isinstance(MERGE_BOUNCE_CAP, int)
+        assert MERGE_BOUNCE_CAP >= 1
+
+    def test_bounce_registry_fresh_returns_zero(self) -> None:
+        """A fresh MergeBounceRegistry returns count 0 for any unseen branch."""
+        reg = MergeBounceRegistry()
+        assert reg.count('task/591') == 0
+        assert reg.count('task/999') == 0
+
+    def test_bounce_registry_record_bounce_increments(self) -> None:
+        """record_bounce returns the new count and increments monotonically."""
+        reg = MergeBounceRegistry()
+        assert reg.record_bounce('task/591') == 1
+        assert reg.record_bounce('task/591') == 2
+        assert reg.count('task/591') == 2
+
+    def test_bounce_registry_two_keys_are_independent(self) -> None:
+        """Two different branch keys are tracked independently."""
+        reg = MergeBounceRegistry()
+        reg.record_bounce('task/591')
+        reg.record_bounce('task/591')
+        reg.record_bounce('task/592')
+        assert reg.count('task/591') == 2
+        assert reg.count('task/592') == 1
