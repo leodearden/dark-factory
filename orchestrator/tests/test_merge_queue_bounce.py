@@ -200,3 +200,118 @@ async def _create_frozen_tip_commit(
     await _run(['git', 'commit', '-m', f'Frozen-tip commit: {filename}'], cwd=repo)
     _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
     return sha.strip()
+
+
+# ── step-01 RED: recompute probes suffix vs FROZEN TIP, not bare main ─────────
+
+
+@pytest.mark.asyncio
+class TestFrozenTipProbe:
+    """recompute_suffix_conflict_graph() §7 must use frozen_prefix_tip() as the
+    probe base, not bare main_sha.
+
+    The RED case: frozen prefix has an entry whose merge_commit T is NOT the
+    same as the current main HEAD (M0).  A suffix item S is clean vs M0 but
+    conflicts with T.
+
+    - Current (bare-main) probe: S vs M0 → clean → NOT in conflicts_with_main.
+      The test asserts IN → FAILS (RED) until step-02 repoints the base.
+    - After fix (frozen-tip) probe: S vs T → conflict → IN conflicts_with_main
+      → PASSES (GREEN).
+
+    CONTROL: empty frozen prefix → frozen_prefix_tip == main_sha == M0 → S
+    clean vs M0 → NOT in conflicts_with_main (both before and after fix).
+
+    RED until step-02 GREEN repoints the §7 probe base to frozen_prefix_tip().
+    """
+
+    async def test_suffix_item_conflicts_with_frozen_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """S is clean vs bare main (M0) but conflicts with the frozen tip T.
+
+        Setup:
+          M0 = initial commit (shared.txt = 'line1\\nline2\\nline3\\n')
+          T  = commit on a side branch 'frozen-tip' that edits shared.txt line2
+               → 'FROZEN-LINE2'.  T's SHA is used as the frozen item's
+               merge_commit.  main HEAD stays at M0.
+          S  = suffix branch off M0 editing shared.txt line2 → 'SUFFIX-LINE2'.
+
+        S vs M0 → CLEAN (only S changed line2; M0 has the original).
+        S vs T  → CONFLICT (both S and T changed line2 to different values).
+        """
+        # Record the original main SHA (M0).
+        _, m0_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        m0_sha = m0_sha_raw.strip()
+
+        # 1. Create T on a side branch (NOT on main) so main_sha stays == M0.
+        await _run(['git', 'checkout', '-b', 'frozen-tip'], cwd=git_repo)
+        (git_repo / 'shared.txt').write_text('line1\nFROZEN-LINE2\nline3\n')
+        await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'Frozen-tip: edit line2'], cwd=git_repo)
+        _, t_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        frozen_tip_sha = t_sha_raw.strip()
+        # Return to main — main HEAD is still M0.
+        await _run(['git', 'checkout', 'main'], cwd=git_repo)
+
+        # Sanity: main must still be at M0 (frozen-tip commit is NOT on main).
+        _, cur_main_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert cur_main_raw.strip() == m0_sha, 'main HEAD must stay at M0 for this test'
+
+        # 2. Create suffix branch S from M0 that edits line2 to 'SUFFIX-LINE2'.
+        #    S vs M0 = clean (no conflicting edit on M0).
+        #    S vs T  = conflict (both S and T edited line2).
+        await _run(['git', 'checkout', '-b', 'task/591'], cwd=git_repo)
+        (git_repo / 'shared.txt').write_text('line1\nSUFFIX-LINE2\nline3\n')
+        await _run(['git', 'add', 'shared.txt'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'S edits line2'], cwd=git_repo)
+        await _run(['git', 'checkout', 'main'], cwd=git_repo)
+
+        # 3. Build worker; populate frozen prefix with T as merge_commit.
+        worker = _make_worker(git_ops)
+        _, item_t = _make_fake_item(
+            't-frozen', merge_commit=frozen_tip_sha, config=config, git_repo=git_repo,
+        )
+        entry_t = _make_inflight_entry(item_t, verifying=True)
+        worker._inflight.append(entry_t)
+
+        # 4. Put suffix request S into the lane buffer.
+        req_s = _make_req('591', '591', config, git_repo)
+        worker._lane_buffers['normal'].append(req_s)
+
+        # 5. Recompute.
+        await worker.recompute_suffix_conflict_graph()
+
+        # 6. S conflicts with the FROZEN TIP → must appear in conflicts_with_main.
+        #    RED: current code probes S vs bare M0 → S is clean → assertion fails.
+        #    GREEN: probe repointed to T → S conflicts → assertion passes.
+        assert req_s.request_id in worker._suffix_conflict_graph.conflicts_with_main, (
+            'Expected S to conflict with the frozen tip T but it was NOT in '
+            'conflicts_with_main.  The §7 probe base must be frozen_prefix_tip(), '
+            'not bare main_sha.  S is clean vs M0 (bare main) but conflicts with T.'
+        )
+
+    async def test_empty_frozen_prefix_uses_bare_main(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """CONTROL: empty frozen prefix → frozen_prefix_tip() == main_sha → a
+        suffix item clean vs bare main is NOT in conflicts_with_main (both
+        before and after the step-02 repoint).
+        """
+        # Create branch S editing only README.md — clean vs shared.txt on main.
+        await _create_branch_editing(
+            git_repo, 'task/591-clean', 'README.md', 'clean-suffix\n',
+        )
+
+        worker = _make_worker(git_ops)  # no _inflight → frozen prefix empty
+        req_s = _make_req('591-clean', '591-clean', config, git_repo)
+        worker._lane_buffers['normal'].append(req_s)
+
+        await worker.recompute_suffix_conflict_graph()
+
+        # S is clean vs bare main == frozen_prefix_tip (empty prefix).
+        assert req_s.request_id not in worker._suffix_conflict_graph.conflicts_with_main, (
+            'S edits only README.md and is clean vs bare main; with an empty '
+            'frozen prefix, frozen_prefix_tip() == main_sha, so S must NOT be '
+            'flagged in conflicts_with_main.'
+        )
