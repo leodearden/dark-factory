@@ -528,6 +528,20 @@ class MergeBounceRegistry:
         self._bounces[branch] = n
         return n
 
+    def clear(self, branch: str) -> None:
+        """Remove the bounce counter for *branch*.
+
+        Call when a branch is escalated (removed from the lane buffer) so that
+        a later resubmission of the same branch name starts from zero rather
+        than inheriting the old count.  This prevents a new PR on a recycled
+        branch name from being prematurely cap-escalated.
+
+        For the successful-merge path the counter is also moot once the branch
+        has landed; wiring a clear() there would require hooking into
+        advance_main / verifier completion — deferred as a future improvement.
+        """
+        self._bounces.pop(branch, None)
+
 
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
     'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
@@ -6356,15 +6370,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         without touching any item.
         """
         if not self._suffix_conflict_graph.conflicts_with_main:
-            return  # nothing to bounce
+            return  # nothing to bounce — leave _suffix_conflict_signature intact
 
-        try:
-            main_sha = await self._git_ops.get_main_sha()
-        except Exception:
-            logger.warning(
-                '_bounce_conflicting_suffix_items: get_main_sha failed; skipping bounce'
-            )
-            return
+        # Use the same main_sha that recompute_suffix_conflict_graph() used to
+        # populate conflicts_with_main.  A concurrent asyncio task (e.g. a verify
+        # completion that mutates _inflight) can change the frozen prefix between
+        # recompute() and here; a freshly-fetched main_sha would give a frozen_tip
+        # inconsistent with the probe_base that actually flagged the conflict —
+        # causing an unnecessary rebase/escalation off a stale graph (TOCTOU).
+        # Reading sig[1] (the main_sha stored in the debounce signature) gives
+        # exactly the same base used during recompute().
+        # Fall back to a fresh fetch only when the signature is None (cleared by a
+        # prior bounce in the same acquire cycle — rare, but handle fail-open).
+        if self._suffix_conflict_signature is not None:
+            main_sha = self._suffix_conflict_signature[1]
+        else:
+            try:
+                main_sha = await self._git_ops.get_main_sha()
+            except Exception:
+                logger.warning(
+                    '_bounce_conflicting_suffix_items: get_main_sha failed; skipping bounce'
+                )
+                return
 
         frozen_tip = self.frozen_prefix_tip(main_sha)
 
@@ -6395,7 +6422,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             if count > MERGE_BOUNCE_CAP:
                 # Cap exceeded — escalate WITHOUT rebasing.
+                #
+                # Trade-off note (robustness_premature_escalation): frozen_tip
+                # is speculative — the frozen items are still verifying and may
+                # themselves fail verification.  A branch that is clean vs bare
+                # main but conflicts with frozen_tip may be escalated for a
+                # collision with an item that never lands.  This is accepted: the
+                # steward resolves it, and if the frozen item later fails, the
+                # branch can be cleanly requeued without prejudice.
                 self._lane_buffers[req.lane].remove(req)
+                self._bounce_registry.clear(branch)  # fresh slate on resubmission
                 outcome = MergeOutcome(
                     status='blocked',
                     reason=(
@@ -6417,6 +6453,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if clean:
                 # Clean rebase — item stays in the lane buffer (re-queued).
                 # Future and merge_first_enqueued_at are untouched.
+                #
+                # Downstream path note (design_double_rebase): the next call to
+                # _pop_next_pickable() may pick this item for dispatch.  The
+                # dispatch loop calls merge_to_main() which performs a
+                # ``git merge --no-ff`` — NOT another rebase — so there is no
+                # double-rebase hazard.  If actual_main has advanced past
+                # frozen_tip since the bounce, the merge integrates those extra
+                # main commits; this is expected behaviour for a speculative
+                # queue.  pre_rebased is intentionally not updated: skip_verify
+                # is always False for single-item merges (task-1724), so updating
+                # it would be a no-op.
                 logger.info(
                     '_bounce_conflicting_suffix_items: clean rebase; re-queued '
                     'task_id=%s branch=%s onto=%s',
@@ -6424,7 +6471,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
             else:
                 # Real conflict — remove from lane buffer and escalate.
+                #
+                # Trade-off note (robustness_premature_escalation): frozen_tip
+                # is speculative — frozen items are still verifying and may fail.
+                # A branch clean vs bare main can thus be escalated for a
+                # collision with an item that never lands.  Accepted: the steward
+                # resolves it; if the frozen item fails, the branch requeues.
                 self._lane_buffers[req.lane].remove(req)
+                self._bounce_registry.clear(branch)  # fresh slate on resubmission
                 outcome = MergeOutcome(
                     status='blocked',
                     reason=(

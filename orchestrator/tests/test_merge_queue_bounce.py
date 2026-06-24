@@ -24,6 +24,7 @@ from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
+    GroupMergeRequest,
     InflightEntry,
     MergeBounceRegistry,
     MergeOutcome,
@@ -113,6 +114,41 @@ def _make_req(
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+
+def _make_group_req(
+    config: OrchestratorConfig,
+    git_repo: Path,
+    branch: str = 'tip-task',
+) -> GroupMergeRequest:
+    """Build a minimal GroupMergeRequest for unit tests.
+
+    Must be called from within an async context (asyncio.get_running_loop()).
+    """
+    async def _dummy_status_check(tids: list) -> dict:
+        return {}
+
+    async def _dummy_mark_done(tid: str, sha: str) -> None:
+        pass
+
+    return GroupMergeRequest(
+        task_id=branch,
+        branch=branch,
+        worktree=git_repo,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        lane='normal',
+        merge_first_enqueued_at=None,
+        train_id='train-1',
+        member_task_ids=[branch],
+        tip_branch=branch,
+        tip_task_id=branch,
+        status_check=_dummy_status_check,
+        mark_member_done=_dummy_mark_done,
+    )
 
 
 def _make_fake_item(
@@ -557,8 +593,11 @@ class TestBounceEscalation:
             f'{outcome.reason!r}.'
         )
 
-        # Registry incremented to 1.
-        assert worker._bounce_registry.count('591') == 1
+        # Registry was incremented then cleared (fresh slate on resubmission).
+        assert worker._bounce_registry.count('591') == 0, (
+            'Bounce count must be 0 after escalation: record_bounce() increments, '
+            'then clear() resets so a later resubmission starts fresh.'
+        )
 
         # Debounce signature invalidated.
         assert worker._suffix_conflict_signature is None
@@ -729,3 +768,163 @@ class TestAcquireWiring:
         assert outcome.status == 'blocked'
         assert outcome.reason is not None
         assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX)
+
+
+# ── amend: test_coverage_gaps — GroupMergeRequest skip, fail-open, empty ──────
+
+
+@pytest.mark.asyncio
+class TestBounceCoverageGaps:
+    """Tests for branches of _bounce_conflicting_suffix_items() previously untested.
+
+    Covers:
+    - GroupMergeRequest skip path (trains must NOT be bounced)
+    - Fail-open when get_main_sha() raises (items and registry untouched)
+    - Early-return when conflicts_with_main is empty (_suffix_conflict_signature unchanged)
+    """
+
+    async def test_group_merge_request_skipped(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """A GroupMergeRequest in conflicts_with_main must NOT be bounced.
+
+        Trains keep their existing TRAIN_REBASE_CONFLICT path.  The bounce loop
+        must skip any GroupMergeRequest instance even when it appears in
+        conflicts_with_main, leaving it in the lane buffer with its future
+        unresolved.
+        """
+        worker = _make_worker(git_ops)
+
+        # Seed _suffix_conflict_signature so bounce reads from it, not get_main_sha.
+        worker._suffix_conflict_signature = ((), 'deadbeef0000')
+
+        # Put a frozen inflight so frozen_prefix_tip is non-trivial.
+        _, item_frozen = _make_fake_item(
+            'frozen-task', merge_commit='deadbeef0000', config=config,
+            git_repo=git_repo,
+        )
+        entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
+        worker._inflight.append(entry_frozen)
+
+        # Build a GroupMergeRequest and put it in the lane buffer.
+        grp_req = _make_group_req(config, git_repo, branch='tip-task')
+        worker._lane_buffers['normal'].append(grp_req)
+
+        # Seed conflicts_with_main with the GroupMergeRequest's rid.
+        worker._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=(grp_req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({grp_req.request_id}),
+        )
+
+        # Call bounce — GroupMergeRequest must be skipped.
+        await worker._bounce_conflicting_suffix_items()
+
+        # grp_req must remain in the buffer, future unresolved.
+        assert grp_req in worker._lane_buffers['normal'], (
+            'GroupMergeRequest was removed from the lane buffer — '
+            'trains must NOT be bounced by _bounce_conflicting_suffix_items().'
+        )
+        assert not grp_req.result.done(), (
+            'GroupMergeRequest future was resolved — trains must NOT be escalated '
+            'by _bounce_conflicting_suffix_items(); they use TRAIN_REBASE_CONFLICT.'
+        )
+
+    async def test_get_main_sha_failure_leaves_items_untouched(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """When _suffix_conflict_signature is None and get_main_sha() raises,
+        all items and the registry must be left untouched (fail-open path).
+
+        This exercises the fallback branch that fires when the signature was
+        invalidated by a prior bounce (sig=None) and the fresh get_main_sha()
+        fetch itself fails.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+
+        # Clear the signature so the bounce falls back to get_main_sha().
+        worker._suffix_conflict_signature = None
+
+        req = _make_req('591', '591', config, git_repo)
+        worker._lane_buffers['normal'].append(req)
+
+        worker._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=(req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({req.request_id}),
+        )
+
+        # Stub get_main_sha to raise.
+        worker._git_ops.get_main_sha = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('network error'),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await worker._bounce_conflicting_suffix_items()
+
+        # req must still be in the buffer, future unresolved.
+        assert req in worker._lane_buffers['normal'], (
+            'req was removed from the buffer despite get_main_sha() failing.'
+        )
+        assert not req.result.done(), (
+            'req.result was resolved despite get_main_sha() failing.'
+        )
+        # Registry must not have been incremented.
+        assert worker._bounce_registry.count('591') == 0, (
+            f'Bounce count must remain 0 after get_main_sha() failure, '
+            f'got {worker._bounce_registry.count("591")}.'
+        )
+        # Signature must remain None (not updated by a failed bounce).
+        assert worker._suffix_conflict_signature is None, (
+            '_suffix_conflict_signature must not be set on a failed bounce.'
+        )
+        # A warning must have been logged.
+        assert any('get_main_sha' in r.message for r in caplog.records), (
+            'Expected a warning about get_main_sha failure but none was logged.'
+        )
+
+    async def test_empty_conflicts_with_main_does_not_invalidate_signature(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """When conflicts_with_main is empty, bounce must return immediately
+        without touching _suffix_conflict_signature.
+
+        This verifies that the debounce cache is not needlessly cleared when
+        there is nothing to bounce.
+        """
+        worker = _make_worker(git_ops)
+
+        # Pre-set a non-None signature so we can detect if it changes.
+        sentinel_sig: tuple[tuple[str, ...], str] = (('rid-a',), 'abc123')
+        worker._suffix_conflict_signature = sentinel_sig
+
+        # Empty conflict graph — nothing to bounce.
+        worker._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=(),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset(),
+        )
+
+        await worker._bounce_conflicting_suffix_items()
+
+        # Signature must be unchanged.
+        assert worker._suffix_conflict_signature == sentinel_sig, (
+            '_suffix_conflict_signature was modified even though conflicts_with_main '
+            f'was empty.  Expected {sentinel_sig!r}, got '
+            f'{worker._suffix_conflict_signature!r}.'
+        )
