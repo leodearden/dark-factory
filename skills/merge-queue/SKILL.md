@@ -253,3 +253,8 @@ The `snapshot()` call exposes these additive, backward-compatible keys:
 | `two_layer_invariants` | `[]` when healthy; list of violation strings otherwise |
 
 For the full architectural companion, see [references/two-layer-model.md](references/two-layer-model.md).
+
+### Related work
+
+- **Warm-lane Δp space-safety batch (1859–1861 / reify 4716–4719):** attacks Δp on the *task-dispatch* path (warm-lane disk-space gates). Complementary to the merge-queue path targeted here; no shared seam.
+- **Merge-verify ENOSPC fail-soft (workflow.py transient-infra block → re-queue):** handles ENOSPC at the individual verify step. This is a separate symptom task and is **out of scope** for the two-layer merge queue (§10 of the PRD). Referenced here for orientation only.
