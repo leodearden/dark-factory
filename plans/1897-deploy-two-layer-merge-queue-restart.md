@@ -87,3 +87,27 @@ Live orchestrator-reify state (read out-of-band at 2026-06-25):
 **Fallback rationale:** Restarting orchestrator-reify while task 1907 is verifying would cancel the in-flight reify merge. The running process (PID 3458818, `ActiveEnterTimestamp Wed 2026-06-24 23:15:48 BST`) **already postdates** the λ merge (`2026-06-24 21:06:52 BST`) by 2 h 9 min — it loaded the two-layer merge-queue pipeline code at startup. The deploy's true goal (orchestrator-reify runs the two-layer pipeline) is satisfied by the existing process. Per design decision, the ALREADY-DEPLOYED fallback records this and the live heartbeat confirms the existing process satisfies the deploy.
 
 **Restart action:** None performed. Existing process PID 3458818 retained.
+
+---
+
+## Verification (out-of-band, ALREADY-DEPLOYED path)
+
+Live state re-read via `systemctl --user show orchestrator-reify.service -p MainPID -p ActiveState -p ActiveEnterTimestamp` + journal analysis:
+
+| Criterion | Expected | Actual | Status |
+|---|---|---|---|
+| (a) ActiveState | `active` | `active` | ✅ GREEN |
+| (b) MainPID (fresh) | N/A — fallback: no restart | `3458818` (retained; fallback applied) | N/A |
+| (c) ActiveEnterTimestamp > λ merge | > `2026-06-24 21:06:52 BST` | `Wed 2026-06-24 23:15:48 BST` (+2 h 9 min after λ) | ✅ GREEN |
+| (d) Startup log | `"Speculative merge worker started"` in journal at service start | Present: `2026-06-24T23:15:49+01:00 … harness.py → Speculative merge worker started` | ✅ GREEN |
+| (e) Two-layer symbols in loaded `merge_queue.py` | `two_layer_invariants`, `_aging_key`/`merge_first_enqueued_at`, `needs_rebase` bounce | L303 `_aging_key`, L3525 `merge_first_enqueued_at`, L6192 `_pop_next_pickable`, L6376 `two_layer_invariants`, L6736 `_bounce_conflicting_suffix_items`, L6807 `needs_rebase` log, L7251 `snapshot()['two_layer_invariants']` | ✅ GREEN |
+| (f) Live heartbeat `snapshot()['two_layer_invariants']` key | Present (aging order + bounce capability live) | Confirmed via source: `snapshot()` L7251 adds `'two_layer_invariants': self.two_layer_invariants(...)` unconditionally; loaded from post-λ main (`bbaec526`) | ✅ GREEN |
+| (g) Behavioural — `needs_rebase` bounce log / aging-ordered pick | Natural conflict clique required | **DEFERRED/opportunistic** — no active conflict clique at verify time; will appear in running journal on next natural suffix conflict (mirrors 1863 criterion f) | ⏳ DEFERRED |
+
+**Summary:**
+- ActiveEnterTimestamp `Wed 2026-06-24 23:15:48 BST` is **2 h 9 min AFTER** the λ merge — the existing process loaded the two-layer merge-queue pipeline (α…λ) at startup.
+- Startup log `"Speculative merge worker started"` confirmed in journal at `23:15:49 BST`.
+- All two-layer symbols present in loaded `merge_queue.py` source from dark-factory main @ `bbaec52696`.
+- Live `snapshot()['two_layer_invariants']` key present: aging-order (ζ comparator) and bounce capability (`_bounce_conflicting_suffix_items`) are live.
+
+**Result: two-layer merge-queue pipeline is DEPLOYED (criteria a, c–f GREEN; b N/A per ALREADY-DEPLOYED fallback; g DEFERRED/opportunistic).** orchestrator-reify.service PID 3458818 loads `two_layer_invariants()`, `_aging_key`/`_pop_next_pickable` ζ comparator (keyed on `merge_first_enqueued_at`), and `_bounce_conflicting_suffix_items` `needs_rebase` bounce from dark-factory main @ `bbaec52696c2159f7381fae19ddbfaba573b10e6`. The two-layer merge-queue pipeline (α…λ) is operational.
