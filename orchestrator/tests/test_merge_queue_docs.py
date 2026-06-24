@@ -39,3 +39,64 @@ def _read(relpath: str) -> str:
 # Every code symbol the docs cite must exist in this source text.
 # ---------------------------------------------------------------------------
 MERGE_QUEUE_SRC: str = _read("orchestrator/src/orchestrator/merge_queue.py")
+
+
+class TestSkillDocumentsNeedsRebaseBounce:
+    """SKILL.md must describe the needs_rebase bounce and two-layer structure."""
+
+    _skill = _read("skills/merge-queue/SKILL.md")
+
+    def test_two_layer_section_heading(self) -> None:
+        """SKILL.md must contain a two-layer section heading."""
+        assert "two-layer merge queue" in self._skill.lower(), (
+            "skills/merge-queue/SKILL.md must contain a heading that "
+            "introduces the two-layer merge queue"
+        )
+
+    def test_needs_rebase_outcome_documented(self) -> None:
+        """SKILL.md must document the needs_rebase outcome."""
+        assert "needs_rebase" in self._skill, (
+            "skills/merge-queue/SKILL.md must document the needs_rebase "
+            "merge outcome"
+        )
+
+    def test_graph_time_disk_free_bounce(self) -> None:
+        """SKILL.md must describe the graph-time, disk-free bounce."""
+        skill_lower = self._skill.lower()
+        # The bounce happens at conflict-graph time, before any verify slot is consumed
+        graph_time = (
+            "graph-time" in skill_lower
+            or "graph time" in skill_lower
+            or "conflict graph" in skill_lower
+        )
+        disk_free = (
+            "disk-free" in skill_lower
+            or "disk free" in skill_lower
+            or "no verify slot" in skill_lower
+            or "before it consumes a verify slot" in skill_lower
+            or "without consuming a verify slot" in skill_lower
+        )
+        assert graph_time, (
+            "skills/merge-queue/SKILL.md must describe the graph-time bounce "
+            "(bounce happens at conflict-graph computation time)"
+        )
+        assert disk_free, (
+            "skills/merge-queue/SKILL.md must describe the disk-free nature of "
+            "the bounce (no verify slot consumed)"
+        )
+
+    # Doc/code consistency: cited constants must exist in merge_queue.py
+
+    def test_needs_rebase_reason_prefix_exists_in_code(self) -> None:
+        """NEEDS_REBASE_REASON_PREFIX must exist in merge_queue.py."""
+        assert "NEEDS_REBASE_REASON_PREFIX" in MERGE_QUEUE_SRC, (
+            "NEEDS_REBASE_REASON_PREFIX not found in merge_queue.py — "
+            "doc cites a symbol that doesn't exist in the code"
+        )
+
+    def test_merge_bounce_cap_exists_in_code(self) -> None:
+        """MERGE_BOUNCE_CAP must exist in merge_queue.py."""
+        assert "MERGE_BOUNCE_CAP" in MERGE_QUEUE_SRC, (
+            "MERGE_BOUNCE_CAP not found in merge_queue.py — "
+            "doc cites a symbol that doesn't exist in the code"
+        )
