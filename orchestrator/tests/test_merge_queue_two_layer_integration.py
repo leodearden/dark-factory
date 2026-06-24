@@ -1118,3 +1118,200 @@ class TestScenario3RealConflictCapped:
         assert worker._bounce_registry.count(branch) == 0, (
             'Expected registry cleared after real-conflict escalation'
         )
+
+
+# ── step-09 RED: §9 scenario 4 (aging beats FIFO) + scenario 5 (disjoint bypass) ─
+
+
+@pytest.mark.asyncio
+class TestScenario4And5AgingAndDisjointBypass:
+    """§9 scenario 4 + 5: clique-scoped aging beats FIFO + disjoint bypass.
+
+    Uses the REAL recomputed graph (not hand-seeded) so footprint_edges between
+    clique members is derived from actual changed-path sets via the DEFAULT detector.
+
+    Setup (FIFO order in lane buffer): [req_a (mfea=300.0), req_c (disjoint), req_b (mfea=100.0)]
+      A: edits shared.txt → footprint-clique member with B
+      B: edits shared.txt → footprint-clique member with A; older (mfea=100.0)
+      C: edits disjoint.txt → disjoint from both A and B
+
+    Expected _pop_next_pickable() sequence:
+      Pick 1: C (disjoint bypass — vacuously minimal despite C being in FIFO position 2)
+      Pick 2: B (aging: B.mfea=100.0 < A.mfea=300.0 → B is clique-minimal)
+      Pick 3: A (only item remaining)
+
+    Invariants: two_layer_invariants(main_sha) == [] before and after each pop
+    (frozen prefix immutable; reorder touches only the unfrozen suffix).
+
+    RED until the suite lands.
+    """
+
+    async def _setup_aging_and_disjoint(
+        self,
+        git_repo: Path,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+    ) -> tuple[SpeculativeMergeWorker, MergeRequest, MergeRequest, MergeRequest, str]:
+        """Return (worker, req_a, req_b, req_c, main_sha).
+
+        Creates real branches; populates _lane_buffers in FIFO order [A, C, B];
+        adds a frozen entry so the test also validates two_layer_invariants.
+        """
+        # Create branches off main.
+        await _create_branch_editing(
+            git_repo, 'task/aging-a', 'shared.txt', 'line1\nAGING-A-LINE2\nline3\n',
+        )
+        await _create_branch_editing(
+            git_repo, 'task/aging-b', 'shared.txt', 'line1\nAGING-B-LINE2\nline3\n',
+        )
+        await _create_branch_editing(
+            git_repo, 'task/disjoint-c', 'disjoint.txt',
+            'DISJOINT-C-LINE1\ndisjoint-line2\n',
+        )
+
+        # Build worker.
+        worker = _make_worker(git_ops)
+
+        # Add a frozen entry to exercise two_layer_invariants in context.
+        _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        main_sha = main_sha_raw.strip()
+
+        frozen_tip_sha = await _create_branch_editing(
+            git_repo, 'task/frozen-tip-s45', 'README.md',
+            '# Frozen-tip for scenario 4/5\n',
+        )
+        _, item_frozen = _make_fake_item(
+            'frozen-s45', base_sha=main_sha, merge_commit=frozen_tip_sha,
+            config=config, git_repo=git_repo,
+        )
+        entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
+        worker._inflight.append(entry_frozen)
+
+        # Build suffix requests — put in FIFO order [A, C, B].
+        req_a = _make_req('aging-a', 'aging-a', config, git_repo, merge_first_enqueued_at=300.0)
+        req_c = _make_req('disjoint-c', 'disjoint-c', config, git_repo, merge_first_enqueued_at=200.0)
+        req_b = _make_req('aging-b', 'aging-b', config, git_repo, merge_first_enqueued_at=100.0)
+        worker._lane_buffers['normal'].extend([req_a, req_c, req_b])
+
+        return worker, req_a, req_b, req_c, main_sha
+
+    async def test_recompute_builds_real_footprint_edge_a_b(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """After recompute, A and B have a footprint edge; C has no edge with A or B."""
+        worker, req_a, req_b, req_c, _ = await self._setup_aging_and_disjoint(
+            git_repo, config, git_ops,
+        )
+
+        await worker.recompute_suffix_conflict_graph()
+
+        graph = worker._suffix_conflict_graph
+        edge_ab = frozenset({req_a.request_id, req_b.request_id})
+
+        assert edge_ab in graph.footprint_edges, (
+            f'Expected footprint edge {{A,B}} — both edit shared.txt. '
+            f'footprint_edges={graph.footprint_edges!r}'
+        )
+
+        # C is disjoint from A and B.
+        edge_ac = frozenset({req_a.request_id, req_c.request_id})
+        edge_bc = frozenset({req_b.request_id, req_c.request_id})
+        assert edge_ac not in graph.footprint_edges, (
+            f'C edits disjoint.txt only — should not overlap with A (shared.txt)'
+        )
+        assert edge_bc not in graph.footprint_edges, (
+            f'C edits disjoint.txt only — should not overlap with B (shared.txt)'
+        )
+
+    async def test_scenario_4_aging_beats_fifo(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """Scenario 4: B (mfea=100.0) is picked before A (mfea=300.0) despite A being FIFO-head.
+
+        After removing C (disjoint), buf=[A, B]:
+          _pop_next_pickable() must return B (older clique-minimal via the real graph).
+        """
+        worker, req_a, req_b, req_c, main_sha = await self._setup_aging_and_disjoint(
+            git_repo, config, git_ops,
+        )
+
+        await worker.recompute_suffix_conflict_graph()
+
+        # Invariant holds before picks.
+        violations = worker.two_layer_invariants(main_sha)
+        assert violations == [], f'two_layer_invariants before picks: {violations!r}'
+
+        # Remove C from buffer to isolate scenario 4 (aging within the clique).
+        worker._lane_buffers['normal'].remove(req_c)
+
+        picked = worker._pop_next_pickable()
+        assert picked is req_b, (
+            f'Expected B (older, mfea=100.0) to be picked via clique-scoped aging '
+            f'but got {picked!r}. A (mfea=300.0) should be skipped because B is '
+            f'its older footprint-neighbor in the same lane.'
+        )
+
+        # After picking B, A should be next (only item remaining).
+        picked2 = worker._pop_next_pickable()
+        assert picked2 is req_a, (
+            f'Expected A to be picked after B is gone but got {picked2!r}'
+        )
+
+        # Invariant holds after picks (suffix was reordered, frozen prefix unchanged).
+        violations = worker.two_layer_invariants(main_sha)
+        assert violations == [], f'two_layer_invariants after picks: {violations!r}'
+
+    async def test_scenario_5_disjoint_bypass(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """Scenario 5: disjoint C bypasses blocked A (whose clique-peer B is older).
+
+        FIFO buf = [A (mfea=300.0), C (mfea=200.0, disjoint), B (mfea=100.0)]:
+          Pick 1 → C (disjoint bypass: C is vacuously minimal; A is blocked by older B)
+          Pick 2 → B (aging: B.mfea < A.mfea in the clique)
+          Pick 3 → A (only item remaining)
+        """
+        worker, req_a, req_b, req_c, main_sha = await self._setup_aging_and_disjoint(
+            git_repo, config, git_ops,
+        )
+
+        await worker.recompute_suffix_conflict_graph()
+
+        # Invariant holds before any pick.
+        violations = worker.two_layer_invariants(main_sha)
+        assert violations == [], f'two_layer_invariants before picks: {violations!r}'
+
+        # Pick 1: C should bypass blocked A (FIFO position 0) and older B.
+        picked1 = worker._pop_next_pickable()
+        assert picked1 is req_c, (
+            f'Expected C (disjoint) to bypass A (blocked by older clique-peer B) '
+            f'but got {picked1!r}. FIFO buf was [A(300.0), C(200.0), B(100.0)]; '
+            f'C is disjoint so it is vacuously minimal and should be picked before '
+            f'A (whose clique-peer B is older = not minimal).'
+        )
+
+        # Pick 2: B (older clique-minimal) beats A.
+        picked2 = worker._pop_next_pickable()
+        assert picked2 is req_b, (
+            f'Expected B (mfea=100.0, older clique-minimal) to be picked next '
+            f'but got {picked2!r}'
+        )
+
+        # Pick 3: A last.
+        picked3 = worker._pop_next_pickable()
+        assert picked3 is req_a, (
+            f'Expected A to be picked last but got {picked3!r}'
+        )
+
+        # Invariant holds after picks.
+        violations = worker.two_layer_invariants(main_sha)
+        assert violations == [], f'two_layer_invariants after picks: {violations!r}'
