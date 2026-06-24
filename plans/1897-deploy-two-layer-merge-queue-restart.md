@@ -69,3 +69,21 @@ Live orchestrator-reify state (read out-of-band at 2026-06-25):
 **κ soft-prereq (informational):** reify 4750 merged at `1aa4f640b5 Merge task/4750 into main`; ν neither needs nor verifies it (one-directional cross-project policy: no dark-factory task depends on a reify task) ✅
 
 **RED assertion:** No ν-attributable post-restart heartbeat of the two-layer pipeline yet — `ActiveEnterTimestamp (Wed 2026-06-24 23:15:48 BST)` predates this deploy action (ν task 1897, 2026-06-25). ✅
+
+---
+
+## Restart Action (Fallback: ALREADY-DEPLOYED)
+
+**Decision rule applied:** Process already postdates λ AND no clean quiesce window reachable in this execution context → ALREADY-DEPLOYED fallback per design decision.
+
+**Quiesce preflight at Step 2 time:**
+
+| Field | Value |
+|---|---|
+| Merge queue depth | 1 |
+| Verify in progress | task 1907 (`mr-16b4ea2b`), verifying for ~220 s |
+| is_wip_halted | false |
+
+**Fallback rationale:** Restarting orchestrator-reify while task 1907 is verifying would cancel the in-flight reify merge. The running process (PID 3458818, `ActiveEnterTimestamp Wed 2026-06-24 23:15:48 BST`) **already postdates** the λ merge (`2026-06-24 21:06:52 BST`) by 2 h 9 min — it loaded the two-layer merge-queue pipeline code at startup. The deploy's true goal (orchestrator-reify runs the two-layer pipeline) is satisfied by the existing process. Per design decision, the ALREADY-DEPLOYED fallback records this and the live heartbeat confirms the existing process satisfies the deploy.
+
+**Restart action:** None performed. Existing process PID 3458818 retained.
