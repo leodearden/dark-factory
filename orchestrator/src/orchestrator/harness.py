@@ -1490,8 +1490,15 @@ Output JSON matching the schema. Every task must appear in the output.
             task_id = str(entry.get('id', ''))
             files = entry.get('files', [])
             if task_id and files:
+                # Persist file-level paths only: strip directory-shaped entries
+                # before writing so the lock-charter guard on update_task /
+                # task_interceptor.update_task accepts the write. Without this,
+                # any LLM-tagged directory entry makes update_task reject the
+                # ENTIRE payload (LockCharterViolation), silently dropping the
+                # valid file-level entries too. Consistent with the strip in
+                # _persist_files_metadata / _reconcile_metadata_files_for_done.
                 await self.scheduler.update_task(
-                    task_id, json.dumps({'files': files})
+                    task_id, json.dumps({'files': strip_directory_locks(files)})
                 )
                 # Also populate in-memory cache so modules are available
                 # immediately without re-fetching from taskmaster.

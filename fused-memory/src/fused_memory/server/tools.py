@@ -2906,6 +2906,9 @@ def create_mcp_server(
             return err
         if err := _reject_done_provenance_in_metadata(metadata):
             return err
+        _dirs = directory_locks(extract_files(metadata))
+        if _dirs:
+            return lock_charter_error(_dirs)
         try:
             if isinstance(metadata, dict):
                 metadata = json.dumps(metadata)

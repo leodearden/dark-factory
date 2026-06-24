@@ -2665,8 +2665,30 @@ async def test_update_task_rejects_metadata_done_provenance(taskmaster, reconcil
 
 @pytest.mark.asyncio
 async def test_update_task_allows_other_metadata(taskmaster, reconciler, event_buffer):
-    """The done_provenance block does not affect other metadata writes."""
+    """The done_provenance and directory-lock blocks do not affect other metadata writes."""
     taskmaster.update_task.return_value = {'success': True}
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.update_task(
+        '1',
+        '/project',
+        metadata=json.dumps({'files': ['orchestrator/src/foo.py']}),
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
+
+
+# ── Lock-charter guard in interceptor.update_task (Change #3) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_directory_in_files(taskmaster, reconciler, event_buffer):
+    """interceptor.update_task must reject metadata.files containing a directory.
+
+    Defense-in-depth guard: this bypasses the MCP layer and calls the
+    interceptor directly, so the interception is specific to Change #3.
+    """
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.update_task(
@@ -2675,7 +2697,28 @@ async def test_update_task_allows_other_metadata(taskmaster, reconciler, event_b
         metadata=json.dumps({'files': ['orchestrator/']}),
     )
 
-    assert 'error' not in result
+    assert result.get('error_type') == 'LockCharterViolation', (
+        f'Expected LockCharterViolation; got {result}'
+    )
+    assert 'orchestrator/' in result.get('directory_paths', []), (
+        f'Expected orchestrator/ in directory_paths; got {result}'
+    )
+    taskmaster.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_task_accepts_file_level_files(taskmaster, reconciler, event_buffer):
+    """interceptor.update_task forwards file-level metadata.files unchanged."""
+    taskmaster.update_task.return_value = {'success': True}
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.update_task(
+        '1',
+        '/project',
+        metadata=json.dumps({'files': ['orchestrator/src/foo.py']}),
+    )
+
+    assert 'error' not in result, f'Expected success; got {result}'
     taskmaster.update_task.assert_called_once()
 
 

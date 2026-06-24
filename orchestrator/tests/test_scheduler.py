@@ -23,6 +23,7 @@ from orchestrator.scheduler import (
     ExternalResolverError,
     ModuleLockTable,
     Scheduler,
+    directory_locks,
     files_to_modules,
 )
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
@@ -1433,6 +1434,131 @@ class TestUpdateTaskMetadataSerialization:
             f"Explicit metadata_mode='merge' must win over append=True; got: {arguments}"
         )
         assert 'append' not in arguments
+
+
+class TestUpdateTaskStructuredRejection:
+    """update_task must return False when the wire response carries a structured rejection.
+
+    The production HTTP/mcp_call path returns
+      ``{'result': {'structuredContent': {'error_type': ..., 'error': ...}, 'content': [...]}}``.
+    The old hand-rolled check read ``error_type`` off ``content`` (= ``result['result']``),
+    but the field lives one level deeper under ``structuredContent``, so it was always
+    ``None`` and a LockCharterViolation rejection was silently reported as success.
+    The fix delegates to ``extract_structured_rejection(result)`` which correctly
+    unwraps both the ``structuredContent`` and the text-block fallback.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_update_task_returns_false_on_structured_rejection_wire_envelope(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """LockCharterViolation in structuredContent must cause update_task to return False.
+
+        Exercises the exact wire shape returned by the production HTTP path:
+        ``dispatch_tool`` returns ``{'result': {'structuredContent': {...}, 'content': [...]}}``.
+        The old ``content.get('error_type')`` was always ``None`` here (nesting bug);
+        the fix passes the full ``result`` envelope to ``extract_structured_rejection``.
+        """
+        import json
+
+        rejection_payload = {
+            'error': "metadata.files contains directory-shaped entries: ['orchestrator/']",
+            'error_type': 'LockCharterViolation',
+            'directory_paths': ['orchestrator/'],
+        }
+        wire_envelope = {
+            'result': {
+                'structuredContent': rejection_payload,
+                'content': [{'type': 'text', 'text': json.dumps(rejection_payload)}],
+            }
+        }
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            return wire_envelope
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        ok = await scheduler.update_task('1', {'files': ['orchestrator/']})
+        assert ok is False, (
+            'update_task must return False on a LockCharterViolation structured rejection'
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_task_returns_false_on_text_block_only_rejection(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Rejection in a text content block (no structuredContent) must return False.
+
+        Exercises the ``extract_structured_rejection`` text-block fallback — the helper
+        parses the JSON text block when ``structuredContent`` is absent.
+        """
+        import json
+
+        rejection_payload = {'error': 'invalid metadata', 'error_type': 'ValidationError'}
+        wire_envelope = {
+            'result': {
+                'content': [{'type': 'text', 'text': json.dumps(rejection_payload)}],
+            }
+        }
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            return wire_envelope
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        ok = await scheduler.update_task('1', {'files': ['backend/']})
+        assert ok is False, (
+            'update_task must return False on a text-block-only rejection envelope'
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_task_returns_true_on_success_wire_envelope(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Success envelope must not be mis-classified as a rejection (regression guard).
+
+        Uses the *actual* ``update_task`` success structuredContent shape produced by
+        ``sqlite_task_backend.update_task`` — ``{'id', 'message', 'updated', 'updated_task'}``.
+        This is more than a proxy: it pins that no field in the real production envelope
+        (``updated``, ``updated_task``, etc.) is accidentally treated as a rejection signal
+        by ``extract_structured_rejection``.
+        """
+        import json
+
+        # Real structuredContent shape from sqlite_task_backend.update_task (line ~928):
+        # {'id': task_id, 'message': 'Task <id> updated', 'updated': True, 'updated_task': ...}
+        # No 'error' / 'error_type' keys — extract_structured_rejection must return None.
+        success_payload = {
+            'id': '1',
+            'message': 'Task 1 updated',
+            'updated': True,
+            'updated_task': {
+                'id': '1',
+                'title': 'test task',
+                'status': 'in-progress',
+                'dependencies': [],
+                'metadata': {'files': ['backend/src/main.py']},
+            },
+        }
+        wire_envelope = {
+            'result': {
+                'structuredContent': success_payload,
+                'content': [{'type': 'text', 'text': json.dumps(success_payload)}],
+            }
+        }
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            return wire_envelope
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        ok = await scheduler.update_task('1', {'files': ['backend/src/main.py']})
+        assert ok is True, 'update_task must return True on a success envelope'
 
 
 class TestRequeueCooldown:
@@ -4229,6 +4355,98 @@ class TestBlastRadiusRefinement:
         ]
         assert set_to_plan_events == [], (
             f'Widening must not emit set_to_plan; got {set_to_plan_events}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_blast_radius_persists_file_level_not_coarsened(
+        self, scheduler: Scheduler
+    ) -> None:
+        """_persist_files_metadata must write the FILE-LEVEL path, not the
+        depth-coarsened module path.
+
+        At lock_depth=4 the file
+        'fused-memory/src/fused_memory/middleware/task_interceptor.py' (5 segs)
+        coarsens to 'fused-memory/src/fused_memory/middleware' (4 segs,
+        directory-shaped, no extension).  The OLD _persist_files_metadata wrote
+        the coarsened `needed` set — on reload _get_modules strips directory
+        entries, yields [], and falls to 'task-<id>' (under-locking).  NEW
+        behaviour: persist the raw file-level path so _get_modules can re-derive
+        the real module lock on restart.
+        """
+        tid = '1905t'
+        deep = 'fused-memory/src/fused_memory/middleware/task_interceptor.py'
+        # files_to_modules coarsens to the 4-segment directory-shaped path
+        coarsened = files_to_modules([deep], 4)
+        assert coarsened == ['fused-memory/src/fused_memory/middleware'], (
+            f'Precondition: files_to_modules must coarsen to directory path; got {coarsened}'
+        )
+
+        lt = scheduler.lock_table
+        # Acquire a stale lock so the narrowing/persist branch fires
+        stale_file = 'crates/reify-compiler/src/lib.rs'
+        assert lt.try_acquire(tid, [stale_file])
+
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': tid, 'metadata': {}}
+        )
+        update_task = AsyncMock(return_value=True)
+        scheduler.update_task = update_task  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            tid,
+            current=[stale_file],
+            needed=coarsened,
+            persist_files=[deep],  # NEW parameter: supply file-level paths
+        )
+
+        assert ok is True
+        assert update_task.await_args is not None, (
+            'update_task must be called for the narrowing persist'
+        )
+        persisted_files = update_task.await_args.args[1]['files']
+        # Must be the file-level path, NOT the coarsened module path
+        assert persisted_files == [deep], (
+            f'Expected file-level path [{deep!r}], got {persisted_files!r}'
+        )
+        # The persisted set must contain no directory entries
+        # (i.e. it would pass the update_task lock-charter guard)
+        assert directory_locks(persisted_files) == [], (
+            f'Persisted files must not contain directory entries; '
+            f'got {directory_locks(persisted_files)}'
+        )
+        # In-memory lock set is still the coarsened module (locking semantics unchanged)
+        assert lt._held[tid] == set(coarsened), (
+            f'In-memory held set must remain coarsened to {coarsened!r}; '
+            f'got {lt._held.get(tid)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_persisted_file_level_metadata_rederives_real_module(
+        self, scheduler: Scheduler
+    ) -> None:
+        """File-level metadata.files lets _get_modules re-derive the real lock
+        module on restart — avoiding the under-locking regression.
+
+        OLD: coarsened path 'fused-memory/src/fused_memory/middleware' written
+             → is_file_path() is False (no extension) → strip_directory_locks
+               removes it → files_to_modules([]) == [] → falls to 'task-<id>'
+             → UNDER-LOCKS on restart.
+        NEW: file-level path written → strip_directory_locks is identity
+             → files_to_modules re-derives the real module lock.
+        """
+        tid = '1905u'
+        deep = 'fused-memory/src/fused_memory/middleware/task_interceptor.py'
+        # Simulate what the NEW _persist_files_metadata writes: file-level paths
+        persisted = [deep]
+        task = {'id': tid, 'metadata': {'files': persisted}}
+        result = scheduler._get_modules(task)
+        assert result == ['fused-memory/src/fused_memory/middleware'], (
+            f'_get_modules must re-derive real module from file-level metadata; '
+            f'got {result!r}'
+        )
+        assert result != [f'task-{tid}'], (
+            f'_get_modules must NOT fall back to task-<id> when file-level '
+            f'metadata is present; got {result!r}'
         )
 
 

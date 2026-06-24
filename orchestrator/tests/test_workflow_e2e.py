@@ -1353,7 +1353,9 @@ class TestBlastRadiusExpansion:
                 return AgentResult(success=True, output='Plan created', cost_usd=0.50)
 
         class DenyingScheduler(FakeScheduler):
-            async def handle_blast_radius_expansion(self, task_id, current, needed):
+            async def handle_blast_radius_expansion(
+                self, task_id, current, needed, /, *, persist_files=None
+            ):
                 return False  # Can't acquire locks
 
         stub = ExpandingArchitectStub()

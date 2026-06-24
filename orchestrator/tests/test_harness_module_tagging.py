@@ -370,3 +370,66 @@ async def test_tag_task_modules_does_not_cache_directory_wide_module(tmp_path):
     assert cached_2 == ['src/config'], (
         f'Expected [\"src/config\"] for src/config/schema.py at depth=2; got {cached_2!r}.'
     )
+
+
+@pytest.mark.asyncio
+async def test_tag_task_modules_strips_directories_in_writeback(tmp_path):
+    """Module-tagger writeback must persist FILE-LEVEL paths only.
+
+    The lock-charter guard on update_task / task_interceptor.update_task
+    REJECTS any metadata.files containing a directory-shaped entry
+    (LockCharterViolation), which would drop the entire payload — including the
+    valid file-level entries in the same write. The writeback must therefore
+    call strip_directory_locks before persisting, consistent with
+    _persist_files_metadata and _reconcile_metadata_files_for_done.
+
+    A mixed file+directory list must persist only the file-level entries.
+    """
+    config = OrchestratorConfig(project_root=tmp_path, lock_depth=2)
+    h = Harness(config)
+
+    tasks = [
+        {
+            'id': '1',
+            'title': 'Mixed-charter task',
+            'description': 'LLM tags a real file and a directory',
+            'status': 'pending',
+            'metadata': {},
+            'dependencies': [],
+        },
+    ]
+    # Agent returns a mixed list: a real file plus a directory-shaped entry.
+    agent_response = {
+        'tasks': [
+            {'id': '1', 'files': ['src/config/schema.py', 'crates/reify-eval/src']},
+        ],
+    }
+
+    h.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    h.scheduler.update_task = AsyncMock()
+
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await h._tag_task_modules()
+
+    h.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = h.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    persisted = json.loads(metadata_json)['files']
+    # The real file survives; the directory entry is stripped so the guard
+    # accepts the write.
+    assert persisted == ['src/config/schema.py'], (
+        f'Writeback must persist file-level entries only (directory stripped); '
+        f'got {persisted!r}.'
+    )
+    from shared.locking import directory_locks
+    assert directory_locks(persisted) == [], (
+        f'Persisted files must contain no directory-shaped entries; '
+        f'got {directory_locks(persisted)!r}.'
+    )
