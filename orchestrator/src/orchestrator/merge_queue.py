@@ -5227,8 +5227,15 @@ class BreakerTrip:
     ------
     action          : ``'halt'`` or ``'resume'``
     window_samples  : configured window size (number of samples)
-    landings_in_window : landings that occurred in the last window (0 on halt)
-    free_start      : free-bytes at the START of the evaluated window
+    landings_in_window : **Dual meaning** — on ``action='halt'``: always 0
+                        (landings were flat across the window, which is the trip
+                        condition); on ``action='resume'``: the delta since trip
+                        time (``landings_total − landings_at_trip``), which may
+                        span much more than one window when disk-recovery (not a
+                        clean landing) triggers resume.  Consumers of resume
+                        records should treat this as ``landings_since_trip``.
+    free_start      : free-bytes at the START of the evaluated window (on halt)
+                      or the free-bytes recorded at trip time (on resume).
     free_end        : free-bytes at the END of the evaluated window (last sample)
     reason          : human-readable one-liner for log/escalation messages
     """
@@ -5296,6 +5303,24 @@ class NoLandingsCircuitBreaker:
         self._free_at_trip: int = 0
 
     # ── public interface ─────────────────────────────────────────────────────
+
+    @property
+    def is_tripped(self) -> bool:
+        """True when the breaker has fired and dispatch is expected to be halted."""
+        return self._tripped
+
+    def reset(self) -> None:
+        """Clear tripped state and sample buffer so the breaker re-arms from scratch.
+
+        Used by the harness when it detects that the scheduler was externally
+        resumed (i.e. the scheduler is no longer paused but the breaker still
+        thinks it is tripped).  After ``reset()``, a fresh full window of
+        flat+falling samples is required before the breaker trips again.
+        """
+        self._tripped = False
+        self._landings_at_trip = 0
+        self._free_at_trip = 0
+        self._samples.clear()
 
     def observe(self, landings_total: int, free_bytes: int) -> BreakerTrip | None:
         """Feed one sample; return a BreakerTrip decision or None.
@@ -5386,6 +5411,14 @@ class NoLandingsCircuitBreaker:
         noise just above the trip level.  On resume, _tripped is cleared so
         ``observe()`` re-enters the trip-detection path.  Buffer clearing
         (anti-flap full-window rebuild) is done in step-08.
+
+        **Plateau risk:** if disk free-bytes stabilise just below
+        ``free_at_trip + disk_margin_bytes`` (never recovering by the full
+        margin) AND no new landings occur, neither resume condition can fire.
+        The breaker remains tripped indefinitely.  The harness escalation detail
+        documents this and instructs operators to call ``force_resume_scheduler``
+        if the halt persists.  The harness also detects external resumes and
+        re-arms the breaker automatically (see ``Harness._run_no_landings_breaker_pass``).
         """
         clean_landing = landings_total > self._landings_at_trip
         disk_recovered = free_bytes >= self._free_at_trip + self._disk_margin_bytes

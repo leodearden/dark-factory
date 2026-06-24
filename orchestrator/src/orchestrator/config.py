@@ -1611,7 +1611,7 @@ class OrchestratorConfig(BaseSettings):
     # are PROVISIONAL (PRD §11); calibration is a follow-up task.
     # Kill-switch for operators to disable a flapping breaker without a code change
     # (because the breaker HALTS dispatch, operators must be able to turn it off
-    # without a code change — mirrors main_tip_sweep_enabled at :1603).
+    # without a code change — mirrors main_tip_sweep_enabled).
     no_landings_breaker_enabled: bool = Field(default=True)
     no_landings_breaker_interval_secs: float = Field(default=60.0)
 

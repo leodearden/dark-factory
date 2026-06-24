@@ -48,7 +48,12 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
-    from orchestrator.merge_queue import MergeWorker, SpeculativeMergeWorker, TrainCallbackFactory
+    from orchestrator.merge_queue import (
+        BreakerTrip,
+        MergeWorker,
+        SpeculativeMergeWorker,
+        TrainCallbackFactory,
+    )
 
 try:
     from escalation.queue import EscalationQueue
@@ -3050,7 +3055,7 @@ Output JSON matching the schema. Every task must appear in the output.
 
     # ── No-landings circuit-breaker helpers (θ=1893, PRD §5.5) ──────────────
 
-    def _file_no_landings_info_escalation(self, trip) -> None:
+    def _file_no_landings_info_escalation(self, trip: BreakerTrip) -> None:
         """File a non-blocking INFO escalation for the no-landings circuit-breaker.
 
         Mirrors ``_file_starvation_info`` (pure operator-signal INFO, level=0)
@@ -3102,10 +3107,14 @@ Output JSON matching the schema. Every task must appear in the output.
                     f'(strictly falling)\n\n'
                     f'Trip reason: {trip.reason}\n\n'
                     'Auto-resume will occur on the next clean landing or when disk '
-                    'free-bytes recover above the trip level + margin.  If the '
-                    'scheduler does not auto-resume, investigate disk usage under '
-                    'the warm-lane worktree volume and call '
-                    'force_resume_scheduler() to manually un-pause dispatch.'
+                    'free-bytes recover above the trip level + 512 MiB margin.\n\n'
+                    'IMPORTANT: if disk free-bytes plateau below the recovery '
+                    'threshold (never recovering the full +512 MiB) and no new '
+                    'landings occur, neither auto-resume condition can fire and the '
+                    'scheduler will remain halted indefinitely across restarts.  '
+                    'In that case, investigate disk usage under the warm-lane '
+                    'worktree volume and call force_resume_scheduler() to manually '
+                    'un-pause dispatch.'
                 ),
                 suggested_action='manual_investigation',
                 level=0,
@@ -3122,15 +3131,24 @@ Output JSON matching the schema. Every task must appear in the output.
                 exc_info=True,
             )
 
-    def _resolve_no_landings_info_escalation(self, trip) -> None:
+    def _resolve_no_landings_info_escalation(
+        self, trip: BreakerTrip | None = None
+    ) -> None:
         """Resolve an open no-landings breaker INFO escalation.
 
-        Called on resume; idempotent (EscalationQueue.resolve is a no-op if
-        already resolved).  Best-effort: no-op when ``_escalation_queue`` is
-        None or resolve raises.  Mirrors ``_resolve_starvation_info``.
+        Called on resume (with a ``BreakerTrip`` record) or on external-resume
+        reconciliation (``trip=None``).  Idempotent — ``EscalationQueue.resolve``
+        is a no-op if already resolved.  Best-effort: no-op when
+        ``_escalation_queue`` is None or resolve raises.  Mirrors
+        ``_resolve_starvation_info``.
         """
         if not self._escalation_queue:
             return
+        resolution_reason = (
+            f'auto-resolved: {trip.reason}'
+            if trip is not None
+            else 'auto-resolved: breaker re-armed (scheduler was externally resumed)'
+        )
         try:
             pending = [
                 e
@@ -3142,7 +3160,7 @@ Output JSON matching the schema. Every task must appear in the output.
             for esc in pending:
                 self._escalation_queue.resolve(
                     esc.id,
-                    f'auto-resolved: {trip.reason}',
+                    resolution_reason,
                     resolved_by='orchestrator-no-landings-breaker',
                 )
                 logger.info(
@@ -3170,6 +3188,18 @@ Output JSON matching the schema. Every task must appear in the output.
         Fail-open on ``OSError`` from ``shutil.disk_usage`` so a transient
         stat failure (or not-yet-created ``worktree_base``) never halts dispatch.
         Mirrors ``_run_main_tip_sweep`` as the single-pass testable entry point.
+
+        **Reconciliation (suggestion 2):** if the breaker thinks it is tripped
+        but the scheduler is no longer paused (an operator or another path
+        resumed it externally), the breaker is reset so it re-arms trip
+        detection rather than silently stopping guard.
+
+        **Idle-queue guard (suggestion 3):** when the merge queue is confirmed
+        empty (``snapshot['depth'] == 0``) and the breaker is not already
+        tripped, trip evaluation is skipped — a quiescent queue cannot produce a
+        churn spiral, so any disk fall in that state is from an unrelated cause.
+        The key defaults to 1 (active) when absent, preserving backward
+        compatibility with test mocks that omit ``'depth'``.
         """
         import shutil as _shutil  # noqa: PLC0415
 
@@ -3188,6 +3218,27 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         landings_total: int = metrics['landings_total']
+
+        # Reconcile breaker state with actual scheduler state.  If something
+        # outside the breaker (operator call, another auto-resume path) un-paused
+        # the scheduler while the breaker still thinks it is tripped, the breaker
+        # would silently stop evaluating trip conditions.  Detect and reset it so
+        # guard re-arms for the next full window.
+        if self._no_landings_breaker.is_tripped and not self.scheduler.is_paused:
+            logger.info(
+                'No-landings breaker: scheduler was externally resumed — re-arming'
+            )
+            self._no_landings_breaker.reset()
+            self._resolve_no_landings_info_escalation()  # best-effort cleanup
+            return
+
+        # Gate trip evaluation on evidence of active dispatch.  An empty queue
+        # (depth == 0) cannot be a churn spiral — any concurrent disk fall is
+        # from an unrelated source.  Defaults to 1 (active) so test mocks that
+        # omit 'depth' are treated as active (backward-compatible).
+        queue_depth: int = snapshot.get('depth', 1)
+        if queue_depth == 0 and not self._no_landings_breaker.is_tripped:
+            return
 
         try:
             free_bytes: int = _shutil.disk_usage(
