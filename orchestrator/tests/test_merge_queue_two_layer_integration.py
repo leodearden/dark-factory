@@ -72,7 +72,6 @@ from orchestrator.merge_queue import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
     InflightEntry,
-    MergeOutcome,
     MergeRequest,
     NoLandingsCircuitBreaker,
     SpeculativeItem,
@@ -1220,10 +1219,10 @@ class TestScenario4And5AgingAndDisjointBypass:
         edge_ac = frozenset({req_a.request_id, req_c.request_id})
         edge_bc = frozenset({req_b.request_id, req_c.request_id})
         assert edge_ac not in graph.footprint_edges, (
-            f'C edits disjoint.txt only — should not overlap with A (shared.txt)'
+            'C edits disjoint.txt only — should not overlap with A (shared.txt)'
         )
         assert edge_bc not in graph.footprint_edges, (
-            f'C edits disjoint.txt only — should not overlap with B (shared.txt)'
+            'C edits disjoint.txt only — should not overlap with B (shared.txt)'
         )
 
     async def test_scenario_4_aging_beats_fifo(
