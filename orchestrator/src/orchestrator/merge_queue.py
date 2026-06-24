@@ -6474,6 +6474,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # intentional (ε/ζ/η consume the relation, not the merge outcome).
             await self.recompute_suffix_conflict_graph()
 
+            # η/1892 — graph-time bounce: divert suffix items that conflict with
+            # the frozen-prefix tip before they can consume a verify slot.
+            # Bounced items are either re-queued (clean rebase) or escalated
+            # (real conflict / cap exceeded); either way they are NOT returned
+            # by _pop_next_pickable() this cycle.
+            await self._bounce_conflicting_suffix_items()
+
             req = self._pop_next_pickable()
             if req is not None:
                 return req
