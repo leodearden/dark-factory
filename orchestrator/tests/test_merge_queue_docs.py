@@ -168,3 +168,104 @@ class TestSkillDocumentsAgingOrderAndCrossrefs:
             "skills/merge-queue/SKILL.md must reference the merge-verify ENOSPC "
             "fail-soft and mark it as out of scope"
         )
+
+
+class TestDesignDocExistsAndMatchesCode:
+    """skills/merge-queue/references/two-layer-model.md must exist and match code."""
+
+    _design_doc_path = "skills/merge-queue/references/two-layer-model.md"
+
+    @staticmethod
+    def _load_doc() -> str:
+        """Load the design doc; fail with a clear message if it doesn't exist."""
+        try:
+            return _read("skills/merge-queue/references/two-layer-model.md")
+        except FileNotFoundError:
+            raise AssertionError(
+                "skills/merge-queue/references/two-layer-model.md does not exist"
+            ) from None
+
+    def test_doc_exists(self) -> None:
+        """The design doc file must exist."""
+        self._load_doc()  # raises AssertionError if missing
+
+    def test_two_layer_table_present(self) -> None:
+        """Design doc must contain a two-layer table (both layer names)."""
+        doc = self._load_doc().lower()
+        has_speculative = (
+            "speculative merge" in doc
+            or "speculative suffix" in doc
+            or "suffix" in doc
+        )
+        has_frozen = (
+            "frozen prefix" in doc
+            or "frozen verify frontier" in doc
+            or "verify frontier" in doc
+        )
+        assert has_speculative, (
+            "Design doc must describe the speculative merge graph layer"
+        )
+        assert has_frozen, (
+            "Design doc must describe the frozen verify frontier layer"
+        )
+
+    def test_section_53_invariants(self) -> None:
+        """Design doc must describe the §5.3 frozen-prefix invariants."""
+        doc = self._load_doc().lower()
+        has_frozen = "frozen prefix" in doc or "frozen-prefix" in doc
+        has_verify_tip = (
+            "verify base" in doc
+            or "verify against" in doc
+            or "frozen-prefix tip" in doc
+            or "frozen prefix tip" in doc
+            or "tip of the frozen" in doc
+        )
+        assert has_frozen, "Design doc must describe frozen prefix invariant"
+        assert has_verify_tip, (
+            "Design doc must describe the verify-against-frozen-tip invariant"
+        )
+
+    def test_no_landings_circuit_breaker(self) -> None:
+        """Design doc must describe the no-landings circuit-breaker."""
+        doc = self._load_doc().lower()
+        assert "circuit" in doc or "circuit-breaker" in doc or "no-landings" in doc, (
+            "Design doc must describe the no-landings circuit-breaker"
+        )
+
+    def test_provenance_table_bounce_task(self) -> None:
+        """Design doc must reference task 1892 (bounce, η=1892) in provenance table."""
+        doc = self._load_doc()
+        assert "1892" in doc, (
+            "Design doc must include the greek→task-ID provenance table with "
+            "η=1892 (needs_rebase bounce)"
+        )
+
+    def test_provenance_table_breaker_task(self) -> None:
+        """Design doc must reference task 1893 (circuit-breaker, θ=1893) in provenance table."""
+        doc = self._load_doc()
+        assert "1893" in doc, (
+            "Design doc must include the greek→task-ID provenance table with "
+            "θ=1893 (no-landings circuit-breaker)"
+        )
+
+    # Doc/code consistency: snapshot keys and merge_first_enqueued_at must be in code
+
+    def test_suffix_conflict_graph_key_in_code(self) -> None:
+        """suffix_conflict_graph snapshot key must exist in merge_queue.py."""
+        assert "suffix_conflict_graph" in MERGE_QUEUE_SRC
+
+    def test_frozen_prefix_key_in_code(self) -> None:
+        """frozen_prefix snapshot key must exist in merge_queue.py."""
+        assert "frozen_prefix" in MERGE_QUEUE_SRC
+
+    def test_metrics_key_in_code(self) -> None:
+        """metrics snapshot key (retries_per_landing) must exist in merge_queue.py."""
+        assert "retries_per_landing" in MERGE_QUEUE_SRC
+
+    def test_two_layer_invariants_key_in_code(self) -> None:
+        """two_layer_invariants must exist in merge_queue.py."""
+        assert "two_layer_invariants" in MERGE_QUEUE_SRC
+
+    def test_merge_first_enqueued_at_in_code(self) -> None:
+        """merge_first_enqueued_at must exist in merge_queue.py."""
+        assert "merge_first_enqueued_at" in MERGE_QUEUE_SRC
