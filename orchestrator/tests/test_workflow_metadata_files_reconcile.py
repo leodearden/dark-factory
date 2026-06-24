@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
-from shared.locking import directory_locks, strip_directory_locks
+from shared.locking import directory_locks
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow
