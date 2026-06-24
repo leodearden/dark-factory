@@ -1603,6 +1603,18 @@ class OrchestratorConfig(BaseSettings):
     main_tip_sweep_enabled: bool = Field(default=True)
     main_tip_sweep_interval_secs: float = Field(default=1800.0)
 
+    # No-landings circuit-breaker (θ=1893, Phase-2 backstop, PRD §5.5).
+    # When rolling landing-rate == 0 AND warm-lane free-bytes is monotonically
+    # falling over a window, halt dispatch and file a non-blocking operator INFO
+    # escalation ("stop digging").  Auto-resumes on a clean landing OR disk
+    # recovery above margin.  Hysteresis prevents flap.  Window and disk-margin
+    # are PROVISIONAL (PRD §11); calibration is a follow-up task.
+    # Kill-switch for operators to disable a flapping breaker without a code change
+    # (because the breaker HALTS dispatch, operators must be able to turn it off
+    # without a code change — mirrors main_tip_sweep_enabled).
+    no_landings_breaker_enabled: bool = Field(default=True)
+    no_landings_breaker_interval_secs: float = Field(default=60.0)
+
     # Backstop for the stranded-`blocked` gap: a task left `blocked` with no
     # open escalation AND no active workflow is an orphaned recovery (its
     # blocking escalation was resolved directly with no live workflow to
