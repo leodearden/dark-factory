@@ -2320,6 +2320,18 @@ class Scheduler:
                         break
                 logger.error(f'Failed to update task {task_id}: {text}')
                 return False
+            # Structured rejections (e.g. LockCharterViolation, ValidationError)
+            # come back as a plain {'error': ..., 'error_type': ...} dict with no
+            # 'isError' key. Treat these as failures too — otherwise a rejected
+            # write is silently reported as success.
+            if isinstance(content, dict) and content.get('error_type'):
+                logger.error(
+                    'Failed to update task %s (%s): %s',
+                    task_id,
+                    content.get('error_type'),
+                    content.get('error'),
+                )
+                return False
             return True
         except Exception as e:
             logger.exception(
