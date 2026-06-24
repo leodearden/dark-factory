@@ -21,6 +21,7 @@ from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.merge_queue import (
+    EMPTY_SUFFIX_CONFLICT_GRAPH,
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     MERGE_LANES,
     NEEDS_REBASE_REASON_PREFIX,
@@ -37,6 +38,7 @@ from orchestrator.merge_queue import (
     MergeWorker,
     SpeculativeItem,
     SpeculativeMergeWorker,
+    SuffixConflictGraph,
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
     _check_plan_files_touched_in_branch,
@@ -105,12 +107,14 @@ def _make_request(
     config: OrchestratorConfig,
     pre_rebased: bool = False,
     lane: Literal['normal', 'high'] = 'normal',
+    merge_first_enqueued_at: float | None = None,
+    request_id: str | None = None,
 ) -> MergeRequest:
     try:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     except RuntimeError:
         future = make_placeholder_future()
-    return MergeRequest(
+    kwargs: dict = dict(
         task_id=task_id,
         branch=branch,
         worktree=worktree,
@@ -120,7 +124,11 @@ def _make_request(
         config=config,
         result=future,
         lane=lane,
+        merge_first_enqueued_at=merge_first_enqueued_at,
     )
+    if request_id is not None:
+        kwargs['request_id'] = request_id
+    return MergeRequest(**kwargs)
 
 
 def _gated_verify(
@@ -17504,6 +17512,248 @@ class TestLanePickOrderHelpers:
         finally:
             asyncio.set_event_loop(None)
             loop.close()
+
+
+class TestAgingPickOrder:
+    """ζ/1891 aging comparator: clique-scoped age-of-first-submission ordering."""
+
+    def _setup(self, git_ops: GitOps, config: OrchestratorConfig):
+        """Return (worker, loop) with the loop set as current event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        return worker, loop
+
+    def test_aging_orders_conflict_clique_by_first_submission(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """Within a footprint clique, the request with the oldest first-submission wins.
+
+        A is enqueued first (FIFO head) but is YOUNGER (mfea=300.0).
+        B is enqueued second but is OLDER (mfea=100.0).
+        Both share a footprint edge → they are in the same clique.
+        Expected pick order: B first (older first-submission), then A, then None.
+
+        Fails against the pure popleft() comparator which returns A (FIFO head) first.
+        """
+        worker, loop = self._setup(git_ops, config)
+        try:
+            req_a = _make_request(
+                't-a', 't-a', git_repo, config,
+                merge_first_enqueued_at=300.0, request_id='mr-a',
+            )
+            req_b = _make_request(
+                't-b', 't-b', git_repo, config,
+                merge_first_enqueued_at=100.0, request_id='mr-b',
+            )
+            # A first in buffer (FIFO head), B second
+            worker._queue.put_nowait(req_a)
+            worker._queue.put_nowait(req_b)
+            worker._drain_queue_into_lanes()
+
+            # Place A and B in the same footprint clique
+            worker._suffix_conflict_graph = SuffixConflictGraph(
+                nodes=('mr-a', 'mr-b'),
+                textual_edges=frozenset(),
+                footprint_edges=frozenset({frozenset({'mr-a', 'mr-b'})}),
+                conflicts_with_main=frozenset(),
+            )
+
+            # Older first-submission (B, mfea=100) must win over FIFO head (A, mfea=300)
+            assert worker._pop_next_pickable() is req_b
+            assert worker._pop_next_pickable() is req_a
+            assert worker._pop_next_pickable() is None
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    def test_aging_clique_fallback_to_enqueued_at_when_mfea_none(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """Legacy fallback: mfea=None → use enqueued_at (FIFO creation order).
+
+        Both requests have merge_first_enqueued_at=None; the legacy enqueued_at
+        field (set at construction time, monotonically increasing) must serve as
+        the aging key, preserving FIFO order even for conflicting clique members.
+        """
+        worker, loop = self._setup(git_ops, config)
+        try:
+            req_x = _make_request(
+                't-x', 't-x', git_repo, config,
+                merge_first_enqueued_at=None, request_id='mr-x',
+            )
+            req_y = _make_request(
+                't-y', 't-y', git_repo, config,
+                merge_first_enqueued_at=None, request_id='mr-y',
+            )
+            # X created first → smaller enqueued_at → older via fallback
+            worker._queue.put_nowait(req_x)
+            worker._queue.put_nowait(req_y)
+            worker._drain_queue_into_lanes()
+
+            worker._suffix_conflict_graph = SuffixConflictGraph(
+                nodes=('mr-x', 'mr-y'),
+                textual_edges=frozenset(),
+                footprint_edges=frozenset({frozenset({'mr-x', 'mr-y'})}),
+                conflicts_with_main=frozenset(),
+            )
+
+            # FIFO (creation) order preserved via enqueued_at fallback
+            assert worker._pop_next_pickable() is req_x
+            assert worker._pop_next_pickable() is req_y
+            assert worker._pop_next_pickable() is None
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
+    def test_aging_tiebreak_equal_timestamp_request_id_lexical(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """Equal mfea: lexically-smaller request_id wins the tie-break.
+
+        Both items share the same merge_first_enqueued_at=100.0.  Buffer order
+        puts the lexically-LARGER 'mr-zzzz' first (idx0) and the lexically-
+        SMALLER 'mr-aaaa' second (idx1).  They share a footprint edge.
+
+        Expected: 'mr-aaaa' is picked first (lexically smaller request_id beats
+        FIFO position on equal timestamps).
+
+        Fails against S4 because the scalar _aging_key makes both items equal
+        under strict ``<`` → both are clique-minimal → FIFO-earliest 'mr-zzzz'
+        is returned.
+        """
+        worker, loop = self._setup(git_ops, config)
+        try:
+            req_zzzz = _make_request(
+                't-zzzz', 't-zzzz', git_repo, config,
+                merge_first_enqueued_at=100.0, request_id='mr-zzzz',
+            )
+            req_aaaa = _make_request(
+                't-aaaa', 't-aaaa', git_repo, config,
+                merge_first_enqueued_at=100.0, request_id='mr-aaaa',
+            )
+            # Lexically larger 'mr-zzzz' is FIFO head (idx0)
+            worker._queue.put_nowait(req_zzzz)
+            worker._queue.put_nowait(req_aaaa)
+            worker._drain_queue_into_lanes()
+
+            worker._suffix_conflict_graph = SuffixConflictGraph(
+                nodes=('mr-zzzz', 'mr-aaaa'),
+                textual_edges=frozenset(),
+                footprint_edges=frozenset({frozenset({'mr-zzzz', 'mr-aaaa'})}),
+                conflicts_with_main=frozenset(),
+            )
+
+            # Lexically smaller 'mr-aaaa' must win despite being the FIFO tail
+            assert worker._pop_next_pickable() is req_aaaa, (
+                "request_id lexical tie-break must beat FIFO position on equal mfea"
+            )
+            assert worker._pop_next_pickable() is req_zzzz
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    def test_aging_is_clique_scoped_and_allows_disjoint_bypass(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ):
+        """Three scenarios proving aging is footprint-scoped, not global.
+
+        (a) SCOPING: disjoint items must NOT be age-reordered — FIFO wins.
+        (b) BYPASS: a disjoint item jumps the FIFO head when the head is blocked
+            by an older footprint-clique peer sitting behind it in the buffer.
+        (c) CROSS-LANE: aging never crosses the lane boundary (high beats normal).
+
+        Scenarios (a) and (b) FAIL against S2's global within-lane aging sort,
+        which would reorder disjoint items and fail to bypass correctly.
+        """
+        # ── (a) SCOPING: two DISJOINT items — younger-ahead must stay first ──
+        worker_a, loop_a = self._setup(git_ops, config)
+        try:
+            req_y = _make_request(
+                't-y', 't-y', git_repo, config,
+                merge_first_enqueued_at=300.0, request_id='mr-y',
+            )
+            req_o = _make_request(
+                't-o', 't-o', git_repo, config,
+                merge_first_enqueued_at=100.0, request_id='mr-o',
+            )
+            # younger-ahead (idx0), older-behind (idx1), NO footprint edge → disjoint
+            worker_a._queue.put_nowait(req_y)
+            worker_a._queue.put_nowait(req_o)
+            worker_a._drain_queue_into_lanes()
+            worker_a._suffix_conflict_graph = EMPTY_SUFFIX_CONFLICT_GRAPH
+
+            # FIFO must be preserved — disjoint items are never age-reordered
+            assert worker_a._pop_next_pickable() is req_y, (
+                "Disjoint items must preserve FIFO (younger head stays first)"
+            )
+            assert worker_a._pop_next_pickable() is req_o
+        finally:
+            asyncio.set_event_loop(None)
+            loop_a.close()
+
+        # ── (b) BYPASS: disjoint C jumps ahead of blocked head A ─────────────
+        worker_b, loop_b = self._setup(git_ops, config)
+        try:
+            req_a = _make_request(
+                't-a', 't-a', git_repo, config,
+                merge_first_enqueued_at=300.0, request_id='mr-a',
+            )
+            req_c = _make_request(
+                't-c', 't-c', git_repo, config,
+                merge_first_enqueued_at=200.0, request_id='mr-c',
+            )
+            req_b2 = _make_request(
+                't-b', 't-b', git_repo, config,
+                merge_first_enqueued_at=100.0, request_id='mr-b',
+            )
+            # Buffer order: A(300, idx0), C(200, idx1), B(100, idx2)
+            # footprint_edges: {mr-a, mr-b} — A and B conflict; C is disjoint
+            worker_b._queue.put_nowait(req_a)
+            worker_b._queue.put_nowait(req_c)
+            worker_b._queue.put_nowait(req_b2)
+            worker_b._drain_queue_into_lanes()
+            worker_b._suffix_conflict_graph = SuffixConflictGraph(
+                nodes=('mr-a', 'mr-c', 'mr-b'),
+                textual_edges=frozenset(),
+                footprint_edges=frozenset({frozenset({'mr-a', 'mr-b'})}),
+                conflicts_with_main=frozenset(),
+            )
+
+            # C (disjoint) must bypass head A (which is blocked by older B behind it)
+            assert worker_b._pop_next_pickable() is req_c, (
+                "Disjoint C must bypass head A (A blocked by older peer B)"
+            )
+        finally:
+            asyncio.set_event_loop(None)
+            loop_b.close()
+
+        # ── (c) CROSS-LANE: high beats normal regardless of aging ─────────────
+        worker_c, loop_c = self._setup(git_ops, config)
+        try:
+            req_hi = _make_request(
+                't-hi', 't-hi', git_repo, config,
+                lane='high', merge_first_enqueued_at=900.0, request_id='mr-hi',
+            )
+            req_lo = _make_request(
+                't-lo', 't-lo', git_repo, config,
+                lane='normal', merge_first_enqueued_at=1.0, request_id='mr-lo',
+            )
+            worker_c._queue.put_nowait(req_hi)
+            worker_c._queue.put_nowait(req_lo)
+            worker_c._drain_queue_into_lanes()
+            worker_c._suffix_conflict_graph = EMPTY_SUFFIX_CONFLICT_GRAPH
+
+            # High-lane item must be picked first even though it's the youngest
+            assert worker_c._pop_next_pickable() is req_hi, (
+                "High-lane item must beat normal-lane regardless of aging key"
+            )
+            assert worker_c._pop_next_pickable() is req_lo
+        finally:
+            asyncio.set_event_loop(None)
+            loop_c.close()
 
 
 @pytest.mark.asyncio

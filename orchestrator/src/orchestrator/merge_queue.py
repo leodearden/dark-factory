@@ -300,6 +300,27 @@ def _normalize_lane(lane: str) -> str:
     return lane if lane in MERGE_LANES else 'normal'
 
 
+def _aging_key(req: MergeRequest) -> tuple[float, str]:
+    """Aging sort key for a merge request (ζ=1891).
+
+    Returns a ``(wall_clock, request_id)`` tuple:
+
+    * **wall_clock** — ``merge_first_enqueued_at`` (persisted epoch of the
+      *first* merge submission, survives restart) with ``enqueued_at`` as
+      the legacy fallback for requests created before α=1886 was deployed
+      (field is ``None``).  Smaller = older = higher priority.
+
+    * **request_id** — lexical tie-break for equal timestamps (PRD §5.4 /
+      §11.3).  Lexically smaller wins.
+
+    Used by ``SpeculativeMergeWorker._pop_next_pickable`` to identify the
+    clique-minimal item within a footprint clique — the buffered item whose
+    footprint-clique peers all have an equal-or-larger aging key.
+    """
+    ts = req.merge_first_enqueued_at if req.merge_first_enqueued_at is not None else req.enqueued_at
+    return (ts, req.request_id)
+
+
 TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
 """Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
 fails with a no-space-left/ENOSPC signature that PERSISTS after one
@@ -6160,17 +6181,50 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._buffer_owned_request(item)
 
     def _pop_next_pickable(self) -> MergeRequest | None:
-        """Return the next pickable request (highest-priority non-halted lane, FIFO).
+        """Return the next pickable request using clique-scoped aging (ζ=1891).
 
-        Returns None if every non-empty lane is halted, or all buffers are
+        Lane priority is unchanged: high beats normal; halted lanes are skipped.
+        Within the first non-empty non-halted lane, pick and remove the
+        **clique-minimal** item: the FIFO-earliest buffered item *x* such that
+        no footprint-neighbor of *x* (per ``self._suffix_conflict_graph``) in
+        the same lane has a strictly smaller :func:`_aging_key`.
+
+        Aging key = ``(merge_first_enqueued_at or enqueued_at, request_id)`` —
+        older (smaller timestamp) wins; lexically-smaller request_id breaks ties.
+
+        Degrades to pure FIFO when the conflict graph is empty or the
+        request_id is absent from the graph (``footprint_neighbors`` returns
+        the empty set → item is vacuously minimal).
+
+        Returns None when every non-empty lane is halted or all buffers are
         empty.  Pure/synchronous so unit tests run without an event loop.
         """
+        graph = self._suffix_conflict_graph
         for lane in MERGE_LANES:  # high → normal
             if self.is_lane_halted(lane):
                 continue
             buf = self._lane_buffers[lane]
-            if buf:
-                return buf.popleft()
+            if not buf:
+                continue
+            # Clique-minimal selection: scan FIFO order; pick the first item x
+            # such that no footprint-neighbor of x in the same buffer has a
+            # strictly smaller aging key than x.  Items with no buffered
+            # footprint-neighbor are vacuously minimal → pure FIFO for disjoint
+            # items.  Degrades to FIFO when graph is empty or rid is absent
+            # from the graph (footprint_neighbors returns frozenset()).
+            buf_rids: frozenset[str] = frozenset(item.request_id for item in buf)
+            for i, x in enumerate(buf):
+                neighbors = graph.footprint_neighbors(x.request_id) & buf_rids
+                key_x = _aging_key(x)
+                # x is clique-minimal iff no same-lane neighbor has key < key_x
+                if not any(_aging_key(buf[j]) < key_x
+                           for j, item in enumerate(buf)
+                           if item.request_id in neighbors):
+                    del buf[i]
+                    return x
+            # Defensive fallback (unreachable: the aging-minimal item is always
+            # minimal by the above criterion, so the loop always returns).
+            return buf.popleft()
         return None
 
     # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
