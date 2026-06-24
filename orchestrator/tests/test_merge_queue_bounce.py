@@ -485,3 +485,122 @@ class TestBounceCleanRebase:
             f'Expected a needs_rebase log line but none found. '
             f'Log records: {[r.message for r in caplog.records]}'
         )
+
+
+# ── step-07 RED: _bounce_conflicting_suffix_items() escalation paths ──────────
+
+
+@pytest.mark.asyncio
+class TestBounceEscalation:
+    """_bounce_conflicting_suffix_items(): escalation paths.
+
+    CASE A: real rebase conflict → item removed from buffer, future resolved
+            'blocked' with NEEDS_REBASE_REASON_PREFIX.
+    CASE B: bounce-cap exceeded → NO rebase attempted, item removed + escalated.
+
+    RED until step-08 GREEN adds the escalation branches.
+    """
+
+    async def _make_worker_with_conflict_setup(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        branch: str = '591',
+    ) -> tuple[SpeculativeMergeWorker, MergeRequest]:
+        """Build a worker with a frozen entry and a conflicting suffix request."""
+        worker = _make_worker(git_ops)
+        frozen_mc = 'deadbeefcafe1111'
+        _, item_frozen = _make_fake_item(
+            'frozen-task', merge_commit=frozen_mc, config=config, git_repo=git_repo,
+        )
+        entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
+        worker._inflight.append(entry_frozen)
+
+        req = _make_req('591', branch, config, git_repo)
+        worker._lane_buffers['normal'].append(req)
+        worker._suffix_conflict_graph = SuffixConflictGraph(
+            nodes=(req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({req.request_id}),
+        )
+        return worker, req
+
+    async def test_case_a_real_conflict_escalates(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """CASE A: rebase_onto_main returns False → item removed, blocked escalated."""
+        worker, req = await self._make_worker_with_conflict_setup(git_ops, config, git_repo)
+
+        # Stub rebase → False (real conflict).
+        worker._git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        await worker._bounce_conflicting_suffix_items()
+
+        # Item must be REMOVED from the lane buffer.
+        assert req not in worker._lane_buffers['normal'], (
+            'Expected req to be removed from lane buffer after a rebase conflict.'
+        )
+
+        # Future is resolved as 'blocked' with NEEDS_REBASE_REASON_PREFIX.
+        assert req.result.done(), 'Expected req.result to be resolved after escalation.'
+        outcome: MergeOutcome = req.result.result()
+        assert outcome.status == 'blocked', (
+            f'Expected status="blocked" but got {outcome.status!r}.'
+        )
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+            f'Expected reason to start with NEEDS_REBASE_REASON_PREFIX but got '
+            f'{outcome.reason!r}.'
+        )
+
+        # Registry incremented to 1.
+        assert worker._bounce_registry.count('591') == 1
+
+        # Debounce signature invalidated.
+        assert worker._suffix_conflict_signature is None
+
+    async def test_case_b_cap_exceeded_no_rebase(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """CASE B: bounce cap already at MERGE_BOUNCE_CAP → escalate WITHOUT rebase."""
+        worker, req = await self._make_worker_with_conflict_setup(git_ops, config, git_repo)
+
+        # Pre-seed registry to MERGE_BOUNCE_CAP (so the NEXT record_bounce exceeds it).
+        for _ in range(MERGE_BOUNCE_CAP):
+            worker._bounce_registry.record_bounce('591')
+        assert worker._bounce_registry.count('591') == MERGE_BOUNCE_CAP
+
+        # Spy on rebase_onto_main — it must NOT be called when cap is exceeded.
+        rebase_spy = AsyncMock(return_value=True)
+        worker._git_ops.rebase_onto_main = rebase_spy  # type: ignore[method-assign]
+
+        await worker._bounce_conflicting_suffix_items()
+
+        # rebase_onto_main must NOT have been called.
+        rebase_spy.assert_not_awaited()
+
+        # Item removed from lane buffer.
+        assert req not in worker._lane_buffers['normal'], (
+            'Expected req to be removed from lane buffer when bounce cap is exceeded.'
+        )
+
+        # Future resolved 'blocked' with NEEDS_REBASE_REASON_PREFIX.
+        assert req.result.done(), 'Expected req.result to be resolved after cap escalation.'
+        outcome: MergeOutcome = req.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+            f'Expected cap-exceeded reason to start with NEEDS_REBASE_REASON_PREFIX, '
+            f'got {outcome.reason!r}.'
+        )
+
+        # Debounce signature invalidated.
+        assert worker._suffix_conflict_signature is None
