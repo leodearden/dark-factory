@@ -159,6 +159,39 @@ Decision-2 check.  After ``advance_main`` succeeds, we verify that
 ``.task/``).  Any divergence indicates conflict resolution dropped or
 rewrote work and needs human judgement, not a steward retry."""
 
+NEEDS_REBASE_REASON_PREFIX = 'Suffix item needs rebase onto frozen-prefix tip'
+"""Prefix of the ``MergeOutcome.reason`` string emitted by the η=1892
+graph-time bounce logic when a suffix item conflicts with the frozen-prefix
+tip (see :meth:`SpeculativeMergeWorker._bounce_conflicting_suffix_items`).
+
+Escalation outcomes carry ``status='blocked'`` with this prefix so they ride
+the existing generic ``blocked`` → ``_mark_blocked(escalate_to_human)``
+steward route.  The prefix distinguishes this category from other blocked
+outcomes for operators and λ analytics — no workflow.py change needed.
+
+Two cases produce this prefix:
+* **Real rebase conflict** — the mechanical rebase onto the frozen tip fails;
+  the item is removed from the lane buffer and escalated to the steward.
+* **Bounce-cap exceeded** — the branch has been bounced
+  :data:`MERGE_BOUNCE_CAP` times already; escalated WITHOUT attempting a
+  further rebase (prevents an A↔B flapping conflict from burning rebase
+  attempts without limit, mirroring the 1688 thrash-signature pattern).
+"""
+
+MERGE_BOUNCE_CAP = 3
+"""Maximum number of times a branch may be mechanically rebased before the
+bounce logic escalates instead of rebasing again (η=1892 cap backstop).
+
+Mirrors the 1688 thrash-signature pattern (:data:`MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS`):
+a flapping A↔B conflict where both branches keep rebasing onto each other
+cannot become an unbounded agent/rebase fire — after this many bounces the
+branch is escalated to the steward.
+
+The count is sha-independent (keyed by branch name in
+:class:`MergeBounceRegistry`) so a successful rebase that advances the HEAD
+still counts toward the cap for this branch lineage.
+"""
+
 MAX_AUTO_CHAINED_GENERATIONS = 2
 """Maximum number of consecutive auto-chained generations per branch lineage (γ2 / PRD D3).
 
@@ -468,6 +501,32 @@ class MainHealthAutoHealRegistry:
         count = self._attempts.get(sig, 0) + 1
         self._attempts[sig] = count
         return count
+
+
+class MergeBounceRegistry:
+    """Monotonic per-branch bounce counter for the η=1892 needs-rebase bounce cap.
+
+    Keyed by branch NAME (sha-independent), so the counter survives the
+    HEAD-SHA churn of repeated rebases.  This is the same robustness principle
+    as the 1688 thrash signature (which is sha-independent), realized here by
+    mirroring :class:`MainHealthAutoHealRegistry`.
+
+    Thread safety: no synchronisation needed — the registry is owned by the
+    merge worker and accessed only from asyncio tasks in the same event loop.
+    """
+
+    def __init__(self) -> None:
+        self._bounces: dict[str, int] = {}
+
+    def count(self, branch: str) -> int:
+        """Return the number of bounces recorded for *branch* (0 if none)."""
+        return self._bounces.get(branch, 0)
+
+    def record_bounce(self, branch: str) -> int:
+        """Increment the bounce counter for *branch* and return the new count."""
+        n = self._bounces.get(branch, 0) + 1
+        self._bounces[branch] = n
+        return n
 
 
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
