@@ -1436,6 +1436,114 @@ class TestUpdateTaskMetadataSerialization:
         assert 'append' not in arguments
 
 
+class TestUpdateTaskStructuredRejection:
+    """update_task must return False when the wire response carries a structured rejection.
+
+    The production HTTP/mcp_call path returns
+      ``{'result': {'structuredContent': {'error_type': ..., 'error': ...}, 'content': [...]}}``.
+    The old hand-rolled check read ``error_type`` off ``content`` (= ``result['result']``),
+    but the field lives one level deeper under ``structuredContent``, so it was always
+    ``None`` and a LockCharterViolation rejection was silently reported as success.
+    The fix delegates to ``extract_structured_rejection(result)`` which correctly
+    unwraps both the ``structuredContent`` and the text-block fallback.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_update_task_returns_false_on_structured_rejection_wire_envelope(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """LockCharterViolation in structuredContent must cause update_task to return False.
+
+        Exercises the exact wire shape returned by the production HTTP path:
+        ``dispatch_tool`` returns ``{'result': {'structuredContent': {...}, 'content': [...]}}``.
+        The old ``content.get('error_type')`` was always ``None`` here (nesting bug);
+        the fix passes the full ``result`` envelope to ``extract_structured_rejection``.
+        """
+        import json
+
+        rejection_payload = {
+            'error': "metadata.files contains directory-shaped entries: ['orchestrator/']",
+            'error_type': 'LockCharterViolation',
+            'directory_paths': ['orchestrator/'],
+        }
+        wire_envelope = {
+            'result': {
+                'structuredContent': rejection_payload,
+                'content': [{'type': 'text', 'text': json.dumps(rejection_payload)}],
+            }
+        }
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            return wire_envelope
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        ok = await scheduler.update_task('1', {'files': ['orchestrator/']})
+        assert ok is False, (
+            'update_task must return False on a LockCharterViolation structured rejection'
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_task_returns_false_on_text_block_only_rejection(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Rejection in a text content block (no structuredContent) must return False.
+
+        Exercises the ``extract_structured_rejection`` text-block fallback — the helper
+        parses the JSON text block when ``structuredContent`` is absent.
+        """
+        import json
+
+        rejection_payload = {'error': 'invalid metadata', 'error_type': 'ValidationError'}
+        wire_envelope = {
+            'result': {
+                'content': [{'type': 'text', 'text': json.dumps(rejection_payload)}],
+            }
+        }
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            return wire_envelope
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        ok = await scheduler.update_task('1', {'files': ['backend/']})
+        assert ok is False, (
+            'update_task must return False on a text-block-only rejection envelope'
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_task_returns_true_on_success_wire_envelope(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Success envelope must not be mis-classified as a rejection (regression guard).
+
+        Pins that ``extract_structured_rejection`` does NOT false-positive on a success
+        response — no top-level ``error`` key and ``success`` is not ``False``.
+        """
+        import json
+
+        success_payload = {'message': 'ok', 'tasks': [{'success': True}]}
+        wire_envelope = {
+            'result': {
+                'structuredContent': success_payload,
+                'content': [{'type': 'text', 'text': json.dumps(success_payload)}],
+            }
+        }
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            return wire_envelope
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        ok = await scheduler.update_task('1', {'files': ['backend/src/main.py']})
+        assert ok is True, 'update_task must return True on a success envelope'
+
+
 class TestRequeueCooldown:
     """Tests for the requeue cooldown that prevents ghost loops."""
 
