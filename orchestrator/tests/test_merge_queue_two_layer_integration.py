@@ -860,16 +860,21 @@ class TestScenario1And8:
         )
 
         # SCENARIO 1 assertion B: no _merge-* worktree created.
+        # Compute unconditionally so the assert always executes (not vacuously
+        # skipped when .worktrees does not exist yet).
         wt_base = git_repo / '.worktrees'
-        if wt_base.exists():
-            merge_dirs = [
+        merge_dirs = (
+            [
                 d for d in wt_base.iterdir()
                 if 'merge' in d.name.lower() or d.name.startswith('_merge')
             ]
-            assert not merge_dirs, (
-                f'Unexpected merge worktree dirs created before verify slot: '
-                f'{merge_dirs!r}'
-            )
+            if wt_base.exists()
+            else []
+        )
+        assert not merge_dirs, (
+            f'Unexpected merge worktree dirs created before verify slot: '
+            f'{merge_dirs!r}'
+        )
 
         # SCENARIO 1 assertion C: conflicting reqs are resolved 'blocked'.
         for rid in conflicting_rids:

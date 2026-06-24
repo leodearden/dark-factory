@@ -4937,7 +4937,6 @@ class MergeWorker(_WipHaltMixin):
             ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
         )
         main_sha = await self._git_ops.get_main_sha()
-        self._last_known_main_sha = main_sha  # λ=1895 cache for snapshot() health surface
         if await self._git_ops.is_ancestor(branch_head.strip(), main_sha):
             # Guard: if worktree has uncommitted changes, an agent may
             # have started work — don't skip.
@@ -6407,7 +6406,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         try:
             # ── inherited checks (base-chain + frozen∩suffix disjointness) ────
-            violations: list[str] = self.check_frozen_prefix_invariant(main_sha)
+            # Skip when main_sha is unavailable ('unknown' sentinel from
+            # snapshot()) to avoid spurious base-chain violations at startup
+            # or after a get_main_sha() failure.  Graph-consistency checks
+            # (i)+(ii) below still run — they don't need main_sha.
+            if main_sha and main_sha != 'unknown':
+                violations: list[str] = self.check_frozen_prefix_invariant(main_sha)
+            else:
+                violations = []
         except Exception as exc:  # pragma: no cover — defensive
             violations = [f'two_layer_invariants: check_frozen_prefix_invariant raised: {exc}']
 
