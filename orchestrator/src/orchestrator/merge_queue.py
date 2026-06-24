@@ -6209,16 +6209,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if has_conflict:
                 textual_edges.add(fp_edge)
 
-        # ── 7. Probe each suffix item vs main_sha (conflicts_with_main marker) ──
-        # This is the δ user-signal: "a new submission that conflicts with main
-        # is marked."  Base = current main_sha.  δ uses bare main per design
-        # decision §δ.5; ε (this task) provides frozen_prefix_tip() as the
-        # seam — η (consumer task) repoints the conflicts_with_main probe base
-        # to frozen_prefix_tip() so the probe correctly targets the frozen tip
-        # rather than raw main when the frozen prefix is non-empty.
-        # Reuses the same _probe_cache by (frozenset({main_sha, head})) key so
-        # if any textual-edge probe already ran main_sha vs head, the result
-        # is returned from cache rather than forking another subprocess.
+        # ── 7. Probe each suffix item vs the frozen-prefix tip (η=1892) ──────────
+        # η repoints the probe base from bare main_sha to frozen_prefix_tip().
+        # When the frozen prefix is non-empty, the tip is the newest frozen
+        # item's merge_commit (the speculative stack top that suffix items must
+        # stack onto); when the frozen prefix is empty, frozen_prefix_tip()
+        # returns main_sha unchanged, so δ's empty-prefix behaviour is
+        # byte-identical to before.  This realizes "bounce the younger, let the
+        # older proceed": the older item is already in the frozen prefix
+        # (verifying), the younger sits in the suffix — probing the suffix item
+        # against the frozen tip flags exactly the younger for a needs_rebase
+        # bounce before it consumes a verify slot.
+        # The _probe_cache is keyed by frozenset({probe_base, head}) so that any
+        # pair already probed in the textual-edge step reuses its cached result.
+        probe_base = self.frozen_prefix_tip(main_sha)
         conflicts_with_main: set[str] = set()
         for k, req in enumerate(suffix):
             head = heads[k]
@@ -6227,16 +6231,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # because we can't even tell if the branch exists; skipping is
                 # safer than always-conflicting for a deleted-branch item).
                 continue
-            cache_key = frozenset({main_sha, head})
+            cache_key = frozenset({probe_base, head})
             if cache_key in _probe_cache:
                 has_main_conflict = _probe_cache[cache_key]
             else:
                 try:
-                    probe = await self._git_ops.merge_tree_conflicts(main_sha, head)
+                    probe = await self._git_ops.merge_tree_conflicts(probe_base, head)
                     has_main_conflict = not probe.clean
                 except Exception:
                     logger.warning(
-                        'recompute_suffix_conflict_graph: merge_tree_conflicts(main, %s) '
+                        'recompute_suffix_conflict_graph: merge_tree_conflicts(frozen_tip, %s) '
                         'raised for item %s; treating as conflicts_with_main (fail-open)',
                         head, req.request_id,
                         exc_info=True,
