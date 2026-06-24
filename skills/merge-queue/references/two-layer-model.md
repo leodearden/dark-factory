@@ -80,9 +80,11 @@ The item with the smallest `_aging_key` (oldest first submission) has priority. 
 - **Landing rate ≈ 0** (no increase in `landings_total`)
 - **Warm-lane free bytes falling** (disk pressure building)
 
-On trigger, the breaker:
+On trigger, `NoLandingsCircuitBreaker.observe()` emits a `BreakerTrip` decision object.  The Harness pass (`_run_no_landings_breaker_pass`, harness.py) acts on that decision:
 1. Calls `force_halt_scheduler` to stop dispatch.
 2. Files an L2-INFO escalation (role `orchestrator-no-landings-breaker`).
+
+The breaker itself is a pure read/decide component; the Harness pass owns all side effects.
 
 **Auto-resume:** when a clean landing occurs (`landings_total` rises) or disk recovers, the breaker transitions to RECOVERING and emits a resume signal.
 
@@ -105,19 +107,20 @@ On trigger, the breaker:
 
 | Symbol | Location | Description |
 |--------|----------|-------------|
-| `NEEDS_REBASE_REASON_PREFIX` | merge_queue.py:162 | Prefix of the `needs_rebase` bounce reason string |
-| `MERGE_BOUNCE_CAP` | merge_queue.py:181 | Max bounce count before thrash-backstop triggers (= 3) |
-| `_aging_key(req)` | merge_queue.py:303 | Sort key: `(merge_first_enqueued_at or enqueued_at, request_id)` |
-| `merge_first_enqueued_at` | merge_queue.py:3525 | Write-once field: epoch of first submission to the merge queue |
-| `SuffixConflictGraph` | merge_queue.py:3821 | In-memory conflict graph over the unfrozen suffix |
-| `NoLandingsCircuitBreaker` | merge_queue.py:5272 | No-landings circuit-breaker (θ=1893) |
-| `_pop_next_pickable()` | merge_queue.py:~6193 | Select next item using clique-scoped aging (ζ=1891) |
-| `frozen_prefix()` | merge_queue.py:6270 | Return ordered `request_id`s in the frozen prefix |
-| `frozen_prefix_tip()` | merge_queue.py:6310 | Return the base SHA for next verify dispatch |
-| `check_frozen_prefix_invariant()` | merge_queue.py:6324 | §5.3 I1+I2 violations (base-chain integrity) |
-| `two_layer_invariants()` | merge_queue.py:6376 | All §5.3 violations (I1–I4 + graph consistency) |
-| `recompute_suffix_conflict_graph()` | merge_queue.py:6491 | Recompute the conflict graph; triggers bounce |
-| `_bounce_conflicting_suffix_items()` | merge_queue.py:6737 | Graph-time disk-free bounce of the younger conflicting item |
+| `NEEDS_REBASE_REASON_PREFIX` | merge_queue.py | Prefix of the `needs_rebase` bounce reason string |
+| `MERGE_BOUNCE_CAP` | merge_queue.py | Max bounce count before thrash-backstop triggers (= 3) |
+| `_aging_key(req)` | merge_queue.py | Sort key: `(merge_first_enqueued_at or enqueued_at, request_id)` |
+| `merge_first_enqueued_at` | merge_queue.py | Write-once field: epoch of first submission to the merge queue |
+| `SuffixConflictGraph` | merge_queue.py | In-memory conflict graph over the unfrozen suffix |
+| `NoLandingsCircuitBreaker` | merge_queue.py | No-landings circuit-breaker decision object (θ=1893) |
+| `_pop_next_pickable()` | merge_queue.py | Select next item using clique-scoped aging (ζ=1891) |
+| `frozen_prefix()` | merge_queue.py | Return ordered `request_id`s in the frozen prefix |
+| `frozen_prefix_tip()` | merge_queue.py | Return the base SHA for next verify dispatch |
+| `check_frozen_prefix_invariant()` | merge_queue.py | §5.3 I1+I2 violations (base-chain integrity) |
+| `two_layer_invariants()` | merge_queue.py | All §5.3 violations (I1–I4 + graph consistency) |
+| `recompute_suffix_conflict_graph()` | merge_queue.py | Recompute the conflict graph; triggers bounce |
+| `_bounce_conflicting_suffix_items()` | merge_queue.py | Graph-time disk-free bounce of the younger conflicting item |
+| `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
 
 ---
 
@@ -154,4 +157,4 @@ Together: G < 1 (self-damping) under normal operating conditions.
 ## 10. Related work
 
 - **Warm-lane Δp space-safety batch (1859–1861 / reify 4716–4719):** attacks Δp on the *task-dispatch* path (warm-lane disk-space gates before a task is dispatched).  Complementary to the merge-queue-path Δp attacked here; no shared seam between the two mitigations.
-- **Merge-verify ENOSPC fail-soft (workflow.py:5089 transient-infra block → re-queue):** handles ENOSPC at the individual verify step by re-queuing as a transient infra failure.  This is a **separate symptom task** and is explicitly **out of scope** for the two-layer merge queue (PRD §10).  Referenced here for orientation; see `workflow.py:5089` for the implementation.
+- **Merge-verify ENOSPC fail-soft (workflow.py `TRANSIENT_INFRA_REASON_PREFIX` branch → re-queue):** handles ENOSPC at the individual verify step by re-queuing as a transient infra failure.  This is a **separate symptom task** and is explicitly **out of scope** for the two-layer merge queue (PRD §10).  Referenced here for orientation; see the `TRANSIENT_INFRA_REASON_PREFIX` short-circuit branch in `workflow.py` for the implementation.
