@@ -563,3 +563,249 @@ class TestTwoLayerInvariants:
             f'Pre-existing snapshot keys missing after adding two_layer_invariants: '
             f'{missing!r}'
         )
+
+
+# ── step-03 RED: §9 scenario 1 (textual conflict bounces disk-free)
+#                + scenario 8 (contract textual⇒overlap) via REAL pipeline ────
+
+
+@pytest.mark.asyncio
+class TestScenario1And8:
+    """§9 scenario 1 + 8: REAL branches, REAL recompute, DEFAULT detector.
+
+    Integration delta: the upstream unit suites hand-seed _suffix_conflict_graph;
+    this class drives recompute_suffix_conflict_graph() against REAL git branches
+    so the real graph flows into bounce and the textual⇒overlap contract is
+    verified end-to-end.
+
+    Scenario 8 (textual⇒overlap contract):
+      Two branches editing the SAME line of shared.txt produce a pair that is in
+      BOTH footprint_edges (path-overlap) AND textual_edges (3-way conflict), and
+      textual_edges ⊆ footprint_edges holds.
+
+    Scenario 1 (textual conflict bounces disk-free):
+      The conflicting suffix item is diverted via _bounce_conflicting_suffix_items()
+      BEFORE any verify slot: _verifier_queue is empty and no _merge-* worktree
+      directory was created.
+
+    RED until the suite lands (the recompute / bounce composition has no known
+    gap — these tests exercise the already-deployed wiring at the integration
+    boundary; they are expected to go GREEN without production changes).
+    """
+
+    async def _setup_real_conflict_branches(
+        self,
+        git_repo: Path,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+    ) -> tuple[SpeculativeMergeWorker, MergeRequest, MergeRequest, str]:
+        """Create two conflicting branches + a frozen-tip InflightEntry.
+
+        Returns (worker, req_a, req_b, frozen_tip_sha) where:
+          req_a — older (merge_first_enqueued_at=100.0), edits shared.txt line2→BRANCH-A
+          req_b — younger (merge_first_enqueued_at=300.0), edits shared.txt line2→BRANCH-B
+          frozen_tip_sha — SHA of the frozen-tip commit (on a side branch, not main)
+
+        Both branches conflict with each other AND with the frozen tip (all edit
+        the same line of shared.txt).  The frozen prefix holds the frozen-tip
+        entry so frozen_prefix_tip() → frozen_tip_sha ≠ main_sha.
+        """
+        # 1. Create the frozen-tip commit on a SIDE branch (NOT on main) so that
+        #    main_sha stays at the initial commit M0.  frozen_prefix_tip will then
+        #    be this side-branch SHA (derived from the frozen entry's merge_commit).
+        frozen_tip_sha = await _create_branch_editing(
+            git_repo, 'task/frozen-tip', 'shared.txt',
+            'line1\nFROZEN-LINE2\nline3\n',
+        )
+
+        # 2. Create suffix branches off M0, both editing line2 differently.
+        await _create_branch_editing(
+            git_repo, 'task/branch-a', 'shared.txt', 'line1\nBRANCH-A-LINE2\nline3\n',
+        )
+        await _create_branch_editing(
+            git_repo, 'task/branch-b', 'shared.txt', 'line1\nBRANCH-B-LINE2\nline3\n',
+        )
+
+        # 3. Build worker.
+        worker = _make_worker(git_ops)
+
+        # 4. Populate frozen prefix with the frozen-tip commit as merge_commit.
+        #    base_sha = main_sha at initial commit (any real SHA — the chain
+        #    integrity check would be tested separately; here we just need
+        #    frozen_prefix_tip() to return frozen_tip_sha).
+        _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        main_sha_at_m0 = main_sha_raw.strip()
+        _, item_frozen = _make_fake_item(
+            'frozen-task',
+            base_sha=main_sha_at_m0,
+            merge_commit=frozen_tip_sha,
+            config=config,
+            git_repo=git_repo,
+        )
+        entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
+        worker._inflight.append(entry_frozen)
+
+        # 5. Put the two suffix requests in the normal lane (A is FIFO-head).
+        req_a = _make_req(
+            'branch-a', 'branch-a', config, git_repo,
+            merge_first_enqueued_at=100.0,
+        )
+        req_b = _make_req(
+            'branch-b', 'branch-b', config, git_repo,
+            merge_first_enqueued_at=300.0,
+        )
+        worker._lane_buffers['normal'].extend([req_a, req_b])
+
+        return worker, req_a, req_b, frozen_tip_sha
+
+    async def test_scenario_8_textual_subset_of_footprint(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """Scenario 8: the conflicting pair is in BOTH textual_edges AND footprint_edges,
+        and textual_edges ⊆ footprint_edges holds — verified through the REAL pipeline.
+        """
+        worker, req_a, req_b, _ = await self._setup_real_conflict_branches(
+            git_repo, config, git_ops,
+        )
+
+        await worker.recompute_suffix_conflict_graph()
+
+        graph = worker._suffix_conflict_graph
+        edge = frozenset({req_a.request_id, req_b.request_id})
+
+        # Both branches edit shared.txt → footprint overlap.
+        assert edge in graph.footprint_edges, (
+            f'Expected footprint edge {{A,B}} but footprint_edges={graph.footprint_edges!r}'
+        )
+
+        # Both branches edit the SAME LINE → textual conflict.
+        assert edge in graph.textual_edges, (
+            f'Expected textual edge {{A,B}} but textual_edges={graph.textual_edges!r}'
+        )
+
+        # Contract: textual_edges ⊆ footprint_edges.
+        assert graph.textual_edges <= graph.footprint_edges, (
+            f'textual_edges ⊄ footprint_edges! '
+            f'textual_edges={graph.textual_edges!r}, '
+            f'footprint_edges={graph.footprint_edges!r}'
+        )
+
+    async def test_scenario_8_conflicts_with_main_flagged(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """Scenario 8 + 1 setup: after recompute, at least one suffix item is in
+        conflicts_with_main (conflicts with the frozen tip).
+        """
+        worker, req_a, req_b, frozen_tip_sha = await self._setup_real_conflict_branches(
+            git_repo, config, git_ops,
+        )
+
+        await worker.recompute_suffix_conflict_graph()
+
+        graph = worker._suffix_conflict_graph
+
+        # At least one (likely both) suffix items conflict with the frozen tip.
+        conflicting = {req_a.request_id, req_b.request_id} & graph.conflicts_with_main
+        assert conflicting, (
+            f'Expected at least one suffix item in conflicts_with_main but got '
+            f'conflicts_with_main={graph.conflicts_with_main!r}.  '
+            f'frozen_prefix_tip should be the frozen-tip SHA; both suffix branches '
+            f'edit the same line of shared.txt as the frozen tip.'
+        )
+
+    async def test_scenario_1_bounce_before_verify_slot(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """Scenario 1: the conflicting item is bounced BEFORE any verify slot.
+
+        After _bounce_conflicting_suffix_items() (with rebase_onto_main stubbed):
+          - _verifier_queue is empty (qsize == 0): no verify slot consumed.
+          - No _merge-* worktree directory was created under git_repo.
+          - The conflicting req(s) are either re-queued (rebase=True) or
+            resolved 'blocked' with NEEDS_REBASE_REASON_PREFIX (rebase=False).
+        """
+        worker, req_a, req_b, _ = await self._setup_real_conflict_branches(
+            git_repo, config, git_ops,
+        )
+
+        await worker.recompute_suffix_conflict_graph()
+
+        graph = worker._suffix_conflict_graph
+        conflicting_rids = {req_a.request_id, req_b.request_id} & graph.conflicts_with_main
+        assert conflicting_rids, 'precondition: at least one item must be in conflicts_with_main'
+
+        # Stub rebase → False: real conflict → item removed, future 'blocked'.
+        worker._git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        await worker._bounce_conflicting_suffix_items()
+
+        # SCENARIO 1 assertion A: _verifier_queue is empty — no verify slot consumed.
+        assert worker._verifier_queue.qsize() == 0, (
+            f'Expected _verifier_queue empty (no verify slot) but qsize='
+            f'{worker._verifier_queue.qsize()}'
+        )
+
+        # SCENARIO 1 assertion B: no _merge-* worktree created.
+        wt_base = git_repo / '.worktrees'
+        if wt_base.exists():
+            merge_dirs = [
+                d for d in wt_base.iterdir()
+                if 'merge' in d.name.lower() or d.name.startswith('_merge')
+            ]
+            assert not merge_dirs, (
+                f'Unexpected merge worktree dirs created before verify slot: '
+                f'{merge_dirs!r}'
+            )
+
+        # SCENARIO 1 assertion C: conflicting reqs are resolved 'blocked'.
+        for rid in conflicting_rids:
+            req = req_a if rid == req_a.request_id else req_b
+            assert req.result.done(), (
+                f'Expected req {rid!r} to be resolved after bounce (rebase=False)'
+            )
+            outcome = req.result.result()
+            assert outcome.status == 'blocked', (
+                f'Expected status=blocked for bounced req {rid!r}, got {outcome.status!r}'
+            )
+            assert outcome.reason is not None
+            assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+                f'Expected reason to start with NEEDS_REBASE_REASON_PREFIX for {rid!r}, '
+                f'got {outcome.reason!r}'
+            )
+
+    async def test_scenario_1_two_layer_invariants_holds_before_bounce(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """two_layer_invariants() == [] holds before the bounce (frozen prefix intact).
+
+        The frozen-prefix chain is well-formed even with conflicting suffix items —
+        the invariant only cares about the frozen prefix structure, not whether
+        suffix items conflict.
+        """
+        worker, req_a, req_b, _ = await self._setup_real_conflict_branches(
+            git_repo, config, git_ops,
+        )
+
+        await worker.recompute_suffix_conflict_graph()
+
+        # Get the actual main SHA for the invariant check.
+        _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        main_sha = main_sha_raw.strip()
+
+        violations = worker.two_layer_invariants(main_sha)
+        assert violations == [], (
+            f'Expected two_layer_invariants == [] before bounce (frozen prefix is '
+            f'well-formed) but got: {violations!r}'
+        )
