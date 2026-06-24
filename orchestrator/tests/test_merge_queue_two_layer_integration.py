@@ -1493,3 +1493,199 @@ class TestScenario6FrontierImmutableUnderReorder:
         assert violations_after == [], (
             f'two_layer_invariants after reorder: {violations_after!r}'
         )
+
+
+# ── step-13 RED: §9 scenario 9 (circuit-breaker fires + escalates + resumes)
+#                via REAL Harness + REAL SpeculativeMergeWorker ────────────────
+
+
+@pytest.mark.asyncio
+class TestScenario9CircuitBreaker:
+    """§9 scenario 9: circuit-breaker fires + escalates + resumes.
+
+    Integration delta over upstream θ test (test_harness_no_landings_breaker.py):
+      - Upstream test used a MagicMock worker with worker.snapshot() hard-coded.
+      - This suite attaches a REAL SpeculativeMergeWorker; the breaker reads
+        ι's REAL landings_total from worker.snapshot()['metrics']['landings_total'].
+      - Resume is driven by calling worker._merge_metrics.record_landing() so
+        that the next snapshot() increments landings_total — proving the breaker
+        reads the live ι counter, not a stub.
+
+    Fake/instrumented runners: shutil.disk_usage patched; no real ssh/build.
+
+    RED until the suite lands.
+    """
+
+    async def _drive_to_trip(
+        self,
+        harness,
+        worker,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        window: int = 3,
+    ) -> None:
+        """Drive the breaker to tripped + scheduler halted state.
+
+        Adds a fake req to the worker's lane buffer so snapshot()['depth'] > 0
+        (required to pass the idle-queue guard in _run_no_landings_breaker_pass).
+        landings_total stays flat (no record_landing() calls).
+        """
+        # Add a queued req so depth > 0 (idle-queue guard bypass).
+        req = MergeRequest(
+            task_id='breaker-dummy',
+            branch='breaker-dummy',
+            worktree=git_repo,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=asyncio.get_running_loop().create_future(),
+        )
+        worker._lane_buffers['normal'].append(req)
+
+        disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
+        with patch('shutil.disk_usage') as mock_du:
+            mock_du.side_effect = lambda _p: MagicMock(free=next(disk_iter))
+            for _ in range(window):
+                await harness._run_no_landings_breaker_pass()
+
+    async def test_fire_halts_scheduler_with_real_worker(
+        self, tmp_path: Path, git_repo: Path, config: OrchestratorConfig,
+        git_ops: GitOps,
+    ) -> None:
+        """FIRE: flat landings_total + falling disk → scheduler paused.
+
+        The breaker reads landings_total from the REAL worker snapshot(),
+        not from a MagicMock stub.
+        """
+        harness, _rs = _make_harness(tmp_path)
+        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        worker = _attach_real_worker(harness, git_ops)
+
+        # landings_total starts at 0 and stays flat (no record_landing calls).
+        assert worker.snapshot()['metrics']['landings_total'] == 0
+
+        await self._drive_to_trip(harness, worker, config, git_repo, window=3)
+
+        assert harness.scheduler.is_paused, (
+            'scheduler should be paused after trip window with flat landings_total '
+            'from real worker snapshot()'
+        )
+
+    async def test_fire_files_info_escalation_with_real_worker(
+        self, tmp_path: Path, git_repo: Path, config: OrchestratorConfig,
+        git_ops: GitOps,
+    ) -> None:
+        """FIRE: after trip, exactly one pending INFO escalation with correct attrs."""
+        harness, _rs = _make_harness(tmp_path)
+        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        worker = _attach_real_worker(harness, git_ops)
+
+        await self._drive_to_trip(harness, worker, config, git_repo, window=3)
+
+        assert harness._escalation_queue is not None
+        pending = [
+            e
+            for e in harness._escalation_queue.get_by_task(
+                _BREAKER_SENTINEL, status='pending'
+            )
+            if e.agent_role == _BREAKER_ROLE
+        ]
+        assert len(pending) == 1, (
+            f'Expected 1 pending breaker INFO escalation, got {len(pending)}'
+        )
+        esc = pending[0]
+        assert esc.severity == 'info'
+        assert esc.level == 0
+        assert esc.category == 'risk_identified'
+        assert esc.task_id == _BREAKER_SENTINEL
+
+    async def test_resume_via_real_landing_unpauses_scheduler(
+        self, tmp_path: Path, git_repo: Path, config: OrchestratorConfig,
+        git_ops: GitOps,
+    ) -> None:
+        """RESUME: recording a REAL landing via worker._merge_metrics.record_landing()
+        increments landings_total in snapshot(); the next breaker pass unpauses
+        the scheduler and resolves the open INFO escalation.
+
+        This is the integration delta: the upstream θ test stubbed the worker's
+        snapshot() — here the real ι counter drives the resume.
+        """
+        harness, _rs = _make_harness(tmp_path)
+        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        worker = _attach_real_worker(harness, git_ops)
+
+        # Trip the breaker.
+        await self._drive_to_trip(harness, worker, config, git_repo, window=3)
+        assert harness.scheduler.is_paused, 'precondition: scheduler must be paused'
+
+        # Confirm escalation was filed.
+        assert harness._escalation_queue is not None
+        before_pending = [
+            e
+            for e in harness._escalation_queue.get_by_task(
+                _BREAKER_SENTINEL, status='pending'
+            )
+            if e.agent_role == _BREAKER_ROLE
+        ]
+        assert before_pending, 'precondition: INFO escalation must be filed'
+
+        # Drive a REAL landing via the ι counter (integration delta).
+        # The breaker's resume condition: landings_total > landings_at_trip.
+        landings_at_trip = worker.snapshot()['metrics']['landings_total']
+        worker._merge_metrics.record_landing()
+        assert worker.snapshot()['metrics']['landings_total'] == landings_at_trip + 1
+
+        # Recovery pass with disk OK.
+        with patch('shutil.disk_usage') as mock_du:
+            mock_du.return_value = MagicMock(free=150_000)
+            await harness._run_no_landings_breaker_pass()
+
+        # Scheduler unpaused.
+        assert not harness.scheduler.is_paused, (
+            'scheduler should be unpaused after real landing increments landings_total'
+        )
+
+        # Breaker INFO escalation resolved.
+        after_pending = [
+            e
+            for e in harness._escalation_queue.get_by_task(
+                _BREAKER_SENTINEL, status='pending'
+            )
+            if e.agent_role == _BREAKER_ROLE
+        ]
+        assert not after_pending, (
+            f'Expected 0 pending breaker INFO escalations after resume via real '
+            f'landing, got {len(after_pending)}'
+        )
+
+    async def test_fire_dedup_one_escalation_with_real_worker(
+        self, tmp_path: Path, git_repo: Path, config: OrchestratorConfig,
+        git_ops: GitOps,
+    ) -> None:
+        """Multiple passes after trip do not stack duplicate escalations (dedup)."""
+        harness, _rs = _make_harness(tmp_path)
+        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        worker = _attach_real_worker(harness, git_ops)
+
+        # Trip then run 3 more passes.
+        await self._drive_to_trip(harness, worker, config, git_repo, window=3)
+
+        # Add more falling-disk passes while still tripped.
+        disk_iter = _make_falling_disk_iter(start=150_000, drop=5_000)
+        with patch('shutil.disk_usage') as mock_du:
+            mock_du.side_effect = lambda _p: MagicMock(free=next(disk_iter))
+            for _ in range(3):
+                await harness._run_no_landings_breaker_pass()
+
+        assert harness._escalation_queue is not None
+        all_pending = [
+            e
+            for e in harness._escalation_queue.get_by_task(
+                _BREAKER_SENTINEL, status='pending'
+            )
+            if e.agent_role == _BREAKER_ROLE
+        ]
+        assert len(all_pending) == 1, (
+            f'Expected exactly 1 breaker INFO escalation (dedup), got {len(all_pending)}'
+        )
