@@ -23,6 +23,7 @@ from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.merge_queue import (
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     MERGE_LANES,
+    NEEDS_REBASE_REASON_PREFIX,
     TRAIN_INCOMPLETE_REASON_PREFIX,
     TRAIN_PARTIAL_FLIP_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
@@ -2029,8 +2030,13 @@ class TestSpeculativeMergeWorker:
     async def test_speculative_conflict_n_plus_1(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """N merges cleanly; N+1 conflicts when speculatively merged.
-        N completes as 'done'; N+1 returns 'conflict'.
+        """N merges cleanly; N+1 conflicts with the frozen-prefix tip.
+
+        task-1892 reclassification: a suffix item that conflicts with the
+        frozen-prefix tip is diverted by _bounce_conflicting_suffix_items and
+        resolves 'blocked' (the speculative rebase-conflict escalation path)
+        instead of the older out-of-band 'conflict' delivery.  The safety property
+        is unchanged: N lands, the conflicting N+1 never lands on main.
         """
         wt_n = await _make_branch_with_file(
             git_ops, 'cfl-n', 'file_cfl_n.py', 'cfl_n = 1\n',
@@ -2060,8 +2066,19 @@ class TestSpeculativeMergeWorker:
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
 
         assert outcome_n.status == 'done', f'N: {outcome_n}'
-        assert outcome_n1.status == 'conflict', f'N+1: {outcome_n1}'
-        assert outcome_n1.conflict_details
+        # task-1892: conflict surfaces as a 'blocked' rebase-conflict escalation.
+        assert outcome_n1.status == 'blocked', f'N+1: {outcome_n1}'
+        assert NEEDS_REBASE_REASON_PREFIX in outcome_n1.reason, (
+            f'Expected rebase-conflict escalation reason, got: {outcome_n1.reason!r}'
+        )
+
+        # Safety property (unchanged): the conflicting N+1 content must NOT land.
+        _, main_readme, _ = await _run(
+            ['git', 'show', 'main:README.md'], cwd=git_ops.project_root,
+        )
+        assert 'N+1 conflict' not in main_readme, (
+            'conflicting N+1 content must not land on main'
+        )
 
         await worker.stop()
         await worker_task
@@ -2265,21 +2282,25 @@ class TestSpeculativeMergeWorker:
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
             assert outcome_n1.status in ('done', 'blocked'), f'N+1: {outcome_n1}'
 
-        # _speculation_slot must have a free permit after all items drain.
-        # Yield several event-loop iterations so:
-        #   (1) _run_inflight_verify completes any awaits it makes after raising
-        #       (the task future resolves with the exception);
-        #   (2) _finalize_inflight's finally block runs and releases the slot;
-        #   (3) the merger acquires the just-released permit for its next
-        #       look-ahead, finds the queue empty, and releases it again;
-        #   (4) the merger blocks at _acquire_next_request() — slot is free.
-        # Without these yields the assertion races with the still-running merger.
-        for _ in range(10):
-            await asyncio.sleep(0)
-        assert not worker._speculation_slot.locked(), (
-            '_speculation_slot locked after all items drained — '
-            'merger will deadlock on next request'
-        )
+            # No-deadlock proof (task 1862): after a verifier exception the merger
+            # must still process a FRESH request.  Under task-1862 the merger may
+            # legitimately hold the single K=1 speculation permit while idle (it is
+            # retained for a late-arriving successor and released on the next
+            # dequeue or in-flight drain), so asserting `not locked()` while idle is
+            # a stale check.  The real invariant — the merger is NOT permanently
+            # wedged — is proven directly: a freshly submitted request resolves to a
+            # terminal outcome within a bounded wait (the retained permit is
+            # released the moment this dequeue arrives).
+            wt_fresh = await _make_branch_with_file(
+                git_ops, 'vex-fresh', 'file_vex_fresh.py', 'fresh = 3\n',
+            )
+            req_fresh = _make_request('vex-fresh', 'vex-fresh', wt_fresh, config)
+            await queue.put(req_fresh)
+            outcome_fresh = await asyncio.wait_for(req_fresh.result, timeout=30)
+            assert outcome_fresh.status in ('done', 'blocked'), (
+                f'merger wedged after verifier exception — a fresh request did not '
+                f'resolve (deadlock); got: {outcome_fresh}'
+            )
 
         await worker.stop()
         await worker_task
@@ -2335,16 +2356,26 @@ class TestSpeculativeMergeWorker:
             )
             assert '_remerge failed' in outcome_n1.reason
 
-        # _speculation_slot must have a free permit after all items drain.
-        # Yield several event-loop iterations: the verifier's finally releases
-        # the slot, the merger acquires it for its next look-ahead, finds the
-        # queue empty, and releases it — all before this assertion runs.
-        for _ in range(10):
-            await asyncio.sleep(0)
-        assert not worker._speculation_slot.locked(), (
-            '_speculation_slot locked after _remerge exception — '
-            'merger will deadlock on next request'
-        )
+            # No-deadlock proof (task 1862): after the _remerge exception the
+            # merger must still process a FRESH request.  Under task-1862 the
+            # merger may legitimately hold the single K=1 speculation permit while
+            # idle (retained for a late-arriving successor, released on the next
+            # dequeue or in-flight drain), so an idle `not locked()` check is stale.
+            # The real invariant — no permanent wedge — is proven directly: a
+            # freshly submitted request resolves to a terminal outcome within a
+            # bounded wait.  (N originally failed verification via the
+            # passed=False mock, so this fresh request verifies the same way and
+            # resolves 'blocked'; the point is that it resolves at all.)
+            wt_fresh = await _make_branch_with_file(
+                git_ops, 'vre-fresh', 'file_vre_fresh.py', 'fresh = 3\n',
+            )
+            req_fresh = _make_request('vre-fresh', 'vre-fresh', wt_fresh, config)
+            await queue.put(req_fresh)
+            outcome_fresh = await asyncio.wait_for(req_fresh.result, timeout=30)
+            assert outcome_fresh.status in ('done', 'blocked'), (
+                f'merger wedged after _remerge exception — a fresh request did not '
+                f'resolve (deadlock); got: {outcome_fresh}'
+            )
 
         await worker.stop()
         await worker_task
@@ -2547,6 +2578,18 @@ class TestSpeculativeMergeWorker:
         With fix: inner try/except Exception in the loop body resolves the in-flight
         req.result as 'blocked' (with the error message) and continues to the next
         request, keeping the merger loop alive.
+
+        Fault-injection note (task-1889/1892 reconcile): the merger's
+        _acquire_next_request now calls get_main_sha() inside
+        recompute_suffix_conflict_graph() (and possibly _bounce_conflicting_suffix_items)
+        BEFORE the request is dequeued — and those sites are fail-open (they catch and
+        log, never raise into the loop body).  A plain "raise on the first call"
+        fault is therefore swallowed there and never reaches the merger-loop body
+        that this test means to exercise.  We instead fault get_main_sha ONLY when an
+        in-flight request is set (worker._inflight_req is not None) — i.e. when called
+        from the loop body at the merge step (merge_queue.py:8271), after
+        _inflight_req=req is set (:8243) but before the SpeculativeItem is enqueued —
+        which is exactly the regression point.
         """
         wt_n = await _make_branch_with_file(
             git_ops, 'mef-n', 'file_mef_n.py', 'n = 1\n',
@@ -2559,14 +2602,17 @@ class TestSpeculativeMergeWorker:
         worker = SpeculativeMergeWorker(git_ops, queue)
         worker_task = asyncio.create_task(worker.run())
 
-        # get_main_sha raises RuntimeError on the first call, succeeds after
+        # get_main_sha raises RuntimeError on the FIRST loop-body call (i.e. once an
+        # in-flight request is set), and succeeds otherwise.  Gating on
+        # worker._inflight_req keeps the fail-open recompute/bounce calls (which run
+        # before _inflight_req is set) from absorbing the fault.
         original_get_main_sha = git_ops.get_main_sha
-        call_count = 0
+        loop_body_fault_fired = False
 
         async def failing_get_main_sha():  # type: ignore[no-untyped-def]
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+            nonlocal loop_body_fault_fired
+            if worker._inflight_req is not None and not loop_body_fault_fired:
+                loop_body_fault_fired = True
                 raise RuntimeError('Simulated get_main_sha failure')
             return await original_get_main_sha()
 
@@ -3109,7 +3155,16 @@ class TestSpeculativeMergeWorker:
     ):
         """Merger-phase emit sites set non-null duration_ms.
 
-        Covers already_merged and conflict outcomes emitted from _merger_loop.
+        Regression guard: every merge_attempt event emitted from the merger phase
+        must carry a non-null duration_ms (a NULL would break duration analytics).
+
+        Scenario A covers the already_merged outcome (a merger-phase merge_attempt).
+        Scenario B covers a conflicting request: task-1892 diverts it via
+        _bounce_conflicting_suffix_items so it resolves 'blocked' and emits NO
+        merger-phase merge_attempt event at all (the bounce path emits nothing).
+        The guard still holds — there must be no merge_attempt row with a NULL
+        duration_ms in either scenario — and we additionally pin the new 'blocked'
+        classification of the conflicting request.
         """
         # --- Scenario A: already_merged (merger phase) ---
         db_a = tmp_path / 'events_sphase_a.db'
@@ -3182,7 +3237,11 @@ class TestSpeculativeMergeWorker:
             out_cfl = await asyncio.wait_for(req_cfl.result, timeout=30)
 
         assert out_n2.status == 'done', f'N2: {out_n2}'
-        assert out_cfl.status == 'conflict', f'Conflict: {out_cfl}'
+        # task-1892: the conflicting request is diverted to 'blocked'.
+        assert out_cfl.status == 'blocked', f'Conflict: {out_cfl}'
+        assert NEEDS_REBASE_REASON_PREFIX in out_cfl.reason, (
+            f'Expected rebase-conflict escalation reason, got: {out_cfl.reason!r}'
+        )
         await w_b.stop()
         await wt_b
 
@@ -3192,7 +3251,13 @@ class TestSpeculativeMergeWorker:
             "FROM events WHERE event_type = 'merge_attempt'"
         ).fetchall()
         conn.close()
-        assert all(r[1] is not None for r in rows_b), f'NULL duration_ms in conflict scenario: {rows_b}'
+        # Regression guard: no emitted merge_attempt may have a NULL duration_ms.
+        # (The bounced conflict emits no merge_attempt; N2's 'done' does, and must
+        # carry a duration.)  Confirm at least N2's done row is present and timed.
+        assert all(r[1] is not None for r in rows_b), f'NULL duration_ms in scenario B: {rows_b}'
+        assert any(r[0] == 'done' and r[1] is not None for r in rows_b), (
+            f"N2's merger-phase 'done' merge_attempt must carry a duration_ms: {rows_b}"
+        )
 
     async def test_speculative_remerge_preserves_duration_ms(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -3331,14 +3396,19 @@ class TestSpeculativeMergeWorker:
     async def test_oob_delivery_nonspec_conflict(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """Non-spec conflict: merger resolves req.result OOB at detection time.
+        """Non-spec conflict: merger resolves req.result before any verify work.
 
-        Drive _merger_loop() directly with a single conflicting non-speculative
-        request.  With OOB delivery the merger must resolve req.result to
-        'conflict' before the verifier runs.  The enqueued SpeculativeItem must
-        carry already_delivered=True.
+        task-1892 reclassification: a request that conflicts with the frozen-prefix
+        tip (here the bare-main tip, since the prefix is empty) is diverted by
+        _bounce_conflicting_suffix_items inside _acquire_next_request — BEFORE it is
+        ever dequeued and built — and resolved 'blocked' (the rebase-conflict
+        escalation path).  This supersedes the older out-of-band 'conflict'
+        delivery: the conflicting item is never enqueued to the verifier queue at
+        all, so it can never consume a verify slot or land.
 
-        RED before step-4 impl: req.result is not resolved by the merger.
+        The invariant this test protects is unchanged: the merger resolves the
+        conflicting request to a terminal outcome eagerly (before any verifier
+        processing), and the conflicting item never reaches the verifier queue.
         """
         # Worktree created BEFORE the main-side README.md change so the merge
         # base is the initial main.  Both sides then diverge on README.md →
@@ -3361,33 +3431,50 @@ class TestSpeculativeMergeWorker:
 
         await worker._merger_loop()
 
-        # Merger must have resolved req.result at conflict-detection time
+        # Merger must have resolved req.result eagerly (before any verify work).
         assert req.result.done(), (
-            'OOB delivery: req.result must be resolved by the merger before '
-            'the verifier dequeues the SpeculativeItem'
+            'merger must resolve a conflicting request before the verifier '
+            'processes any item'
         )
-        assert req.result.result().status == 'conflict', (
-            f'Expected conflict, got {req.result.result().status!r}'
+        # task-1892: the conflict surfaces as a 'blocked' rebase-conflict escalation.
+        assert req.result.result().status == 'blocked', (
+            f'Expected blocked, got {req.result.result().status!r}'
+        )
+        assert NEEDS_REBASE_REASON_PREFIX in req.result.result().reason, (
+            f'Expected rebase-conflict escalation reason, got: '
+            f'{req.result.result().reason!r}'
         )
 
-        # The ordering token must be flagged so the verifier skips set_result
-        item = worker._verifier_queue.get_nowait()
-        assert isinstance(item, SpeculativeItem)
-        assert item.already_delivered is True, (
-            'Non-spec conflict SpeculativeItem must have already_delivered=True'
+        # The conflicting item must NEVER reach the verifier queue — it was bounced
+        # before dequeue, so the only thing the verifier sees is the shutdown
+        # sentinel.  (No SpeculativeItem can ever consume a verify slot or land.)
+        items: list[SpeculativeItem | None] = []
+        while not worker._verifier_queue.empty():
+            items.append(worker._verifier_queue.get_nowait())
+        assert all(it is None for it in items), (
+            f'a bounced conflicting request must not be enqueued to the verifier '
+            f'queue; found SpeculativeItem(s): {items!r}'
         )
 
     async def test_oob_not_delivered_for_speculative_conflict(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """Speculative conflict is NOT OOB-delivered — it rides through the verifier FIFO.
+        """A conflicting suffix item is diverted to 'blocked', never OOB 'conflict'.
 
-        Pre-load N (clean) + M (conflicting) so M is speculatively prefetched.
-        Assert req_M.result stays pending and M's ordering token has
-        already_delivered=False and speculative=True — locking the
-        'not speculative' predicate clause.
+        Pre-load N (clean) + M (conflicting with the frozen prefix).
 
-        Passes both before and after step-4 impl (negative/guard test).
+        task-1892 reclassification: M is diverted by _bounce_conflicting_suffix_items
+        and resolved 'blocked' (the rebase-conflict escalation) — it is NEVER
+        prefetched as a speculative item and never rides the verifier FIFO.  This
+        supersedes the older behaviour where a speculative conflict rode the FIFO as
+        an already_delivered=False token.
+
+        The guard this test protects is unchanged in spirit: a conflicting item is
+        NOT silently OOB-delivered as a (later-flippable) 'conflict'.  Under the new
+        design it is escalated as 'blocked' instead, and:
+          * N (clean) still rides the verifier FIFO non-speculatively, result
+            pending (verifier owns its resolution);
+          * M never appears as a SpeculativeItem in the verifier queue.
         """
         # N: clean branch with a unique file (created BEFORE main-side change)
         wt_n = await _make_branch_with_file(
@@ -3405,7 +3492,7 @@ class TestSpeculativeMergeWorker:
         (wt_m / 'README.md').write_text('# M spec conflict\n')
         await git_ops.commit(wt_m, 'M spec conflict')
 
-        # Pre-load N + M + sentinel so M is speculatively prefetched after N
+        # Pre-load N + M + sentinel.
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
 
@@ -3417,44 +3504,53 @@ class TestSpeculativeMergeWorker:
 
         await worker._merger_loop()
 
-        # Speculative conflict must NOT be OOB-delivered
-        assert not req_m.result.done(), (
-            'Speculative conflict must NOT be OOB-delivered; req_m.result '
-            'must remain pending until the verifier drains the ordering token'
+        # M must be escalated as 'blocked' (the rebase-conflict diversion), NOT
+        # OOB-delivered as a flippable 'conflict'.
+        assert req_m.result.done(), 'M must be resolved by the bounce diversion'
+        assert req_m.result.result().status == 'blocked', (
+            f'M must be diverted to blocked, got {req_m.result.result().status!r}'
+        )
+        assert NEEDS_REBASE_REASON_PREFIX in req_m.result.result().reason, (
+            f'Expected rebase-conflict escalation reason, got: '
+            f'{req_m.result.result().reason!r}'
         )
 
-        # Drain verifier queue to find M's SpeculativeItem
+        # Drain verifier queue: N rides as a non-speculative token (result still
+        # pending — verifier owns it); M never appears as a SpeculativeItem.
         items: list[SpeculativeItem | None] = []
-        while True:
-            it = worker._verifier_queue.get_nowait()
-            items.append(it)
-            if it is None:
-                break
+        while not worker._verifier_queue.empty():
+            items.append(worker._verifier_queue.get_nowait())
 
         m_items = [i for i in items if isinstance(i, SpeculativeItem) and i.request is req_m]
-        assert len(m_items) == 1, f'Expected one SpeculativeItem for req_m, got: {m_items}'
-        m_item = m_items[0]
-        assert m_item.speculative is True, (
-            'M was prefetched speculatively — item.speculative must be True'
+        assert not m_items, (
+            f'M was bounced before prefetch — it must NOT appear as a SpeculativeItem '
+            f'in the verifier queue; got: {m_items}'
         )
-        assert m_item.already_delivered is False, (
-            'Speculative conflict must have already_delivered=False '
-            '(verifier owns resolution for speculative items)'
+        n_items = [i for i in items if isinstance(i, SpeculativeItem) and i.request is req_n]
+        assert len(n_items) == 1, f'Expected one SpeculativeItem for req_n, got: {n_items}'
+        assert n_items[0].already_delivered is False, (
+            'N (clean) rides the verifier FIFO; verifier owns its resolution'
+        )
+        assert not req_n.result.done(), (
+            "N's result must remain pending until the verifier drains it"
         )
 
     async def test_oob_delivery_unblocks_waiter_while_verifier_busy(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """OOB-delivered conflict resolves immediately while verifier is blocked.
+        """A conflicting request resolves immediately while the verifier is blocked.
 
         Start worker.run(); enqueue N (clean, blocking verify); await
-        verify_started; enqueue M (non-spec conflict); assert req_M.result
-        resolves to 'conflict' within 5 seconds while req_N.result is still
-        pending.  The verifier is draining N the entire time — this test proves
-        OOB delivery bypasses the FIFO delay.
+        verify_started; enqueue M (conflicting); assert req_M.result resolves
+        within 5 seconds while req_N.result is still pending.  The verifier is
+        draining N the entire time — this test proves the conflicting item is
+        resolved on the merger's acquire path WITHOUT waiting for N's verify to
+        finish (it bypasses the verifier FIFO delay).
 
-        RED before step-4 impl: req_M.result does not resolve until N's verify
-        finishes, causing the wait_for to time out.
+        task-1892 reclassification: M is diverted by _bounce_conflicting_suffix_items
+        and resolves 'blocked' (rebase-conflict escalation) rather than the older
+        out-of-band 'conflict' delivery.  The latency/ordering property — fast
+        resolution while the verifier is busy — is unchanged.
         """
         # N: clean branch
         wt_n = await _make_branch_with_file(
@@ -3497,9 +3593,13 @@ class TestSpeculativeMergeWorker:
 
             # M must resolve before N's verify finishes
             outcome_m = await asyncio.wait_for(req_m.result, timeout=5)
-            assert outcome_m.status == 'conflict', (
-                f'OOB: M must resolve to conflict while N verify is blocked; '
+            # task-1892: conflict surfaces as a 'blocked' rebase-conflict escalation.
+            assert outcome_m.status == 'blocked', (
+                f'M must resolve to blocked while N verify is blocked; '
                 f'got {outcome_m.status!r}'
+            )
+            assert NEEDS_REBASE_REASON_PREFIX in outcome_m.reason, (
+                f'Expected rebase-conflict escalation reason, got: {outcome_m.reason!r}'
             )
 
             # N is still blocked
@@ -3705,12 +3805,20 @@ class TestSpeculativeMergeWorker:
     async def test_oob_conflict_emits_terminal_event(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        """Property 3 (event): OOB conflict delivery leaves merge_attempt 'conflict'
-        as the latest merge-phase event — no trailing merge_dequeued phantom.
+        """A conflicting request resolves cleanly to 'blocked' and never lands —
+        no phantom merge-phase event implies it merged.
 
-        Run a non-speculative conflicting request through worker.run() with an
-        EventStore.  Assert the terminal merge_attempt 'conflict' event is
-        emitted and is the last merge-phase event row for the task.
+        task-1892 reclassification: the conflicting request is diverted by
+        _bounce_conflicting_suffix_items BEFORE it is dequeued, so it resolves
+        'blocked' (rebase-conflict escalation) and the merger emits no merge-phase
+        event for it at all (no merge_dequeued, no merge_attempt).
+
+        The property this test protects is unchanged: the conflicting item produces
+        a clean terminal outcome with NO event implying it landed — specifically no
+        merge_attempt 'done'/'already_merged' and no trailing merge_dequeued
+        phantom.  (Pre-1892 this was guaranteed by emitting a terminal
+        merge_attempt 'conflict'; post-1892 it is guaranteed by emitting nothing on
+        the bounce path.)
         """
         db_path = tmp_path / 'events_oob_cfl.db'
         event_store = EventStore(db_path=db_path, run_id='oob-evt-run')
@@ -3731,7 +3839,10 @@ class TestSpeculativeMergeWorker:
         req = _make_request('oob-evt-cfl', 'oob-evt-cfl', wt, config)
         await queue.put(req)
         outcome = await asyncio.wait_for(req.result, timeout=30)
-        assert outcome.status == 'conflict'
+        assert outcome.status == 'blocked'
+        assert NEEDS_REBASE_REASON_PREFIX in outcome.reason, (
+            f'Expected rebase-conflict escalation reason, got: {outcome.reason!r}'
+        )
 
         await worker.stop()
         await asyncio.wait_for(worker_task, timeout=30)
@@ -3743,23 +3854,33 @@ class TestSpeculativeMergeWorker:
         ).fetchall()
         conn.close()
 
-        assert ('merge_attempt', 'conflict') in rows, f'rows={rows}'
-        assert rows[-1] == ('merge_attempt', 'conflict'), (
-            f'merge_attempt conflict must be the latest event (no trailing phantom): {rows}'
+        # No event may imply the conflicting item landed.
+        landed_outcomes = {'done', 'already_merged'}
+        assert not any(
+            et == 'merge_attempt' and oc in landed_outcomes for et, oc in rows
+        ), f'conflicting item must not emit a landing merge_attempt: {rows}'
+        # No trailing merge_dequeued phantom (the item was bounced before dequeue).
+        assert all(et != 'merge_dequeued' for et, _ in rows), (
+            f'bounced item must not emit a merge_dequeued phantom: {rows}'
         )
 
     async def test_oob_conflict_resolves_attached_peer_waiter(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """Multi-waiter fan-out: OOB delivery resolves the primary and all peers.
+        """Multi-waiter fan-out: terminal delivery resolves the primary and all peers.
 
         Wire a real InFlightMergeRegistry: acquire(branch, req.result) installs
-        the _mirror done-callbacks via attach().  When _oob_deliver sets
-        req.result, the γ1 mirror fan-out propagates the outcome to the peer
-        future immediately (no verifier involvement).
+        the _mirror done-callbacks via attach().  When the merger resolves
+        req.result (here via the task-1892 rebase-conflict bounce), the γ1 mirror
+        fan-out propagates the outcome to the peer future immediately (no verifier
+        involvement).
+
+        task-1892 reclassification: the conflict surfaces as 'blocked' (rebase-conflict
+        escalation) rather than 'conflict'.  The fan-out invariant — every attached
+        waiter receives the SAME terminal outcome as the primary — is unchanged.
 
         Asserts both the primary future and the attached peer future resolve to
-        status 'conflict'.
+        status 'blocked'.
         """
         from orchestrator.merge_queue import WaiterRecord
 
@@ -3793,27 +3914,29 @@ class TestSpeculativeMergeWorker:
         # Allow done-callbacks to fire.
         await asyncio.sleep(0)
 
-        assert req.result.done(), 'primary future must be resolved by OOB delivery'
-        assert req.result.result().status == 'conflict', (
-            f'primary: expected conflict, got {req.result.result().status!r}'
+        assert req.result.done(), 'primary future must be resolved by the merger'
+        assert req.result.result().status == 'blocked', (
+            f'primary: expected blocked, got {req.result.result().status!r}'
         )
         assert peer_future.done(), (
             'peer future must be resolved via γ1 _mirror fan-out '
-            '(OOB delivery sets req.result → done-callbacks fire → peer resolved)'
+            '(merger sets req.result → done-callbacks fire → peer resolved)'
         )
-        assert peer_future.result().status == 'conflict', (
-            f'peer: expected conflict, got {peer_future.result().status!r}'
+        assert peer_future.result().status == 'blocked', (
+            f'peer: expected blocked, got {peer_future.result().status!r}'
         )
 
     async def test_retention_ring_populated_on_oob_conflict(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        """Invariant-(b): α1/1628 merge_finalized retention callback fires on OOB delivery.
+        """Invariant-(b): α1/1628 merge_finalized retention callback fires on the
+        terminal outcome — including the task-1892 rebase-conflict bounce.
 
         The done-callback registered by enqueue_merge_request is scheduled via
-        call_soon when req.result is set — before the verifier drains the FIFO
-        ordering token.  After OOB delivery the retention ring must contain a
-        record with state=='conflict' for the request.
+        call_soon when req.result is set.  After the merger resolves the
+        conflicting request (now 'blocked' via _bounce_conflicting_suffix_items),
+        the retention ring must contain a record for the request with the terminal
+        state.
 
         Uses the real chokepoint: register_and_enqueue_merge_request with a
         TerminalOutcomeRetention ring so the callback is wired identically to
@@ -3842,7 +3965,10 @@ class TestSpeculativeMergeWorker:
         )
 
         outcome = await asyncio.wait_for(req.result, timeout=30)
-        assert outcome.status == 'conflict'
+        assert outcome.status == 'blocked'
+        assert NEEDS_REBASE_REASON_PREFIX in outcome.reason, (
+            f'Expected rebase-conflict escalation reason, got: {outcome.reason!r}'
+        )
 
         await worker.stop()
         await asyncio.wait_for(worker_task, timeout=30)
@@ -3854,11 +3980,11 @@ class TestSpeculativeMergeWorker:
         stored = retention.get(req.request_id)
         assert stored is not None, (
             'TerminalOutcomeRetention must contain a record for the request '
-            '(α1/1628 merge_finalized callback must fire on OOB set_result)'
+            '(α1/1628 merge_finalized callback must fire on the terminal set_result)'
         )
-        assert stored.state == 'conflict', (
-            f'retention.state must be conflict, got: {stored.state!r}. '
-            'The done-callback must fire before the verifier drains the FIFO token.'
+        assert stored.state == 'blocked', (
+            f'retention.state must be blocked (task-1892 rebase-conflict bounce), '
+            f'got: {stored.state!r}.'
         )
 
     async def test_oob_deliver_status_guard_blocks_done_and_already_merged(
@@ -3910,12 +4036,19 @@ class TestSpeculativeMergeWorker:
     ):
         """Mechanism 1: _MERGE_AHEAD_BOUND caps non-speculative merger build-ahead.
 
-        With BOUND=1: after N's verify is gated and N+1 is in the verifier queue,
-        submitting N+2 on the non-speculative blocking-get path must NOT land in the
-        verifier queue — the Merger blocks at cap.acquire() until the Verifier drains.
+        With BOUND=1 (K=1, default): after N's verify is gated and N+1 is in the
+        verifier queue, submitting N+2 on the non-speculative blocking-get path must
+        NOT land in the verifier queue — the Merger blocks at _merge_ahead_cap.acquire()
+        until the Verifier drains.  The cap sizes the merger-ahead bound to K, so at
+        K=1 at most one counted item is in flight ahead of the verifier.
 
-        RED before impl: ImportError on _MERGE_AHEAD_BOUND (constant not yet added),
-        then assertion failure (no cap → both N+1 and N+2 enqueue → qsize=2 > BOUND).
+        Synchronization note (task-1862/1892 reconcile): the old version waited for
+        N+2's *git merge* to complete (n2_merge_done).  Under a working cap the
+        merger blocks at _merge_ahead_cap.acquire() BEFORE it ever merges N+2, so
+        that event never fires and the wait timed out.  We instead let the merger
+        settle and assert the bound directly — and additionally assert N+2's merge
+        was NOT even attempted while the cap is held (a stronger proof the blocking
+        path is genuinely bounded, not merely delayed).
         """
         from orchestrator.merge_queue import _MERGE_AHEAD_BOUND  # noqa: PLC0415
 
@@ -3933,19 +4066,16 @@ class TestSpeculativeMergeWorker:
                 await gate_open.wait()
             return MagicMock(passed=True, summary='')
 
-        # Track when N+2's git merge finishes so we can check the cap state
-        # deterministically: by the time n2_merge_done fires, the merger has either
-        # blocked at cap.acquire() (WITH cap) or enqueued N+2 and gone back to
-        # queue.get() (WITHOUT cap).  Both sides yield to the event loop before we
-        # resume, so the verifier-queue snapshot is stable.
-        n2_merge_done = asyncio.Event()
+        # Record whether N+2's git merge is ever ATTEMPTED.  With a working cap the
+        # merger blocks at _merge_ahead_cap.acquire() before merging N+2, so this
+        # must stay False for the whole window N is mid-verify.
+        n2_merge_attempted = asyncio.Event()
         original_merge = git_ops.merge_to_main
 
         async def tracking_merge(worktree, branch, **kwargs):
-            result = await original_merge(worktree, branch, **kwargs)
-            if branch == 'cap-n2' and result.success:
-                n2_merge_done.set()
-            return result
+            if branch == 'cap-n2':
+                n2_merge_attempted.set()
+            return await original_merge(worktree, branch, **kwargs)
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
@@ -3981,24 +4111,29 @@ class TestSpeculativeMergeWorker:
             else:
                 pytest.fail('N+1 never appeared in the verifier queue within 15 s')
 
-            # Phase 3: submit N+2 on the non-speculative path.
+            # Phase 3: submit N+2 on the non-speculative path, then let the merger
+            # settle.  With the cap the merger blocks at _merge_ahead_cap.acquire()
+            # (N+1 already holds the single K=1 cap permit) BEFORE merging N+2.
             await queue.put(req_n2)
-
-            # Wait for N+2's git merge to complete.  After this wait the merger
-            # has made its cap decision: either blocked (WITH cap) or enqueued
-            # N+2 and returned to queue.get() (WITHOUT cap).
-            await asyncio.wait_for(n2_merge_done.wait(), timeout=30)
+            for _ in range(50):
+                await asyncio.sleep(0.01)
 
             # KEY ASSERTION — verifier queue must not exceed BOUND counted items
             q_size = worker._verifier_queue.qsize()
             assert q_size <= _MERGE_AHEAD_BOUND, (
                 f'verifier queue has {q_size} items but _MERGE_AHEAD_BOUND={_MERGE_AHEAD_BOUND}; '
-                f'merger built too far ahead (merge-ahead cap not implemented)'
+                f'merger built too far ahead (merge-ahead cap not bounding)'
             )
             # N+2 must still be pending — merger is blocked at cap.acquire()
             assert not req_n2.result.done(), (
                 'N+2 result must still be pending while N is mid-verify '
                 '(merger should be blocked at _merge_ahead_cap.acquire())'
+            )
+            # Stronger bound proof: N+2's merge was not even attempted — the cap
+            # blocks the merger BEFORE the git merge, not merely delaying enqueue.
+            assert not n2_merge_attempted.is_set(), (
+                'N+2 merge must not be attempted while the merge-ahead cap is held '
+                '(merger blocks at _merge_ahead_cap.acquire() before merging N+2)'
             )
 
             # Phase 4: release gate — N, N+1, N+2 all complete as 'done'
@@ -4027,77 +4162,65 @@ class TestSpeculativeMergeWorker:
     ):
         """Mechanism 2: verifier re-bases a real item when main advanced since merge.
 
-        N is mid-verify (gated).  N+1 is built against M0 (main not yet advanced).
-        When N completes and advances main M0→M1, the Verifier picks up N+1 and
-        detects base_sha==M0 != M1.  It emits speculative_discard(reason='main_advanced')
-        and re-merges N+1 against M1.  Both resolve 'done', both files land on main.
+        task-1862 note: a successor built while a predecessor is in-flight ATTACHes
+        to the predecessor's merge commit (speculative=True), so its base is never
+        stale and the `main_advanced` pickup-rebase path can no longer be reached
+        via an in-flight worker predecessor.  To exercise the genuine stale-base
+        pickup-rebase (the original intent), we use a SINGLE non-speculative request
+        and advance main OUT-OF-BAND between the merger building it (base=M0) and the
+        verifier dispatching it.  We interpose on `_dispatch_item` to land a disjoint
+        commit on main exactly once before the first dispatch, so at pickup
+        base_sha==M0 != current_main==M1 → Mechanism 2 fires (speculative=False).
 
         Assertions:
           (1) speculative_discard event with reason='main_advanced' in EventStore.
-          (2) N+1's re-verify runs exactly once and sees N's file (fresh M1 tree).
+          (2) N+1's re-verify runs exactly once and sees the out-of-band file
+              (proving it was re-merged against fresh M1, not stale M0).
           (3) _generation_chain_counts not incremented for N+1 (I7).
-
-        Fails on base: no pickup re-base → no 'main_advanced' discard event and
-        N+1's verify worktree lacks N's file.
         """
         db_path = tmp_path / 'events_rebase.db'
         event_store = EventStore(db_path=db_path, run_id='test-rebase')
 
-        wt_n = await _make_branch_with_file(git_ops, 'rb-n', 'file_rb_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'rb-n1', 'file_rb_n1.py', 'n1 = 2\n')
 
-        # Gate N's verify; record which files each verify call sees
-        n_verify_entered = asyncio.Event()
-        gate_open = asyncio.Event()
         verify_worktrees: list[frozenset] = []
 
         async def tracking_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
             files_present = frozenset(f.name for f in merge_wt.iterdir() if f.is_file())
             verify_worktrees.append(files_present)
-            # Gate only N's first verify (only N's file present, gate not yet open)
-            if 'file_rb_n.py' in files_present and 'file_rb_n1.py' not in files_present and not gate_open.is_set():
-                n_verify_entered.set()
-                await gate_open.wait()
             return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+
+        # Interpose on the verifier's per-item dispatch: the FIRST time the item is
+        # about to be dispatched, advance main out-of-band (disjoint file, clean
+        # re-merge) so the dispatch-time staleness check sees base_sha != main.
+        original_dispatch = worker._dispatch_item
+        advanced = {'done': False}
+
+        async def dispatch_with_oob_advance(item):  # type: ignore[no-untyped-def]
+            if not advanced['done']:
+                advanced['done'] = True
+                (git_ops.project_root / 'oob_extra.py').write_text('extra = 1\n')
+                await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+                await _run(['git', 'commit', '-m', 'oob advance M0->M1'], cwd=git_ops.project_root)
+            return await original_dispatch(item)
+
+        worker._dispatch_item = dispatch_with_oob_advance  # type: ignore[method-assign]
         worker_task = asyncio.create_task(worker.run())
 
         with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=tracking_verify):
-            req_n = _make_request('rb-n', 'rb-n', wt_n, config)
             req_n1 = _make_request('rb-n1', 'rb-n1', wt_n1, config)
-
-            # Submit N and wait for it to be mid-verify.  By the time the gate
-            # fires, the merger has tried (and missed) N+1's speculative look-ahead.
-            await queue.put(req_n)
-            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
-
-            # Submit N+1 on the non-speculative blocking-get path.  Because N has not
-            # yet advanced main, N+1's merge is computed against M0.
+            # Single non-speculative request: merger builds it against M0, hands it
+            # to the verifier; the dispatch interposition advances main to M1 first.
             await queue.put(req_n1)
-
-            # Wait for N+1 to land in the verifier queue (base_sha == M0, main still M0).
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                if worker._verifier_queue.qsize() >= 1:
-                    break
-                await asyncio.sleep(0.05)
-            else:
-                pytest.fail('N+1 never appeared in the verifier queue within 15 s')
-
-            # Release the gate — N verify completes, advances main M0→M1.
-            # The Verifier then picks up N+1 (base_sha==M0 != M1) and should
-            # re-merge it against M1 (Mechanism 2).
-            gate_open.set()
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
 
-        assert outcome_n.status == 'done', f'N: {outcome_n}'
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
 
-        # Both files must be on main
-        for fname in ('file_rb_n.py', 'file_rb_n1.py'):
+        # Both the re-based file and the out-of-band file must be on main.
+        for fname in ('file_rb_n1.py', 'oob_extra.py'):
             _, out, _ = await _run(
                 ['git', 'show', f'main:{fname}'], cwd=git_ops.project_root,
             )
@@ -4115,16 +4238,16 @@ class TestSpeculativeMergeWorker:
             f'got discard reasons: {discard_reasons}  (all events: {rows})'
         )
 
-        # (2) N+1 is re-verified exactly once and its worktree contains N's file
-        #     (proving it was merged against fresh M1, not stale M0)
+        # (2) N+1 is re-verified exactly once and its worktree contains the
+        #     out-of-band file (proving it was merged against fresh M1, not stale M0)
         n1_verify_calls = [fs for fs in verify_worktrees if 'file_rb_n1.py' in fs]
         assert len(n1_verify_calls) == 1, (
             f'N+1 should be verified exactly once (after re-merge against M1); '
             f'got {len(n1_verify_calls)} verify call(s) with file_rb_n1.py'
         )
-        assert 'file_rb_n.py' in n1_verify_calls[0], (
-            f"N+1 re-verify must see N's file (fresh M1 tree includes N's commit); "
-            f'got files: {n1_verify_calls[0]}'
+        assert 'oob_extra.py' in n1_verify_calls[0], (
+            f'N+1 re-verify must see the out-of-band file (fresh M1 tree includes '
+            f"the out-of-band commit); got files: {n1_verify_calls[0]}"
         )
 
         # (3) Pickup re-base must NOT increment the generation chain count (I7)
@@ -4143,74 +4266,62 @@ class TestSpeculativeMergeWorker:
     ):
         """Mechanism 2: a pre_rebased N+1 is verified after a main_advanced re-merge.
 
-        N is mid-verify (gated).  N+1 is built against M0 with skip_verify=False
-        (task-1724: the build-time skip fast path is removed entirely).
-        When N advances main M0→M1, the verifier picks up N+1 (base_sha=M0 != M1)
-        and re-merges it (Mechanism 2 main_advanced path); verification runs
-        unconditionally (task-1724: no force_verify needed).
+        task-1862 note: as in test_verify_pickup_rebases_when_main_advanced, a
+        successor built behind an in-flight worker predecessor now ATTACHes
+        speculatively (base never stale), so the genuine stale-base pickup-rebase
+        is exercised with a SINGLE non-speculative request and an OUT-OF-BAND main
+        advance interposed on `_dispatch_item`.
+
+        N+1 is built against M0 with pre_rebased=True and skip_verify=False
+        (task-1724: the build-time skip fast path is removed entirely).  At pickup
+        base_sha=M0 != M1 → Mechanism 2 main_advanced re-merge; verification then
+        runs unconditionally (task-1724: no force_verify needed).
 
         Assertions:
           (1) speculative_discard event with reason='main_advanced' in EventStore.
           (2) N+1 is verified EXACTLY ONCE on the re-merged tree.
-          (3) Both files land on main; both outcomes 'done'.
+          (3) Both files land on main; outcome 'done'.
         """
         db_path = tmp_path / 'events_pre_rebased.db'
         event_store = EventStore(db_path=db_path, run_id='test-pre-rebased-fv')
 
-        wt_n = await _make_branch_with_file(git_ops, 'rb-n', 'file_rb_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'rb-n1', 'file_rb_n1.py', 'n1 = 2\n')
 
-        # Gate N's verify; record which files each verify call sees
-        n_verify_entered = asyncio.Event()
-        gate_open = asyncio.Event()
         verify_worktrees: list[frozenset] = []
 
         async def tracking_verify(merge_wt, cfg, module_configs, task_files=None, **_kw):
             files_present = frozenset(f.name for f in merge_wt.iterdir() if f.is_file())
             verify_worktrees.append(files_present)
-            # Gate only N's first verify (only N's file present, gate not yet open)
-            if 'file_rb_n.py' in files_present and 'file_rb_n1.py' not in files_present and not gate_open.is_set():
-                n_verify_entered.set()
-                await gate_open.wait()
             return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+
+        # Interpose: advance main out-of-band once, before the first dispatch.
+        original_dispatch = worker._dispatch_item
+        advanced = {'done': False}
+
+        async def dispatch_with_oob_advance(item):  # type: ignore[no-untyped-def]
+            if not advanced['done']:
+                advanced['done'] = True
+                (git_ops.project_root / 'oob_extra.py').write_text('extra = 1\n')
+                await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+                await _run(['git', 'commit', '-m', 'oob advance M0->M1'], cwd=git_ops.project_root)
+            return await original_dispatch(item)
+
+        worker._dispatch_item = dispatch_with_oob_advance  # type: ignore[method-assign]
         worker_task = asyncio.create_task(worker.run())
 
         with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=tracking_verify):
-            req_n = _make_request('rb-n', 'rb-n', wt_n, config)
             # pre_rebased=True: task-1724 removed the build-time skip_verify=True fast path
             req_n1 = _make_request('rb-n1', 'rb-n1', wt_n1, config, pre_rebased=True)
-
-            # Submit N and wait for it to be mid-verify.
-            await queue.put(req_n)
-            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
-
-            # Submit N+1; main still M0; task-1724: built with skip_verify=False (skip removed).
             await queue.put(req_n1)
-
-            # Wait for N+1 to land in the verifier queue (base_sha == M0, main still M0).
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                if worker._verifier_queue.qsize() >= 1:
-                    break
-                await asyncio.sleep(0.05)
-            else:
-                pytest.fail('N+1 never appeared in the verifier queue within 15 s')
-
-            # Release the gate — N verify completes, advances main M0→M1.
-            # Verifier picks up N+1 (base_sha==M0 != M1), detects main_advanced,
-            # and re-merges it; verification runs unconditionally (task-1724).
-            gate_open.set()
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
 
-        assert outcome_n.status == 'done', f'N: {outcome_n}'
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
 
-        # Both files must be on main
-        for fname in ('file_rb_n.py', 'file_rb_n1.py'):
+        # Both the re-based file and the out-of-band file must be on main
+        for fname in ('file_rb_n1.py', 'oob_extra.py'):
             _, out, _ = await _run(
                 ['git', 'show', f'main:{fname}'], cwd=git_ops.project_root,
             )
@@ -4228,8 +4339,9 @@ class TestSpeculativeMergeWorker:
             f'got discard reasons: {discard_reasons}  (all events: {rows})'
         )
 
-        # (2) N+1 is verified EXACTLY ONCE and its worktree contains N's file
-        #     (proving verify was NOT skipped and the re-merge used fresh M1)
+        # (2) N+1 is verified EXACTLY ONCE and its worktree contains the
+        #     out-of-band file (proving verify was NOT skipped and the re-merge
+        #     used fresh M1)
         n1_verify_calls = [fs for fs in verify_worktrees if 'file_rb_n1.py' in fs]
         assert len(n1_verify_calls) == 1, (
             f'N+1 (pre_rebased=True) must be verified exactly once after '
@@ -4237,9 +4349,9 @@ class TestSpeculativeMergeWorker:
             f'got {len(n1_verify_calls)} verify call(s) with file_rb_n1.py. '
             f'verify_worktrees={verify_worktrees!r}'
         )
-        assert 'file_rb_n.py' in n1_verify_calls[0], (
-            f"N+1 re-verify must see N's file (fresh M1 tree includes N's commit); "
-            f'got files: {n1_verify_calls[0]}'
+        assert 'oob_extra.py' in n1_verify_calls[0], (
+            f'N+1 re-verify must see the out-of-band file (fresh M1 tree includes '
+            f'the out-of-band commit); got files: {n1_verify_calls[0]}'
         )
 
         await worker.stop()
@@ -4323,33 +4435,32 @@ class TestSpeculativeMergeWorker:
     async def test_speculative_follower_chain_invalidated_after_pickup_rebase(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        """Mechanism 2 × chain-invalidation: iteration_did_remerge propagates.
+        """Two-deep speculative attach chain lands correctly and in order.
 
-        When a REAL item N+1 is re-merged for 'main_advanced', the finally block
-        sets remerge_occurred=True for the next verifier iteration.  A speculative
-        N+2 that was prefetched against N+1's stale commit is then chain-invalidated
-        (reason='chain_invalidated') in that next iteration.
+        task-1862 redesign: a successor built while a predecessor is in-flight
+        ATTACHes to the predecessor's merge commit instead of being built against
+        stale main, so the old N+1=main_advanced → N+2=chain_invalidated discard
+        sequence no longer fires (the chain bases are fresh by construction — see
+        the `not item.speculative` Mechanism-2 carve-out at merge_queue.py:10317).
+        The discard-event assertions are therefore dropped as now-impossible.
 
-        This covers the interaction introduced by Mechanism 2: a pickup re-base of
-        a non-speculative item correctly invalidates its speculative descendant, just
-        as any other re-merge does.
+        The invariant this test still protects — a genuine TWO-DEEP speculative
+        prefetch produces a correct, in-order landing where each follower is
+        re-verified against the fully-advanced tree — is preserved by running at
+        speculation_depth=2 (K=2) so both N+1 and N+2 are in flight at once, and
+        asserting the end state:
 
-        Scenario:
-          N   — non-speculative, gated mid-verify, passes → main M0→M1
-          N+1 — non-speculative (blocking path), built against M0 (stale);
-                when picked up: base_sha=M0 ≠ M1 → Mechanism 2 fires
-                → main_advanced discard, re-merge against M1
-                → iteration_did_remerge=True → remerge_occurred=True for N+2
-          N+2 — SPECULATIVE prefetch, built against N+1's stale M0-based commit;
-                speculative=True AND remerge_occurred=True
-                → chain_invalidated discard, re-merge against actual main (M2)
+        Scenario (K=2):
+          N   — gated mid-verify, passes → main advances
+          N+1 — attaches to N's commit (speculative); prefetched
+          N+2 — attaches to N+1's commit (speculative); prefetched (K=2 enables
+                the second in-flight permit)
 
         Assertions:
-          (1) speculative_discard(reason='main_advanced') emitted for N+1.
-          (2) speculative_discard(reason='chain_invalidated') emitted for N+2.
-          (3) All three files land on main.
-          (4) N+2's re-verify sees both N's and N+1's files (proves re-merge
-              against final main M2, not the original stale base).
+          (1) All three outcomes 'done'.
+          (2) All three files land on main.
+          (3) N+2's verify sees BOTH N's and N+1's files (proves it merged on top
+              of the advanced tree, not a stale base).
         """
         db_path = tmp_path / 'events_follower.db'
         event_store = EventStore(db_path=db_path, run_id='test-follower')
@@ -4373,7 +4484,11 @@ class TestSpeculativeMergeWorker:
             return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        # K=2: allow a genuine two-deep speculative prefetch (N+1 and N+2 both
+        # in flight) so the attach chain is exercised end-to-end.
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=event_store, speculation_depth=2,
+        )
         worker_task = asyncio.create_task(worker.run())
 
         with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=tracking_verify):
@@ -4381,22 +4496,17 @@ class TestSpeculativeMergeWorker:
             req_n1 = _make_request('sf-n1', 'sf-n1', wt_n1, config)
             req_n2 = _make_request('sf-n2', 'sf-n2', wt_n2, config)
 
-            # Submit N and wait for it to be mid-verify.  Main is still M0 at
-            # this point; the merger's speculative look-ahead missed N+1 (queue
-            # empty then).
+            # Submit N and wait for it to be mid-verify.
             await queue.put(req_n)
             await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
 
-            # Put N+1 and N+2 into the queue atomically so the merger sees both:
-            #   - dequeues N+1 (blocking get, non-speculative), builds it against M0,
-            #     acquires cap, enqueues it
-            #   - speculative look-ahead get_nowait() → sees N+2 → builds it
-            #     speculatively against N+1's stale (M0-based) commit
+            # Put N+1 and N+2 into the queue atomically so the merger attaches
+            # N+1 to N's commit and N+2 to N+1's commit (two-deep prefetch, K=2).
             queue.put_nowait(req_n1)
             queue.put_nowait(req_n2)
 
-            # Wait for both N+1 (counted) and N+2 (speculative) to sit in the
-            # verifier queue — proves the speculative prefetch ran.
+            # Wait for both N+1 and N+2 to sit in the verifier queue — proves the
+            # two-deep speculative prefetch ran (only possible at K=2).
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 if worker._verifier_queue.qsize() >= 2:
@@ -4405,59 +4515,42 @@ class TestSpeculativeMergeWorker:
             else:
                 pytest.fail(
                     'N+1 and N+2 did not both appear in the verifier queue within '
-                    '15 s.  N+2 must be speculatively prefetched after N+1 is built.'
+                    '15 s.  N+2 must be speculatively prefetched after N+1 (K=2).'
                 )
 
-            # Release gate → N passes verify → main M0→M1.
-            # Verifier then picks up N+1 (base_sha=M0 ≠ M1 → main_advanced discard
-            # → re-merge → iteration_did_remerge=True → remerge_occurred=True for N+2)
-            # and N+2 (speculative + remerge_occurred → chain_invalidated → re-merge).
+            # Release gate → N passes verify → main advances; N+1 and N+2 land in
+            # order on the advanced tree.
             gate_open.set()
             outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
             outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
 
+        # (1) All three land done
         assert outcome_n.status == 'done', f'N: {outcome_n}'
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
         assert outcome_n2.status == 'done', f'N+2: {outcome_n2}'
 
-        # (3) All three files must be on main
+        # (2) All three files must be on main
         for fname in ('file_sf_n.py', 'file_sf_n1.py', 'file_sf_n2.py'):
             _, out, _ = await _run(
                 ['git', 'show', f'main:{fname}'], cwd=git_ops.project_root,
             )
             assert out.strip(), f'{fname} not found on main'
 
-        # (1) speculative_discard(reason='main_advanced') for N+1
-        # (2) speculative_discard(reason='chain_invalidated') for N+2
-        conn = sqlite3.connect(str(db_path))
-        rows = conn.execute(
-            "SELECT event_type, json_extract(data, '$.reason') FROM events ORDER BY id"
-        ).fetchall()
-        conn.close()
-        discard_reasons = [r[1] for r in rows if r[0] == 'speculative_discard']
-        assert 'main_advanced' in discard_reasons, (
-            f'Expected speculative_discard(reason=main_advanced) for N+1; '
-            f'got discard reasons: {discard_reasons}  (all events: {rows})'
-        )
-        assert 'chain_invalidated' in discard_reasons, (
-            f'Expected speculative_discard(reason=chain_invalidated) for N+2; '
-            f'got discard reasons: {discard_reasons}  (all events: {rows})'
-        )
-
-        # (4) N+2's re-verify (after re-merge against final main M2) sees both
-        #     N's and N+1's files, proving it was merged against the fresh tree.
+        # (3) N+2's verify sees both N's and N+1's files, proving it was merged on
+        #     top of the fully-advanced tree (the safety property the original
+        #     chain_invalidated re-merge existed to guarantee).
         n2_verify_calls = [fs for fs in verify_worktrees if 'file_sf_n2.py' in fs]
         assert len(n2_verify_calls) == 1, (
-            f'N+2 must be verified exactly once (only the post-re-merge verify); '
+            f'N+2 must be verified exactly once; '
             f'got {len(n2_verify_calls)} verify call(s) with file_sf_n2.py'
         )
         assert 'file_sf_n.py' in n2_verify_calls[0], (
-            f"N+2 re-verify must see N's file (fresh final-main tree); "
+            f"N+2 verify must see N's file (fresh advanced tree); "
             f'got files: {n2_verify_calls[0]}'
         )
         assert 'file_sf_n1.py' in n2_verify_calls[0], (
-            f"N+2 re-verify must see N+1's file (fresh final-main tree); "
+            f"N+2 verify must see N+1's file (fresh advanced tree); "
             f'got files: {n2_verify_calls[0]}'
         )
 
@@ -4469,21 +4562,24 @@ class TestSpeculativeMergeWorker:
     async def test_chain_invalidated_pre_rebased_n2_verify_runs(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        """RED: pre_rebased N+2 chain_invalidated re-merge must invoke verify.
+        """pre_rebased N+2 in a two-deep attach chain is verified on its final tree.
 
         Same scenario as test_speculative_follower_chain_invalidated_after_pickup_rebase
         except N+2 is submitted with pre_rebased=True.  task-1724 removed the
-        skip_verify mechanism entirely: _remerge always returns skip_verify=False
-        and _verify_and_advance verifies unconditionally.
+        skip_verify mechanism entirely: a pre_rebased item is still verified
+        unconditionally on the tree it actually lands.
 
-        The chain_invalidated re-merge against an advanced main produces a NEW tree
-        (M2 now includes N's and N+1's commits) that was never verified; this test
-        confirms the merge gate runs before advance_main on the new tree.
+        task-1862 redesign note: N+2 attaches speculatively to N+1's commit, so the
+        old explicit chain_invalidated re-merge no longer fires (bases are fresh by
+        construction); the discard-event assertions are dropped as now-impossible.
+        The invariant this test still protects — a pre_rebased follower is verified
+        before advance_main, on a tree containing all predecessors' commits — is
+        preserved at speculation_depth=2.
 
-        Assertion (A): run_scoped_verification is called exactly ONCE on N+2's
-        re-merged tree, and that tree contains file_pr_n.py, file_pr_n1.py AND
-        file_pr_n2.py — proving _run_post_merge_verify ran before advance_main.
-        All outcomes 'done'; all files land on main.
+        Assertion (A): run_scoped_verification is called at least ONCE on N+2's
+        tree, and that tree contains file_pr_n.py, file_pr_n1.py AND file_pr_n2.py
+        — proving the merge gate ran before advance_main.  All outcomes 'done';
+        all files land on main.
         """
         db_path = tmp_path / 'events_1687a.db'
         event_store = EventStore(db_path=db_path, run_id='test-1687a')
@@ -4505,7 +4601,10 @@ class TestSpeculativeMergeWorker:
             return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        # K=2: two-deep prefetch so N+2 (pre_rebased) attaches behind N+1.
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=event_store, speculation_depth=2,
+        )
         worker_task = asyncio.create_task(worker.run())
 
         with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=tracking_verify):
@@ -4527,7 +4626,7 @@ class TestSpeculativeMergeWorker:
             else:
                 pytest.fail(
                     'N+1 and N+2 did not both appear in the verifier queue within '
-                    '15 s.  N+2 must be speculatively prefetched after N+1 is built.'
+                    '15 s.  N+2 must be speculatively prefetched after N+1 (K=2).'
                 )
 
             gate_open.set()
@@ -4545,41 +4644,22 @@ class TestSpeculativeMergeWorker:
             )
             assert out.strip(), f'{fname} not found on main'
 
-        conn = sqlite3.connect(str(db_path))
-        rows = conn.execute(
-            "SELECT event_type, json_extract(data, '$.reason') FROM events ORDER BY id"
-        ).fetchall()
-        conn.close()
-        discard_reasons = [r[1] for r in rows if r[0] == 'speculative_discard']
-        assert 'main_advanced' in discard_reasons, (
-            f'Expected speculative_discard(reason=main_advanced) for N+1; '
-            f'got discard reasons: {discard_reasons}'
-        )
-        assert 'chain_invalidated' in discard_reasons, (
-            f'Expected speculative_discard(reason=chain_invalidated) for N+2; '
-            f'got discard reasons: {discard_reasons}'
-        )
-
-        # (A) N+2 re-verify must run at least once and see all three files.
-        #     RED on base: skip_verify=True → verify never called → count == 0.
-        #     We assert >= 1 rather than == 1 because the exact call count is an
-        #     implementation detail subject to speculative-prefetch changes; the
-        #     invariant under test is that _run_post_merge_verify ran before
-        #     advance_main (locked by the three-file assertions below, and by the
-        #     companion blocked-tree test which covers the core safety property).
+        # (A) N+2's verify must run at least once and see all three files —
+        #     proving the merge gate (_run_post_merge_verify) ran before
+        #     advance_main on a tree that now contains N's and N+1's commits.
+        #     RED on the old skip_verify path: verify never called → count == 0.
         n2_verify_calls = [fs for fs in verify_worktrees if 'file_pr_n2.py' in fs]
         assert len(n2_verify_calls) >= 1, (
-            f'N+2 (pre_rebased=True, chain_invalidated) must be verified at least '
-            f'once after re-merge against advanced main (tree changed: now contains '
-            f"N's and N+1's commits); got {len(n2_verify_calls)} verify call(s) with "
-            f'file_pr_n2.py.  verify_worktrees={verify_worktrees!r}'
+            f'N+2 (pre_rebased=True) must be verified at least once on the tree it '
+            f"lands (containing N's and N+1's commits); got {len(n2_verify_calls)} "
+            f'verify call(s) with file_pr_n2.py.  verify_worktrees={verify_worktrees!r}'
         )
         assert 'file_pr_n.py' in n2_verify_calls[0], (
-            f"N+2 re-verify must see N's file (fresh M2 tree includes N's commit); "
+            f"N+2 verify must see N's file (fresh tree includes N's commit); "
             f'got files: {n2_verify_calls[0]}'
         )
         assert 'file_pr_n1.py' in n2_verify_calls[0], (
-            f"N+2 re-verify must see N+1's file (fresh M2 tree includes N+1's commit); "
+            f"N+2 verify must see N+1's file (fresh tree includes N+1's commit); "
             f'got files: {n2_verify_calls[0]}'
         )
 
@@ -4589,22 +4669,22 @@ class TestSpeculativeMergeWorker:
     async def test_chain_invalidated_pre_rebased_n2_red_tree_blocked(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        """RED: pre_rebased N+2 with a tree-changing chain_invalidated re-merge must
-        be blocked when its re-verified tree fails verify.
+        """RED: pre_rebased N+2 in a two-deep attach chain must be blocked when its
+        verified tree fails verify — the red tree must NOT land on main.
 
         Companion to test_chain_invalidated_pre_rebased_n2_verify_runs.  The
         blocking_verify mock returns passed=False whenever N+2's file is present,
         simulating a red tree (e.g. tsc-RED StatusBar.tsx) landing via the skip path.
-        With the bug: skip_verify=True → verify never called → N+2 advances 'done'.
-        With the fix: skip_verify=False → _run_post_merge_verify runs → blocked.
+        With the old skip_verify bug: verify never ran → N+2 advanced 'done'.
+        With the fix: verify runs unconditionally → blocked.
 
-        Assertion (B):
+        task-1862 redesign note: run at speculation_depth=2 so N+2 is a genuine
+        two-deep speculative attach; the core safety invariant is unchanged.
+
+        Assertion (B) — the core safety property:
           outcome_n2.status == 'blocked'.
           file_prb_n2.py is NOT on main (red tree did not advance).
           file_prb_n.py and file_prb_n1.py ARE on main (unaffected).
-
-        RED on current code: skip_verify=True → verify skipped → N+2 advances 'done'
-        → file_prb_n2.py IS on main → status == 'blocked' assertion fails.
         """
         db_path = tmp_path / 'events_1687b.db'
         event_store = EventStore(db_path=db_path, run_id='test-1687b')
@@ -4626,7 +4706,10 @@ class TestSpeculativeMergeWorker:
             return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        # K=2: two-deep prefetch so N+2 (pre_rebased) attaches behind N+1.
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=event_store, speculation_depth=2,
+        )
         worker_task = asyncio.create_task(worker.run())
 
         with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=blocking_verify):
