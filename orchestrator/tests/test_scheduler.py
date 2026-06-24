@@ -1522,12 +1522,29 @@ class TestUpdateTaskStructuredRejection:
     ):
         """Success envelope must not be mis-classified as a rejection (regression guard).
 
-        Pins that ``extract_structured_rejection`` does NOT false-positive on a success
-        response — no top-level ``error`` key and ``success`` is not ``False``.
+        Uses the *actual* ``update_task`` success structuredContent shape produced by
+        ``sqlite_task_backend.update_task`` — ``{'id', 'message', 'updated', 'updated_task'}``.
+        This is more than a proxy: it pins that no field in the real production envelope
+        (``updated``, ``updated_task``, etc.) is accidentally treated as a rejection signal
+        by ``extract_structured_rejection``.
         """
         import json
 
-        success_payload = {'message': 'ok', 'tasks': [{'success': True}]}
+        # Real structuredContent shape from sqlite_task_backend.update_task (line ~928):
+        # {'id': task_id, 'message': 'Task <id> updated', 'updated': True, 'updated_task': ...}
+        # No 'error' / 'error_type' keys — extract_structured_rejection must return None.
+        success_payload = {
+            'id': '1',
+            'message': 'Task 1 updated',
+            'updated': True,
+            'updated_task': {
+                'id': '1',
+                'title': 'test task',
+                'status': 'in-progress',
+                'dependencies': [],
+                'metadata': {'files': ['backend/src/main.py']},
+            },
+        }
         wire_envelope = {
             'result': {
                 'structuredContent': success_payload,

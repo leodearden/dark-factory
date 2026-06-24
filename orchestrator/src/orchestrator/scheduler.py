@@ -4136,6 +4136,18 @@ class Scheduler:
         fresh = await self.get_task(task_id)
         fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
         honest = strip_directory_locks(files)
+        dropped = sorted(set(files) - set(honest))
+        if dropped:
+            logger.debug(
+                'Task %s: _persist_files_metadata stripped %d directory-shaped entr%s '
+                '(%s); these entries have no file-level representation in metadata.files '
+                'and cannot be re-derived from it at restart — lock narrowing on '
+                'restart is possible for directory-only plan entries.',
+                task_id,
+                len(dropped),
+                'ies' if len(dropped) > 1 else 'y',
+                dropped,
+            )
         merged = {**fresh_md, 'files': honest}
         updated = bool(await self.update_task(task_id, merged))
         if not updated:
@@ -4166,10 +4178,15 @@ class Scheduler:
         ``metadata.files`` when the persist branch fires.  If supplied, these
         are written instead of ``needed`` (which is depth-coarsened and
         therefore directory-shaped at depth<5).  When ``None`` the call falls
-        back to ``needed`` so callers that don't supply file-level paths keep
-        the prior behaviour.  Use ``persist_files if persist_files is not None
-        else needed`` (identity check, not truthiness) so an explicit empty
-        list persists [] rather than silently falling back to ``needed``.
+        back to ``needed``; because ``needed`` is depth-coarsened and therefore
+        directory-shaped, ``_persist_files_metadata`` will strip those entries
+        to an empty list — effectively writing ``metadata.files = []``
+        (defer-to-architect), **not** the module paths.  All production call
+        sites supply ``persist_files`` explicitly; the ``None`` default exists
+        for callers that pass file-level ``needed`` (where strip is a no-op).
+        Use ``persist_files if persist_files is not None else needed`` (identity
+        check, not truthiness) so an explicit empty list persists ``[]`` rather
+        than silently falling back to ``needed``.
         """
         depth = self.config.lock_depth
         current_set = {normalize_lock(m, depth) for m in current}
@@ -4181,9 +4198,14 @@ class Scheduler:
 
         # Determine what to write to metadata.files.  When the caller supplies
         # raw file-level paths via persist_files, use those; otherwise fall back
-        # to needed (depth-coarsened).  The `is not None` guard (not truthiness)
-        # is intentional: an explicit [] means "no files declared / defer-to-
-        # architect" and must persist as [], not silently fall back to needed.
+        # to needed (depth-coarsened).  NOTE: because needed is directory-shaped
+        # at depth<5, _persist_files_metadata will strip it to [] — the None
+        # fallback effectively writes metadata.files=[] (defer-to-architect) for
+        # any caller that passes only coarsened module paths.  All production
+        # call sites (workflow.py) pass persist_files explicitly to avoid this.
+        # The `is not None` guard (not truthiness) is intentional: an explicit []
+        # means "no files declared / defer-to-architect" and must persist as [],
+        # not silently fall back to needed.
         files_to_persist = persist_files if persist_files is not None else needed
 
         released: list[str] = []
