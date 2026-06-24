@@ -563,6 +563,112 @@ class TestTwoLayerInvariants:
             f'{missing!r}'
         )
 
+    # ── step-15 RED: snapshot() must use the REAL main SHA (not frozen tip) ─────
+
+    async def test_snapshot_uses_real_main_not_frozen_tip(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """snapshot()['two_layer_invariants'] must agree with two_layer_invariants(M0).
+
+        Regression test for the false base-chain violation in snapshot().
+
+        Setup
+        -----
+        Build a HEALTHY frozen prefix: one verifying entry with
+          base_sha = M0 (real main HEAD)
+          merge_commit = M1 (a DISTINCT side-branch commit ≠ M0)
+
+        This means _newest_frozen_commit() returns M1 ≠ M0.
+
+        Failure mode (before step-16 fix)
+        ----------------------------------
+        snapshot() calls:
+            two_layer_invariants(self._newest_frozen_commit() or 'unknown')
+            → two_layer_invariants(M1)
+        check_frozen_prefix_invariant(M1) expects the first frozen entry's
+        base_sha to be M1, but it is M0 → spurious violation
+            'frozen-prefix base-chain broken at <rid>: expected M1 but item has M0'
+        so snapshot()['two_layer_invariants'] != [] even though the pipeline
+        is HEALTHY.
+
+        Expected behaviour (after step-16 fix)
+        ----------------------------------------
+        snapshot() uses the REAL main SHA cached at recompute time (M0), so
+        two_layer_invariants(M0) returns [] and the surfaces agree.
+
+        Assertions
+        ----------
+        (a) direct call healthy:   worker.two_layer_invariants(M0) == []
+        (b) snapshot agrees:       worker.snapshot()['two_layer_invariants'] == []
+                                   (FAILS today — snapshot forwards M1 → false +ve)
+        (c) surfaces agree:        snapshot value == direct call value
+        """
+        worker = _make_worker(git_ops)
+
+        # M0 — real main HEAD before anything else.
+        m0 = await git_ops.get_main_sha()
+
+        # M1 — a DISTINCT side-branch commit (merge_commit of the frozen entry).
+        # _create_branch_editing leaves main at M0 so get_main_sha() still
+        # returns M0 after recompute_suffix_conflict_graph() runs.
+        m1 = await _create_branch_editing(
+            git_repo, 'task/frozen-tip-s15', 'README.md', '# Frozen tip S15\n',
+        )
+        assert m1 != m0, 'precondition: M1 must differ from M0'
+
+        # Build the frozen entry: base_sha=M0 (correct chain from real main),
+        # merge_commit=M1 (a real SHA so _newest_frozen_commit() returns it).
+        req_frozen = _make_req('frozen-s15', 'task/frozen-tip-s15', config, git_repo)
+        item_frozen = SpeculativeItem(
+            request=req_frozen,
+            merge_result=MergeResult(success=True, merge_commit=m1),
+            merge_wt=None,
+            base_sha=m0,
+            speculative=False,
+            skip_verify=False,
+        )
+        entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
+        worker._inflight.append(entry_frozen)
+
+        # Drive recompute so the worker resolves + caches the real main SHA.
+        # (No suffix reqs → EMPTY_SUFFIX_CONFLICT_GRAPH; that's fine —
+        #  the §5.3 check is on the frozen prefix only.)
+        await worker.recompute_suffix_conflict_graph()
+
+        # Verify the precondition: _newest_frozen_commit() ≠ real main M0.
+        newest = worker._newest_frozen_commit()
+        assert newest is not None, '_newest_frozen_commit() must return M1 for this test'
+        assert newest != m0, (
+            f'precondition: _newest_frozen_commit() must ≠ M0 but got {newest!r} == {m0!r}'
+        )
+
+        # (a) Direct call with the REAL main SHA must be healthy.
+        direct_violations = worker.two_layer_invariants(m0)
+        assert direct_violations == [], (
+            f'two_layer_invariants(M0) should return [] for a healthy pipeline, '
+            f'but got: {direct_violations!r}'
+        )
+
+        # (b) snapshot()['two_layer_invariants'] must also be [] (FAILS before fix).
+        snap = worker.snapshot()
+        snap_violations = snap['two_layer_invariants']
+        assert snap_violations == [], (
+            f"snapshot()['two_layer_invariants'] should be [] for a healthy pipeline "
+            f'but got: {snap_violations!r}\n'
+            f'(If non-empty, snapshot() is forwarding the frozen tip M1={newest!r} '
+            f'instead of the real main M0={m0!r} — the step-16 bug.)'
+        )
+
+        # (c) Both surfaces must agree.
+        assert snap_violations == direct_violations, (
+            f"snapshot() and two_layer_invariants(M0) disagree:\n"
+            f"  snapshot = {snap_violations!r}\n"
+            f"  direct   = {direct_violations!r}"
+        )
+
 
 # ── step-03 RED: §9 scenario 1 (textual conflict bounces disk-free)
 #                + scenario 8 (contract textual⇒overlap) via REAL pipeline ────
