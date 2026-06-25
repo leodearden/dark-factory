@@ -1165,3 +1165,87 @@ class TestOmegaIntegrationGate:
             f'γ: WIP content must be reachable from task/{task_id} after reattach; '
             f'got rc={rc3!r}, out={show_out!r}'
         )
+
+    # -----------------------------------------------------------------------
+    # Step-7: RED merge seam
+    # -----------------------------------------------------------------------
+
+    async def test_merge_seam_no_unknown_branch_and_merge_completes(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """merge seam: _classify_branch_presence returns None AND merge completes.
+
+        Standalone merge check on a freshly-acquired lane with WIP committed.
+
+        ASSERT (NO unknown_branch — the exact merge_queue.py:2372 negative):
+          - await _classify_branch_presence(git_ops, None, id, id, None) is None
+          - await git_ops.resolve_queued_branch_ref(id) is not None
+
+        ASSERT (merge COMPLETES):
+          - result = await git_ops.merge_to_main(lane, id) → result.success
+          - result.merge_commit is not None
+          - await git_ops.advance_main(result.merge_commit) == 'advanced'
+          - WIP landed on main: git show main:<wipfile> contains the content
+
+        Negative control: with α/β reverted the ref is gone →
+        _classify_branch_presence returns unknown_branch MergeOutcome → is None FAILS.
+        """
+        task_id = 'omega-merge-1'
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        git_ops = harness.git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Acquire lane + commit WIP
+        info = await git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo)
+        lane = info.path
+        wip_file = f'wip_merge_{task_id}.txt'
+        wip_content = 'merge seam wip content\n'
+        (lane / wip_file).write_text(wip_content)
+        await git_ops.commit(lane, f'wip: merge seam work for {task_id}')
+
+        # Assert: NO unknown_branch
+        branch_presence = await _classify_branch_presence(
+            git_ops, None, task_id, task_id, None,
+        )
+        assert branch_presence is None, (
+            f'_classify_branch_presence must return None (branch present, not unknown); '
+            f'got {branch_presence!r}; α/β-revert → ref deleted → unknown_branch → FAIL'
+        )
+
+        resolved = await git_ops.resolve_queued_branch_ref(task_id)
+        assert resolved is not None, (
+            f'resolve_queued_branch_ref({task_id!r}) must return a ref, got None'
+        )
+
+        # Assert: merge COMPLETES
+        result = await git_ops.merge_to_main(lane, task_id)
+        assert result.success, (
+            f'merge_to_main must succeed, got success={result.success!r}, '
+            f'details={getattr(result, "details", None)!r}'
+        )
+        assert result.merge_commit is not None, (
+            'merge_to_main must return a merge_commit SHA'
+        )
+        assert result.merge_worktree is not None
+
+        advance = await git_ops.advance_main(result.merge_commit)
+        assert advance == 'advanced', (
+            f'advance_main must return "advanced", got {advance!r}'
+        )
+
+        # WIP landed on main
+        rc_show, show_out, _ = await _run(
+            ['git', 'show', f'main:{wip_file}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_show == 0 and wip_content.strip() in show_out, (
+            f'WIP must land on main after advance_main; '
+            f'rc={rc_show!r}, out={show_out!r}'
+        )
+
+        # Cleanup merge worktree
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
