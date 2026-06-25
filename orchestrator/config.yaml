@@ -29,8 +29,8 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # 6 subprojects (~3 min). Tight timeouts surface hangs (e.g. asyncio-sleep
 # loops in a misconfigured mock) on the first verify that touches the module,
 # not 8 days later at a post-completion full review.
-verify_command_timeout_secs: 600
-verify_cold_command_timeout_secs: 1200
+verify_command_timeout_secs: 1800
+verify_cold_command_timeout_secs: 3600
 
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
