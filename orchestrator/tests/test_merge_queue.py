@@ -1049,6 +1049,109 @@ class TestClassifyBranchPresence:
         conn.close()
         assert count == 0, 'no merge_attempt expected when the branch ref exists'
 
+    async def test_prefixed_input_live_branch_returns_none(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """Already-prefixed input 'task/X' with a live ref → None (proceed).
+
+        Currently mis-classifies as unknown_branch because it computes
+        prefix+'task/X' = 'task/task/X' (absent) before step-4.
+        After step-4 the resolver finds 'task/X' directly → None.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        await git_ops.create_worktree('cp1')  # creates task/cp1
+
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'cp1', 'task/cp1', time.monotonic(),
+        )
+
+        assert outcome is None, f'expected None (proceed) but got {outcome}'
+
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0, 'no merge_attempt emitted when branch exists'
+
+    async def test_full_non_task_input_live_branch_returns_none(
+        self, git_ops: GitOps, tmp_path: Path, git_repo: Path,
+    ):
+        """Full non-task input 'cost-min-prd' with a live ref → None (proceed).
+
+        Currently mis-classifies as unknown_branch because it computes
+        'task/cost-min-prd' (absent) before step-4.
+        After step-4 the resolver finds 'cost-min-prd' directly → None.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        await _run(['git', 'branch', 'cp-cost-min-prd', 'main'], cwd=git_repo)
+
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'cp-cost-min-prd', 'cp-cost-min-prd', time.monotonic(),
+        )
+
+        assert outcome is None, f'expected None (proceed) but got {outcome}'
+
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0, 'no merge_attempt emitted when branch exists'
+
+    async def test_already_merged_via_prefixed_input(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """Prefixed input 'task/X' for a merged+deleted branch → already_merged.
+
+        Merge task/cp-m1 (via bare id 'cp-m1'), advance, delete branch.
+        Call _classify_branch_presence with branch='task/cp-m1' (prefixed).
+        Currently returns unknown_branch because prefix+'task/cp-m1' = 'task/task/cp-m1'
+        has no marker. After step-4 the marker check tries both candidate forms
+        and finds the marker under 'task/cp-m1' → already_merged.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        # Create, merge, advance, and clean up task/cp-m1
+        worktree = (await git_ops.create_worktree('cp-m1')).path
+        (worktree / 'cpm.py').write_text('cpm = 1\n')
+        await git_ops.commit(worktree, 'Add cpm')
+        result = await git_ops.merge_to_main(worktree, 'cp-m1')
+        assert result.success
+        assert result.merge_commit is not None
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        await _run(
+            ['git', 'worktree', 'remove', '--force', str(worktree)],
+            cwd=git_ops.project_root,
+        )
+        await _run(
+            ['git', 'branch', '-D', 'task/cp-m1'], cwd=git_ops.project_root,
+        )
+        assert await git_ops.resolve_branch_sha('task/cp-m1') is None
+
+        # Classify with the PREFIXED branch name
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'cp-m1', 'task/cp-m1', time.monotonic(),
+        )
+
+        assert outcome is not None
+        assert outcome.status == 'already_merged', f'got {outcome}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome') FROM events "
+            "WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert rows == [('already_merged',)], f'rows={rows}'
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
