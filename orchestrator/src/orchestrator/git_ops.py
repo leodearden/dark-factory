@@ -1955,7 +1955,30 @@ class GitOps:
                         'lane %s has orphan %s with commits; reattaching',
                         lane, full_branch,
                     )
-                    await _run(['git', 'checkout', '-f', full_branch], cwd=lane)
+                    _co_rc, _, _co_err = await _run(
+                        ['git', 'checkout', '-f', full_branch], cwd=lane,
+                    )
+                    if _co_rc != 0:
+                        # Cannot re-attach (e.g. branch is checked out in another
+                        # live worktree after a process restart).  Raise rather than
+                        # proceeding: _reuse_warm_lane would commit WIP onto the
+                        # wrong (previous-occupant) branch and corrupt state.
+                        # Mirrors the create-once site (~1809-1826) and
+                        # _cleanup_leftover_branch's raise-not-destroy contract
+                        # (inv.10 fail-safe-retain).
+                        # acquire_warm_lane's top-level except Exception converts
+                        # this to WarmLaneUnavailable.FAULT (lane released, caller
+                        # escalates blocked+L1) while leaving full_branch intact.
+                        raise RuntimeError(
+                            f'acquire_warm_lane: refusing to reuse lane {lane} '
+                            f'— orphan {full_branch!r} carries commits beyond '
+                            f'{self.config.main_branch} but lane checkout failed '
+                            f'(git checkout -f rc={_co_rc}: {_co_err.strip()!r}). '
+                            f'Proceeding would commit WIP onto the wrong branch '
+                            f'and corrupt state. The branch is left intact. '
+                            f'Inspect the branch and, once wanted work is preserved, '
+                            f'remove the other worktree and retry.'
+                        )
                     return await self._reuse_warm_lane(lane, full_branch)
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
