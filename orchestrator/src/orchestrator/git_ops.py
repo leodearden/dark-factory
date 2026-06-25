@@ -2012,7 +2012,10 @@ class GitOps:
         Steps:
         1. ``git -C <lane> checkout --detach`` — detach HEAD so the just-used
            branch is deletable while the lane directory stays in place.
-        2. ``git branch -D task/<branch_name>`` — best-effort; logs on failure.
+        2. ``git branch -D task/<branch_name>`` — **on-main only**: deleted
+           only when the branch carries no commits beyond main (i.e. is at the
+           main tip).  When it carries commits, the branch is RETAINED and a
+           log line is emitted; the pool release still proceeds.
         3. ``await self.warm_lane_pool.release(lane_dir)`` — flip ASSIGNED→FREE.
 
         Never removes the worktree; ``target/`` is left in place incidentally
@@ -2044,14 +2047,20 @@ class GitOps:
             )
 
         try:
-            rc, _, err = await _run(
-                ['git', 'branch', '-D', full_branch],
-                cwd=self.project_root,
-            )
-            if rc != 0:
-                logger.warning(
-                    'release_warm_lane: branch -D %s failed: %s', full_branch, err,
+            if await self._branch_has_commits_beyond_main(full_branch):
+                logger.info(
+                    'release_warm_lane: retaining branch %s — carries commits beyond %s',
+                    full_branch, self.config.main_branch,
                 )
+            else:
+                rc, _, err = await _run(
+                    ['git', 'branch', '-D', full_branch],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    logger.warning(
+                        'release_warm_lane: branch -D %s failed: %s', full_branch, err,
+                    )
         except Exception:
             logger.warning(
                 'release_warm_lane: branch -D error for %s', full_branch, exc_info=True,
