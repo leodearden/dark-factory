@@ -28,18 +28,24 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.config import GitConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import (
     GitOps,
     WarmLaneDiskPressure,
     WarmLanePoolExhausted,
+    WarmLaneUnavailable,
     WorktreeInfo,
     _run,
 )
+from orchestrator.harness import Harness, TaskReport
+from orchestrator.merge_queue import _classify_branch_presence
+from orchestrator.scheduler import TaskAssignment
 from orchestrator.warm_lane_pool import LaneState
+from orchestrator.workflow import WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Repo fixture
@@ -227,6 +233,80 @@ async def _get_head(repo: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
     assert rc == 0, f'git rev-parse HEAD failed (rc={rc})'
     return out.strip()
+
+
+# ---------------------------------------------------------------------------
+# ω-gate scaffolding: harness helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_harness(config: OrchestratorConfig) -> Harness:
+    """Construct a Harness with heavy constructors patched out.
+
+    Mirrors _build_harness from test_harness_warm_lane_wiring.py.
+    """
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.Scheduler'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        return Harness(config)
+
+
+def _make_orch_config(
+    repo: Path,
+    *,
+    max_concurrent_tasks: int = 1,
+) -> OrchestratorConfig:
+    """Build a minimal OrchestratorConfig for ω-gate tests.
+
+    Sets warm_lane_pool=True; disk guard stays default False so the seam
+    tests don't need to stub disk-guard exit codes.
+    """
+    return OrchestratorConfig(
+        project_root=repo,
+        max_concurrent_tasks=max_concurrent_tasks,
+        git=GitConfig(warm_lane_pool=True),
+    )
+
+
+async def _run_synthetic_hard_cancel_slot(
+    harness: Harness,
+    task_id: str,
+) -> TaskReport:
+    """Drive harness._run_slot with TaskWorkflow.run raising asyncio.CancelledError.
+
+    Simulates the T5 hard-cancel scenario (e.g. soft-cancel poll limit exceeded).
+    Returns the synthetic CANCELLED report that the harness except-clause builds.
+
+    The caller must pre-assign a lane for *task_id* (via pool.acquire_for(task_id))
+    before calling this helper; the β guard being tested requires the lane to be
+    ASSIGNED at _run_slot entry.
+
+    Mirrors the setup in
+    TestHardCancelLaneRelease.test_synthetic_hard_cancel_retains_branch_and_lane.
+    """
+    harness.scheduler.carries_substrate_probe.return_value = False
+    harness.scheduler.is_deterministic.return_value = False
+
+    with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        mock_wf = MagicMock()
+        mock_wf.run = AsyncMock(side_effect=asyncio.CancelledError())
+        MockWorkflow.return_value = mock_wf
+
+        assignment = TaskAssignment(
+            task_id=task_id,
+            task={
+                'id': task_id,
+                'title': f'ω-gate synthetic-cancel task {task_id}',
+                'status': 'pending',
+                'metadata': {},
+                'dependencies': [],
+            },
+            modules=[],
+        )
+        sem = asyncio.Semaphore(1)
+        return await harness._run_slot(assignment, sem)
 
 
 # ===========================================================================
