@@ -1004,3 +1004,67 @@ class TestOmegaIntegrationGate:
         assert rc_ref == 0, (
             f'task/{task_id} branch must survive hard-cancel (β skips B2 branch delete)'
         )
+
+    # -----------------------------------------------------------------------
+    # Step-3: RED α seam
+    # -----------------------------------------------------------------------
+
+    async def test_alpha_reclaim_release_retains_branch(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """α seam: branch with commits beyond main survives the real reclaim release.
+
+        Drives release_lane_for_terminal_task (the α-path reclaim β defers to) on
+        a lane whose task/<id> branch has an unmerged commit.  Asserts:
+          - release_lane_for_terminal_task returns True (reclaim succeeded)
+          - git rev-parse --verify refs/heads/task/<id> rc == 0 (branch RETAINED)
+          - pool.state(lane) == FREE (cache reclaimed, no leak)
+
+        Negative control for α: with α reverted, release_warm_lane runs an
+        unconditional git branch -D task/<id> → ref deleted → rev-parse FAILS.
+        """
+        task_id = 'omega-alpha-1'
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        git_ops = harness.git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Acquire lane + commit unmerged WIP (1 commit beyond main)
+        info = await git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo)
+        lane = info.path
+        (lane / 'wip_alpha.txt').write_text('alpha wip content\n')
+        await git_ops.commit(lane, 'wip: alpha seam unmerged work')
+
+        rc, count, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc == 0 and int(count.strip()) == 1, (
+            f'setup: must have exactly 1 commit beyond main, got {count!r}'
+        )
+
+        # Drive the reclaim release (the path β defers to)
+        freed = await git_ops.release_lane_for_terminal_task(task_id)
+        assert freed is True, (
+            'release_lane_for_terminal_task must return True on successful reclaim'
+        )
+
+        # α assertion: branch RETAINED through the real release
+        rc_ref, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', f'refs/heads/task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_ref == 0, (
+            f'task/{task_id} branch must survive release_lane_for_terminal_task '
+            f'when it has commits beyond main (α guard in _delete_branch_if_on_main); '
+            f'α-revert → unconditional git branch -D → ref deleted → FAIL'
+        )
+
+        # Cache reclaimed: lane must be FREE (no leak)
+        assert pool.state(lane) == LaneState.FREE, (
+            f'lane must be FREE after release_lane_for_terminal_task, '
+            f'got {pool.state(lane)!r} (cache leak if still ASSIGNED)'
+        )
