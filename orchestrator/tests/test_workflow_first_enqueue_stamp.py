@@ -115,7 +115,7 @@ def test_merge_request_carries_first_enqueued_at_field():
     RED: MergeRequest has no such field today (TypeError on construction).
     GREEN after step-2 adds the carrier field.
     """
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     # Use a MagicMock stand-in for result — the dataclass stores it but never
     # awaits it during construction, so no real asyncio.Future is needed.
     result_mock = MagicMock()
