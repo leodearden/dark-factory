@@ -3941,6 +3941,13 @@ Output JSON matching the schema. Every task must appear in the output.
             # reconciler / next acquire (α-guarded release_warm_lane retains branch).
             # Genuine DONE / non-synthetic CANCELLED still release here (regression-
             # guarded by test_nonsynthetic_terminal_report_still_releases_lane).
+            #
+            # Coordinated with workflow.py B1 (_hard_cancel via sys.exc_info()):
+            # B1 runs first (inside run() finally, before the harness catches the
+            # CancelledError); B2 here is the outer harness guard.  Both are
+            # independent — B1 uses the in-flight exception, B2 uses the explicit
+            # synthetic_cancel flag on the TaskReport.  Together they ensure the
+            # eager branch-deleting release never fires on a hard-cancel path.
             if (
                 report is not None
                 and report.outcome in (WorkflowOutcome.DONE, WorkflowOutcome.CANCELLED)

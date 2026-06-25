@@ -390,6 +390,19 @@ class TestB1InFlightHardCancelSkipsRelease:
         Contrasting normal-return CANCELLED case (release DOES fire, exc_info==None)
         is covered by TestCancelledWorkflowLaneRelease.test_cancelled_workflow_frees_lane,
         guarding that β does not over-suppress the genuine authoritative-cancel path.
+
+        NOTE — intentionally-unreachable state combination:
+        In production, state==CANCELLED can only be written by
+        _handle_cancelled_terminal_exit (workflow.py:7265), which is never reached
+        during a hard-cancel because the asyncio.CancelledError (a BaseException)
+        propagates directly through run()'s ``except Exception`` guard.  So the
+        combination ``state==CANCELLED AND exc_info()==CancelledError`` cannot
+        occur on a real code path — the ``self.state in (DONE, CANCELLED)`` branch
+        of the B1 condition is already False for hard-cancels in practice.
+        The test nonetheless exercises this combination to lock the defensive
+        ``_hard_cancel`` guard, ensuring it does not silently disappear under
+        refactoring.  A future reader should treat this as intentional belt-and-
+        suspenders for an unreachable production state, not a test of a live path.
         """
         from unittest.mock import AsyncMock, MagicMock
 
@@ -668,6 +681,99 @@ class TestHardCancelLaneRelease:
         )
         assert pool.state(lane) == LaneState.FREE, (
             f'lane must be FREE after non-synthetic CANCELLED exit, got {pool.state(lane)!r}'
+        )
+
+    async def test_reconciler_reclaims_lane_after_synthetic_hard_cancel(self, tmp_path: Path):
+        """β 'reclaimable' guarantee: periodic reconciler drives ASSIGNED → FREE.
+
+        After a synthetic hard-cancel (B2 skipped), the lane stays ASSIGNED.
+        This test drives _reconcile_terminal_lanes and asserts:
+        - lane transitions FREE  (reclaimable, not permanently leaked)
+        - branch is preserved   (release_lane_for_terminal_task is patched to
+          simulate α's branch-preserving primitive; branch deletion is α's job)
+
+        The mock of release_lane_for_terminal_task represents the expected
+        α-guarded behaviour: pool state freed, branch ref left intact.  The
+        test is α-independent because it only verifies that β leaves the pool
+        in a state the reconciler can act on, not that α's unguarded primitive
+        currently preserves the branch.
+
+        Closes the coverage gap flagged by the code reviewer: the 'reclaimable,
+        not permanently leaked' half of β's contract was asserted by
+        test_synthetic_hard_cancel_retains_branch_and_lane as pool ASSIGNED
+        (can be reclaimed), but not as pool FREE (was actually reclaimed).
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.git_ops import GitOps
+        from orchestrator.git_ops import _run as git_run
+        from orchestrator.warm_lane_pool import LaneState
+
+        # ── Setup: repo + harness with pool ────────────────────────────────
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # ── Create task/99 branch beyond main (simulates unmerged work) ───
+        await git_run(['git', 'checkout', '-b', 'task/99'], cwd=repo)
+        (repo / 'recon.txt').write_text('reconciler test\n')
+        await git_run(['git', 'add', '-A'], cwd=repo)
+        await git_run(['git', 'commit', '-m', 'wip: task 99 reconciler test'], cwd=repo)
+        await git_run(['git', 'checkout', 'main'], cwd=repo)
+
+        # ── Simulate β post-hard-cancel state: ASSIGNED, branch alive ─────
+        result = await pool.acquire_for('99')
+        assert result is not None
+        lane, _ = result
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'post-cancel pool must be ASSIGNED (β contract)'
+        )
+
+        # ── Patch release_lane_for_terminal_task to simulate α-guarded release ─
+        # Pool is freed but git branch -D is NOT called (α's branch-preservation
+        # guard).  This isolates β's "reclaimable" claim from α's branch-delete guard.
+        async def _alpha_guarded_release(branch_name: str) -> bool:
+            lne = pool.assignment_for(branch_name)
+            if lne is not None:
+                await pool.release(lne)
+            return True
+
+        git_ops.release_lane_for_terminal_task = _alpha_guarded_release  # type: ignore[method-assign]
+
+        # ── Reconciler sees task/99 as 'cancelled', not live ─────────────
+        harness.scheduler.get_statuses = AsyncMock(return_value=({'99': 'cancelled'}, None))
+        harness.scheduler._dispatched = set()
+        harness.event_store = MagicMock()
+
+        # ── Drive _reconcile_terminal_lanes ───────────────────────────────
+        await harness._reconcile_terminal_lanes()
+
+        # Lane must be FREE (ASSIGNED → FREE via reconciler)
+        assert pool.assignment_for('99') is None, (
+            'reconciler must reclaim the lane that β left ASSIGNED after synthetic hard-cancel'
+        )
+        assert pool.state(lane) == LaneState.FREE, (
+            f'lane must be FREE after reconciler, got {pool.state(lane)!r}'
+        )
+
+        # Branch must survive (α-guarded primitive did not delete it)
+        rc, _, _ = await git_run(
+            ['git', 'rev-parse', '--verify', 'refs/heads/task/99'], cwd=repo,
+        )
+        assert rc == 0, (
+            'task/99 branch must survive the reconciler with α-guarded release '
+            '(β retains the branch by skipping B2; reconciler reclaims via α-safe path)'
         )
 
 

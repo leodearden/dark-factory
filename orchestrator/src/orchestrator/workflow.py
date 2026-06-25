@@ -2008,6 +2008,13 @@ class TaskWorkflow:
             # Detection via sys.exc_info() is the idiomatic Python idiom; a normal
             # DONE/authoritative-CANCELLED return has exc_info()==(None,None,None),
             # so the release fires unchanged for genuine terminal exits.
+            #
+            # Coordinated with harness.py B2 (report.synthetic_cancel=True): both
+            # guards protect the same hard-cancel event via independent mechanisms.
+            # B1 fires first — inside workflow.run() before the harness catches the
+            # CancelledError.  B2 fires in _run_slot's finally after _run_slot
+            # returns.  Neither depends on the other; both must fire to ensure no
+            # eager branch-deleting release escapes on the synthetic-cancel path.
             _exc_type = sys.exc_info()[0]
             _hard_cancel = _exc_type is not None and issubclass(_exc_type, asyncio.CancelledError)
             if (
