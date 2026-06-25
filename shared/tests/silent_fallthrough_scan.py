@@ -26,6 +26,7 @@ References:
 from __future__ import annotations
 
 import ast
+import hashlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
@@ -43,6 +44,7 @@ class Violation(NamedTuple):
     signature: str   # "a" or "b"
     message: str
     qualname: str = ""  # enclosing function qualname (e.g. "Harness.run")
+    content_hash: str = ""  # sha256(ast.unparse(node))[:12] — drift-resistant
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +228,21 @@ def _handler_reraises(handler: ast.ExceptHandler) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Content-hash helper
+# ---------------------------------------------------------------------------
+
+
+def _content_hash(node: ast.AST) -> str:
+    """Return sha256(ast.unparse(node).encode())[:12].
+
+    Produces a 12-char lowercase hex string that is invariant under line-number
+    drift and reindentation (ast.unparse canonicalises the AST text), but
+    changes when the node's type, body, or return literal changes.
+    """
+    return hashlib.sha256(ast.unparse(node).encode("utf-8")).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
 # AST parent-map helpers (for qualname computation)
 # ---------------------------------------------------------------------------
 
@@ -306,6 +323,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                             f"escalate via resolver_failed() or raise"
                         ),
                         qualname=_compute_qualname(node, parent_map),
+                        content_hash=_content_hash(node),
                     ))
 
         # ------------------------------------------------------------------ #
@@ -332,6 +350,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                     f"logger.warning/error/exception(...) before the return"
                 ),
                 qualname=_compute_qualname(node, parent_map),
+                content_hash=_content_hash(node),
             ))
 
     return violations

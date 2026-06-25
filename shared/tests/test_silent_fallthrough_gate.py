@@ -484,12 +484,16 @@ class TestContentHash:
         )
 
     def test_sig_a_content_hash_line_drift_invariant(self):
-        """Prepending blank lines changes lineno but NOT content_hash (sig-a)."""
+        """Prepending blank lines changes lineno but NOT content_hash (sig-a).
+
+        Note: _violations() calls .strip() which removes leading newlines, so
+        we call find_violations() directly to preserve the prepended blank lines.
+        """
         src_base = "x, _ = get_statuses()"
         src_drifted = "\n\n\n" + src_base  # 3 blank lines prepended
 
-        vs_base = _violations(src_base)
-        vs_drifted = _violations(src_drifted)
+        vs_base = find_violations(src_base, "<test>")
+        vs_drifted = find_violations(src_drifted, "<test>")
         sig_a_base = [v for v in vs_base if _sig_a(v)]
         sig_a_drifted = [v for v in vs_drifted if _sig_a(v)]
 
@@ -503,7 +507,11 @@ class TestContentHash:
         )
 
     def test_sig_b_content_hash_line_drift_invariant(self):
-        """Prepending blank lines changes lineno but NOT content_hash (sig-b)."""
+        """Prepending blank lines changes lineno but NOT content_hash (sig-b).
+
+        Note: _violations() calls .strip() which removes leading newlines, so
+        we call find_violations() directly to preserve the prepended blank lines.
+        """
         src_base = textwrap.dedent("""\
             def f():
                 try:
@@ -513,8 +521,8 @@ class TestContentHash:
         """).strip()
         src_drifted = "\n\n\n" + src_base
 
-        vs_base = _violations(src_base)
-        vs_drifted = _violations(src_drifted)
+        vs_base = find_violations(src_base, "<test>")
+        vs_drifted = find_violations(src_drifted, "<test>")
         sig_b_base = [v for v in vs_base if _sig_b(v)]
         sig_b_drifted = [v for v in vs_drifted if _sig_b(v)]
 
