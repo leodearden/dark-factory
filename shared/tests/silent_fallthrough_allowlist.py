@@ -49,21 +49,21 @@ ALLOWLIST_ENTRIES: list[tuple[str, int, str, str]] = [
     # Fixing them is PRD-out-of-scope (48-site migration is complete).
     (
         "orchestrator/src/orchestrator/harness.py",
-        884,
+        985,
         "Harness.run",
         "pre-existing best-effort get_statuses: PRD-tag pre-scan only; "
-        "next get_statuses at :889 binds err; out of 48-site scope",
+        "next get_statuses at :990 binds err; out of 48-site scope",
     ),
     (
         "orchestrator/src/orchestrator/harness.py",
-        929,
+        1034,
         "Harness.run",
         "pre-existing best-effort get_statuses: advisory report.total_tasks "
         "counter only; non-fatal on error; out of 48-site scope",
     ),
     (
         "orchestrator/src/orchestrator/harness.py",
-        1041,
+        1146,
         "Harness.run",
         "pre-existing best-effort get_statuses: advisory cycle-reset "
         "total_tasks counter; non-fatal on error; out of 48-site scope",
@@ -89,7 +89,7 @@ ALLOWLIST_ENTRIES: list[tuple[str, int, str, str]] = [
     ),
     (
         "orchestrator/src/orchestrator/agents/briefing.py",
-        917,
+        923,
         "BriefingAssembler._mcp_search",
         "debug-logged fail-safe: MCP search error returns None for graceful "
         "briefing degradation (non-critical context enrichment)",
@@ -117,28 +117,28 @@ ALLOWLIST_ENTRIES: list[tuple[str, int, str, str]] = [
     ),
     (
         "orchestrator/src/orchestrator/harness.py",
-        5141,
+        5884,
         "Harness._schedule_coro_threadsafe._log_if_raised",
         "deliberate: future.exception() may itself raise CancelledError; "
         "bare return avoids infinite escalation loop inside done-callback",
     ),
     (
         "orchestrator/src/orchestrator/merge_queue.py",
-        676,
+        780,
         "_classify_main_health_red",
         "pre-existing optional probe helper: exception during health check "
         "returns None (no proposal); callers handle None gracefully",
     ),
     (
         "orchestrator/src/orchestrator/verify.py",
-        2901,
+        2960,
         "run_main_tip_sweep",
         "debug-logged fail-safe: get_main_sha failure returns None to skip "
         "sweep entirely (background probe, non-critical)",
     ),
     (
         "orchestrator/src/orchestrator/verify.py",
-        2955,
+        3014,
         "run_main_tip_sweep",
         "debug-logged fail-safe: unexpected error during main-tip sweep "
         "returns None; sweeps are background checks, not on critical path",
