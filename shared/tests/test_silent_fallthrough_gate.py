@@ -565,6 +565,157 @@ class TestContentHash:
 
 
 # ---------------------------------------------------------------------------
+# Step 3 — violation_key and reconcile_against_allowlist helpers
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileMatcher:
+    """Pure helpers: violation_key() and reconcile_against_allowlist()."""
+
+    # ------------------------------------------------------------------
+    # Fixtures: small synthetic sources → live Violation objects
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sig_a_violation() -> Violation:
+        src = "x, _ = get_statuses()"
+        vs = find_violations(src, "fake/module.py")
+        sig_a = [v for v in vs if v.signature == "a"]
+        assert len(sig_a) == 1, f"Expected 1 sig-a, got {sig_a}"
+        return sig_a[0]
+
+    @staticmethod
+    def _sig_b_violation() -> Violation:
+        src = textwrap.dedent("""\
+            def my_func():
+                try:
+                    pass
+                except Exception:
+                    return None
+        """).strip()
+        vs = find_violations(src, "fake/module.py")
+        sig_b = [v for v in vs if v.signature == "b"]
+        assert len(sig_b) == 1, f"Expected 1 sig-b, got {sig_b}"
+        return sig_b[0]
+
+    # ------------------------------------------------------------------
+    # (a) violation_key returns (filename, qualname, content_hash)
+    # ------------------------------------------------------------------
+
+    def test_violation_key_fields(self):
+        """violation_key(v) == (v.filename, v.qualname, v.content_hash)."""
+        from silent_fallthrough_scan import violation_key
+        v = self._sig_a_violation()
+        assert violation_key(v) == (v.filename, v.qualname, v.content_hash)
+
+    def test_violation_key_sig_b(self):
+        """violation_key also works on sig-b violations."""
+        from silent_fallthrough_scan import violation_key
+        v = self._sig_b_violation()
+        assert violation_key(v) == (v.filename, v.qualname, v.content_hash)
+
+    # ------------------------------------------------------------------
+    # (b) violation_key is identical under line drift
+    # ------------------------------------------------------------------
+
+    def test_violation_key_drift_invariant(self):
+        """Same handler with blank lines prepended → same key, different lineno."""
+        from silent_fallthrough_scan import violation_key
+        src_base = textwrap.dedent("""\
+            def my_func():
+                try:
+                    pass
+                except Exception:
+                    return None
+        """).strip()
+        src_drifted = "\n\n\n" + src_base
+
+        vs_base = find_violations(src_base, "fake/module.py")
+        vs_drifted = find_violations(src_drifted, "fake/module.py")
+        sig_b_base = [v for v in vs_base if v.signature == "b"]
+        sig_b_drifted = [v for v in vs_drifted if v.signature == "b"]
+
+        assert len(sig_b_base) == 1
+        assert len(sig_b_drifted) == 1
+        assert sig_b_base[0].lineno != sig_b_drifted[0].lineno, (
+            "Prepending blank lines should change lineno"
+        )
+        assert violation_key(sig_b_base[0]) == violation_key(sig_b_drifted[0]), (
+            "violation_key must be identical despite line drift"
+        )
+
+    # ------------------------------------------------------------------
+    # (c) reconcile_against_allowlist basic cases
+    # ------------------------------------------------------------------
+
+    def test_reconcile_exact_cover_no_issues(self):
+        """Exact 1:1 cover (one violation, one matching key) → ([], [])."""
+        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+        v = self._sig_a_violation()
+        key = violation_key(v)
+        unblessed, stale = reconcile_against_allowlist([v], [key])
+        assert unblessed == [], f"Expected no unblessed, got {unblessed}"
+        assert stale == [], f"Expected no stale, got {stale}"
+
+    def test_reconcile_extra_tree_violation_is_unblessed(self):
+        """Tree has a violation with no matching key → it appears in unblessed."""
+        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+        v_a = self._sig_a_violation()
+        v_b = self._sig_b_violation()
+        # only v_a is blessed
+        key_a = violation_key(v_a)
+        unblessed, stale = reconcile_against_allowlist([v_a, v_b], [key_a])
+        assert len(unblessed) == 1, f"Expected 1 unblessed, got {unblessed}"
+        assert unblessed[0] is v_b
+        assert stale == [], f"Expected no stale, got {stale}"
+
+    def test_reconcile_stale_key_no_matching_violation(self):
+        """Allow_keys has a key with no matching violation → it appears in stale."""
+        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+        v_a = self._sig_a_violation()
+        v_b = self._sig_b_violation()
+        # bless both keys but only provide v_a as the tree violation
+        key_a = violation_key(v_a)
+        key_b = violation_key(v_b)
+        unblessed, stale = reconcile_against_allowlist([v_a], [key_a, key_b])
+        assert unblessed == [], f"Expected no unblessed, got {unblessed}"
+        assert len(stale) == 1, f"Expected 1 stale, got {stale}"
+        assert stale[0] == key_b
+
+    # ------------------------------------------------------------------
+    # (d) Collision: two violations sharing one key — multiset semantics
+    # ------------------------------------------------------------------
+
+    def test_reconcile_collision_two_keys_blessed(self):
+        """Two violations sharing the same key, blessed by TWO key entries → ([], [])."""
+        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+        # Build two identical sig-a violations (same source → same key)
+        src = "x, _ = get_statuses()"
+        v1 = find_violations(src, "fake/module.py")[0]
+        v2 = find_violations(src, "fake/module.py")[0]
+        key = violation_key(v1)
+        assert violation_key(v1) == violation_key(v2), "Both violations must share the same key"
+        # Two copies in allow_keys → both covered
+        unblessed, stale = reconcile_against_allowlist([v1, v2], [key, key])
+        assert unblessed == [], f"Expected no unblessed, got {unblessed}"
+        assert stale == [], f"Expected no stale, got {stale}"
+
+    def test_reconcile_collision_one_key_blessed(self):
+        """Two violations sharing one key, blessed by only ONE key → one unblessed."""
+        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+        src = "x, _ = get_statuses()"
+        v1 = find_violations(src, "fake/module.py")[0]
+        v2 = find_violations(src, "fake/module.py")[0]
+        key = violation_key(v1)
+        # Only one copy in allow_keys → only one covered, one unblessed
+        unblessed, stale = reconcile_against_allowlist([v1, v2], [key])
+        assert len(unblessed) == 1, (
+            f"Expected exactly 1 unblessed (count semantics), got {unblessed}"
+        )
+        assert stale == [], f"Expected no stale, got {stale}"
+
+
+# ---------------------------------------------------------------------------
 # Step 5 — Whole-tree integration + gate self-integrity tests
 # ---------------------------------------------------------------------------
 
