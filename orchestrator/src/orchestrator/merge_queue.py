@@ -2356,20 +2356,45 @@ async def _classify_branch_presence(
     ``unknown_branch`` is a diagnostic terminal outcome, so emitting it is
     consistent with ``_emit_merge_attempt``'s contract (only infrastructure
     ``blocked`` outcomes are intentionally suppressed there).
+
+    *branch* is resolved via :meth:`GitOps.resolve_queued_branch_ref` which
+    tolerates three shapes: bare task id (``'4778'``), already-prefixed
+    (``'task/4778'``), and full non-task names (``'cost-min-prd'``).  When a
+    live ref is found the method returns ``None`` (proceed).
+
+    For the already-merged check, both candidate forms are tried in priority
+    order — ``{branch_prefix}{branch}`` then ``branch`` as-is — because a
+    merged+deleted branch has no live ref and the merge-commit subject on main
+    reflects whichever form ``merge_to_main`` used at merge time.  Trying both
+    ensures prefixed-input callers (``branch='task/4778'``) still classify
+    as ``already_merged`` rather than collapsing to ``unknown_branch``.
+
+    The ``unknown_branch`` reason string always references the prefixed form
+    (``f'{branch_prefix}{branch}'``) to preserve the existing assertion
+    ``'task/ghost-4011' in reason``.
     """
-    full_branch = f'{git_ops.config.branch_prefix}{branch}'  # bare name -> task/<branch>
-    if await git_ops.resolve_branch_sha(full_branch) is not None:
-        return None  # common case: ref present, one rev-parse
-    if await git_ops.find_merge_marker(full_branch) is not None:
-        _emit_merge_attempt(
-            event_store, task_id, 'already_merged', duration_ms=_elapsed_ms(t0),
-        )
-        return MergeOutcome('already_merged')
+    # ── Live-ref check via canonical resolver ─────────────────────────────
+    if await git_ops.resolve_queued_branch_ref(branch) is not None:
+        return None  # common case: ref present (bare, prefixed, or full name)
+
+    # ── No live ref: check for an already-merged marker on main ───────────
+    # Try both candidate forms in priority order (prefixed wins tie-break).
+    # A merged+deleted branch has no live ref, so the resolver returned None;
+    # the merge-commit subject is under whichever form merge_to_main used.
+    prefixed = f'{git_ops.config.branch_prefix}{branch}'
+    for candidate in (prefixed, branch):
+        if await git_ops.find_merge_marker(candidate) is not None:
+            _emit_merge_attempt(
+                event_store, task_id, 'already_merged', duration_ms=_elapsed_ms(t0),
+            )
+            return MergeOutcome('already_merged')
+
+    # ── Genuine misroute ───────────────────────────────────────────────────
     _emit_merge_attempt(
         event_store, task_id, 'unknown_branch', duration_ms=_elapsed_ms(t0),
     )
     return MergeOutcome(
-        'unknown_branch', reason=f'branch {full_branch!r} not found in repo',
+        'unknown_branch', reason=f'branch {prefixed!r} not found in repo',
     )
 
 
