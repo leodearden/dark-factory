@@ -6583,7 +6583,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
 
         # ── 4. Resolve branch heads + footprints ─────────────────────────────
-        branch_prefix = self._git_ops.config.branch_prefix
         # Per-item: (head_sha | None, changed_paths | None)
         heads: list[str | None] = []
         changed_paths_list: list[list[str] | None] = []
