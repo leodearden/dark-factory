@@ -3106,7 +3106,10 @@ class GitOps:
         Never touches ``project_root``'s working tree or index.
         Called by the MergeWorker (serialized via the merge queue).
         """
-        full_branch = f'{self.config.branch_prefix}{branch}'
+        full_branch = (
+            await self.resolve_queued_branch_ref(branch)
+            or f'{self.config.branch_prefix}{branch}'
+        )
         merge_wt: Path | None = None
 
         try:
@@ -3730,7 +3733,10 @@ class GitOps:
         this side channel for done_provenance instead of the pre-rebase
         ``MergeResult.merge_commit`` (which is stale after a rebase).
         """
-        full_branch = f'{self.config.branch_prefix}{branch}' if branch else None
+        full_branch = (
+            (await self.resolve_queued_branch_ref(branch) or f'{self.config.branch_prefix}{branch}')
+            if branch else None
+        )
         rebased = False  # Track whether any rebase/re-merge occurred this call
 
         # Derive the verified branch tip from M^2 — the exact branch commit
