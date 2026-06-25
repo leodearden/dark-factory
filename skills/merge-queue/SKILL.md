@@ -137,6 +137,11 @@ The outcome arrives from either the submit call (terminal at submit time) or the
 
 **`abandoned`** — The submission was cancelled via `merge_cancel` before it finished (surfaces from the poll loop). If the merge is still wanted, resubmit (go back to step 3); otherwise, no further action is needed.
 
+**`needs_rebase`** — Your branch was **bounced at conflict-graph time** (disk-free, before any verify slot was consumed) because it has a textual conflict with another branch already in the queue. The merge worker attempted a mechanical speculative rebase:
+- **Clean auto-rebase:** your branch was re-queued automatically with work preserved; no agent was dispatched, and `merge_first_enqueued_at` (your aging priority) was unchanged. No action required — the queue will re-process it.
+- **Real conflict:** the rebase failed; the merge was bounced with a conflict that requires resolution. Fix the conflict in your worktree and resubmit.
+- **Bounce cap reached (`MERGE_BOUNCE_CAP=3`):** the 1688 thrash-backstop triggered — the task is blocked without further rebase. Read the reason, resolve the underlying conflict, and unblock manually.
+
 **`superseded`** — Your request was absorbed into a coalesced train (surfaces from either the submit call or the poll loop). The response includes `superseded_by: "<train_request_id>"`.
 
 **Critical: do NOT fall back to a direct merge or resubmit on `superseded`** — doing so would race the in-flight train that already carries your branch's work. Follow the train instead:
@@ -196,5 +201,60 @@ After a successful direct merge:
 | Outcome `blocked` | Read reason, fix, resubmit |
 | Outcome `done` or `already_merged` | Update task status, clean up |
 | Outcome `superseded` | Re-poll `merge_status(superseded_by)` until terminal; do NOT direct-merge or resubmit |
+| Outcome `needs_rebase` — auto-rebase succeeded | Queue re-processed automatically; no action needed |
+| Outcome `needs_rebase` — real conflict or cap | Fix conflict in worktree, resubmit (or unblock if cap reached) |
 | Abandon a queued submission | `merge_cancel(request_id)` — the only explicit-cancellation path |
 | Unsure if orchestrator is running | Probe `get_pending_escalations()` — if it responds, use the queue |
+
+## The two-layer merge queue
+
+The orchestrator's merge queue uses a **two-layer pipeline** to separate fast conflict detection (disk-free, reorderable) from in-flight verification (immutable, frozen).
+
+### Layer 1: Speculative merge graph (suffix)
+
+The unfrozen suffix (`_lane_buffers`) holds items that are queued but not yet verifying. The **conflict graph** (`suffix_conflict_graph`) tracks footprint overlaps between suffix items. At each recompute cycle (`recompute_suffix_conflict_graph()`), the queue detects textual conflicts and:
+
+- **Bounces the younger conflicting suffix item** (`_bounce_conflicting_suffix_items`) — graph-time, disk-free, before any verify slot is consumed or `_merge-*` worktree is created.
+- Attempts a **mechanical speculative rebase** first: if clean, the item is re-queued with work preserved and `merge_first_enqueued_at` unchanged; if a real conflict is found, the bounce escalates; if the cap (`MERGE_BOUNCE_CAP=3`) is hit, the 1688 thrash-backstop triggers → blocked without further rebase.
+
+Reordering within the suffix is always disk-free (only recomputes the merge-tree for the affected suffix items, never touches in-flight verify state).
+
+### Layer 2: Frozen verify frontier (prefix)
+
+The **frozen prefix** = {verifying} ∪ {landed}. Items in the frozen prefix are **immutable**:
+- A verify is always dispatched against the tip of the frozen prefix (`frozen_prefix_tip`).
+- No reorder or re-base ever touches an in-flight verify item.
+- The suffix recompute only touches `_lane_buffers`; in-flight `_inflight` order and `base_sha` are unchanged.
+
+Health check: `two_layer_invariants(main_sha)` → `[]` when all §5.3 invariants hold.
+
+### Conflict-clique aging order and disjoint throughput bypass
+
+Within a footprint conflict clique, items are ordered by **age of first submission** (`_aging_key = (merge_first_enqueued_at, request_id)`). The oldest first-submission wins — preserving the most expensive work. `merge_first_enqueued_at` is persisted write-once in task metadata and survives orchestrator restarts (falls back to `enqueued_at` for legacy entries).
+
+Items whose footprint is **disjoint from everything ahead** bypass out-of-order for throughput — a disjoint item never waits behind a blocked clique.
+
+### No-landings circuit-breaker
+
+When the landing rate ≈ 0 over a window **and** warm-lane free bytes are falling, `NoLandingsCircuitBreaker` automatically:
+1. Calls `force_halt_scheduler` to stop dispatch.
+2. Files an L2-INFO escalation (role `orchestrator-no-landings-breaker`).
+3. Auto-resumes when a clean landing occurs (`landings_total` rises) or disk recovers.
+
+### Operator-observable heartbeat keys
+
+The `snapshot()` call exposes these additive, backward-compatible keys:
+
+| Key | What it shows |
+|-----|---------------|
+| `suffix_conflict_graph` | Current conflict-graph edges for suffix items |
+| `frozen_prefix` | `{request_ids, tip_merge_commit, verify_depth}` |
+| `metrics` | `{retries_per_landing, drift_at_detection, landings_total}` |
+| `two_layer_invariants` | `[]` when healthy; list of violation strings otherwise |
+
+For the full architectural companion, see [references/two-layer-model.md](references/two-layer-model.md).
+
+### Related work
+
+- **Warm-lane Δp space-safety batch (1859–1861 / reify 4716–4719):** attacks Δp on the *task-dispatch* path (warm-lane disk-space gates). Complementary to the merge-queue path targeted here; no shared seam.
+- **Merge-verify ENOSPC fail-soft (workflow.py transient-infra block → re-queue):** handles ENOSPC at the individual verify step. This is a separate symptom task and is **out of scope** for the two-layer merge queue (§10 of the PRD). Referenced here for orientation only.

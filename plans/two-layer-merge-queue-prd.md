@@ -1,6 +1,7 @@
 # PRD — Two-Layer Merge Queue: conflict-graph + committed verify frontier (merge-churn gain reduction)
 
-**Status:** deferred (design complete; not yet decomposed) — 2026-06-23
+**Status:** built/landed — decomposed α–λ; full pipeline landed 2026-06-25 via λ=1895 (`bbaec52696`)
+**As-built:** [skills/merge-queue/SKILL.md](../skills/merge-queue/SKILL.md) (§ "The two-layer merge queue") · [skills/merge-queue/references/two-layer-model.md](../skills/merge-queue/references/two-layer-model.md)
 **Milestone:** orchestrator merge-queue hardening (follows 1595 / 1646 / 1862 speculation family; complements the warm-lane Δp space-safety batch and the verifier-loop-supervision batch 1856–1858)
 **Type:** extension of the shipped merge-queue subsystem (dark-factory orchestrator), cross-project (small reify piece)
 **Approach:** B + H (contract + two-way boundary tests) — the merge queue is the load-bearing seam; cross-project; ≥8 mechanisms.
