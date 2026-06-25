@@ -391,9 +391,10 @@ class TestB1InFlightHardCancelSkipsRelease:
         is covered by TestCancelledWorkflowLaneRelease.test_cancelled_workflow_frees_lane,
         guarding that β does not over-suppress the genuine authoritative-cancel path.
         """
+        from unittest.mock import AsyncMock, MagicMock
+
         from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
         from escalation.queue import EscalationQueue
-        from unittest.mock import AsyncMock, MagicMock
 
         from orchestrator.git_ops import GitOps
         from orchestrator.scheduler import TaskAssignment
