@@ -882,6 +882,78 @@ class TestCheckPlanTargetsInTree:
 
 
 @pytest.mark.asyncio
+class TestResolveQueuedBranchRef:
+    """Unit tests for GitOps.resolve_queued_branch_ref — all five input shapes."""
+
+    async def test_bare_id_resolves_to_prefixed(self, git_ops: GitOps):
+        """Bare task id resolves to the prefixed branch (task/X).
+
+        create_worktree('4778') creates refs/heads/task/4778.
+        resolve_queued_branch_ref('4778') should return 'task/4778'
+        (rule 1: try branch_prefix+branch first).
+        """
+        await git_ops.create_worktree('rqbr-bare')
+        result = await git_ops.resolve_queued_branch_ref('rqbr-bare')
+        assert result == 'task/rqbr-bare'
+
+    async def test_already_prefixed_resolves_correctly(self, git_ops: GitOps):
+        """Already-prefixed input 'task/X' resolves to 'task/X'.
+
+        create_worktree('rqbr-pre') creates refs/heads/task/rqbr-pre.
+        When branch='task/rqbr-pre':
+          rule 1: try prefix+'task/rqbr-pre' = 'task/task/rqbr-pre' → absent.
+          rule 2: try 'task/rqbr-pre' as-is → present → return 'task/rqbr-pre'.
+        """
+        await git_ops.create_worktree('rqbr-pre')
+        result = await git_ops.resolve_queued_branch_ref('task/rqbr-pre')
+        assert result == 'task/rqbr-pre'
+
+    async def test_full_non_task_branch_resolves_as_is(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """Full non-task branch names ('cost-min-prd', 'feature/x') resolve as-is.
+
+        create refs/heads/cost-min-prd directly via git branch.
+        resolve_queued_branch_ref('cost-min-prd') should return 'cost-min-prd'
+        (rule 1: 'task/cost-min-prd' absent; rule 2: 'cost-min-prd' present).
+        """
+        await _run(['git', 'branch', 'cost-min-prd', 'main'], cwd=git_repo)
+        result = await git_ops.resolve_queued_branch_ref('cost-min-prd')
+        assert result == 'cost-min-prd'
+
+        # Also test a slash-containing non-task name
+        await _run(['git', 'branch', 'feature/rqbr-x', 'main'], cwd=git_repo)
+        result2 = await git_ops.resolve_queued_branch_ref('feature/rqbr-x')
+        assert result2 == 'feature/rqbr-x'
+
+    async def test_missing_branch_returns_none(self, git_ops: GitOps):
+        """A branch that does not exist in any form returns None."""
+        result = await git_ops.resolve_queued_branch_ref('nope-does-not-exist')
+        assert result is None
+
+    async def test_tiebreak_prefixed_wins(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """When both bare 'X' and 'task/X' exist, rule 1 wins → 'task/X' returned.
+
+        create refs/heads/task/rqbr-tie via create_worktree('rqbr-tie').
+        create refs/heads/rqbr-tie via git branch.
+        resolve_queued_branch_ref('rqbr-tie') must return 'task/rqbr-tie' (rule 1).
+        """
+        await git_ops.create_worktree('rqbr-tie')  # creates task/rqbr-tie
+        await _run(['git', 'branch', 'rqbr-tie', 'main'], cwd=git_repo)
+
+        # Sanity-check: both branches exist
+        assert await git_ops.resolve_branch_sha('task/rqbr-tie') is not None
+        assert await git_ops.resolve_branch_sha('rqbr-tie') is not None
+
+        result = await git_ops.resolve_queued_branch_ref('rqbr-tie')
+        assert result == 'task/rqbr-tie', (
+            f'tie-break: expected task/rqbr-tie but got {result!r}'
+        )
+
+
+@pytest.mark.asyncio
 class TestClassifyBranchPresence:
     """Unit tests for the _classify_branch_presence branch-existence guard."""
 
