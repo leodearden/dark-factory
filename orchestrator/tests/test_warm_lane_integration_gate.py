@@ -1068,3 +1068,100 @@ class TestOmegaIntegrationGate:
             f'lane must be FREE after release_lane_for_terminal_task, '
             f'got {pool.state(lane)!r} (cache leak if still ASSIGNED)'
         )
+
+    # -----------------------------------------------------------------------
+    # Step-5: RED γ seam
+    # -----------------------------------------------------------------------
+
+    async def test_gamma_reattach_preserves_commits(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """γ seam: re-dispatch acquire reattaches with commits preserved.
+
+        Continues from α-released state (lane FREE + registered, task/<id>
+        orphaned with 1 commit beyond main).  Re-dispatch must REATTACH the
+        existing task/<id> branch, preserving all commits.
+
+        ASSERT (reattach, not reset/collide):
+          - isinstance(info, WorktreeInfo) — no collision/fault
+          - lane HEAD on task/<id> (re-attached, not detached/reset-to-main)
+          - rev-list count == n_before (commits preserved across reattach+rebase)
+          - WIP content reachable from task/<id>
+
+        Negative control for γ:
+          - reset-in-place revert → checkout -f -B resets to main → count 0 → FAIL
+          - create-once revert → worktree add -b collides → RuntimeError → not WorktreeInfo → FAIL
+        """
+        task_id = 'omega-gamma-1'
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        git_ops = harness.git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Acquire lane + commit WIP (1 commit beyond main)
+        info = await git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo)
+        lane = info.path
+        wip_file = f'wip_gamma_{task_id}.txt'
+        wip_content = 'gamma wip reattach content\n'
+        (lane / wip_file).write_text(wip_content)
+        await git_ops.commit(lane, f'wip: gamma seam unmerged work for {task_id}')
+
+        # Capture baseline count
+        rc, count_str, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc == 0
+        n_before = int(count_str.strip())
+        assert n_before > 0, (
+            f'setup: task/{task_id} must have commits beyond main, got {n_before}'
+        )
+
+        # α-release: reclaim cache, branch orphaned
+        freed = await git_ops.release_lane_for_terminal_task(task_id)
+        assert freed is True
+        assert pool.state(lane) == LaneState.FREE
+
+        # γ: re-dispatch acquire — must REATTACH
+        info2 = await git_ops.create_worktree(task_id)
+        assert isinstance(info2, WorktreeInfo), (
+            f'γ: re-dispatch must return WorktreeInfo (reattach path), got {info2!r}; '
+            f'γ-revert create-once → worktree add -b collides → RuntimeError'
+        )
+
+        # Lane HEAD on task/<id> (not detached/reset-to-main)
+        rc_br, branch_out, _ = await _run(
+            ['git', '-C', str(info2.path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=ig_git_repo,
+        )
+        assert rc_br == 0
+        assert branch_out.strip() == f'task/{task_id}', (
+            f'γ: lane HEAD must be on task/{task_id} after reattach, '
+            f'got {branch_out.strip()!r}; γ-revert → HEAD detached/at-main → FAIL'
+        )
+
+        # Commits preserved (count == n_before)
+        rc2, count_after, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc2 == 0
+        n_after = int(count_after.strip())
+        assert n_after == n_before, (
+            f'γ: commits must be preserved across reattach+rebase '
+            f'(before={n_before}, after={n_after}); '
+            f'γ-revert reset-in-place → checkout -f -B resets to main → count 0 → FAIL'
+        )
+
+        # WIP content reachable from task/<id>
+        rc3, show_out, _ = await _run(
+            ['git', 'show', f'task/{task_id}:{wip_file}'],
+            cwd=ig_git_repo,
+        )
+        assert rc3 == 0 and wip_content.strip() in show_out, (
+            f'γ: WIP content must be reachable from task/{task_id} after reattach; '
+            f'got rc={rc3!r}, out={show_out!r}'
+        )
