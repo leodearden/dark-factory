@@ -353,38 +353,59 @@ class TestCancelledWorkflowLaneRelease:
 
 
 # ===========================================================================
-# Step-7 (1881): RED — B2: _run_slot finally releases lane on hard-cancel
+# Step-7 (1881) / Step-1 (1913): β — B2 synthetic-CANCELLED contract
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 class TestHardCancelLaneRelease:
-    """B2 (T5): harness._run_slot finally must release the warm lane on hard-cancel.
+    """β (task 1913): hard-cancel → synthetic report must NOT trigger eager B2 release.
 
-    Hard-cancel = asyncio.CancelledError raised inside the try block of _run_slot
-    (harness.py:3402) when hard_cancel_workflow() calls task.cancel(). The slot
-    returns a synthetic TaskReport(outcome=CANCELLED) from the except clause and
-    the run() finally of the WORKFLOW never executes (B1 cannot cover this path).
+    B2 (harness.py:3929 finally) gates the warm-lane release on
+    ``report.outcome in (DONE, CANCELLED)``.  β adds a second guard:
+    ``and not report.synthetic_cancel``.
 
-    Diff 4: in _run_slot finally, after the events pops, add:
-        if report is not None and report.outcome in (DONE, CANCELLED):
-            with contextlib.suppress(Exception):
-                await self.git_ops.release_lane_for_terminal_task(assignment.task_id)
+    A synthetic hard-cancel (asyncio.CancelledError → harness.py:3896) is process
+    teardown, NOT "work finished and discardable".  Pre-fix B2 fires
+    release_lane_for_terminal_task → git branch -D task/<id>, deleting a
+    still-unmerged branch.  Post-fix B2 is skipped for synthetic reports; the lane
+    cache is reclaimed later by the periodic terminal-lane reconciler / next acquire
+    (now α-guarded), preserving the branch.
 
-    RED: finally has no release; lane stays ASSIGNED after _run_slot returns.
+    Contrasting case (non-synthetic CANCELLED still releases) is guarded by
+    test_nonsynthetic_terminal_report_still_releases_lane (regression against
+    over-suppression).
     """
 
-    async def test_hard_cancel_frees_lane(self, tmp_path: Path):
-        """Hard-cancelled slot (asyncio.CancelledError path) → lane freed in slot finally."""
-        from orchestrator.git_ops import GitOps  # noqa: F401
+    async def test_synthetic_hard_cancel_retains_branch_and_lane(self, tmp_path: Path):
+        """Hard-cancel (asyncio.CancelledError): β contract — branch survives + lane reclaimable.
+
+        RED triggers:
+        1. ``report.synthetic_cancel`` AttributeError (field not yet on TaskReport).
+        2. Pre-fix B2 fires release_lane_for_terminal_task → git branch -D task/99
+           (the real branch is deleted, so git rev-parse --verify fails).
+
+        GREEN: field added + B2 gated by ``and not report.synthetic_cancel``
+        → branch retained, lane ASSIGNED (reclaimable, not permanently leaked).
+        """
+        from orchestrator.git_ops import _run as git_run
         from orchestrator.scheduler import TaskAssignment
         from orchestrator.warm_lane_pool import LaneState
         from orchestrator.workflow import WorkflowOutcome
 
-        # ── Setup: minimal git repo ─────────────────────────────────────────
+        # ── Setup: real git repo ────────────────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
         await _init_git_repo(repo)
+
+        # Create task/99 branch with an unmerged commit so rev-list main..task/99 > 0.
+        # Pre-fix B2 fires git branch -D task/99 → ref deleted → RED.
+        # Post-fix B2 is skipped → ref survives → GREEN.
+        await git_run(['git', 'checkout', '-b', 'task/99'], cwd=repo)
+        (repo / 'task99.txt').write_text('work in progress\n')
+        await git_run(['git', 'add', '-A'], cwd=repo)
+        await git_run(['git', 'commit', '-m', 'wip: task 99 work'], cwd=repo)
+        await git_run(['git', 'checkout', 'main'], cwd=repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -392,7 +413,7 @@ class TestHardCancelLaneRelease:
             git=GitConfig(warm_lane_pool=True),
         )
 
-        # ── Harness with real git_ops (warm lane pool) + mocked scheduler ──
+        # ── Harness with real git_ops (warm lane pool) ──────────────────────
         harness = _build_harness(config)
         pool = harness.git_ops.warm_lane_pool
         assert pool is not None
@@ -407,10 +428,14 @@ class TestHardCancelLaneRelease:
         # ── Configure mocked scheduler ──────────────────────────────────────
         # carries_substrate_probe → False so the substrate gate is skipped
         harness.scheduler.carries_substrate_probe.return_value = False
+        # is_deterministic must return False to avoid the deterministic route
+        # (MagicMock default is truthy → routes to _run_deterministic_slot
+        #  which raises RuntimeError because _escalation_queue is None).
+        harness.scheduler.is_deterministic.return_value = False
 
         # ── Patch TaskWorkflow to simulate a hard-cancel ────────────────────
-        # workflow.run() raises CancelledError, exactly as if the slot's
-        # asyncio.Task was cancelled by hard_cancel_workflow().
+        # workflow.run() raises CancelledError, exactly as hard_cancel_workflow()
+        # produces when the soft-cancel is ignored past the poll limit.
         with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
             mock_wf = MagicMock()
             mock_wf.run = AsyncMock(side_effect=asyncio.CancelledError())
@@ -431,13 +456,101 @@ class TestHardCancelLaneRelease:
         assert report is not None
         assert report.outcome == WorkflowOutcome.CANCELLED
 
-        # (B2 RED) Lane must be freed by the slot finally.
-        # Fails: _run_slot finally currently has no release_lane_for_terminal_task call.
-        assert pool.assignment_for('99') is None, (
-            '_run_slot finally must release the lane for a hard-cancelled slot'
+        # β: synthetic_cancel must be True on the hard-cancel report
+        # RED: AttributeError (field not yet on TaskReport)
+        assert report.synthetic_cancel is True, (
+            'hard-cancel must produce a synthetic report with synthetic_cancel=True'
+        )
+
+        # B2 β-fix: task/99 branch must SURVIVE.
+        # Pre-fix: B2 fires release_lane_for_terminal_task → git branch -D task/99 → RED.
+        # Post-fix: B2 gated by `and not report.synthetic_cancel` → skipped → GREEN.
+        rc, _, _ = await git_run(
+            ['git', 'rev-parse', '--verify', 'refs/heads/task/99'], cwd=repo,
+        )
+        assert rc == 0, (
+            'task/99 branch must survive hard-cancel — '
+            'B2 must not delete it when synthetic_cancel=True'
+        )
+
+        # Lane is RECLAIMABLE, not permanently leaked:
+        # assignment intact → reconciler / next acquire can locate + reclaim.
+        assert pool.assignment_for('99') is not None, (
+            'lane assignment must survive hard-cancel '
+            '(reclaimable by terminal-lane reconciler / next acquire)'
+        )
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            f'lane must stay ASSIGNED after synthetic hard-cancel, got {pool.state(lane)!r}'
+        )
+
+    async def test_nonsynthetic_terminal_report_still_releases_lane(self, tmp_path: Path):
+        """Non-synthetic CANCELLED (run() returns normally) still triggers B2 release.
+
+        Regression guard: β must not over-suppress.  The full TaskReport built at
+        harness.py:3842 when run() returns normally inherits synthetic_cancel=False
+        (the default), so B2's eager release still fires for genuine terminal exits.
+
+        The contrasting normal-return CANCELLED case where release DOES fire is also
+        covered by TestCancelledWorkflowLaneRelease.test_cancelled_workflow_frees_lane
+        (authoritative-cancel via B1 path).
+        """
+        from orchestrator.scheduler import TaskAssignment
+        from orchestrator.warm_lane_pool import LaneState
+        from orchestrator.workflow import WorkflowOutcome
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        harness = _build_harness(config)
+        pool = harness.git_ops.warm_lane_pool
+        assert pool is not None
+
+        tid = '88'
+        await pool.acquire_for(tid)
+        lane = pool.assignment_for(tid)
+        assert lane is not None, f'setup: lane must be ASSIGNED for task {tid}'
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        harness.scheduler.carries_substrate_probe.return_value = False
+        harness.scheduler.is_deterministic.return_value = False
+
+        # Patch TaskWorkflow to return CANCELLED normally (not raise).
+        # The harness builds the full report at harness.py:3842 with
+        # synthetic_cancel defaulting to False.
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            mock_wf = MagicMock()
+            mock_wf.run = AsyncMock(return_value=WorkflowOutcome.CANCELLED)
+            MockWorkflow.return_value = mock_wf
+
+            assignment = TaskAssignment(
+                task_id=tid,
+                task={
+                    'id': tid, 'title': 'Non-synthetic cancel', 'status': 'pending',
+                    'metadata': {}, 'dependencies': [],
+                },
+                modules=[],
+            )
+            sem = asyncio.Semaphore(1)
+            report = await harness._run_slot(assignment, sem)
+
+        # Full report: synthetic_cancel defaults to False
+        # RED: AttributeError (field not yet on TaskReport)
+        assert report is not None
+        assert report.synthetic_cancel is False, (
+            'non-synthetic CANCELLED report must have synthetic_cancel=False'
+        )
+        # B2 must STILL fire for a non-synthetic terminal report (regression guard)
+        assert pool.assignment_for(tid) is None, (
+            'B2 must release the lane for a non-synthetic terminal CANCELLED report'
         )
         assert pool.state(lane) == LaneState.FREE, (
-            f'Lane must be FREE after hard-cancel, got {pool.state(lane)!r}'
+            f'lane must be FREE after non-synthetic CANCELLED exit, got {pool.state(lane)!r}'
         )
 
 
