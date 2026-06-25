@@ -2481,6 +2481,42 @@ class GitOps:
         )
         return sha if rc == 0 else None
 
+    async def resolve_queued_branch_ref(self, branch: str) -> str | None:
+        """Resolve a caller-submitted *branch* to its canonical full ref, or None.
+
+        Accepts three input shapes and resolves them deterministically:
+
+        1. **Bare task id** (e.g. ``'4778'``) — the common case.  The prefixed
+           form ``{branch_prefix}{branch}`` (``'task/4778'``) is tried first;
+           if it resolves, it is returned.  This preserves the bare-id contract
+           and wins the tie-break when both forms happen to exist.
+
+        2. **Already-prefixed** (e.g. ``'task/4778'``) — submitted by automated
+           callers (auto-unblock, steward) that supply the full branch name.
+           Rule 1 tries ``'task/task/4778'`` (absent), then rule 2 tries
+           ``'task/4778'`` directly and returns it.
+
+        3. **Full non-task name** (e.g. ``'cost-min-prd'``, ``'feature/x'``) —
+           rule 1 tries ``'task/cost-min-prd'`` (absent), rule 2 tries
+           ``'cost-min-prd'`` and returns it.
+
+        4. **Neither form resolves** → returns ``None`` (genuine misroute;
+           caller emits ``unknown_branch``).
+
+        **Tie-break**: when both ``{branch_prefix}{branch}`` and ``branch`` exist
+        as live refs, rule 1 wins and the prefixed form is returned.  The
+        orchestrator-owned ``task/*`` namespace is authoritative.
+
+        Built on :meth:`resolve_branch_sha` which constrains resolution to
+        ``refs/heads/*``, preventing ambiguity against tags or remote refs.
+        """
+        prefixed = f'{self.config.branch_prefix}{branch}'
+        if await self.resolve_branch_sha(prefixed) is not None:
+            return prefixed
+        if await self.resolve_branch_sha(branch) is not None:
+            return branch
+        return None
+
     async def find_merge_marker(self, branch: str) -> str | None:
         """Search main's history for a merge commit whose subject matches
         ``Merge {branch} into {main_branch}``.
@@ -3070,7 +3106,10 @@ class GitOps:
         Never touches ``project_root``'s working tree or index.
         Called by the MergeWorker (serialized via the merge queue).
         """
-        full_branch = f'{self.config.branch_prefix}{branch}'
+        full_branch = (
+            await self.resolve_queued_branch_ref(branch)
+            or f'{self.config.branch_prefix}{branch}'
+        )
         merge_wt: Path | None = None
 
         try:
@@ -3584,8 +3623,12 @@ class GitOps:
         in-progress merger's ``_merge-*`` worktree persists on disk and is
         correctly detected here.
         """
+        full_branch = (
+            await self.resolve_queued_branch_ref(branch)
+            or f'{self.config.branch_prefix}{branch}'
+        )
         target_subject = _merge_subject(
-            f'{self.config.branch_prefix}{branch}',
+            full_branch,
             self.config.main_branch,
         )
 
@@ -3694,7 +3737,10 @@ class GitOps:
         this side channel for done_provenance instead of the pre-rebase
         ``MergeResult.merge_commit`` (which is stale after a rebase).
         """
-        full_branch = f'{self.config.branch_prefix}{branch}' if branch else None
+        full_branch = (
+            (await self.resolve_queued_branch_ref(branch) or f'{self.config.branch_prefix}{branch}')
+            if branch else None
+        )
         rebased = False  # Track whether any rebase/re-merge occurred this call
 
         # Derive the verified branch tip from M^2 — the exact branch commit

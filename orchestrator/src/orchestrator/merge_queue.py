@@ -2356,20 +2356,46 @@ async def _classify_branch_presence(
     ``unknown_branch`` is a diagnostic terminal outcome, so emitting it is
     consistent with ``_emit_merge_attempt``'s contract (only infrastructure
     ``blocked`` outcomes are intentionally suppressed there).
+
+    *branch* is resolved via :meth:`GitOps.resolve_queued_branch_ref` which
+    tolerates three shapes: bare task id (``'4778'``), already-prefixed
+    (``'task/4778'``), and full non-task names (``'cost-min-prd'``).  When a
+    live ref is found the method returns ``None`` (proceed).
+
+    For the already-merged check, both candidate forms are tried in priority
+    order — ``{branch_prefix}{branch}`` then ``branch`` as-is — because a
+    merged+deleted branch has no live ref and the merge-commit subject on main
+    reflects whichever form ``merge_to_main`` used at merge time.  Trying both
+    ensures prefixed-input callers (``branch='task/4778'``) still classify
+    as ``already_merged`` rather than collapsing to ``unknown_branch``.
+
+    The ``unknown_branch`` reason reports both candidate forms tried
+    (``{prefixed!r}`` and ``{branch!r}``) so operators can see exactly what
+    was submitted and what was attempted during triage.
     """
-    full_branch = f'{git_ops.config.branch_prefix}{branch}'  # bare name -> task/<branch>
-    if await git_ops.resolve_branch_sha(full_branch) is not None:
-        return None  # common case: ref present, one rev-parse
-    if await git_ops.find_merge_marker(full_branch) is not None:
-        _emit_merge_attempt(
-            event_store, task_id, 'already_merged', duration_ms=_elapsed_ms(t0),
-        )
-        return MergeOutcome('already_merged')
+    # ── Live-ref check via canonical resolver ─────────────────────────────
+    if await git_ops.resolve_queued_branch_ref(branch) is not None:
+        return None  # common case: ref present (bare, prefixed, or full name)
+
+    # ── No live ref: check for an already-merged marker on main ───────────
+    # Try both candidate forms in priority order (prefixed wins tie-break).
+    # A merged+deleted branch has no live ref, so the resolver returned None;
+    # the merge-commit subject is under whichever form merge_to_main used.
+    prefixed = f'{git_ops.config.branch_prefix}{branch}'
+    for candidate in (prefixed, branch):
+        if await git_ops.find_merge_marker(candidate) is not None:
+            _emit_merge_attempt(
+                event_store, task_id, 'already_merged', duration_ms=_elapsed_ms(t0),
+            )
+            return MergeOutcome('already_merged')
+
+    # ── Genuine misroute ───────────────────────────────────────────────────
     _emit_merge_attempt(
         event_store, task_id, 'unknown_branch', duration_ms=_elapsed_ms(t0),
     )
     return MergeOutcome(
-        'unknown_branch', reason=f'branch {full_branch!r} not found in repo',
+        'unknown_branch',
+        reason=f'branch not found in repo (tried {prefixed!r} and {branch!r})',
     )
 
 
@@ -6558,7 +6584,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
 
         # ── 4. Resolve branch heads + footprints ─────────────────────────────
-        branch_prefix = self._git_ops.config.branch_prefix
         # Per-item: (head_sha | None, changed_paths | None)
         heads: list[str | None] = []
         changed_paths_list: list[list[str] | None] = []
@@ -6567,15 +6592,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # end of this method.  Do NOT re-initialise this flag in later steps.
         _any_probe_error = False
 
+        branch_prefix = self._git_ops.config.branch_prefix
         for req in suffix:
-            ref = f'{branch_prefix}{req.branch}'
+            ref = None
+            head = None
             try:
-                head = await self._git_ops.resolve_branch_sha(ref)
+                # Mirror resolve_queued_branch_ref: try prefixed form first
+                # (bare-id contract: task/X wins), then bare.  Capturing the
+                # SHA in the same pass avoids a redundant third rev-parse vs
+                # the previous resolve_queued_branch_ref + resolve_branch_sha
+                # pattern (each call forks a git subprocess).
+                prefixed = f'{branch_prefix}{req.branch}'
+                sha = await self._git_ops.resolve_branch_sha(prefixed)
+                if sha is not None:
+                    ref, head = prefixed, sha
+                else:
+                    sha2 = await self._git_ops.resolve_branch_sha(req.branch)
+                    if sha2 is not None:
+                        ref, head = req.branch, sha2
             except Exception:
                 logger.warning(
-                    'recompute_suffix_conflict_graph: resolve_branch_sha(%r) raised; '
-                    'treating item as missing ref', ref, exc_info=True,
+                    'recompute_suffix_conflict_graph: resolve_queued_branch_ref(%r) raised; '
+                    'treating item as missing ref', req.branch, exc_info=True,
                 )
+                ref = None
                 head = None
             heads.append(head)
 
@@ -9437,7 +9477,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         framing because that is the conceptually meaningful question ("what SHA would the
         merge worktree have seen for this branch?").
         """
-        full_branch = f'{self._git_ops.config.branch_prefix}{req.branch}'
+        full_branch = (
+            await self._git_ops.resolve_queued_branch_ref(req.branch)
+            or f'{self._git_ops.config.branch_prefix}{req.branch}'
+        )
         resolved = await self._git_ops.resolve_branch_sha(full_branch)
         return {
             'base_sha': base_sha,

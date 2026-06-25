@@ -882,6 +882,78 @@ class TestCheckPlanTargetsInTree:
 
 
 @pytest.mark.asyncio
+class TestResolveQueuedBranchRef:
+    """Unit tests for GitOps.resolve_queued_branch_ref — all five input shapes."""
+
+    async def test_bare_id_resolves_to_prefixed(self, git_ops: GitOps):
+        """Bare task id resolves to the prefixed branch (task/X).
+
+        create_worktree('4778') creates refs/heads/task/4778.
+        resolve_queued_branch_ref('4778') should return 'task/4778'
+        (rule 1: try branch_prefix+branch first).
+        """
+        await git_ops.create_worktree('rqbr-bare')
+        result = await git_ops.resolve_queued_branch_ref('rqbr-bare')
+        assert result == 'task/rqbr-bare'
+
+    async def test_already_prefixed_resolves_correctly(self, git_ops: GitOps):
+        """Already-prefixed input 'task/X' resolves to 'task/X'.
+
+        create_worktree('rqbr-pre') creates refs/heads/task/rqbr-pre.
+        When branch='task/rqbr-pre':
+          rule 1: try prefix+'task/rqbr-pre' = 'task/task/rqbr-pre' → absent.
+          rule 2: try 'task/rqbr-pre' as-is → present → return 'task/rqbr-pre'.
+        """
+        await git_ops.create_worktree('rqbr-pre')
+        result = await git_ops.resolve_queued_branch_ref('task/rqbr-pre')
+        assert result == 'task/rqbr-pre'
+
+    async def test_full_non_task_branch_resolves_as_is(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """Full non-task branch names ('cost-min-prd', 'feature/x') resolve as-is.
+
+        create refs/heads/cost-min-prd directly via git branch.
+        resolve_queued_branch_ref('cost-min-prd') should return 'cost-min-prd'
+        (rule 1: 'task/cost-min-prd' absent; rule 2: 'cost-min-prd' present).
+        """
+        await _run(['git', 'branch', 'cost-min-prd', 'main'], cwd=git_repo)
+        result = await git_ops.resolve_queued_branch_ref('cost-min-prd')
+        assert result == 'cost-min-prd'
+
+        # Also test a slash-containing non-task name
+        await _run(['git', 'branch', 'feature/rqbr-x', 'main'], cwd=git_repo)
+        result2 = await git_ops.resolve_queued_branch_ref('feature/rqbr-x')
+        assert result2 == 'feature/rqbr-x'
+
+    async def test_missing_branch_returns_none(self, git_ops: GitOps):
+        """A branch that does not exist in any form returns None."""
+        result = await git_ops.resolve_queued_branch_ref('nope-does-not-exist')
+        assert result is None
+
+    async def test_tiebreak_prefixed_wins(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """When both bare 'X' and 'task/X' exist, rule 1 wins → 'task/X' returned.
+
+        create refs/heads/task/rqbr-tie via create_worktree('rqbr-tie').
+        create refs/heads/rqbr-tie via git branch.
+        resolve_queued_branch_ref('rqbr-tie') must return 'task/rqbr-tie' (rule 1).
+        """
+        await git_ops.create_worktree('rqbr-tie')  # creates task/rqbr-tie
+        await _run(['git', 'branch', 'rqbr-tie', 'main'], cwd=git_repo)
+
+        # Sanity-check: both branches exist
+        assert await git_ops.resolve_branch_sha('task/rqbr-tie') is not None
+        assert await git_ops.resolve_branch_sha('rqbr-tie') is not None
+
+        result = await git_ops.resolve_queued_branch_ref('rqbr-tie')
+        assert result == 'task/rqbr-tie', (
+            f'tie-break: expected task/rqbr-tie but got {result!r}'
+        )
+
+
+@pytest.mark.asyncio
 class TestClassifyBranchPresence:
     """Unit tests for the _classify_branch_presence branch-existence guard."""
 
@@ -898,7 +970,9 @@ class TestClassifyBranchPresence:
 
         assert outcome is not None
         assert outcome.status == 'unknown_branch'
-        assert 'task/ghost-4011' in outcome.reason
+        # New format: "branch not found in repo (tried 'task/ghost-4011' and 'ghost-4011')"
+        # Shows both forms tried for accurate operator triage.
+        assert "tried 'task/ghost-4011' and 'ghost-4011'" in outcome.reason
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
@@ -976,6 +1050,109 @@ class TestClassifyBranchPresence:
         ).fetchone()[0]
         conn.close()
         assert count == 0, 'no merge_attempt expected when the branch ref exists'
+
+    async def test_prefixed_input_live_branch_returns_none(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """Already-prefixed input 'task/X' with a live ref → None (proceed).
+
+        Currently mis-classifies as unknown_branch because it computes
+        prefix+'task/X' = 'task/task/X' (absent) before step-4.
+        After step-4 the resolver finds 'task/X' directly → None.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        await git_ops.create_worktree('cp1')  # creates task/cp1
+
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'cp1', 'task/cp1', time.monotonic(),
+        )
+
+        assert outcome is None, f'expected None (proceed) but got {outcome}'
+
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0, 'no merge_attempt emitted when branch exists'
+
+    async def test_full_non_task_input_live_branch_returns_none(
+        self, git_ops: GitOps, tmp_path: Path, git_repo: Path,
+    ):
+        """Full non-task input 'cost-min-prd' with a live ref → None (proceed).
+
+        Currently mis-classifies as unknown_branch because it computes
+        'task/cost-min-prd' (absent) before step-4.
+        After step-4 the resolver finds 'cost-min-prd' directly → None.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        await _run(['git', 'branch', 'cp-cost-min-prd', 'main'], cwd=git_repo)
+
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'cp-cost-min-prd', 'cp-cost-min-prd', time.monotonic(),
+        )
+
+        assert outcome is None, f'expected None (proceed) but got {outcome}'
+
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0, 'no merge_attempt emitted when branch exists'
+
+    async def test_already_merged_via_prefixed_input(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """Prefixed input 'task/X' for a merged+deleted branch → already_merged.
+
+        Merge task/cp-m1 (via bare id 'cp-m1'), advance, delete branch.
+        Call _classify_branch_presence with branch='task/cp-m1' (prefixed).
+        Currently returns unknown_branch because prefix+'task/cp-m1' = 'task/task/cp-m1'
+        has no marker. After step-4 the marker check tries both candidate forms
+        and finds the marker under 'task/cp-m1' → already_merged.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        # Create, merge, advance, and clean up task/cp-m1
+        worktree = (await git_ops.create_worktree('cp-m1')).path
+        (worktree / 'cpm.py').write_text('cpm = 1\n')
+        await git_ops.commit(worktree, 'Add cpm')
+        result = await git_ops.merge_to_main(worktree, 'cp-m1')
+        assert result.success
+        assert result.merge_commit is not None
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        await _run(
+            ['git', 'worktree', 'remove', '--force', str(worktree)],
+            cwd=git_ops.project_root,
+        )
+        await _run(
+            ['git', 'branch', '-D', 'task/cp-m1'], cwd=git_ops.project_root,
+        )
+        assert await git_ops.resolve_branch_sha('task/cp-m1') is None
+
+        # Classify with the PREFIXED branch name
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'cp-m1', 'task/cp-m1', time.monotonic(),
+        )
+
+        assert outcome is not None
+        assert outcome.status == 'already_merged', f'got {outcome}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome') FROM events "
+            "WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert rows == [('already_merged',)], f'rows={rows}'
 
 
 @pytest.mark.asyncio
@@ -1665,6 +1842,155 @@ class TestMergeWorker:
         assert rc != 0, (
             'file_mg_serial.py must NOT be on main when the merge-gate verify is '
             'red — a red tree advanced main via MergeWorker (reify-4502 serial escape).'
+        )
+
+    async def test_prefixed_branch_merges_successfully(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Prefixed-branch submission ('task/X') reaches done, not unknown_branch.
+
+        Reproduces the task-4778 incident: automated callers (steward/auto-unblock)
+        submit req.branch='task/queue-prefixed' (full branch name) rather than the
+        bare id 'queue-prefixed'.  With the resolver in place, classify finds the
+        live ref directly and merge_to_main uses the resolved full ref, so the
+        request lands on main.
+
+        RED before step-4/step-6: _classify_branch_presence computes
+        'task/task/queue-prefixed' (absent) → unknown_branch; even with step-4
+        the merge_to_main double-prefixes the ref → git-merge fails → status != done.
+        GREEN after step-6: merge_to_main resolves via the same canonical resolver.
+        """
+        worktree = (await git_ops.create_worktree('queue-prefixed')).path
+        (worktree / 'prefixed.py').write_text('prefixed = True\n')
+        await git_ops.commit(worktree, 'Add prefixed file')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            # Submit with the PREFIXED branch string, not the bare id
+            req = _make_request('4778', 'task/queue-prefixed', worktree, config)
+            await queue.put(req)
+            result = await asyncio.wait_for(req.result, timeout=30)
+
+        assert result.status == 'done', (
+            f'expected done for prefixed-branch submission but got '
+            f'{result.status!r} (reason={result.reason!r})'
+        )
+
+        # Verify file is on main — the merge actually landed
+        rc, content, _ = await _run(
+            ['git', 'show', 'main:prefixed.py'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'prefixed.py must be on main after successful prefixed-branch merge'
+        assert 'prefixed = True' in content
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestRecomputeSuffixConflictGraphErrorHandling — amend-1911 (suggestion 3a)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecomputeSuffixConflictGraphErrorHandling:
+    """Error-path tests for the resolver try/except in recompute_suffix_conflict_graph.
+
+    After the performance fix the loop calls resolve_branch_sha directly (not
+    resolve_queued_branch_ref), so we mock resolve_branch_sha to raise.  The
+    item must be treated as missing ref (head=None) and the recompute must
+    complete without aborting; other items in the suffix are unaffected.
+    """
+
+    async def test_resolve_sha_raises_treats_item_as_missing_ref(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """resolve_branch_sha raising for an item → item treated as missing ref.
+
+        The recompute must not raise; the item must appear in graph.nodes
+        (it was in the suffix) but no footprint or textual edges touch it
+        (head=None → skipped from all pairwise comparisons).
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request(
+            'rsce-err', 'rsce-err', git_ops.project_root, config,
+            request_id='mr-rsce-err',
+        )
+        worker._lane_buffers['normal'].append(req)
+
+        # Make every resolve_branch_sha call raise
+        async def _raising_sha(_branch_name: str) -> str | None:
+            raise RuntimeError('simulated sha resolution failure')
+
+        with patch.object(git_ops, 'resolve_branch_sha', new=_raising_sha):
+            # Must complete without raising despite the per-item error
+            await worker.recompute_suffix_conflict_graph()
+
+        graph = worker._suffix_conflict_graph
+        # The item must appear in the ordered node list (it was in the suffix)
+        assert 'mr-rsce-err' in graph.nodes, f'nodes={graph.nodes}'
+        # With head=None there is nothing to compare — no edges
+        assert len(graph.footprint_edges) == 0, f'unexpected edges: {graph.footprint_edges}'
+        assert len(graph.textual_edges) == 0, f'unexpected edges: {graph.textual_edges}'
+        # And it did not get flagged as conflicting with main
+        assert 'mr-rsce-err' not in graph.conflicts_with_main
+
+
+# ---------------------------------------------------------------------------
+# TestBuildMergeFailureDiagnostic — amend-1911 (suggestion 3b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBuildMergeFailureDiagnostic:
+    """Tests for _build_merge_failure_diagnostic branch resolution via the resolver.
+
+    Confirms that a prefixed req.branch ('task/X') resolves to the correct SHA
+    via the canonical resolver rather than double-prefixing to 'task/task/X'.
+    """
+
+    async def test_prefixed_branch_resolves_to_correct_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Prefixed req.branch 'task/X' → branch_ref_in_worktree is the real SHA.
+
+        Before the fix, 'task/X' would produce prefix+'task/X' = 'task/task/X'
+        (absent → or-fallback → prefix+'task/X') and then resolve that,
+        returning the correct SHA only by coincidence (fallback lands on the
+        same ref).  With the resolver in place, 'task/X' is found directly
+        and never double-prefixed.
+        """
+        worktree = (await git_ops.create_worktree('diag-prefixed')).path
+        (worktree / 'diag.py').write_text('diag = 1\n')
+        await git_ops.commit(worktree, 'Add diag')
+
+        expected_sha = await git_ops.resolve_branch_sha('task/diag-prefixed')
+        assert expected_sha is not None, 'task/diag-prefixed must exist after create_worktree'
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Submit with the PREFIXED branch string
+        req = _make_request('diag-t', 'task/diag-prefixed', worktree, config)
+        base_sha = await git_ops.get_main_sha()
+
+        diag = await worker._build_merge_failure_diagnostic(
+            req, base_sha, 'main', '',
+        )
+
+        assert diag['branch_ref_in_worktree'] == expected_sha, (
+            f'Expected SHA {expected_sha!r} for prefixed branch, '
+            f'got {diag["branch_ref_in_worktree"]!r}'
+        )
+        assert diag['branch_ref_in_worktree'] != '<unresolved>', (
+            'branch_ref_in_worktree must not be <unresolved> for a prefixed branch'
         )
 
 
