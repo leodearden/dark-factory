@@ -1842,6 +1842,53 @@ class TestMergeWorker:
             'red — a red tree advanced main via MergeWorker (reify-4502 serial escape).'
         )
 
+    async def test_prefixed_branch_merges_successfully(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Prefixed-branch submission ('task/X') reaches done, not unknown_branch.
+
+        Reproduces the task-4778 incident: automated callers (steward/auto-unblock)
+        submit req.branch='task/queue-prefixed' (full branch name) rather than the
+        bare id 'queue-prefixed'.  With the resolver in place, classify finds the
+        live ref directly and merge_to_main uses the resolved full ref, so the
+        request lands on main.
+
+        RED before step-4/step-6: _classify_branch_presence computes
+        'task/task/queue-prefixed' (absent) → unknown_branch; even with step-4
+        the merge_to_main double-prefixes the ref → git-merge fails → status != done.
+        GREEN after step-6: merge_to_main resolves via the same canonical resolver.
+        """
+        worktree = (await git_ops.create_worktree('queue-prefixed')).path
+        (worktree / 'prefixed.py').write_text('prefixed = True\n')
+        await git_ops.commit(worktree, 'Add prefixed file')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            # Submit with the PREFIXED branch string, not the bare id
+            req = _make_request('4778', 'task/queue-prefixed', worktree, config)
+            await queue.put(req)
+            result = await asyncio.wait_for(req.result, timeout=30)
+
+        assert result.status == 'done', (
+            f'expected done for prefixed-branch submission but got '
+            f'{result.status!r} (reason={result.reason!r})'
+        )
+
+        # Verify file is on main — the merge actually landed
+        rc, content, _ = await _run(
+            ['git', 'show', 'main:prefixed.py'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'prefixed.py must be on main after successful prefixed-branch merge'
+        assert 'prefixed = True' in content
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
 
 # ---------------------------------------------------------------------------
 # Helpers for speculative tests
