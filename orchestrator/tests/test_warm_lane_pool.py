@@ -2704,7 +2704,7 @@ class TestAcquireWarmLaneReattach:
         # Note: _reuse_warm_lane may add a WIP commit (saving untracked files),
         # so count_after may be > count_a.  The invariant is ">= n, not 0".
         _, count_out, _ = await _run(
-            ['git', 'rev-list', '--count', f'main..task/A'],
+            ['git', 'rev-list', '--count', 'main..task/A'],
             cwd=wl_git_repo,
         )
         count_after = int(count_out.strip())
@@ -2785,7 +2785,7 @@ class TestAcquireWarmLaneReattach:
 
         # Commit count must be 0 (branch at main tip)
         _, count_out, _ = await _run(
-            ['git', 'rev-list', '--count', f'main..task/FRESH'],
+            ['git', 'rev-list', '--count', 'main..task/FRESH'],
             cwd=wl_git_repo,
         )
         assert int(count_out.strip()) == 0, (
@@ -2841,7 +2841,7 @@ class TestAcquireWarmLaneReattach:
 
         # task/A commit count MUST be preserved (>=2, not 0)
         _, count_out, _ = await _run(
-            ['git', 'rev-list', '--count', f'main..task/A'],
+            ['git', 'rev-list', '--count', 'main..task/A'],
             cwd=wl_git_repo,
         )
         count_after = int(count_out.strip())
@@ -2906,7 +2906,7 @@ class TestAcquireWarmLaneReattach:
 
         # Commit count must be 0 (branch at main tip)
         _, count_out, _ = await _run(
-            ['git', 'rev-list', '--count', f'main..task/FRESH'],
+            ['git', 'rev-list', '--count', 'main..task/FRESH'],
             cwd=wl_git_repo,
         )
         assert int(count_out.strip()) == 0, (
