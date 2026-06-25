@@ -6713,7 +6713,7 @@ class TestReleaseWarmLaneBranchRetention:
     """release_warm_lane retains task/<id> when it carries commits beyond main;
     deletes it (on-main only) when the branch is at the main tip."""
 
-    def _warm_config(self, git_repo: Path) -> GitConfig:
+    def _warm_config(self) -> GitConfig:
         return GitConfig(
             main_branch='main',
             branch_prefix='task/',
@@ -6733,18 +6733,18 @@ class TestReleaseWarmLaneBranchRetention:
         from orchestrator.warm_lane_pool import LaneState
 
         await _add_warm_lane_scripts(git_repo)
-        git_ops = GitOps(self._warm_config(git_repo), git_repo, warm_lane_pool_size=1)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
 
         info = await git_ops.create_worktree('A')
 
-        # Commit one file on the lane so task/A has 1 commit beyond main.
+        # Commit one file on the lane so task/A has 1 committed commit beyond main.
         (info.path / 'wip.txt').write_text('work in progress\n')
         await _run(['git', 'add', '-A'], cwd=info.path)
         await _run(['git', 'commit', '-m', 'wip'], cwd=info.path)
 
         await git_ops.release_warm_lane(info.path, 'A')
 
-        # Branch must be RETAINED — it carries uncommitted WIP.
+        # Branch must be RETAINED — it carries committed commits beyond main.
         rc, _, _ = await _run(
             ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
         )
@@ -6768,7 +6768,7 @@ class TestReleaseWarmLaneBranchRetention:
         It also confirms the fresh-lane base == main tip premise.
         """
         await _add_warm_lane_scripts(git_repo)
-        git_ops = GitOps(self._warm_config(git_repo), git_repo, warm_lane_pool_size=1)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
 
         # Fresh lane: task/A == main tip, 0 commits beyond main.
         info = await git_ops.create_worktree('A')
@@ -6781,6 +6781,46 @@ class TestReleaseWarmLaneBranchRetention:
         assert rc != 0, (
             'task/A must be DELETED after release_warm_lane when it is at '
             'the main tip (0 commits beyond main)'
+        )
+
+    async def test_retains_branch_on_rev_list_failure(self, git_repo: Path):
+        """release_warm_lane RETAINS task/A when the rev-list probe fails.
+
+        Validates the fail-safe: when _branch_has_commits_beyond_main returns
+        True due to a git error (rc != 0) or unparseable output, the branch
+        must be RETAINED rather than deleted.  This is the safety-critical
+        path that protects WIP from destruction on uncertainty.
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # Fresh lane (no commits beyond main) — normally this branch would be
+        # deleted.  With the fail-safe patched to True it must be retained.
+        info = await git_ops.create_worktree('A')
+
+        async def _always_has_commits(*args, **kwargs) -> bool:
+            return True  # simulates git error / unparseable output → fail-safe True
+
+        with patch.object(
+            git_ops, '_branch_has_commits_beyond_main', side_effect=_always_has_commits,
+        ):
+            await git_ops.release_warm_lane(info.path, 'A')
+
+        # Branch must be RETAINED — fail-safe returned True.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc == 0, (
+            'task/A must be RETAINED when _branch_has_commits_beyond_main '
+            'returns True (fail-safe on git error)'
+        )
+
+        # Cache lifecycle is independent — lane must be FREE regardless.
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE, (
+            'lane must be FREE after release even when branch is retained via fail-safe'
         )
 
 
@@ -6819,7 +6859,7 @@ class TestCleanupWorktreeColdBranchRetention:
             'Cold worktree path must be removed by cleanup_worktree'
         )
 
-        # Branch must be RETAINED — it carries WIP commits.
+        # Branch must be RETAINED — it carries committed commits beyond main.
         rc, _, _ = await _run(
             ['git', 'rev-parse', '--verify', 'task/Z'], cwd=git_repo,
         )
@@ -6848,4 +6888,42 @@ class TestCleanupWorktreeColdBranchRetention:
         assert rc != 0, (
             'task/Z must be DELETED after cold cleanup_worktree when it is '
             'at the main tip (0 commits beyond main)'
+        )
+
+    async def test_retains_branch_on_rev_list_failure(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """cleanup_worktree RETAINS task/Z when the rev-list probe fails.
+
+        Validates the fail-safe: when _branch_has_commits_beyond_main returns
+        True due to a git error (rc != 0) or unparseable output, the branch
+        must be RETAINED rather than deleted.  The worktree is still removed
+        (cold path's worktree removal is orthogonal to the branch guard).
+        """
+        # Fresh worktree (no commits beyond main) — normally this branch
+        # would be deleted.  With the fail-safe patched to True it must be
+        # retained.
+        info = await git_ops.create_worktree('Z')
+
+        async def _always_has_commits(*args, **kwargs) -> bool:
+            return True  # simulates git error / unparseable output → fail-safe True
+
+        with patch.object(
+            git_ops, '_branch_has_commits_beyond_main', side_effect=_always_has_commits,
+        ):
+            await git_ops.cleanup_worktree(info.path, 'Z')
+
+        # Worktree directory must be REMOVED (cold path unchanged).
+        assert not info.path.exists(), (
+            'Cold worktree path must be removed by cleanup_worktree even '
+            'when branch is retained via fail-safe'
+        )
+
+        # Branch must be RETAINED — fail-safe returned True.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/Z'], cwd=git_repo,
+        )
+        assert rc == 0, (
+            'task/Z must be RETAINED when _branch_has_commits_beyond_main '
+            'returns True (fail-safe on git error)'
         )

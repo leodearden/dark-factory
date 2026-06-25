@@ -2046,25 +2046,7 @@ class GitOps:
                 'release_warm_lane: checkout --detach error for %s', lane_dir, exc_info=True,
             )
 
-        try:
-            if await self._branch_has_commits_beyond_main(full_branch):
-                logger.info(
-                    'release_warm_lane: retaining branch %s — carries commits beyond %s',
-                    full_branch, self.config.main_branch,
-                )
-            else:
-                rc, _, err = await _run(
-                    ['git', 'branch', '-D', full_branch],
-                    cwd=self.project_root,
-                )
-                if rc != 0:
-                    logger.warning(
-                        'release_warm_lane: branch -D %s failed: %s', full_branch, err,
-                    )
-        except Exception:
-            logger.warning(
-                'release_warm_lane: branch -D error for %s', full_branch, exc_info=True,
-            )
+        await self._delete_branch_if_on_main(full_branch, context='release_warm_lane')
 
         await self.warm_lane_pool.release(lane_dir)
         logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
@@ -2295,6 +2277,45 @@ class GitOps:
             return int(out.strip()) > 0
         except ValueError:
             return True
+
+    async def _delete_branch_if_on_main(
+        self, full_branch: str, *, context: str,
+    ) -> None:
+        """Delete *full_branch* only when it carries no commits beyond main.
+
+        Guard: calls :meth:`_branch_has_commits_beyond_main`; if it returns
+        ``True`` (branch has WIP) or raises (fail-safe ``True``), the branch
+        is *retained* and a retain message is logged at INFO.  The delete is
+        attempted only when the branch is provably at the main tip (0 commits
+        beyond main).
+
+        Best-effort / never-raise: all git errors are logged at WARNING and
+        the method returns normally regardless.
+
+        Args:
+            full_branch: Fully-qualified branch name (e.g. ``task/123``).
+            context: Short identifier used in log messages (e.g.
+                ``"release_warm_lane"`` or ``"cleanup_worktree"``).
+        """
+        try:
+            if await self._branch_has_commits_beyond_main(full_branch):
+                logger.info(
+                    '%s: retaining branch %s — carries commits beyond %s',
+                    context, full_branch, self.config.main_branch,
+                )
+            else:
+                rc, _, err = await _run(
+                    ['git', 'branch', '-D', full_branch],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    logger.warning(
+                        '%s: branch -D %s failed: %s', context, full_branch, err,
+                    )
+        except Exception:
+            logger.warning(
+                '%s: branch -D error for %s', context, full_branch, exc_info=True,
+            )
 
     async def _cleanup_leftover_branch(
         self, full_branch: str, branch_name: str,
@@ -4536,18 +4557,7 @@ class GitOps:
 
         # Delete branch — on-main only: skip if the branch carries commits
         # beyond main (i.e. still holds unmerged WIP).
-        if await self._branch_has_commits_beyond_main(full_branch):
-            logger.info(
-                'cleanup_worktree: retaining branch %s — carries commits beyond %s',
-                full_branch, self.config.main_branch,
-            )
-        else:
-            rc, _, err = await _run(
-                ['git', 'branch', '-D', full_branch],
-                cwd=self.project_root,
-            )
-            if rc != 0:
-                logger.warning(f'Failed to delete branch {full_branch}: {err}')
+        await self._delete_branch_if_on_main(full_branch, context='cleanup_worktree')
 
         logger.info(f'Cleaned up worktree {worktree} and branch {full_branch}')
 
