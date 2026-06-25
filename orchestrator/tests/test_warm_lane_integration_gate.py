@@ -1249,3 +1249,174 @@ class TestOmegaIntegrationGate:
 
         # Cleanup merge worktree
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    # -----------------------------------------------------------------------
+    # Step-9: RED combined ω gate — G2 two-way-boundary capstone
+    # -----------------------------------------------------------------------
+
+    async def test_omega_combined_gate(self, ig_git_repo: Path) -> None:
+        """ω G2 capstone: restart mid-pre-merge-rebase → branch survives → merge completes.
+
+        ONE harness/git_ops/WarmLanePool threading all five phases:
+
+        Phase 0 — create_worktree(id) → lane on task/<id>; commit unmerged WIP
+                   (mid-pre-merge-rebase state; n_before > 0 beyond main).
+        Phase 1 (β) — synthetic hard-cancel via harness._run_slot;
+                   assert synthetic_cancel True, lane ASSIGNED, branch alive.
+        Phase 2 (α) — release_lane_for_terminal_task(id) reclaim;
+                   assert branch ref still alive AND lane FREE.
+        Phase 3 (γ) — re-dispatch create_worktree(id);
+                   assert WorktreeInfo, HEAD on task/<id>, count==n_before, WIP reachable.
+        Phase 4    — _classify_branch_presence is None + merge_to_main + advance_main
+                   → 'advanced' + WIP on main.
+
+        Mirrors TestG5Gate.test_all_four_behaviors_on_single_pool structure.
+
+        This is the single e2e proof that α+β+γ compose to remove the loss-WINDOW:
+          FAIL if β reverted → eager B2 release → lane FREE → Phase 1 ASSIGNED check FAILS
+          FAIL if α reverted → unconditional branch delete → ref gone → Phase 2 check FAILS
+          FAIL if γ reverted → commits reset/collision → count 0 / not WorktreeInfo → FAILS
+        """
+        task_id = 'omega-combined-1'
+        wip_file = f'wip_omega_{task_id}.txt'
+        wip_content = 'omega combined gate wip content\n'
+
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        git_ops = harness.git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # ── Phase 0: create lane + commit unmerged WIP ───────────────────────
+        info = await git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo), (
+            f'Phase 0: create_worktree must return WorktreeInfo, got {info!r}'
+        )
+        lane = info.path
+        (lane / wip_file).write_text(wip_content)
+        await git_ops.commit(lane, f'wip: omega combined gate work for {task_id}')
+
+        rc, count_str, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc == 0
+        n_before = int(count_str.strip())
+        assert n_before > 0, (
+            f'Phase 0: task/{task_id} must have commits beyond main, got {n_before}'
+        )
+
+        # ── Phase 1 (β): synthetic hard-cancel ──────────────────────────────
+        report = await _run_synthetic_hard_cancel_slot(harness, task_id)
+
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.CANCELLED, (
+            f'Phase 1 (β): hard-cancel must produce CANCELLED, got {report.outcome!r}'
+        )
+        assert report.synthetic_cancel is True, (
+            'Phase 1 (β): hard-cancel must produce synthetic_cancel=True; '
+            'β-revert → False → B2 fires release → Phase 2 ASSIGNED check FAILS'
+        )
+        assert pool.assignment_for(task_id) is not None, (
+            'Phase 1 (β): lane assignment must survive hard-cancel (B2 skipped)'
+        )
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            f'Phase 1 (β): lane must stay ASSIGNED; β-revert → FREE → FAIL; '
+            f'got {pool.state(lane)!r}'
+        )
+        rc_ref, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', f'refs/heads/task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_ref == 0, (
+            f'Phase 1 (β): task/{task_id} branch must survive hard-cancel'
+        )
+
+        # ── Phase 2 (α): reclaim release — branch must survive ───────────────
+        freed = await git_ops.release_lane_for_terminal_task(task_id)
+        assert freed is True, (
+            'Phase 2 (α): release_lane_for_terminal_task must return True'
+        )
+
+        rc_ref2, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', f'refs/heads/task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_ref2 == 0, (
+            f'Phase 2 (α): task/{task_id} branch must survive the real reclaim release; '
+            f'α-revert → unconditional branch -D → ref gone → FAIL'
+        )
+        assert pool.state(lane) == LaneState.FREE, (
+            f'Phase 2 (α): lane must be FREE after reclaim, got {pool.state(lane)!r}'
+        )
+
+        # ── Phase 3 (γ): re-dispatch — reattach with commits preserved ───────
+        info2 = await git_ops.create_worktree(task_id)
+        assert isinstance(info2, WorktreeInfo), (
+            f'Phase 3 (γ): re-dispatch must return WorktreeInfo (reattach), '
+            f'got {info2!r}; γ-revert create-once → collision → RuntimeError → FAIL'
+        )
+
+        rc_br, branch_out, _ = await _run(
+            ['git', '-C', str(info2.path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=ig_git_repo,
+        )
+        assert rc_br == 0
+        assert branch_out.strip() == f'task/{task_id}', (
+            f'Phase 3 (γ): lane HEAD must be on task/{task_id} after reattach, '
+            f'got {branch_out.strip()!r}'
+        )
+
+        rc2, count_after_str, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc2 == 0
+        n_after = int(count_after_str.strip())
+        assert n_after == n_before, (
+            f'Phase 3 (γ): commits must be preserved (before={n_before}, after={n_after}); '
+            f'γ-revert reset-in-place → count 0 → FAIL'
+        )
+
+        rc3, show_wip, _ = await _run(
+            ['git', 'show', f'task/{task_id}:{wip_file}'],
+            cwd=ig_git_repo,
+        )
+        assert rc3 == 0 and wip_content.strip() in show_wip, (
+            f'Phase 3 (γ): WIP content must be reachable from task/{task_id}; '
+            f'rc={rc3!r}, out={show_wip!r}'
+        )
+
+        # ── Phase 4: merge — no unknown_branch + WIP lands on main ───────────
+        branch_presence = await _classify_branch_presence(
+            git_ops, None, task_id, task_id, None,
+        )
+        assert branch_presence is None, (
+            f'Phase 4: _classify_branch_presence must be None (no unknown_branch); '
+            f'got {branch_presence!r}; α/β-revert → ref gone → unknown_branch → FAIL'
+        )
+
+        merge_result = await git_ops.merge_to_main(info2.path, task_id)
+        assert merge_result.success, (
+            f'Phase 4: merge_to_main must succeed; '
+            f'details={getattr(merge_result, "details", None)!r}'
+        )
+        assert merge_result.merge_commit is not None
+
+        advance = await git_ops.advance_main(merge_result.merge_commit)
+        assert advance == 'advanced', (
+            f'Phase 4: advance_main must return "advanced", got {advance!r}'
+        )
+
+        # WIP must land on main (the user-observable two-way boundary)
+        rc_main, main_wip, _ = await _run(
+            ['git', 'show', f'main:{wip_file}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_main == 0 and wip_content.strip() in main_wip, (
+            f'Phase 4: WIP must land on main after advance_main; '
+            f'rc={rc_main!r}, out={main_wip!r}'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
