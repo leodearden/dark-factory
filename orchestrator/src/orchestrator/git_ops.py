@@ -1807,15 +1807,23 @@ class GitOps:
                         cwd=self.project_root,
                     )
                     if _co_add_rc != 0:
-                        # Cannot attach — report FAULT so the caller escalates.
-                        # Step-6 hardens this to a protective raise (never-destroy).
-                        logger.warning(
-                            'acquire_warm_lane: create-once reattach failed for '
-                            '%s (%s): %s',
-                            lane, full_branch, _co_err,
+                        # Cannot re-attach (e.g. branch is checked out in another
+                        # live worktree).  Raise rather than falling through to any
+                        # destructive op — mirrors _cleanup_leftover_branch's
+                        # raise-not-destroy contract (inv.10 fail-safe-retain).
+                        # acquire_warm_lane's top-level except Exception converts
+                        # this to WarmLaneUnavailable.FAULT (lane released, caller
+                        # escalates blocked+L1) while leaving full_branch intact.
+                        raise RuntimeError(
+                            f'acquire_warm_lane: refusing to reset {full_branch!r} '
+                            f'— it carries commits beyond {self.config.main_branch} '
+                            f'and cannot be safely re-attached to lane {lane} '
+                            f'(git worktree add failed: {_co_err.strip()!r}). '
+                            f'This would destroy work. Inspect the branch and, '
+                            f'once any wanted work is preserved, remove the other '
+                            f'worktree and retry: '
+                            f'`git branch -D {full_branch}` only after preserving work.'
                         )
-                        await self.warm_lane_pool.release(lane)
-                        return WarmLaneUnavailable.FAULT
                     # Mirror the normal create-once seed path
                     _co_seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                     if _co_seed_rc != 0:
