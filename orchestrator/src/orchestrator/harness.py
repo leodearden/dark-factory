@@ -3898,9 +3898,12 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             # Assign to `report` so the B2 guard in the finally block can inspect
             # `synthetic_cancel=True` and SKIP the eager branch-deleting release.
-            # Process teardown is NOT "work finished and discardable"; lane-cache
-            # reclaim is deferred to the periodic terminal-lane reconciler / next
-            # acquire (now α-guarded), which retains the branch (β, task 1913).
+            # Process teardown is NOT "work finished and discardable"; β (task 1913)
+            # suppresses the EAGER deletion and leaves the lane ASSIGNED so the
+            # periodic terminal-lane reconciler / next acquire can reclaim it.
+            # NOTE: β alone only DELAYS deletion to the reconciler tick; durable
+            # branch survival across that reclaim requires α (task 1912)'s
+            # branch-preservation guard in release_warm_lane (not yet landed).
             report = TaskReport(
                 task_id=assignment.task_id,
                 title=assignment.task.get('title', ''),
@@ -3937,8 +3940,11 @@ Output JSON matching the schema. Every task must appear in the output.
             #
             # β guard (task 1913): skip the eager release when the report is a
             # SYNTHETIC hard-cancel (process teardown ≠ "work finished and
-            # discardable").  The lane cache is reclaimed by the periodic terminal-lane
-            # reconciler / next acquire (α-guarded release_warm_lane retains branch).
+            # discardable").  The lane stays ASSIGNED; the periodic terminal-lane
+            # reconciler / next acquire will reclaim it later.  Until α (task 1912)
+            # lands its branch-preservation guard in release_warm_lane, that
+            # reconciler reclaim still routes through the unguarded git branch -D
+            # — β only prevents the EAGER deletion at process-teardown time.
             # Genuine DONE / non-synthetic CANCELLED still release here (regression-
             # guarded by test_nonsynthetic_terminal_report_still_releases_lane).
             #

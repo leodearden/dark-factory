@@ -499,8 +499,9 @@ class TestHardCancelLaneRelease:
     teardown, NOT "work finished and discardable".  Pre-fix B2 fires
     release_lane_for_terminal_task → git branch -D task/<id>, deleting a
     still-unmerged branch.  Post-fix B2 is skipped for synthetic reports; the lane
-    cache is reclaimed later by the periodic terminal-lane reconciler / next acquire
-    (now α-guarded), preserving the branch.
+    stays ASSIGNED and is reclaimable by the periodic terminal-lane reconciler /
+    next acquire.  β alone only DELAYS deletion to the reconciler tick — durable
+    branch survival across that reclaim is α (task 1912)'s contract, not β's.
 
     Contrasting case (non-synthetic CANCELLED still releases) is guarded by
     test_nonsynthetic_terminal_report_still_releases_lane (regression against

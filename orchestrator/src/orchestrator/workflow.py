@@ -2009,6 +2009,11 @@ class TaskWorkflow:
             # DONE/authoritative-CANCELLED return has exc_info()==(None,None,None),
             # so the release fires unchanged for genuine terminal exits.
             #
+            # Skipping the eager release here only DEFERS lane reclaim to the
+            # periodic terminal-lane reconciler / next acquire; durable branch
+            # survival across that later reclaim requires α (task 1912)'s
+            # branch-preservation guard in release_warm_lane (not yet landed).
+            #
             # Coordinated with harness.py B2 (report.synthetic_cancel=True): both
             # guards protect the same hard-cancel event via independent mechanisms.
             # B1 fires first — inside workflow.run() before the harness catches the
