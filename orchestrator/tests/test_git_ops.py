@@ -6927,3 +6927,389 @@ class TestCleanupWorktreeColdBranchRetention:
             'task/Z must be RETAINED when _branch_has_commits_beyond_main '
             'returns True (fail-safe on git error)'
         )
+
+
+# ===========================================================================
+# Task-1914 step-5: RED — create-once leftover protective guard + fail-safe
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneCreateOnceLeftoverGuard:
+    """create-once site NEVER destroys a leftover task/<id> branch that carries
+    commits beyond main.  If the leftover cannot be re-attached (e.g. already
+    checked out in another worktree), acquire returns WarmLaneUnavailable.FAULT
+    while leaving the branch intact.  Fail-safe: _branch_has_commits_beyond_main
+    True (including on git error) → reattach/retain direction taken on both paths."""
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_create_once_leftover_with_commits_not_destroyed_when_unattachable(
+        self, git_repo: Path, tmp_path: Path,
+    ):
+        """Create-once leftover carrying commits is NEVER destroyed when it cannot
+        be re-attached (already checked out in another worktree).
+
+        Setup: create task/A with commits via a temp worktree and LEAVE the
+        worktree in place (not removed).  When acquire_warm_lane tries
+        `git worktree add <lane> task/A`, git refuses with 'branch already
+        checked out' — and the branch must NOT be deleted as a fallback.
+
+        After step-4: the reattach guard fires and `git worktree add` (no -b)
+        fails → FAULT returned; task/A is never touched → both assertions PASS.
+        After step-6: same external result; the raise-not-destroy contract is
+        the same observable effect.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        # Create task/A with 2 commits AND leave the worktree checked out.
+        # git_repo is at tmp_path/repo; tmp_path is the shared temp root.
+        tmp_wt_a = tmp_path / 'kept_wt_A'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/A', str(tmp_wt_a), start_ref],
+            cwd=git_repo,
+        )
+        for i in range(2):
+            (tmp_wt_a / f'wip_{i}.txt').write_text(f'work item {i}\n')
+            await _run(['git', 'add', '-A'], cwd=tmp_wt_a)
+            await _run(['git', 'commit', '-m', f'wip {i}'], cwd=tmp_wt_a)
+
+        # Capture count BEFORE acquire (for regression comparison)
+        _, count_before_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_before = int(count_before_raw.strip())
+        assert count_before >= 2, f'Expected >=2 commits for task/A, got {count_before}'
+
+        # FRESH pool — _lane-0 never acquired
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # Must return WarmLaneUnavailable (FAULT), NOT WorktreeInfo
+        assert isinstance(result, WarmLaneUnavailable), (
+            f'Expected WarmLaneUnavailable for unattachable orphan, got {result!r}'
+        )
+
+        # task/A branch must be RETAINED — never destroyed regardless of failure
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc_verify == 0, (
+            'task/A branch must be RETAINED after unattachable reattach attempt '
+            '— the never-destroy contract must hold even on FAULT'
+        )
+
+        # Commit count must be UNCHANGED (no commits lost)
+        _, count_after_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_after = int(count_after_raw.strip())
+        assert count_after == count_before, (
+            f'task/A commit count must be unchanged: expected {count_before}, '
+            f'got {count_after} — the branch was modified when it should not have been'
+        )
+
+    async def test_reattach_fail_safe_when_commits_probe_true(
+        self, git_repo: Path, tmp_path: Path,
+    ):
+        """Reattach guard takes the retain/reattach direction when
+        _branch_has_commits_beyond_main returns True (including on git error).
+
+        Mirrors α's test_retains_branch_on_rev_list_failure: patches the probe
+        to always-True (simulating a git error or unparseable output).  The
+        guard must fire on the reset-in-place path and reattach rather than
+        resetting to start_ref (which would destroy the commits).
+
+        Validates the fail-safe direction: uncertainty → retain, not reset.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        # Create orphan task/A with 2 commits via a temp worktree, then remove it.
+        tmp_wt_a = tmp_path / 'orphan_wt_A'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/A', str(tmp_wt_a), start_ref],
+            cwd=git_repo,
+        )
+        for i in range(2):
+            (tmp_wt_a / f'wip_{i}.txt').write_text(f'work item {i}\n')
+            await _run(['git', 'add', '-A'], cwd=tmp_wt_a)
+            await _run(['git', 'commit', '-m', f'wip {i}'], cwd=tmp_wt_a)
+        _, count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_before = int(count_raw.strip())
+        # Remove the temp worktree (task/A becomes orphan: exists but not checked out)
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt_a)], cwd=git_repo)
+
+        # Register+free _lane-0 to hit the reset-in-place path on next acquire.
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+        info_seed = await git_ops.acquire_warm_lane('seed', start_ref)
+        assert isinstance(info_seed, WorktreeInfo), (
+            f'Seed acquire failed: {info_seed!r}'
+        )
+        await git_ops.warm_lane_pool.release(info_seed.path)
+
+        # Patch _branch_has_commits_beyond_main to always-True (simulates git error)
+        async def _always_has_commits(*args, **kwargs) -> bool:
+            return True
+
+        with patch.object(
+            git_ops, '_branch_has_commits_beyond_main', side_effect=_always_has_commits,
+        ):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # Reattach/retain direction: result must be WorktreeInfo (not FAULT)
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected WorktreeInfo (reattach) when fail-safe is True, got {result!r}'
+        )
+
+        # task/A must be RETAINED and commit count PRESERVED (not reset to 0)
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc_verify == 0, (
+            'task/A branch must be RETAINED when fail-safe fires (probe → True)'
+        )
+        _, count_after_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_after = int(count_after_raw.strip())
+        assert count_after >= count_before, (
+            f'task/A commit count must be preserved (>=original): '
+            f'expected >={count_before}, got {count_after}'
+        )
+
+    async def test_create_once_reattach_seed_failure_returns_fault_and_retains_branch(
+        self, git_repo: Path, tmp_path: Path,
+    ):
+        """Seed failure on the create-once reattach path (worktree add succeeds
+        but _seed_warm_lane returns non-zero) must:
+          - Return WarmLaneUnavailable (FAULT)
+          - Release the lane back to FREE
+          - Leave task/<id> branch + commits intact (never-destroy contract)
+
+        Exercises git_ops.py lines 1828-1849 — the worktree-remove + pool-
+        release block that fires when _seed_warm_lane returns a non-zero rc
+        during the create-once reattach path (after a successful worktree add).
+        This path had no dedicated test; a bug here (e.g. forgetting to release
+        the lane) would leak a lane or strand a registered worktree silently.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+        from orchestrator.warm_lane_pool import LaneState
+
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        # Create orphan task/A with 2 commits, then remove the temp worktree so
+        # task/A is a dangling branch (not checked out anywhere — worktree add
+        # during reattach will succeed, letting us exercise the seed-failure branch).
+        tmp_wt_a = tmp_path / 'orphan_seed_fail_wt'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/A', str(tmp_wt_a), start_ref],
+            cwd=git_repo,
+        )
+        for i in range(2):
+            (tmp_wt_a / f'seed_fail_{i}.txt').write_text(f'work {i}\n')
+            await _run(['git', 'add', '-A'], cwd=tmp_wt_a)
+            await _run(['git', 'commit', '-m', f'seed-fail wip {i}'], cwd=tmp_wt_a)
+        _, count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_before = int(count_raw.strip())
+        assert count_before >= 2, f'Expected >=2 commits for task/A, got {count_before}'
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt_a)], cwd=git_repo)
+
+        # FRESH pool — _lane-0 never acquired (create-once path).
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        # Capture lane path before the call so we can verify its state afterwards.
+        lane_path = next(iter(git_ops.warm_lane_pool._lanes))
+
+        # Patch _seed_warm_lane to return 1 (generic seed failure).
+        async def _failing_seed(*args, **kwargs) -> int:
+            return 1
+
+        with patch.object(git_ops, '_seed_warm_lane', side_effect=_failing_seed):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # Must return WarmLaneUnavailable (FAULT), not WorktreeInfo
+        assert isinstance(result, WarmLaneUnavailable), (
+            f'Expected WarmLaneUnavailable for seed failure on create-once reattach '
+            f'path, got {result!r}'
+        )
+
+        # Lane must be released back to FREE (pool.release was called)
+        lane_state = git_ops.warm_lane_pool.state(lane_path)
+        assert lane_state == LaneState.FREE, (
+            f'Lane must be released to FREE after seed failure on reattach path, '
+            f'got {lane_state!r} — indicates pool.release was not called'
+        )
+
+        # task/A branch + commits must be RETAINED (never-destroy contract)
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc_verify == 0, (
+            'task/A branch must be RETAINED after seed failure on reattach path '
+            '— the branch must not be deleted even when seeding fails'
+        )
+        _, count_after_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_after = int(count_after_raw.strip())
+        assert count_after == count_before, (
+            f'task/A commit count must be unchanged after seed failure: '
+            f'expected {count_before}, got {count_after}'
+        )
+
+
+# ===========================================================================
+# Task-1914 step-7: RED — reset-in-place checkout failure must NOT silently
+# proceed on the WRONG branch
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
+    """reset-in-place reattach site must capture the rc of `git checkout -f`
+    and raise (→ WarmLaneUnavailable.FAULT) when checkout fails, rather than
+    silently calling _reuse_warm_lane against the wrong (previous-occupant)
+    branch.
+
+    Mirrors the create-once site (~1805-1826) which already checks the
+    worktree-add rc and raises.  Makes both reattach sites symmetric."""
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_reset_in_place_checkout_failure_does_not_proceed_on_wrong_branch(
+        self, git_repo: Path, tmp_path: Path,
+    ):
+        """When git checkout -f task/<id> fails in the reset-in-place reattach
+        path (e.g. already checked out in another live worktree after a process
+        restart), acquire must return WarmLaneUnavailable.FAULT instead of
+        silently calling _reuse_warm_lane on the wrong branch.
+
+        Setup:
+        (a) Create task/A with 2 commits via tmp_wt_a; LEAVE it checked out.
+        (b) Register+free _lane-0 as 'seed' so the lane is on task/seed and
+            the next acquire for 'A' hits the registered (else) path.
+        (c) Acquire for 'A' — reattach guard fires (task/A exists + commits)
+            but git checkout -f task/A inside the lane FAILS because task/A
+            is already checked out in tmp_wt_a.
+
+        RED today: rc of checkout is discarded and _reuse_warm_lane(lane,
+        task/A) runs against the lane still on task/seed, returning WorktreeInfo
+        instead of WarmLaneUnavailable.
+
+        GREEN after step-8: rc is captured; non-zero → RuntimeError →
+        top-level except → WarmLaneUnavailable.FAULT, task/A intact.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        # (a) Create task/A with 2 commits and LEAVE tmp_wt_a checked out.
+        tmp_wt_a = tmp_path / 'kept_wt_A_rip'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/A', str(tmp_wt_a), start_ref],
+            cwd=git_repo,
+        )
+        for i in range(2):
+            (tmp_wt_a / f'wip_{i}.txt').write_text(f'work item {i}\n')
+            await _run(['git', 'add', '-A'], cwd=tmp_wt_a)
+            await _run(['git', 'commit', '-m', f'wip {i}'], cwd=tmp_wt_a)
+
+        # (c) Capture count before acquire (regression guard)
+        _, count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_before = int(count_raw.strip())
+        assert count_before >= 2, f'Expected >=2 commits for task/A, got {count_before}'
+
+        # (b) Register+free _lane-0 as 'seed' so next acquire for 'A' hits
+        #     the registered else-branch (reset-in-place path).
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+        info_seed = await git_ops.acquire_warm_lane('seed', start_ref)
+        assert isinstance(info_seed, WorktreeInfo), (
+            f'Seed acquire failed (setup): {info_seed!r}'
+        )
+        lane_path = info_seed.path
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        # Confirm the lane is currently on task/seed (previous occupant).
+        _, seed_head_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane_path,
+        )
+        assert seed_head_raw.strip() == 'task/seed', (
+            f'Lane should be on task/seed before reattach attempt, got {seed_head_raw.strip()!r}'
+        )
+
+        # (d) Acquire for 'A' — hits reset-in-place site → reattach guard fires
+        #     → git checkout -f task/A FAILS (task/A checked out in tmp_wt_a)
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # PRIMARY discriminator (RED today → GREEN after step-8):
+        # must return WarmLaneUnavailable.FAULT, NOT WorktreeInfo
+        assert isinstance(result, WarmLaneUnavailable), (
+            f'Expected WarmLaneUnavailable.FAULT when checkout -f task/A fails '
+            f'(branch already checked out in another worktree), got {result!r}. '
+            f'The reset-in-place site must capture the checkout rc and raise, '
+            f'not silently call _reuse_warm_lane on the wrong branch.'
+        )
+
+        # task/A must be RETAINED — never destroyed on the FAULT path
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc_verify == 0, (
+            'task/A branch must be RETAINED after checkout failure '
+            '— never-destroy contract must hold on FAULT path'
+        )
+        _, count_after_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_after = int(count_after_raw.strip())
+        assert count_after == count_before, (
+            f'task/A commit count must be unchanged: expected {count_before}, '
+            f'got {count_after} — branch was modified when it should not have been'
+        )
+
+        # Clarifying assert: the previous-occupant branch task/seed must have
+        # gained no spurious WIP (lane was NOT silently committed onto it).
+        _, seed_count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/seed'], cwd=git_repo,
+        )
+        seed_count = int(seed_count_raw.strip())
+        assert seed_count == 0, (
+            f'task/seed must have 0 commits beyond main (lane was not silently '
+            f'used), got {seed_count} — indicates _reuse_warm_lane ran on wrong branch'
+        )

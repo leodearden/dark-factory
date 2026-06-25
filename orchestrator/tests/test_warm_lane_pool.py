@@ -2595,3 +2595,326 @@ class TestReleaseLaneForTerminalTask:
         assert pool.state(lane_0) == LaneState.ASSIGNED, (
             "task 9000's lane must remain ASSIGNED (not stolen)"
         )
+
+
+# ===========================================================================
+# Task-1914 step-1: RED — reset-in-place reattach (acquire integration)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneReattach:
+    """acquire_warm_lane detects an orphan task/<id> with commits beyond main
+    and reattaches to it (reset-in-place + create-once paths) rather than
+    resetting/colliding.  Fresh ids still reset/create as before (byte-identical)."""
+
+    async def _make_repo_with_scripts(self, repo: Path) -> str:
+        """Commit seed+debug-port scripts to *repo*; return start_ref (HEAD SHA)."""
+        scripts_dir = repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        seed_marker = repo / 'seed_calls.txt'
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(
+            f'#!/usr/bin/env bash\n'
+            f'echo "called:$3" >> {seed_marker}\n'
+            f'mkdir -p "$2/target"\n'
+            f'echo "seeded" > "$2/target/seeded.bin"\n'
+        )
+        seed_script.chmod(0o755)
+        debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+        debug_script.write_text('#!/usr/bin/env bash\necho 39411\n')
+        debug_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=repo)
+        await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
+        _, ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+        return ref.strip()
+
+    async def _create_orphan_branch_with_commits(
+        self,
+        repo: Path,
+        branch: str,
+        start_ref: str,
+        tmp_wt: Path,
+        n: int = 2,
+    ) -> tuple[str, int]:
+        """Create *branch* at *start_ref* with *n* commits via a temp worktree.
+
+        Removes the worktree after committing, leaving *branch* as an orphan
+        (exists in the repo but not checked out anywhere).
+
+        Returns:
+            (tip_sha, commit_count_beyond_main)
+        """
+        await _run(
+            ['git', 'worktree', 'add', '-b', branch, str(tmp_wt), start_ref],
+            cwd=repo,
+        )
+        for i in range(n):
+            (tmp_wt / f'wip_{i}.txt').write_text(f'work item {i}\n')
+            await _run(['git', 'add', '-A'], cwd=tmp_wt)
+            await _run(['git', 'commit', '-m', f'wip {i}'], cwd=tmp_wt)
+        _, tip_sha, _ = await _run(['git', 'rev-parse', branch], cwd=repo)
+        _, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..{branch}'],
+            cwd=repo,
+        )
+        # --force: safe here since we've committed all changes
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=repo)
+        return tip_sha.strip(), int(count_out.strip())
+
+    async def test_reset_in_place_reattaches_orphan_with_commits(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, tmp_path: Path,
+    ):
+        """Reset-in-place path REATTACHES to task/A that carries commits beyond main.
+
+        Setup: register+free _lane-0 via acquire('seed')+pool.release; create orphan
+        task/A with 2 commits via a temp worktree then remove it.
+
+        RED today: `_reset_warm_lane` runs `checkout -f -B task/A start_ref`,
+        resetting commit count→0 and destroying the orphan's work.
+        GREEN after step-2 adds the reattach guard before _reset_warm_lane.
+        """
+        start_ref = await self._make_repo_with_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        # Register+free _lane-0 to make it a registered worktree on task/seed.
+        # After pool.release, _lane-0 is FREE but still a registered worktree.
+        info_seed = await git_ops.acquire_warm_lane('seed', start_ref)
+        assert isinstance(info_seed, WorktreeInfo), (
+            f'Initial acquire for seed failed: {info_seed!r}'
+        )
+        await git_ops.warm_lane_pool.release(info_seed.path)
+
+        # Create orphan task/A with 2 commits via a temp worktree, then remove it.
+        # task/A exists in the repo but is not checked out anywhere.
+        tip_a, count_a = await self._create_orphan_branch_with_commits(
+            wl_git_repo, 'task/A', start_ref, tmp_path / 'tmp_wt_A', n=2,
+        )
+        assert count_a == 2, f'Expected 2 commits for task/A pre-test, got {count_a}'
+
+        # Acquire _lane-0 for 'A' — reattach guard must fire, NOT reset-in-place.
+        info_a = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert isinstance(info_a, WorktreeInfo), (
+            f'Expected WorktreeInfo after reattach, got {info_a!r}'
+        )
+
+        # task/A commit count MUST be preserved (reattach, not reset to 0).
+        # Note: _reuse_warm_lane may add a WIP commit (saving untracked files),
+        # so count_after may be > count_a.  The invariant is ">= n, not 0".
+        _, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'],
+            cwd=wl_git_repo,
+        )
+        count_after = int(count_out.strip())
+        assert count_after >= count_a, (
+            f'task/A commit count must be preserved after reattach: '
+            f'expected >={count_a}, got {count_after}'
+        )
+
+        # Lane HEAD must equal the current task/A branch tip.
+        # (_reuse_warm_lane may add a WIP commit, so the branch tip may differ
+        # from the pre-reattach tip_a — use rev-parse task/A for the live tip.)
+        _, current_tip, _ = await _run(['git', 'rev-parse', 'task/A'], cwd=wl_git_repo)
+        _, lane_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_a.path)
+        assert lane_head.strip() == current_tip.strip(), (
+            f'Lane HEAD must equal current task/A tip after reattach: '
+            f'expected {current_tip.strip()}, got {lane_head.strip()}'
+        )
+
+        # Lane HEAD must NOT be start_ref (that would mean a reset happened).
+        assert lane_head.strip() != start_ref, (
+            'Lane HEAD must NOT be start_ref — that would mean a reset happened '
+            'and task/A commits were destroyed'
+        )
+
+        # The original task/A tip must be an ancestor of the current HEAD —
+        # the pre-reattach work is preserved in the commit chain.
+        anc_rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', tip_a, lane_head.strip()],
+            cwd=wl_git_repo,
+        )
+        assert anc_rc == 0, (
+            f'Original task/A tip ({tip_a[:12]}) must be an ancestor of '
+            f'current HEAD: the original commits must be reachable'
+        )
+
+    async def test_reset_in_place_fresh_id_resets_to_start_ref(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Reset-in-place path RESETS to start_ref for a fresh id with no orphan branch.
+
+        Regression guard: the reattach guard must NOT fire when task/FRESH has
+        no pre-existing branch.  Existing reset-in-place behavior is byte-identical
+        (guard scoped to branches that exist AND carry commits beyond main).
+
+        Must stay GREEN both before and after the step-2 impl.
+        """
+        start_ref = await self._make_repo_with_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        # Register+free _lane-0
+        info_seed = await git_ops.acquire_warm_lane('seed', start_ref)
+        assert isinstance(info_seed, WorktreeInfo), (
+            f'Initial acquire for seed failed: {info_seed!r}'
+        )
+        await git_ops.warm_lane_pool.release(info_seed.path)
+
+        # Assert task/FRESH does not exist yet
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', 'task/FRESH'],
+            cwd=wl_git_repo,
+        )
+        assert rc != 0, 'task/FRESH must not exist before the test'
+
+        # Acquire for fresh id 'FRESH' — guard must NOT fire; reset-in-place as before
+        info_fresh = await git_ops.acquire_warm_lane('FRESH', start_ref)
+
+        assert isinstance(info_fresh, WorktreeInfo), (
+            f'Expected WorktreeInfo for fresh id, got {info_fresh!r}'
+        )
+
+        # HEAD must be at start_ref (reset-in-place creates task/FRESH at start_ref)
+        _, lane_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_fresh.path)
+        assert lane_head.strip() == start_ref, (
+            f'Lane HEAD must be start_ref after reset-in-place: '
+            f'expected {start_ref}, got {lane_head.strip()}'
+        )
+
+        # Commit count must be 0 (branch at main tip)
+        _, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/FRESH'],
+            cwd=wl_git_repo,
+        )
+        assert int(count_out.strip()) == 0, (
+            'task/FRESH must have 0 commits beyond main after reset-in-place'
+        )
+
+        # Branch must exist
+        rc_b, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/FRESH'], cwd=wl_git_repo,
+        )
+        assert rc_b == 0, 'task/FRESH must exist after acquire'
+
+    # ── step-3: create-once reattach ────────────────────────────────────────
+
+    async def test_create_once_reattaches_existing_leftover_with_commits(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, tmp_path: Path,
+    ):
+        """Create-once path REATTACHES to task/A that carries commits beyond main.
+
+        Setup: FRESH pool (_lane-0 never acquired → unregistered); create orphan
+        task/A with 2 commits via a temp worktree then remove it.
+
+        RED today: create-once runs `git worktree add -b task/A lane start_ref`
+        which collides ('A branch named task/A already exists') → FAULT.
+        GREEN after step-4 adds the reattach guard before the -b worktree add.
+        """
+        start_ref = await self._make_repo_with_scripts(wl_git_repo)
+        # FRESH pool — _lane-0 is unregistered (never acquired)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        # Create orphan task/A with 2 commits, then remove the temp worktree.
+        # task/A exists in the repo but is not checked out anywhere.
+        tip_a, count_a = await self._create_orphan_branch_with_commits(
+            wl_git_repo, 'task/A', start_ref, tmp_path / 'tmp_wt_co_A', n=2,
+        )
+        assert count_a == 2, f'Expected 2 commits for task/A pre-test, got {count_a}'
+
+        # Acquire for 'A' — reattach guard must fire, NOT collide with -b
+        info_a = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert isinstance(info_a, WorktreeInfo), (
+            f'Expected WorktreeInfo after create-once reattach, got {info_a!r}'
+        )
+
+        # Lane must be a registered worktree on task/A branch
+        _, abbrev_head, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=info_a.path,
+        )
+        assert abbrev_head.strip() == 'task/A', (
+            f'Lane must be on task/A after reattach, got {abbrev_head.strip()!r}'
+        )
+
+        # task/A commit count MUST be preserved (>=2, not 0)
+        _, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'],
+            cwd=wl_git_repo,
+        )
+        count_after = int(count_out.strip())
+        assert count_after >= count_a, (
+            f'task/A commit count must be preserved after create-once reattach: '
+            f'expected >={count_a}, got {count_after}'
+        )
+
+        # Lane HEAD must NOT be start_ref (that would mean a reset happened)
+        _, lane_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_a.path)
+        assert lane_head.strip() != start_ref, (
+            'Lane HEAD must NOT be start_ref — that would mean a fresh create '
+            'happened and task/A commits were not carried over'
+        )
+
+        # Original tip_a must be an ancestor of current HEAD (commits preserved)
+        anc_rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', tip_a, lane_head.strip()],
+            cwd=wl_git_repo,
+        )
+        assert anc_rc == 0, (
+            f'Original task/A tip ({tip_a[:12]}) must be an ancestor of '
+            f'current HEAD: the original commits must be reachable'
+        )
+
+    async def test_create_once_fresh_id_creates_branch(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Create-once path CREATES task/FRESH at start_ref for a fresh id with no orphan.
+
+        Regression guard: the reattach guard must NOT fire when task/FRESH has
+        no pre-existing branch.  Existing create-once behavior (git worktree add
+        -b task/FRESH lane start_ref) is byte-identical.
+
+        Must stay GREEN both before and after the step-4 impl.
+        """
+        start_ref = await self._make_repo_with_scripts(wl_git_repo)
+        # FRESH pool — _lane-0 is unregistered
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        # Assert task/FRESH does not exist yet
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', 'task/FRESH'],
+            cwd=wl_git_repo,
+        )
+        assert rc != 0, 'task/FRESH must not exist before the test'
+
+        # Acquire for fresh id 'FRESH' — guard must NOT fire; create-once as before
+        info_fresh = await git_ops.acquire_warm_lane('FRESH', start_ref)
+
+        assert isinstance(info_fresh, WorktreeInfo), (
+            f'Expected WorktreeInfo for fresh id, got {info_fresh!r}'
+        )
+
+        # HEAD must be at start_ref (fresh create places task/FRESH at start_ref)
+        _, lane_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_fresh.path)
+        assert lane_head.strip() == start_ref, (
+            f'Lane HEAD must be start_ref after fresh create: '
+            f'expected {start_ref}, got {lane_head.strip()}'
+        )
+
+        # Commit count must be 0 (branch at main tip)
+        _, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/FRESH'],
+            cwd=wl_git_repo,
+        )
+        assert int(count_out.strip()) == 0, (
+            'task/FRESH must have 0 commits beyond main after fresh create'
+        )
+
+        # Branch must exist
+        rc_b, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/FRESH'], cwd=wl_git_repo,
+        )
+        assert rc_b == 0, 'task/FRESH must exist after acquire'

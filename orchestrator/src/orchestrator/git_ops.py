@@ -1781,6 +1781,72 @@ class GitOps:
                     shutil.rmtree(lane)
                 lane.parent.mkdir(parents=True, exist_ok=True)
 
+                # ── γ reattach guard (create-once site) ──────────────────────
+                # If the leftover task/<id> branch still carries commits beyond
+                # main, attach the worktree to it (no -b) rather than letting
+                # the -b create collide ('branch already exists').  Route through
+                # _reuse_warm_lane after seeding — the REUSE tail (commit-WIP →
+                # rebase_onto_main → re-provision), NOT the shared create tail
+                # (gitignore/scrub/merge-base below).  Matches the disk-backstop
+                # reuse path so orphan commits are rebased onto current main.
+                #
+                # _orphan_has_commits wraps the rev-parse --verify existence gate
+                # + _branch_has_commits_beyond_main (fail-safe True on git error).
+                if await self._orphan_has_commits(full_branch):
+                    logger.info(
+                        'acquire_warm_lane: reattach (create-once site) — '
+                        'orphan %s has commits; attaching lane %s without -b',
+                        full_branch, lane,
+                    )
+                    _co_add_rc, _, _co_err = await _run(
+                        ['git', 'worktree', 'add', str(lane), full_branch],
+                        cwd=self.project_root,
+                    )
+                    if _co_add_rc != 0:
+                        # Cannot re-attach (e.g. branch is checked out in another
+                        # live worktree).  Raise rather than falling through to any
+                        # destructive op — mirrors _cleanup_leftover_branch's
+                        # raise-not-destroy contract (inv.10 fail-safe-retain).
+                        # acquire_warm_lane's top-level except Exception converts
+                        # this to WarmLaneUnavailable.FAULT (lane released, caller
+                        # escalates blocked+L1) while leaving full_branch intact.
+                        raise RuntimeError(
+                            f'acquire_warm_lane: refusing to reset {full_branch!r} '
+                            f'— it carries commits beyond {self.config.main_branch} '
+                            f'and cannot be safely re-attached to lane {lane} '
+                            f'(git worktree add failed: {_co_err.strip()!r}). '
+                            f'This would destroy work. Inspect the branch and, '
+                            f'once any wanted work is preserved, remove the other '
+                            f'worktree and retry: '
+                            f'`git branch -D {full_branch}` only after preserving work.'
+                        )
+                    # Seed as in the normal create-once path; the post-seed tail
+                    # is _reuse_warm_lane (commit-WIP → rebase → re-provision),
+                    # NOT the shared create tail at the bottom of this method.
+                    _co_seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
+                    if _co_seed_rc != 0:
+                        if _co_seed_rc == 127:
+                            logger.warning(
+                                'acquire_warm_lane: create-once reattach seed script '
+                                'absent for lane %s (rc=127)', lane,
+                            )
+                        else:
+                            logger.warning(
+                                'acquire_warm_lane: create-once reattach seed failed '
+                                '(rc=%d) for %s; removing worktree',
+                                _co_seed_rc, lane,
+                            )
+                        await _run(
+                            ['git', 'worktree', 'remove', str(lane), '--force'],
+                            cwd=self.project_root,
+                        )
+                        await self.warm_lane_pool.release(lane)
+                        return (
+                            WarmLaneUnavailable.DISK_PRESSURE if _co_seed_rc == 75
+                            else WarmLaneUnavailable.FAULT
+                        )
+                    return await self._reuse_warm_lane(lane, full_branch)
+
                 git_add_rc, _, err = await _run(
                     ['git', 'worktree', 'add', '-b', full_branch, str(lane), start_ref],
                     cwd=self.project_root,
@@ -1862,6 +1928,49 @@ class GitOps:
                     pass
 
                 if disk_reuse:
+                    return await self._reuse_warm_lane(lane, full_branch)
+
+                # ── γ reattach guard (reset-in-place site) ───────────────────
+                # If the orphaned task/<id> branch still carries commits beyond
+                # main, reattach to it (checkout -f <branch>, no -B) rather than
+                # destroying those commits with a reset.  Route through
+                # _reuse_warm_lane (commit-WIP → rebase_onto_main → re-provision)
+                # — the same tail as the disk-backstop reuse path above.
+                #
+                # _orphan_has_commits wraps the rev-parse --verify existence gate
+                # + _branch_has_commits_beyond_main (fail-safe True on git error),
+                # ensuring brand-new task ids (no branch yet) reach the byte-
+                # identical reset-in-place path below, not an erroneous reattach.
+                if await self._orphan_has_commits(full_branch):
+                    logger.info(
+                        'acquire_warm_lane: reattach (reset-in-place site) — '
+                        'lane %s has orphan %s with commits; reattaching',
+                        lane, full_branch,
+                    )
+                    _co_rc, _, _co_err = await _run(
+                        ['git', 'checkout', '-f', full_branch], cwd=lane,
+                    )
+                    if _co_rc != 0:
+                        # Cannot re-attach (e.g. branch is checked out in another
+                        # live worktree after a process restart).  Raise rather than
+                        # proceeding: _reuse_warm_lane would commit WIP onto the
+                        # wrong (previous-occupant) branch and corrupt state.
+                        # Mirrors the create-once site (~1809-1826) and
+                        # _cleanup_leftover_branch's raise-not-destroy contract
+                        # (inv.10 fail-safe-retain).
+                        # acquire_warm_lane's top-level except Exception converts
+                        # this to WarmLaneUnavailable.FAULT (lane released, caller
+                        # escalates blocked+L1) while leaving full_branch intact.
+                        raise RuntimeError(
+                            f'acquire_warm_lane: refusing to reuse lane {lane} '
+                            f'— orphan {full_branch!r} carries commits beyond '
+                            f'{self.config.main_branch} but lane checkout failed '
+                            f'(git checkout -f rc={_co_rc}: {_co_err.strip()!r}). '
+                            f'Proceeding would commit WIP onto the wrong branch '
+                            f'and corrupt state. The branch is left intact. '
+                            f'Inspect the branch and, once wanted work is preserved, '
+                            f'remove the other worktree and retry.'
+                        )
                     return await self._reuse_warm_lane(lane, full_branch)
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
@@ -2277,6 +2386,32 @@ class GitOps:
             return int(out.strip()) > 0
         except ValueError:
             return True
+
+    async def _orphan_has_commits(self, full_branch: str) -> bool:
+        """Whether *full_branch* exists AND carries commits beyond main.
+
+        Combines an explicit ``git rev-parse --verify`` existence gate with
+        :meth:`_branch_has_commits_beyond_main`.  The existence gate is required
+        because ``_branch_has_commits_beyond_main`` fail-safe-returns ``True``
+        for a nonexistent branch (its ``rev-list`` errors, rc != 0 → True);
+        using the probe alone would wrongly fire the reattach guard for brand-new
+        task ids.
+
+        Returns ``False`` when the branch does not exist — the fresh-create or
+        reset-in-place path is correct.  Returns ``True`` when the branch exists
+        AND the commits probe confirms work beyond main (including fail-safe
+        ``True`` on git error — retain direction).
+
+        Used by both γ reattach sites in :meth:`acquire_warm_lane` to avoid
+        duplicating the two-step existence-then-probe gate.
+        """
+        rp_rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', full_branch],
+            cwd=self.project_root,
+        )
+        if rp_rc != 0:
+            return False  # branch does not exist — take the fresh path
+        return await self._branch_has_commits_beyond_main(full_branch)
 
     async def _delete_branch_if_on_main(
         self, full_branch: str, *, context: str,
