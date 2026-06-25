@@ -447,6 +447,116 @@ class TestSignatureBNegatives:
 
 
 # ---------------------------------------------------------------------------
+# Step 1 supplement — content-hash on Violation
+# ---------------------------------------------------------------------------
+import re as _re  # noqa: E402
+
+
+class TestContentHash:
+    """Scanner emits a drift-resistant content_hash on every Violation."""
+
+    def test_sig_a_content_hash_format(self):
+        """content_hash is a 12-char lowercase hex string on sig-a violations."""
+        src = "x, _ = get_statuses()"
+        vs = _violations(src)
+        sig_a = [v for v in vs if _sig_a(v)]
+        assert len(sig_a) == 1
+        h = sig_a[0].content_hash
+        assert _re.fullmatch(r"[0-9a-f]{12}", h), (
+            f"content_hash {h!r} does not match ^[0-9a-f]{{12}}$"
+        )
+
+    def test_sig_b_content_hash_format(self):
+        """content_hash is a 12-char lowercase hex string on sig-b violations."""
+        src = """\
+        def f():
+            try:
+                pass
+            except Exception:
+                return None
+        """
+        vs = _violations(src)
+        sig_b = [v for v in vs if _sig_b(v)]
+        assert len(sig_b) == 1
+        h = sig_b[0].content_hash
+        assert _re.fullmatch(r"[0-9a-f]{12}", h), (
+            f"content_hash {h!r} does not match ^[0-9a-f]{{12}}$"
+        )
+
+    def test_sig_a_content_hash_line_drift_invariant(self):
+        """Prepending blank lines changes lineno but NOT content_hash (sig-a)."""
+        src_base = "x, _ = get_statuses()"
+        src_drifted = "\n\n\n" + src_base  # 3 blank lines prepended
+
+        vs_base = _violations(src_base)
+        vs_drifted = _violations(src_drifted)
+        sig_a_base = [v for v in vs_base if _sig_a(v)]
+        sig_a_drifted = [v for v in vs_drifted if _sig_a(v)]
+
+        assert len(sig_a_base) == 1
+        assert len(sig_a_drifted) == 1
+        assert sig_a_base[0].lineno != sig_a_drifted[0].lineno, (
+            "Prepending blank lines should change lineno"
+        )
+        assert sig_a_base[0].content_hash == sig_a_drifted[0].content_hash, (
+            "content_hash must be identical despite line drift"
+        )
+
+    def test_sig_b_content_hash_line_drift_invariant(self):
+        """Prepending blank lines changes lineno but NOT content_hash (sig-b)."""
+        src_base = textwrap.dedent("""\
+            def f():
+                try:
+                    pass
+                except Exception:
+                    return None
+        """).strip()
+        src_drifted = "\n\n\n" + src_base
+
+        vs_base = _violations(src_base)
+        vs_drifted = _violations(src_drifted)
+        sig_b_base = [v for v in vs_base if _sig_b(v)]
+        sig_b_drifted = [v for v in vs_drifted if _sig_b(v)]
+
+        assert len(sig_b_base) == 1
+        assert len(sig_b_drifted) == 1
+        assert sig_b_base[0].lineno != sig_b_drifted[0].lineno, (
+            "Prepending blank lines should change lineno"
+        )
+        assert sig_b_base[0].content_hash == sig_b_drifted[0].content_hash, (
+            "content_hash must be identical despite line drift"
+        )
+
+    def test_sig_b_content_hash_change_sensitive(self):
+        """Changing the returned empty literal changes content_hash (sig-b)."""
+        src_none = textwrap.dedent("""\
+            def f():
+                try:
+                    pass
+                except Exception:
+                    return None
+        """).strip()
+        src_dict = textwrap.dedent("""\
+            def f():
+                try:
+                    pass
+                except Exception:
+                    return {}
+        """).strip()
+
+        vs_none = _violations(src_none)
+        vs_dict = _violations(src_dict)
+        sig_b_none = [v for v in vs_none if _sig_b(v)]
+        sig_b_dict = [v for v in vs_dict if _sig_b(v)]
+
+        assert len(sig_b_none) == 1
+        assert len(sig_b_dict) == 1
+        assert sig_b_none[0].content_hash != sig_b_dict[0].content_hash, (
+            "Different return literals must produce different content_hash"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step 5 — Whole-tree integration + gate self-integrity tests
 # ---------------------------------------------------------------------------
 
