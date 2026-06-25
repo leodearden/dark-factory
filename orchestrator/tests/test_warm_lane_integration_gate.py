@@ -907,3 +907,100 @@ class TestTerminalLaneRelease:
         assert isinstance(info_b, WorktreeInfo), (
             f'After terminal release, create_worktree must succeed, got {info_b!r}'
         )
+
+
+# ===========================================================================
+# ω-gate: Step-1 (RED β seam) + Step-3 (RED α seam) + Step-5 (RED γ seam) +
+#          Step-7 (RED merge seam) + Step-9 (RED combined gate)
+#
+# One class — TestOmegaIntegrationGate — hosts all ω seam tests plus the
+# combined ω gate.  Each seam gets a distinct observable so the gate FAILS
+# if ANY of α/β/γ is reverted.  The combined gate is the G2 deliverable.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestOmegaIntegrationGate:
+    """ω (task 1915) integration gate: restart mid-pre-merge-rebase → branch
+    survives release+restart → merge completes (no unknown_branch), composing α/β/γ.
+
+    Negative-control design:
+      β observable: lane stays ASSIGNED after synthetic hard-cancel (B2 skipped)
+      α observable: branch retained after real reclaim release (commits > main)
+      γ observable: commits preserved on re-dispatch reattach (count == n_before)
+      merge: _classify_branch_presence is None AND merge_to_main succeeds
+    """
+
+    # -----------------------------------------------------------------------
+    # Step-1: RED β seam
+    # -----------------------------------------------------------------------
+
+    async def test_beta_synthetic_cancel_lane_stays_assigned(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """β seam: hard-cancel leaves lane ASSIGNED and branch alive.
+
+        Phase 0: create_worktree(id) → lane on task/<id>; commit unmerged WIP.
+        Phase 1 (β): synthetic hard-cancel via harness._run_slot.
+        ASSERT:
+          - report.outcome == CANCELLED and report.synthetic_cancel is True
+          - pool.assignment_for(id) is not None AND pool.state(lane) == ASSIGNED
+          - git rev-parse --verify refs/heads/task/<id> rc == 0
+
+        Negative control for β: with β reverted, B2 fires release_lane_for_terminal_task
+        → lane flips FREE → the ASSIGNED assertion fails.
+        """
+        task_id = 'omega-beta-1'
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        pool = harness.git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Phase 0: acquire lane + commit unmerged WIP
+        info = await harness.git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo), (
+            f'Phase 0: create_worktree must return WorktreeInfo, got {info!r}'
+        )
+        lane = info.path
+        (lane / 'wip_beta.txt').write_text('beta wip content\n')
+        await harness.git_ops.commit(lane, 'wip: beta seam unmerged work')
+
+        # Verify WIP is beyond main
+        rc, count, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc == 0 and int(count.strip()) > 0, (
+            f'setup: task/{task_id} must have commits beyond main, got count={count!r}'
+        )
+
+        # Phase 1 (β): synthetic hard-cancel via harness._run_slot
+        report = await _run_synthetic_hard_cancel_slot(harness, task_id)
+
+        # β assertions
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.CANCELLED, (
+            f'synthetic hard-cancel must produce CANCELLED outcome, got {report.outcome!r}'
+        )
+        assert report.synthetic_cancel is True, (
+            'hard-cancel must produce synthetic_cancel=True (β field, harness.py:3911)'
+        )
+
+        # Lane stays ASSIGNED (B2 skipped by β guard)
+        assert pool.assignment_for(task_id) is not None, (
+            'lane assignment must survive hard-cancel (B2 β-guard skipped release)'
+        )
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            f'lane must stay ASSIGNED after synthetic hard-cancel, got {pool.state(lane)!r}; '
+            'β-revert → B2 fires release_lane_for_terminal_task → lane flips FREE'
+        )
+
+        # Branch alive after synthetic cancel
+        rc_ref, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', f'refs/heads/task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_ref == 0, (
+            f'task/{task_id} branch must survive hard-cancel (β skips B2 branch delete)'
+        )
