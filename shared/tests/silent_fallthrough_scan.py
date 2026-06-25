@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
@@ -240,6 +241,76 @@ def _content_hash(node: ast.AST) -> str:
     changes when the node's type, body, or return literal changes.
     """
     return hashlib.sha256(ast.unparse(node).encode("utf-8")).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
+# Drift-resistant key helpers (for gate matching)
+# ---------------------------------------------------------------------------
+
+
+def violation_key(v: Violation) -> tuple[str, str, str]:
+    """Return the drift-resistant identity key for a violation.
+
+    The key is ``(filename, qualname, content_hash)`` — omitting lineno so
+    that pure line-number drift (from edits in the same file above the site)
+    does not invalidate a blessed allowlist entry.
+
+    Args:
+        v: A :class:`Violation` instance (must have content_hash populated).
+
+    Returns:
+        A 3-tuple ``(relpath, qualname, content_hash)``.
+    """
+    return (v.filename, v.qualname, v.content_hash)
+
+
+def reconcile_against_allowlist(
+    violations: list[Violation],
+    allow_keys: list[tuple[str, str, str]],
+) -> tuple[list[Violation], list[tuple[str, str, str]]]:
+    """Reconcile tree violations against the blessed allowlist using multiset semantics.
+
+    Uses :class:`collections.Counter` subtraction so that duplicate keys (two
+    byte-identical violation sites in the same function) are handled correctly:
+    each copy in the tree must be matched by a copy in the allowlist.
+
+    Args:
+        violations: All violations found in the source tree.
+        allow_keys: The list of blessed ``(relpath, qualname, content_hash)``
+            keys from the allowlist (duplicates permitted and significant).
+
+    Returns:
+        A 2-tuple ``(unblessed_violations, stale_keys)`` where:
+
+        * ``unblessed_violations`` — violations whose key count in the tree
+          exceeds the blessed count (new or uncovered sites).
+        * ``stale_keys`` — allowlist keys whose count exceeds the tree count
+          (fixed violations whose blessing should be removed).
+    """
+    tree_counts: Counter[tuple[str, str, str]] = Counter(
+        violation_key(v) for v in violations
+    )
+    allow_counts: Counter[tuple[str, str, str]] = Counter(allow_keys)
+
+    # stale = allow entries that have no matching tree violation
+    stale_keys: list[tuple[str, str, str]] = list(
+        (allow_counts - tree_counts).elements()
+    )
+
+    # unblessed = tree violations not covered by the allowlist
+    # Iterate violations in order, decrementing a working copy of allow_counts;
+    # once a key's allowance is exhausted, subsequent violations with that key
+    # are emitted as unblessed.
+    remaining = Counter(allow_counts)
+    unblessed: list[Violation] = []
+    for v in violations:
+        key = violation_key(v)
+        if remaining[key] > 0:
+            remaining[key] -= 1
+        else:
+            unblessed.append(v)
+
+    return unblessed, stale_keys
 
 
 # ---------------------------------------------------------------------------
