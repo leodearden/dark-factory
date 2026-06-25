@@ -3623,8 +3623,12 @@ class GitOps:
         in-progress merger's ``_merge-*`` worktree persists on disk and is
         correctly detected here.
         """
+        full_branch = (
+            await self.resolve_queued_branch_ref(branch)
+            or f'{self.config.branch_prefix}{branch}'
+        )
         target_subject = _merge_subject(
-            f'{self.config.branch_prefix}{branch}',
+            full_branch,
             self.config.main_branch,
         )
 

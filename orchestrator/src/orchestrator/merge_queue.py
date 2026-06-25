@@ -6593,9 +6593,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _any_probe_error = False
 
         for req in suffix:
-            ref = f'{branch_prefix}{req.branch}'
             try:
-                head = await self._git_ops.resolve_branch_sha(ref)
+                ref = (
+                    await self._git_ops.resolve_queued_branch_ref(req.branch)
+                )
+            except Exception:
+                logger.warning(
+                    'recompute_suffix_conflict_graph: resolve_queued_branch_ref(%r) raised; '
+                    'treating item as missing ref', req.branch, exc_info=True,
+                )
+                ref = None
+            try:
+                head = await self._git_ops.resolve_branch_sha(ref) if ref else None
             except Exception:
                 logger.warning(
                     'recompute_suffix_conflict_graph: resolve_branch_sha(%r) raised; '
@@ -9462,7 +9471,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         framing because that is the conceptually meaningful question ("what SHA would the
         merge worktree have seen for this branch?").
         """
-        full_branch = f'{self._git_ops.config.branch_prefix}{req.branch}'
+        full_branch = (
+            await self._git_ops.resolve_queued_branch_ref(req.branch)
+            or f'{self._git_ops.config.branch_prefix}{req.branch}'
+        )
         resolved = await self._git_ops.resolve_branch_sha(full_branch)
         return {
             'base_sha': base_sha,
