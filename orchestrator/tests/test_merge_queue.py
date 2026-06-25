@@ -970,7 +970,9 @@ class TestClassifyBranchPresence:
 
         assert outcome is not None
         assert outcome.status == 'unknown_branch'
-        assert 'task/ghost-4011' in outcome.reason
+        # New format: "branch not found in repo (tried 'task/ghost-4011' and 'ghost-4011')"
+        # Shows both forms tried for accurate operator triage.
+        assert "tried 'task/ghost-4011' and 'ghost-4011'" in outcome.reason
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
@@ -1888,6 +1890,108 @@ class TestMergeWorker:
         worker_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestRecomputeSuffixConflictGraphErrorHandling — amend-1911 (suggestion 3a)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecomputeSuffixConflictGraphErrorHandling:
+    """Error-path tests for the resolver try/except in recompute_suffix_conflict_graph.
+
+    After the performance fix the loop calls resolve_branch_sha directly (not
+    resolve_queued_branch_ref), so we mock resolve_branch_sha to raise.  The
+    item must be treated as missing ref (head=None) and the recompute must
+    complete without aborting; other items in the suffix are unaffected.
+    """
+
+    async def test_resolve_sha_raises_treats_item_as_missing_ref(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """resolve_branch_sha raising for an item → item treated as missing ref.
+
+        The recompute must not raise; the item must appear in graph.nodes
+        (it was in the suffix) but no footprint or textual edges touch it
+        (head=None → skipped from all pairwise comparisons).
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request(
+            'rsce-err', 'rsce-err', git_ops.project_root, config,
+            request_id='mr-rsce-err',
+        )
+        worker._lane_buffers['normal'].append(req)
+
+        # Make every resolve_branch_sha call raise
+        async def _raising_sha(_branch_name: str) -> str | None:
+            raise RuntimeError('simulated sha resolution failure')
+
+        with patch.object(git_ops, 'resolve_branch_sha', new=_raising_sha):
+            # Must complete without raising despite the per-item error
+            await worker.recompute_suffix_conflict_graph()
+
+        graph = worker._suffix_conflict_graph
+        # The item must appear in the ordered node list (it was in the suffix)
+        assert 'mr-rsce-err' in graph.nodes, f'nodes={graph.nodes}'
+        # With head=None there is nothing to compare — no edges
+        assert len(graph.footprint_edges) == 0, f'unexpected edges: {graph.footprint_edges}'
+        assert len(graph.textual_edges) == 0, f'unexpected edges: {graph.textual_edges}'
+        # And it did not get flagged as conflicting with main
+        assert 'mr-rsce-err' not in graph.conflicts_with_main
+
+
+# ---------------------------------------------------------------------------
+# TestBuildMergeFailureDiagnostic — amend-1911 (suggestion 3b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBuildMergeFailureDiagnostic:
+    """Tests for _build_merge_failure_diagnostic branch resolution via the resolver.
+
+    Confirms that a prefixed req.branch ('task/X') resolves to the correct SHA
+    via the canonical resolver rather than double-prefixing to 'task/task/X'.
+    """
+
+    async def test_prefixed_branch_resolves_to_correct_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Prefixed req.branch 'task/X' → branch_ref_in_worktree is the real SHA.
+
+        Before the fix, 'task/X' would produce prefix+'task/X' = 'task/task/X'
+        (absent → or-fallback → prefix+'task/X') and then resolve that,
+        returning the correct SHA only by coincidence (fallback lands on the
+        same ref).  With the resolver in place, 'task/X' is found directly
+        and never double-prefixed.
+        """
+        worktree = (await git_ops.create_worktree('diag-prefixed')).path
+        (worktree / 'diag.py').write_text('diag = 1\n')
+        await git_ops.commit(worktree, 'Add diag')
+
+        expected_sha = await git_ops.resolve_branch_sha('task/diag-prefixed')
+        assert expected_sha is not None, 'task/diag-prefixed must exist after create_worktree'
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Submit with the PREFIXED branch string
+        req = _make_request('diag-t', 'task/diag-prefixed', worktree, config)
+        base_sha = await git_ops.get_main_sha()
+
+        diag = await worker._build_merge_failure_diagnostic(
+            req, base_sha, 'main', '',
+        )
+
+        assert diag['branch_ref_in_worktree'] == expected_sha, (
+            f'Expected SHA {expected_sha!r} for prefixed branch, '
+            f'got {diag["branch_ref_in_worktree"]!r}'
+        )
+        assert diag['branch_ref_in_worktree'] != '<unresolved>', (
+            'branch_ref_in_worktree must not be <unresolved> for a prefixed branch'
+        )
 
 
 # ---------------------------------------------------------------------------

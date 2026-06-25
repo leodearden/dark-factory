@@ -2369,9 +2369,9 @@ async def _classify_branch_presence(
     ensures prefixed-input callers (``branch='task/4778'``) still classify
     as ``already_merged`` rather than collapsing to ``unknown_branch``.
 
-    The ``unknown_branch`` reason string always references the prefixed form
-    (``f'{branch_prefix}{branch}'``) to preserve the existing assertion
-    ``'task/ghost-4011' in reason``.
+    The ``unknown_branch`` reason reports both candidate forms tried
+    (``{prefixed!r}`` and ``{branch!r}``) so operators can see exactly what
+    was submitted and what was attempted during triage.
     """
     # ── Live-ref check via canonical resolver ─────────────────────────────
     if await git_ops.resolve_queued_branch_ref(branch) is not None:
@@ -2394,7 +2394,8 @@ async def _classify_branch_presence(
         event_store, task_id, 'unknown_branch', duration_ms=_elapsed_ms(t0),
     )
     return MergeOutcome(
-        'unknown_branch', reason=f'branch {prefixed!r} not found in repo',
+        'unknown_branch',
+        reason=f'branch not found in repo (tried {prefixed!r} and {branch!r})',
     )
 
 
@@ -6591,24 +6592,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # end of this method.  Do NOT re-initialise this flag in later steps.
         _any_probe_error = False
 
+        branch_prefix = self._git_ops.config.branch_prefix
         for req in suffix:
+            ref = None
+            head = None
             try:
-                ref = (
-                    await self._git_ops.resolve_queued_branch_ref(req.branch)
-                )
+                # Mirror resolve_queued_branch_ref: try prefixed form first
+                # (bare-id contract: task/X wins), then bare.  Capturing the
+                # SHA in the same pass avoids a redundant third rev-parse vs
+                # the previous resolve_queued_branch_ref + resolve_branch_sha
+                # pattern (each call forks a git subprocess).
+                prefixed = f'{branch_prefix}{req.branch}'
+                sha = await self._git_ops.resolve_branch_sha(prefixed)
+                if sha is not None:
+                    ref, head = prefixed, sha
+                else:
+                    sha2 = await self._git_ops.resolve_branch_sha(req.branch)
+                    if sha2 is not None:
+                        ref, head = req.branch, sha2
             except Exception:
                 logger.warning(
                     'recompute_suffix_conflict_graph: resolve_queued_branch_ref(%r) raised; '
                     'treating item as missing ref', req.branch, exc_info=True,
                 )
                 ref = None
-            try:
-                head = await self._git_ops.resolve_branch_sha(ref) if ref else None
-            except Exception:
-                logger.warning(
-                    'recompute_suffix_conflict_graph: resolve_branch_sha(%r) raised; '
-                    'treating item as missing ref', ref, exc_info=True,
-                )
                 head = None
             heads.append(head)
 
