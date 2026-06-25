@@ -604,13 +604,13 @@ class TestReconcileMatcher:
 
     def test_violation_key_fields(self):
         """violation_key(v) == (v.filename, v.qualname, v.content_hash)."""
-        from silent_fallthrough_scan import violation_key
+
         v = self._sig_a_violation()
         assert violation_key(v) == (v.filename, v.qualname, v.content_hash)
 
     def test_violation_key_sig_b(self):
         """violation_key also works on sig-b violations."""
-        from silent_fallthrough_scan import violation_key
+
         v = self._sig_b_violation()
         assert violation_key(v) == (v.filename, v.qualname, v.content_hash)
 
@@ -620,7 +620,7 @@ class TestReconcileMatcher:
 
     def test_violation_key_drift_invariant(self):
         """Same handler with blank lines prepended → same key, different lineno."""
-        from silent_fallthrough_scan import violation_key
+
         src_base = textwrap.dedent("""\
             def my_func():
                 try:
@@ -650,7 +650,7 @@ class TestReconcileMatcher:
 
     def test_reconcile_exact_cover_no_issues(self):
         """Exact 1:1 cover (one violation, one matching key) → ([], [])."""
-        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+
         v = self._sig_a_violation()
         key = violation_key(v)
         unblessed, stale = reconcile_against_allowlist([v], [key])
@@ -659,7 +659,7 @@ class TestReconcileMatcher:
 
     def test_reconcile_extra_tree_violation_is_unblessed(self):
         """Tree has a violation with no matching key → it appears in unblessed."""
-        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+
         v_a = self._sig_a_violation()
         v_b = self._sig_b_violation()
         # only v_a is blessed
@@ -671,7 +671,7 @@ class TestReconcileMatcher:
 
     def test_reconcile_stale_key_no_matching_violation(self):
         """Allow_keys has a key with no matching violation → it appears in stale."""
-        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+
         v_a = self._sig_a_violation()
         v_b = self._sig_b_violation()
         # bless both keys but only provide v_a as the tree violation
@@ -688,7 +688,7 @@ class TestReconcileMatcher:
 
     def test_reconcile_collision_two_keys_blessed(self):
         """Two violations sharing the same key, blessed by TWO key entries → ([], [])."""
-        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+
         # Build two identical sig-a violations (same source → same key)
         src = "x, _ = get_statuses()"
         v1 = find_violations(src, "fake/module.py")[0]
@@ -702,7 +702,7 @@ class TestReconcileMatcher:
 
     def test_reconcile_collision_one_key_blessed(self):
         """Two violations sharing one key, blessed by only ONE key → one unblessed."""
-        from silent_fallthrough_scan import reconcile_against_allowlist, violation_key
+
         src = "x, _ = get_statuses()"
         v1 = find_violations(src, "fake/module.py")[0]
         v2 = find_violations(src, "fake/module.py")[0]
@@ -719,10 +719,15 @@ class TestReconcileMatcher:
 # Step 5 — Whole-tree integration + gate self-integrity tests
 # ---------------------------------------------------------------------------
 
+from collections import Counter as _Counter  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from silent_fallthrough_allowlist import ALLOWLIST_ENTRIES, ALLOWLIST_VIOLATIONS  # noqa: E402
-from silent_fallthrough_scan import iter_first_party_files  # noqa: E402
+from silent_fallthrough_allowlist import ALLOWLIST_ENTRIES, ALLOWLIST_KEYS  # noqa: E402
+from silent_fallthrough_scan import (  # noqa: E402
+    iter_first_party_files,
+    reconcile_against_allowlist,
+    violation_key,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -730,10 +735,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 class _TreeScanData(NamedTuple):
     """Cached result of a full first-party tree scan (session-scoped)."""
 
-    files: list        # list[Path]
-    violations: list   # list[Violation]
-    violations_by_key: dict  # {(relpath, lineno): Violation}
-    parse_failures: list     # list[str]
+    files: list             # list[Path]
+    violations: list        # list[Violation]
+    violation_key_counts: _Counter  # Counter[(relpath, qualname, content_hash)]
+    parse_failures: list    # list[str]
 
 
 @pytest.fixture(scope="session")
@@ -745,7 +750,6 @@ def tree_scan_data() -> _TreeScanData:
     """
     files = list(iter_first_party_files(_REPO_ROOT))
     violations: list[Violation] = []
-    violations_by_key: dict[tuple[str, int], Violation] = {}
     parse_failures: list[str] = []
     for filepath in files:
         source = filepath.read_text(encoding="utf-8", errors="replace")
@@ -754,13 +758,14 @@ def tree_scan_data() -> _TreeScanData:
             ast.parse(source, filename=str(filepath))
         except SyntaxError as e:
             parse_failures.append(f"{filepath}: {e}")
-        for v in find_violations(source, rel):
-            violations.append(v)
-            violations_by_key[(v.filename, v.lineno)] = v
+        violations.extend(find_violations(source, rel))
+    violation_key_counts: _Counter[tuple[str, str, str]] = _Counter(
+        violation_key(v) for v in violations
+    )
     return _TreeScanData(
         files=files,
         violations=violations,
-        violations_by_key=violations_by_key,
+        violation_key_counts=violation_key_counts,
         parse_failures=parse_failures,
     )
 
@@ -812,27 +817,59 @@ class TestWholeTreeGate:
 
     def test_no_violations_outside_allowlist(self, tree_scan_data):
         """The set of violations across the first-party tree must be empty
-        after subtracting the documented baseline ALLOWLIST.
+        after subtracting the documented baseline ALLOWLIST (multiset ratchet).
 
         Any new violation means a silent-fallthrough-on-error was introduced.
         Either fix it (preferred) or add a documented entry to ALLOWLIST.
         """
-        non_baseline = [
-            v for v in tree_scan_data.violations
-            if (v.filename, v.lineno) not in ALLOWLIST_VIOLATIONS
-        ]
+        unblessed, _stale = reconcile_against_allowlist(
+            tree_scan_data.violations, ALLOWLIST_KEYS
+        )
 
-        if non_baseline:
+        if unblessed:
             offender_list = "\n".join(
-                f"  {v.filename}:{v.lineno} [sig-{v.signature}] {v.message}"
-                for v in sorted(non_baseline, key=lambda v: (v.filename, v.lineno))
+                f"  {v.filename}:{v.lineno} [{v.qualname}] "
+                f"[sig-{v.signature}] {v.message}"
+                for v in sorted(unblessed, key=lambda v: (v.filename, v.lineno))
             )
             raise AssertionError(
                 "Silent-fallthrough violations found outside the baseline allowlist.\n"
                 "Fix the violation (preferred) or add a documented entry to\n"
                 "shared/tests/silent_fallthrough_allowlist.py (non-silent, with reason).\n"
-                f"\nOffending sites ({len(non_baseline)}):\n{offender_list}"
+                f"\nOffending sites ({len(unblessed)}):\n{offender_list}"
             )
+
+    def test_blessed_site_survives_simulated_line_drift(self):
+        """A blessed key still matches its violation after line drift (gate regression)."""
+        # Build a synthetic sig-b violation and derive its key
+        src_base = textwrap.dedent("""\
+            def check_health():
+                try:
+                    pass
+                except Exception:
+                    return None
+        """).strip()
+        vs_base = find_violations(src_base, "fake/health.py")
+        sig_b = [v for v in vs_base if v.signature == "b"]
+        assert len(sig_b) == 1, "Expected exactly one sig-b violation in synthetic source"
+        base_key = violation_key(sig_b[0])
+
+        # Simulate line drift: prepend blank lines — changes lineno, not key
+        src_drifted = "\n\n\n\n\n" + src_base
+        vs_drifted = find_violations(src_drifted, "fake/health.py")
+        sig_b_drifted = [v for v in vs_drifted if v.signature == "b"]
+        assert len(sig_b_drifted) == 1
+
+        # The drifted violation must still be covered by the original (pre-drift) key
+        unblessed, stale = reconcile_against_allowlist(sig_b_drifted, [base_key])
+        assert unblessed == [], (
+            "Line drift caused the blessed key to stop matching — "
+            f"unblessed={unblessed}"
+        )
+        assert stale == [], (
+            "Line drift caused the allowlist entry to appear stale — "
+            f"stale={stale}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -850,8 +887,8 @@ class TestAllowlistIntegrity:
     def test_every_entry_has_nonempty_reason(self):
         """No allowlist entry may have a blank reason (that would be a silent exemption)."""
         blank = [
-            f"{relpath}:{lineno} ({qualname})"
-            for relpath, lineno, qualname, reason in ALLOWLIST_ENTRIES
+            f"{relpath} ({qualname})"
+            for relpath, qualname, _content_hash, reason in ALLOWLIST_ENTRIES
             if not reason.strip()
         ]
         if blank:
@@ -863,8 +900,8 @@ class TestAllowlistIntegrity:
     def test_every_entry_relpath_exists(self):
         """Every allowlist relpath must point to an existing file under repo root."""
         missing = [
-            f"{relpath}:{lineno}"
-            for relpath, lineno, _qualname, _reason in ALLOWLIST_ENTRIES
+            relpath
+            for relpath, _qualname, _content_hash, _reason in ALLOWLIST_ENTRIES
             if not (_REPO_ROOT / relpath).is_file()
         ]
         if missing:
@@ -879,8 +916,8 @@ class TestAllowlistIntegrity:
         # Valid: 'foo', 'Foo.bar', 'A.B.c._d', '<module>'
         _DOTTED_IDENT = re.compile(r'^(?:<module>|[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)$')
         invalid = [
-            f"{relpath}:{lineno} qualname={qualname!r}"
-            for relpath, lineno, qualname, _reason in ALLOWLIST_ENTRIES
+            f"{relpath} qualname={qualname!r}"
+            for relpath, qualname, _content_hash, _reason in ALLOWLIST_ENTRIES
             if not _DOTTED_IDENT.match(qualname)
         ]
         if invalid:
@@ -889,35 +926,58 @@ class TestAllowlistIntegrity:
                 + "\n".join(f"  {e}" for e in invalid)
             )
 
+    def test_every_entry_content_hash_wellformed(self):
+        """Every content_hash must be exactly 12 lowercase hex chars."""
+        import re
+        _HEX12 = re.compile(r'^[0-9a-f]{12}$')
+        invalid = [
+            f"{relpath} ({qualname}) content_hash={content_hash!r}"
+            for relpath, qualname, content_hash, _reason in ALLOWLIST_ENTRIES
+            if not _HEX12.match(content_hash)
+        ]
+        if invalid:
+            raise AssertionError(
+                "Allowlist entries with malformed content_hash (expected 12 hex chars):\n"
+                + "\n".join(f"  {e}" for e in invalid)
+            )
+
     def test_no_duplicate_entries(self):
-        """No two allowlist entries should share the same (relpath, lineno)."""
-        seen: set[tuple[str, int]] = set()
+        """No two allowlist entries should be identical full 4-tuples.
+
+        Same-key entries (same relpath+qualname+content_hash) are legitimate —
+        the harness.py pair has two identical-key sites with distinct reasons.
+        A full-tuple duplicate (all four fields identical) is a copy-paste bug.
+        """
+        seen: set[tuple[str, str, str, str]] = set()
         dupes: list[str] = []
-        for relpath, lineno, qualname, _reason in ALLOWLIST_ENTRIES:
-            key = (relpath, lineno)
-            if key in seen:
-                dupes.append(f"{relpath}:{lineno} ({qualname})")
-            seen.add(key)
+        for entry in ALLOWLIST_ENTRIES:
+            relpath, qualname, content_hash, reason = entry
+            if entry in seen:
+                dupes.append(f"{relpath} ({qualname}) {content_hash!r}")
+            seen.add(entry)
         if dupes:
             raise AssertionError(
-                "Duplicate allowlist entries (same relpath:lineno):\n"
+                "Duplicate allowlist entries (identical 4-tuple):\n"
                 + "\n".join(f"  {e}" for e in dupes)
             )
 
     def test_no_stale_entries(self, tree_scan_data):
-        """Every allowlist entry must correspond to a real violation in the current tree.
+        """Every allowlist key must correspond to a real violation in the current tree.
 
-        If a violation is fixed, the allowlist entry becomes stale.  This test
-        fails on stale entries, forcing the baseline to shrink as code improves.
+        Uses the same multiset reconciliation as the gate test: if the allowlist
+        key count for (relpath, qualname, content_hash) exceeds the tree count,
+        those excess entries are stale and must be removed.
         """
-        stale = [
-            f"{relpath}:{lineno} ({qualname}) — {reason[:60]}"
-            for relpath, lineno, qualname, reason in ALLOWLIST_ENTRIES
-            if (relpath, lineno) not in tree_scan_data.violations_by_key
-        ]
+        _unblessed, stale = reconcile_against_allowlist(
+            tree_scan_data.violations, ALLOWLIST_KEYS
+        )
         if stale:
+            stale_display = [
+                f"{relpath} ({qualname}) [{content_hash}]"
+                for relpath, qualname, content_hash in stale
+            ]
             raise AssertionError(
                 "Stale allowlist entries: the violation no longer exists in the source tree.\n"
                 "Remove these entries from shared/tests/silent_fallthrough_allowlist.py:\n"
-                + "\n".join(f"  {e}" for e in stale)
+                + "\n".join(f"  {e}" for e in stale_display)
             )
