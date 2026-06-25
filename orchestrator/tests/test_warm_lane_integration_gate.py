@@ -37,7 +37,6 @@ from orchestrator.git_ops import (
     GitOps,
     WarmLaneDiskPressure,
     WarmLanePoolExhausted,
-    WarmLaneUnavailable,
     WorktreeInfo,
     _run,
 )
@@ -273,7 +272,7 @@ def _make_orch_config(
 async def _run_synthetic_hard_cancel_slot(
     harness: Harness,
     task_id: str,
-) -> TaskReport:
+) -> TaskReport | None:
     """Drive harness._run_slot with TaskWorkflow.run raising asyncio.CancelledError.
 
     Simulates the T5 hard-cancel scenario (e.g. soft-cancel poll limit exceeded).
@@ -1419,4 +1418,5 @@ class TestOmegaIntegrationGate:
             f'rc={rc_main!r}, out={main_wip!r}'
         )
 
+        assert merge_result.merge_worktree is not None
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
