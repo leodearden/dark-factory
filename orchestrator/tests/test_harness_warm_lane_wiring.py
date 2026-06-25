@@ -353,6 +353,122 @@ class TestCancelledWorkflowLaneRelease:
 
 
 # ===========================================================================
+# Step-3 (1913): RED — B1: run() finally skips release on in-flight hard-cancel
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestB1InFlightHardCancelSkipsRelease:
+    """β (task 1913): B1 (workflow.run() finally) must SKIP release when an
+    asyncio.CancelledError is propagating through the finally block.
+
+    B1 condition (workflow.py:2002):
+        if self.state in (DONE, CANCELLED) and not self._worktree_external:
+            await git_ops.release_lane_for_terminal_task(...)
+
+    β adds a third guard:  and not _hard_cancel
+    where _hard_cancel = sys.exc_info()[0] is asyncio.CancelledError (in-flight).
+
+    A normal DONE/authoritative-CANCELLED run() return has exc_info==None →
+    release fires (unchanged, regression-guarded by test_cancelled_workflow_frees_lane).
+    An in-flight asyncio.CancelledError (process teardown) suppresses the release.
+    """
+
+    async def test_b1_run_finally_skips_release_on_inflight_hard_cancel(
+        self, tmp_path: Path
+    ):
+        """B1 guard: in-flight CancelledError prevents release_lane_for_terminal_task.
+
+        Setup: force run() finally to execute with self.state==CANCELLED AND an
+        in-flight asyncio.CancelledError by monkeypatching _setup_worktree_and_artifacts
+        (the first await in run()'s try block) to set state then raise CancelledError.
+
+        RED: pre-guard B1 evaluates self.state in (DONE, CANCELLED) and not
+        _worktree_external → True → calls release_lane_for_terminal_task (spy fires).
+        GREEN: _hard_cancel=True (in-flight) → condition is False → spy not called.
+
+        Contrasting normal-return CANCELLED case (release DOES fire, exc_info==None)
+        is covered by TestCancelledWorkflowLaneRelease.test_cancelled_workflow_frees_lane,
+        guarding that β does not over-suppress the genuine authoritative-cancel path.
+        """
+        from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+        from escalation.queue import EscalationQueue
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.git_ops import GitOps
+        from orchestrator.scheduler import TaskAssignment
+        from orchestrator.workflow import TaskWorkflow, WorkflowState
+
+        # ── Setup: minimal git repo ─────────────────────────────────────────
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+
+        # ── Build TaskWorkflow ──────────────────────────────────────────────
+        scheduler = FakeScheduler()
+        assignment = TaskAssignment(
+            task_id='55',
+            task={
+                'id': '55', 'title': 'B1 hard-cancel test', 'status': 'pending',
+                'metadata': {}, 'dependencies': [],
+            },
+            modules=[],
+        )
+        workflow = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=scheduler,
+            briefing=FakeBriefing(),
+            mcp=FakeMcp(),
+            escalation_queue=EscalationQueue(tmp_path / 'esc'),
+            merge_queue=asyncio.Queue(),
+            merge_worker=None,
+        )
+
+        # ── Stub finally-block helpers so they don't crash on a half-set-up workflow
+        # _steward=None by default (no stop() call issued) — nothing to do.
+        # _maybe_cleanup_done_worktree and _cleanup_config_dir are replaced
+        # with no-ops so the finally completes cleanly before we reach the B1 check.
+        workflow._maybe_cleanup_done_worktree = AsyncMock()  # type: ignore[method-assign]
+        workflow._cleanup_config_dir = MagicMock()  # type: ignore[method-assign]
+
+        # _worktree_external is False by default (line 609) — B1 condition reads it.
+        assert not workflow._worktree_external
+
+        # ── Spy on release_lane_for_terminal_task ───────────────────────────
+        release_spy = AsyncMock(return_value=False)
+        git_ops.release_lane_for_terminal_task = release_spy  # type: ignore[method-assign]
+
+        # ── Force the run() try-block to raise CancelledError with state==CANCELLED
+        # Monkeypatch _setup_worktree_and_artifacts (first await in the try block):
+        # set workflow.state to CANCELLED THEN raise asyncio.CancelledError so the
+        # finally block sees the terminal state AND an in-flight exception.
+        async def _fake_setup_raises_cancelled(branch_name: str) -> None:
+            workflow.state = WorkflowState.CANCELLED
+            raise asyncio.CancelledError('simulated hard-cancel')
+
+        workflow._setup_worktree_and_artifacts = _fake_setup_raises_cancelled  # type: ignore[method-assign]
+
+        # ── Run — expect CancelledError to propagate ────────────────────────
+        with pytest.raises(asyncio.CancelledError):
+            await workflow.run()
+
+        # B1 β-guard: in-flight CancelledError must suppress the release.
+        # RED: pre-guard B1 condition is True (state==CANCELLED, not external) →
+        #      release_spy is called (fails assert_not_called).
+        # GREEN: _hard_cancel=True → condition is False → spy not called.
+        release_spy.assert_not_called()
+
+
+# ===========================================================================
 # Step-7 (1881) / Step-1 (1913): β — B2 synthetic-CANCELLED contract
 # ===========================================================================
 
