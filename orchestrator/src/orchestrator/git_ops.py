@@ -1785,18 +1785,14 @@ class GitOps:
                 # If the leftover task/<id> branch still carries commits beyond
                 # main, attach the worktree to it (no -b) rather than letting
                 # the -b create collide ('branch already exists').  Route through
-                # _reuse_warm_lane after seeding — same tail as a fresh create.
+                # _reuse_warm_lane after seeding — the REUSE tail (commit-WIP →
+                # rebase_onto_main → re-provision), NOT the shared create tail
+                # (gitignore/scrub/merge-base below).  Matches the disk-backstop
+                # reuse path so orphan commits are rebased onto current main.
                 #
-                # Existence gate: same CRITICAL caveat as the reset-in-place
-                # site above — check rev-parse --verify FIRST before consulting
-                # _branch_has_commits_beyond_main (which fail-safe-returns True
-                # for a nonexistent branch).
-                _co_rp_rc, _, _ = await _run(
-                    ['git', 'rev-parse', '--verify', '--quiet', full_branch],
-                    cwd=self.project_root,
-                )
-                _co_branch_exists = _co_rp_rc == 0
-                if _co_branch_exists and await self._branch_has_commits_beyond_main(full_branch):
+                # _orphan_has_commits wraps the rev-parse --verify existence gate
+                # + _branch_has_commits_beyond_main (fail-safe True on git error).
+                if await self._orphan_has_commits(full_branch):
                     logger.info(
                         'acquire_warm_lane: reattach (create-once site) — '
                         'orphan %s has commits; attaching lane %s without -b',
@@ -1824,7 +1820,9 @@ class GitOps:
                             f'worktree and retry: '
                             f'`git branch -D {full_branch}` only after preserving work.'
                         )
-                    # Mirror the normal create-once seed path
+                    # Seed as in the normal create-once path; the post-seed tail
+                    # is _reuse_warm_lane (commit-WIP → rebase → re-provision),
+                    # NOT the shared create tail at the bottom of this method.
                     _co_seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                     if _co_seed_rc != 0:
                         if _co_seed_rc == 127:
@@ -1939,17 +1937,11 @@ class GitOps:
                 # _reuse_warm_lane (commit-WIP → rebase_onto_main → re-provision)
                 # — the same tail as the disk-backstop reuse path above.
                 #
-                # CRITICAL existence gate: _branch_has_commits_beyond_main
-                # fail-safe-returns True for a NONEXISTENT branch (rc!=0 →
-                # True).  Always check rev-parse --verify first so a brand-new
-                # task id — which has no branch yet — reaches the byte-identical
-                # reset-in-place path below, not an erroneous reattach.
-                _rp_rc, _, _ = await _run(
-                    ['git', 'rev-parse', '--verify', '--quiet', full_branch],
-                    cwd=self.project_root,
-                )
-                _branch_exists = _rp_rc == 0
-                if _branch_exists and await self._branch_has_commits_beyond_main(full_branch):
+                # _orphan_has_commits wraps the rev-parse --verify existence gate
+                # + _branch_has_commits_beyond_main (fail-safe True on git error),
+                # ensuring brand-new task ids (no branch yet) reach the byte-
+                # identical reset-in-place path below, not an erroneous reattach.
+                if await self._orphan_has_commits(full_branch):
                     logger.info(
                         'acquire_warm_lane: reattach (reset-in-place site) — '
                         'lane %s has orphan %s with commits; reattaching',
@@ -2394,6 +2386,32 @@ class GitOps:
             return int(out.strip()) > 0
         except ValueError:
             return True
+
+    async def _orphan_has_commits(self, full_branch: str) -> bool:
+        """Whether *full_branch* exists AND carries commits beyond main.
+
+        Combines an explicit ``git rev-parse --verify`` existence gate with
+        :meth:`_branch_has_commits_beyond_main`.  The existence gate is required
+        because ``_branch_has_commits_beyond_main`` fail-safe-returns ``True``
+        for a nonexistent branch (its ``rev-list`` errors, rc != 0 → True);
+        using the probe alone would wrongly fire the reattach guard for brand-new
+        task ids.
+
+        Returns ``False`` when the branch does not exist — the fresh-create or
+        reset-in-place path is correct.  Returns ``True`` when the branch exists
+        AND the commits probe confirms work beyond main (including fail-safe
+        ``True`` on git error — retain direction).
+
+        Used by both γ reattach sites in :meth:`acquire_warm_lane` to avoid
+        duplicating the two-step existence-then-probe gate.
+        """
+        rp_rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', full_branch],
+            cwd=self.project_root,
+        )
+        if rp_rc != 0:
+            return False  # branch does not exist — take the fresh path
+        return await self._branch_has_commits_beyond_main(full_branch)
 
     async def _delete_branch_if_on_main(
         self, full_branch: str, *, context: str,

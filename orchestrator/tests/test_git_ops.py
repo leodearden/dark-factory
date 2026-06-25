@@ -7095,6 +7095,91 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
             f'expected >={count_before}, got {count_after}'
         )
 
+    async def test_create_once_reattach_seed_failure_returns_fault_and_retains_branch(
+        self, git_repo: Path, tmp_path: Path,
+    ):
+        """Seed failure on the create-once reattach path (worktree add succeeds
+        but _seed_warm_lane returns non-zero) must:
+          - Return WarmLaneUnavailable (FAULT)
+          - Release the lane back to FREE
+          - Leave task/<id> branch + commits intact (never-destroy contract)
+
+        Exercises git_ops.py lines 1828-1849 — the worktree-remove + pool-
+        release block that fires when _seed_warm_lane returns a non-zero rc
+        during the create-once reattach path (after a successful worktree add).
+        This path had no dedicated test; a bug here (e.g. forgetting to release
+        the lane) would leak a lane or strand a registered worktree silently.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+        from orchestrator.warm_lane_pool import LaneState
+
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        # Create orphan task/A with 2 commits, then remove the temp worktree so
+        # task/A is a dangling branch (not checked out anywhere — worktree add
+        # during reattach will succeed, letting us exercise the seed-failure branch).
+        tmp_wt_a = tmp_path / 'orphan_seed_fail_wt'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/A', str(tmp_wt_a), start_ref],
+            cwd=git_repo,
+        )
+        for i in range(2):
+            (tmp_wt_a / f'seed_fail_{i}.txt').write_text(f'work {i}\n')
+            await _run(['git', 'add', '-A'], cwd=tmp_wt_a)
+            await _run(['git', 'commit', '-m', f'seed-fail wip {i}'], cwd=tmp_wt_a)
+        _, count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_before = int(count_raw.strip())
+        assert count_before >= 2, f'Expected >=2 commits for task/A, got {count_before}'
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt_a)], cwd=git_repo)
+
+        # FRESH pool — _lane-0 never acquired (create-once path).
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        # Capture lane path before the call so we can verify its state afterwards.
+        lane_path = next(iter(git_ops.warm_lane_pool._lanes))
+
+        # Patch _seed_warm_lane to return 1 (generic seed failure).
+        async def _failing_seed(*args, **kwargs) -> int:
+            return 1
+
+        with patch.object(git_ops, '_seed_warm_lane', side_effect=_failing_seed):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        # Must return WarmLaneUnavailable (FAULT), not WorktreeInfo
+        assert isinstance(result, WarmLaneUnavailable), (
+            f'Expected WarmLaneUnavailable for seed failure on create-once reattach '
+            f'path, got {result!r}'
+        )
+
+        # Lane must be released back to FREE (pool.release was called)
+        lane_state = git_ops.warm_lane_pool.state(lane_path)
+        assert lane_state == LaneState.FREE, (
+            f'Lane must be released to FREE after seed failure on reattach path, '
+            f'got {lane_state!r} — indicates pool.release was not called'
+        )
+
+        # task/A branch + commits must be RETAINED (never-destroy contract)
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc_verify == 0, (
+            'task/A branch must be RETAINED after seed failure on reattach path '
+            '— the branch must not be deleted even when seeding fails'
+        )
+        _, count_after_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        count_after = int(count_after_raw.strip())
+        assert count_after == count_before, (
+            f'task/A commit count must be unchanged after seed failure: '
+            f'expected {count_before}, got {count_after}'
+        )
+
 
 # ===========================================================================
 # Task-1914 step-7: RED — reset-in-place checkout failure must NOT silently
