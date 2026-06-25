@@ -4534,13 +4534,20 @@ class GitOps:
         if rc != 0:
             logger.warning(f'Failed to remove worktree {worktree}: {err}')
 
-        # Delete branch
-        rc, _, err = await _run(
-            ['git', 'branch', '-D', full_branch],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            logger.warning(f'Failed to delete branch {full_branch}: {err}')
+        # Delete branch — on-main only: skip if the branch carries commits
+        # beyond main (i.e. still holds unmerged WIP).
+        if await self._branch_has_commits_beyond_main(full_branch):
+            logger.info(
+                'cleanup_worktree: retaining branch %s — carries commits beyond %s',
+                full_branch, self.config.main_branch,
+            )
+        else:
+            rc, _, err = await _run(
+                ['git', 'branch', '-D', full_branch],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                logger.warning(f'Failed to delete branch {full_branch}: {err}')
 
         logger.info(f'Cleaned up worktree {worktree} and branch {full_branch}')
 
