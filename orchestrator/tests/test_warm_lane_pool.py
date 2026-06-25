@@ -2701,6 +2701,8 @@ class TestAcquireWarmLaneReattach:
         )
 
         # task/A commit count MUST be preserved (reattach, not reset to 0).
+        # Note: _reuse_warm_lane may add a WIP commit (saving untracked files),
+        # so count_after may be > count_a.  The invariant is ">= n, not 0".
         _, count_out, _ = await _run(
             ['git', 'rev-list', '--count', f'main..task/A'],
             cwd=wl_git_repo,
@@ -2711,15 +2713,31 @@ class TestAcquireWarmLaneReattach:
             f'expected >={count_a}, got {count_after}'
         )
 
-        # Lane HEAD must equal task/A tip (reattached, not reset to start_ref).
+        # Lane HEAD must equal the current task/A branch tip.
+        # (_reuse_warm_lane may add a WIP commit, so the branch tip may differ
+        # from the pre-reattach tip_a — use rev-parse task/A for the live tip.)
+        _, current_tip, _ = await _run(['git', 'rev-parse', 'task/A'], cwd=wl_git_repo)
         _, lane_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_a.path)
-        assert lane_head.strip() == tip_a, (
-            f'Lane HEAD must equal task/A tip after reattach: '
-            f'expected {tip_a}, got {lane_head.strip()}'
+        assert lane_head.strip() == current_tip.strip(), (
+            f'Lane HEAD must equal current task/A tip after reattach: '
+            f'expected {current_tip.strip()}, got {lane_head.strip()}'
         )
+
+        # Lane HEAD must NOT be start_ref (that would mean a reset happened).
         assert lane_head.strip() != start_ref, (
             'Lane HEAD must NOT be start_ref — that would mean a reset happened '
             'and task/A commits were destroyed'
+        )
+
+        # The original task/A tip must be an ancestor of the current HEAD —
+        # the pre-reattach work is preserved in the commit chain.
+        anc_rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', tip_a, lane_head.strip()],
+            cwd=wl_git_repo,
+        )
+        assert anc_rc == 0, (
+            f'Original task/A tip ({tip_a[:12]}) must be an ancestor of '
+            f'current HEAD: the original commits must be reachable'
         )
 
     async def test_reset_in_place_fresh_id_resets_to_start_ref(

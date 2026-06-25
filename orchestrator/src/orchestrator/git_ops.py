@@ -1864,6 +1864,32 @@ class GitOps:
                 if disk_reuse:
                     return await self._reuse_warm_lane(lane, full_branch)
 
+                # ── γ reattach guard (reset-in-place site) ───────────────────
+                # If the orphaned task/<id> branch still carries commits beyond
+                # main, reattach to it (checkout -f <branch>, no -B) rather than
+                # destroying those commits with a reset.  Route through
+                # _reuse_warm_lane (commit-WIP → rebase_onto_main → re-provision)
+                # — the same tail as the disk-backstop reuse path above.
+                #
+                # CRITICAL existence gate: _branch_has_commits_beyond_main
+                # fail-safe-returns True for a NONEXISTENT branch (rc!=0 →
+                # True).  Always check rev-parse --verify first so a brand-new
+                # task id — which has no branch yet — reaches the byte-identical
+                # reset-in-place path below, not an erroneous reattach.
+                _rp_rc, _, _ = await _run(
+                    ['git', 'rev-parse', '--verify', '--quiet', full_branch],
+                    cwd=self.project_root,
+                )
+                _branch_exists = _rp_rc == 0
+                if _branch_exists and await self._branch_has_commits_beyond_main(full_branch):
+                    logger.info(
+                        'acquire_warm_lane: reattach (reset-in-place site) — '
+                        'lane %s has orphan %s with commits; reattaching',
+                        lane, full_branch,
+                    )
+                    await _run(['git', 'checkout', '-f', full_branch], cwd=lane)
+                    return await self._reuse_warm_lane(lane, full_branch)
+
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
                 await self._reset_warm_lane(lane, full_branch, start_ref)
                 # β: THIN re-seed — rm target/ before seeding (no retained bloat).
