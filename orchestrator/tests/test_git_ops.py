@@ -6701,3 +6701,84 @@ class TestMergeTreeConflicts:
         assert bogus in err_text, (
             f'Expected bogus ref {bogus!r} in error message; got: {err_text!r}'
         )
+
+
+# ===========================================================================
+# Task-1912 step-1: RED — release_warm_lane branch-retention guard
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestReleaseWarmLaneBranchRetention:
+    """release_warm_lane retains task/<id> when it carries commits beyond main;
+    deletes it (on-main only) when the branch is at the main tip."""
+
+    def _warm_config(self, git_repo: Path) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_retains_branch_when_unmerged(self, git_repo: Path):
+        """release_warm_lane RETAINS task/A when the branch has commits beyond main.
+
+        RED today: the unguarded `git branch -D task/A` destroys the branch
+        before the pool.release(); this assertion will flip to PASS after
+        step-2 introduces the _branch_has_commits_beyond_main guard.
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(git_repo), git_repo, warm_lane_pool_size=1)
+
+        info = await git_ops.create_worktree('A')
+
+        # Commit one file on the lane so task/A has 1 commit beyond main.
+        (info.path / 'wip.txt').write_text('work in progress\n')
+        await _run(['git', 'add', '-A'], cwd=info.path)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=info.path)
+
+        await git_ops.release_warm_lane(info.path, 'A')
+
+        # Branch must be RETAINED — it carries uncommitted WIP.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc == 0, (
+            'task/A must be RETAINED after release_warm_lane when it carries '
+            'commits beyond main'
+        )
+
+        # Cache lifecycle is independent — lane must be FREE regardless.
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE, (
+            'lane must be FREE after release even when branch is retained'
+        )
+
+    async def test_deletes_branch_when_merged(self, git_repo: Path):
+        """release_warm_lane DELETES task/A when the branch is at the main tip
+        (0 commits beyond main — i.e. a fresh lane that was never used).
+
+        This assertion passes today and is the regression guard that prevents
+        an always-retain implementation from leaking branch refs forever.
+        It also confirms the fresh-lane base == main tip premise.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(git_repo), git_repo, warm_lane_pool_size=1)
+
+        # Fresh lane: task/A == main tip, 0 commits beyond main.
+        info = await git_ops.create_worktree('A')
+
+        await git_ops.release_warm_lane(info.path, 'A')
+
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc != 0, (
+            'task/A must be DELETED after release_warm_lane when it is at '
+            'the main tip (0 commits beyond main)'
+        )
