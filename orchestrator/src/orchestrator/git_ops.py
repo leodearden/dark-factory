@@ -1781,6 +1781,66 @@ class GitOps:
                     shutil.rmtree(lane)
                 lane.parent.mkdir(parents=True, exist_ok=True)
 
+                # ── γ reattach guard (create-once site) ──────────────────────
+                # If the leftover task/<id> branch still carries commits beyond
+                # main, attach the worktree to it (no -b) rather than letting
+                # the -b create collide ('branch already exists').  Route through
+                # _reuse_warm_lane after seeding — same tail as a fresh create.
+                #
+                # Existence gate: same CRITICAL caveat as the reset-in-place
+                # site above — check rev-parse --verify FIRST before consulting
+                # _branch_has_commits_beyond_main (which fail-safe-returns True
+                # for a nonexistent branch).
+                _co_rp_rc, _, _ = await _run(
+                    ['git', 'rev-parse', '--verify', '--quiet', full_branch],
+                    cwd=self.project_root,
+                )
+                _co_branch_exists = _co_rp_rc == 0
+                if _co_branch_exists and await self._branch_has_commits_beyond_main(full_branch):
+                    logger.info(
+                        'acquire_warm_lane: reattach (create-once site) — '
+                        'orphan %s has commits; attaching lane %s without -b',
+                        full_branch, lane,
+                    )
+                    _co_add_rc, _, _co_err = await _run(
+                        ['git', 'worktree', 'add', str(lane), full_branch],
+                        cwd=self.project_root,
+                    )
+                    if _co_add_rc != 0:
+                        # Cannot attach — report FAULT so the caller escalates.
+                        # Step-6 hardens this to a protective raise (never-destroy).
+                        logger.warning(
+                            'acquire_warm_lane: create-once reattach failed for '
+                            '%s (%s): %s',
+                            lane, full_branch, _co_err,
+                        )
+                        await self.warm_lane_pool.release(lane)
+                        return WarmLaneUnavailable.FAULT
+                    # Mirror the normal create-once seed path
+                    _co_seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
+                    if _co_seed_rc != 0:
+                        if _co_seed_rc == 127:
+                            logger.warning(
+                                'acquire_warm_lane: create-once reattach seed script '
+                                'absent for lane %s (rc=127)', lane,
+                            )
+                        else:
+                            logger.warning(
+                                'acquire_warm_lane: create-once reattach seed failed '
+                                '(rc=%d) for %s; removing worktree',
+                                _co_seed_rc, lane,
+                            )
+                        await _run(
+                            ['git', 'worktree', 'remove', str(lane), '--force'],
+                            cwd=self.project_root,
+                        )
+                        await self.warm_lane_pool.release(lane)
+                        return (
+                            WarmLaneUnavailable.DISK_PRESSURE if _co_seed_rc == 75
+                            else WarmLaneUnavailable.FAULT
+                        )
+                    return await self._reuse_warm_lane(lane, full_branch)
+
                 git_add_rc, _, err = await _run(
                     ['git', 'worktree', 'add', '-b', full_branch, str(lane), start_ref],
                     cwd=self.project_root,
