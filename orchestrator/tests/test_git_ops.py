@@ -6782,3 +6782,70 @@ class TestReleaseWarmLaneBranchRetention:
             'task/A must be DELETED after release_warm_lane when it is at '
             'the main tip (0 commits beyond main)'
         )
+
+
+# ===========================================================================
+# Task-1912 step-3: RED — cold cleanup_worktree branch-retention guard
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestCleanupWorktreeColdBranchRetention:
+    """cold cleanup_worktree retains task/<id> when it carries commits beyond main;
+    deletes it (on-main only) when the branch is at the main tip."""
+
+    async def test_retains_branch_when_unmerged(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """cleanup_worktree RETAINS task/Z when the branch has commits beyond main.
+
+        Uses the default git_ops fixture (pool disabled) so create_worktree
+        yields a cold (non-lane) worktree — mirrors test_cleanup_knob_off_cold_path.
+
+        RED today: the unguarded `git branch -D task/Z` destroys the branch;
+        this assertion will flip to PASS after step-4 adds the guard.
+        """
+        info = await git_ops.create_worktree('Z')
+
+        # Commit one file on the worktree so task/Z has 1 commit beyond main.
+        (info.path / 'wip.txt').write_text('cold path wip\n')
+        await _run(['git', 'add', '-A'], cwd=info.path)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=info.path)
+
+        await git_ops.cleanup_worktree(info.path, 'Z')
+
+        # Worktree directory must be REMOVED (cold path unchanged).
+        assert not info.path.exists(), (
+            'Cold worktree path must be removed by cleanup_worktree'
+        )
+
+        # Branch must be RETAINED — it carries WIP commits.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/Z'], cwd=git_repo,
+        )
+        assert rc == 0, (
+            'task/Z must be RETAINED after cold cleanup_worktree when it '
+            'carries commits beyond main'
+        )
+
+    async def test_deletes_branch_when_merged(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """cleanup_worktree DELETES task/Z when the branch is at the main tip
+        (0 commits beyond main — fresh worktree, never committed to).
+
+        This assertion passes today and is the regression guard that prevents
+        an always-retain implementation from leaking branch refs forever.
+        """
+        info = await git_ops.create_worktree('Z')
+
+        # Fresh worktree: task/Z == main tip, 0 commits beyond main.
+        await git_ops.cleanup_worktree(info.path, 'Z')
+
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/Z'], cwd=git_repo,
+        )
+        assert rc != 0, (
+            'task/Z must be DELETED after cold cleanup_worktree when it is '
+            'at the main tip (0 commits beyond main)'
+        )
