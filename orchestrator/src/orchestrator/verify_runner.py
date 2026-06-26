@@ -841,15 +841,22 @@ class RemoteRunner:
         Co-located with local merge-verify archives for side-by-side operator triage (task 1920,
         sibling of 1768).  Convention mirrors _archive_merge_verify_logs (verify.py:779-856).
 
-        NOTE: best-effort error handling (try/except) is added in step-6.
+        Best-effort: any exception is swallowed with a WARNING so the caller's VerifyResult
+        is always returned unchanged (PRD §A Invariant 5).
         """
-        target_dir = Path(archive_root) / task_id
-        target_dir.mkdir(parents=True, exist_ok=True)
-        utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
-        safe = self.name.replace('/', '_').replace(' ', '_')
-        (target_dir / f'attempt-1.remote-{safe}-{utc_ts}.stderr.log').write_text(
-            stderr_text, encoding='utf-8',
-        )
+        import logging as _logging
+        try:
+            target_dir = Path(archive_root) / task_id
+            target_dir.mkdir(parents=True, exist_ok=True)
+            utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+            safe = self.name.replace('/', '_').replace(' ', '_')
+            (target_dir / f'attempt-1.remote-{safe}-{utc_ts}.stderr.log').write_text(
+                stderr_text, encoding='utf-8',
+            )
+        except Exception as exc:
+            _logging.getLogger(__name__).warning(
+                'RemoteRunner %r: best-effort stderr archival failed: %s', self.name, exc,
+            )
 
     async def cancel_verify(self) -> int:
         """Cancel the in-flight verify-merge on the remote host.
