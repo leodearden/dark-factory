@@ -3212,3 +3212,126 @@ class TestMergeRequestSnapshotReconcile:
         assert mq.empty(), f'Expected empty queue (no fresh dispatch), got qsize={mq.qsize()}'
 
         live_fut.cancel()  # clean up
+
+
+# ---------------------------------------------------------------------------
+# TestMergeRequestTipRecency — step-5/6: classifier_git_ops wired to server
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestTipRecency:
+    """RED: merge_request dispatches (not coalesces) a SUPERSET re-submission
+    when the server passes classifier_git_ops to coalesce_or_enqueue.
+
+    Step-5 tests fail until step-6 wires classifier_git_ops in server.py.
+    Without the wiring, the MCP path always coalesces (returns 'attached').
+    """
+
+    def _make_tip_recency_git_ops(
+        self,
+        *,
+        new_tip: str,
+        old_tip: str,
+        main_branch: str = 'main',
+    ) -> types.SimpleNamespace:
+        """Build a git_ops stub for the SUPERSET tip-recency scenario.
+
+        - resolve_branch_sha('task/B') → new_tip
+        - is_ancestor(new_tip, main_branch) → False  (skip already_merged)
+        - is_ancestor(old_tip, new_tip) → True       (SUPERSET for classify)
+        - find_inflight_merge_worktree('B') → None   (no disk worktree)
+        """
+        async def _resolve_branch_sha(branch: str) -> str | None:
+            if branch == 'task/B':
+                return new_tip
+            return None
+
+        async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+            # already_merged fast-path: is_ancestor(new_tip, main_branch) → False
+            if ancestor == new_tip and descendant == main_branch:
+                return False
+            # classify_tip_relation: is_ancestor(old_tip, new_tip) → True (SUPERSET)
+            if ancestor == old_tip and descendant == new_tip:
+                return True
+            return False
+
+        async def _find_inflight_merge_worktree(branch: str):
+            return None
+
+        return types.SimpleNamespace(
+            resolve_branch_sha=_resolve_branch_sha,
+            is_ancestor=_is_ancestor,
+            find_inflight_merge_worktree=_find_inflight_merge_worktree,
+            project_root='/fake/project',
+        )
+
+    async def test_superset_tip_dispatches_not_coalesces(
+        self, tmp_path: Path,
+    ) -> None:
+        """SUPERSET re-submission against in-flight slot → dispatched (not coalesced).
+
+        Pre-seeds registry at OLD_TIP, submits branch B with snapshot_tip=NEW_TIP
+        where OLD_TIP is ancestor of NEW_TIP (SUPERSET).
+
+        RED until step-6: without classifier_git_ops wired the MCP path
+        always coalesces → returns 'attached' instead of 'queued'.
+        """
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InFlightMergeRegistry,
+            MergeOutcome,
+        )
+
+        OLD_TIP = 'aaaa0000deadbeef'
+        NEW_TIP = 'bbbb1111cafef00d'
+
+        mq: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        # Seed registry with in-flight slot at OLD_TIP (verifying=False)
+        old_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        ok = registry.acquire(
+            'B', 'task-old', old_fut,
+            request_id='mr-old', snapshot_tip=OLD_TIP,
+        )
+        assert ok, 'Registry slot for B must be free initially'
+        assert registry.is_inflight('B'), 'Slot must be in-flight after seed'
+
+        # Build git_ops stub: NEW_TIP is SUPERSET of OLD_TIP
+        git_ops = self._make_tip_recency_git_ops(new_tip=NEW_TIP, old_tip=OLD_TIP)
+
+        # Build server with the stub git_ops
+        server, mq, _reg, _, _ = _build_merge_server(
+            tmp_path,
+            registry=registry,
+            git_ops=git_ops,
+        )
+
+        # Submit merge_request for branch B (which will resolve tip=NEW_TIP)
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='task-new',
+                branch='B',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                wait_secs=0,
+            ),
+            timeout=5.0,
+        )
+
+        # RED: without classifier_git_ops wiring → 'attached' (wrong)
+        # GREEN: with classifier_git_ops wiring → 'queued' (SUPERSET dispatched)
+        assert result.get('status') != 'attached', (
+            f'SUPERSET new_tip must NOT coalesce; got status={result.get("status")!r}. '
+            f'Step-6 must wire classifier_git_ops to the coalesce call in server.py.'
+        )
+        assert result.get('status') == 'queued', (
+            f'Expected status=queued (dispatched independently); got: {result}'
+        )
+        assert mq.qsize() == 1, (
+            f'SUPERSET must enqueue 1 item; got qsize={mq.qsize()}'
+        )
+
+        # Clean up
+        old_fut.cancel()
