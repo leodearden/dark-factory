@@ -8607,6 +8607,85 @@ class TestCheckPostMergeEquivalence:
         )
         assert failed == []
 
+    async def test_merged_tip_prevents_false_positive_on_drifted_worktree(
+        self, git_ops: GitOps,
+    ):
+        """merged_tip=SNAP prevents a false-positive when the worktree HEAD drifts.
+
+        Scenario (mirrors the production regression in task 1917):
+        - A file is committed to a branch → SNAP (the branch tip at merge time).
+        - The merge is landed → ADVANCED.
+        - The worktree HEAD drifts to a DIVERGENT commit D that changes the
+          same file differently (simulating a lane hijacked by a new task).
+
+        Without merged_tip (legacy path): the gate compares DIVERGENT HEAD D
+        against ADVANCED → false-positive ['h.py'] even though the merge was
+        byte-perfect.
+
+        With merged_tip=SNAP: the gate compares the actual merged tip SNAP
+        against ADVANCED → clean [] (file content preserved).
+
+        RED until step-8 adds the merged_tip kwarg to _check_post_merge_equivalence.
+        """
+        wt = (await git_ops.create_worktree('drifted-worktree-equiv')).path
+        (wt / 'h.py').write_text('h = 1\n')
+        await git_ops.commit(wt, 'Add h.py')
+
+        # Capture SNAP = the branch tip that will be merged
+        rc, snap_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        snap = snap_out.strip()
+
+        pre_merge_main = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'drifted-worktree-equiv')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='drifted-worktree-equiv', max_attempts=1,
+            )
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
+                or merge_result.merge_commit
+            )
+            assert advanced is not None
+
+            # Rewrite the worktree HEAD to a DIVERGENT commit D (simulates drift)
+            (wt / 'h.py').write_text('DIVERGENT = 999\n')
+            rc, _, _ = await _run(['git', 'add', 'h.py'], cwd=wt)
+            assert rc == 0
+            rc, _, _ = await _run(
+                ['git', 'commit', '-m', 'Divergent: different h.py content'], cwd=wt,
+            )
+            assert rc == 0
+
+            # Legacy path (no merged_tip): reads worktree HEAD D → false-positive
+            # h.py diverges from ADVANCED. This is the bug: the merge was clean
+            # but the drifted HEAD makes the gate think work was dropped.
+            legacy_result = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, pre_merge_main, task_id='drifted-legacy',
+            )
+            assert legacy_result != [], (
+                'Legacy path (no merged_tip) must false-positive when worktree drifts; '
+                f'got [] — test setup may be wrong. advanced={advanced[:8]}, snap={snap[:8]}'
+            )
+
+            # New path (merged_tip=SNAP): compares the actual merged tip → clean []
+            # RED until step-8: this kwarg doesn't exist yet (TypeError)
+            clean_result = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, pre_merge_main,
+                task_id='drifted-merged-tip',
+                merged_tip=snap,
+            )
+            assert clean_result == [], (
+                f'merged_tip=SNAP path must return [] (clean); got {clean_result!r}. '
+                f'advanced={advanced[:8]}, snap={snap[:8]}'
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 async def test_speculative_merger_surfaces_worktree_missing_after_plan_touched_class(
