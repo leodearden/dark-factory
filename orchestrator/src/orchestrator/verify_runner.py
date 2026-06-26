@@ -40,6 +40,7 @@ import json
 import shlex
 import time
 import uuid
+from datetime import UTC, datetime
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -683,12 +684,21 @@ class RemoteRunner:
         self,
         merge_sha: str,
         spec: MergeVerifySpec,
+        *,
+        task_id: str | None = None,
+        archive_root: Path | None = None,
     ) -> VerifyResult:
         """Run the combined merge-verify bundle on the remote host.
 
         (a) git push <git_remote> <merge_sha>:refs/merge-verify/<request_id>
         (b) ssh <ssh_host> <shlex-quoted remote argv>
         (c) parse stdout via result_from_json
+
+        When the result has passed=False and both *task_id* and *archive_root*
+        are provided, the remote ssh stderr is archived best-effort to
+        ``<archive_root>/<task_id>/attempt-1.remote-<name>-<utc_ts>.stderr.log``
+        (task 1920).  Any archival error is swallowed so the VerifyResult is
+        always returned unchanged (PRD §A Invariant 5).
 
         Raises RunnerUnavailable on any transport failure (step-8).
         Returns a VerifyResult unchanged — even passed=False or timed_out=True
@@ -794,11 +804,18 @@ class RemoteRunner:
                 # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
                 # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
                 try:
-                    return result_from_json(ssh_stdout)
+                    result = result_from_json(ssh_stdout)
                 except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
                     raise RunnerUnavailable(
                         f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
                     ) from exc
+
+                # task-1920: archive remote stderr on failure for operator triage.
+                # Best-effort: any error is swallowed so the VerifyResult is unchanged.
+                if not result.passed and archive_root is not None and task_id is not None:
+                    self._archive_failure_stderr(archive_root, task_id, ssh_stderr)
+
+                return result
 
             finally:
                 # Best-effort ref cleanup — never alters returned result nor masks exceptions
@@ -811,6 +828,28 @@ class RemoteRunner:
         finally:
             # Always clear the in-flight tracker so cancel_verify is idempotent after return
             self._inflight_request_id = None
+
+    def _archive_failure_stderr(
+        self,
+        archive_root: Path,
+        task_id: str,
+        stderr_text: str,
+    ) -> None:
+        """Write *stderr_text* to a timestamped .stderr.log file under archive_root/task_id/.
+
+        Filename: attempt-1.remote-<safe_name>-<utc_ts>.stderr.log
+        Co-located with local merge-verify archives for side-by-side operator triage (task 1920,
+        sibling of 1768).  Convention mirrors _archive_merge_verify_logs (verify.py:779-856).
+
+        NOTE: best-effort error handling (try/except) is added in step-6.
+        """
+        target_dir = Path(archive_root) / task_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
+        safe = self.name.replace('/', '_').replace(' ', '_')
+        (target_dir / f'attempt-1.remote-{safe}-{utc_ts}.stderr.log').write_text(
+            stderr_text, encoding='utf-8',
+        )
 
     async def cancel_verify(self) -> int:
         """Cancel the in-flight verify-merge on the remote host.
