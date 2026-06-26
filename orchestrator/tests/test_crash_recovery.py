@@ -641,19 +641,24 @@ class TestRecoverCrashedTasksWarmLane:
         assert '42' in harness._recovered_plans
         assert '55' in harness._recovered_plans
 
-    async def test_warm_lane_terminal_task_released(self, harness: Harness):
-        """T10 amplifier: task already terminal (done) → lane released, not restored.
+    @pytest.mark.parametrize('term_status', ['done', 'cancelled'])
+    async def test_warm_lane_terminal_task_released(
+        self, harness: Harness, term_status: str
+    ):
+        """T10 amplifier: task already terminal → lane released, not restored.
 
-        task 1881 regression lock: when get_status returns 'done', recovery must
-        call cleanup_worktree instead of restore_assignment, preventing a dead lane
-        from consuming a pool slot on every harness restart.
+        task 1881 regression lock: when get_status returns a terminal status
+        ('done' or 'cancelled'), recovery must call cleanup_worktree instead of
+        restore_assignment, preventing a dead lane from consuming a pool slot on
+        every harness restart.  Both arms of the predicate are exercised via
+        parametrize so a regression narrowing the check to only one value is caught.
         """
         pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
         lane_path = _setup_lane(base, '_lane-0', plan)
-        # Per-test override: drive the terminal (release) branch
-        harness.scheduler.get_status = AsyncMock(return_value='done')
+        # Per-test override: drive the terminal (release) branch for each status
+        harness.scheduler.get_status = AsyncMock(return_value=term_status)
 
         await harness._recover_crashed_tasks()
 
@@ -665,6 +670,8 @@ class TestRecoverCrashedTasksWarmLane:
         assert '42' not in harness._recovered_plans
         # Pool assignment NOT created (release path skips restore_assignment)
         assert pool.assignment_for('42') is None
+        # Lane state must remain FREE — restore_assignment was bypassed
+        assert pool.state(lane_path) == LaneState.FREE
 
 
 # ===========================================================================
