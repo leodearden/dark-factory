@@ -921,40 +921,48 @@ class RemoteRunner:
 
         Early-returns when all three streams are empty (no orphan summary.json emitted).
 
-        Best-effort: exceptions are NOT swallowed here; the caller (run_merge_verify)
-        is responsible for the outer guard (step-4 adds the try/except wrapper).
+        Best-effort: any exception is swallowed with a WARNING so the caller's
+        VerifyResult is always returned unchanged (PRD §A Invariant 5).
+        _archive_merge_verify_logs already swallows OSError internally; this outer
+        guard additionally swallows non-OSError failures as a backstop (task 1921 step-4).
         """
-        # Build synthetic run dicts for each non-empty stream.
-        runs = []
-        for label, output in (
-            ('test', result.test_output),
-            ('lint', result.lint_output),
-            ('type', result.type_output),
-        ):
-            if output:
-                runs.append({
-                    'label': label,
-                    'cmd': f'<remote {label}>',
-                    'rc': 1,
-                    'output': output,
-                    'timed_out': result.timed_out,
-                    'started_at': '',
-                    'duration_secs': 0.0,
-                })
+        import logging as _logging
+        try:
+            # Build synthetic run dicts for each non-empty stream.
+            runs = []
+            for label, output in (
+                ('test', result.test_output),
+                ('lint', result.lint_output),
+                ('type', result.type_output),
+            ):
+                if output:
+                    runs.append({
+                        'label': label,
+                        'cmd': f'<remote {label}>',
+                        'rc': 1,
+                        'output': output,
+                        'timed_out': result.timed_out,
+                        'started_at': '',
+                        'duration_secs': 0.0,
+                    })
 
-        # Early-return: no non-empty streams → nothing to archive.
-        if not runs:
-            return
+            # Early-return: no non-empty streams → nothing to archive.
+            if not runs:
+                return
 
-        _archive_merge_verify_logs(
-            runs,
-            Path(archive_root),
-            task_id,
-            1,  # attempt_id pinned to 1, matching the local merge path default
-            result.category,
-            result.cause_hint,
-            module_prefix=f'remote-{self.name}',
-        )
+            _archive_merge_verify_logs(
+                runs,
+                Path(archive_root),
+                task_id,
+                1,  # attempt_id pinned to 1, matching the local merge path default
+                result.category,
+                result.cause_hint,
+                module_prefix=f'remote-{self.name}',
+            )
+        except Exception as exc:
+            _logging.getLogger(__name__).warning(
+                'RemoteRunner %r: best-effort stream archival failed: %s', self.name, exc,
+            )
 
     async def cancel_verify(self) -> int:
         """Cancel the in-flight verify-merge on the remote host.
