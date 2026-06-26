@@ -2297,6 +2297,21 @@ async def run_verification(
         _scope_kw = (
             {'use_cgroup_scope': True} if config.verify_use_cgroup_scope else {}
         )
+        # Pass clock_stop only when enabled (mirrors _scope_kw pattern) so the
+        # default-off call signature stays byte-identical for existing test doubles.
+        _clock_kw = (
+            {
+                'clock_stop': ClockStopConfig(
+                    marker_stop=config.verify_clock_stop_marker_stop,
+                    marker_heartbeat=config.verify_clock_stop_marker_heartbeat,
+                    marker_start=config.verify_clock_stop_marker_start,
+                    heartbeat_idle_max=config.verify_clock_stop_heartbeat_idle_max,
+                    max_total_secs=config.verify_clock_stop_max_total_secs,
+                ),
+            }
+            if config.verify_clock_stop_enabled
+            else {}
+        )
         rc, out, timed_out_flag = await _run_cmd(
             cmd,
             worktree,
@@ -2304,6 +2319,7 @@ async def run_verification(
             env=verify_env or None,
             log_path=_stream_log_path(label, current_attempt),
             **_scope_kw,
+            **_clock_kw,
         )
         return rc, out, timed_out_flag, started_at, time.monotonic() - t0
 
