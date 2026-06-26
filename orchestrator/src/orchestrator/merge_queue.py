@@ -5446,8 +5446,10 @@ class MergeMetrics:
 # PROVISIONAL thresholds — PRD §11: calibrate from ι's landings_total metric.
 # These are module-level defaults that the constructor can override (tests
 # inject small values).  A follow-up task will calibrate from production data.
-_NO_LANDINGS_WINDOW_SAMPLES: int = 10  # ≈ 10 min at 60 s interval
-_NO_LANDINGS_DISK_MARGIN_BYTES: int = 512 * 1024 * 1024  # 512 MiB
+_NO_LANDINGS_WINDOW_SAMPLES: int = 30  # 30 samples × 60 s = 30 min > worst-case ~25 min
+# serialized reify verify, so a healthy slow pipeline registers ≥1 landing in
+# the window; only a true 0-landing spiral (with falling disk) trips.
+_NO_LANDINGS_DISK_FREE_FLOOR_BYTES: int = 50 * 1024 * 1024 * 1024  # 50 GiB absolute floor
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5498,18 +5500,22 @@ class NoLandingsCircuitBreaker:
 
     **Resume conditions (OR)**:
     * a clean landing: ``landings_total`` increased above the value at trip time
-    * disk recovered: ``free_bytes >= free_at_trip + disk_margin_bytes``
+    * disk recovered: ``free_bytes >= disk_free_floor_bytes`` (absolute floor,
+      independent of the trip-level free_bytes)
 
     **Anti-flap**:
-    * disk-side margin hysteresis (small rise below margin does not resume)
     * sample buffer is CLEARED on every resume — a fresh full window of
       flat+falling samples is required before the next trip can fire
 
     Args
     ----
-    window_samples    : Number of consecutive samples needed to trip.
-    disk_margin_bytes : Disk must recover at least this many bytes above the
-                        trip-point free_bytes to resume on disk signal.
+    window_samples       : Number of consecutive samples needed to trip.
+    disk_free_floor_bytes: Absolute disk-free floor in bytes.  Dispatch
+                           auto-resumes once ``free_bytes`` rises back above
+                           this floor, regardless of the free-bytes level at
+                           which the trip occurred.  Defaults to 50 GiB,
+                           aligned with ``warm_lane_min_free_gib`` (50 GiB)
+                           admission threshold.
 
     Notes
     -----
@@ -5523,10 +5529,10 @@ class NoLandingsCircuitBreaker:
     def __init__(
         self,
         window_samples: int = _NO_LANDINGS_WINDOW_SAMPLES,
-        disk_margin_bytes: int = _NO_LANDINGS_DISK_MARGIN_BYTES,
+        disk_free_floor_bytes: int = _NO_LANDINGS_DISK_FREE_FLOOR_BYTES,
     ) -> None:
         self._window_samples = window_samples
-        self._disk_margin_bytes = disk_margin_bytes
+        self._disk_free_floor_bytes = disk_free_floor_bytes
         # Rolling buffer of (landings_total, free_bytes) tuples, bounded to
         # window_samples entries (oldest drops automatically via maxlen).
         self._samples: collections.deque[tuple[int, int]] = collections.deque(
@@ -5639,24 +5645,19 @@ class NoLandingsCircuitBreaker:
 
         Resume when EITHER (OR semantics, PRD §5.5):
           * clean landing: landings_total > landings-at-trip
-          * disk recovery: free_bytes >= free_at_trip + disk_margin_bytes
+          * disk recovered: free_bytes >= disk_free_floor_bytes  (absolute floor)
 
-        The disk margin is the disk-side hysteresis: a small rise below the
-        margin threshold does NOT resume — keeps the breaker from oscillating on
-        noise just above the trip level.  On resume, _tripped is cleared so
-        ``observe()`` re-enters the trip-detection path.  Buffer clearing
-        (anti-flap full-window rebuild) is done in step-08.
+        The absolute floor is independent of the trip-level free_bytes — it
+        resumes once disk is back above the configured floor regardless of where
+        the trip occurred.  Anti-flap is provided by the buffer-clear-on-resume:
+        a fresh full window of flat+falling samples is required before the next
+        trip can fire.
 
-        **Plateau risk:** if disk free-bytes stabilise just below
-        ``free_at_trip + disk_margin_bytes`` (never recovering by the full
-        margin) AND no new landings occur, neither resume condition can fire.
-        The breaker remains tripped indefinitely.  The harness escalation detail
-        documents this and instructs operators to call ``force_resume_scheduler``
-        if the halt persists.  The harness also detects external resumes and
-        re-arms the breaker automatically (see ``Harness._run_no_landings_breaker_pass``).
+        On resume, _tripped is cleared so ``observe()`` re-enters the
+        trip-detection path.
         """
         clean_landing = landings_total > self._landings_at_trip
-        disk_recovered = free_bytes >= self._free_at_trip + self._disk_margin_bytes
+        disk_recovered = free_bytes >= self._disk_free_floor_bytes
 
         if not (clean_landing or disk_recovered):
             return None  # neither condition met — stay tripped
@@ -5667,7 +5668,7 @@ class NoLandingsCircuitBreaker:
         # in the deque, reducing the effective window for the next trip
         # evaluation.  (PRD §5.5 "hysteresis to prevent flap".)
         self._tripped = False
-        self._samples.clear()  # step-08: buffer clear on resume
+        self._samples.clear()
         reason = (
             'No-landings circuit-breaker cleared: '
             + (
@@ -5675,7 +5676,7 @@ class NoLandingsCircuitBreaker:
                 if clean_landing
                 else (
                     f'disk recovered ({free_bytes:,} >= '
-                    f'{self._free_at_trip:,} + {self._disk_margin_bytes:,} margin)'
+                    f'absolute floor {self._disk_free_floor_bytes:,})'
                 )
             )
         )

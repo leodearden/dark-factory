@@ -57,9 +57,9 @@ def _stub_merge_worker(harness: Harness, landings_total: int) -> MagicMock:
     return worker
 
 
-def _small_breaker(window: int = 3, margin: int = 1000) -> NoLandingsCircuitBreaker:
+def _small_breaker(window: int = 3, floor: int = 1000) -> NoLandingsCircuitBreaker:
     """Return a breaker with a small window for test speed."""
-    return NoLandingsCircuitBreaker(window_samples=window, disk_margin_bytes=margin)
+    return NoLandingsCircuitBreaker(window_samples=window, disk_free_floor_bytes=floor)
 
 
 def _make_falling_disk_iter(
@@ -89,7 +89,7 @@ class TestHarnessNoLandingsFire:
         """After window passes with flat landings + falling disk, scheduler is paused."""
         harness, _rs = _make_harness(tmp_path)
         # Override the breaker with a small-window instance
-        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
         _stub_merge_worker(harness, landings_total=5)  # landings stay flat
 
         disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
@@ -107,7 +107,7 @@ class TestHarnessNoLandingsFire:
     async def test_fire_files_info_escalation(self, tmp_path: Path) -> None:
         """After trip, exactly one INFO escalation with correct attributes is filed."""
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
         _stub_merge_worker(harness, landings_total=5)
 
         disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
@@ -137,7 +137,7 @@ class TestHarnessNoLandingsFire:
     async def test_fire_escalation_mentions_window_and_disk(self, tmp_path: Path) -> None:
         """Escalation summary and detail describe window, landings, and disk trend."""
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
         _stub_merge_worker(harness, landings_total=5)
 
         disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
@@ -165,9 +165,14 @@ class TestHarnessNoLandingsFire:
     async def test_fire_dedup_one_escalation_across_multiple_trips(
         self, tmp_path: Path
     ) -> None:
-        """Multiple passes after trip do not stack duplicate escalations."""
+        """Multiple passes after trip do not stack duplicate escalations.
+
+        Use a high floor (500_000) so the falling disk values (200k..150k)
+        never trigger disk-recovery resume — only a clean landing would resume,
+        which never happens here (landings_total stays flat at 5).
+        """
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=500_000)
         _stub_merge_worker(harness, landings_total=5)
 
         disk_iter = _make_falling_disk_iter(start=200_000, drop=10_000)
@@ -194,7 +199,7 @@ class TestHarnessNoLandingsFire:
     async def test_bare_harness_no_worker_is_graceful_noop(self, tmp_path: Path) -> None:
         """Harness without _merge_worker makes the pass a graceful no-op."""
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
         # No _merge_worker attached (harness._merge_worker is None by default)
         assert harness._merge_worker is None
         # Must not raise
@@ -206,7 +211,7 @@ class TestHarnessNoLandingsFire:
     async def test_disk_stat_oserror_is_fail_open(self, tmp_path: Path) -> None:
         """OSError from shutil.disk_usage must never halt dispatch (fail-open)."""
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
         _stub_merge_worker(harness, landings_total=5)
 
         with patch('shutil.disk_usage', side_effect=OSError('disk stat failed')):
@@ -244,7 +249,7 @@ class TestHarnessNoLandingsResume:
     async def test_clean_landing_resumes_scheduler(self, tmp_path: Path) -> None:
         """A pass where landings_total increased unpauses the scheduler."""
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
         await self._drive_to_trip(harness)
         assert harness.scheduler.is_paused, 'precondition: scheduler must be paused'
 
@@ -262,7 +267,7 @@ class TestHarnessNoLandingsResume:
     async def test_resume_resolves_info_escalation(self, tmp_path: Path) -> None:
         """After resume, the open breaker INFO escalation is resolved (no pending)."""
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, margin=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
         await self._drive_to_trip(harness)
 
         # Confirm escalation was filed
@@ -297,23 +302,23 @@ class TestHarnessNoLandingsResume:
 
     @pytest.mark.asyncio
     async def test_disk_recovery_resumes(self, tmp_path: Path) -> None:
-        """Disk recovered above trip+margin also unpauses the scheduler."""
-        margin = 10_000
+        """Disk recovered above absolute floor also unpauses the scheduler."""
+        floor = 150_000  # floor well below free_at_trip=180_000
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, margin=margin)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=floor)
         await self._drive_to_trip(harness)
         assert harness.scheduler.is_paused
 
-        # Drive the breaker's _free_at_trip: after filling window=3 with
-        # drop=10000 starting at 200000, _free_at_trip = 200000 - 2*10000 = 180000
-        # Recovery: free_bytes >= 180000 + 10000 = 190000
+        # After filling window=3 with drop=10000 starting at 200000,
+        # _free_at_trip = 180_000.  With absolute-floor semantics, any free_bytes
+        # >= floor (150_000) resumes — including values below free_at_trip.
         _stub_merge_worker(harness, landings_total=5)  # same landings — disk path
         with patch('shutil.disk_usage') as mock_du:
-            mock_du.return_value = MagicMock(free=190_000)
+            mock_du.return_value = MagicMock(free=160_000)  # 160k >= 150k floor
             await harness._run_no_landings_breaker_pass()
 
         assert not harness.scheduler.is_paused, (
-            'scheduler should be unpaused after disk recovery above margin'
+            'scheduler should be unpaused after disk recovery above absolute floor'
         )
 
 
