@@ -3270,11 +3270,31 @@ class GitOps:
 
         Never touches ``project_root``'s working tree or index.
         Called by the MergeWorker (serialized via the merge queue).
+
+        **Absent-ref fallback**: when ``resolve_queued_branch_ref(branch)``
+        returns None (the named ``task/<id>`` ref was deleted while the work
+        still sat in the worktree), the merge SOURCE is derived from the
+        worktree HEAD via ``git rev-parse HEAD``.  The merge-commit subject
+        remains the canonical ``Merge task/<id> into main`` form so that
+        ``find_merge_marker`` keeps already_merged idempotency on re-dispatch.
+        If the worktree HEAD cannot be resolved (rc≠0), the prior ``full_branch``
+        fallback is preserved so a genuine misroute still fails loudly.
         """
-        full_branch = (
-            await self.resolve_queued_branch_ref(branch)
-            or f'{self.config.branch_prefix}{branch}'
-        )
+        resolved = await self.resolve_queued_branch_ref(branch)
+        full_branch = resolved or f'{self.config.branch_prefix}{branch}'
+
+        # Derive the merge source: prefer the named ref; when absent, fall back
+        # to the worktree HEAD SHA so commits present in the worktree can still
+        # land on main without the named branch ref.
+        merge_source: str
+        if resolved is not None:
+            merge_source = resolved
+        else:
+            rc_head, head_sha, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+            )
+            merge_source = head_sha.strip() if rc_head == 0 else full_branch
+
         merge_wt: Path | None = None
 
         try:
@@ -3288,9 +3308,13 @@ class GitOps:
             if task_dir.exists():
                 shutil.rmtree(task_dir)
 
-            # Merge with no-ff
+            # Merge with no-ff.
+            # merge_source is the named branch ref when present, or the worktree
+            # HEAD SHA as an absent-ref fallback.  full_branch is always the
+            # canonical prefixed name for _merge_subject so the commit message
+            # stays 'Merge task/<id> into main' for find_merge_marker.
             rc, out, err = await _run(
-                ['git', 'merge', '--no-ff', full_branch,
+                ['git', 'merge', '--no-ff', merge_source,
                  '-m', _merge_subject(full_branch, self.config.main_branch)],
                 cwd=merge_wt,
             )
