@@ -4464,3 +4464,36 @@ class TestRemoteRunnerStreamArchival:
         remote_stream_logs += list(tmp_path.rglob('attempt-1.remote-*.lint-*.log'))
         remote_stream_logs += list(tmp_path.rglob('attempt-1.remote-*.type-*.log'))
         assert remote_stream_logs == [], f'Unexpected remote stream logs: {remote_stream_logs}'
+
+    # step-3: non-OSError archival exception is swallowed; result unchanged
+    async def test_stream_archival_exception_is_swallowed_result_unchanged(self, tmp_path, monkeypatch):
+        """Non-OSError in _archive_failure_streams → swallowed; VerifyResult returned unchanged.
+
+        Monkeypatches orchestrator.verify_runner._archive_merge_verify_logs to raise
+        RuntimeError('boom') — a non-OSError that _archive_merge_verify_logs's internal
+        OSError handler does not catch.  Verifies that run_merge_verify:
+          (1) does NOT raise;
+          (2) returns the VerifyResult unchanged.
+
+        This is RED before step-4 because step-2's _archive_failure_streams has no outer
+        exception guard, so the RuntimeError propagates out of run_merge_verify.
+        """
+        import orchestrator.verify_runner as _vrmod
+
+        def boom(*args, **kwargs):
+            raise RuntimeError('boom')
+
+        monkeypatch.setattr(_vrmod, '_archive_merge_verify_logs', boom)
+
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        # Must NOT raise; must return fail_result unchanged
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1921', archive_root=tmp_path,
+        )
+
+        assert result == fail_result
