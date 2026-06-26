@@ -28,10 +28,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.config import GitConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import (
     GitOps,
     WarmLaneDiskPressure,
@@ -39,7 +40,11 @@ from orchestrator.git_ops import (
     WorktreeInfo,
     _run,
 )
+from orchestrator.harness import Harness, TaskReport
+from orchestrator.merge_queue import _classify_branch_presence
+from orchestrator.scheduler import TaskAssignment
 from orchestrator.warm_lane_pool import LaneState
+from orchestrator.workflow import WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Repo fixture
@@ -227,6 +232,81 @@ async def _get_head(repo: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
     assert rc == 0, f'git rev-parse HEAD failed (rc={rc})'
     return out.strip()
+
+
+# ---------------------------------------------------------------------------
+# ω-gate scaffolding: harness helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_harness(config: OrchestratorConfig) -> Harness:
+    """Construct a Harness with heavy constructors patched out.
+
+    Mirrors _build_harness from test_harness_warm_lane_wiring.py.
+    """
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.Scheduler'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        return Harness(config)
+
+
+def _make_orch_config(
+    repo: Path,
+    *,
+    max_concurrent_tasks: int = 1,
+) -> OrchestratorConfig:
+    """Build a minimal OrchestratorConfig for ω-gate tests.
+
+    Sets warm_lane_pool=True; disk guard stays default False so the seam
+    tests don't need to stub disk-guard exit codes.
+    """
+    return OrchestratorConfig(
+        project_root=repo,
+        max_concurrent_tasks=max_concurrent_tasks,
+        git=GitConfig(warm_lane_pool=True),
+    )
+
+
+async def _run_synthetic_hard_cancel_slot(
+    harness: Harness,
+    task_id: str,
+) -> TaskReport | None:
+    """Drive harness._run_slot with TaskWorkflow.run raising asyncio.CancelledError.
+
+    Simulates the T5 hard-cancel scenario (e.g. soft-cancel poll limit exceeded).
+    Returns the synthetic CANCELLED report that the harness except-clause builds.
+
+    The caller must have an ASSIGNED lane for *task_id* before calling this helper
+    (e.g. via git_ops.create_worktree(task_id), as all current callers do, or
+    pool.acquire_for(task_id)); the β guard being tested requires the lane to be
+    ASSIGNED at _run_slot entry.
+
+    Mirrors the setup in
+    TestHardCancelLaneRelease.test_synthetic_hard_cancel_retains_branch_and_lane.
+    """
+    harness.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    harness.scheduler.is_deterministic = MagicMock(return_value=False)
+
+    with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        mock_wf = MagicMock()
+        mock_wf.run = AsyncMock(side_effect=asyncio.CancelledError())
+        MockWorkflow.return_value = mock_wf
+
+        assignment = TaskAssignment(
+            task_id=task_id,
+            task={
+                'id': task_id,
+                'title': f'ω-gate synthetic-cancel task {task_id}',
+                'status': 'pending',
+                'metadata': {},
+                'dependencies': [],
+            },
+            modules=[],
+        )
+        sem = asyncio.Semaphore(1)
+        return await harness._run_slot(assignment, sem)
 
 
 # ===========================================================================
@@ -827,3 +907,444 @@ class TestTerminalLaneRelease:
         assert isinstance(info_b, WorktreeInfo), (
             f'After terminal release, create_worktree must succeed, got {info_b!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# ω-gate phase assertion helpers (shared between seam tests and combined gate)
+# ---------------------------------------------------------------------------
+
+
+async def _assert_beta_phase(
+    report: TaskReport | None,
+    pool: Any,
+    lane: Path,
+    task_id: str,
+    repo_path: Path,
+) -> None:
+    """Assert β observable: hard-cancel leaves lane ASSIGNED and branch alive."""
+    assert report is not None
+    assert report.outcome == WorkflowOutcome.CANCELLED, (
+        f'synthetic hard-cancel must produce CANCELLED outcome, got {report.outcome!r}'
+    )
+    assert report.synthetic_cancel is True, (
+        'TaskReport.synthetic_cancel must be True on hard-cancel '
+        '(set in harness._run_slot CancelledError handler)'
+    )
+    assert pool.assignment_for(task_id) is not None, (
+        'lane assignment must survive hard-cancel (B2 β-guard skipped release)'
+    )
+    assert pool.state(lane) == LaneState.ASSIGNED, (
+        f'lane must stay ASSIGNED after synthetic hard-cancel, got {pool.state(lane)!r}; '
+        'β-revert → B2 fires release_lane_for_terminal_task → lane flips FREE'
+    )
+    rc_ref, _, _ = await _run(
+        ['git', 'rev-parse', '--verify', f'refs/heads/task/{task_id}'],
+        cwd=repo_path,
+    )
+    assert rc_ref == 0, (
+        f'task/{task_id} branch must survive hard-cancel (β skips B2 branch delete)'
+    )
+
+
+async def _assert_alpha_phase(
+    git_ops: GitOps,
+    pool: Any,
+    lane: Path,
+    task_id: str,
+    repo_path: Path,
+) -> None:
+    """Assert α observable: release_lane_for_terminal_task retains branch with commits beyond main."""
+    freed = await git_ops.release_lane_for_terminal_task(task_id)
+    assert freed is True, (
+        'release_lane_for_terminal_task must return True on successful reclaim'
+    )
+    rc_ref, _, _ = await _run(
+        ['git', 'rev-parse', '--verify', f'refs/heads/task/{task_id}'],
+        cwd=repo_path,
+    )
+    assert rc_ref == 0, (
+        f'task/{task_id} branch must survive release_lane_for_terminal_task '
+        f'when it has commits beyond main (_delete_branch_if_on_main guard, α); '
+        f'α-revert → unconditional git branch -D → ref deleted → FAIL'
+    )
+    assert pool.state(lane) == LaneState.FREE, (
+        f'lane must be FREE after release_lane_for_terminal_task, '
+        f'got {pool.state(lane)!r} (cache leak if still ASSIGNED)'
+    )
+
+
+async def _assert_gamma_phase(
+    git_ops: GitOps,
+    task_id: str,
+    n_before: int,
+    wip_file: str,
+    wip_content: str,
+    repo_path: Path,
+) -> WorktreeInfo:
+    """Assert γ observable: re-dispatch reattaches with commits preserved. Returns WorktreeInfo."""
+    info2 = await git_ops.create_worktree(task_id)
+    assert isinstance(info2, WorktreeInfo), (
+        f'γ: re-dispatch must return WorktreeInfo (reattach path), got {info2!r}; '
+        f'γ-revert create-once → worktree add -b collides → RuntimeError'
+    )
+    rc_br, branch_out, _ = await _run(
+        ['git', '-C', str(info2.path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+        cwd=repo_path,
+    )
+    assert rc_br == 0
+    assert branch_out.strip() == f'task/{task_id}', (
+        f'γ: lane HEAD must be on task/{task_id} after reattach, '
+        f'got {branch_out.strip()!r}; γ-revert → HEAD detached/at-main → FAIL'
+    )
+    rc2, count_after, _ = await _run(
+        ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+        cwd=repo_path,
+    )
+    assert rc2 == 0
+    n_after = int(count_after.strip())
+    assert n_after == n_before, (
+        f'γ: commits must be preserved across reattach+rebase '
+        f'(before={n_before}, after={n_after}); '
+        f'γ-revert reset-in-place → checkout -f -B resets to main → count 0 → FAIL'
+    )
+    rc3, show_out, _ = await _run(
+        ['git', 'show', f'task/{task_id}:{wip_file}'],
+        cwd=repo_path,
+    )
+    assert rc3 == 0 and wip_content.strip() in show_out, (
+        f'γ: WIP content must be reachable from task/{task_id} after reattach; '
+        f'rc={rc3!r}, out={show_out!r}'
+    )
+    return info2
+
+
+async def _assert_merge_phase(
+    git_ops: GitOps,
+    lane: Path,
+    task_id: str,
+    wip_file: str,
+    wip_content: str,
+    repo_path: Path,
+) -> None:
+    """Assert merge seam: _classify_branch_presence returns None AND merge completes."""
+    branch_presence = await _classify_branch_presence(
+        git_ops, None, task_id, task_id, None,
+    )
+    assert branch_presence is None, (
+        f'_classify_branch_presence must return None (branch present, not unknown); '
+        f'got {branch_presence!r}; α/β-revert → ref deleted → unknown_branch → FAIL'
+    )
+    resolved = await git_ops.resolve_queued_branch_ref(task_id)
+    assert resolved is not None, (
+        f'resolve_queued_branch_ref({task_id!r}) must return a ref, got None'
+    )
+    result = await git_ops.merge_to_main(lane, task_id)
+    assert result.success, (
+        f'merge_to_main must succeed; details={getattr(result, "details", None)!r}'
+    )
+    assert result.merge_commit is not None, (
+        'merge_to_main must return a merge_commit SHA'
+    )
+    assert result.merge_worktree is not None
+    advance = await git_ops.advance_main(result.merge_commit)
+    assert advance == 'advanced', (
+        f'advance_main must return "advanced", got {advance!r}'
+    )
+    rc_show, show_out, _ = await _run(
+        ['git', 'show', f'main:{wip_file}'],
+        cwd=repo_path,
+    )
+    assert rc_show == 0 and wip_content.strip() in show_out, (
+        f'WIP must land on main after advance_main; rc={rc_show!r}, out={show_out!r}'
+    )
+    await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+
+# ===========================================================================
+# ω-gate: Step-1 (RED β seam) + Step-3 (RED α seam) + Step-5 (RED γ seam) +
+#          Step-7 (RED merge seam) + Step-9 (RED combined gate)
+#
+# One class — TestOmegaIntegrationGate — hosts all ω seam tests plus the
+# combined ω gate.  Each seam gets a distinct observable so the gate FAILS
+# if ANY of α/β/γ is reverted.  The combined gate is the G2 deliverable.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestOmegaIntegrationGate:
+    """ω (task 1915) integration gate: restart mid-pre-merge-rebase → branch
+    survives release+restart → merge completes (no unknown_branch), composing α/β/γ.
+
+    Negative-control design:
+      β observable: lane stays ASSIGNED after synthetic hard-cancel (B2 skipped)
+      α observable: branch retained after real reclaim release (commits > main)
+      γ observable: commits preserved on re-dispatch reattach (count == n_before)
+      merge: _classify_branch_presence is None AND merge_to_main succeeds
+    """
+
+    # -----------------------------------------------------------------------
+    # Step-1: RED β seam
+    # -----------------------------------------------------------------------
+
+    async def test_beta_synthetic_cancel_lane_stays_assigned(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """β seam: hard-cancel leaves lane ASSIGNED and branch alive.
+
+        Phase 0: create_worktree(id) → lane on task/<id>; commit unmerged WIP.
+        Phase 1 (β): synthetic hard-cancel via harness._run_slot.
+        ASSERT:
+          - report.outcome == CANCELLED and report.synthetic_cancel is True
+          - pool.assignment_for(id) is not None AND pool.state(lane) == ASSIGNED
+          - git rev-parse --verify refs/heads/task/<id> rc == 0
+
+        Negative control for β: with β reverted, B2 fires release_lane_for_terminal_task
+        → lane flips FREE → the ASSIGNED assertion fails.
+        """
+        task_id = 'omega-beta-1'
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        pool = harness.git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Phase 0: acquire lane + commit unmerged WIP
+        info = await harness.git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo), (
+            f'Phase 0: create_worktree must return WorktreeInfo, got {info!r}'
+        )
+        lane = info.path
+        (lane / 'wip_beta.txt').write_text('beta wip content\n')
+        await harness.git_ops.commit(lane, 'wip: beta seam unmerged work')
+
+        # Verify WIP is beyond main
+        rc, count, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc == 0 and int(count.strip()) > 0, (
+            f'setup: task/{task_id} must have commits beyond main, got count={count!r}'
+        )
+
+        # Phase 1 (β): synthetic hard-cancel via harness._run_slot
+        report = await _run_synthetic_hard_cancel_slot(harness, task_id)
+        await _assert_beta_phase(report, pool, lane, task_id, ig_git_repo)
+
+    # -----------------------------------------------------------------------
+    # Step-3: RED α seam
+    # -----------------------------------------------------------------------
+
+    async def test_alpha_reclaim_release_retains_branch(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """α seam: branch with commits beyond main survives the real reclaim release.
+
+        Drives release_lane_for_terminal_task (the α-path reclaim β defers to) on
+        a lane whose task/<id> branch has an unmerged commit.  Asserts:
+          - release_lane_for_terminal_task returns True (reclaim succeeded)
+          - git rev-parse --verify refs/heads/task/<id> rc == 0 (branch RETAINED)
+          - pool.state(lane) == FREE (cache reclaimed, no leak)
+
+        Negative control for α: with α reverted, release_warm_lane runs an
+        unconditional git branch -D task/<id> → ref deleted → rev-parse FAILS.
+        """
+        task_id = 'omega-alpha-1'
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        git_ops = harness.git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Acquire lane + commit unmerged WIP (1 commit beyond main)
+        info = await git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo)
+        lane = info.path
+        (lane / 'wip_alpha.txt').write_text('alpha wip content\n')
+        await git_ops.commit(lane, 'wip: alpha seam unmerged work')
+
+        rc, count, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc == 0 and int(count.strip()) == 1, (
+            f'setup: must have exactly 1 commit beyond main, got {count!r}'
+        )
+
+        # α assertion: reclaim releases lane to FREE while retaining branch with commits beyond main
+        await _assert_alpha_phase(git_ops, pool, lane, task_id, ig_git_repo)
+
+    # -----------------------------------------------------------------------
+    # Step-5: RED γ seam
+    # -----------------------------------------------------------------------
+
+    async def test_gamma_reattach_preserves_commits(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """γ seam: re-dispatch acquire reattaches with commits preserved.
+
+        Continues from α-released state (lane FREE + registered, task/<id>
+        orphaned with 1 commit beyond main).  Re-dispatch must REATTACH the
+        existing task/<id> branch, preserving all commits.
+
+        ASSERT (reattach, not reset/collide):
+          - isinstance(info, WorktreeInfo) — no collision/fault
+          - lane HEAD on task/<id> (re-attached, not detached/reset-to-main)
+          - rev-list count == n_before (commits preserved across reattach+rebase)
+          - WIP content reachable from task/<id>
+
+        Negative control for γ:
+          - reset-in-place revert → checkout -f -B resets to main → count 0 → FAIL
+          - create-once revert → worktree add -b collides → RuntimeError → not WorktreeInfo → FAIL
+        """
+        task_id = 'omega-gamma-1'
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        git_ops = harness.git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Acquire lane + commit WIP (1 commit beyond main)
+        info = await git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo)
+        lane = info.path
+        wip_file = f'wip_gamma_{task_id}.txt'
+        wip_content = 'gamma wip reattach content\n'
+        (lane / wip_file).write_text(wip_content)
+        await git_ops.commit(lane, f'wip: gamma seam unmerged work for {task_id}')
+
+        # Capture baseline count
+        rc, count_str, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc == 0
+        n_before = int(count_str.strip())
+        assert n_before > 0, (
+            f'setup: task/{task_id} must have commits beyond main, got {n_before}'
+        )
+
+        # α-release: reclaim cache, branch orphaned (prerequisite for γ reattach)
+        await _assert_alpha_phase(git_ops, pool, lane, task_id, ig_git_repo)
+
+        # γ: re-dispatch acquire — must REATTACH with commits preserved
+        await _assert_gamma_phase(git_ops, task_id, n_before, wip_file, wip_content, ig_git_repo)
+
+    # -----------------------------------------------------------------------
+    # Step-7: RED merge seam
+    # -----------------------------------------------------------------------
+
+    async def test_merge_seam_no_unknown_branch_and_merge_completes(
+        self, ig_git_repo: Path,
+    ) -> None:
+        """merge seam: _classify_branch_presence returns None AND merge completes.
+
+        Standalone merge check on a freshly-acquired lane with WIP committed.
+
+        ASSERT (NO unknown_branch — _classify_branch_presence returns None for a present branch):
+          - await _classify_branch_presence(git_ops, None, id, id, None) is None
+          - await git_ops.resolve_queued_branch_ref(id) is not None
+
+        ASSERT (merge COMPLETES):
+          - result = await git_ops.merge_to_main(lane, id) → result.success
+          - result.merge_commit is not None
+          - await git_ops.advance_main(result.merge_commit) == 'advanced'
+          - WIP landed on main: git show main:<wipfile> contains the content
+
+        This standalone test only verifies the merge path on a PRESENT branch; it
+        does not exercise the α (reclaim) or β (synthetic-cancel) paths, so it would
+        still pass with those seams reverted. The α/β-revert negative control for the
+        merge seam is provided by test_omega_combined_gate, where _assert_merge_phase
+        runs after a real release+reattach.
+        """
+        task_id = 'omega-merge-1'
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        git_ops = harness.git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # Acquire lane + commit WIP
+        info = await git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo)
+        lane = info.path
+        wip_file = f'wip_merge_{task_id}.txt'
+        wip_content = 'merge seam wip content\n'
+        (lane / wip_file).write_text(wip_content)
+        await git_ops.commit(lane, f'wip: merge seam work for {task_id}')
+
+        await _assert_merge_phase(git_ops, lane, task_id, wip_file, wip_content, ig_git_repo)
+
+    # -----------------------------------------------------------------------
+    # Step-9: RED combined ω gate — G2 two-way-boundary capstone
+    # -----------------------------------------------------------------------
+
+    async def test_omega_combined_gate(self, ig_git_repo: Path) -> None:
+        """ω G2 capstone: restart mid-pre-merge-rebase → branch survives → merge completes.
+
+        ONE harness/git_ops/WarmLanePool threading all five phases:
+
+        Phase 0 — create_worktree(id) → lane on task/<id>; commit unmerged WIP
+                   (mid-pre-merge-rebase state; n_before > 0 beyond main).
+        Phase 1 (β) — synthetic hard-cancel via harness._run_slot;
+                   assert synthetic_cancel True, lane ASSIGNED, branch alive.
+        Phase 2 (α) — release_lane_for_terminal_task(id) reclaim;
+                   assert branch ref still alive AND lane FREE.
+        Phase 3 (γ) — re-dispatch create_worktree(id);
+                   assert WorktreeInfo, HEAD on task/<id>, count==n_before, WIP reachable.
+        Phase 4    — _classify_branch_presence is None + merge_to_main + advance_main
+                   → 'advanced' + WIP on main.
+
+        Mirrors TestG5Gate.test_all_four_behaviors_on_single_pool structure.
+
+        This is the single e2e proof that α+β+γ compose to remove the loss-WINDOW:
+          FAIL if β reverted → eager B2 release → lane FREE → Phase 1 ASSIGNED check FAILS
+          FAIL if α reverted → unconditional branch delete → ref gone → Phase 2 check FAILS
+          FAIL if γ reverted → commits reset/collision → count 0 / not WorktreeInfo → FAILS
+        """
+        task_id = 'omega-combined-1'
+        wip_file = f'wip_omega_{task_id}.txt'
+        wip_content = 'omega combined gate wip content\n'
+
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        git_ops = harness.git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # ── Phase 0: create lane + commit unmerged WIP ───────────────────────
+        info = await git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo), (
+            f'Phase 0: create_worktree must return WorktreeInfo, got {info!r}'
+        )
+        lane = info.path
+        (lane / wip_file).write_text(wip_content)
+        await git_ops.commit(lane, f'wip: omega combined gate work for {task_id}')
+
+        rc, count_str, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc == 0
+        n_before = int(count_str.strip())
+        assert n_before > 0, (
+            f'Phase 0: task/{task_id} must have commits beyond main, got {n_before}'
+        )
+
+        # ── Phase 1 (β): synthetic hard-cancel ──────────────────────────────
+        report = await _run_synthetic_hard_cancel_slot(harness, task_id)
+        await _assert_beta_phase(report, pool, lane, task_id, ig_git_repo)
+
+        # ── Phase 2 (α): reclaim release — branch must survive ───────────────
+        await _assert_alpha_phase(git_ops, pool, lane, task_id, ig_git_repo)
+
+        # ── Phase 3 (γ): re-dispatch — reattach with commits preserved ───────
+        info2 = await _assert_gamma_phase(
+            git_ops, task_id, n_before, wip_file, wip_content, ig_git_repo,
+        )
+
+        # ── Phase 4: merge — no unknown_branch + WIP lands on main ───────────
+        await _assert_merge_phase(git_ops, info2.path, task_id, wip_file, wip_content, ig_git_repo)
