@@ -1857,6 +1857,9 @@ async def _run_cmd(
                 deadline = t0 + timeout
                 stop_entered: float = 0.0
                 idle_deadline: float = 0.0
+                # Cumulative stopped time across all completed stop/start cycles
+                # (step-10: max_total_secs cap).
+                total_stopped: float = 0.0
                 line_buf = bytearray()
 
                 while True:
@@ -1865,6 +1868,13 @@ async def _run_cmd(
                         read_timeout = deadline - now
                     else:  # _CS_STOPPED
                         read_timeout = idle_deadline - now
+                        # max_total_secs cap (step-10): when > 0, also bound
+                        # the read timeout by the remaining total-stopped budget
+                        # so we don't stay STOPPED past the cumulative cap.
+                        if clock_stop.max_total_secs > 0:
+                            cumulative = total_stopped + (now - stop_entered)
+                            remaining_total = clock_stop.max_total_secs - cumulative
+                            read_timeout = min(read_timeout, remaining_total)
 
                     if read_timeout <= 0:
                         raise TimeoutError()
@@ -1911,8 +1921,10 @@ async def _run_cmd(
                                 idle_deadline = now + clock_stop.heartbeat_idle_max
                             elif marker == 'start':
                                 # Resume: shift wall-clock deadline forward by
-                                # the duration of this stopped span.
+                                # the duration of this stopped span; accumulate
+                                # total_stopped for the max_total_secs cap.
                                 stopped_duration = now - stop_entered
+                                total_stopped += stopped_duration
                                 deadline += stopped_duration
                                 state = _CS_RUNNING
 
