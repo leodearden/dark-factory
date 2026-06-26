@@ -2021,6 +2021,33 @@ class OrchestratorConfig(BaseSettings):
         return v.resolve()
 
     @model_validator(mode='after')
+    def _validate_clock_stop_markers(self) -> 'OrchestratorConfig':
+        """When clock-stop is enabled, the three marker strings must be non-empty
+        and mutually distinct.  No-op when disabled so operators can leave markers
+        blank in configs that opt out."""
+        if not self.verify_clock_stop_enabled:
+            return self
+        markers = {
+            'verify_clock_stop_marker_stop': self.verify_clock_stop_marker_stop,
+            'verify_clock_stop_marker_heartbeat': self.verify_clock_stop_marker_heartbeat,
+            'verify_clock_stop_marker_start': self.verify_clock_stop_marker_start,
+        }
+        for name, value in markers.items():
+            if not value:
+                raise ValueError(
+                    f'{name} must be non-empty when verify_clock_stop_enabled is True'
+                )
+        values = list(markers.values())
+        if len(set(values)) != len(values):
+            raise ValueError(
+                'verify_clock_stop_marker_stop, verify_clock_stop_marker_heartbeat, and '
+                'verify_clock_stop_marker_start must be mutually distinct when '
+                'verify_clock_stop_enabled is True; got: '
+                + repr(values)
+            )
+        return self
+
+    @model_validator(mode='after')
     def _validate_steward_timeout_invariant(self) -> 'OrchestratorConfig':
         if self.timeouts.steward < self.steward_completion_timeout:
             raise ValueError(
