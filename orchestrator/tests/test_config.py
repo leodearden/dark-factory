@@ -1668,3 +1668,66 @@ class TestVerifyInfraRetryConfig:
         assert cfg.verify_infra_retry_max_attempts == 10
         assert cfg.verify_infra_retry_backoff_secs == 5.0
         assert cfg.verify_infra_retry_max_backoff_secs == 120.0
+
+
+# ---------------------------------------------------------------------------
+# task/1918 step-03: no-landings breaker tuning knobs
+# ---------------------------------------------------------------------------
+
+
+class TestNoLandingsBreakerTuning:
+    """OrchestratorConfig exposes window_samples and disk_free_floor_bytes knobs.
+
+    RED until step-04 GREEN adds the two config fields.
+    """
+
+    def test_window_spans_worst_case_verify(self):
+        """Default window covers more than the worst-case serialized reify verify.
+
+        Regression guard: a reify --scope-all merge-verify takes ~18-25 min.
+        The window must be > 25 min so a healthy slow pipeline (≥1 landing per
+        window) never false-trips.  30 × 60 s = 1800 s >= 1500 s (25 min).
+        """
+        config = OrchestratorConfig()
+        # 30 samples × 60 s/sample = 1800 s = 30 min > 25 min worst-case
+        window_secs = (
+            config.no_landings_breaker_window_samples
+            * config.no_landings_breaker_interval_secs
+        )
+        assert window_secs >= 25 * 60, (
+            f'window ({window_secs:.0f}s) must cover the ~25 min worst-case '
+            f'serialized reify verify; got {config.no_landings_breaker_window_samples} '
+            f'samples × {config.no_landings_breaker_interval_secs}s = {window_secs:.0f}s'
+        )
+
+    def test_disk_free_floor_is_sane_absolute_value(self):
+        """Default disk_free_floor_bytes is a positive integer >= 1 GiB."""
+        config = OrchestratorConfig()
+        floor = config.no_landings_breaker_disk_free_floor_bytes
+        assert isinstance(floor, int), "disk_free_floor_bytes must be an int"
+        assert floor >= 1 * 1024 ** 3, (
+            f'disk_free_floor_bytes ({floor:,}) must be >= 1 GiB; got {floor}'
+        )
+
+    def test_disk_free_floor_matches_warm_lane_min_free_gib_default(self):
+        """Default disk_free_floor_bytes is aligned with git.warm_lane_min_free_gib.
+
+        Both default to 50 GiB — 'resume dispatch once disk is back above the
+        warm-lane admission floor.'  This guards the stated coupling so a
+        retuning of git.warm_lane_min_free_gib is an intentional decision to also
+        update no_landings_breaker_disk_free_floor_bytes (or explicitly break the
+        coupling with a comment explaining why they differ).
+
+        Note: warm_lane_min_free_gib lives in OrchestratorConfig.git (GitConfig),
+        not on OrchestratorConfig directly.
+        """
+        config = OrchestratorConfig()
+        warm_lane_gib = config.git.warm_lane_min_free_gib
+        expected = warm_lane_gib * 1024 ** 3
+        assert config.no_landings_breaker_disk_free_floor_bytes == expected, (
+            f'no_landings_breaker_disk_free_floor_bytes '
+            f'({config.no_landings_breaker_disk_free_floor_bytes:,}) should equal '
+            f'git.warm_lane_min_free_gib ({warm_lane_gib} GiB) × 1024³ = '
+            f'{expected:,}; update both together or add a comment explaining the '
+            f'intentional divergence.'
+        )

@@ -1675,6 +1675,28 @@ class OrchestratorConfig(BaseSettings):
     # without a code change — mirrors main_tip_sweep_enabled).
     no_landings_breaker_enabled: bool = Field(default=True)
     no_landings_breaker_interval_secs: float = Field(default=60.0)
+    no_landings_breaker_window_samples: int = Field(
+        default=30,
+        ge=1,
+        description=(
+            'Number of consecutive samples required to trip the no-landings breaker. '
+            '30 samples × 60 s/sample = 30 min > worst-case ~25 min serialized reify '
+            'verify (test semaphore N=1), so a healthy slow pipeline registers ≥1 '
+            'landing in the window; raise this value if verify durations grow.'
+        ),
+    )
+    no_landings_breaker_disk_free_floor_bytes: int = Field(
+        default=50 * 1024 * 1024 * 1024,  # 50 GiB
+        ge=0,
+        description=(
+            'Absolute disk-free floor in bytes at which the no-landings breaker '
+            'auto-resumes dispatch (after a disk-pressure trip) on the next breaker '
+            'pass, regardless of the free-bytes level at which the trip occurred. '
+            'Defaults to 50 GiB, aligned with the warm_lane_min_free_gib (50 GiB) '
+            'admission threshold — "resume dispatch once disk is back above the '
+            'warm-lane admission floor".'
+        ),
+    )
 
     # Backstop for the stranded-`blocked` gap: a task left `blocked` with no
     # open escalation AND no active workflow is an orphaned recovery (its
