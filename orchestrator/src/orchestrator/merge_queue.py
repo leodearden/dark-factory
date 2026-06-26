@@ -5114,7 +5114,13 @@ class MergeWorker(_WipHaltMixin):
             ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
         )
         main_sha = await self._git_ops.get_main_sha()
-        if await self._git_ops.is_ancestor(branch_head.strip(), main_sha):
+        # Use snapshot_tip when set: it is the ref THIS request intends to
+        # merge, which is drift-proof vs a shared or hijacked lane whose
+        # worktree HEAD may have been rebased to an orphaned lineage after
+        # snapshotting.  Workflow-path requests leave snapshot_tip=None and
+        # retain the existing worktree-HEAD basis (back-compat).
+        effective_tip = req.snapshot_tip or branch_head.strip()
+        if await self._git_ops.is_ancestor(effective_tip, main_sha):
             # Guard: if worktree has uncommitted changes, an agent may
             # have started work — don't skip.
             if await self._git_ops.has_uncommitted_work(req.worktree):
