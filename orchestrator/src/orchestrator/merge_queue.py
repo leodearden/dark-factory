@@ -1749,6 +1749,7 @@ async def _check_post_merge_equivalence(
     main_sha: str,
     *,
     task_id: str | None = None,
+    merged_tip: str | None = None,
 ) -> list[str]:
     """Return branch-touched paths whose ``advanced_sha`` blob differs from ``branch_HEAD``.
 
@@ -1778,19 +1779,30 @@ async def _check_post_merge_equivalence(
     Fail-open on git error: returns an empty list and logs a WARNING.
     The call is a defense-in-depth check; a transient git error must
     not block a successful merge from being recorded.
+
+    *merged_tip* — when provided, it is used directly as the branch tip to
+    compare against ``advanced_sha``, bypassing the ``git rev-parse HEAD``
+    read in ``task_worktree``.  Pass the tip *actually merged* (e.g. the
+    second parent of the merge commit, ``advanced_sha^2``) so that the gate
+    is drift-proof when the worktree HEAD has been rebased or hijacked after
+    the snapshot was taken.  When ``None`` (the default) the existing
+    worktree-HEAD behaviour is preserved for back-compat.
     """
-    rc, head_out, head_err = await _run(
-        ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
-    )
-    if rc != 0:
-        logger.warning(
-            'post-merge-equiv: git rev-parse HEAD failed in %s '
-            '(rc=%d, stderr=%s); failing open. task_id=%s advanced_sha=%s',
-            task_worktree, rc, head_err.strip(),
-            task_id or '<unknown>', advanced_sha,
+    if merged_tip is not None:
+        branch_head = merged_tip
+    else:
+        rc, head_out, head_err = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
         )
-        return []
-    branch_head = head_out.strip()
+        if rc != 0:
+            logger.warning(
+                'post-merge-equiv: git rev-parse HEAD failed in %s '
+                '(rc=%d, stderr=%s); failing open. task_id=%s advanced_sha=%s',
+                task_worktree, rc, head_err.strip(),
+                task_id or '<unknown>', advanced_sha,
+            )
+            return []
+        branch_head = head_out.strip()
 
     # Determine the branch's touched set against the merge-base with the
     # PRE-merge main tip (main_sha).  Using main_sha rather than advanced_sha
