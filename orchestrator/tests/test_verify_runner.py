@@ -4282,6 +4282,39 @@ class TestRemoteRunnerStreamArchival:
         assert lint_files == [], f'Unexpected lint files: {lint_files}'
         assert type_files == [], f'Unexpected type files: {type_files}'
 
+    # (a2) single non-empty stream: lint_output only — closes the label-mapping matrix
+    async def test_single_stream_lint_output_writes_one_log_file(self, tmp_path):
+        """Failure + non-empty lint_output (test/type empty) → one .lint-*.log; no test/type files.
+
+        Guards the per-stream loop against a label-mapping regression on the lint branch.
+        """
+        fail_result = VerifyResult(
+            passed=False, test_output='', lint_output='LINT ERROR: unused import', type_output='',
+            summary='lint fail', category='lint_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1921', archive_root=tmp_path,
+        )
+
+        # VerifyResult must be returned UNCHANGED (PRD §A Invariant 5)
+        assert result == fail_result
+
+        task_dir = tmp_path / '1921'
+        assert task_dir.is_dir(), f'Expected {task_dir} to exist'
+
+        # Exactly one .lint-*.log file
+        lint_files = list(task_dir.glob('attempt-1.remote-leo-laptop.lint-*.log'))
+        assert len(lint_files) == 1, f'Expected 1 lint log, got {[f.name for f in lint_files]}'
+        assert lint_files[0].read_text(encoding='utf-8') == 'LINT ERROR: unused import'
+
+        # No test or type log files
+        test_files = list(task_dir.glob('attempt-1.remote-*.test-*.log'))
+        type_files = list(task_dir.glob('attempt-1.remote-*.type-*.log'))
+        assert test_files == [], f'Unexpected test files: {test_files}'
+        assert type_files == [], f'Unexpected type files: {type_files}'
+
     # (b) multi-stream: test_output + type_output + summary sidecar
     async def test_multi_stream_test_and_type_output(self, tmp_path):
         """Failure + non-empty test_output and type_output → two .log files + one summary.json."""
@@ -4357,12 +4390,13 @@ class TestRemoteRunnerStreamArchival:
         await runner.run_merge_verify('abc123', _make_spec(), task_id='1921', archive_root=tmp_path)
 
         task_dir = tmp_path / '1921'
-        # Either no dir at all, or the dir exists but contains no stream/summary files
-        if task_dir.exists():
-            stream_files = list(task_dir.glob('attempt-1.remote-*.*.log'))
-            summary_files = list(task_dir.glob('attempt-1.remote-*.summary-*.json'))
-            assert stream_files == [], f'Unexpected stream files: {stream_files}'
-            assert summary_files == [], f'Unexpected summary files: {summary_files}'
+        # With all-empty streams AND empty ssh_stderr the dir must never be created.
+        # Asserting directly (not under `if exists`) ensures the check runs unconditionally:
+        # removing the early-return would create the dir + summary.json, making this fail.
+        assert not task_dir.exists(), (
+            f'Expected no archive dir for all-empty streams; found: '
+            f'{sorted(p.name for p in task_dir.iterdir()) if task_dir.exists() else []}'
+        )
 
     # (e) distinguishability: timeout vs real failure summaries differ
     async def test_distinguishability_timeout_vs_test_failure(self, tmp_path):

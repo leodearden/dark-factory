@@ -950,6 +950,11 @@ class RemoteRunner:
             if not runs:
                 return
 
+            # Producer-side contract: the remote verify process is responsible for
+            # populating result.category (e.g. 'infra_timeout' vs 'test_failure') and
+            # result.timed_out=True when a timeout occurred.  Distinguishability in the
+            # emitted summary.json depends on the remote host honouring this contract;
+            # this method threads the fields through verbatim but cannot enforce them.
             _archive_merge_verify_logs(
                 runs,
                 Path(archive_root),
