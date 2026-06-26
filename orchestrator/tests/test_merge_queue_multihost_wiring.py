@@ -1988,3 +1988,84 @@ class TestReprobeQuarantinedHosts:
         assert l1_escs == [], (
             f'no L1 alarm expected with secs=0; got: {l1_escs}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-1920 step-9: end-to-end remote-pool archive_root wiring — RED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerifyRemoteStderrWiring:
+    """_run_post_merge_verify passes archive_root into the remote pool (task 1920 step-9/10)."""
+
+    async def test_remote_stderr_archived_under_data_verify_logs(self, tmp_path):
+        """runner=RemoteRunner + failing result → stderr archived to
+        data/verify-logs/<task_id>/attempt-1.remote-leo-laptop-*.stderr.log (task 1920).
+
+        Fails now: merge_queue.py:897-901 builds VerifyRunnerPool without archive_root
+        so dispatch threads archive_root=None and no file is written.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.verify import VerifyResult
+        from orchestrator.verify_runner import RemoteRunner, result_to_json
+
+        fail_result = VerifyResult(
+            passed=False,
+            test_output='REMOTE FAILED',
+            lint_output='',
+            type_output='',
+            summary='test fail',
+            category='test_failure',
+        )
+
+        # Fake run: git push → (0,'',''), ssh → (0, json, 'E2E REMOTE STDERR')
+        _it = iter([
+            (0, '', ''),                                             # git push (load-bearing)
+            (0, result_to_json(fail_result), 'E2E REMOTE STDERR'),  # ssh verify
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')  # ref cleanup
+            return next(_it)
+
+        remote_runner = RemoteRunner(
+            name='leo-laptop',
+            ssh_host='leo-laptop.local',
+            git_remote='origin',
+            cwd=str(tmp_path),
+            run=fake_run,
+            id_factory=lambda: 'e2e-test-id',
+        )
+
+        # Build config with project_root=tmp_path so archive resolves there
+        config = _make_config()
+        config = config.model_copy(update={'project_root': tmp_path})
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+
+        from orchestrator.event_store import EventStore
+
+        class FakeEventStore(EventStore):
+            def __init__(self):
+                object.__init__(self)
+
+            def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
+                pass  # swallow events for this test
+
+        await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            event_store=FakeEventStore(),
+            merge_sha='abc123',
+            runner=remote_runner,
+        )
+
+        # Assert: exactly one file under data/verify-logs/<task_id>/
+        expected_dir = tmp_path / 'data' / 'verify-logs' / req.task_id
+        assert expected_dir.is_dir(), f'Expected archive dir {expected_dir} to exist'
+        files = list(expected_dir.glob('attempt-1.remote-leo-laptop-*.stderr.log'))
+        assert len(files) == 1, f'Expected 1 stderr log, got {[f.name for f in list(expected_dir.iterdir())]}'
+        assert files[0].read_text(encoding='utf-8') == 'E2E REMOTE STDERR'

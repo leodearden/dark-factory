@@ -42,6 +42,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
@@ -581,6 +582,24 @@ class LocalRunner:
 # ---------------------------------------------------------------------------
 
 
+# Archive timestamp format — mirrors _archive_merge_verify_logs (verify.py:827).
+# Microsecond precision ensures uniqueness across back-to-back ENOSPC retries for
+# the same task; the format is still lexicographically sortable.
+_STDERR_ARCHIVE_TS_FMT = '%Y%m%dT%H%M%S_%fZ'
+
+
+def _sanitize_runner_name(name: str) -> str:
+    """Sanitize a runner name for filesystem use in archive filenames.
+
+    Applies the same ``/`` and `` `` → ``_`` replacement as ``_make_infix``
+    in verify.py (without the leading dot, which is local-log-specific).
+    Runner names originate from trusted operator config, so other path-hostile
+    characters are not expected; this single policy ensures remote and local
+    archive filename conventions stay aligned.
+    """
+    return name.replace('/', '_').replace(' ', '_')
+
+
 async def _default_subprocess_run(
     argv: list[str],
     *,
@@ -683,12 +702,21 @@ class RemoteRunner:
         self,
         merge_sha: str,
         spec: MergeVerifySpec,
+        *,
+        task_id: str | None = None,
+        archive_root: Path | None = None,
     ) -> VerifyResult:
         """Run the combined merge-verify bundle on the remote host.
 
         (a) git push <git_remote> <merge_sha>:refs/merge-verify/<request_id>
         (b) ssh <ssh_host> <shlex-quoted remote argv>
         (c) parse stdout via result_from_json
+
+        When the result has passed=False and both *task_id* and *archive_root*
+        are provided, the remote ssh stderr is archived best-effort to
+        ``<archive_root>/<task_id>/attempt-1.remote-<name>-<utc_ts>.stderr.log``
+        (task 1920).  Any archival error is swallowed so the VerifyResult is
+        always returned unchanged (PRD §A Invariant 5).
 
         Raises RunnerUnavailable on any transport failure (step-8).
         Returns a VerifyResult unchanged — even passed=False or timed_out=True
@@ -794,11 +822,18 @@ class RemoteRunner:
                 # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
                 # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
                 try:
-                    return result_from_json(ssh_stdout)
+                    result = result_from_json(ssh_stdout)
                 except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
                     raise RunnerUnavailable(
                         f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
                     ) from exc
+
+                # task-1920: archive remote stderr on failure for operator triage.
+                # Best-effort: any error is swallowed so the VerifyResult is unchanged.
+                if not result.passed and ssh_stderr.strip() and archive_root is not None and task_id is not None:
+                    self._archive_failure_stderr(archive_root, task_id, ssh_stderr)
+
+                return result
 
             finally:
                 # Best-effort ref cleanup — never alters returned result nor masks exceptions
@@ -811,6 +846,46 @@ class RemoteRunner:
         finally:
             # Always clear the in-flight tracker so cancel_verify is idempotent after return
             self._inflight_request_id = None
+
+    def _archive_failure_stderr(
+        self,
+        archive_root: Path,
+        task_id: str,
+        stderr_text: str,
+    ) -> None:
+        """Write *stderr_text* to a timestamped .stderr.log file under archive_root/task_id/.
+
+        Filename: ``attempt-1.remote-<safe_name>-<utc_ts>.stderr.log``
+
+        Co-located with local merge-verify archives for side-by-side operator triage (task 1920,
+        sibling of 1768).  Timestamp format and name sanitization mirror _archive_merge_verify_logs
+        (verify.py:779-856) via _STDERR_ARCHIVE_TS_FMT and _sanitize_runner_name.
+
+        The attempt number is pinned to 1, matching the local merge path's ``attempt_id or 1``
+        default (verify.py:2529).  Microsecond-precision timestamps already guarantee filename
+        uniqueness across back-to-back ENOSPC retries, so threading attempt_id through the call
+        chain is unnecessary and would complicate the interface for no triage benefit.
+
+        Filesystem I/O is synchronous (mkdir + write_text), matching the local-archive convention.
+        Remote stderr payloads are bounded by the ssh process output buffer; the event-loop
+        blocking window is negligible at current sizes.
+
+        Best-effort: any exception is swallowed with a WARNING so the caller's VerifyResult
+        is always returned unchanged (PRD §A Invariant 5).
+        """
+        import logging as _logging
+        try:
+            target_dir = Path(archive_root) / task_id
+            target_dir.mkdir(parents=True, exist_ok=True)
+            utc_ts = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
+            safe = _sanitize_runner_name(self.name)
+            (target_dir / f'attempt-1.remote-{safe}-{utc_ts}.stderr.log').write_text(
+                stderr_text, encoding='utf-8',
+            )
+        except Exception as exc:
+            _logging.getLogger(__name__).warning(
+                'RemoteRunner %r: best-effort stderr archival failed: %s', self.name, exc,
+            )
 
     async def cancel_verify(self) -> int:
         """Cancel the in-flight verify-merge on the remote host.
@@ -908,6 +983,7 @@ class VerifyRunnerPool:
         *,
         event_store: Any = None,
         task_id: str | None = None,
+        archive_root: Path | None = None,
     ) -> None:
         if not runners:
             raise ValueError('VerifyRunnerPool requires at least one runner')
@@ -921,6 +997,9 @@ class VerifyRunnerPool:
         )
         self._event_store = event_store
         self._task_id = task_id
+        # task-1920: thread archive_root into RemoteRunner.run_merge_verify so failed
+        # remote-verify stderr is archived beside local merge-verify logs for triage.
+        self._archive_root = archive_root
         # ι: quarantine set — names of runners dropped from eligible dispatch.
         # Local (is_local) is the trust anchor and is never quarantined.
         self._quarantined: set[str] = set()
@@ -997,7 +1076,18 @@ class VerifyRunnerPool:
         selected = self._select_runner()
         t0 = time.monotonic()
         try:
-            result = await selected.run_merge_verify(merge_sha, spec)
+            # task-1920: thread archive_root + task_id into RemoteRunner only.
+            # Existing 2-arg test doubles and LocalRunner (which archives via its own
+            # constructor) are left untouched — the isinstance branch confines the
+            # change to the one runner that needs it.
+            if isinstance(selected, RemoteRunner):
+                result = await selected.run_merge_verify(
+                    merge_sha, spec,
+                    task_id=self._task_id,
+                    archive_root=self._archive_root,
+                )
+            else:
+                result = await selected.run_merge_verify(merge_sha, spec)
             actual_runner = selected
         except RunnerUnavailable:
             # Fall back to the local runner if one exists and is not the
@@ -1008,6 +1098,7 @@ class VerifyRunnerPool:
                     selected.name,
                     merge_sha,
                 )
+                # RunnerUnavailable→local fallback: always 2-arg (local never archives remote stderr)
                 result = await self._local.run_merge_verify(merge_sha, spec)
                 actual_runner = self._local
             else:

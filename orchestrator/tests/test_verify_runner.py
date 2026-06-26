@@ -3979,3 +3979,224 @@ class TestLocalRunnerArchiveRoot:
         assert kwargs.get('archive_root') is None, (
             f'Expected archive_root=None when not set, got {kwargs.get("archive_root")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-1920 step-7/9: TestVerifyRunnerPoolArchivalThreading
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPoolArchivalThreading:
+    """VerifyRunnerPool threads archive_root into RemoteRunner.dispatch but not into 2-arg fakes (task 1920)."""
+
+    def _make_remote_runner_with_stderr(self, tmp_path, stderr_text='POOL STDERR'):
+        """Build a real RemoteRunner with a fake run that returns a failing result + stderr_text."""
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+        _it = iter([
+            (0, '', ''),                                       # git push
+            (0, result_to_json(fail_result), stderr_text),     # ssh
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        runner = RemoteRunner(
+            name='leo-laptop',
+            ssh_host='leo-laptop.local',
+            git_remote='origin',
+            cwd=str(tmp_path),
+            run=fake_run,
+            id_factory=lambda: 'pool-test-id',
+        )
+        return runner, fail_result
+
+    async def test_pool_threads_archive_root_to_remote_runner(self, tmp_path):
+        """VerifyRunnerPool([remote_runner], archive_root=…) threads archive_root into dispatch."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        remote_runner, fail_result = self._make_remote_runner_with_stderr(tmp_path)
+
+        pool = VerifyRunnerPool(
+            [remote_runner],
+            task_id='1920',
+            archive_root=tmp_path,
+        )
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        # Result must be returned UNCHANGED
+        assert result == fail_result
+
+        # Exactly one .stderr.log file under tmp_path / '1920'
+        task_dir = tmp_path / '1920'
+        assert task_dir.is_dir(), f'Expected {task_dir} to exist'
+        files = list(task_dir.glob('attempt-1.remote-*-*.stderr.log'))
+        assert len(files) == 1, f'Expected 1 stderr log file, got {[f.name for f in files]}'
+        assert files[0].read_text(encoding='utf-8') == 'POOL STDERR'
+
+    async def test_local_only_pool_writes_no_remote_stderr_log(self, tmp_path):
+        """Local-only pool: 2-arg fake is NOT passed archive_root; no remote stderr file written."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+
+        # 2-arg fake (matches existing LocalRunner / test-double signature)
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+
+        async def local_run_merge_verify(sha, spec):
+            return fail_result
+
+        local_fake.run_merge_verify = AsyncMock(side_effect=local_run_merge_verify)
+
+        pool = VerifyRunnerPool(
+            [local_fake],
+            task_id='1920',
+            archive_root=tmp_path,
+        )
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result == fail_result
+        # No remote stderr log files anywhere under tmp_path
+        remote_logs = list(tmp_path.rglob('*.remote-*.stderr.log'))
+        assert remote_logs == [], f'Unexpected remote logs: {remote_logs}'
+
+
+# ---------------------------------------------------------------------------
+# task-1920 step-1/3/5: TestRemoteRunnerStderrArchival
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerStderrArchival:
+    """Failed remote-verify stderr is archived when task_id + archive_root are provided (task 1920)."""
+
+    def _make_fail_result(self):
+        return VerifyResult(
+            passed=False,
+            test_output='FAILED',
+            lint_output='',
+            type_output='',
+            summary='test fail',
+            category='test_failure',
+        )
+
+    def _make_runner(self, ssh_stderr, *, name='leo-laptop', fail_result=None):
+        """Build a RemoteRunner whose fake run returns git→(0,'','') and ssh→(0,json,ssh_stderr)."""
+        if fail_result is None:
+            fail_result = self._make_fail_result()
+
+        _result_json = result_to_json(fail_result)
+        _it = iter([
+            (0, '', ''),            # git push (load-bearing)
+            (0, _result_json, ssh_stderr),  # ssh verify
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            # ref cleanup push (best-effort, inside contextlib.suppress)
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        runner = RemoteRunner(
+            name=name,
+            ssh_host=f'{name}.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'test-id',
+        )
+        return runner, fail_result
+
+    async def test_failure_with_stderr_writes_one_file(self, tmp_path):
+        """Failed result + non-empty ssh_stderr → one .stderr.log under <archive_root>/<task_id>."""
+        runner, fail_result = self._make_runner('REMOTE STDERR DETAIL')
+
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1920', archive_root=tmp_path,
+        )
+
+        # VerifyResult must be returned UNCHANGED (PRD §A Invariant 5)
+        assert result == fail_result
+
+        # Exactly one file under tmp_path / '1920'
+        task_dir = tmp_path / '1920'
+        assert task_dir.is_dir(), f'Expected {task_dir} to be a directory'
+        files = list(task_dir.iterdir())
+        assert len(files) == 1, f'Expected 1 file, got {[f.name for f in files]}'
+
+        # Filename shape: attempt-1.remote-leo-laptop-<utc_ts>.stderr.log
+        fname = files[0].name
+        assert fname.startswith('attempt-1.remote-leo-laptop-'), f'Bad prefix: {fname!r}'
+        assert fname.endswith('.stderr.log'), f'Bad suffix: {fname!r}'
+
+        # Content must be the raw ssh_stderr
+        assert files[0].read_text(encoding='utf-8') == 'REMOTE STDERR DETAIL'
+
+    # step-3 negative cases
+    async def test_passing_result_writes_no_file(self, tmp_path):
+        """Passing remote verify: ssh_stderr noise is NOT archived (failure-only contract)."""
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        _it = iter([
+            (0, '', ''),
+            (0, result_to_json(pass_result), 'some noise'),
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        runner = RemoteRunner(
+            name='leo-laptop',
+            ssh_host='leo-laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'test-id',
+        )
+
+        await runner.run_merge_verify('abc123', _make_spec(), task_id='1920', archive_root=tmp_path)
+
+        # No file should have been written
+        task_dir = tmp_path / '1920'
+        assert not task_dir.exists(), f'Expected no archive dir, found {list(task_dir.iterdir()) if task_dir.exists() else "nothing"}'
+
+    async def test_whitespace_only_stderr_writes_no_file(self, tmp_path):
+        """Failed verify with whitespace-only ssh_stderr → NO file written (strip guard)."""
+        runner, _ = self._make_runner('   \n  ')
+
+        await runner.run_merge_verify('abc123', _make_spec(), task_id='1920', archive_root=tmp_path)
+
+        task_dir = tmp_path / '1920'
+        assert not task_dir.exists(), 'Expected no archive dir for whitespace stderr'
+
+    # step-5 archival-error-is-swallowed
+    async def test_archival_error_is_swallowed_result_unchanged(self, tmp_path):
+        """Unwritable archive_root → archival error swallowed; VerifyResult returned unchanged."""
+        # Create a regular FILE at the path where the directory would go
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('x')
+
+        runner, fail_result = self._make_runner('REMOTE STDERR DETAIL')
+
+        # Must NOT raise even though mkdir will fail (NotADirectoryError)
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1920', archive_root=blocker,
+        )
+
+        # VerifyResult is returned unchanged
+        assert result == fail_result
