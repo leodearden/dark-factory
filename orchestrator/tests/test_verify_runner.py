@@ -4200,3 +4200,255 @@ class TestRemoteRunnerStderrArchival:
 
         # VerifyResult is returned unchanged
         assert result == fail_result
+
+
+# ---------------------------------------------------------------------------
+# task-1921: TestRemoteRunnerStreamArchival
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerStreamArchival:
+    """RemoteRunner archives test/lint/type output streams on failure (task 1921).
+
+    Mirrors _archive_merge_verify_logs via a synthetic runs projection.
+    Filename pattern: attempt-1.remote-<name>.{label}-<utc_ts>.log
+                      attempt-1.remote-<name>.summary-<utc_ts>.json
+    """
+
+    def _make_runner(self, fail_result, *, name='leo-laptop', ssh_stderr=''):
+        """Build a RemoteRunner whose fake run returns git→(0,'','') and ssh→(0,json,ssh_stderr)."""
+        _result_json = result_to_json(fail_result)
+        _it = iter([
+            (0, '', ''),                             # git push (load-bearing)
+            (0, _result_json, ssh_stderr),           # ssh verify
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            # ref cleanup push (best-effort, inside contextlib.suppress)
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        runner = RemoteRunner(
+            name=name,
+            ssh_host=f'{name}.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'test-id',
+        )
+        return runner, fail_result
+
+    # (a) single non-empty stream: test_output only
+    async def test_single_stream_test_output_writes_one_log_file(self, tmp_path):
+        """Failure + non-empty test_output → one .test-*.log file; no lint/type files."""
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED TEST OUTPUT', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1921', archive_root=tmp_path,
+        )
+
+        # VerifyResult must be returned UNCHANGED (PRD §A Invariant 5)
+        assert result == fail_result
+
+        task_dir = tmp_path / '1921'
+        assert task_dir.is_dir(), f'Expected {task_dir} to exist'
+
+        # Exactly one .test-*.log file
+        test_files = list(task_dir.glob('attempt-1.remote-leo-laptop.test-*.log'))
+        assert len(test_files) == 1, f'Expected 1 test log, got {[f.name for f in test_files]}'
+        assert test_files[0].read_text(encoding='utf-8') == 'FAILED TEST OUTPUT'
+
+        # No lint or type log files
+        lint_files = list(task_dir.glob('attempt-1.remote-*.lint-*.log'))
+        type_files = list(task_dir.glob('attempt-1.remote-*.type-*.log'))
+        assert lint_files == [], f'Unexpected lint files: {lint_files}'
+        assert type_files == [], f'Unexpected type files: {type_files}'
+
+    # (b) multi-stream: test_output + type_output + summary sidecar
+    async def test_multi_stream_test_and_type_output(self, tmp_path):
+        """Failure + non-empty test_output and type_output → two .log files + one summary.json."""
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED TESTS', lint_output='', type_output='TYPE ERRORS',
+            summary='multiple failures', category='test_failure', cause_hint='assertion error',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1921', archive_root=tmp_path,
+        )
+
+        assert result == fail_result
+
+        task_dir = tmp_path / '1921'
+        assert task_dir.is_dir()
+
+        # Two stream files
+        test_files = list(task_dir.glob('attempt-1.remote-leo-laptop.test-*.log'))
+        type_files = list(task_dir.glob('attempt-1.remote-leo-laptop.type-*.log'))
+        assert len(test_files) == 1, f'Expected 1 test log, got {test_files}'
+        assert len(type_files) == 1, f'Expected 1 type log, got {type_files}'
+        assert test_files[0].read_text(encoding='utf-8') == 'FAILED TESTS'
+        assert type_files[0].read_text(encoding='utf-8') == 'TYPE ERRORS'
+
+        # Exactly one summary.json
+        summary_files = list(task_dir.glob('attempt-1.remote-leo-laptop.summary-*.json'))
+        assert len(summary_files) == 1, f'Expected 1 summary, got {summary_files}'
+        import json as _json
+        summary = _json.loads(summary_files[0].read_text(encoding='utf-8'))
+        assert 'category' in summary, 'Summary missing category'
+        assert 'timed_out' in summary, 'Summary missing timed_out'
+        assert 'commands' in summary, 'Summary missing commands'
+
+    # (c) passing result → no archive dir
+    async def test_passing_result_writes_no_files(self, tmp_path):
+        """Passing remote verify (passed=True) → no archive dir written."""
+        pass_result = VerifyResult(
+            passed=True, test_output='all tests pass', lint_output='clean', type_output='no errors',
+            summary='ok', category='',
+        )
+        _result_json = result_to_json(pass_result)
+        _it = iter([
+            (0, '', ''),
+            (0, _result_json, ''),
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        runner = RemoteRunner(
+            name='leo-laptop', ssh_host='leo-laptop.local', git_remote='origin',
+            cwd='/repo', run=fake_run, id_factory=lambda: 'test-id',
+        )
+
+        await runner.run_merge_verify('abc123', _make_spec(), task_id='1921', archive_root=tmp_path)
+
+        task_dir = tmp_path / '1921'
+        assert not task_dir.exists(), f'Expected no archive dir for passing result, got {task_dir}'
+
+    # (d) failure with all-empty streams → no file and no summary
+    async def test_all_empty_streams_failure_writes_nothing(self, tmp_path):
+        """Failure with all-empty streams → early-return; no stream file and no summary."""
+        fail_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='failed but no output', category='test_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        await runner.run_merge_verify('abc123', _make_spec(), task_id='1921', archive_root=tmp_path)
+
+        task_dir = tmp_path / '1921'
+        # Either no dir at all, or the dir exists but contains no stream/summary files
+        if task_dir.exists():
+            stream_files = list(task_dir.glob('attempt-1.remote-*.*.log'))
+            summary_files = list(task_dir.glob('attempt-1.remote-*.summary-*.json'))
+            assert stream_files == [], f'Unexpected stream files: {stream_files}'
+            assert summary_files == [], f'Unexpected summary files: {summary_files}'
+
+    # (e) distinguishability: timeout vs real failure summaries differ
+    async def test_distinguishability_timeout_vs_test_failure(self, tmp_path):
+        """timed_out=True/infra_timeout and timed_out=False/test_failure produce different summaries."""
+        import json as _json
+
+        # timeout result
+        timeout_result = VerifyResult(
+            passed=False, test_output='TIMED OUT', lint_output='', type_output='',
+            summary='timed out', category='infra_timeout', timed_out=True,
+        )
+        runner_a, _ = self._make_runner(timeout_result, name='leo-laptop')
+        await runner_a.run_merge_verify(
+            'abc123', _make_spec(), task_id='timeout-task', archive_root=tmp_path,
+        )
+
+        # real test failure result (separate task_id to avoid filename collision)
+        fail_result = VerifyResult(
+            passed=False, test_output='ASSERTION FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure', timed_out=False,
+        )
+        runner_b, _ = self._make_runner(fail_result, name='leo-laptop')
+        await runner_b.run_merge_verify(
+            'abc123', _make_spec(), task_id='fail-task', archive_root=tmp_path,
+        )
+
+        timeout_dir = tmp_path / 'timeout-task'
+        fail_dir = tmp_path / 'fail-task'
+
+        timeout_summary_files = list(timeout_dir.glob('attempt-1.remote-*.summary-*.json'))
+        fail_summary_files = list(fail_dir.glob('attempt-1.remote-*.summary-*.json'))
+
+        assert len(timeout_summary_files) == 1, f'Expected 1 timeout summary, got {timeout_summary_files}'
+        assert len(fail_summary_files) == 1, f'Expected 1 fail summary, got {fail_summary_files}'
+
+        timeout_summary = _json.loads(timeout_summary_files[0].read_text(encoding='utf-8'))
+        fail_summary = _json.loads(fail_summary_files[0].read_text(encoding='utf-8'))
+
+        # timed_out must differ
+        assert timeout_summary['timed_out'] is True, f'Expected timed_out=True, got {timeout_summary["timed_out"]}'
+        assert fail_summary['timed_out'] is False, f'Expected timed_out=False, got {fail_summary["timed_out"]}'
+
+        # category must differ
+        assert timeout_summary['category'] == 'infra_timeout', f'Unexpected category: {timeout_summary["category"]}'
+        assert fail_summary['category'] == 'test_failure', f'Unexpected category: {fail_summary["category"]}'
+
+    # (f) unwritable archive_root → archival swallowed; result unchanged
+    async def test_unwritable_archive_root_swallowed_result_unchanged(self, tmp_path):
+        """Unwritable archive_root (file where dir should go) → swallowed; result unchanged."""
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        # Place a regular FILE at the path where the task_id directory would be created
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('x')
+
+        # Must NOT raise; must return fail_result unchanged
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='blocker', archive_root=blocker,
+        )
+
+        assert result == fail_result
+
+    # (g) local-only pool regression: no remote stream files written
+    async def test_local_only_pool_writes_no_remote_stream_logs(self, tmp_path):
+        """Local-only pool (2-arg fake, not RemoteRunner): no remote stream files written."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+
+        # 2-arg fake (matches existing LocalRunner / test-double signature)
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+
+        async def local_run_merge_verify(sha, spec):
+            return fail_result
+
+        local_fake.run_merge_verify = AsyncMock(side_effect=local_run_merge_verify)
+
+        pool = VerifyRunnerPool(
+            [local_fake],
+            task_id='1921',
+            archive_root=tmp_path,
+        )
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result == fail_result
+
+        # No remote stream log files anywhere under tmp_path
+        remote_stream_logs = list(tmp_path.rglob('attempt-1.remote-*.test-*.log'))
+        remote_stream_logs += list(tmp_path.rglob('attempt-1.remote-*.lint-*.log'))
+        remote_stream_logs += list(tmp_path.rglob('attempt-1.remote-*.type-*.log'))
+        assert remote_stream_logs == [], f'Unexpected remote stream logs: {remote_stream_logs}'
