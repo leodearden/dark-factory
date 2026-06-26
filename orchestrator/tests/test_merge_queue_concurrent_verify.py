@@ -3899,16 +3899,28 @@ class TestCascadeErrorContainment:
                 outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
 
             # (3a) SLOT EXACT-ONCE: check BEFORE stop() (which over-releases for safety).
-            # The cascade body releases the slot at :7365, BEFORE the _remerge call.
-            # GREEN: _entry_released=True prevents the except handler from re-releasing;
-            #        slot stays at depth0 (exactly once).
-            # A naive unconditional re-release in the except handler would leave
-            # _value == depth0+1 and fail this assertion.
-            assert worker._speculation_slot._value == depth0, (
-                f'Expected speculation slot at depth0={depth0}, '
+            # The cascade releases the downstream speculative permit exactly once
+            # (in-body, BEFORE the _remerge call); _entry_released=True then prevents
+            # the except handler from re-releasing it on the _remerge-raises path.
+            #
+            # MEASUREMENT NOTE (task 1907): the merger is parked at its speculative
+            # look-ahead acquire() — _speculation_depth=1 and the downstream entry
+            # held the only permit — so it is a *waiter* on the slot.
+            # asyncio.Semaphore.release() hands the freed permit straight to that
+            # waiter (_wake_up_first decrements _value back), so a correct single
+            # release leaves _value at depth0 - 1, NOT depth0; the merger holds that
+            # one look-ahead permit for the rest of the test. A naive unconditional
+            # re-release in the except handler (double-release) would push _value up
+            # to depth0 — so this assertion still catches it. An under-release (leak)
+            # leaves the merger waiter blocked → req_c never dispatched → caught by
+            # the loop-survival assertion below.
+            expected_slot = depth0 - 1  # one permit held by the merger look-ahead
+            assert worker._speculation_slot._value == expected_slot, (
+                f'Expected speculation slot at depth0-1={expected_slot} '
+                f'(merger holds one look-ahead permit), '
                 f'got {worker._speculation_slot._value!r}. '
-                'Slot was either leaked (under-release) or over-released '
-                '(naive unconditional re-release in except handler).'
+                'A higher value means the except handler over-released '
+                '(naive unconditional re-release).'
             )
 
             # Queue a third request as the loop-survival signal.
@@ -4126,12 +4138,20 @@ class TestCascadeErrorContainment:
             # req_c is non-speculative (no in-flight head), so it never acquires
             # the speculation slot.  Once req_c resolves, the verifier_loop has
             # completed the cascade iteration and the not-_entry_released handler
-            # has released the slot exactly once.
-            # A double-release bug would leave _value == depth0+1.
-            assert worker._speculation_slot._value == depth0, (
-                f'Expected speculation slot at depth0={depth0}, '
+            # has released the downstream speculative permit exactly once.
+            #
+            # MEASUREMENT NOTE (task 1907): as in the sibling test, the merger is
+            # perpetually a waiter/holder of one speculative look-ahead permit
+            # (_speculation_depth=1), so a correct single release leaves _value at
+            # depth0 - 1: release() hands the freed permit straight to the merger's
+            # pending acquire(). A double-release in the not-_entry_released branch
+            # would push _value up to depth0 — caught here.
+            expected_slot = depth0 - 1  # one permit held by the merger look-ahead
+            assert worker._speculation_slot._value == expected_slot, (
+                f'Expected speculation slot at depth0-1={expected_slot} '
+                f'(merger holds one look-ahead permit), '
                 f'got {worker._speculation_slot._value!r}. '
-                'The not-_entry_released handler must release the slot exactly once.'
+                'A higher value means the not-_entry_released handler over-released.'
             )
 
             await worker.stop()

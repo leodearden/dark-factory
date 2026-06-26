@@ -161,8 +161,8 @@ async def test_loop_death_escalates_loudly_and_restarts(
     run_task = asyncio.create_task(worker.run())
 
     # Poll up to ~2s for the escalation to appear
-    deadline = asyncio.get_event_loop().time() + 2.0
-    while eq.submit.call_count == 0 and asyncio.get_event_loop().time() < deadline:
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while eq.submit.call_count == 0 and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.02)
 
     # ── Assert 1: escalation was submitted once ───────────────────────────
@@ -417,7 +417,7 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
 
     # Build a minimal MergeRequest with a pending Future
-    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     req = MergeRequest(
         task_id='sv7-task',
         branch='task/sv7',
@@ -689,10 +689,10 @@ async def test_real_merger_crash_preserves_verifier_and_pipeline(
         run_task = asyncio.create_task(worker.run())
 
         # Poll up to ~2s until run() spawns both loop tasks.
-        deadline = asyncio.get_event_loop().time() + 2.0
+        deadline = asyncio.get_running_loop().time() + 2.0
         while (
             (worker._merger_task is None or worker._verifier_task is None)
-            and asyncio.get_event_loop().time() < deadline
+            and asyncio.get_running_loop().time() < deadline
         ):
             await asyncio.sleep(0.02)
 
@@ -701,8 +701,8 @@ async def test_real_merger_crash_preserves_verifier_and_pipeline(
         verifier_task_before = worker._verifier_task
 
         # Poll up to ~3s for the merger death escalation.
-        deadline = asyncio.get_event_loop().time() + 3.0
-        while eq.submit.call_count == 0 and asyncio.get_event_loop().time() < deadline:
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while eq.submit.call_count == 0 and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
 
         # ── Assert 3: escalation emitted for merger death ─────────────────────

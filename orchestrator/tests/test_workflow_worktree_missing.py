@@ -49,6 +49,8 @@ def _make_workflow(
 
     scheduler = MagicMock()
     git_ops = MagicMock()
+    # task-1923: _submit_to_merge_queue awaits rebind_branch_to_head before enqueue.
+    git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
     wf = TaskWorkflow(
         assignment=assignment,

@@ -3079,8 +3079,8 @@ class TestSpeculativeMergeWorker:
         worker_task2 = asyncio.create_task(worker2.run())
 
         # Poll up to 2s for the restart (second merger invocation)
-        deadline2 = asyncio.get_event_loop().time() + 2.0
-        while merger2_invocations < 2 and asyncio.get_event_loop().time() < deadline2:
+        deadline2 = asyncio.get_running_loop().time() + 2.0
+        while merger2_invocations < 2 and asyncio.get_running_loop().time() < deadline2:
             await asyncio.sleep(0.02)
 
         # run() must NOT have raised (supervisor absorbed the crash)
@@ -8128,6 +8128,9 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         workflow.event_store = event_store_mock
         workflow.worktree = tmp_path / 'wt'
         workflow.worktree.mkdir()
+        # task-1923: _submit_to_merge_queue awaits git_ops.rebind_branch_to_head
+        # (belt-and-braces rebind) before enqueue — stub it async.
+        workflow.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
         # Before step-12: merge_queue.put() is called directly → resolve future
         # so _submit_to_merge_queue doesn't hang.

@@ -91,6 +91,10 @@ def _make(
     git_ops = MagicMock()
     git_ops.config.branch_prefix = 'task/'
     git_ops.config.main_branch = 'main'
+    # task-1923/diff-5d: tip group-merge awaits release_lane_for_terminal_task
+    # per done member and rebind_branch_to_head before enqueue.
+    git_ops.release_lane_for_terminal_task = AsyncMock(return_value=None)
+    git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
     esc_queue = MagicMock()
     esc_queue.has_open_l1 = MagicMock(return_value=False)
