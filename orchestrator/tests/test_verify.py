@@ -592,7 +592,7 @@ class TestRunVerificationColdFirstUse:
 
         config = self._make_config(warm=1800.0, cold=5400.0, retries=0)
 
-        async def fake_real_failure(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_real_failure(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'FAILED some_test', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_real_failure):
@@ -3602,7 +3602,7 @@ class TestRunVerificationMergeArchival:
         archive_root = tmp_path / 'data' / 'verify-logs'
         config = self._make_config(tmp_path)
 
-        async def fake_pass(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_pass(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 0, 'ok', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_pass):
@@ -5209,7 +5209,7 @@ class TestRoleThreading:
         """Fake _run_cmd that captures the env kwarg and returns success."""
         captured_envs: list[dict[str, str]] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env: dict[str, str] | None = None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env: dict[str, str] | None = None, log_path=None, **kwargs):
             assert env is not None, '_run_cmd called with env=None; expected DF_VERIFY_ROLE to be set'
             captured_envs.append(env)
             return 0, '', False
@@ -5559,7 +5559,7 @@ def guard_spy():
     """Return (spy, calls) where spy is a fake _run_cmd that records command strings."""
     calls: list[str] = []
 
-    async def _spy(cmd, cwd, timeout, env=None, log_path=None):
+    async def _spy(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
         calls.append(cmd)
         return 0, '', False
 
