@@ -421,3 +421,79 @@ class TestHarnessBreakerConfigWiring:
         harness = Harness(config)
         assert harness._no_landings_breaker._window_samples == 17
         assert harness._no_landings_breaker._disk_free_floor_bytes == 123_456_789
+
+
+# ---------------------------------------------------------------------------
+# task/1918 step-07: idle-queue guard clears sample buffer
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessIdleQueueClears:
+    """An oscillating/idle queue cannot accrete a spurious trip.
+
+    RED until step-08 GREEN adds reset() call in the depth==0 idle-queue guard.
+    """
+
+    def _stub_worker_with_depth(
+        self, harness: Harness, landings_total: int, depth: int
+    ) -> MagicMock:
+        """Attach a stub worker that reports fixed landings_total and depth."""
+        worker = MagicMock()
+        worker.snapshot.return_value = {
+            'metrics': {'landings_total': landings_total},
+            'depth': depth,
+        }
+        harness._merge_worker = worker
+        return worker
+
+    @pytest.mark.asyncio
+    async def test_idle_pass_clears_samples_so_subsequent_passes_cannot_trip(
+        self, tmp_path: Path
+    ) -> None:
+        """Idle queue (depth=0) pass clears accumulated flat+falling samples.
+
+        Sequence:
+          pass 1: depth>0, free=100_000  → 1 flat+falling sample buffered
+          pass 2: depth>0, free= 95_000  → 2 flat+falling samples (window=3 -1)
+          pass 3: depth=0  (idle)         → guard fires; current code returns
+                                            WITHOUT clearing → stale samples remain
+          pass 4: depth>0, free= 90_000  → 3rd flat+falling sample arrives
+                                            OLD: window full → TRIP → scheduler paused
+                                            NEW: idle-pass cleared → only 1 sample → None
+
+        Under current code (no reset on idle): buffer holds [100k, 95k] after
+        pass 3; pass 4 completes a strictly-falling window of 3 → trip → paused.
+        RED until step-08 adds reset() on the depth==0 path.
+        """
+        harness, _rs = _make_harness(tmp_path)
+        # High floor so disk-recovery resume never fires accidentally
+        harness._no_landings_breaker = _small_breaker(window=3, floor=500_000)
+
+        landings = 5  # stays flat throughout
+
+        with patch('shutil.disk_usage') as mock_du:
+            # Pass 1: active queue, falling disk — 1 sample
+            self._stub_worker_with_depth(harness, landings_total=landings, depth=2)
+            mock_du.return_value = MagicMock(free=100_000)
+            await harness._run_no_landings_breaker_pass()
+
+            # Pass 2: active queue, falling disk — 2 samples (1 short of window=3)
+            self._stub_worker_with_depth(harness, landings_total=landings, depth=2)
+            mock_du.return_value = MagicMock(free=95_000)
+            await harness._run_no_landings_breaker_pass()
+
+            # Pass 3: depth=0 (idle) — guard must fire and CLEAR the buffer
+            self._stub_worker_with_depth(harness, landings_total=landings, depth=0)
+            # disk_usage not called (idle guard returns before stat)
+            await harness._run_no_landings_breaker_pass()
+
+            # Pass 4: active queue again, disk still falling — only 1 sample post-clear
+            self._stub_worker_with_depth(harness, landings_total=landings, depth=2)
+            mock_du.return_value = MagicMock(free=90_000)
+            await harness._run_no_landings_breaker_pass()
+
+        # With the idle-pass buffer clear: only 1 sample post-idle → no trip
+        assert not harness.scheduler.is_paused, (
+            'scheduler should NOT be paused: idle pass should have cleared the '
+            'sample buffer so only 1 post-idle sample exists (< window=3)'
+        )
