@@ -1392,6 +1392,67 @@ class OrchestratorConfig(BaseSettings):
     verify_cold_command_timeout_secs: float | None = Field(default=None)
     verify_timeout_retries: int = Field(default=2)
 
+    # ── Clock-stop verify timeout (task 1916) ────────────────────────────────
+    # Generic capability: while streaming verify output, recognise a configurable
+    # clock-marker family and EXCLUDE the declared admission-wait span from
+    # verify_command_timeout_secs so the wall-clock budget is not consumed during
+    # legitimate waits (e.g. reify GPU slot starvation).  A heartbeat-idle backstop
+    # ensures a genuinely-wedged wait is still killed.
+    #
+    # Split default: Pydantic default is False so every directly-constructed
+    # OrchestratorConfig (including all existing _run_cmd test doubles) is opt-out
+    # by default — byte-identical to pre-1916 behaviour.  defaults.yaml ships True
+    # so the deployed orchestrator activates the seam for reify without a separate
+    # ops config change (same split used by verify_cold_command_timeout_secs).
+    verify_clock_stop_enabled: bool = Field(
+        default=False,
+        description=(
+            'Enable the clock-stop verify timeout seam.  When True, the streamed '
+            '_run_cmd path recognises the configured marker family and excludes '
+            'declared admission-wait spans from verify_command_timeout_secs.'
+        ),
+    )
+    # Marker strings emitted by the verify subprocess to signal stop/heartbeat/start.
+    # Matched by substring containment in complete output lines, tolerant of
+    # trailing fields (reason=…, waited=…, pid=…) and leading harness prefixes.
+    # Defaults to reify's @@REIFY_CLOCK_*@@ family; configurable so DF can adopt
+    # different consumers without code changes.
+    verify_clock_stop_marker_stop: str = Field(
+        default='@@REIFY_CLOCK_STOP@@',
+        description='Marker emitted by the subprocess to start a clock-stop span.',
+    )
+    verify_clock_stop_marker_heartbeat: str = Field(
+        default='@@REIFY_CLOCK_HEARTBEAT@@',
+        description='Marker emitted periodically during a clock-stop span to reset the idle backstop.',
+    )
+    verify_clock_stop_marker_start: str = Field(
+        default='@@REIFY_CLOCK_START@@',
+        description='Marker emitted by the subprocess to end a clock-stop span and resume the wall-clock.',
+    )
+    # Heartbeat-idle backstop: if no heartbeat arrives within this many seconds
+    # of the last stop/heartbeat while STOPPED, the process is killed
+    # (timed_out=True → infra_timeout).  Ensures a genuinely-wedged wait is
+    # reaped even though the wall-clock is paused.
+    verify_clock_stop_heartbeat_idle_max: float = Field(
+        default=180.0,
+        gt=0,
+        description=(
+            'Max seconds between heartbeats (or after STOP) before the idle '
+            'backstop kills the verify subprocess (gt 0).'
+        ),
+    )
+    # Optional cumulative-stopped-time cap: when > 0, kill if total time spent
+    # in STOPPED state across all stop/start cycles exceeds this many seconds
+    # (timed_out=True → infra_timeout).  0 means unlimited (no cap).
+    verify_clock_stop_max_total_secs: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            'Max cumulative seconds allowed in STOPPED state across all '
+            'stop/start cycles.  0 = unlimited.'
+        ),
+    )
+
     # Verification execution mode + env
     # When False, test/lint/type run sequentially within a single verify
     # invocation.  Useful for Rust workspaces where cargo takes an advisory
@@ -1958,6 +2019,56 @@ class OrchestratorConfig(BaseSettings):
     @classmethod
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
+
+    @model_validator(mode='after')
+    def _validate_clock_stop_markers(self) -> 'OrchestratorConfig':
+        """When clock-stop is enabled, the three marker strings must be non-empty,
+        mutually distinct, AND pairwise non-substrings.  No-op when disabled so
+        operators can leave markers blank in configs that opt out.
+
+        Distinctness alone is insufficient: ``_match_clock_marker`` checks
+        stop→heartbeat→start in priority order by substring containment.  If
+        e.g. marker_stop='STOP' and marker_start='STOPSTART', a START line would
+        match the 'stop' check first and be silently misclassified.  Only the
+        pairwise non-substring invariant guarantees correct classification for
+        any configured marker family, not just the default @@REIFY_CLOCK_*@@ one."""
+        if not self.verify_clock_stop_enabled:
+            return self
+        markers = {
+            'verify_clock_stop_marker_stop': self.verify_clock_stop_marker_stop,
+            'verify_clock_stop_marker_heartbeat': self.verify_clock_stop_marker_heartbeat,
+            'verify_clock_stop_marker_start': self.verify_clock_stop_marker_start,
+        }
+        for name, value in markers.items():
+            if not value:
+                raise ValueError(
+                    f'{name} must be non-empty when verify_clock_stop_enabled is True'
+                )
+        values = list(markers.values())
+        if len(set(values)) != len(values):
+            raise ValueError(
+                'verify_clock_stop_marker_stop, verify_clock_stop_marker_heartbeat, and '
+                'verify_clock_stop_marker_start must be mutually distinct when '
+                'verify_clock_stop_enabled is True; got: '
+                + repr(values)
+            )
+        # Reject any marker that is a substring of another.  Distinctness alone
+        # is insufficient: 'STOP' is distinct from 'STOPSTART', but the former
+        # is a substring of the latter, so _match_clock_marker would match 'stop'
+        # first for a line containing 'STOPSTART' and silently misclassify it.
+        marker_items = list(markers.items())
+        for i, (name_a, val_a) in enumerate(marker_items):
+            for name_b, val_b in marker_items[i + 1:]:
+                if val_a in val_b or val_b in val_a:
+                    raise ValueError(
+                        f'{name_a!r} ({val_a!r}) must not be a substring of '
+                        f'{name_b!r} ({val_b!r}), nor vice versa, when '
+                        'verify_clock_stop_enabled is True; _match_clock_marker '
+                        'uses substring containment in stop→heartbeat→start '
+                        'priority order and would misclassify a line where one '
+                        'marker string is contained in another.'
+                    )
+        return self
 
     @model_validator(mode='after')
     def _validate_steward_timeout_invariant(self) -> 'OrchestratorConfig':

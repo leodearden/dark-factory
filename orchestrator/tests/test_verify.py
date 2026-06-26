@@ -511,7 +511,7 @@ class TestRunVerificationColdFirstUse:
         """AsyncMock that records timeout kwargs and returns (0, '', False) — success."""
         captured_timeouts: list[float] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             captured_timeouts.append(timeout)
             return 0, '', False
 
@@ -519,7 +519,7 @@ class TestRunVerificationColdFirstUse:
 
     def _make_timeout_mock(self):
         """AsyncMock that always returns a pure-timeout result (1, 'Command timed out…', True)."""
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, f'Command timed out after {timeout}s: {cmd}', True
 
         return fake_run_cmd
@@ -592,7 +592,7 @@ class TestRunVerificationColdFirstUse:
 
         config = self._make_config(warm=1800.0, cold=5400.0, retries=0)
 
-        async def fake_real_failure(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_real_failure(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'FAILED some_test', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_real_failure):
@@ -1299,7 +1299,7 @@ class TestRunScopedVerificationSkipsUntouched:
         # Spy on _run_cmd; pretend every command passes instantly.
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             calls.append(cmd)
             return 0, '', False
 
@@ -1346,7 +1346,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             calls.append(cmd)
             return 0, '', False
 
@@ -1377,7 +1377,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             calls.append(cmd)
             return 0, '', False
 
@@ -1414,7 +1414,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             calls.append(cmd)
             return 0, '', False
 
@@ -1454,7 +1454,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         state = {'current': 0, 'peak': 0}
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             state['current'] += 1
             state['peak'] = max(state['peak'], state['current'])
             await asyncio.sleep(0.02)  # hold the slot so overlap is observable
@@ -1488,7 +1488,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             calls.append(cmd)
             return 0, '', False
 
@@ -1523,7 +1523,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         test_calls = 0
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             nonlocal test_calls
             if cmd == '__test_cmd__':
                 test_calls += 1
@@ -1553,7 +1553,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         test_calls = 0
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             nonlocal test_calls
             if cmd == '__test_cmd__':
                 test_calls += 1
@@ -2157,7 +2157,7 @@ class TestVerifyResultCauseHint:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, '', False
@@ -2183,7 +2183,7 @@ class TestVerifyResultCauseHint:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, 'error: cargo-bad', False
             if 'ruff' in cmd:
@@ -2236,7 +2236,7 @@ class TestVerifyResultCauseHint:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 0, '', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
@@ -2259,7 +2259,7 @@ class TestVerifyResultCauseHint:
             verify_command_timeout_secs=0.1,
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, f'Command timed out after {timeout}s: {cmd}', True
             return 0, '', False
@@ -2296,7 +2296,7 @@ class TestVerificationFailedLogCauseHint:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, '', False
@@ -2331,7 +2331,7 @@ class TestVerificationFailedLogCauseHint:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 0, '', False
 
         with (
@@ -2381,7 +2381,7 @@ class TestVerificationFailedLogIncludesPath:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, 'ok', False
@@ -2441,7 +2441,7 @@ class TestVerificationFailedLogIncludesPath:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, '', False
@@ -2985,7 +2985,7 @@ class TestVerifyResultCategoryAndPaths:
         )
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, '', False
@@ -3435,7 +3435,7 @@ class TestRunVerificationPersistence:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, 'ok', False
@@ -3488,7 +3488,7 @@ class TestRunVerificationPersistence:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, 'error: --exclude bad', False
             return 0, '', False
@@ -3517,7 +3517,7 @@ class TestRunVerificationPersistence:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, 'error: --exclude bad', False
             return 0, '', False
@@ -3560,7 +3560,7 @@ class TestRunVerificationMergeArchival:
 
     def _make_failing_cmd(self, test_output: str = 'test FAILED'):
         """Return a fake _run_cmd that fails the test command."""
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, 'ok', False
@@ -3602,7 +3602,7 @@ class TestRunVerificationMergeArchival:
         archive_root = tmp_path / 'data' / 'verify-logs'
         config = self._make_config(tmp_path)
 
-        async def fake_pass(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_pass(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 0, 'ok', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_pass):
@@ -3832,7 +3832,7 @@ class TestRunScopedVerificationConcurrentNoClobber:
         config = self._make_config(tmp_path)
         module_configs = self._make_module_configs()
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cratea' in cmd:
                 return 1, 'cratea ERR\nfoo\nbar\n', False
             if 'crateb' in cmd:
@@ -4317,7 +4317,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         config = self._make_config(tmp_path)
         module_configs = self._make_module_configs()
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'cratea' in cmd:
                 return 1, 'error: --exclude cratea\ncratea ERR\n', False
             if 'crateb' in cmd:
@@ -4350,7 +4350,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         config = self._make_config(tmp_path)
         module_configs = self._make_module_configs()
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'error: --exclude\n', False
 
         from orchestrator import verify  # noqa: PLC0415
@@ -4379,7 +4379,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         archive_root = tmp_path / 'data' / 'verify-logs'
         config = self._make_config(tmp_path)
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'error: --exclude\nfoo\n', False
 
         from orchestrator import verify  # noqa: PLC0415
@@ -4563,7 +4563,7 @@ class TestPruneArchiveThrottle:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'error: --exclude\nfoo\n', False
 
         wrapper_calls: list[object] = []
@@ -5023,7 +5023,7 @@ class TestRunScopedVerificationForceWorkspace:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             calls.append(cmd)
             return 0, '', False
 
@@ -5073,7 +5073,7 @@ class TestRunScopedVerificationForceWorkspace:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             calls.append(cmd)
             return 0, '', False
 
@@ -5117,7 +5117,7 @@ class TestRunScopedVerificationForceWorkspace:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             calls.append(cmd)
             return 0, '', False
 
@@ -5209,7 +5209,7 @@ class TestRoleThreading:
         """Fake _run_cmd that captures the env kwarg and returns success."""
         captured_envs: list[dict[str, str]] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env: dict[str, str] | None = None, log_path=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env: dict[str, str] | None = None, log_path=None, **kwargs):
             assert env is not None, '_run_cmd called with env=None; expected DF_VERIFY_ROLE to be set'
             captured_envs.append(env)
             return 0, '', False
@@ -5559,7 +5559,7 @@ def guard_spy():
     """Return (spy, calls) where spy is a fake _run_cmd that records command strings."""
     calls: list[str] = []
 
-    async def _spy(cmd, cwd, timeout, env=None, log_path=None):
+    async def _spy(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
         calls.append(cmd)
         return 0, '', False
 
