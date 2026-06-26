@@ -5553,6 +5553,18 @@ class NoLandingsCircuitBreaker:
         """True when the breaker has fired and dispatch is expected to be halted."""
         return self._tripped
 
+    @property
+    def disk_free_floor_bytes(self) -> int:
+        """Absolute disk-free floor in bytes.
+
+        The breaker trips only when free-bytes falls strictly below this value
+        and auto-resumes once free-bytes rises back to or above it.  Exposed as
+        a public property so callers (e.g. Harness escalation messages, capacity
+        sanity checks) do not need to reach into the private ``_disk_free_floor_bytes``
+        attribute.
+        """
+        return self._disk_free_floor_bytes
+
     def reset(self) -> None:
         """Clear tripped state and sample buffer so the breaker re-arms from scratch.
 
@@ -5627,6 +5639,17 @@ class NoLandingsCircuitBreaker:
         landings_flat = (last_landings == first_landings)
 
         # Condition 2: disk strictly falling (every pair strictly less)
+        #
+        # Calibration note: the warm-lane admission gate (warm_lane_disk_guard /
+        # warm_lane_min_free_gib, default 50 GiB, same as the floor default) throttles
+        # new warm-lane worktree acquisitions below the floor.  Because acquisitions are
+        # throttled near the floor, the disk fall may plateau around the boundary rather
+        # than continuing to fall monotonically, which can break this strict-fall
+        # condition.  If production telemetry shows that genuine spirals below 50 GiB
+        # fail to produce 30 consecutive strictly-falling samples (because the admission
+        # gate keeps disk oscillating at the floor), consider relaxing to
+        # non-increasing-with-net-decline: ``window[0][1] > window[-1][1]`` with no
+        # individual pair required to be strictly less.  See PRD §11 calibration.
         disk_falling = all(
             window[i + 1][1] < window[i][1]
             for i in range(len(window) - 1)
@@ -5673,6 +5696,12 @@ class NoLandingsCircuitBreaker:
         the trip occurred.  Anti-flap is provided by the buffer-clear-on-resume:
         a fresh full window of flat+falling samples is required before the next
         trip can fire.
+
+        **Corner case**: if ``disk_free_floor_bytes`` exceeds the volume's total
+        capacity, ``free_bytes`` can never reach the floor, so the disk-recovery
+        branch is structurally unreachable.  In that case only a clean landing
+        can resume.  The Harness logs a one-shot WARNING when it detects this
+        condition (floor > total) via ``shutil.disk_usage``.
 
         On resume, _tripped is cleared so ``observe()`` re-enters the
         trip-detection path.

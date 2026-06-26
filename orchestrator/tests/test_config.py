@@ -1708,3 +1708,26 @@ class TestNoLandingsBreakerTuning:
         assert floor >= 1 * 1024 ** 3, (
             f'disk_free_floor_bytes ({floor:,}) must be >= 1 GiB; got {floor}'
         )
+
+    def test_disk_free_floor_matches_warm_lane_min_free_gib_default(self):
+        """Default disk_free_floor_bytes is aligned with git.warm_lane_min_free_gib.
+
+        Both default to 50 GiB — 'resume dispatch once disk is back above the
+        warm-lane admission floor.'  This guards the stated coupling so a
+        retuning of git.warm_lane_min_free_gib is an intentional decision to also
+        update no_landings_breaker_disk_free_floor_bytes (or explicitly break the
+        coupling with a comment explaining why they differ).
+
+        Note: warm_lane_min_free_gib lives in OrchestratorConfig.git (GitConfig),
+        not on OrchestratorConfig directly.
+        """
+        config = OrchestratorConfig()
+        warm_lane_gib = config.git.warm_lane_min_free_gib
+        expected = warm_lane_gib * 1024 ** 3
+        assert config.no_landings_breaker_disk_free_floor_bytes == expected, (
+            f'no_landings_breaker_disk_free_floor_bytes '
+            f'({config.no_landings_breaker_disk_free_floor_bytes:,}) should equal '
+            f'git.warm_lane_min_free_gib ({warm_lane_gib} GiB) × 1024³ = '
+            f'{expected:,}; update both together or add a comment explaining the '
+            f'intentional divergence.'
+        )

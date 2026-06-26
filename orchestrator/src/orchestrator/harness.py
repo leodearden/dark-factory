@@ -668,6 +668,9 @@ class Harness:
             disk_free_floor_bytes=config.no_landings_breaker_disk_free_floor_bytes,
         )
         self._no_landings_breaker_task: asyncio.Task | None = None
+        # One-shot flag: log a WARNING if disk_free_floor_bytes exceeds the
+        # volume's total capacity (making disk-recovery auto-resume unreachable).
+        self._no_landings_floor_capacity_warned: bool = False
 
         # Per-task consecutive-failure counter for the reconcile sweep —
         # cleared on any successful mark_done, used to gate L1 escalation.
@@ -3124,8 +3127,8 @@ Output JSON matching the schema. Every task must appear in the output.
                     f'Trip reason: {trip.reason}\n\n'
                     'Auto-resume will occur on the next clean landing OR once '
                     'warm-lane disk free-bytes recover above the configured absolute '
-                    f'floor ({self._no_landings_breaker._disk_free_floor_bytes:,} bytes '
-                    f'= {self._no_landings_breaker._disk_free_floor_bytes // (1024**3)} GiB).  '
+                    f'floor ({self._no_landings_breaker.disk_free_floor_bytes:,} bytes '
+                    f'= {self._no_landings_breaker.disk_free_floor_bytes // (1024**3)} GiB).  '
                     'Anti-flap: after auto-resume a fresh full window of flat+falling '
                     'samples is required to re-trip.\n\n'
                     'force_resume_scheduler() remains the manual override if neither '
@@ -3261,15 +3264,45 @@ Output JSON matching the schema. Every task must appear in the output.
         # required to re-trip (anti-flap is preserved by the buffer-clear-on-
         # resume inside _check_resume; this reset() only clears pre-idle
         # samples).
+        #
+        # Sensitivity tradeoff: a bursty spiral whose queue drains to depth==0
+        # between churn bursts (even briefly, within each 30-min window) will
+        # never accumulate a full window of flat+falling samples and will never
+        # trip.  This is intentional — brief queue drains are an anti-spiral
+        # signal — but means the breaker is tuned for *continuous* spirals, not
+        # bursty ones.  If bursty-drain spirals become a concern, gate the reset
+        # on a sustained-idle counter (N consecutive depth==0 passes) rather
+        # than a single observation.
         queue_depth: int = snapshot.get('depth', 1)
         if queue_depth == 0 and not self._no_landings_breaker.is_tripped:
             self._no_landings_breaker.reset()
             return
 
         try:
-            free_bytes: int = _shutil.disk_usage(
-                self.git_ops.worktree_base
-            ).free
+            _du = _shutil.disk_usage(self.git_ops.worktree_base)
+            free_bytes: int = _du.free
+            # One-shot sanity check: if the configured floor exceeds the volume's
+            # total capacity, disk-recovery auto-resume (free_bytes >= floor) is
+            # structurally unreachable and only a clean landing can clear the
+            # breaker.  Guards with isinstance so test mocks that set only 'free'
+            # (without 'total') do not trigger spurious log noise — in tests
+            # MagicMock().total is a MagicMock, not an int.
+            _total = _du.total
+            if (
+                not self._no_landings_floor_capacity_warned
+                and isinstance(_total, int)
+                and 0 < _total < self._no_landings_breaker.disk_free_floor_bytes
+            ):
+                logger.warning(
+                    'No-landings breaker: configured disk_free_floor_bytes (%d GiB) '
+                    'exceeds volume total capacity (%d GiB) — disk-recovery auto-resume '
+                    'is unreachable on this host; only a clean landing can clear the '
+                    'breaker.  Consider reducing no_landings_breaker_disk_free_floor_bytes '
+                    'to a value below the volume total capacity.',
+                    self._no_landings_breaker.disk_free_floor_bytes // (1024 ** 3),
+                    _total // (1024 ** 3),
+                )
+                self._no_landings_floor_capacity_warned = True
         except OSError:
             # Fail-open: stat failure (e.g. worktree_base not yet created on a
             # fresh host) must never halt dispatch.  Mirror
