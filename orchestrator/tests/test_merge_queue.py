@@ -21111,9 +21111,7 @@ class TestCoalesceTipRecency:
 
         async def _is_ancestor(a: str, b: str) -> bool:
             # SUPERSET: old_tip is ancestor of new_tip
-            if a == old_tip and b == new_tip:
-                return True
-            return False
+            return bool(a == old_tip and b == new_tip)
 
         git_ops.is_ancestor = _is_ancestor
         return git_ops
@@ -21132,9 +21130,7 @@ class TestCoalesceTipRecency:
 
         async def _is_ancestor(a: str, b: str) -> bool:
             # SUBSET: new_tip is ancestor of old_tip
-            if a == new_tip and b == old_tip:
-                return True
-            return False
+            return bool(a == new_tip and b == old_tip)
 
         git_ops.is_ancestor = _is_ancestor
         return git_ops

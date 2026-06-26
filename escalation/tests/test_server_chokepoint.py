@@ -3252,9 +3252,7 @@ class TestMergeRequestTipRecency:
             if ancestor == new_tip and descendant == main_branch:
                 return False
             # classify_tip_relation: is_ancestor(old_tip, new_tip) → True (SUPERSET)
-            if ancestor == old_tip and descendant == new_tip:
-                return True
-            return False
+            return bool(ancestor == old_tip and descendant == new_tip)
 
         async def _find_inflight_merge_worktree(branch: str):
             return None
@@ -3279,7 +3277,6 @@ class TestMergeRequestTipRecency:
         """
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,
-            MergeOutcome,
         )
 
         OLD_TIP = 'aaaa0000deadbeef'
