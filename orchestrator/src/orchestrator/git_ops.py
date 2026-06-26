@@ -2076,6 +2076,44 @@ class GitOps:
         )
         return WorktreeInfo(path=lane_dir, base_commit=base_commit, reify_debug_port=port)
 
+    async def rebind_branch_to_head(self, worktree: Path, full_branch: str) -> bool:
+        """Rebind *full_branch* to the current HEAD of *worktree* and attach the lane.
+
+        Runs ``git checkout -B <full_branch>`` (no explicit start point, so the
+        implicit start point is HEAD).  This both:
+        * resets ``refs/heads/<full_branch>`` to the worktree's current HEAD, and
+        * attaches the worktree onto the branch (no longer detached).
+
+        This mirrors the ``checkout -B`` idiom used by :meth:`_reset_warm_lane`
+        (without ``-f``, since _reuse_warm_lane's tree is already
+        committed/clean after :meth:`commit`).
+
+        **Best-effort / never-raise** (task-1923 live-requeue residual fix):
+        When *full_branch* is checked out in another live worktree, git refuses
+        to force-move it and returns a non-zero rc.  In that case this method
+        logs a WARNING and returns ``False`` — leaving the rebased work intact
+        on the lane's current HEAD (no worse than today's detached-HEAD
+        situation).  It never converts a reuse into a FAULT.
+
+        Returns:
+            True on success; False on any non-zero git rc.
+        """
+        rc, _, err = await _run(
+            ['git', 'checkout', '-B', full_branch],
+            cwd=worktree,
+        )
+        if rc != 0:
+            logger.warning(
+                'rebind_branch_to_head: checkout -B %s failed for %s (rc=%d): %s '
+                '(branch may be checked out in another live worktree — fail-safe)',
+                full_branch, worktree, rc, err.strip(),
+            )
+            return False
+        logger.debug(
+            'rebind_branch_to_head: rebound %s to HEAD of %s', full_branch, worktree,
+        )
+        return True
+
     async def _reset_warm_lane(
         self, lane_dir: Path, full_branch: str, target_commit: str,
     ) -> None:
