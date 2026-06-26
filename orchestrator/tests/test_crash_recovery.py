@@ -27,10 +27,19 @@ def harness(tmp_path: Path, mock_orch_config):
     # title-less dict ({} is non-None → no defer; no title → identities_match
     # fails open → adopt), so the pre-Fix-C recovery tests behave unchanged.
     h.scheduler.get_task = AsyncMock(return_value={})
+    # T10 amplifier (task 1881): get_status is awaited inside the warm-lane
+    # recovery branch.  Default None → "transient/None → fall through to
+    # restore" safe path (harness.py:1718-1719); all warm-lane RED tests assert
+    # restore/preserve, none assert release.
+    h.scheduler.get_status = AsyncMock(return_value=None)
     h.scheduler._dispatched = set()
     # Substrate gate: return False from carries_substrate_probe so _run_slot
     # tests skip the D4 gate entirely (no real git repo in tmp_path).
     h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    # Deterministic dispatch (task 1899): is_deterministic is a sync @staticmethod
+    # predicate checked at top of _run_slot (harness.py:3728).  Stub False so the
+    # 4 _run_slot tests skip _run_deterministic_slot — mirrors carries_substrate_probe.
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
 
     # Replace git_ops cleanup/quarantine with async mocks; keep worktree_base real
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
