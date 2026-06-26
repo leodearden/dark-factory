@@ -5228,8 +5228,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     f'(old={old_tip!r}, new={new_tip!r}); enqueueing independently.'
                 )
             else:
-                # Tip-relation classification via the shared helper (also
-                # used by the MCP coalesce path so both paths stay in sync).
+                # Tip-relation classification via the shared helper — same
+                # classification decision as the MCP coalesce path.  Action
+                # handling differs: on RESNAPSHOT the workflow coalesces the
+                # new request as a peer waiter (see else-branch below); the MCP
+                # path independent-enqueues instead (see coalesce_or_enqueue).
                 action = await resolve_attach_action(
                     new_tip, old_tip, verifying=verifying, git_ops=self.git_ops,
                 )

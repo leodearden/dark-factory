@@ -1205,6 +1205,12 @@ async def _finalize_advanced_merge(
         # The merge already landed on main (advanced_sha IS the merge commit);
         # record it so reconciliation knows about the landing even though the
         # gate is signalling a content divergence.
+        #
+        # Robustness note: all downstream consumers (workflow.py, _on_finalized,
+        # merge_status/_durable_terminal_state) branch on outcome.status
+        # ('blocked'), NOT on merge_sha presence.  Carrying merge_sha on a
+        # 'blocked' outcome is therefore safe — no consumer misinterprets a
+        # landed-but-blocked task as 'done' due to the non-None merge_sha.
         return MergeOutcome(
             'blocked',
             merge_sha=advanced_sha,
@@ -1238,6 +1244,8 @@ async def _finalize_advanced_merge(
             member_task_ids=member_task_ids,
         )
         # The merge already landed; record advanced_sha for observability.
+        # Same robustness guarantee as the equivalence case above: consumers
+        # gate on outcome.status ('blocked'), not on merge_sha presence.
         return MergeOutcome(
             'blocked',
             merge_sha=advanced_sha,
@@ -1765,8 +1773,18 @@ async def resolve_attach_action(
     """Classify and decide the attach action for a new tip vs an in-flight tip.
 
     Shared helper used by BOTH the workflow path (workflow.py) and the MCP
-    coalesce path (coalesce_or_enqueue_merge_request) so the two paths cannot
-    diverge on tip-recency decisions again.
+    coalesce path (coalesce_or_enqueue_merge_request) so the two paths share
+    the same tip-recency *classification decision* and cannot diverge on which
+    :class:`AttachAction` class to return.
+
+    Note: the two consumers handle the resulting action differently.  The
+    workflow path on RESNAPSHOT re-snapshots and then coalesces the new request
+    as a peer waiter onto the in-flight entry (the peer future resolves with the
+    in-flight outcome).  The MCP path on RESNAPSHOT re-snapshots and then
+    independent-enqueues via :func:`register_and_enqueue_merge_request` — the
+    new submission gets its own merge+verify pass; the old in-flight is not
+    cancelled.  Both paths on ATTACH_AND_CHAIN independent-enqueue (identical
+    behaviour).
 
     Composes :func:`classify_tip_relation` → :func:`resolve_divergent` →
     :func:`decide_attach_action` in sequence:
@@ -3545,10 +3563,23 @@ async def coalesce_or_enqueue_merge_request(
         else:
             # ── Tip-recency check (γ2/γ3 consumer wiring) ─────────────────
             # When classifier_git_ops is wired AND both snapshot tips are
-            # known, classify the relation.  On SUPERSET (new tip is strictly
-            # ahead of the in-flight snapshot) refuse to coalesce — the newer
-            # commits must get their own merge+verify pass.  SAME/SUBSET fall
-            # through to the unconditional coalesce below (back-compat).
+            # known, classify the relation using the shared resolve_attach_action
+            # helper (same classification decision as workflow.py — the two
+            # paths cannot diverge on *which* action class is returned).
+            #
+            # Action handling is intentionally different from the workflow path:
+            #   • RESNAPSHOT: re_snapshot + independent-enqueue via
+            #     register_and_enqueue_merge_request (dispatched=True, no alias).
+            #     The old in-flight is NOT cancelled or replaced; it continues
+            #     and typically lands first.  The second item (the new tip) will
+            #     then resolve to already_merged — a redundant but benign extra
+            #     merge+verify pass.  The non-blocking MCP path cannot attach the
+            #     new request as a peer waiter (as the workflow path does) because
+            #     that requires a live Future reference not available in the MCP
+            #     call stack.
+            #   • ATTACH_AND_CHAIN: independent-enqueue (same as workflow path).
+            #   • COALESCE / ATTACH_CONTAINMENT (SAME/SUBSET): fall through to
+            #     the unconditional coalesce below (back-compat).
             if (
                 classifier_git_ops is not None
                 and entry is not None
