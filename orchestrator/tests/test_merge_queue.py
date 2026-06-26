@@ -13512,6 +13512,176 @@ class TestFinalizeAdvancedMerge:
             f'coexistence: retention recorded wrong branch; got {rec.branch!r}'
         )
 
+    # step-9 RED — merged_tip forwarding and blocked-but-landed observability
+    # -----------------------------------------------------------------------
+    # These tests will be RED until step-10 adds _resolve_second_parent and
+    # wires merged_tip + merge_sha into _finalize_advanced_merge.
+
+    async def test_merged_tip_forwarded_to_equivalence_check(self) -> None:
+        """merged_tip=SECONDP (from ADVANCED^2) is forwarded to _check_post_merge_equivalence.
+
+        _finalize_advanced_merge must:
+        (1) resolve the second parent of advanced_sha via `git rev-parse <sha>^2`,
+        (2) pass it as merged_tip= kwarg to _check_post_merge_equivalence.
+
+        RED until step-10: _finalize_advanced_merge currently calls
+        _check_post_merge_equivalence without merged_tip.
+        """
+        from orchestrator.merge_queue import _finalize_advanced_merge
+
+        ADVANCED = 'abc123def456'
+        SECONDP = 'secondparent01'
+        SNAP = 'snaptip99'
+
+        git_ops = self._make_git_ops(last_advanced_sha=ADVANCED)
+        req = self._make_req()
+        req.snapshot_tip = SNAP
+
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        equiv_mock = AsyncMock(return_value=[])
+
+        def _run_side_effect(cmd, cwd=None, **kw):
+            # Intercept the _resolve_second_parent call
+            if cmd == ['git', 'rev-parse', f'{ADVANCED}^2']:
+                return (0, f'{SECONDP}\n', '')
+            # Should not be called for anything else in this unit test
+            raise AssertionError(f'Unexpected _run call: {cmd!r}')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', equiv_mock),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=_run_side_effect)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'done', f'expected done; got {outcome.status!r}'
+
+        # The key assertion: merged_tip must be the resolved second parent
+        call_kwargs = equiv_mock.call_args
+        assert call_kwargs is not None, '_check_post_merge_equivalence was not called'
+        assert call_kwargs.kwargs.get('merged_tip') == SECONDP, (
+            f'merged_tip not forwarded to _check_post_merge_equivalence; '
+            f'got merged_tip={call_kwargs.kwargs.get("merged_tip")!r}, expected {SECONDP!r}'
+        )
+
+    async def test_blocked_equiv_outcome_carries_advanced_sha(self) -> None:
+        """blocked outcome from equivalence failure must include merge_sha=advanced_sha.
+
+        When _check_post_merge_equivalence returns a non-empty list the merge
+        was already landed on main (advanced_sha IS the merge commit); the
+        MergeOutcome must carry that SHA so reconciliation knows the landing.
+
+        RED until step-10: currently merge_sha is not set on the blocked outcome
+        (MergeOutcome('blocked', ...) — defaults to None).
+        """
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        ADVANCED = 'deadbeef1234'
+
+        git_ops = self._make_git_ops(last_advanced_sha=ADVANCED)
+        req = self._make_req()
+        req.snapshot_tip = None  # fallback path: snapshot_tip absent
+
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+
+        def _run_side_effect(cmd, cwd=None, **kw):
+            if len(cmd) >= 3 and cmd[1] == 'rev-parse' and cmd[2].endswith('^2'):
+                return (1, '', 'fatal: bad revision')  # no second parent → fallback
+            raise AssertionError(f'Unexpected _run call: {cmd!r}')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence',
+                  AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=_run_side_effect)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )
+        # The key assertion: merge_sha must carry the landed SHA
+        assert outcome.merge_sha == ADVANCED, (
+            f'blocked equiv outcome must carry merge_sha=ADVANCED; '
+            f'got merge_sha={outcome.merge_sha!r}, expected {ADVANCED!r}'
+        )
+
+    async def test_blocked_pyright_outcome_carries_advanced_sha(self) -> None:
+        """blocked outcome from pyright failure must include merge_sha=advanced_sha.
+
+        Same rationale as test_blocked_equiv_outcome_carries_advanced_sha —
+        the merge already landed; the blocked outcome must be observable.
+
+        RED until step-10: currently merge_sha is not set on the pyright-blocked outcome.
+        """
+        from orchestrator.merge_queue import (
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        ADVANCED = 'cafebabe5678'
+
+        git_ops = self._make_git_ops(last_advanced_sha=ADVANCED)
+        req = self._make_req()
+        req.snapshot_tip = None
+
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_broken = MagicMock(broken=True, failing_subprojects=['pkg'], detail='type error')
+
+        def _run_side_effect(cmd, cwd=None, **kw):
+            if len(cmd) >= 3 and cmd[1] == 'rev-parse' and cmd[2].endswith('^2'):
+                return (1, '', 'fatal: bad revision')
+            raise AssertionError(f'Unexpected _run call: {cmd!r}')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence',
+                  AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright',
+                  AsyncMock(return_value=pyright_broken)),
+            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=_run_side_effect)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )
+        # The key assertion: merge_sha must carry the landed SHA
+        assert outcome.merge_sha == ADVANCED, (
+            f'blocked pyright outcome must carry merge_sha=ADVANCED; '
+            f'got merge_sha={outcome.merge_sha!r}, expected {ADVANCED!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMapAdvanceFailure — unit tests for the _map_advance_failure helper
