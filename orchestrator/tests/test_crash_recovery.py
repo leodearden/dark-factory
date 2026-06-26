@@ -27,10 +27,19 @@ def harness(tmp_path: Path, mock_orch_config):
     # title-less dict ({} is non-None → no defer; no title → identities_match
     # fails open → adopt), so the pre-Fix-C recovery tests behave unchanged.
     h.scheduler.get_task = AsyncMock(return_value={})
+    # T10 amplifier (task 1881): get_status is awaited inside the warm-lane
+    # recovery branch.  Default None → "transient/None → fall through to
+    # restore" safe path (harness.py:1718-1719); all warm-lane RED tests assert
+    # restore/preserve, none assert release.
+    h.scheduler.get_status = AsyncMock(return_value=None)
     h.scheduler._dispatched = set()
     # Substrate gate: return False from carries_substrate_probe so _run_slot
     # tests skip the D4 gate entirely (no real git repo in tmp_path).
     h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    # Deterministic dispatch (task 1899): is_deterministic is a sync @staticmethod
+    # predicate checked at top of _run_slot (harness.py:3728).  Stub False so the
+    # 4 _run_slot tests skip _run_deterministic_slot — mirrors carries_substrate_probe.
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
 
     # Replace git_ops cleanup/quarantine with async mocks; keep worktree_base real
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
@@ -631,6 +640,38 @@ class TestRecoverCrashedTasksWarmLane:
 
         assert '42' in harness._recovered_plans
         assert '55' in harness._recovered_plans
+
+    @pytest.mark.parametrize('term_status', ['done', 'cancelled'])
+    async def test_warm_lane_terminal_task_released(
+        self, harness: Harness, term_status: str
+    ):
+        """T10 amplifier: task already terminal → lane released, not restored.
+
+        task 1881 regression lock: when get_status returns a terminal status
+        ('done' or 'cancelled'), recovery must call cleanup_worktree instead of
+        restore_assignment, preventing a dead lane from consuming a pool slot on
+        every harness restart.  Both arms of the predicate are exercised via
+        parametrize so a regression narrowing the check to only one value is caught.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane_path = _setup_lane(base, '_lane-0', plan)
+        # Per-test override: drive the terminal (release) branch for each status
+        harness.scheduler.get_status = AsyncMock(return_value=term_status)
+
+        await harness._recover_crashed_tasks()
+
+        # Lane was released (cleanup), not restored
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            lane_path, '42'
+        )
+        # Plan NOT injected (released task needs no recovery)
+        assert '42' not in harness._recovered_plans
+        # Pool assignment NOT created (release path skips restore_assignment)
+        assert pool.assignment_for('42') is None
+        # Lane state must remain FREE — restore_assignment was bypassed
+        assert pool.state(lane_path) == LaneState.FREE
 
 
 # ===========================================================================
