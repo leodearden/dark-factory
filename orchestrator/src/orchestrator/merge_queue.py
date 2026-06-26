@@ -1066,6 +1066,34 @@ class _GenerationChainContext:
     scope and is the second precondition guarded by AUTO_CHAIN_GENERATIONS_ENABLED."""
 
 
+async def _resolve_second_parent(git_ops: GitOps, sha: str) -> str | None:
+    """Return the second parent (``sha^2``) of a merge commit, or None.
+
+    Runs ``git rev-parse <sha>^2`` in *git_ops.project_root*.  Returns the
+    stripped SHA string on success (rc==0) or ``None`` if the commit has no
+    second parent or the command fails (e.g. fast-forward commit, transient
+    git error, or missing worktree).
+
+    Used by :func:`_finalize_advanced_merge` to derive the branch tip that was
+    actually merged into the ``--no-ff`` merge commit so the post-merge
+    equivalence gate compares the right tree (drift-proof vs a lane whose
+    worktree HEAD has been hijacked or rebased after snapshotting).
+
+    Fail-open: any exception returns ``None`` so the caller falls back to the
+    next tier (``merged_branch_tip`` or ``req.snapshot_tip``).
+    """
+    try:
+        rc, out, _err = await _run(
+            ['git', 'rev-parse', f'{sha}^2'],
+            cwd=git_ops.project_root,
+        )
+    except Exception:
+        return None
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
 async def _finalize_advanced_merge(
     git_ops: GitOps,
     req: MergeRequest,
@@ -1122,10 +1150,22 @@ async def _finalize_advanced_merge(
     # pre-rebase SHA and would fail done_provenance ancestor check).
     advanced_sha = getattr(git_ops, '_last_advanced_sha', None) or merge_commit_fallback
 
+    # Resolve the branch tip that was actually merged (second parent of the
+    # --no-ff merge commit).  Preferred over the live worktree HEAD so the
+    # equivalence gate is drift-proof when a warm lane's worktree HEAD has
+    # been rebased or hijacked after the snapshot was taken.
+    # Fallback chain: advanced_sha^2 → merged_branch_tip (caller) → req.snapshot_tip.
+    resolved_merged_tip = (
+        (await _resolve_second_parent(git_ops, advanced_sha))
+        or merged_branch_tip
+        or getattr(req, 'snapshot_tip', None)
+    )
+
     # Decision-2 post-merge content-equivalence check.
     equiv_failed = await _check_post_merge_equivalence(
         req.worktree, advanced_sha, git_ops, base_sha,
         task_id=req.task_id,
+        merged_tip=resolved_merged_tip,
     )
     if equiv_failed:
         logger.warning(
@@ -1147,7 +1187,7 @@ async def _finalize_advanced_merge(
         if chain_ctx is not None and AUTO_CHAIN_GENERATIONS_ENABLED:
             chained = await _maybe_auto_chain_generation(
                 req, advanced_sha, git_ops, event_store,
-                merged_branch_tip=merged_branch_tip,
+                merged_branch_tip=merged_branch_tip or resolved_merged_tip,
                 counts=chain_ctx.counts,
                 queue=chain_ctx.queue,
                 max_auto_generations=chain_ctx.max_auto_generations,
@@ -1162,8 +1202,12 @@ async def _finalize_advanced_merge(
                     member_task_ids=member_task_ids,
                 )
                 return chained
+        # The merge already landed on main (advanced_sha IS the merge commit);
+        # record it so reconciliation knows about the landing even though the
+        # gate is signalling a content divergence.
         return MergeOutcome(
             'blocked',
+            merge_sha=advanced_sha,
             reason=(
                 f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
                 f'branch and main diverge in '
@@ -1193,8 +1237,10 @@ async def _finalize_advanced_merge(
             train_id=train_id,
             member_task_ids=member_task_ids,
         )
+        # The merge already landed; record advanced_sha for observability.
         return MergeOutcome(
             'blocked',
+            merge_sha=advanced_sha,
             reason=(
                 f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
                 f'post-merge unscoped type-check failed for '
