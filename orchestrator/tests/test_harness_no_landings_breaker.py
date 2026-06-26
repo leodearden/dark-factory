@@ -381,3 +381,43 @@ class TestHarnessNoLandingsLifecycle:
         # Should not raise
         await harness._stop_no_landings_breaker()
         assert harness._no_landings_breaker_task is None
+
+
+# ---------------------------------------------------------------------------
+# task/1918 step-05: config wiring
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessBreakerConfigWiring:
+    """Harness.__init__ builds the breaker from config knobs, not module defaults.
+
+    RED until step-06 GREEN wires config into _NLCB() construction.
+    """
+
+    def test_window_samples_wired_from_config(self, tmp_path: Path) -> None:
+        """harness._no_landings_breaker._window_samples == config.no_landings_breaker_window_samples."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        config.no_landings_breaker_window_samples = 17  # non-default
+        harness = Harness(config)
+        assert harness._no_landings_breaker._window_samples == 17, (
+            f'expected _window_samples=17, got {harness._no_landings_breaker._window_samples}'
+        )
+
+    def test_disk_free_floor_bytes_wired_from_config(self, tmp_path: Path) -> None:
+        """harness._no_landings_breaker._disk_free_floor_bytes == config.no_landings_breaker_disk_free_floor_bytes."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        config.no_landings_breaker_disk_free_floor_bytes = 123_456_789  # non-default
+        harness = Harness(config)
+        assert harness._no_landings_breaker._disk_free_floor_bytes == 123_456_789, (
+            f'expected _disk_free_floor_bytes=123456789, '
+            f'got {harness._no_landings_breaker._disk_free_floor_bytes}'
+        )
+
+    def test_both_config_knobs_wired_together(self, tmp_path: Path) -> None:
+        """Both config knobs are propagated to the breaker in one Harness construction."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        config.no_landings_breaker_window_samples = 17
+        config.no_landings_breaker_disk_free_floor_bytes = 123_456_789
+        harness = Harness(config)
+        assert harness._no_landings_breaker._window_samples == 17
+        assert harness._no_landings_breaker._disk_free_floor_bytes == 123_456_789
