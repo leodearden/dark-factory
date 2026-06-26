@@ -5170,8 +5170,12 @@ class MergeWorker(_WipHaltMixin):
         # merge_request — or already_merged when the ref was cleaned up after
         # merge).  Runs before the rev-parse HEAD below so a misroute can't be
         # born as a bare merge_dequeued (phantom in_flight on the dashboard).
+        # Pass req.worktree so _classify_branch_presence can distinguish a
+        # genuine misroute (no unmerged commits) from a lost-ref-but-work-present
+        # scenario where the worktree HEAD carries commits beyond main.
         guard = await _classify_branch_presence(
             self._git_ops, self._event_store, req.task_id, req.branch, t0,
+            worktree=req.worktree,
         )
         if guard is not None:
             return guard
@@ -8877,9 +8881,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # outcome means the latest event is the terminal
                     # merge_attempt _classify_branch_presence emitted, not a
                     # bare merge_dequeued (phantom in_flight on the dashboard).
+                    # Pass req.worktree for parity with _do_merge: the
+                    # absent-ref worktree-HEAD fallback fires in both paths.
                     guard = await _classify_branch_presence(
                         self._git_ops, self._event_store, req.task_id,
                         req.branch, t0,
+                        worktree=req.worktree,
                     )
                     if guard is not None:
                         _already = self._oob_deliver(req, guard, speculative=speculative)
