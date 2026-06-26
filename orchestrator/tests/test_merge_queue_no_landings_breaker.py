@@ -315,3 +315,79 @@ class TestBreakerNoFlap:
         for i in range(window - 1):
             result = breaker.observe(4, 200_000 - i * 2_000)
         assert result is None, f"window-1 samples should not re-trip, got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# task/1918 step-01: absolute-floor resume semantics
+# ---------------------------------------------------------------------------
+
+
+class TestBreakerAbsoluteFloorResume:
+    """NoLandingsCircuitBreaker resumes on an absolute disk-free floor (not
+    a relative margin above the trip level).
+
+    RED until step-02 GREEN renames disk_margin_bytes -> disk_free_floor_bytes
+    and changes the resume condition.
+    """
+
+    def _trip_with_floor(
+        self,
+        floor: int,
+        landings: int = 5,
+        free_start: int = 200_000,
+        drop: int = 10_000,
+        window: int = 3,
+    ) -> NoLandingsCircuitBreaker:
+        """Drive a breaker (constructed with disk_free_floor_bytes=floor) to
+        tripped state and return it."""
+        breaker = NoLandingsCircuitBreaker(
+            window_samples=window, disk_free_floor_bytes=floor
+        )
+        for i in range(window):
+            breaker.observe(landings, free_start - i * drop)
+        assert breaker.is_tripped, "breaker should be tripped after fill"
+        return breaker
+
+    def test_disk_recovery_to_absolute_floor_resumes_below_trip_level(self):
+        """free_bytes >= floor resumes even when free_bytes < free_at_trip.
+
+        Scenario:
+          window=3, floor=100_000
+          Fill: free 200_000 -> 190_000 -> 180_000  (free_at_trip=180_000)
+          Observe: free=150_000, same landings
+          OLD behaviour: 150_000 < 180_000 + margin  -> stay tripped (relative)
+          NEW behaviour: 150_000 >= 100_000 floor    -> resume (absolute)
+        """
+        # free_at_trip = 200_000 - (3-1)*10_000 = 180_000
+        # floor = 100_000 < free_at_trip, so old relative margin would NOT resume
+        breaker = self._trip_with_floor(
+            floor=100_000, landings=5, free_start=200_000, drop=10_000, window=3
+        )
+        result = breaker.observe(5, 150_000)  # 150_000 >= 100_000 floor
+        assert result is not None, (
+            "disk recovery to absolute floor (150k >= 100k) should resume, "
+            "even though 150k < free_at_trip=180k"
+        )
+        assert result.action == 'resume'
+
+    def test_disk_below_floor_stays_tripped(self):
+        """free_bytes < floor keeps the breaker tripped."""
+        breaker = self._trip_with_floor(
+            floor=100_000, landings=5, free_start=200_000, drop=10_000, window=3
+        )
+        result = breaker.observe(5, 90_000)  # 90_000 < 100_000 floor
+        assert result is None, "free below floor should stay tripped"
+
+    def test_clean_landing_still_resumes_with_floor(self):
+        """A clean landing resumes regardless of the disk-free floor."""
+        breaker = self._trip_with_floor(
+            floor=500_000,  # unreachably high floor — disk path can never fire
+            landings=5,
+            free_start=200_000,
+            drop=10_000,
+            window=3,
+        )
+        # Increase landings — clean landing always resumes (OR semantics)
+        result = breaker.observe(6, 100_000)  # 100_000 << 500_000 floor
+        assert result is not None, "clean landing should resume even when disk is below floor"
+        assert result.action == 'resume'
