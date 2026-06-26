@@ -7835,7 +7835,7 @@ class TestReuseWarmLaneBranchAware:
 
         # (d) task/R carries commits beyond main
         _, count_raw, _ = await _run(
-            ['git', 'rev-list', '--count', f'main..task/R'], cwd=git_repo,
+            ['git', 'rev-list', '--count', 'main..task/R'], cwd=git_repo,
         )
         count = int(count_raw.strip())
         assert count > 0, (
@@ -7844,7 +7844,7 @@ class TestReuseWarmLaneBranchAware:
 
         # (e) New WIP file is reachable from task/R (was committed during _reuse)
         rc_show, _, _ = await _run(
-            ['git', 'show', f'task/R:new_wip.txt'], cwd=git_repo,
+            ['git', 'show', 'task/R:new_wip.txt'], cwd=git_repo,
         )
         assert rc_show == 0, (
             'new_wip.txt must be reachable from task/R after _reuse_warm_lane '
