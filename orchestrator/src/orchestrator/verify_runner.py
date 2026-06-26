@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from orchestrator.config import ModuleConfig
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -833,6 +833,11 @@ class RemoteRunner:
                 if not result.passed and ssh_stderr.strip() and archive_root is not None and task_id is not None:
                     self._archive_failure_stderr(archive_root, task_id, ssh_stderr)
 
+                # task-1921: archive captured test/lint/type output streams on failure.
+                # Mirrors local _archive_merge_verify_logs; distinguishes timeout vs real failure.
+                if not result.passed and archive_root is not None and task_id is not None:
+                    self._archive_failure_streams(archive_root, task_id, result)
+
                 return result
 
             finally:
@@ -886,6 +891,70 @@ class RemoteRunner:
             _logging.getLogger(__name__).warning(
                 'RemoteRunner %r: best-effort stderr archival failed: %s', self.name, exc,
             )
+
+    def _archive_failure_streams(
+        self,
+        archive_root: Path,
+        task_id: str,
+        result: VerifyResult,
+    ) -> None:
+        """Archive captured test/lint/type output streams to archive_root/task_id/ on failure.
+
+        Mirrors verify._archive_merge_verify_logs by projecting the three VerifyResult
+        output fields into synthetic per-stream run dicts, one per NON-EMPTY stream.
+        Delegates to _archive_merge_verify_logs so filenames, the microsecond UTC timestamp,
+        and the summary.json shape are byte-identical to local merge-verify archives.
+
+        Filename convention (task 1921):
+            ``attempt-1.remote-<safe_name>.{label}-<utc_ts>.log``
+            ``attempt-1.remote-<safe_name>.summary-<utc_ts>.json``
+
+        The module_prefix ``remote-<name>`` causes _make_infix to emit the
+        ``.remote-<name>`` infix, co-located with and identically shaped to local
+        archives (remote-origin marker, analogous to task 1920 stderr file naming).
+
+        Synthetic run dicts use placeholder ``cmd=f'<remote {label}>'`` (non-None so
+        the log file is emitted), ``rc=1``, ``started_at=''``, ``duration_secs=0.0``.
+        The load-bearing distinguishability fields — ``timed_out``, ``category``,
+        ``cause_hint`` — are threaded from the real VerifyResult so summary.json can
+        distinguish infra_timeout from test_failure without re-running (task 1921 goal).
+
+        Early-returns when all three streams are empty (no orphan summary.json emitted).
+
+        Best-effort: exceptions are NOT swallowed here; the caller (run_merge_verify)
+        is responsible for the outer guard (step-4 adds the try/except wrapper).
+        """
+        # Build synthetic run dicts for each non-empty stream.
+        runs = []
+        for label, output in (
+            ('test', result.test_output),
+            ('lint', result.lint_output),
+            ('type', result.type_output),
+        ):
+            if output:
+                runs.append({
+                    'label': label,
+                    'cmd': f'<remote {label}>',
+                    'rc': 1,
+                    'output': output,
+                    'timed_out': result.timed_out,
+                    'started_at': '',
+                    'duration_secs': 0.0,
+                })
+
+        # Early-return: no non-empty streams → nothing to archive.
+        if not runs:
+            return
+
+        _archive_merge_verify_logs(
+            runs,
+            Path(archive_root),
+            task_id,
+            1,  # attempt_id pinned to 1, matching the local merge path default
+            result.category,
+            result.cause_hint,
+            module_prefix=f'remote-{self.name}',
+        )
 
     async def cancel_verify(self) -> int:
         """Cancel the in-flight verify-merge on the remote host.

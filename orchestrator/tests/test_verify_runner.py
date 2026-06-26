@@ -4120,7 +4120,13 @@ class TestRemoteRunnerStderrArchival:
         return runner, fail_result
 
     async def test_failure_with_stderr_writes_one_file(self, tmp_path):
-        """Failed result + non-empty ssh_stderr → one .stderr.log under <archive_root>/<task_id>."""
+        """Failed result + non-empty ssh_stderr → one .stderr.log under <archive_root>/<task_id>.
+
+        task-1921 note: the task_id directory now also contains stream files
+        (.test-*.log, summary-*.json) written by _archive_failure_streams.
+        This test verifies specifically that the .stderr.log is written correctly
+        (not the total file count, which changed in task-1921).
+        """
         runner, fail_result = self._make_runner('REMOTE STDERR DETAIL')
 
         result = await runner.run_merge_verify(
@@ -4130,19 +4136,17 @@ class TestRemoteRunnerStderrArchival:
         # VerifyResult must be returned UNCHANGED (PRD §A Invariant 5)
         assert result == fail_result
 
-        # Exactly one file under tmp_path / '1920'
+        # task_id directory must exist
         task_dir = tmp_path / '1920'
         assert task_dir.is_dir(), f'Expected {task_dir} to be a directory'
-        files = list(task_dir.iterdir())
-        assert len(files) == 1, f'Expected 1 file, got {[f.name for f in files]}'
 
-        # Filename shape: attempt-1.remote-leo-laptop-<utc_ts>.stderr.log
-        fname = files[0].name
+        # Exactly one .stderr.log file with the correct filename shape and content
+        stderr_files = list(task_dir.glob('attempt-1.remote-leo-laptop-*.stderr.log'))
+        assert len(stderr_files) == 1, f'Expected 1 stderr.log, got {[f.name for f in stderr_files]}'
+        fname = stderr_files[0].name
         assert fname.startswith('attempt-1.remote-leo-laptop-'), f'Bad prefix: {fname!r}'
         assert fname.endswith('.stderr.log'), f'Bad suffix: {fname!r}'
-
-        # Content must be the raw ssh_stderr
-        assert files[0].read_text(encoding='utf-8') == 'REMOTE STDERR DETAIL'
+        assert stderr_files[0].read_text(encoding='utf-8') == 'REMOTE STDERR DETAIL'
 
     # step-3 negative cases
     async def test_passing_result_writes_no_file(self, tmp_path):
@@ -4176,13 +4180,21 @@ class TestRemoteRunnerStderrArchival:
         assert not task_dir.exists(), f'Expected no archive dir, found {list(task_dir.iterdir()) if task_dir.exists() else "nothing"}'
 
     async def test_whitespace_only_stderr_writes_no_file(self, tmp_path):
-        """Failed verify with whitespace-only ssh_stderr → NO file written (strip guard)."""
+        """Failed verify with whitespace-only ssh_stderr → NO .stderr.log written (strip guard).
+
+        task-1921 note: stream files (.test-*.log, summary-*.json) may still be written
+        by _archive_failure_streams when the VerifyResult has non-empty output streams.
+        This test verifies specifically that the .stderr.log is NOT written
+        (the ssh_stderr strip guard is the contract being tested here).
+        """
         runner, _ = self._make_runner('   \n  ')
 
         await runner.run_merge_verify('abc123', _make_spec(), task_id='1920', archive_root=tmp_path)
 
         task_dir = tmp_path / '1920'
-        assert not task_dir.exists(), 'Expected no archive dir for whitespace stderr'
+        # No .stderr.log files (the strip guard must have suppressed stderr archival)
+        stderr_files = list(task_dir.glob('*.stderr.log')) if task_dir.exists() else []
+        assert stderr_files == [], f'Expected no .stderr.log files, got {stderr_files}'
 
     # step-5 archival-error-is-swallowed
     async def test_archival_error_is_swallowed_result_unchanged(self, tmp_path):
