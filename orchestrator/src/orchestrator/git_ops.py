@@ -3286,6 +3286,13 @@ class GitOps:
         # Derive the merge source: prefer the named ref; when absent, fall back
         # to the worktree HEAD SHA so commits present in the worktree can still
         # land on main without the named branch ref.
+        #
+        # Safety guard: only use the worktree HEAD as fallback when it actually
+        # carries commits beyond main.  A HEAD that is already an ancestor of
+        # main (e.g. the project root on the main branch) would produce an
+        # "Already up to date" no-op merge instead of the expected failure for
+        # a genuinely absent ref — so we fall back to full_branch in that case
+        # to let git fail loudly with "not something we can merge".
         merge_source: str
         if resolved is not None:
             merge_source = resolved
@@ -3293,7 +3300,16 @@ class GitOps:
             rc_head, head_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=worktree,
             )
-            merge_source = head_sha.strip() if rc_head == 0 else full_branch
+            if rc_head == 0:
+                head_sha = head_sha.strip()
+                _main_sha = await self.get_main_sha()
+                if not await self.is_ancestor(head_sha, _main_sha):
+                    merge_source = head_sha
+                else:
+                    # HEAD is at or behind main — not a useful fallback source.
+                    merge_source = full_branch
+            else:
+                merge_source = full_branch
 
         merge_wt: Path | None = None
 

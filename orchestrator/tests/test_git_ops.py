@@ -1032,7 +1032,7 @@ class TestWorktreeLifecycle:
 
         # The orphan_work.py file must now be on main (content merged correctly)
         rc, content, err = await _run(
-            ['git', 'show', f'main:orphan_work.py'], cwd=git_ops.project_root,
+            ['git', 'show', 'main:orphan_work.py'], cwd=git_ops.project_root,
         )
         assert rc == 0, f'File not found on main: {err}'
         assert 'orphan = True' in content

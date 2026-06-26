@@ -2521,18 +2521,39 @@ async def _classify_branch_presence(
     # If a worktree was provided and its HEAD carries commits beyond main,
     # this is NOT a misroute — the ref was lost while the work is still live.
     # Return None (proceed) so merge_to_main can merge via the worktree HEAD.
+    #
+    # Misroute guard: when the worktree HEAD is on an ATTACHED branch (i.e.
+    # not in detached-HEAD state), we verify the branch name matches the
+    # expected branch before proceeding.  A different attached branch means
+    # this is a genuine misroute (wrong worktree was passed) — fall through to
+    # unknown_branch in that case.  A detached HEAD indicates the ref was
+    # deleted while the work sat as a bare commit (the intended scenario), so
+    # it skips the name check and trusts the SHA directly.
     if worktree is not None and worktree.exists():
-        rc_head, head_sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+        rc_sym, sym_ref, _ = await _run(
+            ['git', 'symbolic-ref', 'HEAD'], cwd=worktree,
         )
-        if rc_head == 0:
-            head_sha = head_sha.strip()
-            main_sha = await git_ops.get_main_sha()
-            if not await git_ops.is_ancestor(head_sha, main_sha):
-                # HEAD carries commits beyond main — this is not a misroute.
-                # Return None (proceed); merge_to_main uses the worktree-HEAD
-                # fallback as the merge source.
-                return None
+        sym_ref = sym_ref.strip()
+        is_detached = (rc_sym != 0)
+
+        # For an attached HEAD, the symbolic ref must end with the expected
+        # branch (prefixed or bare).  A mismatch is a misroute — skip fallback.
+        branch_matches = is_detached or (
+            sym_ref.endswith('/' + prefixed) or sym_ref.endswith('/' + branch)
+        )
+
+        if branch_matches:
+            rc_head, head_sha, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+            )
+            if rc_head == 0:
+                head_sha = head_sha.strip()
+                main_sha = await git_ops.get_main_sha()
+                if not await git_ops.is_ancestor(head_sha, main_sha):
+                    # HEAD carries commits beyond main — this is not a misroute.
+                    # Return None (proceed); merge_to_main uses the worktree-HEAD
+                    # fallback as the merge source.
+                    return None
 
     # ── Genuine misroute ───────────────────────────────────────────────────
     _emit_merge_attempt(
