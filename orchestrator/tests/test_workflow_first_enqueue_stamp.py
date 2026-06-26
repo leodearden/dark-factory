@@ -283,6 +283,9 @@ async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
     wf.merge_inflight_registry = None  # skip attach branch
     wf.plan = {'files': []}
     wf._module_configs = []
+    # task-1923: _submit_to_merge_queue now calls rebind_branch_to_head
+    # (belt-and-braces rebind before enqueue); must be AsyncMock for await.
+    wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
     captured: list[MergeRequest] = []
 

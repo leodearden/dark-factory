@@ -2056,6 +2056,28 @@ class GitOps:
                 '_reuse_warm_lane: rebase failed for %s; continuing on old base', lane_dir,
             )
 
+        # 2b. Rebind refs/heads/<full_branch> to the lane's current HEAD and
+        #     re-attach the lane onto the branch.
+        #
+        #     Task-1923 residual: release_warm_lane detaches the lane via
+        #     `git checkout --detach`.  If the same task is re-dispatched via
+        #     the disk-backstop reuse route (route 2) or the in-memory reuse
+        #     route (route 1), _reuse_warm_lane runs commit()+rebase_onto_main
+        #     on a DETACHED HEAD and never moves refs/heads/<full_branch> to
+        #     match.  The stale ref then causes α's retention guard to evaluate
+        #     0-commits-beyond-main (incorrect) and delete it, and the merge
+        #     worker (resolve_queued_branch_ref) to hit unknown_branch.
+        #
+        #     best-effort: if the rebind fails (e.g. invalid branch name or
+        #     some other git error), log and continue — WIP is still on the
+        #     lane's HEAD, which is no worse than today's detached-HEAD state.
+        #     NOTE: checkout -B bypasses git's single-checkout guard; a
+        #     concurrent worktree on full_branch is NOT a fail-safe — it is a
+        #     duplicate-dispatch hazard (both worktrees end up on the branch).
+        #     Route 3 (γ reattach) already re-attaches before this call, so
+        #     the rebind is a harmless reset-to-self there.
+        await self.rebind_branch_to_head(lane_dir, full_branch)
+
         # 3. Re-ensure task .gitignore (idempotent)
         _ensure_task_gitignore(lane_dir)
 
@@ -2075,6 +2097,46 @@ class GitOps:
             lane_dir, full_branch, base_commit[:8] if base_commit else '?', port,
         )
         return WorktreeInfo(path=lane_dir, base_commit=base_commit, reify_debug_port=port)
+
+    async def rebind_branch_to_head(self, worktree: Path, full_branch: str) -> bool:
+        """Rebind *full_branch* to the current HEAD of *worktree* and attach the lane.
+
+        Runs ``git checkout -B <full_branch>`` (no explicit start point, so the
+        implicit start point is HEAD).  This both:
+        * resets ``refs/heads/<full_branch>`` to the worktree's current HEAD, and
+        * attaches the worktree onto the branch (no longer detached).
+
+        This mirrors the ``checkout -B`` idiom used by :meth:`_reset_warm_lane`
+        (without ``-f``, since _reuse_warm_lane's tree is already
+        committed/clean after :meth:`commit`).
+
+        **Best-effort / never-raise** (task-1923 live-requeue residual fix):
+        ``git checkout -B`` bypasses git's linked-worktree single-checkout
+        guard: if *full_branch* is currently checked out in another live
+        worktree, the command still succeeds (rc=0), force-resets the ref to
+        the current HEAD, and leaves both worktrees tracking the same branch —
+        a duplicate-dispatch hazard, NOT a safe fail-safe.  This method
+        returns ``False`` only on a genuine non-zero rc (e.g. an invalid
+        branch name); in that case it logs a WARNING and never raises.
+        It never converts a reuse into a FAULT.
+
+        Returns:
+            True on success (rc=0); False on any non-zero git rc.
+        """
+        rc, _, err = await _run(
+            ['git', 'checkout', '-B', full_branch],
+            cwd=worktree,
+        )
+        if rc != 0:
+            logger.warning(
+                'rebind_branch_to_head: checkout -B %s failed for %s (rc=%d): %s',
+                full_branch, worktree, rc, err.strip(),
+            )
+            return False
+        logger.debug(
+            'rebind_branch_to_head: rebound %s to HEAD of %s', full_branch, worktree,
+        )
+        return True
 
     async def _reset_warm_lane(
         self, lane_dir: Path, full_branch: str, target_commit: str,

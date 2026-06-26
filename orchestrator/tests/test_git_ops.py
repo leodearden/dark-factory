@@ -7374,3 +7374,563 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
             f'task/seed must have 0 commits beyond main (lane was not silently '
             f'used), got {seed_count} — indicates _reuse_warm_lane ran on wrong branch'
         )
+
+
+# ===========================================================================
+# Task-1923 step-1: RED — rebind_branch_to_head contract
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRebindBranchToHead:
+    """GitOps.rebind_branch_to_head(worktree, full_branch) contract.
+
+    RED today: AttributeError — method does not exist.
+    GREEN after step-2 implements `git checkout -B <full_branch>`.
+    """
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_rebind_reattaches_detached_lane_and_updates_ref(
+        self, git_repo: Path,
+    ):
+        """(a) On a DETACHED lane: rebind_branch_to_head returns True, rebinds
+        refs/heads/task/X to the lane HEAD, and attaches the lane onto task/X.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # Acquire a lane on task/X
+        info = await git_ops.acquire_warm_lane('X', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        # Commit a WIP file onto the lane so task/X has commits beyond main
+        (lane / 'wip.txt').write_text('work in progress\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'wip commit'], cwd=lane)
+
+        # Detach the lane (mirror what release_warm_lane does)
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=lane)
+        assert rc == 0, f'checkout --detach failed: {err}'
+
+        # Confirm detached
+        _, abbrev_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert abbrev_raw.strip() == 'HEAD', (
+            f'Lane should be DETACHED, got {abbrev_raw.strip()!r}'
+        )
+
+        # Get the current HEAD SHA on the detached lane
+        _, head_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        head_sha = head_sha_raw.strip()
+
+        # === THE CALL UNDER TEST ===
+        result = await git_ops.rebind_branch_to_head(lane, 'task/X')
+
+        assert result is True, (
+            f'rebind_branch_to_head should return True on success, got {result!r}'
+        )
+
+        # refs/heads/task/X must now point at the lane's HEAD
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == head_sha, (
+            f'refs/heads/task/X must equal lane HEAD ({head_sha[:8]}), '
+            f'got {ref_sha_raw.strip()[:8]}'
+        )
+
+        # Lane must be attached to task/X (not detached)
+        _, attached_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert attached_raw.strip() == 'task/X', (
+            f'Lane must be ON task/X after rebind, got {attached_raw.strip()!r}'
+        )
+
+    async def test_rebind_idempotent_when_already_on_branch(
+        self, git_repo: Path,
+    ):
+        """(b) When the lane is already on task/X, a second call is idempotent:
+        still returns True, ref still == HEAD, no error.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        info = await git_ops.acquire_warm_lane('X', start_ref)
+        assert isinstance(info, WorktreeInfo)
+        lane = info.path
+
+        # Commit WIP so the branch has content
+        (lane / 'wip.txt').write_text('work\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=lane)
+
+        # Confirm lane is already on task/X
+        _, abbrev_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert abbrev_raw.strip() == 'task/X', (
+            f'Expected lane on task/X before idempotent test, got {abbrev_raw.strip()!r}'
+        )
+
+        _, head_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        head_sha = head_sha_raw.strip()
+
+        # First call
+        result1 = await git_ops.rebind_branch_to_head(lane, 'task/X')
+        assert result1 is True, f'First call should return True, got {result1!r}'
+
+        # Second call (idempotent)
+        result2 = await git_ops.rebind_branch_to_head(lane, 'task/X')
+        assert result2 is True, f'Second call should return True, got {result2!r}'
+
+        # ref must still equal HEAD
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == head_sha, (
+            f'refs/heads/task/X must equal HEAD after idempotent rebind, '
+            f'got {ref_sha_raw.strip()[:8]} vs {head_sha[:8]}'
+        )
+
+    async def test_rebind_returns_false_and_never_raises_on_git_error(
+        self, git_repo: Path,
+    ):
+        """(c) best-effort / never-raise: when git checkout -B fails (e.g. invalid
+        branch name), rebind_branch_to_head returns False and does NOT raise.
+
+        NOTE on "branch checked out in another worktree": git checkout -B bypasses
+        git's linked-worktree single-checkout guard (unlike bare `git checkout`).
+        The "fail-safe" for that collision scenario is thus NOT enforced by git
+        itself; it is an edge case that implies duplicate dispatch.  This test
+        verifies the observable never-raise contract via an invalid branch name
+        (which IS reliably rejected by git regardless of worktree state).
+        Escalation esc-1923-18 records the false premise in the original design.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        info = await git_ops.acquire_warm_lane('X', start_ref)
+        assert isinstance(info, WorktreeInfo)
+        lane = info.path
+
+        # Commit WIP so the lane has content
+        (lane / 'wip.txt').write_text('work\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=lane)
+
+        # Detach the lane (mirrors release_warm_lane)
+        await _run(['git', 'checkout', '--detach'], cwd=lane)
+
+        # === THE CALL UNDER TEST ===
+        # Use an invalid branch name — git rejects these reliably
+        # (double-dots are not allowed in branch names per git-check-ref-format)
+        result = await git_ops.rebind_branch_to_head(lane, 'task/in..valid..name')
+
+        # Must return False (best-effort contract) — never raise
+        assert result is False, (
+            f'rebind_branch_to_head must return False when git checkout -B fails '
+            f'(invalid branch name), got {result!r}'
+        )
+
+        # Lane HEAD must be intact — the rebased WIP is not destroyed by a failed rebind
+        rc_head, _, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        assert rc_head == 0, 'Lane HEAD must be resolvable after a failed rebind'
+
+    async def test_rebind_succeeds_even_when_branch_checked_out_in_other_worktree(
+        self, git_repo: Path,
+    ):
+        """(d) Documents the actual collision behavior on git 2.43.0.
+
+        git checkout -B bypasses the linked-worktree single-checkout guard.
+        When *full_branch* is concurrently checked out in a second live
+        worktree, the call still returns True (rc=0) and force-resets the
+        branch ref — leaving BOTH worktrees tracking the same branch.
+        This is a duplicate-dispatch hazard, NOT the fail-safe the original
+        docstring claimed (esc-1923-18).  The test pins this actual behavior
+        so any future git version change that restores a non-zero rc for the
+        collision case is immediately surfaced.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # Acquire a lane on task/C and commit WIP
+        info = await git_ops.acquire_warm_lane('C', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        (lane / 'col_wip.txt').write_text('collision test\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'collision wip'], cwd=lane)
+
+        _, lane_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        lane_head = lane_head_raw.strip()
+
+        # Create a SECOND worktree also on task/C (requires --force since task/C
+        # is already checked out in the first lane)
+        second_wt = git_repo / 'col_second_wt'
+        rc_add, _, err_add = await _run(
+            ['git', 'worktree', 'add', '--force', str(second_wt), 'task/C'],
+            cwd=git_repo,
+        )
+        assert rc_add == 0, f'git worktree add --force failed: {err_add}'
+
+        # Confirm second worktree is on task/C
+        _, second_branch_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=second_wt,
+        )
+        assert second_branch_raw.strip() == 'task/C', (
+            f'Second worktree should be on task/C, got {second_branch_raw.strip()!r}'
+        )
+
+        # Detach the FIRST lane (mirrors release_warm_lane)
+        await _run(['git', 'checkout', '--detach'], cwd=lane)
+
+        # === THE CALL UNDER TEST ===
+        # task/C is checked out in second_wt — checkout -B does NOT refuse it
+        result = await git_ops.rebind_branch_to_head(lane, 'task/C')
+
+        # On git 2.43.0: rc=0 (bypasses single-checkout guard)
+        assert result is True, (
+            f'rebind_branch_to_head returned {result!r} when task/C is checked out '
+            f'in a second worktree.  Expected True — checkout -B bypasses the '
+            f'single-checkout guard and does NOT fail safe for this collision.  '
+            f'If git changed this behavior, update the docstring + this assertion.'
+        )
+
+        # The ref was force-moved to the first lane's current HEAD
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/C'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == lane_head, (
+            f'refs/heads/task/C must be moved to first-lane HEAD ({lane_head[:8]}), '
+            f'got {ref_sha_raw.strip()[:8]}'
+        )
+
+        # The first lane is now attached to task/C
+        _, attached_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert attached_raw.strip() == 'task/C', (
+            f'First lane must be ON task/C after rebind, got {attached_raw.strip()!r}'
+        )
+
+        # Clean up the second worktree
+        await _run(['git', 'worktree', 'remove', '--force', str(second_wt)], cwd=git_repo)
+
+
+# ===========================================================================
+# Task-1923 step-5: RED — disk-backstop route end-to-end via acquire_warm_lane
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireDiskBackstopReuseDetachedRebind:
+    """End-to-end test of the PROVEN residual route: disk-backstop reuse (route 2)
+    on an already-detached lane.
+
+    RED today (before step-4 fix): after release_warm_lane detaches the lane,
+    re-acquire via disk-backstop calls _reuse_warm_lane on a DETACHED HEAD,
+    the ref stays stale (0-beyond-main), and the second release_warm_lane
+    DELETES task/D (α's retention guard sees 0 commits and deletes it).
+
+    GREEN after step-4 inserted rebind_branch_to_head in _reuse_warm_lane.
+    """
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_disk_backstop_reuse_on_detached_lane_retains_on_second_release(
+        self, git_repo: Path,
+    ):
+        """After release(detach) → re-acquire-via-disk-backstop → second release:
+        task/D must be RETAINED by α (not deleted as 0-beyond-main).
+
+        Sequence:
+        1. Acquire lane on 'D', write .task/plan.json, commit WIP commit
+        2. Advance main
+        3. release_warm_lane('D') → detach + retain task/D (WIP > 0) + FREE
+        4. acquire_warm_lane('D', main_HEAD) → disk-backstop route (route 2)
+        5. Assert: WorktreeInfo; refs/heads/task/D == lane HEAD; lane ON task/D
+        6. release_warm_lane('D') again → MUST RETAIN task/D (α protects rebased work)
+
+        Acceptance criteria 1+2 from the plan.
+        """
+        import json as _json
+
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # Step 1: Acquire lane on 'D', write plan.json, commit WIP
+        info = await git_ops.acquire_warm_lane('D', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        # Write .task/plan.json with task_id='D' (forces disk-backstop route on re-acquire)
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': 'D'}))
+
+        # Commit WIP so task/D has commits beyond main
+        (lane / 'wip_d.txt').write_text('work for task D\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'wip for D'], cwd=lane)
+
+        # Step 2: Advance main with an unrelated commit
+        (git_repo / 'main_advance.txt').write_text('main advance\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'advance main'], cwd=git_repo)
+
+        _, main_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        main_head = main_head_raw.strip()
+
+        # Step 3: release_warm_lane → detach + retain + FREE
+        await git_ops.release_warm_lane(lane, 'D')
+
+        # Verify: detached, task/D retained, plan.json intact
+        _, abbrev_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert abbrev_raw.strip() == 'HEAD', (
+            f'Lane should be DETACHED after release, got {abbrev_raw.strip()!r}'
+        )
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
+        )
+        assert rc_verify == 0, 'task/D must be RETAINED after first release (α)'
+        assert (task_dir / 'plan.json').exists(), (
+            'plan.json must survive release_warm_lane (used by disk-backstop re-acquire)'
+        )
+
+        # Step 4: re-acquire via disk-backstop route
+        # (pool sees lane as FREE+registered with plan.json task_id=='D' → route 2)
+        info2 = await git_ops.acquire_warm_lane('D', main_head)
+
+        # Step 5: assertions on re-acquire result
+        assert isinstance(info2, WorktreeInfo), (
+            f'Re-acquire must return WorktreeInfo via disk-backstop route, got {info2!r}'
+        )
+        assert info2.path == lane, (
+            f'Re-acquire must reuse same lane ({lane}), got {info2.path}'
+        )
+
+        # refs/heads/task/D must equal lane HEAD (the rebind closed the drift)
+        rc_verify2, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
+        )
+        assert rc_verify2 == 0, (
+            'task/D must resolve after disk-backstop re-acquire '
+            '(RED today: rebind missing, ref stays stale and α deletes it)'
+        )
+
+        _, lane_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        lane_head = lane_head_raw.strip()
+
+        _, ref_raw, _ = await _run(['git', 'rev-parse', 'task/D'], cwd=git_repo)
+        assert ref_raw.strip() == lane_head, (
+            f'task/D ({ref_raw.strip()[:8]}) must equal lane HEAD ({lane_head[:8]}) '
+            f'after disk-backstop re-acquire '
+            f'(RED today: ref drifts from rebased detached HEAD)'
+        )
+
+        # Lane must be ON task/D (attached)
+        _, abbrev2_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert abbrev2_raw.strip() == 'task/D', (
+            f'Lane must be ON task/D after re-acquire, got {abbrev2_raw.strip()!r}'
+        )
+
+        # Step 6: second release_warm_lane — must RETAIN task/D (acceptance 1+2)
+        await git_ops.release_warm_lane(lane, 'D')
+
+        rc_verify3, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
+        )
+        assert rc_verify3 == 0, (
+            'task/D must be RETAINED after second release_warm_lane — α must '
+            'protect the real rebased commits '
+            '(RED today: α sees 0-beyond-main on stale ref and deletes task/D)'
+        )
+
+        _, count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/D'], cwd=git_repo,
+        )
+        count = int(count_raw.strip())
+        assert count > 0, (
+            f'task/D must carry commits beyond main after second release (α retained it), '
+            f'got count={count}'
+        )
+
+
+# ===========================================================================
+# Task-1923 step-3: RED — _reuse_warm_lane on a DETACHED lane rebinds ref
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestReuseWarmLaneBranchAware:
+    """_reuse_warm_lane called on a DETACHED lane must rebind refs/heads/task/R
+    to the lane HEAD after commit()+rebase_onto_main.
+
+    RED today: _reuse_warm_lane runs commit+rebase on the detached HEAD but
+    never rebinds refs/heads/task/R — the ref stays at the pre-detach tip
+    (which diverges from the rebased detached HEAD).
+    GREEN after step-4 inserts rebind_branch_to_head inside _reuse_warm_lane.
+    """
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_reuse_on_detached_lane_rebinds_ref_and_attaches(
+        self, git_repo: Path,
+    ):
+        """_reuse_warm_lane on a detached lane:
+        (a) returns WorktreeInfo (not an error)
+        (b) refs/heads/task/R resolves (rc==0) AND equals the lane HEAD
+        (c) lane is ON task/R (--abbrev-ref HEAD == 'task/R')
+        (d) task/R carries commits beyond main (rebase preserved the WIP)
+        (e) the uncommitted WIP file (added before _reuse_warm_lane) is reachable
+            from task/R (commit() committed it during _reuse_warm_lane)
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # Acquire a lane on task/R with an initial committed WIP commit (1 beyond main)
+        info = await git_ops.acquire_warm_lane('R', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        (lane / 'initial_wip.txt').write_text('initial work\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'initial wip commit'], cwd=lane)
+
+        # Advance main with an unrelated commit (so rebase_onto_main has work to do)
+        (git_repo / 'main_advance.txt').write_text('main advance\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'advance main'], cwd=git_repo)
+
+        # Remember pre-detach tip of task/R (this is the STALE ref after detach)
+        _, pre_detach_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/R'], cwd=git_repo,
+        )
+        pre_detach_sha = pre_detach_sha_raw.strip()
+
+        # Detach the lane (mirrors what release_warm_lane does)
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=lane)
+        assert rc == 0, f'checkout --detach failed: {err}'
+
+        # Confirm detached AND that task/R ref still points at pre-detach tip
+        _, abbrev_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert abbrev_raw.strip() == 'HEAD', (
+            f'Lane should be DETACHED before _reuse_warm_lane, got {abbrev_raw.strip()!r}'
+        )
+        _, ref_before_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/R'], cwd=git_repo,
+        )
+        assert ref_before_raw.strip() == pre_detach_sha, (
+            'refs/heads/task/R should still point at pre-detach tip before _reuse_warm_lane'
+        )
+
+        # Add uncommitted WIP on the detached lane (to be committed by _reuse_warm_lane)
+        (lane / 'new_wip.txt').write_text('new work on detached lane\n')
+
+        # === THE CALL UNDER TEST ===
+        result = await git_ops._reuse_warm_lane(lane, 'task/R')
+
+        # (a) Returns WorktreeInfo
+        assert isinstance(result, WorktreeInfo), (
+            f'_reuse_warm_lane must return WorktreeInfo on a detached lane, got {result!r}'
+        )
+
+        # (b) refs/heads/task/R resolves and equals lane HEAD
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'refs/heads/task/R'], cwd=git_repo,
+        )
+        assert rc_verify == 0, (
+            'refs/heads/task/R must resolve after _reuse_warm_lane on a detached lane '
+            '(RED today: ref stays at stale pre-detach tip which was deleted by α)'
+        )
+
+        _, lane_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        lane_head = lane_head_raw.strip()
+
+        _, ref_after_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/R'], cwd=git_repo,
+        )
+        assert ref_after_raw.strip() == lane_head, (
+            f'refs/heads/task/R ({ref_after_raw.strip()[:8]}) must equal lane HEAD '
+            f'({lane_head[:8]}) after _reuse_warm_lane '
+            f'(RED today: ref drifts from rebased detached HEAD)'
+        )
+
+        # (c) Lane is ON task/R (attached, not detached)
+        _, attached_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert attached_raw.strip() == 'task/R', (
+            f'Lane must be ON task/R after _reuse_warm_lane, got {attached_raw.strip()!r}'
+        )
+
+        # (d) task/R carries commits beyond main
+        _, count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/R'], cwd=git_repo,
+        )
+        count = int(count_raw.strip())
+        assert count > 0, (
+            f'task/R must carry commits beyond main after _reuse_warm_lane, got {count}'
+        )
+
+        # (e) New WIP file is reachable from task/R (was committed during _reuse)
+        rc_show, _, _ = await _run(
+            ['git', 'show', 'task/R:new_wip.txt'], cwd=git_repo,
+        )
+        assert rc_show == 0, (
+            'new_wip.txt must be reachable from task/R after _reuse_warm_lane '
+            '(commit() in _reuse_warm_lane committed the uncommitted WIP file)'
+        )
