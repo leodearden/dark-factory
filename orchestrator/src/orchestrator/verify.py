@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 from shared.proc_group import terminate_process_group
 
@@ -1682,6 +1682,18 @@ class ClockStopConfig:
     max_total_secs: float = 0.0
 
 
+class _ScopeKw(TypedDict, total=False):
+    """Keyword arguments for the cgroup-scope path in ``_run_cmd``."""
+
+    use_cgroup_scope: bool
+
+
+class _ClockKw(TypedDict, total=False):
+    """Keyword arguments for the clock-stop path in ``_run_cmd``."""
+
+    clock_stop: ClockStopConfig | None
+
+
 def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
     """Return 'stop', 'heartbeat', or 'start' if *line* contains the respective
     configured marker string; else None.
@@ -2294,12 +2306,12 @@ async def run_verification(
         t0 = time.monotonic()
         # Pass use_cgroup_scope only when enabled so the default-off call
         # signature stays byte-identical (test doubles stub the legacy kwargs).
-        _scope_kw = (
+        _scope_kw: _ScopeKw = (
             {'use_cgroup_scope': True} if config.verify_use_cgroup_scope else {}
         )
         # Pass clock_stop only when enabled (mirrors _scope_kw pattern) so the
         # default-off call signature stays byte-identical for existing test doubles.
-        _clock_kw = (
+        _clock_kw: _ClockKw = (
             {
                 'clock_stop': ClockStopConfig(
                     marker_stop=config.verify_clock_stop_marker_stop,

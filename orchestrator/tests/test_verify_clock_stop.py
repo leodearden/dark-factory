@@ -11,7 +11,6 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 from importlib import resources as pkg_resources
 from pathlib import Path
 
@@ -509,7 +508,7 @@ class TestClockStopWiring:
     async def test_run_cmd_gets_clock_stop_when_enabled(self, tmp_path: Path):
         """When verify_clock_stop_enabled=True, _run_cmd is called with a
         ClockStopConfig whose fields match the config values."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         from orchestrator.verify import ClockStopConfig, run_verification
 
