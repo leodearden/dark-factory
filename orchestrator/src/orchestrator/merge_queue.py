@@ -2492,14 +2492,15 @@ async def _classify_branch_presence(
 
     **Worktree-HEAD fallback**: when *worktree* is supplied (keyword-only) and
     the ref is absent with no merge marker, BEFORE emitting unknown_branch this
-    function checks whether the worktree's HEAD carries commits beyond main.
-    If ``git rev-parse HEAD`` succeeds in *worktree* and the resulting SHA is
-    NOT an ancestor of main (i.e. there are unmerged commits), it returns
-    ``None`` (proceed) without emitting a merge_attempt.  This allows
-    ``merge_to_main``'s worktree-HEAD fallback to land those commits.
-    If *worktree* is None, the worktree is unreadable (rc≠0 from rev-parse),
-    or the HEAD is already an ancestor of main, the function falls through to
-    the original ``unknown_branch`` outcome — failing safe to today's behavior.
+    function checks whether the worktree's HEAD carries commits beyond main via
+    :meth:`GitOps.worktree_head_beyond_main` (the shared helper also used by
+    :meth:`GitOps.merge_to_main`).  When that helper returns a non-None SHA
+    (i.e. HEAD is not an ancestor of main), this function returns ``None``
+    (proceed) without emitting a merge_attempt, allowing ``merge_to_main``'s
+    worktree-HEAD fallback to land those commits.
+    If *worktree* is None, the worktree is unreadable, or HEAD is already an
+    ancestor of main, the function falls through to the original
+    ``unknown_branch`` outcome — failing safe to today's behavior.
     """
     # ── Live-ref check via canonical resolver ─────────────────────────────
     if await git_ops.resolve_queued_branch_ref(branch) is not None:
@@ -2542,18 +2543,15 @@ async def _classify_branch_presence(
             sym_ref.endswith('/' + prefixed) or sym_ref.endswith('/' + branch)
         )
 
-        if branch_matches:
-            rc_head, head_sha, _ = await _run(
-                ['git', 'rev-parse', 'HEAD'], cwd=worktree,
-            )
-            if rc_head == 0:
-                head_sha = head_sha.strip()
-                main_sha = await git_ops.get_main_sha()
-                if not await git_ops.is_ancestor(head_sha, main_sha):
-                    # HEAD carries commits beyond main — this is not a misroute.
-                    # Return None (proceed); merge_to_main uses the worktree-HEAD
-                    # fallback as the merge source.
-                    return None
+        # Use the shared helper so the proceed-decision here and the
+        # merge-source-selection in merge_to_main share one source of truth
+        # for "worktree HEAD carries commits beyond main".  The branch_matches
+        # guard short-circuits before the async helper on a misrouted worktree.
+        if branch_matches and await git_ops.worktree_head_beyond_main(worktree) is not None:
+            # HEAD carries commits beyond main — this is not a misroute.
+            # Return None (proceed); merge_to_main uses the worktree-HEAD
+            # fallback as the merge source.
+            return None
 
     # ── Genuine misroute ───────────────────────────────────────────────────
     _emit_merge_attempt(

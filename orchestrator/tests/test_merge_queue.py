@@ -2186,6 +2186,7 @@ class TestMergeWorker:
 
         req = _make_request('misroute', 'misroute-test', wt, config)
 
+        pre_main_sha = await git_ops.get_main_sha()
         outcome = await worker._do_merge(req)
 
         assert outcome is not None
@@ -2194,11 +2195,12 @@ class TestMergeWorker:
             f'got {outcome.status!r}'
         )
 
-        # The misroute file must NOT be on main (nothing to merge)
-        rc, _, _ = await _run(
-            ['git', 'show', 'main:misroute_work.py'], cwd=git_ops.project_root,
+        # Prove that no merge commit was created: main must be unchanged.
+        post_main_sha = await git_ops.get_main_sha()
+        assert pre_main_sha == post_main_sha, (
+            'No merge commit should be created for a misrouted request; '
+            f'main advanced from {pre_main_sha!r} to {post_main_sha!r}'
         )
-        assert rc != 0, 'No file should land on main for a misrouted request'
 
 
 # ---------------------------------------------------------------------------

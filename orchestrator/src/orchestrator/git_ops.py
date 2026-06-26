@@ -3128,6 +3128,42 @@ class GitOps:
         )
         return rc == 0
 
+    async def worktree_head_beyond_main(self, worktree: Path) -> str | None:
+        """Return the HEAD SHA when *worktree* carries commits beyond main, else None.
+
+        Resolves ``HEAD`` in *worktree* via ``git rev-parse HEAD`` and returns
+        the stripped SHA only when it is **not** an ancestor of main (i.e. the
+        worktree holds unmerged commits).  Returns ``None`` when:
+
+        * the worktree directory cannot be read (``git rev-parse`` rc≠0), or
+        * the HEAD commit is already an ancestor of (or equal to) main.
+
+        This is the single source of truth for the absent-ref fallback shared
+        by :meth:`merge_to_main` (merge-source selection) and
+        :func:`_classify_branch_presence` (proceed-vs-misroute decision).
+        Extracting it here keeps both callers in lockstep: a future change to
+        the "beyond main" definition only needs to be made in one place.
+
+        .. note::
+            This method does **not** check which branch the worktree is
+            attached to.  The ``_classify_branch_presence`` function runs the
+            symbolic-ref misroute guard before calling this helper, so the
+            branch-identity vetting is handled there.  Callers invoking
+            :meth:`merge_to_main` directly are responsible for ensuring the
+            worktree belongs to the intended task before relying on this
+            fallback.
+        """
+        rc_head, head_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+        )
+        if rc_head != 0:
+            return None
+        head_sha = head_sha_raw.strip()
+        main_sha = await self.get_main_sha()
+        if not await self.is_ancestor(head_sha, main_sha):
+            return head_sha
+        return None
+
     async def has_uncommitted_work(self, worktree: Path) -> bool:
         """Return True if worktree has staged or unstaged changes outside .task/."""
         rc, output, _ = await _run(
@@ -3274,42 +3310,36 @@ class GitOps:
         **Absent-ref fallback**: when ``resolve_queued_branch_ref(branch)``
         returns None (the named ``task/<id>`` ref was deleted while the work
         still sat in the worktree), the merge SOURCE is derived from the
-        worktree HEAD via ``git rev-parse HEAD``.  The merge-commit subject
-        remains the canonical ``Merge task/<id> into main`` form so that
-        ``find_merge_marker`` keeps already_merged idempotency on re-dispatch.
-        If the worktree HEAD cannot be resolved (rc≠0), the prior ``full_branch``
-        fallback is preserved so a genuine misroute still fails loudly.
+        worktree HEAD via :meth:`worktree_head_beyond_main`.  The merge-commit
+        subject remains the canonical ``Merge task/<id> into main`` form so
+        that ``find_merge_marker`` keeps already_merged idempotency on
+        re-dispatch.  If the worktree HEAD cannot be resolved or is already an
+        ancestor of main, the prior ``full_branch`` fallback is preserved so a
+        genuine misroute still fails loudly.
+
+        **Misroute note**: this method does not replicate the symbolic-ref
+        branch-name guard that :func:`_classify_branch_presence` performs.  In
+        the normal MergeWorker flow ``_classify_branch_presence`` runs first
+        and rejects attached-HEAD misroutes before this method is reached.
+        Callers invoking ``merge_to_main`` directly are responsible for
+        ensuring the worktree belongs to the intended task.
         """
         resolved = await self.resolve_queued_branch_ref(branch)
         full_branch = resolved or f'{self.config.branch_prefix}{branch}'
 
         # Derive the merge source: prefer the named ref; when absent, fall back
-        # to the worktree HEAD SHA so commits present in the worktree can still
-        # land on main without the named branch ref.
-        #
-        # Safety guard: only use the worktree HEAD as fallback when it actually
-        # carries commits beyond main.  A HEAD that is already an ancestor of
-        # main (e.g. the project root on the main branch) would produce an
-        # "Already up to date" no-op merge instead of the expected failure for
-        # a genuinely absent ref — so we fall back to full_branch in that case
-        # to let git fail loudly with "not something we can merge".
-        merge_source: str
-        if resolved is not None:
-            merge_source = resolved
-        else:
-            rc_head, head_sha, _ = await _run(
-                ['git', 'rev-parse', 'HEAD'], cwd=worktree,
-            )
-            if rc_head == 0:
-                head_sha = head_sha.strip()
-                _main_sha = await self.get_main_sha()
-                if not await self.is_ancestor(head_sha, _main_sha):
-                    merge_source = head_sha
-                else:
-                    # HEAD is at or behind main — not a useful fallback source.
-                    merge_source = full_branch
-            else:
-                merge_source = full_branch
+        # to the worktree HEAD SHA via the shared helper so the proceed-decision
+        # in _classify_branch_presence and the source-selection here stay in
+        # lockstep (both call worktree_head_beyond_main).
+        # Derive the merge source: prefer the named ref; when absent, fall back
+        # to the worktree HEAD SHA via the shared helper so the proceed-decision
+        # in _classify_branch_presence and the source-selection here stay in
+        # lockstep (both call worktree_head_beyond_main).
+        # If the helper returns None (HEAD on/behind main, or unreadable worktree)
+        # we fall back to full_branch so git fails loudly with "not something we
+        # can merge" — preserving the genuine-misroute signal.
+        _head_sha = None if resolved is not None else await self.worktree_head_beyond_main(worktree)
+        merge_source: str = resolved or _head_sha or full_branch
 
         merge_wt: Path | None = None
 
