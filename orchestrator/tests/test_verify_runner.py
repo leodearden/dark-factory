@@ -4120,7 +4120,13 @@ class TestRemoteRunnerStderrArchival:
         return runner, fail_result
 
     async def test_failure_with_stderr_writes_one_file(self, tmp_path):
-        """Failed result + non-empty ssh_stderr → one .stderr.log under <archive_root>/<task_id>."""
+        """Failed result + non-empty ssh_stderr → one .stderr.log under <archive_root>/<task_id>.
+
+        task-1921 note: the task_id directory now also contains stream files
+        (.test-*.log, summary-*.json) written by _archive_failure_streams.
+        This test verifies specifically that the .stderr.log is written correctly
+        (not the total file count, which changed in task-1921).
+        """
         runner, fail_result = self._make_runner('REMOTE STDERR DETAIL')
 
         result = await runner.run_merge_verify(
@@ -4130,19 +4136,17 @@ class TestRemoteRunnerStderrArchival:
         # VerifyResult must be returned UNCHANGED (PRD §A Invariant 5)
         assert result == fail_result
 
-        # Exactly one file under tmp_path / '1920'
+        # task_id directory must exist
         task_dir = tmp_path / '1920'
         assert task_dir.is_dir(), f'Expected {task_dir} to be a directory'
-        files = list(task_dir.iterdir())
-        assert len(files) == 1, f'Expected 1 file, got {[f.name for f in files]}'
 
-        # Filename shape: attempt-1.remote-leo-laptop-<utc_ts>.stderr.log
-        fname = files[0].name
+        # Exactly one .stderr.log file with the correct filename shape and content
+        stderr_files = list(task_dir.glob('attempt-1.remote-leo-laptop-*.stderr.log'))
+        assert len(stderr_files) == 1, f'Expected 1 stderr.log, got {[f.name for f in stderr_files]}'
+        fname = stderr_files[0].name
         assert fname.startswith('attempt-1.remote-leo-laptop-'), f'Bad prefix: {fname!r}'
         assert fname.endswith('.stderr.log'), f'Bad suffix: {fname!r}'
-
-        # Content must be the raw ssh_stderr
-        assert files[0].read_text(encoding='utf-8') == 'REMOTE STDERR DETAIL'
+        assert stderr_files[0].read_text(encoding='utf-8') == 'REMOTE STDERR DETAIL'
 
     # step-3 negative cases
     async def test_passing_result_writes_no_file(self, tmp_path):
@@ -4176,13 +4180,21 @@ class TestRemoteRunnerStderrArchival:
         assert not task_dir.exists(), f'Expected no archive dir, found {list(task_dir.iterdir()) if task_dir.exists() else "nothing"}'
 
     async def test_whitespace_only_stderr_writes_no_file(self, tmp_path):
-        """Failed verify with whitespace-only ssh_stderr → NO file written (strip guard)."""
+        """Failed verify with whitespace-only ssh_stderr → NO .stderr.log written (strip guard).
+
+        task-1921 note: stream files (.test-*.log, summary-*.json) may still be written
+        by _archive_failure_streams when the VerifyResult has non-empty output streams.
+        This test verifies specifically that the .stderr.log is NOT written
+        (the ssh_stderr strip guard is the contract being tested here).
+        """
         runner, _ = self._make_runner('   \n  ')
 
         await runner.run_merge_verify('abc123', _make_spec(), task_id='1920', archive_root=tmp_path)
 
         task_dir = tmp_path / '1920'
-        assert not task_dir.exists(), 'Expected no archive dir for whitespace stderr'
+        # No .stderr.log files (the strip guard must have suppressed stderr archival)
+        stderr_files = list(task_dir.glob('*.stderr.log')) if task_dir.exists() else []
+        assert stderr_files == [], f'Expected no .stderr.log files, got {stderr_files}'
 
     # step-5 archival-error-is-swallowed
     async def test_archival_error_is_swallowed_result_unchanged(self, tmp_path):
@@ -4199,4 +4211,323 @@ class TestRemoteRunnerStderrArchival:
         )
 
         # VerifyResult is returned unchanged
+        assert result == fail_result
+
+
+# ---------------------------------------------------------------------------
+# task-1921: TestRemoteRunnerStreamArchival
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerStreamArchival:
+    """RemoteRunner archives test/lint/type output streams on failure (task 1921).
+
+    Mirrors _archive_merge_verify_logs via a synthetic runs projection.
+    Filename pattern: attempt-1.remote-<name>.{label}-<utc_ts>.log
+                      attempt-1.remote-<name>.summary-<utc_ts>.json
+    """
+
+    def _make_runner(self, fail_result, *, name='leo-laptop', ssh_stderr=''):
+        """Build a RemoteRunner whose fake run returns git→(0,'','') and ssh→(0,json,ssh_stderr)."""
+        _result_json = result_to_json(fail_result)
+        _it = iter([
+            (0, '', ''),                             # git push (load-bearing)
+            (0, _result_json, ssh_stderr),           # ssh verify
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            # ref cleanup push (best-effort, inside contextlib.suppress)
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        runner = RemoteRunner(
+            name=name,
+            ssh_host=f'{name}.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'test-id',
+        )
+        return runner, fail_result
+
+    # (a) single non-empty stream: test_output only
+    async def test_single_stream_test_output_writes_one_log_file(self, tmp_path):
+        """Failure + non-empty test_output → one .test-*.log file; no lint/type files."""
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED TEST OUTPUT', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1921', archive_root=tmp_path,
+        )
+
+        # VerifyResult must be returned UNCHANGED (PRD §A Invariant 5)
+        assert result == fail_result
+
+        task_dir = tmp_path / '1921'
+        assert task_dir.is_dir(), f'Expected {task_dir} to exist'
+
+        # Exactly one .test-*.log file
+        test_files = list(task_dir.glob('attempt-1.remote-leo-laptop.test-*.log'))
+        assert len(test_files) == 1, f'Expected 1 test log, got {[f.name for f in test_files]}'
+        assert test_files[0].read_text(encoding='utf-8') == 'FAILED TEST OUTPUT'
+
+        # No lint or type log files
+        lint_files = list(task_dir.glob('attempt-1.remote-*.lint-*.log'))
+        type_files = list(task_dir.glob('attempt-1.remote-*.type-*.log'))
+        assert lint_files == [], f'Unexpected lint files: {lint_files}'
+        assert type_files == [], f'Unexpected type files: {type_files}'
+
+    # (a2) single non-empty stream: lint_output only — closes the label-mapping matrix
+    async def test_single_stream_lint_output_writes_one_log_file(self, tmp_path):
+        """Failure + non-empty lint_output (test/type empty) → one .lint-*.log; no test/type files.
+
+        Guards the per-stream loop against a label-mapping regression on the lint branch.
+        """
+        fail_result = VerifyResult(
+            passed=False, test_output='', lint_output='LINT ERROR: unused import', type_output='',
+            summary='lint fail', category='lint_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1921', archive_root=tmp_path,
+        )
+
+        # VerifyResult must be returned UNCHANGED (PRD §A Invariant 5)
+        assert result == fail_result
+
+        task_dir = tmp_path / '1921'
+        assert task_dir.is_dir(), f'Expected {task_dir} to exist'
+
+        # Exactly one .lint-*.log file
+        lint_files = list(task_dir.glob('attempt-1.remote-leo-laptop.lint-*.log'))
+        assert len(lint_files) == 1, f'Expected 1 lint log, got {[f.name for f in lint_files]}'
+        assert lint_files[0].read_text(encoding='utf-8') == 'LINT ERROR: unused import'
+
+        # No test or type log files
+        test_files = list(task_dir.glob('attempt-1.remote-*.test-*.log'))
+        type_files = list(task_dir.glob('attempt-1.remote-*.type-*.log'))
+        assert test_files == [], f'Unexpected test files: {test_files}'
+        assert type_files == [], f'Unexpected type files: {type_files}'
+
+    # (b) multi-stream: test_output + type_output + summary sidecar
+    async def test_multi_stream_test_and_type_output(self, tmp_path):
+        """Failure + non-empty test_output and type_output → two .log files + one summary.json."""
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED TESTS', lint_output='', type_output='TYPE ERRORS',
+            summary='multiple failures', category='test_failure', cause_hint='assertion error',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1921', archive_root=tmp_path,
+        )
+
+        assert result == fail_result
+
+        task_dir = tmp_path / '1921'
+        assert task_dir.is_dir()
+
+        # Two stream files
+        test_files = list(task_dir.glob('attempt-1.remote-leo-laptop.test-*.log'))
+        type_files = list(task_dir.glob('attempt-1.remote-leo-laptop.type-*.log'))
+        assert len(test_files) == 1, f'Expected 1 test log, got {test_files}'
+        assert len(type_files) == 1, f'Expected 1 type log, got {type_files}'
+        assert test_files[0].read_text(encoding='utf-8') == 'FAILED TESTS'
+        assert type_files[0].read_text(encoding='utf-8') == 'TYPE ERRORS'
+
+        # Exactly one summary.json
+        summary_files = list(task_dir.glob('attempt-1.remote-leo-laptop.summary-*.json'))
+        assert len(summary_files) == 1, f'Expected 1 summary, got {summary_files}'
+        import json as _json
+        summary = _json.loads(summary_files[0].read_text(encoding='utf-8'))
+        assert 'category' in summary, 'Summary missing category'
+        assert 'timed_out' in summary, 'Summary missing timed_out'
+        assert 'commands' in summary, 'Summary missing commands'
+
+    # (c) passing result → no archive dir
+    async def test_passing_result_writes_no_files(self, tmp_path):
+        """Passing remote verify (passed=True) → no archive dir written."""
+        pass_result = VerifyResult(
+            passed=True, test_output='all tests pass', lint_output='clean', type_output='no errors',
+            summary='ok', category='',
+        )
+        _result_json = result_to_json(pass_result)
+        _it = iter([
+            (0, '', ''),
+            (0, _result_json, ''),
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        runner = RemoteRunner(
+            name='leo-laptop', ssh_host='leo-laptop.local', git_remote='origin',
+            cwd='/repo', run=fake_run, id_factory=lambda: 'test-id',
+        )
+
+        await runner.run_merge_verify('abc123', _make_spec(), task_id='1921', archive_root=tmp_path)
+
+        task_dir = tmp_path / '1921'
+        assert not task_dir.exists(), f'Expected no archive dir for passing result, got {task_dir}'
+
+    # (d) failure with all-empty streams → no file and no summary
+    async def test_all_empty_streams_failure_writes_nothing(self, tmp_path):
+        """Failure with all-empty streams → early-return; no stream file and no summary."""
+        fail_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='failed but no output', category='test_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        await runner.run_merge_verify('abc123', _make_spec(), task_id='1921', archive_root=tmp_path)
+
+        task_dir = tmp_path / '1921'
+        # With all-empty streams AND empty ssh_stderr the dir must never be created.
+        # Asserting directly (not under `if exists`) ensures the check runs unconditionally:
+        # removing the early-return would create the dir + summary.json, making this fail.
+        assert not task_dir.exists(), (
+            f'Expected no archive dir for all-empty streams; found: '
+            f'{sorted(p.name for p in task_dir.iterdir()) if task_dir.exists() else []}'
+        )
+
+    # (e) distinguishability: timeout vs real failure summaries differ
+    async def test_distinguishability_timeout_vs_test_failure(self, tmp_path):
+        """timed_out=True/infra_timeout and timed_out=False/test_failure produce different summaries."""
+        import json as _json
+
+        # timeout result
+        timeout_result = VerifyResult(
+            passed=False, test_output='TIMED OUT', lint_output='', type_output='',
+            summary='timed out', category='infra_timeout', timed_out=True,
+        )
+        runner_a, _ = self._make_runner(timeout_result, name='leo-laptop')
+        await runner_a.run_merge_verify(
+            'abc123', _make_spec(), task_id='timeout-task', archive_root=tmp_path,
+        )
+
+        # real test failure result (separate task_id to avoid filename collision)
+        fail_result = VerifyResult(
+            passed=False, test_output='ASSERTION FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure', timed_out=False,
+        )
+        runner_b, _ = self._make_runner(fail_result, name='leo-laptop')
+        await runner_b.run_merge_verify(
+            'abc123', _make_spec(), task_id='fail-task', archive_root=tmp_path,
+        )
+
+        timeout_dir = tmp_path / 'timeout-task'
+        fail_dir = tmp_path / 'fail-task'
+
+        timeout_summary_files = list(timeout_dir.glob('attempt-1.remote-*.summary-*.json'))
+        fail_summary_files = list(fail_dir.glob('attempt-1.remote-*.summary-*.json'))
+
+        assert len(timeout_summary_files) == 1, f'Expected 1 timeout summary, got {timeout_summary_files}'
+        assert len(fail_summary_files) == 1, f'Expected 1 fail summary, got {fail_summary_files}'
+
+        timeout_summary = _json.loads(timeout_summary_files[0].read_text(encoding='utf-8'))
+        fail_summary = _json.loads(fail_summary_files[0].read_text(encoding='utf-8'))
+
+        # timed_out must differ
+        assert timeout_summary['timed_out'] is True, f'Expected timed_out=True, got {timeout_summary["timed_out"]}'
+        assert fail_summary['timed_out'] is False, f'Expected timed_out=False, got {fail_summary["timed_out"]}'
+
+        # category must differ
+        assert timeout_summary['category'] == 'infra_timeout', f'Unexpected category: {timeout_summary["category"]}'
+        assert fail_summary['category'] == 'test_failure', f'Unexpected category: {fail_summary["category"]}'
+
+    # (f) unwritable archive_root → archival swallowed; result unchanged
+    async def test_unwritable_archive_root_swallowed_result_unchanged(self, tmp_path):
+        """Unwritable archive_root (file where dir should go) → swallowed; result unchanged."""
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        # Place a regular FILE at the path where the task_id directory would be created
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('x')
+
+        # Must NOT raise; must return fail_result unchanged
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='blocker', archive_root=blocker,
+        )
+
+        assert result == fail_result
+
+    # (g) local-only pool regression: no remote stream files written
+    async def test_local_only_pool_writes_no_remote_stream_logs(self, tmp_path):
+        """Local-only pool (2-arg fake, not RemoteRunner): no remote stream files written."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+
+        # 2-arg fake (matches existing LocalRunner / test-double signature)
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+
+        async def local_run_merge_verify(sha, spec):
+            return fail_result
+
+        local_fake.run_merge_verify = AsyncMock(side_effect=local_run_merge_verify)
+
+        pool = VerifyRunnerPool(
+            [local_fake],
+            task_id='1921',
+            archive_root=tmp_path,
+        )
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result == fail_result
+
+        # No remote stream log files anywhere under tmp_path
+        remote_stream_logs = list(tmp_path.rglob('attempt-1.remote-*.test-*.log'))
+        remote_stream_logs += list(tmp_path.rglob('attempt-1.remote-*.lint-*.log'))
+        remote_stream_logs += list(tmp_path.rglob('attempt-1.remote-*.type-*.log'))
+        assert remote_stream_logs == [], f'Unexpected remote stream logs: {remote_stream_logs}'
+
+    # step-3: non-OSError archival exception is swallowed; result unchanged
+    async def test_stream_archival_exception_is_swallowed_result_unchanged(self, tmp_path, monkeypatch):
+        """Non-OSError in _archive_failure_streams → swallowed; VerifyResult returned unchanged.
+
+        Monkeypatches orchestrator.verify_runner._archive_merge_verify_logs to raise
+        RuntimeError('boom') — a non-OSError that _archive_merge_verify_logs's internal
+        OSError handler does not catch.  Verifies that run_merge_verify:
+          (1) does NOT raise;
+          (2) returns the VerifyResult unchanged.
+
+        This is RED before step-4 because step-2's _archive_failure_streams has no outer
+        exception guard, so the RuntimeError propagates out of run_merge_verify.
+        """
+        import orchestrator.verify_runner as _vrmod
+
+        def boom(*args, **kwargs):
+            raise RuntimeError('boom')
+
+        monkeypatch.setattr(_vrmod, '_archive_merge_verify_logs', boom)
+
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+        runner, _ = self._make_runner(fail_result)
+
+        # Must NOT raise; must return fail_result unchanged
+        result = await runner.run_merge_verify(
+            'abc123', _make_spec(), task_id='1921', archive_root=tmp_path,
+        )
+
         assert result == fail_result
