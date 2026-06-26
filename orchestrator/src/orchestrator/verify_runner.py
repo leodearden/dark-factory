@@ -582,6 +582,24 @@ class LocalRunner:
 # ---------------------------------------------------------------------------
 
 
+# Archive timestamp format — mirrors _archive_merge_verify_logs (verify.py:827).
+# Microsecond precision ensures uniqueness across back-to-back ENOSPC retries for
+# the same task; the format is still lexicographically sortable.
+_STDERR_ARCHIVE_TS_FMT = '%Y%m%dT%H%M%S_%fZ'
+
+
+def _sanitize_runner_name(name: str) -> str:
+    """Sanitize a runner name for filesystem use in archive filenames.
+
+    Applies the same ``/`` and `` `` → ``_`` replacement as ``_make_infix``
+    in verify.py (without the leading dot, which is local-log-specific).
+    Runner names originate from trusted operator config, so other path-hostile
+    characters are not expected; this single policy ensures remote and local
+    archive filename conventions stay aligned.
+    """
+    return name.replace('/', '_').replace(' ', '_')
+
+
 async def _default_subprocess_run(
     argv: list[str],
     *,
@@ -837,9 +855,20 @@ class RemoteRunner:
     ) -> None:
         """Write *stderr_text* to a timestamped .stderr.log file under archive_root/task_id/.
 
-        Filename: attempt-1.remote-<safe_name>-<utc_ts>.stderr.log
+        Filename: ``attempt-1.remote-<safe_name>-<utc_ts>.stderr.log``
+
         Co-located with local merge-verify archives for side-by-side operator triage (task 1920,
-        sibling of 1768).  Convention mirrors _archive_merge_verify_logs (verify.py:779-856).
+        sibling of 1768).  Timestamp format and name sanitization mirror _archive_merge_verify_logs
+        (verify.py:779-856) via _STDERR_ARCHIVE_TS_FMT and _sanitize_runner_name.
+
+        The attempt number is pinned to 1, matching the local merge path's ``attempt_id or 1``
+        default (verify.py:2529).  Microsecond-precision timestamps already guarantee filename
+        uniqueness across back-to-back ENOSPC retries, so threading attempt_id through the call
+        chain is unnecessary and would complicate the interface for no triage benefit.
+
+        Filesystem I/O is synchronous (mkdir + write_text), matching the local-archive convention.
+        Remote stderr payloads are bounded by the ssh process output buffer; the event-loop
+        blocking window is negligible at current sizes.
 
         Best-effort: any exception is swallowed with a WARNING so the caller's VerifyResult
         is always returned unchanged (PRD §A Invariant 5).
@@ -848,8 +877,8 @@ class RemoteRunner:
         try:
             target_dir = Path(archive_root) / task_id
             target_dir.mkdir(parents=True, exist_ok=True)
-            utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%fZ')
-            safe = self.name.replace('/', '_').replace(' ', '_')
+            utc_ts = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
+            safe = _sanitize_runner_name(self.name)
             (target_dir / f'attempt-1.remote-{safe}-{utc_ts}.stderr.log').write_text(
                 stderr_text, encoding='utf-8',
             )
