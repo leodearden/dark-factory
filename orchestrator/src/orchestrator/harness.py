@@ -663,7 +663,10 @@ class Harness:
         # I/O wiring (disk-stat, halt/resume, escalation file/resolve) lives
         # here, in a periodic loop mirroring the main-tip-sweep lifecycle.
         from orchestrator.merge_queue import NoLandingsCircuitBreaker as _NLCB  # noqa: PLC0415
-        self._no_landings_breaker: _NLCB = _NLCB()
+        self._no_landings_breaker: _NLCB = _NLCB(
+            window_samples=config.no_landings_breaker_window_samples,
+            disk_free_floor_bytes=config.no_landings_breaker_disk_free_floor_bytes,
+        )
         self._no_landings_breaker_task: asyncio.Task | None = None
 
         # Per-task consecutive-failure counter for the reconcile sweep —
@@ -3119,15 +3122,15 @@ Output JSON matching the schema. Every task must appear in the output.
                     f'Disk free-bytes: {trip.free_start:,} → {trip.free_end:,} '
                     f'(strictly falling)\n\n'
                     f'Trip reason: {trip.reason}\n\n'
-                    'Auto-resume will occur on the next clean landing or when disk '
-                    'free-bytes recover above the trip level + 512 MiB margin.\n\n'
-                    'IMPORTANT: if disk free-bytes plateau below the recovery '
-                    'threshold (never recovering the full +512 MiB) and no new '
-                    'landings occur, neither auto-resume condition can fire and the '
-                    'scheduler will remain halted indefinitely across restarts.  '
-                    'In that case, investigate disk usage under the warm-lane '
-                    'worktree volume and call force_resume_scheduler() to manually '
-                    'un-pause dispatch.'
+                    'Auto-resume will occur on the next clean landing OR once '
+                    'warm-lane disk free-bytes recover above the configured absolute '
+                    f'floor ({self._no_landings_breaker._disk_free_floor_bytes:,} bytes '
+                    f'= {self._no_landings_breaker._disk_free_floor_bytes // (1024**3)} GiB).  '
+                    'Anti-flap: after auto-resume a fresh full window of flat+falling '
+                    'samples is required to re-trip.\n\n'
+                    'force_resume_scheduler() remains the manual override if neither '
+                    'condition fires (e.g. disk is recovering slowly but has not yet '
+                    'crossed the floor, and no new landings are occurring).'
                 ),
                 suggested_action='manual_investigation',
                 level=0,
