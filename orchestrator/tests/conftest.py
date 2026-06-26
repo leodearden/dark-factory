@@ -325,6 +325,14 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     config.no_landings_breaker_interval_secs = 60.0
     config.no_landings_breaker_window_samples = 30
     config.no_landings_breaker_disk_free_floor_bytes = 50 * 1024 * 1024 * 1024
+    # Main-tip integrity sweep — disabled by default in tests (task 1907).
+    # Left enabled, the sweep loop starts under mocked git_ops/transport, its
+    # pass fails immediately, and (absent a real interval) the loop can spin
+    # logging exceptions — starving the xdist worker until the 60s per-test
+    # timeout os._exit()s it.  A real interval is also set so any test that
+    # explicitly re-enables the sweep gets a sane asyncio.sleep() argument.
+    config.main_tip_sweep_enabled = False
+    config.main_tip_sweep_interval_secs = 1800.0
     # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
     # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
     # is a @property on OrchestratorConfig (see config.py) and Harness wires
