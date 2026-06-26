@@ -7557,6 +7557,90 @@ class TestRebindBranchToHead:
         rc_head, _, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
         assert rc_head == 0, 'Lane HEAD must be resolvable after a failed rebind'
 
+    async def test_rebind_succeeds_even_when_branch_checked_out_in_other_worktree(
+        self, git_repo: Path,
+    ):
+        """(d) Documents the actual collision behavior on git 2.43.0.
+
+        git checkout -B bypasses the linked-worktree single-checkout guard.
+        When *full_branch* is concurrently checked out in a second live
+        worktree, the call still returns True (rc=0) and force-resets the
+        branch ref — leaving BOTH worktrees tracking the same branch.
+        This is a duplicate-dispatch hazard, NOT the fail-safe the original
+        docstring claimed (esc-1923-18).  The test pins this actual behavior
+        so any future git version change that restores a non-zero rc for the
+        collision case is immediately surfaced.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # Acquire a lane on task/C and commit WIP
+        info = await git_ops.acquire_warm_lane('C', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        (lane / 'col_wip.txt').write_text('collision test\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'collision wip'], cwd=lane)
+
+        _, lane_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        lane_head = lane_head_raw.strip()
+
+        # Create a SECOND worktree also on task/C (requires --force since task/C
+        # is already checked out in the first lane)
+        second_wt = git_repo / 'col_second_wt'
+        rc_add, _, err_add = await _run(
+            ['git', 'worktree', 'add', '--force', str(second_wt), 'task/C'],
+            cwd=git_repo,
+        )
+        assert rc_add == 0, f'git worktree add --force failed: {err_add}'
+
+        # Confirm second worktree is on task/C
+        _, second_branch_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=second_wt,
+        )
+        assert second_branch_raw.strip() == 'task/C', (
+            f'Second worktree should be on task/C, got {second_branch_raw.strip()!r}'
+        )
+
+        # Detach the FIRST lane (mirrors release_warm_lane)
+        await _run(['git', 'checkout', '--detach'], cwd=lane)
+
+        # === THE CALL UNDER TEST ===
+        # task/C is checked out in second_wt — checkout -B does NOT refuse it
+        result = await git_ops.rebind_branch_to_head(lane, 'task/C')
+
+        # On git 2.43.0: rc=0 (bypasses single-checkout guard)
+        assert result is True, (
+            f'rebind_branch_to_head returned {result!r} when task/C is checked out '
+            f'in a second worktree.  Expected True — checkout -B bypasses the '
+            f'single-checkout guard and does NOT fail safe for this collision.  '
+            f'If git changed this behavior, update the docstring + this assertion.'
+        )
+
+        # The ref was force-moved to the first lane's current HEAD
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/C'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == lane_head, (
+            f'refs/heads/task/C must be moved to first-lane HEAD ({lane_head[:8]}), '
+            f'got {ref_sha_raw.strip()[:8]}'
+        )
+
+        # The first lane is now attached to task/C
+        _, attached_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert attached_raw.strip() == 'task/C', (
+            f'First lane must be ON task/C after rebind, got {attached_raw.strip()!r}'
+        )
+
+        # Clean up the second worktree
+        await _run(['git', 'worktree', 'remove', '--force', str(second_wt)], cwd=git_repo)
+
 
 # ===========================================================================
 # Task-1923 step-5: RED — disk-backstop route end-to-end via acquire_warm_lane

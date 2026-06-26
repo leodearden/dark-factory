@@ -2071,6 +2071,9 @@ class GitOps:
         #     best-effort: if the rebind fails (e.g. invalid branch name or
         #     some other git error), log and continue — WIP is still on the
         #     lane's HEAD, which is no worse than today's detached-HEAD state.
+        #     NOTE: checkout -B bypasses git's single-checkout guard; a
+        #     concurrent worktree on full_branch is NOT a fail-safe — it is a
+        #     duplicate-dispatch hazard (both worktrees end up on the branch).
         #     Route 3 (γ reattach) already re-attaches before this call, so
         #     the rebind is a harmless reset-to-self there.
         await self.rebind_branch_to_head(lane_dir, full_branch)
@@ -2108,14 +2111,17 @@ class GitOps:
         committed/clean after :meth:`commit`).
 
         **Best-effort / never-raise** (task-1923 live-requeue residual fix):
-        When *full_branch* is checked out in another live worktree, git refuses
-        to force-move it and returns a non-zero rc.  In that case this method
-        logs a WARNING and returns ``False`` — leaving the rebased work intact
-        on the lane's current HEAD (no worse than today's detached-HEAD
-        situation).  It never converts a reuse into a FAULT.
+        ``git checkout -B`` bypasses git's linked-worktree single-checkout
+        guard: if *full_branch* is currently checked out in another live
+        worktree, the command still succeeds (rc=0), force-resets the ref to
+        the current HEAD, and leaves both worktrees tracking the same branch —
+        a duplicate-dispatch hazard, NOT a safe fail-safe.  This method
+        returns ``False`` only on a genuine non-zero rc (e.g. an invalid
+        branch name); in that case it logs a WARNING and never raises.
+        It never converts a reuse into a FAULT.
 
         Returns:
-            True on success; False on any non-zero git rc.
+            True on success (rc=0); False on any non-zero git rc.
         """
         rc, _, err = await _run(
             ['git', 'checkout', '-B', full_branch],
@@ -2123,8 +2129,7 @@ class GitOps:
         )
         if rc != 0:
             logger.warning(
-                'rebind_branch_to_head: checkout -B %s failed for %s (rc=%d): %s '
-                '(branch may be checked out in another live worktree — fail-safe)',
+                'rebind_branch_to_head: checkout -B %s failed for %s (rc=%d): %s',
                 full_branch, worktree, rc, err.strip(),
             )
             return False
