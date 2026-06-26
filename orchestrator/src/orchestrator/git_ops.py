@@ -2056,6 +2056,25 @@ class GitOps:
                 '_reuse_warm_lane: rebase failed for %s; continuing on old base', lane_dir,
             )
 
+        # 2b. Rebind refs/heads/<full_branch> to the lane's current HEAD and
+        #     re-attach the lane onto the branch.
+        #
+        #     Task-1923 residual: release_warm_lane detaches the lane via
+        #     `git checkout --detach`.  If the same task is re-dispatched via
+        #     the disk-backstop reuse route (route 2) or the in-memory reuse
+        #     route (route 1), _reuse_warm_lane runs commit()+rebase_onto_main
+        #     on a DETACHED HEAD and never moves refs/heads/<full_branch> to
+        #     match.  The stale ref then causes α's retention guard to evaluate
+        #     0-commits-beyond-main (incorrect) and delete it, and the merge
+        #     worker (resolve_queued_branch_ref) to hit unknown_branch.
+        #
+        #     best-effort: if the rebind fails (e.g. invalid branch name or
+        #     some other git error), log and continue — WIP is still on the
+        #     lane's HEAD, which is no worse than today's detached-HEAD state.
+        #     Route 3 (γ reattach) already re-attaches before this call, so
+        #     the rebind is a harmless reset-to-self there.
+        await self.rebind_branch_to_head(lane_dir, full_branch)
+
         # 3. Re-ensure task .gitignore (idempotent)
         _ensure_task_gitignore(lane_dir)
 
