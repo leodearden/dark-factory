@@ -5183,6 +5183,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         'plan_files_narrowed',
                     )
 
+        # Belt-and-braces rebind (task-1923): re-assert refs/heads/task/<id>
+        # == self.worktree HEAD immediately before every enqueue so the named
+        # ref the merge worker resolves (merge_to_main → resolve_queued_branch_ref
+        # by name) always matches the worktree HEAD.  This defends against the
+        # live-requeue residual window where _reuse_warm_lane ran commit+rebase
+        # on a DETACHED HEAD (leaving refs/heads/task/<id> stale) and the
+        # rebind in _reuse_warm_lane was somehow not reached (e.g. a future code
+        # path that bypasses it).  Best-effort: the helper never raises.
+        await self.git_ops.rebind_branch_to_head(
+            self.worktree,
+            f'{self.git_ops.config.branch_prefix}{branch_name}',
+        )
+
         # Stamp write-once first-submission epoch before construction so every
         # submit path (including coalesced/attached) records the lineage's age.
         # The stamp is a no-op (fast-path return) when metadata already carries
