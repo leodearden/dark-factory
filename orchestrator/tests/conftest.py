@@ -311,6 +311,20 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # an additional asyncio.Task to manage.
     config.stranded_reconcile_enabled = False
     config.stranded_reconcile_interval_secs = 900.0
+    # No-landings circuit-breaker (task 1918/θ-1893). Disabled by default, like
+    # the other background sweep loops above, so its asyncio.Task doesn't spin
+    # up under fixtures that don't expect it — and so its `while True` loop
+    # can't churn on MagicMock config (a MagicMock interval crashes
+    # asyncio.sleep, which the loop logs-and-retries forever). window_samples /
+    # disk_free_floor_bytes are read synchronously in Harness.__init__ to size
+    # collections.deque(maxlen=...), so they must be real ints regardless of
+    # `enabled` (a MagicMock there raises "TypeError: an integer is required").
+    # Values mirror the production defaults (config.py: 60 s, 30 samples,
+    # 50 GiB floor); breaker-specific tests override these per-test.
+    config.no_landings_breaker_enabled = False
+    config.no_landings_breaker_interval_secs = 60.0
+    config.no_landings_breaker_window_samples = 30
+    config.no_landings_breaker_disk_free_floor_bytes = 50 * 1024 * 1024 * 1024
     # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
     # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
     # is a @property on OrchestratorConfig (see config.py) and Harness wires

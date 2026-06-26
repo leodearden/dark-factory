@@ -397,6 +397,9 @@ class TestHarnessWiring:
         # Stub git_ops so the worker constructor doesn't fail on project_root.
         harness.git_ops = MagicMock()
         harness.git_ops.project_root = None  # no shadow-state path needed
+        # B3 warm-lane release on member-done is awaited (harness.py:403);
+        # stub it async so mark_member_done doesn't await a sync MagicMock.
+        harness.git_ops.release_lane_for_terminal_task = AsyncMock()
 
         # Capturing fake that records kwargs and provides an async no-op run().
         captured: dict[str, Any] = {}

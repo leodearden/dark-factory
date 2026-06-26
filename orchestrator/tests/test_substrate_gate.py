@@ -476,6 +476,9 @@ def _make_harness(tmp_path: Path):
     h.scheduler = MagicMock()
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.carries_substrate_probe = MagicMock(return_value=True)
+    # is_deterministic was added after these tests were written (task 1899);
+    # mock it False so _run_slot stays on the normal (non-deterministic) path.
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
 
     # Wire stub git_ops
     h.git_ops = MagicMock()

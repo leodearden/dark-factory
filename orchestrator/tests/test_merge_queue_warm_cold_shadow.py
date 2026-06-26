@@ -1863,6 +1863,10 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         config.fused_memory_restart_debounce_secs = 120.0
         config.fused_memory_restart_watch_prefixes = []
         config.fused_memory_restart_script = ''
+        # No-landings breaker ints are read at Harness.__init__ (deque maxlen),
+        # so a MagicMock crashes construction (task 1918).
+        config.no_landings_breaker_window_samples = 30
+        config.no_landings_breaker_disk_free_floor_bytes = 50 * 1024 * 1024 * 1024
 
         with patch('orchestrator.harness.McpLifecycle'), \
              patch('orchestrator.harness.Scheduler'), \
@@ -1918,6 +1922,10 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         config.fused_memory_restart_debounce_secs = 120.0
         config.fused_memory_restart_watch_prefixes = []
         config.fused_memory_restart_script = ''
+        # No-landings breaker ints are read at Harness.__init__ (deque maxlen),
+        # so a MagicMock crashes construction (task 1918).
+        config.no_landings_breaker_window_samples = 30
+        config.no_landings_breaker_disk_free_floor_bytes = 50 * 1024 * 1024 * 1024
 
         with patch('orchestrator.harness.McpLifecycle'), \
              patch('orchestrator.harness.Scheduler'), \

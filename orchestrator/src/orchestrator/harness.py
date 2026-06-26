@@ -2351,7 +2351,7 @@ Output JSON matching the schema. Every task must appear in the output.
                             tid, metadata.get('branch_base_sha'),
                         )
                         return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run,
+                            tid, mid_run=mid_run, metadata=metadata,
                         )
                     logger.info(
                         'Reconcile: task %s branch is degenerate '
@@ -2404,7 +2404,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         tid, metadata.get('branch_base_sha'),
                     )
                     return await self._revert_in_progress_if_no_live_claimant(
-                        tid, mid_run=mid_run,
+                        tid, mid_run=mid_run, metadata=metadata,
                     )
                 logger.info(
                     'Reconcile: task %s branch tip == branch_base_sha (%s); '
@@ -2587,11 +2587,11 @@ Output JSON matching the schema. Every task must appear in the output.
         # is_ancestor==True degenerate-provisioning-branch guards above so a
         # never-advanced branch (the 2992 strand) is recovered, not left to sit.
         return await self._revert_in_progress_if_no_live_claimant(
-            tid, mid_run=mid_run,
+            tid, mid_run=mid_run, metadata=metadata,
         )
 
     async def _revert_in_progress_if_no_live_claimant(
-        self, tid: str, *, mid_run: bool,
+        self, tid: str, *, mid_run: bool, metadata: dict | None = None,
     ) -> str | None:
         """Revert a stranded in-progress task to pending when no live claimant.
 
@@ -2624,11 +2624,19 @@ Output JSON matching the schema. Every task must appear in the output.
         # non-degenerate (has commits beyond branch_base_sha).  Degenerate
         # branches (provisioned but never implemented) are not protected because
         # there is no real work to preserve.
-        try:
-            _infra_task = await self.scheduler.get_task(tid)
-            _infra_meta = (_infra_task or {}).get('metadata') or {}
-        except Exception:
-            _infra_meta = {}
+        # Prefer the metadata the reconcile caller already hoisted (one get_task
+        # per stranded task — see harness.py:2275). Re-fetching unconditionally
+        # here was the task-1883 step-14 regression that double-fetched on the
+        # neither-path; the row is immutable across the read-only intervening
+        # is_ancestor/marker/citation/degenerate checks. Standalone callers
+        # (direct unit tests) may omit metadata and pay one fetch.
+        if metadata is None:
+            try:
+                _infra_task = await self.scheduler.get_task(tid)
+                metadata = (_infra_task or {}).get('metadata') or {}
+            except Exception:
+                metadata = {}
+        _infra_meta = metadata
         if _infra_meta.get('infra_hold'):
             _branch = f'{self.git_ops.config.branch_prefix}{tid}'
             if not await self._branch_is_degenerate(_branch, _infra_meta):
