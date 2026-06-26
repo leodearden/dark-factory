@@ -2112,6 +2112,94 @@ class TestMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
+    async def test_do_merge_absent_ref_with_worktree_head_beyond_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_do_merge integration: absent task/<id> ref + worktree HEAD with unmerged
+        commits → MERGES (not unknown_branch) and the commits land on main.
+
+        This is acceptance #1 from the task spec. Drives _do_merge end-to-end
+        with run_scoped_verification patched to pass.
+
+        Fails today: _do_merge does not pass worktree to _classify_branch_presence,
+        so the absent ref → unknown_branch and no merge.
+        """
+        # Create worktree + commit a file → HEAD carries commits beyond main
+        wt = (await git_ops.create_worktree('orphan-merge-test')).path
+        (wt / 'orphan_landing.py').write_text('landed = True\n')
+        await git_ops.commit(wt, 'Add orphan_landing.py')
+
+        # Detach HEAD and delete the branch ref — work sits in the worktree
+        await _run(['git', 'checkout', '--detach'], cwd=wt)
+        await _run(
+            ['git', 'branch', '-D', 'task/orphan-merge-test'],
+            cwd=git_ops.project_root,
+        )
+        assert await git_ops.resolve_branch_sha('task/orphan-merge-test') is None
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        req = _make_request('orphan-merge', 'orphan-merge-test', wt, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        # Must NOT be unknown_branch — the worktree HEAD fallback should kick in
+        assert outcome is not None, '_do_merge returned None (unexpected)'
+        assert outcome.status != 'unknown_branch', (
+            f'Expected merge to succeed (not unknown_branch); got {outcome.status!r} '
+            f'reason={outcome.reason!r}. _do_merge must pass worktree to '
+            '_classify_branch_presence so the absent-ref fallback fires.'
+        )
+        assert outcome.status == 'done', (
+            f'Expected done after successful merge, got {outcome.status!r}'
+        )
+
+        # File must be reachable on main now
+        rc, content, err = await _run(
+            ['git', 'show', 'main:orphan_landing.py'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'orphan_landing.py not on main after merge: {err}'
+        assert 'landed = True' in content
+
+    async def test_do_merge_misroute_worktree_head_on_main_still_unknown_branch(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_do_merge integration regression: absent ref + worktree HEAD on main
+        (no extra commits) → STILL unknown_branch (genuine misroute preserved).
+
+        This is acceptance #2 from the task spec.
+        """
+        # Create worktree but do NOT commit any files — HEAD equals main
+        wt = (await git_ops.create_worktree('misroute-test')).path
+        # Detach HEAD and delete the ref WITHOUT adding commits
+        await _run(['git', 'checkout', '--detach'], cwd=wt)
+        await _run(
+            ['git', 'branch', '-D', 'task/misroute-test'],
+            cwd=git_ops.project_root,
+        )
+        assert await git_ops.resolve_branch_sha('task/misroute-test') is None
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        req = _make_request('misroute', 'misroute-test', wt, config)
+
+        outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'unknown_branch', (
+            f'Misroute should still yield unknown_branch when HEAD is on main, '
+            f'got {outcome.status!r}'
+        )
+
+        # The misroute file must NOT be on main (nothing to merge)
+        rc, _, _ = await _run(
+            ['git', 'show', 'main:misroute_work.py'], cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'No file should land on main for a misrouted request'
+
 
 # ---------------------------------------------------------------------------
 # TestRecomputeSuffixConflictGraphErrorHandling — amend-1911 (suggestion 3a)
