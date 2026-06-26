@@ -3406,6 +3406,7 @@ async def coalesce_or_enqueue_merge_request(
     liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     retention: TerminalOutcomeRetention | None = None,
     live_snapshot: Callable[[], dict] | None = None,
+    classifier_git_ops: GitOps | None = None,
 ) -> MergeDispatchResult:
     """De-dup gate for the merge_request MCP chokepoint.
 
@@ -3453,6 +3454,19 @@ async def coalesce_or_enqueue_merge_request(
     through to the acquire-and-enqueue block dispatching a fresh request.
     When absent (None) or when ``live_snapshot()`` raises, the gate
     behaves exactly as today — trust the registry.
+
+    *classifier_git_ops* (keyword-only, default None): when provided AND both
+    ``entry.snapshot_tip`` and ``req.snapshot_tip`` are set, the registry
+    fast-path classifies the tip relation via :func:`resolve_attach_action`
+    before coalescing.  On SUPERSET (the new submission is strictly ahead of
+    the in-flight snapshot), the request is independent-enqueued via
+    :func:`register_and_enqueue_merge_request` (which enqueues even when the
+    slot is held) and ``dispatched=True`` is returned — mirroring workflow.py's
+    ATTACH_AND_CHAIN path.  On RESNAPSHOT, :meth:`InFlightMergeRegistry.re_snapshot`
+    is also called before enqueueing.  SAME/SUBSET fall through to the existing
+    unconditional coalesce.  When absent or either snapshot_tip is None, the
+    gate is a no-op and the path preserves current behaviour (back-compat).
+    The disk-scan cross-process coalesce branch is intentionally left untouched.
     """
     branch = req.branch
 
@@ -3471,6 +3485,52 @@ async def coalesce_or_enqueue_merge_request(
             registry.release(branch, detach_waiters=True)
             # Fall through to the acquire-and-enqueue block below.
         else:
+            # ── Tip-recency check (γ2/γ3 consumer wiring) ─────────────────
+            # When classifier_git_ops is wired AND both snapshot tips are
+            # known, classify the relation.  On SUPERSET (new tip is strictly
+            # ahead of the in-flight snapshot) refuse to coalesce — the newer
+            # commits must get their own merge+verify pass.  SAME/SUBSET fall
+            # through to the unconditional coalesce below (back-compat).
+            if (
+                classifier_git_ops is not None
+                and entry is not None
+                and entry.snapshot_tip is not None
+                and req.snapshot_tip is not None
+            ):
+                attach_action = await resolve_attach_action(
+                    req.snapshot_tip, entry.snapshot_tip,
+                    verifying=entry.verifying,
+                    git_ops=classifier_git_ops,
+                )
+                if attach_action is AttachAction.RESNAPSHOT:
+                    registry.re_snapshot(branch, req.snapshot_tip)
+                    logger.info(
+                        'coalesce_or_enqueue_merge_request: RESNAPSHOT — '
+                        'new tip %s is SUPERSET of in-flight %s for branch %r; '
+                        'independent-enqueue with snapshot update.',
+                        req.snapshot_tip[:12], entry.snapshot_tip[:12], branch,
+                    )
+                    await register_and_enqueue_merge_request(
+                        queue, req, event_store, registry, retention=retention,
+                    )
+                    return MergeDispatchResult(
+                        dispatched=True, in_flight=False, branch=branch,
+                    )
+                elif attach_action is AttachAction.ATTACH_AND_CHAIN:
+                    logger.info(
+                        'coalesce_or_enqueue_merge_request: ATTACH_AND_CHAIN — '
+                        'new tip %s is SUPERSET of verifying in-flight %s for branch %r; '
+                        'independent-enqueue for own merge+verify.',
+                        req.snapshot_tip[:12], entry.snapshot_tip[:12], branch,
+                    )
+                    await register_and_enqueue_merge_request(
+                        queue, req, event_store, registry, retention=retention,
+                    )
+                    return MergeDispatchResult(
+                        dispatched=True, in_flight=False, branch=branch,
+                    )
+                # COALESCE or ATTACH_CONTAINMENT → fall through to coalesce.
+
             eta = registry.eta_seconds(branch)
             # Coalescing onto a LIVE in-flight entry: register the caller's
             # request_id as an alias onto the primary entry's request_id, so a
