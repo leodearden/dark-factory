@@ -1923,7 +1923,7 @@ async def _run_cmd(
                             proc.stdout.read(4096),
                             timeout=read_timeout,
                         )
-                    except (asyncio.TimeoutError, TimeoutError):
+                    except TimeoutError:
                         _cs_timeout_msg.append(_cs_reason)
                         raise
 
