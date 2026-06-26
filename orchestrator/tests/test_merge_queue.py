@@ -1154,6 +1154,103 @@ class TestClassifyBranchPresence:
         conn.close()
         assert rows == [('already_merged',)], f'rows={rows}'
 
+    async def test_absent_ref_with_worktree_head_beyond_main_returns_none(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """Absent ref + worktree HEAD carrying commits beyond main → None (proceed).
+
+        When task/<id> ref is deleted but the worktree's HEAD has unmerged
+        commits, _classify_branch_presence must return None so _do_merge can
+        proceed to merge_to_main (which will use the worktree-HEAD fallback).
+
+        Fails today: _classify_branch_presence has no 'worktree' parameter
+        (TypeError) and unconditionally emits unknown_branch on absent ref +
+        no marker.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        # Create worktree + commit a file → HEAD carries commits beyond main
+        wt = (await git_ops.create_worktree('ghost')).path
+        (wt / 'ghost_work.py').write_text('ghost = True\n')
+        await git_ops.commit(wt, 'Add ghost work file')
+
+        # Detach HEAD and delete the ref — mimics the ref-absent scenario
+        await _run(['git', 'checkout', '--detach'], cwd=wt)
+        await _run(['git', 'branch', '-D', 'task/ghost'], cwd=git_ops.project_root)
+        assert await git_ops.resolve_branch_sha('task/ghost') is None
+
+        outcome = await _classify_branch_presence(
+            git_ops, event_store, 'ghost', 'ghost', time.monotonic(),
+            worktree=wt,
+        )
+
+        # Must return None (proceed) — NOT unknown_branch
+        assert outcome is None, (
+            f'Expected None (proceed) but got {outcome!r}; '
+            'absent-ref worktree with commits beyond main should not be a misroute'
+        )
+
+        # NO merge_attempt should be emitted — it's not a terminal outcome
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0, (
+            f'No merge_attempt expected when worktree HEAD has commits beyond main, '
+            f'got {count}'
+        )
+
+    async def test_absent_ref_with_worktree_head_on_main_still_unknown_branch(
+        self, git_ops: GitOps, tmp_path: Path,
+    ):
+        """Absent ref + worktree HEAD that is an ancestor of main → unknown_branch.
+
+        The worktree HEAD has no extra commits (HEAD == main or behind main),
+        so this is a genuine misroute: unknown_branch must still be returned.
+        Also verifies worktree=None (default) gives unknown_branch.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        # Create worktree but do NOT commit any files — HEAD equals main
+        wt = (await git_ops.create_worktree('stale-ghost')).path
+        # Detach HEAD and delete the ref without adding commits
+        await _run(['git', 'checkout', '--detach'], cwd=wt)
+        await _run(
+            ['git', 'branch', '-D', 'task/stale-ghost'], cwd=git_ops.project_root,
+        )
+        assert await git_ops.resolve_branch_sha('task/stale-ghost') is None
+
+        # Case (a): worktree provided but its HEAD is NOT beyond main
+        outcome_a = await _classify_branch_presence(
+            git_ops, event_store, 'stale-ghost', 'stale-ghost', time.monotonic(),
+            worktree=wt,
+        )
+        assert outcome_a is not None, 'Expected a terminal outcome'
+        assert outcome_a.status == 'unknown_branch', (
+            f'Expected unknown_branch (HEAD on main = misroute), got {outcome_a.status!r}'
+        )
+        conn = sqlite3.connect(str(db_path))
+        rows_a = conn.execute(
+            "SELECT json_extract(data, '$.outcome') FROM events "
+            "WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert rows_a == [('unknown_branch',)], f'merge_attempt rows={rows_a}'
+
+        # Case (b): worktree=None (default) → still unknown_branch (regression guard)
+        db_path2 = tmp_path / 'events2.db'
+        event_store2 = EventStore(db_path=db_path2, run_id='test-run2')
+        outcome_b = await _classify_branch_presence(
+            git_ops, event_store2, 'stale-ghost', 'stale-ghost', time.monotonic(),
+        )
+        assert outcome_b is not None
+        assert outcome_b.status == 'unknown_branch', (
+            f'Expected unknown_branch with worktree=None, got {outcome_b.status!r}'
+        )
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
@@ -2014,6 +2111,96 @@ class TestMergeWorker:
         worker_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker_task
+
+    async def test_do_merge_absent_ref_with_worktree_head_beyond_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_do_merge integration: absent task/<id> ref + worktree HEAD with unmerged
+        commits → MERGES (not unknown_branch) and the commits land on main.
+
+        This is acceptance #1 from the task spec. Drives _do_merge end-to-end
+        with run_scoped_verification patched to pass.
+
+        Fails today: _do_merge does not pass worktree to _classify_branch_presence,
+        so the absent ref → unknown_branch and no merge.
+        """
+        # Create worktree + commit a file → HEAD carries commits beyond main
+        wt = (await git_ops.create_worktree('orphan-merge-test')).path
+        (wt / 'orphan_landing.py').write_text('landed = True\n')
+        await git_ops.commit(wt, 'Add orphan_landing.py')
+
+        # Detach HEAD and delete the branch ref — work sits in the worktree
+        await _run(['git', 'checkout', '--detach'], cwd=wt)
+        await _run(
+            ['git', 'branch', '-D', 'task/orphan-merge-test'],
+            cwd=git_ops.project_root,
+        )
+        assert await git_ops.resolve_branch_sha('task/orphan-merge-test') is None
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        req = _make_request('orphan-merge', 'orphan-merge-test', wt, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            outcome = await worker._do_merge(req)
+
+        # Must NOT be unknown_branch — the worktree HEAD fallback should kick in
+        assert outcome is not None, '_do_merge returned None (unexpected)'
+        assert outcome.status != 'unknown_branch', (
+            f'Expected merge to succeed (not unknown_branch); got {outcome.status!r} '
+            f'reason={outcome.reason!r}. _do_merge must pass worktree to '
+            '_classify_branch_presence so the absent-ref fallback fires.'
+        )
+        assert outcome.status == 'done', (
+            f'Expected done after successful merge, got {outcome.status!r}'
+        )
+
+        # File must be reachable on main now
+        rc, content, err = await _run(
+            ['git', 'show', 'main:orphan_landing.py'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'orphan_landing.py not on main after merge: {err}'
+        assert 'landed = True' in content
+
+    async def test_do_merge_misroute_worktree_head_on_main_still_unknown_branch(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_do_merge integration regression: absent ref + worktree HEAD on main
+        (no extra commits) → STILL unknown_branch (genuine misroute preserved).
+
+        This is acceptance #2 from the task spec.
+        """
+        # Create worktree but do NOT commit any files — HEAD equals main
+        wt = (await git_ops.create_worktree('misroute-test')).path
+        # Detach HEAD and delete the ref WITHOUT adding commits
+        await _run(['git', 'checkout', '--detach'], cwd=wt)
+        await _run(
+            ['git', 'branch', '-D', 'task/misroute-test'],
+            cwd=git_ops.project_root,
+        )
+        assert await git_ops.resolve_branch_sha('task/misroute-test') is None
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        req = _make_request('misroute', 'misroute-test', wt, config)
+
+        pre_main_sha = await git_ops.get_main_sha()
+        outcome = await worker._do_merge(req)
+
+        assert outcome is not None
+        assert outcome.status == 'unknown_branch', (
+            f'Misroute should still yield unknown_branch when HEAD is on main, '
+            f'got {outcome.status!r}'
+        )
+
+        # Prove that no merge commit was created: main must be unchanged.
+        post_main_sha = await git_ops.get_main_sha()
+        assert pre_main_sha == post_main_sha, (
+            'No merge commit should be created for a misrouted request; '
+            f'main advanced from {pre_main_sha!r} to {post_main_sha!r}'
+        )
 
 
 # ---------------------------------------------------------------------------

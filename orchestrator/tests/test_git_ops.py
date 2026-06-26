@@ -989,6 +989,67 @@ class TestWorktreeLifecycle:
             'base_commit must NOT equal the pre-race SHA — that is the bug'
         )
 
+    async def test_merge_to_main_absent_ref_falls_back_to_worktree_head(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main falls back to the worktree HEAD when task/<id> ref is absent.
+
+        Scenario: the named ref 'task/orphan' is deleted after the worktree's
+        HEAD carries a commit beyond main (ref absent but work is present).
+        merge_to_main must still succeed, merging via the worktree HEAD SHA, and
+        the merge-commit subject must be 'Merge task/orphan into main' so that
+        find_merge_marker keeps already_merged idempotency on re-dispatch.
+
+        Fails today: absent ref → git merge --no-ff task/orphan on a non-existent
+        ref → MergeResult.success=False.
+        """
+        # Create a worktree and commit a file (this creates refs/heads/task/orphan)
+        wt = (await git_ops.create_worktree('orphan')).path
+        (wt / 'orphan_work.py').write_text('orphan = True\n')
+        await git_ops.commit(wt, 'Add orphan work file')
+
+        # Detach HEAD so we can safely delete the branch ref without
+        # git complaining about the worktree's current branch being deleted.
+        await _run(['git', 'checkout', '--detach'], cwd=wt)
+
+        # Delete the named branch ref — the worktree HEAD still carries commits
+        await _run(
+            ['git', 'branch', '-D', 'task/orphan'], cwd=git_ops.project_root,
+        )
+
+        # Sanity: confirm the ref is truly absent
+        assert await git_ops.resolve_branch_sha('task/orphan') is None
+
+        # merge_to_main must succeed using the worktree HEAD as the merge source
+        result = await git_ops.merge_to_main(wt, 'orphan')
+
+        assert result.success is True, f'Expected success but got: {result}'
+        assert result.merge_commit is not None
+
+        # Advance main so the merge commit lands
+        advanced = await git_ops.advance_main(result.merge_commit)
+        assert advanced == 'advanced'
+
+        # The orphan_work.py file must now be on main (content merged correctly)
+        rc, content, err = await _run(
+            ['git', 'show', 'main:orphan_work.py'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'File not found on main: {err}'
+        assert 'orphan = True' in content
+
+        # The merge-commit subject must be canonical 'Merge task/orphan into main'
+        # so that find_merge_marker works on re-dispatch (already_merged idempotency).
+        _, commit_msg, _ = await _run(
+            ['git', 'log', '-1', '--format=%s', result.merge_commit.strip()],
+            cwd=git_ops.project_root,
+        )
+        assert commit_msg.strip() == 'Merge task/orphan into main', (
+            f'Unexpected merge-commit subject: {commit_msg.strip()!r}'
+        )
+
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestFreshenMain:

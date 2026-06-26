@@ -2447,6 +2447,8 @@ async def _classify_branch_presence(
     task_id: str,
     branch: str,
     t0: float | None,
+    *,
+    worktree: Path | None = None,
 ) -> MergeOutcome | None:
     """Terminal outcome when *branch* has no live ref in this repo, else None.
 
@@ -2455,6 +2457,8 @@ async def _classify_branch_presence(
 
         ref present            -> None  (proceed with normal merge)
         ref absent + marker    -> already_merged   (merged then cleaned up)
+        ref absent + no marker + worktree HEAD beyond main
+                               -> None  (proceed; merge_to_main uses HEAD fallback)
         ref absent + no marker -> unknown_branch    (never existed; likely a misroute)
 
     The ``unknown_branch`` case fires when a ``merge_request`` for one repo's
@@ -2485,6 +2489,18 @@ async def _classify_branch_presence(
     The ``unknown_branch`` reason reports both candidate forms tried
     (``{prefixed!r}`` and ``{branch!r}``) so operators can see exactly what
     was submitted and what was attempted during triage.
+
+    **Worktree-HEAD fallback**: when *worktree* is supplied (keyword-only) and
+    the ref is absent with no merge marker, BEFORE emitting unknown_branch this
+    function checks whether the worktree's HEAD carries commits beyond main via
+    :meth:`GitOps.worktree_head_beyond_main` (the shared helper also used by
+    :meth:`GitOps.merge_to_main`).  When that helper returns a non-None SHA
+    (i.e. HEAD is not an ancestor of main), this function returns ``None``
+    (proceed) without emitting a merge_attempt, allowing ``merge_to_main``'s
+    worktree-HEAD fallback to land those commits.
+    If *worktree* is None, the worktree is unreadable, or HEAD is already an
+    ancestor of main, the function falls through to the original
+    ``unknown_branch`` outcome — failing safe to today's behavior.
     """
     # ── Live-ref check via canonical resolver ─────────────────────────────
     if await git_ops.resolve_queued_branch_ref(branch) is not None:
@@ -2501,6 +2517,41 @@ async def _classify_branch_presence(
                 event_store, task_id, 'already_merged', duration_ms=_elapsed_ms(t0),
             )
             return MergeOutcome('already_merged')
+
+    # ── Worktree-HEAD fallback: ref absent, no marker, but work is present ─
+    # If a worktree was provided and its HEAD carries commits beyond main,
+    # this is NOT a misroute — the ref was lost while the work is still live.
+    # Return None (proceed) so merge_to_main can merge via the worktree HEAD.
+    #
+    # Misroute guard: when the worktree HEAD is on an ATTACHED branch (i.e.
+    # not in detached-HEAD state), we verify the branch name matches the
+    # expected branch before proceeding.  A different attached branch means
+    # this is a genuine misroute (wrong worktree was passed) — fall through to
+    # unknown_branch in that case.  A detached HEAD indicates the ref was
+    # deleted while the work sat as a bare commit (the intended scenario), so
+    # it skips the name check and trusts the SHA directly.
+    if worktree is not None and worktree.exists():
+        rc_sym, sym_ref, _ = await _run(
+            ['git', 'symbolic-ref', 'HEAD'], cwd=worktree,
+        )
+        sym_ref = sym_ref.strip()
+        is_detached = (rc_sym != 0)
+
+        # For an attached HEAD, the symbolic ref must end with the expected
+        # branch (prefixed or bare).  A mismatch is a misroute — skip fallback.
+        branch_matches = is_detached or (
+            sym_ref.endswith('/' + prefixed) or sym_ref.endswith('/' + branch)
+        )
+
+        # Use the shared helper so the proceed-decision here and the
+        # merge-source-selection in merge_to_main share one source of truth
+        # for "worktree HEAD carries commits beyond main".  The branch_matches
+        # guard short-circuits before the async helper on a misrouted worktree.
+        if branch_matches and await git_ops.worktree_head_beyond_main(worktree) is not None:
+            # HEAD carries commits beyond main — this is not a misroute.
+            # Return None (proceed); merge_to_main uses the worktree-HEAD
+            # fallback as the merge source.
+            return None
 
     # ── Genuine misroute ───────────────────────────────────────────────────
     _emit_merge_attempt(
@@ -5138,8 +5189,12 @@ class MergeWorker(_WipHaltMixin):
         # merge_request — or already_merged when the ref was cleaned up after
         # merge).  Runs before the rev-parse HEAD below so a misroute can't be
         # born as a bare merge_dequeued (phantom in_flight on the dashboard).
+        # Pass req.worktree so _classify_branch_presence can distinguish a
+        # genuine misroute (no unmerged commits) from a lost-ref-but-work-present
+        # scenario where the worktree HEAD carries commits beyond main.
         guard = await _classify_branch_presence(
             self._git_ops, self._event_store, req.task_id, req.branch, t0,
+            worktree=req.worktree,
         )
         if guard is not None:
             return guard
@@ -8845,9 +8900,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # outcome means the latest event is the terminal
                     # merge_attempt _classify_branch_presence emitted, not a
                     # bare merge_dequeued (phantom in_flight on the dashboard).
+                    # Pass req.worktree for parity with _do_merge: the
+                    # absent-ref worktree-HEAD fallback fires in both paths.
                     guard = await _classify_branch_presence(
                         self._git_ops, self._event_store, req.task_id,
                         req.branch, t0,
+                        worktree=req.worktree,
                     )
                     if guard is not None:
                         _already = self._oob_deliver(req, guard, speculative=speculative)
