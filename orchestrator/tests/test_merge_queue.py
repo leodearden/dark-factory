@@ -20712,3 +20712,273 @@ class TestResolveAttachAction:
         ):
             action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)
         assert action is AttachAction.ATTACH_CONTAINMENT
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceTipRecency — step-3/4: coalesce_or_enqueue recency check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceTipRecency:
+    """RED: coalesce_or_enqueue_merge_request refuses to coalesce a SUPERSET
+    re-submission when classifier_git_ops is wired.
+
+    Step-3 tests fail until step-4 adds the classifier_git_ops param.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'recency_events.db'
+        return EventStore(db_path=db, run_id='recency-test')
+
+    def _make_superset_git_ops(self, *, old_tip: str, new_tip: str) -> MagicMock:
+        """Stub git_ops where is_ancestor(old, new)=True → SUPERSET."""
+        git_ops = MagicMock()
+        git_ops.project_root = '/fake/root'
+
+        async def _is_ancestor(a: str, b: str) -> bool:
+            # SUPERSET: old_tip is ancestor of new_tip
+            if a == old_tip and b == new_tip:
+                return True
+            return False
+
+        git_ops.is_ancestor = _is_ancestor
+        return git_ops
+
+    def _make_same_tip_git_ops(self) -> MagicMock:
+        """Stub git_ops for SAME-tip (no is_ancestor calls needed)."""
+        git_ops = MagicMock()
+        git_ops.project_root = '/fake/root'
+        git_ops.is_ancestor = AsyncMock(return_value=False)
+        return git_ops
+
+    def _make_subset_git_ops(self, *, old_tip: str, new_tip: str) -> MagicMock:
+        """Stub git_ops where is_ancestor(new, old)=True → SUBSET."""
+        git_ops = MagicMock()
+        git_ops.project_root = '/fake/root'
+
+        async def _is_ancestor(a: str, b: str) -> bool:
+            # SUBSET: new_tip is ancestor of old_tip
+            if a == new_tip and b == old_tip:
+                return True
+            return False
+
+        git_ops.is_ancestor = _is_ancestor
+        return git_ops
+
+    def _seed_registry_with_snapshot(
+        self,
+        registry: InFlightMergeRegistry,
+        branch: str,
+        task_id: str,
+        future: asyncio.Future,
+        *,
+        request_id: str,
+        snapshot_tip: str,
+    ) -> None:
+        """Seed the registry with a slot that has snapshot_tip set."""
+        ok = registry.acquire(
+            branch, task_id, future,
+            request_id=request_id,
+            snapshot_tip=snapshot_tip,
+        )
+        assert ok, 'Expected to acquire the slot'
+
+    async def test_superset_dispatches_not_coalesces(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """SUPERSET new_tip + classifier_git_ops → dispatched=True, not coalesced.
+
+        Pre-seeds registry at OLD_TIP, submits req with snapshot_tip=NEW_TIP
+        where OLD_TIP is ancestor of NEW_TIP (SUPERSET). Assert the request is
+        dispatched independently rather than coalesced.
+        """
+        OLD_TIP = 'aaa0001'
+        NEW_TIP = 'bbb0002'
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        retention = TerminalOutcomeRetention()
+
+        # Seed the registry: in-flight slot at OLD_TIP
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'B', 'task-old', old_fut,
+            request_id='mr-old', snapshot_tip=OLD_TIP,
+        )
+        assert registry.is_inflight('B'), 'Slot seeded'
+
+        # New request with SUPERSET tip
+        req = _make_request('task-new', 'B', tmp_path, config, request_id='mr-new')
+        req.snapshot_tip = NEW_TIP  # type: ignore[attr-defined]
+
+        classifier = self._make_superset_git_ops(old_tip=OLD_TIP, new_tip=NEW_TIP)
+
+        # RED: classifier_git_ops kwarg does not exist yet → TypeError
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            retention=retention,
+            classifier_git_ops=classifier,
+        )
+
+        # SUPERSET → independent dispatch (not coalesced)
+        assert result.dispatched is True, (
+            f'SUPERSET with classifier_git_ops must dispatch, not coalesce; got {result}'
+        )
+        assert result.in_flight is False
+        assert queue.qsize() == 1, 'One new item enqueued'
+        # No alias registered (would be 'mr-new' → 'mr-old')
+        assert 'mr-new' not in retention._aliases, (
+            'SUPERSET dispatch must NOT register a coalesce alias'
+        )
+
+    async def test_same_tip_coalesces_with_classifier(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """SAME tip → still coalesces even when classifier_git_ops is provided."""
+        TIP = 'aaa0001'
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'C', 'task-old', old_fut,
+            request_id='mr-old-c', snapshot_tip=TIP,
+        )
+
+        req = _make_request('task-new-c', 'C', tmp_path, config, request_id='mr-new-c')
+        req.snapshot_tip = TIP  # type: ignore[attr-defined]
+
+        classifier = self._make_same_tip_git_ops()
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            classifier_git_ops=classifier,
+        )
+
+        assert result.in_flight is True, (
+            f'SAME tip should coalesce; got dispatched={result.dispatched}'
+        )
+        assert queue.qsize() == 0, 'SAME tip must not enqueue'
+
+    async def test_subset_coalesces_with_classifier(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """SUBSET new_tip → still coalesces (in-flight is at-or-ahead)."""
+        OLD_TIP = 'aaa0001'
+        NEW_TIP = 'bbb0000'  # NEW is older (subset of OLD)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'D', 'task-old', old_fut,
+            request_id='mr-old-d', snapshot_tip=OLD_TIP,
+        )
+
+        req = _make_request('task-new-d', 'D', tmp_path, config, request_id='mr-new-d')
+        req.snapshot_tip = NEW_TIP  # type: ignore[attr-defined]
+
+        classifier = self._make_subset_git_ops(old_tip=OLD_TIP, new_tip=NEW_TIP)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            classifier_git_ops=classifier,
+        )
+
+        assert result.in_flight is True, (
+            f'SUBSET should coalesce; got dispatched={result.dispatched}'
+        )
+        assert queue.qsize() == 0, 'SUBSET must not enqueue'
+
+    async def test_no_classifier_git_ops_coalesces_unchanged(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Back-compat: no classifier_git_ops → unconditional coalesce regardless of tips."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'E', 'task-old', old_fut,
+            request_id='mr-old-e', snapshot_tip='snap-old',
+        )
+
+        req = _make_request('task-new-e', 'E', tmp_path, config)
+        req.snapshot_tip = 'snap-new-superset'  # type: ignore[attr-defined]
+
+        # No classifier_git_ops → must coalesce unconditionally (back-compat)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None,
+        )
+
+        assert result.in_flight is True, (
+            f'Without classifier_git_ops should coalesce; got {result}'
+        )
+        assert queue.qsize() == 0
+
+    async def test_no_req_snapshot_tip_coalesces_unchanged(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Back-compat: req.snapshot_tip=None → coalesce unchanged (gate skipped)."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'F', 'task-old', old_fut,
+            request_id='mr-old-f', snapshot_tip='snap-old-f',
+        )
+
+        req = _make_request('task-new-f', 'F', tmp_path, config)
+        # req.snapshot_tip is None (default)
+
+        classifier = self._make_superset_git_ops(old_tip='snap-old-f', new_tip='snap-new-f')
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            classifier_git_ops=classifier,
+        )
+
+        assert result.in_flight is True, (
+            f'req.snapshot_tip=None must coalesce unchanged; got {result}'
+        )
+
+    async def test_no_entry_snapshot_tip_coalesces_unchanged(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Back-compat: entry.snapshot_tip=None → coalesce unchanged (gate skipped)."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        # Seed with no snapshot_tip (None)
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        ok = registry.acquire('G', 'task-old-g', old_fut, request_id='mr-old-g')
+        assert ok
+
+        req = _make_request('task-new-g', 'G', tmp_path, config)
+        req.snapshot_tip = 'snap-new-g'  # type: ignore[attr-defined]
+
+        classifier = self._make_superset_git_ops(old_tip='NONE', new_tip='snap-new-g')
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            classifier_git_ops=classifier,
+        )
+
+        assert result.in_flight is True, (
+            f'entry.snapshot_tip=None must coalesce unchanged; got {result}'
+        )
