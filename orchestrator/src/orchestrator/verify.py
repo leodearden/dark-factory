@@ -1724,6 +1724,7 @@ async def _run_cmd(
     log_path: 'Path | None' = None,
     *,
     use_cgroup_scope: bool = False,
+    clock_stop: ClockStopConfig | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
 
@@ -1748,6 +1749,16 @@ async def _run_cmd(
     accumulated buffer is also returned via the second tuple slot, identical
     to the legacy ``proc.communicate()`` contract.  When *log_path* is None
     no file is created.
+
+    When *clock_stop* is provided AND *log_path* is not None, the streamed
+    path uses a marker-aware state machine instead of the single
+    ``asyncio.wait_for``.  The loop recognises the configured STOP /
+    HEARTBEAT / START marker family and EXCLUDES the declared admission-wait
+    span from *timeout* (the wall-clock deadline is shifted forward by the
+    stopped duration on START).  A heartbeat-idle backstop fires if no
+    heartbeat arrives within ``clock_stop.heartbeat_idle_max`` seconds of
+    the last STOP or HEARTBEAT.  Any deadline breach raises ``TimeoutError``,
+    which the existing kill path catches (``timed_out=True → infra_timeout``).
 
     ``PYTHONUNBUFFERED=1`` is unconditionally injected into the subprocess env
     so that python children (pytest, ruff, pyright via uv) flush their stdout
@@ -1812,18 +1823,99 @@ async def _run_cmd(
         # handler runs, which is exactly what we want.
         buf = bytearray()
         with open(log_path, 'wb') as log_fh:
-            async def _stream() -> None:
-                assert proc is not None and proc.stdout is not None
+            assert proc.stdout is not None
+            if clock_stop is None:
+                # ── Legacy streamed path (unchanged) ────────────────────────
+                async def _stream() -> None:
+                    assert proc is not None and proc.stdout is not None
+                    while True:
+                        chunk = await proc.stdout.read(4096)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        log_fh.write(chunk)
+                        log_fh.flush()
+                    await proc.wait()
+
+                await asyncio.wait_for(_stream(), timeout=timeout)
+            else:
+                # ── Marker-aware clock-stop loop (task 1916) ────────────────
+                # State machine: RUNNING enforces a wall-clock deadline that
+                # is shifted forward by each STOP→START span so admission
+                # waits are excluded.  STOPPED enforces a heartbeat-idle
+                # backstop; any deadline breach raises TimeoutError → existing
+                # kill path → timed_out=True.  Raw bytes are written verbatim
+                # to log_fh/buf (byte-identical on-disk log).  A SEPARATE
+                # line_buf decodes complete lines for marker scanning without
+                # disturbing the raw stream.
+                _CS_RUNNING = 'running'
+                _CS_STOPPED = 'stopped'
+                state = _CS_RUNNING
+                t0 = time.monotonic()
+                # Wall-clock deadline: start + timeout, shifted forward on each
+                # STOP→START transition by the duration of the stopped span.
+                deadline = t0 + timeout
+                stop_entered: float = 0.0
+                idle_deadline: float = 0.0
+                line_buf = bytearray()
+
                 while True:
-                    chunk = await proc.stdout.read(4096)
+                    now = time.monotonic()
+                    if state == _CS_RUNNING:
+                        read_timeout = deadline - now
+                    else:  # _CS_STOPPED
+                        read_timeout = idle_deadline - now
+
+                    if read_timeout <= 0:
+                        raise TimeoutError()
+
+                    chunk = await asyncio.wait_for(
+                        proc.stdout.read(4096),
+                        timeout=read_timeout,
+                    )
+
                     if not chunk:
+                        # EOF: process finished; wait for exit code within
+                        # remaining wall-clock budget (fast in practice).
+                        now = time.monotonic()
+                        wait_budget = max(5.0, deadline - now)
+                        await asyncio.wait_for(proc.wait(), timeout=wait_budget)
                         break
+
+                    # Write raw bytes verbatim (byte-identical on-disk log).
                     buf.extend(chunk)
                     log_fh.write(chunk)
                     log_fh.flush()
-                await proc.wait()
 
-            await asyncio.wait_for(_stream(), timeout=timeout)
+                    # Scan complete lines for clock-stop markers.
+                    # line_buf accumulates bytes until a newline boundary.
+                    line_buf.extend(chunk)
+                    while b'\n' in line_buf:
+                        idx = line_buf.index(b'\n')
+                        line_bytes = line_buf[:idx]
+                        line_buf = line_buf[idx + 1:]
+                        line = line_bytes.decode(errors='replace')
+                        marker = _match_clock_marker(line, clock_stop)
+                        if marker is None:
+                            continue
+
+                        now = time.monotonic()
+                        if state == _CS_RUNNING:
+                            if marker == 'stop':
+                                state = _CS_STOPPED
+                                stop_entered = now
+                                idle_deadline = now + clock_stop.heartbeat_idle_max
+                        else:  # _CS_STOPPED
+                            if marker in ('heartbeat', 'stop'):
+                                # Heartbeat (or duplicate STOP) resets idle backstop.
+                                idle_deadline = now + clock_stop.heartbeat_idle_max
+                            elif marker == 'start':
+                                # Resume: shift wall-clock deadline forward by
+                                # the duration of this stopped span.
+                                stopped_duration = now - stop_entered
+                                deadline += stopped_duration
+                                state = _CS_RUNNING
+
         rc = proc.returncode if proc.returncode is not None else 1
         return rc, buf.decode(errors='replace'), False
     except TimeoutError:
