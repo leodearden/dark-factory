@@ -1666,10 +1666,11 @@ class TestScenario9CircuitBreaker:
         """FIRE: flat landings_total + falling disk → scheduler paused.
 
         The breaker reads landings_total from the REAL worker snapshot(),
-        not from a MagicMock stub.
+        not from a MagicMock stub.  floor=10_000_000 > disk values (180k–200k)
+        so the disk-pressure gate (last_free < floor) is satisfied.
         """
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
         worker = _attach_real_worker(harness, git_ops)
 
         # landings_total starts at 0 and stays flat (no record_landing calls).
@@ -1686,9 +1687,12 @@ class TestScenario9CircuitBreaker:
         self, tmp_path: Path, git_repo: Path, config: OrchestratorConfig,
         git_ops: GitOps,
     ) -> None:
-        """FIRE: after trip, exactly one pending INFO escalation with correct attrs."""
+        """FIRE: after trip, exactly one pending INFO escalation with correct attrs.
+
+        floor=10_000_000 so disk-pressure gate is satisfied at trip time.
+        """
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
         worker = _attach_real_worker(harness, git_ops)
 
         await self._drive_to_trip(harness, worker, config, git_repo, window=3)
@@ -1720,9 +1724,10 @@ class TestScenario9CircuitBreaker:
 
         This is the integration delta: the upstream θ test stubbed the worker's
         snapshot() — here the real ι counter drives the resume.
+        floor=10_000_000 so disk-pressure gate is satisfied at trip time.
         """
         harness, _rs = _make_harness(tmp_path)
-        harness._no_landings_breaker = _small_breaker(window=3, floor=1000)
+        harness._no_landings_breaker = _small_breaker(window=3, floor=10_000_000)
         worker = _attach_real_worker(harness, git_ops)
 
         # Trip the breaker.

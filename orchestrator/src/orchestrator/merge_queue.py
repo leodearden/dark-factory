@@ -5497,6 +5497,9 @@ class NoLandingsCircuitBreaker:
       the full ``window_samples``
     * disk strictly falling: every consecutive free_bytes is strictly less than
       its predecessor across the full window
+    * disk under pressure: window-end ``free_bytes < disk_free_floor_bytes``
+      (trip only fires below the floor; mirrors resume's ``>= floor`` so a
+      trip above the floor is impossible and self-resume cannot occur)
 
     **Resume conditions (OR)**:
     * a clean landing: ``landings_total`` increased above the value at trip time
@@ -5594,10 +5597,21 @@ class NoLandingsCircuitBreaker:
     def _check_trip(self) -> BreakerTrip | None:
         """Evaluate trip conditions over the last window_samples entries.
 
-        Returns a BreakerTrip(action='halt') when BOTH conditions hold:
+        Returns a BreakerTrip(action='halt') when ALL THREE conditions hold:
           1. Landing-rate == 0: landings_total is identical across the window.
           2. Disk strictly falling: every consecutive pair of free_bytes values
              is strictly decreasing (no plateau allowed).
+          3. Disk under pressure: the most recent free_bytes is strictly less
+             than disk_free_floor_bytes (trip only when disk is already below
+             the floor, never while disk is healthy above it).
+
+        The trip/resume floor symmetry is intentional: trip fires when
+        ``last_free < disk_free_floor_bytes`` and resume fires when
+        ``free_bytes >= disk_free_floor_bytes``, so a trip can only occur
+        below the floor and self-resume is structurally impossible (the
+        halted host cannot transition from tripped-below to untripped-above
+        without passing through the floor).  This eliminates the
+        halt+escalate+auto-resume flap that occurs when disk is healthy.
 
         Returns None otherwise.  Sets internal ``_tripped`` state on first trip.
         """
@@ -5618,10 +5632,16 @@ class NoLandingsCircuitBreaker:
             for i in range(len(window) - 1)
         )
 
-        if not (landings_flat and disk_falling):
+        # Condition 3: disk under pressure — only trip when window-end free is
+        # strictly below the absolute floor (mirrors _check_resume's >= floor).
+        # A host with healthy disk above the floor must never trip so it can
+        # never immediately self-resume (the flap elimination).
+        disk_pressure = last_free < self._disk_free_floor_bytes
+
+        if not (landings_flat and disk_falling and disk_pressure):
             return None
 
-        # Both conditions met — trip
+        # All three conditions met — trip
         self._tripped = True
         self._landings_at_trip = last_landings
         self._free_at_trip = last_free
@@ -5630,6 +5650,7 @@ class NoLandingsCircuitBreaker:
             f'No-landings circuit-breaker tripped: 0 landings over '
             f'{self._window_samples} samples; disk free fell '
             f'{first_free:,} → {last_free:,} bytes'
+            f'; free below floor {self._disk_free_floor_bytes:,}'
         )
         return BreakerTrip(
             action='halt',
