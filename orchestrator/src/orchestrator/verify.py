@@ -1648,6 +1648,74 @@ def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
     return env
 
 
+@dataclass(frozen=True)
+class ClockStopConfig:
+    """Configuration for the clock-stop verify timeout seam (task 1916).
+
+    Bundles the marker strings and timing limits used by the marker-aware
+    streamed loop in ``_run_cmd``.  Constructed from ``OrchestratorConfig``
+    fields in ``_run_or_skip_timed`` and passed as ``clock_stop=...``.
+
+    Modelled on the ``ModuleConfig`` dataclass style (plain frozen dataclass
+    holding verify-related overrides, defined next to its consumer).
+
+    Fields
+    ------
+    marker_stop : str
+        Substring matched against complete output lines to enter STOPPED state.
+    marker_heartbeat : str
+        Substring matched to reset the heartbeat-idle deadline while STOPPED.
+    marker_start : str
+        Substring matched to resume RUNNING state (wall-clock resumes).
+    heartbeat_idle_max : float
+        Max seconds between heartbeats (or after STOP) before the idle backstop
+        kills the subprocess.  Must be > 0.
+    max_total_secs : float
+        Max cumulative seconds in STOPPED state across all stop/start cycles.
+        0 means unlimited (no total cap).
+    """
+
+    marker_stop: str
+    marker_heartbeat: str
+    marker_start: str
+    heartbeat_idle_max: float
+    max_total_secs: float = 0.0
+
+
+def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
+    """Return 'stop', 'heartbeat', or 'start' if *line* contains the respective
+    configured marker string; else None.
+
+    Matching is by substring containment of the FULL configured marker string
+    against a complete (newline-delimited) line.  This is tolerant of:
+    - Trailing fields on the marker line  (reason=…, waited=…, pid=…).
+    - A leading harness/log prefix before the marker.
+
+    The three marker strings are guaranteed mutually distinct (enforced by the
+    OrchestratorConfig validator when enabled), so substring matching cannot
+    misclassify — e.g. @@REIFY_CLOCK_START@@ and @@REIFY_CLOCK_STOP@@ share
+    no common substring that would cross-match.
+
+    Parameters
+    ----------
+    line : str
+        A complete, newline-stripped output line from the verify subprocess.
+    cfg : ClockStopConfig
+        The active clock-stop configuration.
+
+    Returns
+    -------
+    'stop' | 'heartbeat' | 'start' | None
+    """
+    if cfg.marker_stop in line:
+        return 'stop'
+    if cfg.marker_heartbeat in line:
+        return 'heartbeat'
+    if cfg.marker_start in line:
+        return 'start'
+    return None
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
