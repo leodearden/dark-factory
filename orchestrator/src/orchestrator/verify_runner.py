@@ -812,7 +812,7 @@ class RemoteRunner:
 
                 # task-1920: archive remote stderr on failure for operator triage.
                 # Best-effort: any error is swallowed so the VerifyResult is unchanged.
-                if not result.passed and archive_root is not None and task_id is not None:
+                if not result.passed and ssh_stderr.strip() and archive_root is not None and task_id is not None:
                     self._archive_failure_stderr(archive_root, task_id, ssh_stderr)
 
                 return result
