@@ -954,6 +954,7 @@ class VerifyRunnerPool:
         *,
         event_store: Any = None,
         task_id: str | None = None,
+        archive_root: Path | None = None,
     ) -> None:
         if not runners:
             raise ValueError('VerifyRunnerPool requires at least one runner')
@@ -967,6 +968,9 @@ class VerifyRunnerPool:
         )
         self._event_store = event_store
         self._task_id = task_id
+        # task-1920: thread archive_root into RemoteRunner.run_merge_verify so failed
+        # remote-verify stderr is archived beside local merge-verify logs for triage.
+        self._archive_root = archive_root
         # ι: quarantine set — names of runners dropped from eligible dispatch.
         # Local (is_local) is the trust anchor and is never quarantined.
         self._quarantined: set[str] = set()
@@ -1043,7 +1047,18 @@ class VerifyRunnerPool:
         selected = self._select_runner()
         t0 = time.monotonic()
         try:
-            result = await selected.run_merge_verify(merge_sha, spec)
+            # task-1920: thread archive_root + task_id into RemoteRunner only.
+            # Existing 2-arg test doubles and LocalRunner (which archives via its own
+            # constructor) are left untouched — the isinstance branch confines the
+            # change to the one runner that needs it.
+            if isinstance(selected, RemoteRunner):
+                result = await selected.run_merge_verify(
+                    merge_sha, spec,
+                    task_id=self._task_id,
+                    archive_root=self._archive_root,
+                )
+            else:
+                result = await selected.run_merge_verify(merge_sha, spec)
             actual_runner = selected
         except RunnerUnavailable:
             # Fall back to the local runner if one exists and is not the
@@ -1054,6 +1069,7 @@ class VerifyRunnerPool:
                     selected.name,
                     merge_sha,
                 )
+                # RunnerUnavailable→local fallback: always 2-arg (local never archives remote stderr)
                 result = await self._local.run_merge_verify(merge_sha, spec)
                 actual_runner = self._local
             else:
