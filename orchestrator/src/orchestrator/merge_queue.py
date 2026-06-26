@@ -1709,6 +1709,39 @@ def decide_attach_action(
     )
 
 
+async def resolve_attach_action(
+    new_tip: str,
+    old_tip: str,
+    *,
+    verifying: bool,
+    git_ops: GitOps,
+) -> AttachAction:
+    """Classify and decide the attach action for a new tip vs an in-flight tip.
+
+    Shared helper used by BOTH the workflow path (workflow.py) and the MCP
+    coalesce path (coalesce_or_enqueue_merge_request) so the two paths cannot
+    diverge on tip-recency decisions again.
+
+    Composes :func:`classify_tip_relation` → :func:`resolve_divergent` →
+    :func:`decide_attach_action` in sequence:
+
+    1. Classify the topological relationship between *new_tip* and *old_tip*.
+    2. If DIVERGENT, resolve via patch-id content comparison
+       (:func:`resolve_divergent`) to either SUBSET or SUPERSET.
+    3. Map the resolved relation + *verifying* to an :class:`AttachAction`.
+
+    Returns one of:
+    - :attr:`AttachAction.COALESCE` — tips are identical (SAME).
+    - :attr:`AttachAction.RESNAPSHOT` — new tip is a SUPERSET and not verifying.
+    - :attr:`AttachAction.ATTACH_AND_CHAIN` — new tip is a SUPERSET and verifying.
+    - :attr:`AttachAction.ATTACH_CONTAINMENT` — new tip is a SUBSET.
+    """
+    relation = await classify_tip_relation(new_tip, old_tip, git_ops)
+    if relation is TipRelation.DIVERGENT:
+        relation = await resolve_divergent(new_tip, old_tip, git_ops)
+    return decide_attach_action(relation, verifying=verifying)
+
+
 async def _check_post_merge_equivalence(
     task_worktree: Path,
     advanced_sha: str,
