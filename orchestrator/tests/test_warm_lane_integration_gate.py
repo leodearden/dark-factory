@@ -1348,3 +1348,222 @@ class TestOmegaIntegrationGate:
 
         # ── Phase 4: merge — no unknown_branch + WIP lands on main ───────────
         await _assert_merge_phase(git_ops, info2.path, task_id, wip_file, wip_content, ig_git_repo)
+
+
+# ===========================================================================
+# ω-gate (task 1923): live-requeue reuse on already-detached lane
+#
+# Covers the proven residual that the original ω gate (task 1915) missed:
+# route 2 (disk-backstop reuse) on an already-detached lane.  The 1915 gate
+# only covered route 3 (γ reattach with no plan.json), which bypasses the
+# release_warm_lane detach.  This gate exercises the DETACH → disk-backstop
+# reuse → rebind → merge path end-to-end.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestOmegaLiveRequeueReuseGate:
+    """ω (task 1923) live-requeue reuse gate: disk-backstop reuse on an
+    already-detached lane → branch rebinds to lane HEAD → α retains → merge.
+
+    The proven residual (esc-4759-73):
+      release_warm_lane detaches the lane and frees it; a same-id re-dispatch
+      takes the disk-backstop reuse route (route 2, above the γ reattach site)
+      onto the DETACHED HEAD.  _reuse_warm_lane commit()s+rebase_onto_main on
+      the detached HEAD and (before step-4) never rebinds refs/heads/task/<id>.
+      The named ref stays at the pre-detach tip; after main advances that tip
+      is 0-beyond-main, so α's _branch_has_commits_beyond_main deletes it, and
+      merge_to_main → resolve_queued_branch_ref hits unknown_branch.
+
+    With the step-4 fix (_reuse_warm_lane calls rebind_branch_to_head after
+    rebase_onto_main):
+      Phase 0 — create_worktree(id); write .task/plan.json {"task_id": id}
+                 (forces disk-backstop reuse route 2); commit WIP (n>0 beyond
+                 main); advance main so pre-detach tip falls to 0-beyond-main.
+      Phase 1 — release_warm_lane(lane, id) → detach HEAD, α retains
+                 task/<id>, pool FREE, plan.json intact.
+      Phase 2 (reuse) — acquire_warm_lane(id, <main HEAD>) → disk-backstop
+                 reuse: refs/heads/task/<id> == lane HEAD (rebind fixed ref);
+                 lane ON task/<id>; commits > 0 beyond main; WIP reachable.
+      Phase 3 (α) — release_lane_for_terminal_task retains task/<id> because
+                 the rebind made α see the REAL rebased commits, not the stale
+                 pre-detach tip.
+      Phase 4 (merge) — _classify_branch_presence is None; merge_to_main
+                 resolves by name (no unknown_branch); WIP lands on main.
+
+    Negative controls:
+      FAIL if step-4 rebind reverted → Phase 2 ref ≠ HEAD → FAIL
+      FAIL if α reverted → Phase 3 branch deleted → _classify returns non-None → FAIL
+    """
+
+    async def test_live_requeue_reuse_on_detached_lane(self, ig_git_repo: Path) -> None:
+        """End-to-end: disk-backstop reuse on a detached lane closes the 1923 residual."""
+        import json as _json
+
+        task_id = 'live-requeue-gate-1'
+        wip_file = f'wip_live_requeue_{task_id}.txt'
+        wip_content = 'live-requeue gate wip content\n'
+
+        await _add_all_warm_lane_scripts(ig_git_repo)
+        config = _make_orch_config(ig_git_repo)
+        harness = _build_harness(config)
+        git_ops = harness.git_ops
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # ── Phase 0: create lane, write plan.json (forces disk-backstop reuse
+        #    route 2), commit WIP (n_before>0 beyond main), advance main ─────
+        info = await git_ops.create_worktree(task_id)
+        assert isinstance(info, WorktreeInfo), (
+            f'Phase 0: create_worktree must return WorktreeInfo, got {info!r}'
+        )
+        lane = info.path
+
+        # Write .task/plan.json — the disk-backstop reuse trigger.
+        # acquire_warm_lane reads this on re-dispatch to route to _reuse_warm_lane
+        # (route 2) instead of reset-in-place, preserving WIP across detach+reacquire.
+        task_dir = lane / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': task_id}))
+
+        # Write and commit WIP (1 commit beyond main)
+        (lane / wip_file).write_text(wip_content)
+        await git_ops.commit(lane, f'wip: live-requeue gate work for {task_id}')
+
+        rc, count_str, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc == 0
+        n_before = int(count_str.strip())
+        assert n_before > 0, (
+            f'Phase 0: task/{task_id} must have commits beyond main after WIP commit, '
+            f'got {n_before}'
+        )
+
+        # Advance main with an unrelated commit.
+        # This makes the pre-detach tip of task/<id> fall to 0-beyond-main after
+        # detach; without the step-4 rebind, α would see 0-beyond-main and delete
+        # the branch, causing merge_to_main → unknown_branch.
+        unrelated = ig_git_repo / 'main_advance_live_requeue.txt'
+        unrelated.write_text('main advance: live-requeue gate\n')
+        await _run(['git', 'add', '-A'], cwd=ig_git_repo)
+        await _run(
+            ['git', 'commit', '-m', 'advance main: live-requeue gate (unrelated)'],
+            cwd=ig_git_repo,
+        )
+        main_head = await _get_head(ig_git_repo)
+
+        # ── Phase 1: release_warm_lane → detach, α retains, pool FREE ────────
+        await git_ops.release_warm_lane(lane, task_id)
+
+        # Lane must be detached
+        rc_br, branch_out, _ = await _run(
+            ['git', '-C', str(lane), 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=ig_git_repo,
+        )
+        assert rc_br == 0 and branch_out.strip() == 'HEAD', (
+            f'Phase 1: lane must be detached after release_warm_lane, '
+            f'got {branch_out.strip()!r}'
+        )
+        # α retained task/<id> (it had commits before advance; now the REF is
+        # at the pre-detach tip, which is NOT yet 0-beyond-main because advance
+        # happened AFTER the commit, so α sees the WIP commit and retains it)
+        rc_retain, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', f'refs/heads/task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_retain == 0, (
+            f'Phase 1: task/{task_id} must be retained by α guard after release; '
+            f'the pre-detach tip had {n_before} commit(s) beyond main at release time'
+        )
+        # pool FREE
+        assert pool.state(lane) == LaneState.FREE, (
+            f'Phase 1: lane must be FREE after release_warm_lane, '
+            f'got {pool.state(lane)!r}'
+        )
+        # plan.json intact (release_warm_lane never touches .task/)
+        assert (lane / '.task' / 'plan.json').exists(), (
+            'Phase 1: .task/plan.json must survive release_warm_lane '
+            '(disk-backstop reuse depends on it persisting across detach)'
+        )
+
+        # ── Phase 2: acquire_warm_lane → disk-backstop reuse on detached lane ─
+        info2 = await git_ops.acquire_warm_lane(task_id, main_head)
+        assert isinstance(info2, WorktreeInfo), (
+            f'Phase 2: acquire_warm_lane must return WorktreeInfo via disk-backstop '
+            f'reuse (route 2), got {info2!r}'
+        )
+        assert info2.path == lane, (
+            f'Phase 2: must reuse the SAME physical lane (disk-backstop route 2), '
+            f'got {info2.path!r} != {lane!r}'
+        )
+
+        # KEY assertion: refs/heads/task/<id> must equal lane HEAD after the
+        # step-4 rebind_branch_to_head call inside _reuse_warm_lane.
+        # Without the fix the ref stays at the pre-detach tip (drifted from the
+        # rebased detached HEAD) → ref ≠ HEAD → FAIL.
+        rc_ref, ref_sha, _ = await _run(
+            ['git', 'rev-parse', f'refs/heads/task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_ref == 0, (
+            f'Phase 2: refs/heads/task/{task_id} must resolve (step-4 rebind); '
+            f'rc={rc_ref}'
+        )
+        rc_head, head_sha, _ = await _run(
+            ['git', '-C', str(lane), 'rev-parse', 'HEAD'],
+            cwd=ig_git_repo,
+        )
+        assert rc_head == 0
+        assert ref_sha.strip() == head_sha.strip(), (
+            f'Phase 2: refs/heads/task/{task_id} must equal lane HEAD after rebind '
+            f'(step-4 _reuse_warm_lane fix); '
+            f'ref={ref_sha.strip()!r}, HEAD={head_sha.strip()!r}. '
+            f'Reverted step-4 → ref stays at stale pre-detach tip → FAIL.'
+        )
+
+        # Lane must be ON task/<id> (attached, not detached)
+        rc_br2, branch_out2, _ = await _run(
+            ['git', '-C', str(lane), 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=ig_git_repo,
+        )
+        assert rc_br2 == 0
+        assert branch_out2.strip() == f'task/{task_id}', (
+            f'Phase 2: lane must be ON task/{task_id} after disk-backstop reuse + rebind; '
+            f'got {branch_out2.strip()!r}'
+        )
+
+        # Commits preserved (rebased-equivalent > 0 beyond main)
+        rc_count, count_str2, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..task/{task_id}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_count == 0
+        n_after = int(count_str2.strip())
+        assert n_after > 0, (
+            f'Phase 2: task/{task_id} must have commits beyond rebased main after '
+            f'disk-backstop reuse; got {n_after}'
+        )
+
+        # WIP content reachable from task/<id>
+        rc_show, show_out, _ = await _run(
+            ['git', 'show', f'task/{task_id}:{wip_file}'],
+            cwd=ig_git_repo,
+        )
+        assert rc_show == 0 and wip_content.strip() in show_out, (
+            f'Phase 2: WIP must be reachable from task/{task_id} after disk-backstop '
+            f'reuse+rebase; rc={rc_show!r}, out={show_out!r}'
+        )
+
+        # ── Phase 3 (α): release retains the branch ───────────────────────────
+        # The rebind made α's _branch_has_commits_beyond_main see the REAL rebased
+        # commits (not the stale pre-detach tip), so it retains task/<id>.
+        # Without the step-4 fix this release would see 0-beyond-main and delete it.
+        await _assert_alpha_phase(git_ops, pool, lane, task_id, ig_git_repo)
+
+        # ── Phase 4 (merge): no unknown_branch + WIP lands on main ───────────
+        # _classify_branch_presence must return None (branch present, not unknown).
+        # merge_to_main must resolve by name (no absent-ref fallback needed).
+        # WIP content must land on main after advance_main.
+        await _assert_merge_phase(git_ops, lane, task_id, wip_file, wip_content, ig_git_repo)
