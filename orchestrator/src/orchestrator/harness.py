@@ -3252,8 +3252,18 @@ Output JSON matching the schema. Every task must appear in the output.
         # (depth == 0) cannot be a churn spiral — any concurrent disk fall is
         # from an unrelated source.  Defaults to 1 (active) so test mocks that
         # omit 'depth' are treated as active (backward-compatible).
+        #
+        # Buffer clear: also reset() the breaker so stale flat+falling samples
+        # accumulated before the idle gap are dropped.  Without this, an
+        # oscillating queue (active → idle → active) can fill a trip window
+        # across the idle gap and spuriously trip on a queue that was never
+        # continuously active.  A fresh full window of flat+falling samples is
+        # required to re-trip (anti-flap is preserved by the buffer-clear-on-
+        # resume inside _check_resume; this reset() only clears pre-idle
+        # samples).
         queue_depth: int = snapshot.get('depth', 1)
         if queue_depth == 0 and not self._no_landings_breaker.is_tripped:
+            self._no_landings_breaker.reset()
             return
 
         try:
