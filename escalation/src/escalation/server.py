@@ -859,6 +859,11 @@ def create_server(
         # returns immediately with in_flight=True — no future await, no duplicate
         # enqueue.  On dispatch acquires the registry slot and awaits the future
         # exactly as the original enqueue_merge_request path.
+        # classifier_git_ops: the same harness GitOps handle is reused here so
+        # the recency check (resolve_attach_action) can classify the tip relation
+        # between req.snapshot_tip and the in-flight entry's snapshot_tip.  When
+        # git_ops_for_scan is None (standalone / tests without orchestrator) the
+        # classifier is also None and the recency check is a no-op (back-compat).
         dispatch = await coalesce_or_enqueue_merge_request(
             merge_queue,
             merge_req,
@@ -866,6 +871,7 @@ def create_server(
             _registry,
             git_ops=git_ops_for_scan,
             live_snapshot=live_snapshot,
+            classifier_git_ops=git_ops_for_scan,
         )
 
         def _nonblocking_state_response(

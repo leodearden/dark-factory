@@ -5104,15 +5104,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             AttachAction,
             MergeRequest,
-            TipRelation,
             WaiterRecord,
             _check_plan_files_touched_in_branch,
             _emit_merge_attempt,
             _emit_merge_coalesced,
-            classify_tip_relation,
-            decide_attach_action,
             register_and_enqueue_merge_request,
-            resolve_divergent,
+            resolve_attach_action,
         )
 
         assert self.worktree is not None
@@ -5231,11 +5228,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     f'(old={old_tip!r}, new={new_tip!r}); enqueueing independently.'
                 )
             else:
-                # Tip-relation classification.
-                relation = await classify_tip_relation(new_tip, old_tip, self.git_ops)
-                if relation is TipRelation.DIVERGENT:
-                    relation = await resolve_divergent(new_tip, old_tip, self.git_ops)
-                action = decide_attach_action(relation, verifying=verifying)
+                # Tip-relation classification via the shared helper — same
+                # classification decision as the MCP coalesce path.  Action
+                # handling differs: on RESNAPSHOT the workflow coalesces the
+                # new request as a peer waiter (see else-branch below); the MCP
+                # path independent-enqueues instead (see coalesce_or_enqueue).
+                action = await resolve_attach_action(
+                    new_tip, old_tip, verifying=verifying, git_ops=self.git_ops,
+                )
                 if action is AttachAction.RESNAPSHOT:
                     _registry.re_snapshot(branch_name, new_tip)
 

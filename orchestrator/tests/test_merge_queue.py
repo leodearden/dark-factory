@@ -1343,6 +1343,130 @@ class TestMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
+    async def test_already_merged_honors_snapshot_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """already-merged check uses req.snapshot_tip when set, ignoring drifted worktree HEAD.
+
+        Scenario (mirrors the production regression in task 1917):
+        - Branch tip SNAP is merged onto main.
+        - Worktree HEAD is then rewritten to a DIVERGENT commit D (non-ancestor of main),
+          simulating a lane reused by a new task or an orphaned lineage.
+        - req.snapshot_tip = SNAP (the ref THIS request was intended to merge).
+        - The ancestor check should use SNAP (already on main) → 'already_merged'.
+
+        RED until step-12: currently the check reads only the worktree HEAD (D),
+        which is NOT an ancestor of main, so it proceeds to merge instead of
+        returning 'already_merged'.
+        """
+        wt = (await git_ops.create_worktree('snap-already-merged')).path
+        (wt / 'snap_am.py').write_text('snap = 1\n')
+        await git_ops.commit(wt, 'Add snap_am.py')
+
+        # Capture SNAP (the branch tip that was merged)
+        rc, snap_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        snap = snap_out.strip()
+
+        # Merge SNAP to main
+        merge_result = await git_ops.merge_to_main(wt, 'snap-already-merged')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        await git_ops.advance_main(
+            merge_result.merge_commit, merge_result.merge_worktree,
+            branch='snap-already-merged', max_attempts=1,
+        )
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # Rewrite worktree HEAD to a DIVERGENT commit D (non-ancestor of main)
+        (wt / 'snap_am.py').write_text('DIVERGENT = 999\n')
+        rc, _, _ = await _run(['git', 'add', 'snap_am.py'], cwd=wt)
+        assert rc == 0
+        rc, _, _ = await _run(
+            ['git', 'commit', '-m', 'Divergent: rewrite snap_am.py'], cwd=wt,
+        )
+        assert rc == 0
+
+        # req.snapshot_tip = SNAP (the already-merged tip)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = MergeRequest(
+            task_id='snap-am-test',
+            branch='snap-already-merged',
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=asyncio.get_running_loop().create_future(),
+            snapshot_tip=snap,  # the already-merged tip — check should use this
+        )
+        await queue.put(req)
+
+        outcome = await asyncio.wait_for(req.result, timeout=15)
+        # RED until step-12: currently uses worktree HEAD D (non-ancestor) →
+        # proceeds to merge instead of 'already_merged'.
+        assert outcome.status == 'already_merged', (
+            f'expected already_merged (snapshot_tip=SNAP is ancestor of main); '
+            f'got {outcome.status!r}. snapshot_tip={snap[:8]}'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_already_merged_snapshot_tip_none_uses_worktree_head(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Back-compat: snapshot_tip=None falls back to worktree HEAD basis.
+
+        When req.snapshot_tip is None, the existing worktree-HEAD ancestor check
+        must still fire: a non-ancestor HEAD → the merge proceeds (not skipped).
+        This test also PASSES today (before step-12) because the current code
+        already uses the worktree HEAD and the new code explicitly falls back.
+
+        MUST STILL PASS after step-12.
+        """
+        wt = (await git_ops.create_worktree('snap-backcompat-none')).path
+        (wt / 'snap_bc.py').write_text('bc = 1\n')
+        await git_ops.commit(wt, 'Add snap_bc.py')
+
+        # snapshot_tip=None — the check should use worktree HEAD
+        # HEAD is a non-ancestor of main (branch not yet merged) → proceed to merge
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = MergeRequest(
+                task_id='snap-bc-none',
+                branch='snap-backcompat-none',
+                worktree=wt,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=asyncio.get_running_loop().create_future(),
+                snapshot_tip=None,  # falls back to worktree HEAD
+            )
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=15)
+
+        # Must NOT be already_merged — worktree HEAD is not on main yet
+        assert outcome.status != 'already_merged', (
+            'snapshot_tip=None + non-ancestor HEAD must not return already_merged; '
+            f'got {outcome.status!r}'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
     async def test_unknown_branch_emits_terminal_merge_attempt(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
@@ -8607,6 +8731,85 @@ class TestCheckPostMergeEquivalence:
         )
         assert failed == []
 
+    async def test_merged_tip_prevents_false_positive_on_drifted_worktree(
+        self, git_ops: GitOps,
+    ):
+        """merged_tip=SNAP prevents a false-positive when the worktree HEAD drifts.
+
+        Scenario (mirrors the production regression in task 1917):
+        - A file is committed to a branch → SNAP (the branch tip at merge time).
+        - The merge is landed → ADVANCED.
+        - The worktree HEAD drifts to a DIVERGENT commit D that changes the
+          same file differently (simulating a lane hijacked by a new task).
+
+        Without merged_tip (legacy path): the gate compares DIVERGENT HEAD D
+        against ADVANCED → false-positive ['h.py'] even though the merge was
+        byte-perfect.
+
+        With merged_tip=SNAP: the gate compares the actual merged tip SNAP
+        against ADVANCED → clean [] (file content preserved).
+
+        RED until step-8 adds the merged_tip kwarg to _check_post_merge_equivalence.
+        """
+        wt = (await git_ops.create_worktree('drifted-worktree-equiv')).path
+        (wt / 'h.py').write_text('h = 1\n')
+        await git_ops.commit(wt, 'Add h.py')
+
+        # Capture SNAP = the branch tip that will be merged
+        rc, snap_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        snap = snap_out.strip()
+
+        pre_merge_main = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'drifted-worktree-equiv')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='drifted-worktree-equiv', max_attempts=1,
+            )
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
+                or merge_result.merge_commit
+            )
+            assert advanced is not None
+
+            # Rewrite the worktree HEAD to a DIVERGENT commit D (simulates drift)
+            (wt / 'h.py').write_text('DIVERGENT = 999\n')
+            rc, _, _ = await _run(['git', 'add', 'h.py'], cwd=wt)
+            assert rc == 0
+            rc, _, _ = await _run(
+                ['git', 'commit', '-m', 'Divergent: different h.py content'], cwd=wt,
+            )
+            assert rc == 0
+
+            # Legacy path (no merged_tip): reads worktree HEAD D → false-positive
+            # h.py diverges from ADVANCED. This is the bug: the merge was clean
+            # but the drifted HEAD makes the gate think work was dropped.
+            legacy_result = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, pre_merge_main, task_id='drifted-legacy',
+            )
+            assert legacy_result != [], (
+                'Legacy path (no merged_tip) must false-positive when worktree drifts; '
+                f'got [] — test setup may be wrong. advanced={advanced[:8]}, snap={snap[:8]}'
+            )
+
+            # New path (merged_tip=SNAP): compares the actual merged tip → clean []
+            # RED until step-8: this kwarg doesn't exist yet (TypeError)
+            clean_result = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, pre_merge_main,
+                task_id='drifted-merged-tip',
+                merged_tip=snap,
+            )
+            assert clean_result == [], (
+                f'merged_tip=SNAP path must return [] (clean); got {clean_result!r}. '
+                f'advanced={advanced[:8]}, snap={snap[:8]}'
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 async def test_speculative_merger_surfaces_worktree_missing_after_plan_touched_class(
@@ -13431,6 +13634,176 @@ class TestFinalizeAdvancedMerge:
         )
         assert rec.branch == 'task/t-chain', (
             f'coexistence: retention recorded wrong branch; got {rec.branch!r}'
+        )
+
+    # step-9 RED — merged_tip forwarding and blocked-but-landed observability
+    # -----------------------------------------------------------------------
+    # These tests will be RED until step-10 adds _resolve_second_parent and
+    # wires merged_tip + merge_sha into _finalize_advanced_merge.
+
+    async def test_merged_tip_forwarded_to_equivalence_check(self) -> None:
+        """merged_tip=SECONDP (from ADVANCED^2) is forwarded to _check_post_merge_equivalence.
+
+        _finalize_advanced_merge must:
+        (1) resolve the second parent of advanced_sha via `git rev-parse <sha>^2`,
+        (2) pass it as merged_tip= kwarg to _check_post_merge_equivalence.
+
+        RED until step-10: _finalize_advanced_merge currently calls
+        _check_post_merge_equivalence without merged_tip.
+        """
+        from orchestrator.merge_queue import _finalize_advanced_merge
+
+        ADVANCED = 'abc123def456'
+        SECONDP = 'secondparent01'
+        SNAP = 'snaptip99'
+
+        git_ops = self._make_git_ops(last_advanced_sha=ADVANCED)
+        req = self._make_req()
+        req.snapshot_tip = SNAP
+
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        equiv_mock = AsyncMock(return_value=[])
+
+        def _run_side_effect(cmd, cwd=None, **kw):
+            # Intercept the _resolve_second_parent call
+            if cmd == ['git', 'rev-parse', f'{ADVANCED}^2']:
+                return (0, f'{SECONDP}\n', '')
+            # Should not be called for anything else in this unit test
+            raise AssertionError(f'Unexpected _run call: {cmd!r}')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence', equiv_mock),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=_run_side_effect)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'done', f'expected done; got {outcome.status!r}'
+
+        # The key assertion: merged_tip must be the resolved second parent
+        call_kwargs = equiv_mock.call_args
+        assert call_kwargs is not None, '_check_post_merge_equivalence was not called'
+        assert call_kwargs.kwargs.get('merged_tip') == SECONDP, (
+            f'merged_tip not forwarded to _check_post_merge_equivalence; '
+            f'got merged_tip={call_kwargs.kwargs.get("merged_tip")!r}, expected {SECONDP!r}'
+        )
+
+    async def test_blocked_equiv_outcome_carries_advanced_sha(self) -> None:
+        """blocked outcome from equivalence failure must include merge_sha=advanced_sha.
+
+        When _check_post_merge_equivalence returns a non-empty list the merge
+        was already landed on main (advanced_sha IS the merge commit); the
+        MergeOutcome must carry that SHA so reconciliation knows the landing.
+
+        RED until step-10: currently merge_sha is not set on the blocked outcome
+        (MergeOutcome('blocked', ...) — defaults to None).
+        """
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        ADVANCED = 'deadbeef1234'
+
+        git_ops = self._make_git_ops(last_advanced_sha=ADVANCED)
+        req = self._make_req()
+        req.snapshot_tip = None  # fallback path: snapshot_tip absent
+
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+
+        def _run_side_effect(cmd, cwd=None, **kw):
+            if len(cmd) >= 3 and cmd[1] == 'rev-parse' and cmd[2].endswith('^2'):
+                return (1, '', 'fatal: bad revision')  # no second parent → fallback
+            raise AssertionError(f'Unexpected _run call: {cmd!r}')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence',
+                  AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=_run_side_effect)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )
+        # The key assertion: merge_sha must carry the landed SHA
+        assert outcome.merge_sha == ADVANCED, (
+            f'blocked equiv outcome must carry merge_sha=ADVANCED; '
+            f'got merge_sha={outcome.merge_sha!r}, expected {ADVANCED!r}'
+        )
+
+    async def test_blocked_pyright_outcome_carries_advanced_sha(self) -> None:
+        """blocked outcome from pyright failure must include merge_sha=advanced_sha.
+
+        Same rationale as test_blocked_equiv_outcome_carries_advanced_sha —
+        the merge already landed; the blocked outcome must be observable.
+
+        RED until step-10: currently merge_sha is not set on the pyright-blocked outcome.
+        """
+        from orchestrator.merge_queue import (
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        ADVANCED = 'cafebabe5678'
+
+        git_ops = self._make_git_ops(last_advanced_sha=ADVANCED)
+        req = self._make_req()
+        req.snapshot_tip = None
+
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_broken = MagicMock(broken=True, failing_subprojects=['pkg'], detail='type error')
+
+        def _run_side_effect(cmd, cwd=None, **kw):
+            if len(cmd) >= 3 and cmd[1] == 'rev-parse' and cmd[2].endswith('^2'):
+                return (1, '', 'fatal: bad revision')
+            raise AssertionError(f'Unexpected _run call: {cmd!r}')
+
+        with (
+            patch('orchestrator.merge_queue._check_post_merge_equivalence',
+                  AsyncMock(return_value=[])),
+            patch('orchestrator.merge_queue._check_post_merge_pyright',
+                  AsyncMock(return_value=pyright_broken)),
+            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=_run_side_effect)),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+            )
+
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )
+        # The key assertion: merge_sha must carry the landed SHA
+        assert outcome.merge_sha == ADVANCED, (
+            f'blocked pyright outcome must carry merge_sha=ADVANCED; '
+            f'got merge_sha={outcome.merge_sha!r}, expected {ADVANCED!r}'
         )
 
 
@@ -20619,4 +20992,362 @@ class TestRefreshWarmBaseWiring:
         assert refresh_spy.await_count == 0, (
             f'refresh_warm_base must NOT be called on the cold/ephemeral path; '
             f'got {refresh_spy.await_count} calls'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestResolveAttachAction — step-1/2: resolve_attach_action shared helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestResolveAttachAction:
+    """RED: resolve_attach_action(new_tip, old_tip, *, verifying, git_ops)
+    composes classify_tip_relation → resolve_divergent → decide_attach_action.
+
+    Step-1 tests fail until step-2 adds the helper to merge_queue.py.
+    """
+
+    def _stub_git_ops(
+        self,
+        *,
+        old_is_ancestor_new: bool,
+        new_is_ancestor_old: bool,
+        patch_contained: bool = False,
+    ) -> MagicMock:
+        """Build a MagicMock git_ops with AsyncMock is_ancestor.
+
+        is_ancestor(old_tip, new_tip) → old_is_ancestor_new (SUPERSET if True)
+        is_ancestor(new_tip, old_tip) → new_is_ancestor_old (SUBSET if True)
+        """
+        git_ops = MagicMock()
+        git_ops.project_root = '/fake/project'
+
+        async def _is_ancestor(a: str, b: str) -> bool:
+            # classify_tip_relation calls: is_ancestor(old_tip, new_tip) first
+            # then is_ancestor(new_tip, old_tip)
+            if a == 'OLD' and b == 'NEW':
+                return old_is_ancestor_new
+            if a == 'NEW' and b == 'OLD':
+                return new_is_ancestor_old
+            return False
+
+        git_ops.is_ancestor = _is_ancestor
+        git_ops._patch_contained = patch_contained
+        return git_ops
+
+    async def test_same_tip_returns_coalesce(self) -> None:
+        """SAME tip (new_tip == old_tip) → COALESCE regardless of verifying."""
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        git_ops = self._stub_git_ops(old_is_ancestor_new=False, new_is_ancestor_old=False)
+        action = await resolve_attach_action('TIP', 'TIP', verifying=False, git_ops=git_ops)
+        assert action is AttachAction.COALESCE
+
+    async def test_superset_not_verifying_returns_resnapshot(self) -> None:
+        """old is ancestor of new (SUPERSET) + verifying=False → RESNAPSHOT."""
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        git_ops = self._stub_git_ops(old_is_ancestor_new=True, new_is_ancestor_old=False)
+        action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)
+        assert action is AttachAction.RESNAPSHOT
+
+    async def test_superset_verifying_returns_attach_and_chain(self) -> None:
+        """old is ancestor of new (SUPERSET) + verifying=True → ATTACH_AND_CHAIN."""
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        git_ops = self._stub_git_ops(old_is_ancestor_new=True, new_is_ancestor_old=False)
+        action = await resolve_attach_action('NEW', 'OLD', verifying=True, git_ops=git_ops)
+        assert action is AttachAction.ATTACH_AND_CHAIN
+
+    async def test_subset_returns_attach_containment(self) -> None:
+        """new is ancestor of old (SUBSET) → ATTACH_CONTAINMENT."""
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        git_ops = self._stub_git_ops(old_is_ancestor_new=False, new_is_ancestor_old=True)
+        action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)
+        assert action is AttachAction.ATTACH_CONTAINMENT
+
+    async def test_divergent_patch_contained_returns_attach_containment(self) -> None:
+        """DIVERGENT (no ancestor relation) + patch-contained → SUBSET → ATTACH_CONTAINMENT.
+
+        Patches patch_content_contained to return True, simulating a
+        rebased-but-identical set of commits.
+        """
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        # Neither is ancestor of the other → DIVERGENT
+        git_ops = self._stub_git_ops(old_is_ancestor_new=False, new_is_ancestor_old=False)
+
+        with patch(
+            'orchestrator.merge_queue.patch_content_contained',
+            AsyncMock(return_value=True),
+        ):
+            action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)
+        assert action is AttachAction.ATTACH_CONTAINMENT
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceTipRecency — step-3/4: coalesce_or_enqueue recency check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceTipRecency:
+    """RED: coalesce_or_enqueue_merge_request refuses to coalesce a SUPERSET
+    re-submission when classifier_git_ops is wired.
+
+    Step-3 tests fail until step-4 adds the classifier_git_ops param.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'recency_events.db'
+        return EventStore(db_path=db, run_id='recency-test')
+
+    def _make_superset_git_ops(self, *, old_tip: str, new_tip: str) -> MagicMock:
+        """Stub git_ops where is_ancestor(old, new)=True → SUPERSET."""
+        git_ops = MagicMock()
+        git_ops.project_root = '/fake/root'
+
+        async def _is_ancestor(a: str, b: str) -> bool:
+            # SUPERSET: old_tip is ancestor of new_tip
+            return bool(a == old_tip and b == new_tip)
+
+        git_ops.is_ancestor = _is_ancestor
+        return git_ops
+
+    def _make_same_tip_git_ops(self) -> MagicMock:
+        """Stub git_ops for SAME-tip (no is_ancestor calls needed)."""
+        git_ops = MagicMock()
+        git_ops.project_root = '/fake/root'
+        git_ops.is_ancestor = AsyncMock(return_value=False)
+        return git_ops
+
+    def _make_subset_git_ops(self, *, old_tip: str, new_tip: str) -> MagicMock:
+        """Stub git_ops where is_ancestor(new, old)=True → SUBSET."""
+        git_ops = MagicMock()
+        git_ops.project_root = '/fake/root'
+
+        async def _is_ancestor(a: str, b: str) -> bool:
+            # SUBSET: new_tip is ancestor of old_tip
+            return bool(a == new_tip and b == old_tip)
+
+        git_ops.is_ancestor = _is_ancestor
+        return git_ops
+
+    def _seed_registry_with_snapshot(
+        self,
+        registry: InFlightMergeRegistry,
+        branch: str,
+        task_id: str,
+        future: asyncio.Future,
+        *,
+        request_id: str,
+        snapshot_tip: str,
+    ) -> None:
+        """Seed the registry with a slot that has snapshot_tip set."""
+        ok = registry.acquire(
+            branch, task_id, future,
+            request_id=request_id,
+            snapshot_tip=snapshot_tip,
+        )
+        assert ok, 'Expected to acquire the slot'
+
+    async def test_superset_dispatches_not_coalesces(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """SUPERSET new_tip + classifier_git_ops → dispatched=True, not coalesced.
+
+        Pre-seeds registry at OLD_TIP, submits req with snapshot_tip=NEW_TIP
+        where OLD_TIP is ancestor of NEW_TIP (SUPERSET). Assert the request is
+        dispatched independently rather than coalesced.
+        """
+        OLD_TIP = 'aaa0001'
+        NEW_TIP = 'bbb0002'
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+        retention = TerminalOutcomeRetention()
+
+        # Seed the registry: in-flight slot at OLD_TIP
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'B', 'task-old', old_fut,
+            request_id='mr-old', snapshot_tip=OLD_TIP,
+        )
+        assert registry.is_inflight('B'), 'Slot seeded'
+
+        # New request with SUPERSET tip
+        req = _make_request('task-new', 'B', tmp_path, config, request_id='mr-new')
+        req.snapshot_tip = NEW_TIP  # type: ignore[attr-defined]
+
+        classifier = self._make_superset_git_ops(old_tip=OLD_TIP, new_tip=NEW_TIP)
+
+        # RED: classifier_git_ops kwarg does not exist yet → TypeError
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            retention=retention,
+            classifier_git_ops=classifier,
+        )
+
+        # SUPERSET → independent dispatch (not coalesced)
+        assert result.dispatched is True, (
+            f'SUPERSET with classifier_git_ops must dispatch, not coalesce; got {result}'
+        )
+        assert result.in_flight is False
+        assert queue.qsize() == 1, 'One new item enqueued'
+        # No alias registered (would be 'mr-new' → 'mr-old')
+        assert 'mr-new' not in retention._aliases, (
+            'SUPERSET dispatch must NOT register a coalesce alias'
+        )
+
+    async def test_same_tip_coalesces_with_classifier(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """SAME tip → still coalesces even when classifier_git_ops is provided."""
+        TIP = 'aaa0001'
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'C', 'task-old', old_fut,
+            request_id='mr-old-c', snapshot_tip=TIP,
+        )
+
+        req = _make_request('task-new-c', 'C', tmp_path, config, request_id='mr-new-c')
+        req.snapshot_tip = TIP  # type: ignore[attr-defined]
+
+        classifier = self._make_same_tip_git_ops()
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            classifier_git_ops=classifier,
+        )
+
+        assert result.in_flight is True, (
+            f'SAME tip should coalesce; got dispatched={result.dispatched}'
+        )
+        assert queue.qsize() == 0, 'SAME tip must not enqueue'
+
+    async def test_subset_coalesces_with_classifier(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """SUBSET new_tip → still coalesces (in-flight is at-or-ahead)."""
+        OLD_TIP = 'aaa0001'
+        NEW_TIP = 'bbb0000'  # NEW is older (subset of OLD)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'D', 'task-old', old_fut,
+            request_id='mr-old-d', snapshot_tip=OLD_TIP,
+        )
+
+        req = _make_request('task-new-d', 'D', tmp_path, config, request_id='mr-new-d')
+        req.snapshot_tip = NEW_TIP  # type: ignore[attr-defined]
+
+        classifier = self._make_subset_git_ops(old_tip=OLD_TIP, new_tip=NEW_TIP)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            classifier_git_ops=classifier,
+        )
+
+        assert result.in_flight is True, (
+            f'SUBSET should coalesce; got dispatched={result.dispatched}'
+        )
+        assert queue.qsize() == 0, 'SUBSET must not enqueue'
+
+    async def test_no_classifier_git_ops_coalesces_unchanged(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Back-compat: no classifier_git_ops → unconditional coalesce regardless of tips."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'E', 'task-old', old_fut,
+            request_id='mr-old-e', snapshot_tip='snap-old',
+        )
+
+        req = _make_request('task-new-e', 'E', tmp_path, config)
+        req.snapshot_tip = 'snap-new-superset'  # type: ignore[attr-defined]
+
+        # No classifier_git_ops → must coalesce unconditionally (back-compat)
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry, git_ops=None,
+        )
+
+        assert result.in_flight is True, (
+            f'Without classifier_git_ops should coalesce; got {result}'
+        )
+        assert queue.qsize() == 0
+
+    async def test_no_req_snapshot_tip_coalesces_unchanged(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Back-compat: req.snapshot_tip=None → coalesce unchanged (gate skipped)."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        self._seed_registry_with_snapshot(
+            registry, 'F', 'task-old', old_fut,
+            request_id='mr-old-f', snapshot_tip='snap-old-f',
+        )
+
+        req = _make_request('task-new-f', 'F', tmp_path, config)
+        # req.snapshot_tip is None (default)
+
+        classifier = self._make_superset_git_ops(old_tip='snap-old-f', new_tip='snap-new-f')
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            classifier_git_ops=classifier,
+        )
+
+        assert result.in_flight is True, (
+            f'req.snapshot_tip=None must coalesce unchanged; got {result}'
+        )
+
+    async def test_no_entry_snapshot_tip_coalesces_unchanged(
+        self, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Back-compat: entry.snapshot_tip=None → coalesce unchanged (gate skipped)."""
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = self._make_event_store(tmp_path)
+
+        # Seed with no snapshot_tip (None)
+        old_fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+        ok = registry.acquire('G', 'task-old-g', old_fut, request_id='mr-old-g')
+        assert ok
+
+        req = _make_request('task-new-g', 'G', tmp_path, config)
+        req.snapshot_tip = 'snap-new-g'  # type: ignore[attr-defined]
+
+        classifier = self._make_superset_git_ops(old_tip='NONE', new_tip='snap-new-g')
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=None,
+            classifier_git_ops=classifier,
+        )
+
+        assert result.in_flight is True, (
+            f'entry.snapshot_tip=None must coalesce unchanged; got {result}'
         )

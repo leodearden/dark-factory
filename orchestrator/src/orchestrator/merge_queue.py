@@ -1066,6 +1066,34 @@ class _GenerationChainContext:
     scope and is the second precondition guarded by AUTO_CHAIN_GENERATIONS_ENABLED."""
 
 
+async def _resolve_second_parent(git_ops: GitOps, sha: str) -> str | None:
+    """Return the second parent (``sha^2``) of a merge commit, or None.
+
+    Runs ``git rev-parse <sha>^2`` in *git_ops.project_root*.  Returns the
+    stripped SHA string on success (rc==0) or ``None`` if the commit has no
+    second parent or the command fails (e.g. fast-forward commit, transient
+    git error, or missing worktree).
+
+    Used by :func:`_finalize_advanced_merge` to derive the branch tip that was
+    actually merged into the ``--no-ff`` merge commit so the post-merge
+    equivalence gate compares the right tree (drift-proof vs a lane whose
+    worktree HEAD has been hijacked or rebased after snapshotting).
+
+    Fail-open: any exception returns ``None`` so the caller falls back to the
+    next tier (``merged_branch_tip`` or ``req.snapshot_tip``).
+    """
+    try:
+        rc, out, _err = await _run(
+            ['git', 'rev-parse', f'{sha}^2'],
+            cwd=git_ops.project_root,
+        )
+    except Exception:
+        return None
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
 async def _finalize_advanced_merge(
     git_ops: GitOps,
     req: MergeRequest,
@@ -1122,10 +1150,22 @@ async def _finalize_advanced_merge(
     # pre-rebase SHA and would fail done_provenance ancestor check).
     advanced_sha = getattr(git_ops, '_last_advanced_sha', None) or merge_commit_fallback
 
+    # Resolve the branch tip that was actually merged (second parent of the
+    # --no-ff merge commit).  Preferred over the live worktree HEAD so the
+    # equivalence gate is drift-proof when a warm lane's worktree HEAD has
+    # been rebased or hijacked after the snapshot was taken.
+    # Fallback chain: advanced_sha^2 → merged_branch_tip (caller) → req.snapshot_tip.
+    resolved_merged_tip = (
+        (await _resolve_second_parent(git_ops, advanced_sha))
+        or merged_branch_tip
+        or getattr(req, 'snapshot_tip', None)
+    )
+
     # Decision-2 post-merge content-equivalence check.
     equiv_failed = await _check_post_merge_equivalence(
         req.worktree, advanced_sha, git_ops, base_sha,
         task_id=req.task_id,
+        merged_tip=resolved_merged_tip,
     )
     if equiv_failed:
         logger.warning(
@@ -1147,7 +1187,7 @@ async def _finalize_advanced_merge(
         if chain_ctx is not None and AUTO_CHAIN_GENERATIONS_ENABLED:
             chained = await _maybe_auto_chain_generation(
                 req, advanced_sha, git_ops, event_store,
-                merged_branch_tip=merged_branch_tip,
+                merged_branch_tip=merged_branch_tip or resolved_merged_tip,
                 counts=chain_ctx.counts,
                 queue=chain_ctx.queue,
                 max_auto_generations=chain_ctx.max_auto_generations,
@@ -1162,8 +1202,18 @@ async def _finalize_advanced_merge(
                     member_task_ids=member_task_ids,
                 )
                 return chained
+        # The merge already landed on main (advanced_sha IS the merge commit);
+        # record it so reconciliation knows about the landing even though the
+        # gate is signalling a content divergence.
+        #
+        # Robustness note: all downstream consumers (workflow.py, _on_finalized,
+        # merge_status/_durable_terminal_state) branch on outcome.status
+        # ('blocked'), NOT on merge_sha presence.  Carrying merge_sha on a
+        # 'blocked' outcome is therefore safe — no consumer misinterprets a
+        # landed-but-blocked task as 'done' due to the non-None merge_sha.
         return MergeOutcome(
             'blocked',
+            merge_sha=advanced_sha,
             reason=(
                 f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
                 f'branch and main diverge in '
@@ -1193,8 +1243,12 @@ async def _finalize_advanced_merge(
             train_id=train_id,
             member_task_ids=member_task_ids,
         )
+        # The merge already landed; record advanced_sha for observability.
+        # Same robustness guarantee as the equivalence case above: consumers
+        # gate on outcome.status ('blocked'), not on merge_sha presence.
         return MergeOutcome(
             'blocked',
+            merge_sha=advanced_sha,
             reason=(
                 f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
                 f'post-merge unscoped type-check failed for '
@@ -1709,6 +1763,49 @@ def decide_attach_action(
     )
 
 
+async def resolve_attach_action(
+    new_tip: str,
+    old_tip: str,
+    *,
+    verifying: bool,
+    git_ops: GitOps,
+) -> AttachAction:
+    """Classify and decide the attach action for a new tip vs an in-flight tip.
+
+    Shared helper used by BOTH the workflow path (workflow.py) and the MCP
+    coalesce path (coalesce_or_enqueue_merge_request) so the two paths share
+    the same tip-recency *classification decision* and cannot diverge on which
+    :class:`AttachAction` class to return.
+
+    Note: the two consumers handle the resulting action differently.  The
+    workflow path on RESNAPSHOT re-snapshots and then coalesces the new request
+    as a peer waiter onto the in-flight entry (the peer future resolves with the
+    in-flight outcome).  The MCP path on RESNAPSHOT re-snapshots and then
+    independent-enqueues via :func:`register_and_enqueue_merge_request` — the
+    new submission gets its own merge+verify pass; the old in-flight is not
+    cancelled.  Both paths on ATTACH_AND_CHAIN independent-enqueue (identical
+    behaviour).
+
+    Composes :func:`classify_tip_relation` → :func:`resolve_divergent` →
+    :func:`decide_attach_action` in sequence:
+
+    1. Classify the topological relationship between *new_tip* and *old_tip*.
+    2. If DIVERGENT, resolve via patch-id content comparison
+       (:func:`resolve_divergent`) to either SUBSET or SUPERSET.
+    3. Map the resolved relation + *verifying* to an :class:`AttachAction`.
+
+    Returns one of:
+    - :attr:`AttachAction.COALESCE` — tips are identical (SAME).
+    - :attr:`AttachAction.RESNAPSHOT` — new tip is a SUPERSET and not verifying.
+    - :attr:`AttachAction.ATTACH_AND_CHAIN` — new tip is a SUPERSET and verifying.
+    - :attr:`AttachAction.ATTACH_CONTAINMENT` — new tip is a SUBSET.
+    """
+    relation = await classify_tip_relation(new_tip, old_tip, git_ops)
+    if relation is TipRelation.DIVERGENT:
+        relation = await resolve_divergent(new_tip, old_tip, git_ops)
+    return decide_attach_action(relation, verifying=verifying)
+
+
 async def _check_post_merge_equivalence(
     task_worktree: Path,
     advanced_sha: str,
@@ -1716,6 +1813,7 @@ async def _check_post_merge_equivalence(
     main_sha: str,
     *,
     task_id: str | None = None,
+    merged_tip: str | None = None,
 ) -> list[str]:
     """Return branch-touched paths whose ``advanced_sha`` blob differs from ``branch_HEAD``.
 
@@ -1745,19 +1843,30 @@ async def _check_post_merge_equivalence(
     Fail-open on git error: returns an empty list and logs a WARNING.
     The call is a defense-in-depth check; a transient git error must
     not block a successful merge from being recorded.
+
+    *merged_tip* — when provided, it is used directly as the branch tip to
+    compare against ``advanced_sha``, bypassing the ``git rev-parse HEAD``
+    read in ``task_worktree``.  Pass the tip *actually merged* (e.g. the
+    second parent of the merge commit, ``advanced_sha^2``) so that the gate
+    is drift-proof when the worktree HEAD has been rebased or hijacked after
+    the snapshot was taken.  When ``None`` (the default) the existing
+    worktree-HEAD behaviour is preserved for back-compat.
     """
-    rc, head_out, head_err = await _run(
-        ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
-    )
-    if rc != 0:
-        logger.warning(
-            'post-merge-equiv: git rev-parse HEAD failed in %s '
-            '(rc=%d, stderr=%s); failing open. task_id=%s advanced_sha=%s',
-            task_worktree, rc, head_err.strip(),
-            task_id or '<unknown>', advanced_sha,
+    if merged_tip is not None:
+        branch_head = merged_tip
+    else:
+        rc, head_out, head_err = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
         )
-        return []
-    branch_head = head_out.strip()
+        if rc != 0:
+            logger.warning(
+                'post-merge-equiv: git rev-parse HEAD failed in %s '
+                '(rc=%d, stderr=%s); failing open. task_id=%s advanced_sha=%s',
+                task_worktree, rc, head_err.strip(),
+                task_id or '<unknown>', advanced_sha,
+            )
+            return []
+        branch_head = head_out.strip()
 
     # Determine the branch's touched set against the merge-base with the
     # PRE-merge main tip (main_sha).  Using main_sha rather than advanced_sha
@@ -3373,6 +3482,7 @@ async def coalesce_or_enqueue_merge_request(
     liveness_secs: int = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     retention: TerminalOutcomeRetention | None = None,
     live_snapshot: Callable[[], dict] | None = None,
+    classifier_git_ops: GitOps | None = None,
 ) -> MergeDispatchResult:
     """De-dup gate for the merge_request MCP chokepoint.
 
@@ -3420,6 +3530,19 @@ async def coalesce_or_enqueue_merge_request(
     through to the acquire-and-enqueue block dispatching a fresh request.
     When absent (None) or when ``live_snapshot()`` raises, the gate
     behaves exactly as today — trust the registry.
+
+    *classifier_git_ops* (keyword-only, default None): when provided AND both
+    ``entry.snapshot_tip`` and ``req.snapshot_tip`` are set, the registry
+    fast-path classifies the tip relation via :func:`resolve_attach_action`
+    before coalescing.  On SUPERSET (the new submission is strictly ahead of
+    the in-flight snapshot), the request is independent-enqueued via
+    :func:`register_and_enqueue_merge_request` (which enqueues even when the
+    slot is held) and ``dispatched=True`` is returned — mirroring workflow.py's
+    ATTACH_AND_CHAIN path.  On RESNAPSHOT, :meth:`InFlightMergeRegistry.re_snapshot`
+    is also called before enqueueing.  SAME/SUBSET fall through to the existing
+    unconditional coalesce.  When absent or either snapshot_tip is None, the
+    gate is a no-op and the path preserves current behaviour (back-compat).
+    The disk-scan cross-process coalesce branch is intentionally left untouched.
     """
     branch = req.branch
 
@@ -3438,6 +3561,65 @@ async def coalesce_or_enqueue_merge_request(
             registry.release(branch, detach_waiters=True)
             # Fall through to the acquire-and-enqueue block below.
         else:
+            # ── Tip-recency check (γ2/γ3 consumer wiring) ─────────────────
+            # When classifier_git_ops is wired AND both snapshot tips are
+            # known, classify the relation using the shared resolve_attach_action
+            # helper (same classification decision as workflow.py — the two
+            # paths cannot diverge on *which* action class is returned).
+            #
+            # Action handling is intentionally different from the workflow path:
+            #   • RESNAPSHOT: re_snapshot + independent-enqueue via
+            #     register_and_enqueue_merge_request (dispatched=True, no alias).
+            #     The old in-flight is NOT cancelled or replaced; it continues
+            #     and typically lands first.  The second item (the new tip) will
+            #     then resolve to already_merged — a redundant but benign extra
+            #     merge+verify pass.  The non-blocking MCP path cannot attach the
+            #     new request as a peer waiter (as the workflow path does) because
+            #     that requires a live Future reference not available in the MCP
+            #     call stack.
+            #   • ATTACH_AND_CHAIN: independent-enqueue (same as workflow path).
+            #   • COALESCE / ATTACH_CONTAINMENT (SAME/SUBSET): fall through to
+            #     the unconditional coalesce below (back-compat).
+            if (
+                classifier_git_ops is not None
+                and entry is not None
+                and entry.snapshot_tip is not None
+                and req.snapshot_tip is not None
+            ):
+                attach_action = await resolve_attach_action(
+                    req.snapshot_tip, entry.snapshot_tip,
+                    verifying=entry.verifying,
+                    git_ops=classifier_git_ops,
+                )
+                if attach_action is AttachAction.RESNAPSHOT:
+                    registry.re_snapshot(branch, req.snapshot_tip)
+                    logger.info(
+                        'coalesce_or_enqueue_merge_request: RESNAPSHOT — '
+                        'new tip %s is SUPERSET of in-flight %s for branch %r; '
+                        'independent-enqueue with snapshot update.',
+                        req.snapshot_tip[:12], entry.snapshot_tip[:12], branch,
+                    )
+                    await register_and_enqueue_merge_request(
+                        queue, req, event_store, registry, retention=retention,
+                    )
+                    return MergeDispatchResult(
+                        dispatched=True, in_flight=False, branch=branch,
+                    )
+                elif attach_action is AttachAction.ATTACH_AND_CHAIN:
+                    logger.info(
+                        'coalesce_or_enqueue_merge_request: ATTACH_AND_CHAIN — '
+                        'new tip %s is SUPERSET of verifying in-flight %s for branch %r; '
+                        'independent-enqueue for own merge+verify.',
+                        req.snapshot_tip[:12], entry.snapshot_tip[:12], branch,
+                    )
+                    await register_and_enqueue_merge_request(
+                        queue, req, event_store, registry, retention=retention,
+                    )
+                    return MergeDispatchResult(
+                        dispatched=True, in_flight=False, branch=branch,
+                    )
+                # COALESCE or ATTACH_CONTAINMENT → fall through to coalesce.
+
             eta = registry.eta_seconds(branch)
             # Coalescing onto a LIVE in-flight entry: register the caller's
             # request_id as an alias onto the primary entry's request_id, so a
@@ -4963,7 +5145,13 @@ class MergeWorker(_WipHaltMixin):
             ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
         )
         main_sha = await self._git_ops.get_main_sha()
-        if await self._git_ops.is_ancestor(branch_head.strip(), main_sha):
+        # Use snapshot_tip when set: it is the ref THIS request intends to
+        # merge, which is drift-proof vs a shared or hijacked lane whose
+        # worktree HEAD may have been rebased to an orphaned lineage after
+        # snapshotting.  Workflow-path requests leave snapshot_tip=None and
+        # retain the existing worktree-HEAD basis (back-compat).
+        effective_tip = req.snapshot_tip or branch_head.strip()
+        if await self._git_ops.is_ancestor(effective_tip, main_sha):
             # Guard: if worktree has uncommitted changes, an agent may
             # have started work — don't skip.
             if await self._git_ops.has_uncommitted_work(req.worktree):
