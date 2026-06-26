@@ -2006,8 +2006,6 @@ class TestRunPostMergeVerifyRemoteStderrWiring:
         Fails now: merge_queue.py:897-901 builds VerifyRunnerPool without archive_root
         so dispatch threads archive_root=None and no file is written.
         """
-        from pathlib import Path
-
         from orchestrator.merge_queue import _run_post_merge_verify
         from orchestrator.verify import VerifyResult
         from orchestrator.verify_runner import RemoteRunner, result_to_json

@@ -4182,7 +4182,7 @@ class TestRemoteRunnerStderrArchival:
         await runner.run_merge_verify('abc123', _make_spec(), task_id='1920', archive_root=tmp_path)
 
         task_dir = tmp_path / '1920'
-        assert not task_dir.exists(), f'Expected no archive dir for whitespace stderr'
+        assert not task_dir.exists(), 'Expected no archive dir for whitespace stderr'
 
     # step-5 archival-error-is-swallowed
     async def test_archival_error_is_swallowed_result_unchanged(self, tmp_path):
