@@ -1343,6 +1343,130 @@ class TestMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
+    async def test_already_merged_honors_snapshot_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """already-merged check uses req.snapshot_tip when set, ignoring drifted worktree HEAD.
+
+        Scenario (mirrors the production regression in task 1917):
+        - Branch tip SNAP is merged onto main.
+        - Worktree HEAD is then rewritten to a DIVERGENT commit D (non-ancestor of main),
+          simulating a lane reused by a new task or an orphaned lineage.
+        - req.snapshot_tip = SNAP (the ref THIS request was intended to merge).
+        - The ancestor check should use SNAP (already on main) → 'already_merged'.
+
+        RED until step-12: currently the check reads only the worktree HEAD (D),
+        which is NOT an ancestor of main, so it proceeds to merge instead of
+        returning 'already_merged'.
+        """
+        wt = (await git_ops.create_worktree('snap-already-merged')).path
+        (wt / 'snap_am.py').write_text('snap = 1\n')
+        await git_ops.commit(wt, 'Add snap_am.py')
+
+        # Capture SNAP (the branch tip that was merged)
+        rc, snap_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        snap = snap_out.strip()
+
+        # Merge SNAP to main
+        merge_result = await git_ops.merge_to_main(wt, 'snap-already-merged')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        await git_ops.advance_main(
+            merge_result.merge_commit, merge_result.merge_worktree,
+            branch='snap-already-merged', max_attempts=1,
+        )
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # Rewrite worktree HEAD to a DIVERGENT commit D (non-ancestor of main)
+        (wt / 'snap_am.py').write_text('DIVERGENT = 999\n')
+        rc, _, _ = await _run(['git', 'add', 'snap_am.py'], cwd=wt)
+        assert rc == 0
+        rc, _, _ = await _run(
+            ['git', 'commit', '-m', 'Divergent: rewrite snap_am.py'], cwd=wt,
+        )
+        assert rc == 0
+
+        # req.snapshot_tip = SNAP (the already-merged tip)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = MergeRequest(
+            task_id='snap-am-test',
+            branch='snap-already-merged',
+            worktree=wt,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=asyncio.get_running_loop().create_future(),
+            snapshot_tip=snap,  # the already-merged tip — check should use this
+        )
+        await queue.put(req)
+
+        outcome = await asyncio.wait_for(req.result, timeout=15)
+        # RED until step-12: currently uses worktree HEAD D (non-ancestor) →
+        # proceeds to merge instead of 'already_merged'.
+        assert outcome.status == 'already_merged', (
+            f'expected already_merged (snapshot_tip=SNAP is ancestor of main); '
+            f'got {outcome.status!r}. snapshot_tip={snap[:8]}'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_already_merged_snapshot_tip_none_uses_worktree_head(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Back-compat: snapshot_tip=None falls back to worktree HEAD basis.
+
+        When req.snapshot_tip is None, the existing worktree-HEAD ancestor check
+        must still fire: a non-ancestor HEAD → the merge proceeds (not skipped).
+        This test also PASSES today (before step-12) because the current code
+        already uses the worktree HEAD and the new code explicitly falls back.
+
+        MUST STILL PASS after step-12.
+        """
+        wt = (await git_ops.create_worktree('snap-backcompat-none')).path
+        (wt / 'snap_bc.py').write_text('bc = 1\n')
+        await git_ops.commit(wt, 'Add snap_bc.py')
+
+        # snapshot_tip=None — the check should use worktree HEAD
+        # HEAD is a non-ancestor of main (branch not yet merged) → proceed to merge
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = MergeRequest(
+                task_id='snap-bc-none',
+                branch='snap-backcompat-none',
+                worktree=wt,
+                pre_rebased=False,
+                task_files=None,
+                module_configs=[],
+                config=config,
+                result=asyncio.get_running_loop().create_future(),
+                snapshot_tip=None,  # falls back to worktree HEAD
+            )
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=15)
+
+        # Must NOT be already_merged — worktree HEAD is not on main yet
+        assert outcome.status != 'already_merged', (
+            'snapshot_tip=None + non-ancestor HEAD must not return already_merged; '
+            f'got {outcome.status!r}'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
     async def test_unknown_branch_emits_terminal_merge_attempt(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
