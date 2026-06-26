@@ -20620,3 +20620,95 @@ class TestRefreshWarmBaseWiring:
             f'refresh_warm_base must NOT be called on the cold/ephemeral path; '
             f'got {refresh_spy.await_count} calls'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestResolveAttachAction — step-1/2: resolve_attach_action shared helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestResolveAttachAction:
+    """RED: resolve_attach_action(new_tip, old_tip, *, verifying, git_ops)
+    composes classify_tip_relation → resolve_divergent → decide_attach_action.
+
+    Step-1 tests fail until step-2 adds the helper to merge_queue.py.
+    """
+
+    def _stub_git_ops(
+        self,
+        *,
+        old_is_ancestor_new: bool,
+        new_is_ancestor_old: bool,
+        patch_contained: bool = False,
+    ) -> MagicMock:
+        """Build a MagicMock git_ops with AsyncMock is_ancestor.
+
+        is_ancestor(old_tip, new_tip) → old_is_ancestor_new (SUPERSET if True)
+        is_ancestor(new_tip, old_tip) → new_is_ancestor_old (SUBSET if True)
+        """
+        git_ops = MagicMock()
+        git_ops.project_root = '/fake/project'
+
+        async def _is_ancestor(a: str, b: str) -> bool:
+            # classify_tip_relation calls: is_ancestor(old_tip, new_tip) first
+            # then is_ancestor(new_tip, old_tip)
+            if a == 'OLD' and b == 'NEW':
+                return old_is_ancestor_new
+            if a == 'NEW' and b == 'OLD':
+                return new_is_ancestor_old
+            return False
+
+        git_ops.is_ancestor = _is_ancestor
+        git_ops._patch_contained = patch_contained
+        return git_ops
+
+    async def test_same_tip_returns_coalesce(self) -> None:
+        """SAME tip (new_tip == old_tip) → COALESCE regardless of verifying."""
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        git_ops = self._stub_git_ops(old_is_ancestor_new=False, new_is_ancestor_old=False)
+        action = await resolve_attach_action('TIP', 'TIP', verifying=False, git_ops=git_ops)
+        assert action is AttachAction.COALESCE
+
+    async def test_superset_not_verifying_returns_resnapshot(self) -> None:
+        """old is ancestor of new (SUPERSET) + verifying=False → RESNAPSHOT."""
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        git_ops = self._stub_git_ops(old_is_ancestor_new=True, new_is_ancestor_old=False)
+        action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)
+        assert action is AttachAction.RESNAPSHOT
+
+    async def test_superset_verifying_returns_attach_and_chain(self) -> None:
+        """old is ancestor of new (SUPERSET) + verifying=True → ATTACH_AND_CHAIN."""
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        git_ops = self._stub_git_ops(old_is_ancestor_new=True, new_is_ancestor_old=False)
+        action = await resolve_attach_action('NEW', 'OLD', verifying=True, git_ops=git_ops)
+        assert action is AttachAction.ATTACH_AND_CHAIN
+
+    async def test_subset_returns_attach_containment(self) -> None:
+        """new is ancestor of old (SUBSET) → ATTACH_CONTAINMENT."""
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        git_ops = self._stub_git_ops(old_is_ancestor_new=False, new_is_ancestor_old=True)
+        action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)
+        assert action is AttachAction.ATTACH_CONTAINMENT
+
+    async def test_divergent_patch_contained_returns_attach_containment(self) -> None:
+        """DIVERGENT (no ancestor relation) + patch-contained → SUBSET → ATTACH_CONTAINMENT.
+
+        Patches patch_content_contained to return True, simulating a
+        rebased-but-identical set of commits.
+        """
+        from orchestrator.merge_queue import AttachAction, resolve_attach_action
+
+        # Neither is ancestor of the other → DIVERGENT
+        git_ops = self._stub_git_ops(old_is_ancestor_new=False, new_is_ancestor_old=False)
+
+        with patch(
+            'orchestrator.merge_queue.patch_content_contained',
+            AsyncMock(return_value=True),
+        ):
+            action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)
+        assert action is AttachAction.ATTACH_CONTAINMENT
