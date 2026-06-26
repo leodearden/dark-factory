@@ -894,10 +894,14 @@ async def _run_post_merge_verify(
     if runner is not None:
         # Remote path: build a single-runner pool from the injected runner.
         # Warm-swap runs only for LOCAL leases (caller's responsibility).
+        # archive_root mirrors the local path (910-920) so remote stderr lands
+        # beside local merge-verify logs for side-by-side operator triage
+        # (task 1920, sibling of 1768).
         pool = VerifyRunnerPool(
             [runner],
             event_store=event_store,
             task_id=req.task_id,
+            archive_root=req.config.project_root / 'data' / 'verify-logs',
         )
     else:
         # Local path: sole production site for human-facing local merge verify.
