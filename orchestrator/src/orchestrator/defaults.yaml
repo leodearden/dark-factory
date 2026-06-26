@@ -88,6 +88,23 @@ verify_cold_command_timeout_secs: 5400
 merge_verify_cold_command_timeout_secs: 7200
 verify_timeout_retries: 2
 
+# Clock-stop verify timeout (task 1916): exclude declared admission-wait spans
+# from verify_command_timeout_secs while enforcing a heartbeat-idle backstop.
+# Reify is the first consumer (markers emitted by the verify-admission-wait
+# subsystem; reify task 4837 gates emission until this DF seam is deployed).
+# Pydantic default for verify_clock_stop_enabled is False (opt-out for test
+# doubles); shipping true here activates the seam on deploy without a separate
+# ops config change.
+verify_clock_stop_enabled: true
+verify_clock_stop_marker_stop: "@@REIFY_CLOCK_STOP@@"
+verify_clock_stop_marker_heartbeat: "@@REIFY_CLOCK_HEARTBEAT@@"
+verify_clock_stop_marker_start: "@@REIFY_CLOCK_START@@"
+# Heartbeat-idle backstop: kill if no heartbeat arrives within 180s of STOP
+# or last heartbeat (keeps the verify bus reachable even during long waits).
+verify_clock_stop_heartbeat_idle_max: 180
+# Max cumulative stopped time: 0 = unlimited (no total-stopped cap by default).
+verify_clock_stop_max_total_secs: 0
+
 # Verification execution mode + environment injection
 concurrent_verify: true
 verify_env: {}

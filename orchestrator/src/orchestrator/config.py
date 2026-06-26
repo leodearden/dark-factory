@@ -1392,6 +1392,67 @@ class OrchestratorConfig(BaseSettings):
     verify_cold_command_timeout_secs: float | None = Field(default=None)
     verify_timeout_retries: int = Field(default=2)
 
+    # ── Clock-stop verify timeout (task 1916) ────────────────────────────────
+    # Generic capability: while streaming verify output, recognise a configurable
+    # clock-marker family and EXCLUDE the declared admission-wait span from
+    # verify_command_timeout_secs so the wall-clock budget is not consumed during
+    # legitimate waits (e.g. reify GPU slot starvation).  A heartbeat-idle backstop
+    # ensures a genuinely-wedged wait is still killed.
+    #
+    # Split default: Pydantic default is False so every directly-constructed
+    # OrchestratorConfig (including all existing _run_cmd test doubles) is opt-out
+    # by default — byte-identical to pre-1916 behaviour.  defaults.yaml ships True
+    # so the deployed orchestrator activates the seam for reify without a separate
+    # ops config change (same split used by verify_cold_command_timeout_secs).
+    verify_clock_stop_enabled: bool = Field(
+        default=False,
+        description=(
+            'Enable the clock-stop verify timeout seam.  When True, the streamed '
+            '_run_cmd path recognises the configured marker family and excludes '
+            'declared admission-wait spans from verify_command_timeout_secs.'
+        ),
+    )
+    # Marker strings emitted by the verify subprocess to signal stop/heartbeat/start.
+    # Matched by substring containment in complete output lines, tolerant of
+    # trailing fields (reason=…, waited=…, pid=…) and leading harness prefixes.
+    # Defaults to reify's @@REIFY_CLOCK_*@@ family; configurable so DF can adopt
+    # different consumers without code changes.
+    verify_clock_stop_marker_stop: str = Field(
+        default='@@REIFY_CLOCK_STOP@@',
+        description='Marker emitted by the subprocess to start a clock-stop span.',
+    )
+    verify_clock_stop_marker_heartbeat: str = Field(
+        default='@@REIFY_CLOCK_HEARTBEAT@@',
+        description='Marker emitted periodically during a clock-stop span to reset the idle backstop.',
+    )
+    verify_clock_stop_marker_start: str = Field(
+        default='@@REIFY_CLOCK_START@@',
+        description='Marker emitted by the subprocess to end a clock-stop span and resume the wall-clock.',
+    )
+    # Heartbeat-idle backstop: if no heartbeat arrives within this many seconds
+    # of the last stop/heartbeat while STOPPED, the process is killed
+    # (timed_out=True → infra_timeout).  Ensures a genuinely-wedged wait is
+    # reaped even though the wall-clock is paused.
+    verify_clock_stop_heartbeat_idle_max: float = Field(
+        default=180.0,
+        gt=0,
+        description=(
+            'Max seconds between heartbeats (or after STOP) before the idle '
+            'backstop kills the verify subprocess (gt 0).'
+        ),
+    )
+    # Optional cumulative-stopped-time cap: when > 0, kill if total time spent
+    # in STOPPED state across all stop/start cycles exceeds this many seconds
+    # (timed_out=True → infra_timeout).  0 means unlimited (no cap).
+    verify_clock_stop_max_total_secs: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            'Max cumulative seconds allowed in STOPPED state across all '
+            'stop/start cycles.  0 = unlimited.'
+        ),
+    )
+
     # Verification execution mode + env
     # When False, test/lint/type run sequentially within a single verify
     # invocation.  Useful for Rust workspaces where cargo takes an advisory
