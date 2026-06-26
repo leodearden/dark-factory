@@ -7559,6 +7559,160 @@ class TestRebindBranchToHead:
 
 
 # ===========================================================================
+# Task-1923 step-5: RED — disk-backstop route end-to-end via acquire_warm_lane
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireDiskBackstopReuseDetachedRebind:
+    """End-to-end test of the PROVEN residual route: disk-backstop reuse (route 2)
+    on an already-detached lane.
+
+    RED today (before step-4 fix): after release_warm_lane detaches the lane,
+    re-acquire via disk-backstop calls _reuse_warm_lane on a DETACHED HEAD,
+    the ref stays stale (0-beyond-main), and the second release_warm_lane
+    DELETES task/D (α's retention guard sees 0 commits and deletes it).
+
+    GREEN after step-4 inserted rebind_branch_to_head in _reuse_warm_lane.
+    """
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_disk_backstop_reuse_on_detached_lane_retains_on_second_release(
+        self, git_repo: Path,
+    ):
+        """After release(detach) → re-acquire-via-disk-backstop → second release:
+        task/D must be RETAINED by α (not deleted as 0-beyond-main).
+
+        Sequence:
+        1. Acquire lane on 'D', write .task/plan.json, commit WIP commit
+        2. Advance main
+        3. release_warm_lane('D') → detach + retain task/D (WIP > 0) + FREE
+        4. acquire_warm_lane('D', main_HEAD) → disk-backstop route (route 2)
+        5. Assert: WorktreeInfo; refs/heads/task/D == lane HEAD; lane ON task/D
+        6. release_warm_lane('D') again → MUST RETAIN task/D (α protects rebased work)
+
+        Acceptance criteria 1+2 from the plan.
+        """
+        import json as _json
+
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # Step 1: Acquire lane on 'D', write plan.json, commit WIP
+        info = await git_ops.acquire_warm_lane('D', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        # Write .task/plan.json with task_id='D' (forces disk-backstop route on re-acquire)
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': 'D'}))
+
+        # Commit WIP so task/D has commits beyond main
+        (lane / 'wip_d.txt').write_text('work for task D\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'wip for D'], cwd=lane)
+
+        # Step 2: Advance main with an unrelated commit
+        (git_repo / 'main_advance.txt').write_text('main advance\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'advance main'], cwd=git_repo)
+
+        _, main_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        main_head = main_head_raw.strip()
+
+        # Step 3: release_warm_lane → detach + retain + FREE
+        await git_ops.release_warm_lane(lane, 'D')
+
+        # Verify: detached, task/D retained, plan.json intact
+        _, abbrev_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert abbrev_raw.strip() == 'HEAD', (
+            f'Lane should be DETACHED after release, got {abbrev_raw.strip()!r}'
+        )
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
+        )
+        assert rc_verify == 0, 'task/D must be RETAINED after first release (α)'
+        assert (task_dir / 'plan.json').exists(), (
+            'plan.json must survive release_warm_lane (used by disk-backstop re-acquire)'
+        )
+
+        # Step 4: re-acquire via disk-backstop route
+        # (pool sees lane as FREE+registered with plan.json task_id=='D' → route 2)
+        info2 = await git_ops.acquire_warm_lane('D', main_head)
+
+        # Step 5: assertions on re-acquire result
+        assert isinstance(info2, WorktreeInfo), (
+            f'Re-acquire must return WorktreeInfo via disk-backstop route, got {info2!r}'
+        )
+        assert info2.path == lane, (
+            f'Re-acquire must reuse same lane ({lane}), got {info2.path}'
+        )
+
+        # refs/heads/task/D must equal lane HEAD (the rebind closed the drift)
+        rc_verify2, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
+        )
+        assert rc_verify2 == 0, (
+            'task/D must resolve after disk-backstop re-acquire '
+            '(RED today: rebind missing, ref stays stale and α deletes it)'
+        )
+
+        _, lane_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        lane_head = lane_head_raw.strip()
+
+        _, ref_raw, _ = await _run(['git', 'rev-parse', 'task/D'], cwd=git_repo)
+        assert ref_raw.strip() == lane_head, (
+            f'task/D ({ref_raw.strip()[:8]}) must equal lane HEAD ({lane_head[:8]}) '
+            f'after disk-backstop re-acquire '
+            f'(RED today: ref drifts from rebased detached HEAD)'
+        )
+
+        # Lane must be ON task/D (attached)
+        _, abbrev2_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert abbrev2_raw.strip() == 'task/D', (
+            f'Lane must be ON task/D after re-acquire, got {abbrev2_raw.strip()!r}'
+        )
+
+        # Step 6: second release_warm_lane — must RETAIN task/D (acceptance 1+2)
+        await git_ops.release_warm_lane(lane, 'D')
+
+        rc_verify3, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
+        )
+        assert rc_verify3 == 0, (
+            'task/D must be RETAINED after second release_warm_lane — α must '
+            'protect the real rebased commits '
+            '(RED today: α sees 0-beyond-main on stale ref and deletes task/D)'
+        )
+
+        _, count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/D'], cwd=git_repo,
+        )
+        count = int(count_raw.strip())
+        assert count > 0, (
+            f'task/D must carry commits beyond main after second release (α retained it), '
+            f'got count={count}'
+        )
+
+
+# ===========================================================================
 # Task-1923 step-3: RED — _reuse_warm_lane on a DETACHED lane rebinds ref
 # ===========================================================================
 
