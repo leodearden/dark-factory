@@ -278,15 +278,16 @@ async def _run_synthetic_hard_cancel_slot(
     Simulates the T5 hard-cancel scenario (e.g. soft-cancel poll limit exceeded).
     Returns the synthetic CANCELLED report that the harness except-clause builds.
 
-    The caller must pre-assign a lane for *task_id* (via pool.acquire_for(task_id))
-    before calling this helper; the β guard being tested requires the lane to be
+    The caller must have an ASSIGNED lane for *task_id* before calling this helper
+    (e.g. via git_ops.create_worktree(task_id), as all current callers do, or
+    pool.acquire_for(task_id)); the β guard being tested requires the lane to be
     ASSIGNED at _run_slot entry.
 
     Mirrors the setup in
     TestHardCancelLaneRelease.test_synthetic_hard_cancel_retains_branch_and_lane.
     """
-    harness.scheduler.carries_substrate_probe.return_value = False
-    harness.scheduler.is_deterministic.return_value = False
+    harness.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    harness.scheduler.is_deterministic = MagicMock(return_value=False)
 
     with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
         mock_wf = MagicMock()
@@ -1251,8 +1252,11 @@ class TestOmegaIntegrationGate:
           - await git_ops.advance_main(result.merge_commit) == 'advanced'
           - WIP landed on main: git show main:<wipfile> contains the content
 
-        Negative control: with α/β reverted the ref is gone →
-        _classify_branch_presence returns unknown_branch MergeOutcome → is None FAILS.
+        This standalone test only verifies the merge path on a PRESENT branch; it
+        does not exercise the α (reclaim) or β (synthetic-cancel) paths, so it would
+        still pass with those seams reverted. The α/β-revert negative control for the
+        merge seam is provided by test_omega_combined_gate, where _assert_merge_phase
+        runs after a real release+reattach.
         """
         task_id = 'omega-merge-1'
         await _add_all_warm_lane_scripts(ig_git_repo)
