@@ -2447,6 +2447,8 @@ async def _classify_branch_presence(
     task_id: str,
     branch: str,
     t0: float | None,
+    *,
+    worktree: Path | None = None,
 ) -> MergeOutcome | None:
     """Terminal outcome when *branch* has no live ref in this repo, else None.
 
@@ -2455,6 +2457,8 @@ async def _classify_branch_presence(
 
         ref present            -> None  (proceed with normal merge)
         ref absent + marker    -> already_merged   (merged then cleaned up)
+        ref absent + no marker + worktree HEAD beyond main
+                               -> None  (proceed; merge_to_main uses HEAD fallback)
         ref absent + no marker -> unknown_branch    (never existed; likely a misroute)
 
     The ``unknown_branch`` case fires when a ``merge_request`` for one repo's
@@ -2485,6 +2489,17 @@ async def _classify_branch_presence(
     The ``unknown_branch`` reason reports both candidate forms tried
     (``{prefixed!r}`` and ``{branch!r}``) so operators can see exactly what
     was submitted and what was attempted during triage.
+
+    **Worktree-HEAD fallback**: when *worktree* is supplied (keyword-only) and
+    the ref is absent with no merge marker, BEFORE emitting unknown_branch this
+    function checks whether the worktree's HEAD carries commits beyond main.
+    If ``git rev-parse HEAD`` succeeds in *worktree* and the resulting SHA is
+    NOT an ancestor of main (i.e. there are unmerged commits), it returns
+    ``None`` (proceed) without emitting a merge_attempt.  This allows
+    ``merge_to_main``'s worktree-HEAD fallback to land those commits.
+    If *worktree* is None, the worktree is unreadable (rc≠0 from rev-parse),
+    or the HEAD is already an ancestor of main, the function falls through to
+    the original ``unknown_branch`` outcome — failing safe to today's behavior.
     """
     # ── Live-ref check via canonical resolver ─────────────────────────────
     if await git_ops.resolve_queued_branch_ref(branch) is not None:
@@ -2501,6 +2516,23 @@ async def _classify_branch_presence(
                 event_store, task_id, 'already_merged', duration_ms=_elapsed_ms(t0),
             )
             return MergeOutcome('already_merged')
+
+    # ── Worktree-HEAD fallback: ref absent, no marker, but work is present ─
+    # If a worktree was provided and its HEAD carries commits beyond main,
+    # this is NOT a misroute — the ref was lost while the work is still live.
+    # Return None (proceed) so merge_to_main can merge via the worktree HEAD.
+    if worktree is not None and worktree.exists():
+        rc_head, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+        )
+        if rc_head == 0:
+            head_sha = head_sha.strip()
+            main_sha = await git_ops.get_main_sha()
+            if not await git_ops.is_ancestor(head_sha, main_sha):
+                # HEAD carries commits beyond main — this is not a misroute.
+                # Return None (proceed); merge_to_main uses the worktree-HEAD
+                # fallback as the merge source.
+                return None
 
     # ── Genuine misroute ───────────────────────────────────────────────────
     _emit_merge_attempt(
