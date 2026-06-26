@@ -102,7 +102,13 @@ verify_clock_stop_marker_start: "@@REIFY_CLOCK_START@@"
 # Heartbeat-idle backstop: kill if no heartbeat arrives within 180s of STOP
 # or last heartbeat (keeps the verify bus reachable even during long waits).
 verify_clock_stop_heartbeat_idle_max: 180
-# Max cumulative stopped time: 0 = unlimited (no total-stopped cap by default).
+# Max cumulative stopped time across all stop/start cycles: 0 = unlimited (no
+# total-stopped cap by default).  NOTE: with max_total_secs=0, a subprocess
+# that emits heartbeats indefinitely but never emits START is bounded ONLY by
+# heartbeat_idle_max between consecutive heartbeats, not by wall-clock time.
+# The heartbeat-idle backstop does NOT bound a heartbeating-but-never-starting
+# process when max_total_secs=0.  Set a non-zero value for an absolute cap on
+# the total admission-wait duration (e.g. 3600 for a 1-hour hard ceiling).
 verify_clock_stop_max_total_secs: 0
 
 # Verification execution mode + environment injection

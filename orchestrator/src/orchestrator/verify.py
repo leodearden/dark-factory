@@ -311,7 +311,10 @@ def _extract_cause_hint(output: str) -> str:
         _PYTEST_FAILURE_SUMMARY_RE,
         re.compile(r'^error: .+$', re.MULTILINE),
         re.compile(r'^.+\s+FAILED$', re.MULTILINE),
-        re.compile(r'^Command timed out after \d+s:.+$', re.MULTILINE),
+        re.compile(
+            r'^Command (?:timed out after \d+s|clock-stop timed out[^:]+):.+$',
+            re.MULTILINE,
+        ),
         re.compile(r'^ERROR: .+$', re.MULTILINE),
         re.compile(r'^.*npm (ERR!|error).*$', re.MULTILINE),
     ]
@@ -1703,10 +1706,12 @@ def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
     - Trailing fields on the marker line  (reason=…, waited=…, pid=…).
     - A leading harness/log prefix before the marker.
 
-    The three marker strings are guaranteed mutually distinct (enforced by the
-    OrchestratorConfig validator when enabled), so substring matching cannot
-    misclassify — e.g. @@REIFY_CLOCK_START@@ and @@REIFY_CLOCK_STOP@@ share
-    no common substring that would cross-match.
+    The three marker strings are guaranteed pairwise non-substrings (enforced by
+    the ``OrchestratorConfig`` validator when enabled; distinctness alone is
+    insufficient — 'STOP' and 'STOPSTART' are distinct but the former is a
+    substring of the latter, which would cause a START line to match 'stop'
+    first).  This invariant ensures substring matching cannot misclassify for
+    any configured marker family, not just the default @@REIFY_CLOCK_*@@ one.
 
     Parameters
     ----------
@@ -1793,6 +1798,9 @@ async def _run_cmd(
     scope_unit: str | None = None
     if use_cgroup_scope and shutil.which('systemd-run') is not None:
         scope_unit = f'df-verify-{uuid.uuid4().hex[:12]}.scope'
+    # Populated by the clock-stop loop before raising TimeoutError so the except
+    # handler can emit a richer message (actual wall time + which deadline fired).
+    _cs_timeout_msg: list[str] = []
     try:
         if scope_unit is not None:
             # Launch inside a transient --user scope (its own cgroup) so a
@@ -1873,28 +1881,51 @@ async def _run_cmd(
                 # (step-10: max_total_secs cap).
                 total_stopped: float = 0.0
                 line_buf = bytearray()
+                # Human-readable reason for the binding deadline (overwritten each
+                # iteration; captured in _cs_timeout_msg before raising TimeoutError
+                # so the except handler can emit an informative message with the
+                # actual wall time and which limit fired).
+                _cs_reason = f'wall-clock budget ({timeout:.0f}s)'
 
                 while True:
                     now = time.monotonic()
                     if state == _CS_RUNNING:
                         read_timeout = deadline - now
+                        _cs_reason = (
+                            f'wall-clock budget ({timeout:.0f}s), '
+                            f'wall time {now - t0:.1f}s'
+                        )
                     else:  # _CS_STOPPED
                         read_timeout = idle_deadline - now
+                        _cs_reason = (
+                            f'heartbeat-idle backstop ({clock_stop.heartbeat_idle_max:.0f}s), '
+                            f'wall time {now - t0:.1f}s'
+                        )
                         # max_total_secs cap (step-10): when > 0, also bound
                         # the read timeout by the remaining total-stopped budget
                         # so we don't stay STOPPED past the cumulative cap.
                         if clock_stop.max_total_secs > 0:
                             cumulative = total_stopped + (now - stop_entered)
                             remaining_total = clock_stop.max_total_secs - cumulative
-                            read_timeout = min(read_timeout, remaining_total)
+                            if remaining_total < read_timeout:
+                                read_timeout = remaining_total
+                                _cs_reason = (
+                                    f'max-total-stopped cap ({clock_stop.max_total_secs:.0f}s), '
+                                    f'wall time {now - t0:.1f}s'
+                                )
 
                     if read_timeout <= 0:
+                        _cs_timeout_msg.append(_cs_reason)
                         raise TimeoutError()
 
-                    chunk = await asyncio.wait_for(
-                        proc.stdout.read(4096),
-                        timeout=read_timeout,
-                    )
+                    try:
+                        chunk = await asyncio.wait_for(
+                            proc.stdout.read(4096),
+                            timeout=read_timeout,
+                        )
+                    except (asyncio.TimeoutError, TimeoutError):
+                        _cs_timeout_msg.append(_cs_reason)
+                        raise
 
                     if not chunk:
                         # EOF: process finished; wait for exit code within
@@ -1909,13 +1940,15 @@ async def _run_cmd(
                     log_fh.write(chunk)
                     log_fh.flush()
 
-                    # Scan complete lines for clock-stop markers.
-                    # line_buf accumulates bytes until a newline boundary.
+                    # Scan complete lines for clock-stop markers.  Split on
+                    # '\n' in one pass (O(n) per chunk) rather than the
+                    # index+re-slice loop that is O(n^2) when a chunk contains
+                    # many newlines.  The last element is a partial line (no
+                    # trailing newline yet) and becomes the new line_buf.
                     line_buf.extend(chunk)
-                    while b'\n' in line_buf:
-                        idx = line_buf.index(b'\n')
-                        line_bytes = line_buf[:idx]
-                        line_buf = line_buf[idx + 1:]
+                    parts = line_buf.split(b'\n')
+                    line_buf = bytearray(parts[-1])
+                    for line_bytes in parts[:-1]:
                         line = line_bytes.decode(errors='replace')
                         marker = _match_clock_marker(line, clock_stop)
                         if marker is None:
@@ -1948,6 +1981,11 @@ async def _run_cmd(
             await _kill_cgroup_scope(scope_unit)
         if proc is not None and pgid is not None:
             await terminate_process_group(proc, pgid, grace_secs=5.0)
+        if _cs_timeout_msg:
+            # Clock-stop path: include actual wall time and which deadline fired
+            # (idle backstop / wall-clock budget / max-total cap) so infra_timeout
+            # incidents are distinguishable in the verify log.
+            return 1, f'Command clock-stop timed out ({_cs_timeout_msg[0]}): {cmd}', True
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except asyncio.CancelledError:
         if scope_unit is not None:
