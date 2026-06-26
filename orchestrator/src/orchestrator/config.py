@@ -2022,9 +2022,16 @@ class OrchestratorConfig(BaseSettings):
 
     @model_validator(mode='after')
     def _validate_clock_stop_markers(self) -> 'OrchestratorConfig':
-        """When clock-stop is enabled, the three marker strings must be non-empty
-        and mutually distinct.  No-op when disabled so operators can leave markers
-        blank in configs that opt out."""
+        """When clock-stop is enabled, the three marker strings must be non-empty,
+        mutually distinct, AND pairwise non-substrings.  No-op when disabled so
+        operators can leave markers blank in configs that opt out.
+
+        Distinctness alone is insufficient: ``_match_clock_marker`` checks
+        stop→heartbeat→start in priority order by substring containment.  If
+        e.g. marker_stop='STOP' and marker_start='STOPSTART', a START line would
+        match the 'stop' check first and be silently misclassified.  Only the
+        pairwise non-substring invariant guarantees correct classification for
+        any configured marker family, not just the default @@REIFY_CLOCK_*@@ one."""
         if not self.verify_clock_stop_enabled:
             return self
         markers = {
@@ -2045,6 +2052,22 @@ class OrchestratorConfig(BaseSettings):
                 'verify_clock_stop_enabled is True; got: '
                 + repr(values)
             )
+        # Reject any marker that is a substring of another.  Distinctness alone
+        # is insufficient: 'STOP' is distinct from 'STOPSTART', but the former
+        # is a substring of the latter, so _match_clock_marker would match 'stop'
+        # first for a line containing 'STOPSTART' and silently misclassify it.
+        marker_items = list(markers.items())
+        for i, (name_a, val_a) in enumerate(marker_items):
+            for name_b, val_b in marker_items[i + 1:]:
+                if val_a in val_b or val_b in val_a:
+                    raise ValueError(
+                        f'{name_a!r} ({val_a!r}) must not be a substring of '
+                        f'{name_b!r} ({val_b!r}), nor vice versa, when '
+                        'verify_clock_stop_enabled is True; _match_clock_marker '
+                        'uses substring containment in stop→heartbeat→start '
+                        'priority order and would misclassify a line where one '
+                        'marker string is contained in another.'
+                    )
         return self
 
     @model_validator(mode='after')

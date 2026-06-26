@@ -215,6 +215,31 @@ class TestClockStopConfigValidator:
         )
         assert config.verify_clock_stop_enabled is False
 
+    def test_enabled_with_stop_substring_of_start_raises(self):
+        """Enabled=True with marker_stop a substring of marker_start raises ValidationError.
+
+        Distinctness alone is insufficient: 'STOP' and 'STOPSTART' are distinct
+        but the former is a substring of the latter.  _match_clock_marker checks
+        stop→heartbeat→start in priority order, so a START line containing
+        'STOPSTART' would match 'stop' first and be silently misclassified."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(
+                verify_clock_stop_enabled=True,
+                verify_clock_stop_marker_stop='STOP',
+                verify_clock_stop_marker_heartbeat='HB',
+                verify_clock_stop_marker_start='STOPSTART',  # 'STOP' ⊂ 'STOPSTART'
+            )
+
+    def test_enabled_with_start_substring_of_stop_raises(self):
+        """Enabled=True with marker_start a substring of marker_stop raises ValidationError."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(
+                verify_clock_stop_enabled=True,
+                verify_clock_stop_marker_stop='STARTHERE',
+                verify_clock_stop_marker_heartbeat='HB',
+                verify_clock_stop_marker_start='START',  # 'START' ⊂ 'STARTHERE'
+            )
+
 
 # ── Step-5 / Step-6: _match_clock_marker unit tests ───────────────────────────
 
