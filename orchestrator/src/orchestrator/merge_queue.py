@@ -10591,6 +10591,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         speculative=item.speculative,
                         skip_verify=item.skip_verify,
                         started_monotonic=item.started_monotonic,
+                        # task-1928 PRIMARY fix: carry the branch tip at merge
+                        # time (γ2 term-2) through the rebuild so that
+                        # _finalize_advanced_merge can pass it to
+                        # _check_post_merge_equivalence as merged_tip.  Without
+                        # this, all three tip-resolution terms collapse to None
+                        # on a rebase-flattened landing → gate reads the live
+                        # worktree HEAD → phantom POST_MERGE_EQUIVALENCE_FAILED.
+                        merged_branch_tip=item.merged_branch_tip,
                     )
                     logger.info(
                         'Task %s: gate cleared (disjoint or green re-verify); '
@@ -10661,6 +10669,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     speculative=item.speculative,
                     skip_verify=item.skip_verify,
                     started_monotonic=item.started_monotonic,
+                    # task-1928 PRIMARY fix: carry merged_branch_tip (γ2 term-2)
+                    # through the cas_failed rebuild for the same reason as the
+                    # rebased_pending_reverify rebuild above.
+                    merged_branch_tip=item.merged_branch_tip,
                 )
                 logger.info(
                     f'Task {req.task_id}: CAS failed (attempt {total}/'
