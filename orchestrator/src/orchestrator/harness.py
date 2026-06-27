@@ -3431,13 +3431,24 @@ Output JSON matching the schema. Every task must appear in the output.
         Delegates unconditionally to ``git_ops._run_warm_lane_gc_reclaim()``,
         which is already fail-soft: rc 127 when the script is absent (no-op),
         non-zero on script error (logged at WARNING inside the helper), and
-        never raises.  This method therefore also never raises — all rc values
-        are accepted and logged at INFO for observability.
+        never raises.  This method therefore also never raises.
+
+        Logging is tiered to avoid noise on hosts where gc.sh is absent
+        (rc=127 is the expected no-op case on ~144 ticks/day with the 600s
+        default):
+          * rc==0   → INFO  (actual reclaim ran)
+          * rc==127 → DEBUG (script absent — expected no-op)
+          * other   → WARNING (unexpected non-zero)
 
         Called by ``_warm_lane_gc_loop()`` on every interval tick.
         """
         rc = await self.git_ops._run_warm_lane_gc_reclaim()
-        logger.info('Warm-lane GC reclaim pass: rc=%d', rc)
+        if rc == 0:
+            logger.info('Warm-lane GC reclaim pass: reclaimed (rc=0)')
+        elif rc == 127:
+            logger.debug('Warm-lane GC reclaim pass: script absent, no-op (rc=127)')
+        else:
+            logger.warning('Warm-lane GC reclaim pass: non-zero rc=%d', rc)
 
     def _start_warm_lane_gc(self) -> None:
         """Start the periodic warm-lane GC reclaim cadence loop.
