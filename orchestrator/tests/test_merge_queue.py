@@ -9000,6 +9000,83 @@ class TestCheckPostMergeEquivalence:
         finally:
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_allow_worktree_head_fallback_false_suppresses_head_read(
+        self, git_ops: GitOps,
+    ):
+        """allow_worktree_head_fallback=False suppresses the live HEAD read when
+        merged_tip=None.
+
+        Scenario: a file is committed to a branch, merged, and main is advanced.
+        The worktree HEAD is then overwritten with a DIVERGENT commit (different
+        content in the same file).
+
+        Legacy path (no kwarg / allow_worktree_head_fallback=True): reads the
+        drifted worktree HEAD → false-positive (non-empty), confirming the
+        worktree-HEAD fallback is triggered.
+
+        New path (allow_worktree_head_fallback=False, merged_tip=None): must NOT
+        read the worktree HEAD and must return [] immediately.
+
+        RED until step-2 adds the `allow_worktree_head_fallback` kwarg to
+        _check_post_merge_equivalence (TypeError on current code).
+        """
+        wt = (await git_ops.create_worktree('suppress-head-read')).path
+        (wt / 'i.py').write_text('i = 1\n')
+        await git_ops.commit(wt, 'Add i.py')
+
+        pre_merge_main = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'suppress-head-read')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='suppress-head-read', max_attempts=1,
+            )
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
+                or merge_result.merge_commit
+            )
+            assert advanced is not None
+
+            # Drift the worktree HEAD to a DIVERGENT commit (different i.py).
+            (wt / 'i.py').write_text('DIVERGENT_I = 999\n')
+            rc, _, _ = await _run(['git', 'add', 'i.py'], cwd=wt)
+            assert rc == 0
+            rc, _, _ = await _run(
+                ['git', 'commit', '-m', 'Divergent: different i.py content'], cwd=wt,
+            )
+            assert rc == 0
+
+            # Legacy path (no kwarg, merged_tip=None): reads drifted HEAD → FP.
+            # Confirms the worktree-HEAD fallback is in effect and would diverge.
+            legacy_result = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, pre_merge_main,
+                task_id='suppress-head-fp',
+                merged_tip=None,
+            )
+            assert legacy_result != [], (
+                'Legacy path (merged_tip=None, no kwarg) must FP when worktree '
+                f'drifts; got [] — test setup may be wrong. advanced={advanced[:8]}'
+            )
+
+            # Suppressed path (allow_worktree_head_fallback=False, merged_tip=None):
+            # must NOT read the worktree HEAD → return [] immediately (fail-safe skip).
+            # RED: TypeError until step-2 adds this kwarg.
+            suppressed_result = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, pre_merge_main,
+                task_id='suppress-head-suppressed',
+                merged_tip=None,
+                allow_worktree_head_fallback=False,
+            )
+            assert suppressed_result == [], (
+                f'allow_worktree_head_fallback=False with merged_tip=None must return '
+                f'[] (no HEAD read); got {suppressed_result!r}. advanced={advanced[:8]}'
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 async def test_speculative_merger_surfaces_worktree_missing_after_plan_touched_class(
