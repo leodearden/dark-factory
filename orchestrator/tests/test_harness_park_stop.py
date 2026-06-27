@@ -570,6 +570,7 @@ class TestHarnessIdleWhilePaused:
         harness._start_stranded_reconcile = MagicMock()
         harness._start_main_tip_sweep = MagicMock()
         harness._start_no_landings_breaker = MagicMock()  # task 1918: neutralise the breaker loop
+        harness._start_warm_lane_gc = MagicMock()  # task 1927: neutralise the warm-lane GC loop
         harness._tag_task_modules = AsyncMock()
         harness._recover_crashed_tasks = AsyncMock()
         harness._reconcile_stranded_in_progress = AsyncMock(return_value=0)
@@ -653,6 +654,7 @@ class TestHarnessRunForever:
         harness._start_stranded_reconcile = MagicMock()
         harness._start_main_tip_sweep = MagicMock()
         harness._start_no_landings_breaker = MagicMock()  # task 1918: neutralise the breaker loop
+        harness._start_warm_lane_gc = MagicMock()  # task 1927: neutralise the warm-lane GC loop
         harness._tag_task_modules = AsyncMock()
         harness._recover_crashed_tasks = AsyncMock()
         harness._reconcile_stranded_in_progress = AsyncMock(return_value=0)
