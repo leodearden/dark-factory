@@ -1664,6 +1664,37 @@ class OrchestratorConfig(BaseSettings):
     main_tip_sweep_enabled: bool = Field(default=True)
     main_tip_sweep_interval_secs: float = Field(default=1800.0)
 
+    # Warm-lane auto-GC cadence loop (task 1926).
+    # Periodic unconditional invocation of scripts/warm-lane-gc.sh reclaim to
+    # bound FREE _lane-*/_spec-* target/ re-accretion.  gc.sh only resets FREE
+    # lanes (preserves dirty/unlanded), is idempotent/cheap when nothing to
+    # reclaim, and _run_warm_lane_gc_reclaim() is fail-soft (rc 127 no-op when
+    # the script is absent), so the loop is harmless on hosts without gc.sh and
+    # active on hosts that have it.  This is independent of warm_lane_disk_guard
+    # (the reactive acquire-time burst gate, defaults False/opt-in) and
+    # warm_lane_pool (gc reclaims both _lane-* and _spec-*).
+    # Operator kill-switch (mirrors main_tip_sweep_enabled; set to False to
+    # disable without a code change).  Default: True (MUST be on automatically
+    # — the whole point of this task is to close the ε gap with zero manual
+    # wiring, unlike the reactive gate that requires explicit enabling).
+    warm_lane_gc_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable the periodic warm-lane GC reclaim cadence loop '
+            '(scripts/warm-lane-gc.sh reclaim).  Defaults to True so the loop '
+            'fires automatically with no operator action; set to False as a '
+            'kill-switch without requiring a code change.'
+        ),
+    )
+    warm_lane_gc_interval_secs: float = Field(
+        default=600.0,
+        description=(
+            'Interval in seconds between warm-lane GC reclaim passes '
+            '(600 s = 10 min, provisional/tunable).  Independent of the '
+            'reactive admit-time disk-pressure gate (warm_lane_disk_guard).'
+        ),
+    )
+
     # No-landings circuit-breaker (θ=1893, Phase-2 backstop, PRD §5.5).
     # When rolling landing-rate == 0 AND warm-lane free-bytes is monotonically
     # falling over a window, halt dispatch and file a non-blocking operator INFO
