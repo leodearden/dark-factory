@@ -182,7 +182,14 @@ class TestDeadLetter:
             group_id='proj1', operation='add_episode',
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
         )
-        await asyncio.sleep(1.0)
+        # Poll until the item reaches 'dead' status instead of using a fixed
+        # wall-clock sleep.  The dead-letter path (attempt1→retry→attempt2→dead)
+        # involves several real SQLite fsync commits; under full-suite xdist load
+        # the fixed 1.0s budget was regularly exceeded, causing flaky failures.
+        # 20s is generous under any load while staying well under the 60s
+        # pytest-timeout.  The accounting itself (attempts counter, 'dead'
+        # status) is deterministic given a single worker + max_attempts=2.
+        await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
 
         dead = await q.get_dead_items()
         assert len(dead) == 1

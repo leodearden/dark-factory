@@ -16,6 +16,11 @@ Test coverage:
   step-5:  test_run_main_tip_sweep_failsafe_empty_sha
            test_run_main_tip_sweep_failsafe_worktree_add_fails
            test_run_main_tip_sweep_drift_passthrough
+  task-1925 step-1 (Part B retry-on-flake):
+           test_run_main_tip_sweep_retries_once_and_suppresses_transient_flake
+           test_run_main_tip_sweep_both_passes_fail_is_drift
+           test_run_main_tip_sweep_passes_first_time_no_retry
+           test_run_main_tip_sweep_internalerror_on_retry_returns_none
 """
 
 from __future__ import annotations
@@ -290,5 +295,190 @@ class TestRunMainTipSweepFailSafes:
         remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
         assert remove_calls, (
             'git worktree remove --force must run even when returning None for '
+            'pytest_internalerror (cleanup-in-finally guarantee)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task-1925 step-1: retry-on-flake-once (Part B)
+# ---------------------------------------------------------------------------
+
+
+class TestRunMainTipSweepRetryOnFlake:
+    """task-1925 step-1: run_main_tip_sweep retries once on first-pass failure
+    to distinguish transient flakiness from deterministic drift.
+
+    RED today: current code calls run_full_verification exactly once and returns
+    the first result regardless of pass/fail (no retry logic).
+    """
+
+    def test_run_main_tip_sweep_retries_once_and_suppresses_transient_flake(
+        self, tmp_path: Path
+    ) -> None:
+        """First-pass FAIL + retry PASS → returns passing result (flake suppressed).
+
+        RED today: returns (sha, FAILING_RESULT) after exactly one call.
+        GREEN after impl: returns (sha, PASSING_RESULT) after exactly two calls,
+        and appends a structured record to verify._suppressed_flake_records.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        # Capture registry length before run so we can assert exactly one entry
+        # was appended (module-level list accumulates across tests in the suite).
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', rfv),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None, 'Expected (sha, VerifyResult), got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is True, (
+            f'Expected passing result after retry suppressed transient flake, '
+            f'got passed={vr.passed!r}'
+        )
+        assert rfv.call_count == 2, (
+            f'Expected exactly 2 calls to run_full_verification (initial + retry), '
+            f'got {rfv.call_count}'
+        )
+
+        # Verify the structured audit record was appended.
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert len(new_records) == 1, (
+            f'Expected exactly 1 new entry in _suppressed_flake_records, '
+            f'got {len(new_records)}: {new_records!r}'
+        )
+        rec = new_records[0]
+        assert rec['sha'] == MAIN_SHA, f'record sha mismatch: {rec!r}'
+        assert rec['first_pass_category'] == FAILING_RESULT.category, (
+            f'record first_pass_category mismatch: {rec!r}'
+        )
+        assert rec['first_pass_cause_hint'] == FAILING_RESULT.cause_hint, (
+            f'record first_pass_cause_hint mismatch: {rec!r}'
+        )
+
+    def test_run_main_tip_sweep_both_passes_fail_is_drift(
+        self, tmp_path: Path
+    ) -> None:
+        """First-pass FAIL + retry FAIL → returns failing result (deterministic drift).
+
+        Both passes fail → the failure is real drift, not a transient flake.
+        Harness must still receive a failing result so it can file the L1 escalation.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, FAILING_RESULT])
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', rfv),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None, 'Expected (sha, VerifyResult) even on drift, got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is False, 'Expected failing result — deterministic drift still escalates'
+        assert vr.category == 'test_failure'
+        assert rfv.call_count == 2, (
+            f'Expected exactly 2 calls to run_full_verification (initial + retry), '
+            f'got {rfv.call_count}'
+        )
+
+    def test_run_main_tip_sweep_passes_first_time_no_retry(
+        self, tmp_path: Path
+    ) -> None:
+        """First-pass PASS → returns passing result; run_full_verification called once.
+
+        No needless retry when the first pass succeeds.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        rfv = AsyncMock(side_effect=[PASSING_RESULT])
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', rfv),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is True
+        assert rfv.call_count == 1, (
+            f'Expected exactly 1 call (no needless retry on first-pass success), '
+            f'got {rfv.call_count}'
+        )
+
+    def test_run_main_tip_sweep_internalerror_on_retry_returns_none(
+        self, tmp_path: Path
+    ) -> None:
+        """First-pass FAIL + retry INTERNALERROR → returns None (infra sentinel).
+
+        pytest INTERNALERROR on the retry means the xdist infrastructure crashed.
+        Must return None (retry next tick, no false-positive drift escalation).
+        The worktree cleanup must still run (finally block).
+
+        RED today: returns (sha, FAILING_RESULT) after one call (no retry logic).
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return (0, '', '')
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, INTERNALERROR_RESULT])
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', rfv),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is None, (
+            f'Expected None (infra sentinel) when retry returns pytest_internalerror, '
+            f'got {result!r}'
+        )
+        # Cleanup must still run even when we return None (finally block guarantee)
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, (
+            'git worktree remove --force must run even when retry returns '
             'pytest_internalerror (cleanup-in-finally guarantee)'
         )
