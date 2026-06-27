@@ -14468,7 +14468,6 @@ class TestFinalizeAdvancedMerge:
         RED: AttributeError — _commit_is_linear does not exist yet (step-6 adds it).
         """
         from orchestrator.merge_queue import (
-            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
             _finalize_advanced_merge,
         )
 
