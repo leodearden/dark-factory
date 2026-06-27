@@ -1220,12 +1220,16 @@ async def _finalize_advanced_merge(
     )
 
     # Task-1928 fail-safe: if no trusted branch tip is recoverable via any of the
-    # three terms AND advanced_sha is positively linear (rebase-flattened), suppress
-    # the live worktree-HEAD fallback.  The rebased tree was already re-verified green
-    # by _reverify_rebased_tree on this path, so comparing a potentially drifted
-    # worktree HEAD would only produce phantom failures.
-    # The positive-linearity check (_commit_is_linear) distinguishes a confirmed
-    # rebase-flattened landing from a transient ^2 git error on a real merge commit —
+    # three terms AND advanced_sha is positively linear (confirmed single-parent),
+    # suppress the live worktree-HEAD fallback.  A positively-linear advanced_sha
+    # means the landed tree is a fast-forward or rebase-flattened projection of the
+    # branch tip, so the HEAD-drift comparison can only produce phantom failures —
+    # the tree is already equivalent by construction.  This holds for both rebase
+    # landings (where _reverify_rebased_tree also ran) and ff-style landings (where
+    # it did not): in both cases a genuine file drop would require the branch itself
+    # to have differed from what was merged, which the linear commit topology rules
+    # out.  The positive-linearity check (_commit_is_linear) distinguishes a confirmed
+    # linear commit from a transient ^2 git error on a real merge commit —
     # the latter must keep the legacy HEAD check to avoid masking a real drop.
     allow_worktree_head_fallback = True
     if resolved_merged_tip is None and await _commit_is_linear(git_ops, advanced_sha):
@@ -1926,20 +1930,23 @@ async def _check_post_merge_equivalence(
 
     *allow_worktree_head_fallback* — when ``False`` and ``merged_tip`` is
     ``None``, return ``[]`` immediately WITHOUT reading the live worktree
-    HEAD.  This is set to ``False`` by :func:`_finalize_advanced_merge` on
-    a rebase-flattened landing where no trusted branch tip is recoverable:
-    the rebased tree was already re-verified green by
-    ``_reverify_rebased_tree`` on that path, so reading a potentially
-    drifted worktree HEAD would only produce phantom failures.  Default
-    ``True`` preserves byte-for-byte back-compat for all existing callers.
+    HEAD.  This is set to ``False`` by :func:`_finalize_advanced_merge`
+    when no trusted branch tip is recoverable AND ``advanced_sha`` is
+    positively linear (confirmed single-parent commit).  A linear
+    ``advanced_sha`` means the landed tree is a fast-forward or
+    rebase-flattened projection of the branch tip, so the HEAD-drift
+    comparison can only produce phantom failures — the tree is equivalent
+    by construction regardless of whether ``_reverify_rebased_tree`` ran on
+    this path.  Default ``True`` preserves byte-for-byte back-compat for
+    all existing callers.
     """
     if merged_tip is not None:
         branch_head = merged_tip
     elif not allow_worktree_head_fallback:
         # No trusted tip and caller explicitly suppressed the worktree-HEAD
-        # fallback (rebase-flattened landing already re-verified by
-        # _reverify_rebased_tree).  Return [] rather than reading a
-        # potentially drifted live HEAD.
+        # fallback (advanced_sha is a positively-linear commit — the landed
+        # tree is equivalent to the branch tip by construction).  Return []
+        # rather than reading a potentially drifted live HEAD.
         logger.debug(
             'post-merge-equiv: allow_worktree_head_fallback=False with '
             'merged_tip=None — skipping gate (no HEAD read). '
@@ -9909,6 +9916,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         parameters and tree-equality cascade are removed.
         """
         actual_main = await self._git_ops.get_main_sha()
+
+        # Capture the branch tip now, before merge_to_main creates a separate
+        # merge worktree.  req.worktree HEAD does not change during _remerge —
+        # all merge operations write into a fresh merge_worktree.  Mirrors the
+        # merger-loop's rev-parse at Step 1; used as merged_branch_tip on the
+        # success-path SpeculativeItem so _finalize_advanced_merge can compare
+        # the equivalence gate against the actual tip (PRIMARY fix parity).
+        _rc_bt, _branch_tip_raw, _err_bt = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
+        )
+        _remerge_branch_tip: str | None = (
+            _branch_tip_raw.strip() if _rc_bt == 0 else None
+        )
+        if _rc_bt != 0:
+            logger.warning(
+                'Task %s: _remerge: rev-parse HEAD failed (will not set '
+                'merged_branch_tip): %s', req.task_id, _err_bt.strip(),
+            )
+
         merge_result = await self._git_ops.merge_to_main(
             req.worktree, req.branch, base_sha=None,
         )
@@ -9973,6 +9999,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     request=req, merge_result=retry_result,
                     merge_wt=retry_result.merge_worktree,
                     base_sha=retry_main, speculative=False, skip_verify=False,
+                    merged_branch_tip=_remerge_branch_tip,  # γ2: parity with merger loop
                     started_monotonic=started_monotonic,
                 )
             if retry_result.conflicts:
@@ -10074,6 +10101,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             request=req, merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=actual_main, speculative=False, skip_verify=False,
+            merged_branch_tip=_remerge_branch_tip,  # γ2: parity with merger loop
             started_monotonic=started_monotonic,
         )
 
