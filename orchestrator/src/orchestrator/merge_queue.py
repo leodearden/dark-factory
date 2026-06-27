@@ -1092,6 +1092,17 @@ async def _resolve_second_parent(git_ops: GitOps, sha: str) -> str | None:
             cwd=git_ops.project_root,
         )
     except Exception:
+        # Abnormal failure (subprocess spawn error etc.) — the routine
+        # "commit has no second parent" case returns rc != 0 below, NOT here.
+        # Log so the fail-open to the next tip-resolution tier is observable
+        # (task 1917 added this fail-open silently; greens the shared
+        # silent-fallthrough gate, which requires WARN+ logging or re-raise).
+        logger.warning(
+            '_resolve_second_parent: git rev-parse %s^2 raised — '
+            'falling open to None (caller uses next tip tier)',
+            sha,
+            exc_info=True,
+        )
         return None
     if rc != 0:
         return None

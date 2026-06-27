@@ -287,3 +287,58 @@ class TestMainTipSweepLifecycle:
 
         mock_task.cancel.assert_called_once()
         assert h._main_tip_sweep_task is None
+
+
+# ---------------------------------------------------------------------------
+# task 1907: _main_tip_sweep_loop failure handling — bounded logging + backoff
+# (regression: a failed pass must NOT logger.exception the full traceback, and
+# an immediately-failing pass must NOT tight-spin and starve the event loop —
+# the worker-kill → 60s-timeout → os._exit → suite-hang chain root cause.)
+# ---------------------------------------------------------------------------
+
+
+class TestMainTipSweepLoopFailureHandling:
+    """task 1907: the sweep loop logs a bounded summary and backs off on failure."""
+
+    @pytest.mark.asyncio
+    async def test_loop_failure_is_bounded_and_backs_off_not_spin(self) -> None:
+        """A pass that fails immediately must back off (no tight-spin) and log a
+        bounded summary via logger.error — NOT logger.exception (whose O(frames)
+        traceback formatting on a pathological traceback caused the worker kill).
+        """
+        h = _make_lifecycle_harness(enabled=True)
+        # Interval 0 so the top-of-loop sleep returns immediately: without the
+        # backoff guarantee, a failing pass would spin without yielding.
+        h.config = h.config.model_copy(update={'main_tip_sweep_interval_secs': 0.0})
+
+        calls = {'n': 0}
+
+        async def _failing_pass() -> None:
+            calls['n'] += 1
+            raise RuntimeError('sweep boom')
+
+        h._run_main_tip_sweep = _failing_pass  # type: ignore[method-assign]
+
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def _tracking_sleep(delay: float, *a, **k):
+            sleeps.append(delay)
+            # Stop the loop after a couple of failing iterations so the test
+            # terminates deterministically without relying on wall-clock.
+            if calls['n'] >= 2:
+                raise asyncio.CancelledError()
+            return await real_sleep(0)
+
+        with patch('orchestrator.harness.asyncio.sleep', side_effect=_tracking_sleep), \
+                patch('orchestrator.harness.logger') as mock_logger, \
+                pytest.raises(asyncio.CancelledError):
+            await h._main_tip_sweep_loop()
+
+        # logger.exception must NOT be used (pathological-traceback footgun).
+        mock_logger.exception.assert_not_called()
+        # A bounded one-line summary is logged via logger.error per failure.
+        assert mock_logger.error.call_count >= 1, 'expected bounded logger.error summary'
+        # The backoff sleep (60.0s) was requested after a failure — proving the
+        # loop yields a real quiescent gap instead of tight-spinning.
+        assert 60.0 in sleeps, f'expected a 60s backoff sleep, got {sleeps!r}'

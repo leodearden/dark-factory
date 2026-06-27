@@ -1872,6 +1872,7 @@ def _make_run_wired_harness(tmp_path: Path) -> tuple:
     h._start_orphan_l0_reaper = MagicMock()
     h._start_stranded_reconcile = MagicMock()
     h._start_main_tip_sweep = MagicMock()
+    h._start_no_landings_breaker = MagicMock()  # task θ/1893 loop (task 1907)
 
     # Scheduler: one pending task so run() proceeds to the acquire_next loop,
     # which then raises RuntimeError('stop') to halt immediately after startup.

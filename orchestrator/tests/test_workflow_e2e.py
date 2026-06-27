@@ -6278,9 +6278,12 @@ class TestMarkBlockedBypassDetection:
             f'Expected CANCELLED when task cancelled before setup, got {outcome!r}'
         )
 
-        # Workflow must NEVER have entered the BLOCKED phase.
-        assert workflow.state == WorkflowState.PLAN, (
-            f'Expected state=PLAN (never entered BLOCKED), got {workflow.state!r}'
+        # Graceful cancel: state ends CANCELLED (1881 step-6 / 37a8ff627f —
+        # _handle_cancelled_terminal_exit calls _enter_phase(CANCELLED)), and
+        # NEVER BLOCKED.
+        assert workflow.state == WorkflowState.CANCELLED, (
+            f'Expected state=CANCELLED (graceful cancel, never BLOCKED), '
+            f'got {workflow.state!r}'
         )
 
         # Zero escalations — no task_failure, no bypass_done.
@@ -6341,9 +6344,12 @@ class TestMarkBlockedBypassDetection:
             f'statuses seen: {written!r}'
         )
 
-        # (c) Workflow must NEVER have entered the BLOCKED phase.
-        assert workflow.state == WorkflowState.PLAN, (
-            f'Expected state=PLAN (never entered BLOCKED), got {workflow.state!r}'
+        # (c) Graceful cancel: state ends CANCELLED (1881 step-6 / 37a8ff627f —
+        # _handle_cancelled_terminal_exit calls _enter_phase(CANCELLED)), and
+        # NEVER BLOCKED.
+        assert workflow.state == WorkflowState.CANCELLED, (
+            f'Expected state=CANCELLED (graceful cancel, never BLOCKED), '
+            f'got {workflow.state!r}'
         )
 
         # (d) Zero escalations — no task_failure, no bypass_done.

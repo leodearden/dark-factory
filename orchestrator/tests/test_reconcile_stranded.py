@@ -2067,6 +2067,11 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     # and sqlite3.connect(str(...)) without leaking MagicMock-named files —
     # Harness.__init__ wires OverrideStore unconditionally (task 1313).
     config.overrides_db_path = tmp_path / 'overrides.db'
+    # No-landings breaker (task 1918): ints are read at construction (deque
+    # maxlen); enabled=False keeps run() from spinning up the breaker loop.
+    config.no_landings_breaker_enabled = False
+    config.no_landings_breaker_window_samples = 30
+    config.no_landings_breaker_disk_free_floor_bytes = 50 * 1024 * 1024 * 1024
 
     with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
          patch('orchestrator.harness.Scheduler'), \

@@ -156,7 +156,7 @@ class TestReserveNowConsumedShortCircuit:
         (b) NO reservation_installed event with data.get('reason') == 'reserve_now'
             (semantic upgrade — old event replaced).
         """
-        config = OrchestratorConfig(max_per_module=1)
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         store = OverrideStore(tmp_path / 'o.db')
         store.set_override('/proj', 'A', reserve_now=True)
 
@@ -168,8 +168,8 @@ class TestReserveNowConsumedShortCircuit:
         scheduler.lock_table._held['seed'] = {'compiler/src', 'eval/src'}
         scheduler._dispatched.add('seed')
 
-        task_a = _pending_task('A', files=['compiler/src', 'eval/src'], priority='medium')
-        task_b = _pending_task('B', files=['other/module'])
+        task_a = _pending_task('A', files=['compiler/src/a.py', 'eval/src/b.py'], priority='medium')
+        task_b = _pending_task('B', files=['other/module/c.py'])
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
 
         await scheduler.acquire_next()
@@ -651,7 +651,7 @@ class TestGetStateSnapshotPopulated:
 
         Assertions mirror the step-13 spec exactly.
         """
-        config = OrchestratorConfig(max_per_module=1)
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         store = OverrideStore(tmp_path / 'o.db')
 
         # T1 gets a boost override (medium → high).
@@ -670,9 +670,9 @@ class TestGetStateSnapshotPopulated:
         scheduler._dispatched.add('holder')
 
         # Three tasks with distinct modules so they don't conflict each other.
-        task_t1 = _pending_task('T1', priority='medium', files=['t1/src'])
-        task_t2 = _pending_task('T2', priority='medium', files=['t2/src'])
-        task_t3 = _pending_task('T3', priority='critical', files=['t3/src'])
+        task_t1 = _pending_task('T1', priority='medium', files=['t1/src/x.py'])
+        task_t2 = _pending_task('T2', priority='medium', files=['t2/src/x.py'])
+        task_t3 = _pending_task('T3', priority='critical', files=['t3/src/x.py'])
         scheduler.get_tasks = AsyncMock(return_value=[task_t1, task_t2, task_t3])
 
         # Tick 1: T2 dispatches (pinned — bypasses the scored candidate loop).

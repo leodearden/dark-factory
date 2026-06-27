@@ -100,6 +100,12 @@ _WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
 # Maximum backoff between unclean watcher exits (seconds).
 _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 
+# Fixed quiescent gap after a failed background-loop pass (seconds). Shared by
+# the main-tip sweep and no-landings breaker loops. Guarantees neither loop can
+# tight-spin on a pass that fails immediately, even if the configured interval
+# is non-numeric (task 1907).
+_BG_LOOP_FAILURE_BACKOFF_SECS: float = 60.0
+
 # Idle-while-paused tuning (task 1322 follow-up).  When the scheduler is paused
 # and no tasks are active, the main run loop idles in-process instead of exiting
 # 0 (which defeats Restart=on-failure and wedges the factory).
@@ -2351,7 +2357,7 @@ Output JSON matching the schema. Every task must appear in the output.
                             tid, metadata.get('branch_base_sha'),
                         )
                         return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run,
+                            tid, mid_run=mid_run, metadata=metadata,
                         )
                     logger.info(
                         'Reconcile: task %s branch is degenerate '
@@ -2404,7 +2410,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         tid, metadata.get('branch_base_sha'),
                     )
                     return await self._revert_in_progress_if_no_live_claimant(
-                        tid, mid_run=mid_run,
+                        tid, mid_run=mid_run, metadata=metadata,
                     )
                 logger.info(
                     'Reconcile: task %s branch tip == branch_base_sha (%s); '
@@ -2587,11 +2593,11 @@ Output JSON matching the schema. Every task must appear in the output.
         # is_ancestor==True degenerate-provisioning-branch guards above so a
         # never-advanced branch (the 2992 strand) is recovered, not left to sit.
         return await self._revert_in_progress_if_no_live_claimant(
-            tid, mid_run=mid_run,
+            tid, mid_run=mid_run, metadata=metadata,
         )
 
     async def _revert_in_progress_if_no_live_claimant(
-        self, tid: str, *, mid_run: bool,
+        self, tid: str, *, mid_run: bool, metadata: dict | None = None,
     ) -> str | None:
         """Revert a stranded in-progress task to pending when no live claimant.
 
@@ -2624,11 +2630,19 @@ Output JSON matching the schema. Every task must appear in the output.
         # non-degenerate (has commits beyond branch_base_sha).  Degenerate
         # branches (provisioned but never implemented) are not protected because
         # there is no real work to preserve.
-        try:
-            _infra_task = await self.scheduler.get_task(tid)
-            _infra_meta = (_infra_task or {}).get('metadata') or {}
-        except Exception:
-            _infra_meta = {}
+        # Prefer the metadata the reconcile caller already hoisted (one get_task
+        # per stranded task — see harness.py:2275). Re-fetching unconditionally
+        # here was the task-1883 step-14 regression that double-fetched on the
+        # neither-path; the row is immutable across the read-only intervening
+        # is_ancestor/marker/citation/degenerate checks. Standalone callers
+        # (direct unit tests) may omit metadata and pay one fetch.
+        if metadata is None:
+            try:
+                _infra_task = await self.scheduler.get_task(tid)
+                metadata = (_infra_task or {}).get('metadata') or {}
+            except Exception:
+                metadata = {}
+        _infra_meta = metadata
         if _infra_meta.get('infra_hold'):
             _branch = f'{self.git_ops.config.branch_prefix}{tid}'
             if not await self._branch_is_degenerate(_branch, _infra_meta):
@@ -3368,7 +3382,12 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Mirrors ``_main_tip_sweep_loop``: sleep first, then run the pass;
         re-raise CancelledError, swallow-and-log other exceptions so a
-        transient pass failure does not kill the loop.
+        transient pass failure does not kill the loop. Failure logging is
+        bounded (task 1907): a one-line ``logger.error`` summary — NOT
+        ``logger.exception``, whose O(frame-count) traceback formatting on a
+        pathological traceback can exceed the per-test 60s timeout and kill the
+        xdist worker — plus a fixed backoff so an immediately-failing pass can
+        never tight-spin.
         """
         interval = self.config.no_landings_breaker_interval_secs
         while True:
@@ -3377,8 +3396,13 @@ Output JSON matching the schema. Every task must appear in the output.
                 await self._run_no_landings_breaker_pass()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception('No-landings circuit-breaker pass failed')
+            except Exception as exc:
+                logger.error(
+                    'No-landings circuit-breaker pass failed: %s: %s',
+                    type(exc).__name__,
+                    exc,
+                )
+                await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
     async def _block_and_escalate_substrate_flip(
         self,
@@ -5797,7 +5821,17 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.info('Main-tip integrity sweep stopped')
 
     async def _main_tip_sweep_loop(self) -> None:
-        """Wake periodically and run the main-tip sweep pass."""
+        """Wake periodically and run the main-tip sweep pass.
+
+        Failure handling is deliberately bounded (task 1907): a failed pass is
+        logged as a one-line summary (exc type + message) — NOT via
+        ``logger.exception``, whose full traceback formatting is O(frame-count)
+        and on a pathological traceback (deep recursion / long ``__context__``
+        chain) can exceed the per-test 60s timeout, killing the xdist worker.
+        Every iteration also sleeps at least ``interval`` even on the failure
+        path, so a pass that fails *immediately* (e.g. mocked git_ops in unit
+        tests) can never tight-spin and starve the event loop.
+        """
         interval = self.config.main_tip_sweep_interval_secs
         while True:
             try:
@@ -5805,8 +5839,18 @@ Output JSON matching the schema. Every task must appear in the output.
                 await self._run_main_tip_sweep()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception('Main-tip integrity sweep pass failed')
+            except Exception as exc:
+                # Bounded, traceback-free summary — see docstring.
+                logger.error(
+                    'Main-tip integrity sweep pass failed: %s: %s',
+                    type(exc).__name__,
+                    exc,
+                )
+                # Backoff guarantee: a fixed, always-numeric quiescent gap so
+                # the loop cannot spin even if the failure surfaced before the
+                # loop's own ``asyncio.sleep`` (e.g. a non-numeric interval).
+                # CancelledError propagates out of this sleep to stop the loop.
+                await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
     async def _run_main_tip_sweep(self) -> None:
         """Single testable pass of the main-tip integrity sweep.

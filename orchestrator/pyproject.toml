@@ -91,7 +91,13 @@ timeout_method = "thread"
 # count from CPUs; ``--dist loadgroup`` keeps tests tagged with the same
 # xdist_group on a single worker (see test_cargo_scope.py /
 # test_stale_escalation_cleanup.py for the unsafe-to-share fixtures).
-addopts = "-n auto --dist loadgroup"
+# ``--max-worker-restart=0`` is the resilience net (task 1907): if any test
+# ever exceeds the 60s timeout, pytest-timeout's thread method os._exit()s the
+# xdist worker. With restarts allowed, xdist spawns a replacement node that
+# re-collects the full suite and re-dies → restart/re-collect/re-die loop that
+# hangs the whole suite at ~98%. Disabling restarts degrades a worker death to
+# a single clean per-test failure instead of a suite-wide hang.
+addopts = "-n auto --dist loadgroup --max-worker-restart=0"
 markers = [
     "exercise_dry_run_unblock: allow workflow._mark_blocked to spawn the real run_dry_run_unblock hook (fire-and-forget Claude CLI). Default: autouse no-op installed in conftest.py.",
     "mocks_dry_run_unblock: opt the class into an AsyncMock(return_value=None) patch of orchestrator.workflow.run_dry_run_unblock so BLOCKED-driving e2e tests do not invoke the real fire-and-forget hook. Default in test_workflow_e2e.py: a fail-fast stub that records calls and asserts in teardown.",

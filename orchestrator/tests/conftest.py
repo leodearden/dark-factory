@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -39,6 +40,55 @@ from orchestrator.config import (  # noqa: E402
     ReviewConfig,
     SandboxConfig,
 )
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reap_leaked_merge_workers():
+    """Gracefully stop any MergeWorker orphaned onto the test event loop (task 1907).
+
+    A merge-queue test that raises before its own ``await worker.stop()`` (e.g. an
+    assertion fails partway through) leaks the worker's ``run()`` task and its
+    four background loops, which do real ``git`` subprocess work. If
+    pytest-asyncio's per-test loop teardown (``asyncio.runners._cancel_all_tasks``)
+    then cancels a loop caught mid-subprocess-spawn
+    (``BaseSubprocessTransport._connect_pipes``), the cancellation ``gather``
+    deadlocks and the whole ``pytest tests/`` process HANGS forever at teardown
+    (this is the remaining full-suite teardown stall once the worker-kill hang is
+    fixed; there are 100+ ``create_task(worker.run())`` sites with inline-only
+    cleanup, so per-test ``try/finally`` is not tractable).
+
+    Reaping here — in the test's own loop, before it is closed — via the graceful
+    ``worker.stop()`` (sets ``_running=False`` + sends sentinels + bounded drain)
+    lets each loop FINISH its in-flight subprocess and exit cleanly, instead of
+    being abruptly cancelled mid-spawn. Best-effort and bounded: it never fails a
+    test and is a cheap no-op for the (vast majority of) tests that leak nothing.
+
+    Works for sync and async tests alike: pytest-asyncio (strict mode) provides a
+    loop for this async fixture even under a sync test, where ``all_tasks()`` is
+    simply empty.
+    """
+    yield
+    import asyncio
+    import contextlib
+
+    for task in list(asyncio.all_tasks()):
+        if task.done():
+            continue
+        coro = task.get_coro()
+        if not getattr(coro, "__qualname__", "").endswith("MergeWorker.run"):
+            continue
+        frame = getattr(coro, "cr_frame", None)
+        worker = frame.f_locals.get("self") if frame is not None else None
+        if worker is None or not hasattr(worker, "stop"):
+            continue
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(worker.stop(), timeout=15.0)
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(
+                    asyncio.gather(task, return_exceptions=True), timeout=15.0
+                )
 
 
 @pytest.fixture(scope="session")
@@ -311,6 +361,28 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # an additional asyncio.Task to manage.
     config.stranded_reconcile_enabled = False
     config.stranded_reconcile_interval_secs = 900.0
+    # No-landings circuit-breaker (task 1918/θ-1893). Disabled by default, like
+    # the other background sweep loops above, so its asyncio.Task doesn't spin
+    # up under fixtures that don't expect it — and so its `while True` loop
+    # can't churn on MagicMock config (a MagicMock interval crashes
+    # asyncio.sleep, which the loop logs-and-retries forever). window_samples /
+    # disk_free_floor_bytes are read synchronously in Harness.__init__ to size
+    # collections.deque(maxlen=...), so they must be real ints regardless of
+    # `enabled` (a MagicMock there raises "TypeError: an integer is required").
+    # Values mirror the production defaults (config.py: 60 s, 30 samples,
+    # 50 GiB floor); breaker-specific tests override these per-test.
+    config.no_landings_breaker_enabled = False
+    config.no_landings_breaker_interval_secs = 60.0
+    config.no_landings_breaker_window_samples = 30
+    config.no_landings_breaker_disk_free_floor_bytes = 50 * 1024 * 1024 * 1024
+    # Main-tip integrity sweep — disabled by default in tests (task 1907).
+    # Left enabled, the sweep loop starts under mocked git_ops/transport, its
+    # pass fails immediately, and (absent a real interval) the loop can spin
+    # logging exceptions — starving the xdist worker until the 60s per-test
+    # timeout os._exit()s it.  A real interval is also set so any test that
+    # explicitly re-enables the sweep gets a sane asyncio.sleep() argument.
+    config.main_tip_sweep_enabled = False
+    config.main_tip_sweep_interval_secs = 1800.0
     # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
     # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
     # is a @property on OrchestratorConfig (see config.py) and Harness wires

@@ -55,6 +55,11 @@ def _make_workflow(config: OrchestratorConfig, worktree: Path) -> TaskWorkflow:
     )
     git_ops = MagicMock(spec=GitOps)
     git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
+    # task-1923: _submit_to_merge_queue awaits rebind_branch_to_head before
+    # enqueue and reads git_ops.config.branch_prefix to name the ref.  spec=GitOps
+    # hides the __init__-assigned ``config`` attr, so set it explicitly.
+    git_ops.config = MagicMock(branch_prefix='task/', main_branch='main')
+    git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock()
     workflow = TaskWorkflow(

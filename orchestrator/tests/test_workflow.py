@@ -72,6 +72,10 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
     wf.plan = {'files': ['a.py', 'b.py', 'c.py']}
     wf._base_commit = 'base_sha'
     wf._module_configs = []
+    # task-1923: _submit_to_merge_queue awaits git_ops.rebind_branch_to_head
+    # (returns bool, result discarded) — stub it so the plain MagicMock git_ops
+    # is awaitable.
+    wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
     return wf
 
 
@@ -436,6 +440,10 @@ def _make_run_wf(
     wf.git_ops.get_main_sha = AsyncMock(return_value='deadbeef00')
     wf.git_ops.is_ancestor = AsyncMock(return_value=False)  # not already merged
     wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
+    # run()'s terminal finally awaits git_ops.release_lane_for_terminal_task on
+    # the DONE/CANCELLED path (workflow.py:2030) — stub so the plain MagicMock
+    # git_ops is awaitable (result discarded).
+    wf.git_ops.release_lane_for_terminal_task = AsyncMock(return_value=None)
     wf.config.max_merge_retries = 1
     wf.config.max_pre_merge_retries = 1
 
@@ -613,6 +621,7 @@ class TestSubmitToMergeQueueRegistersInRegistry:
         wf.plan = {}          # empty → _task_files=None → gate skipped
         wf._base_commit = None
         wf._module_configs = []
+        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
 
         inflight_seen: list[bool] = []
 
@@ -669,6 +678,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         wf.plan = {}
         wf._base_commit = None
         wf._module_configs = []
+        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
         return wf
 
     async def test_peer_completion_no_duplicate_enqueue(
@@ -1038,6 +1048,7 @@ class TestAttachedWaiterOutcomeMapping:
         wf.plan = {}
         wf._base_commit = None
         wf._module_configs = []
+        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
 
         async def fake_run(cmd, cwd=None, timeout=None):
             if 'rev-parse' in cmd:
@@ -1168,6 +1179,7 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         wf.plan = {}
         wf._base_commit = None
         wf._module_configs = []
+        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
 
         async def fake_run(cmd, cwd=None, timeout=None):
             if 'rev-parse' in cmd:
@@ -1250,6 +1262,7 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         wf.plan = {}
         wf._base_commit = None
         wf._module_configs = []
+        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
 
         async def fake_run(cmd, cwd=None, timeout=None):
             if 'rev-parse' in cmd:
@@ -1478,6 +1491,7 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         wf.plan = {}
         wf._base_commit = None
         wf._module_configs = []
+        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
         return wf, real_queue
 
     async def test_enqueue_path_soft_cancel_cancels_future(
@@ -1616,6 +1630,7 @@ class TestBoundaryTableWorkflow:
         wf.plan = {}
         wf._base_commit = None
         wf._module_configs = []
+        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
         return wf
 
     async def test_scenario_10_soft_cancel_detach_remaining_waiter_completes(

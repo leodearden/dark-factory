@@ -78,6 +78,8 @@ def _make(
 
     git_ops = MagicMock()
     git_ops.get_main_sha = AsyncMock(return_value='SHA-A')
+    # task-1923: _submit_to_merge_queue awaits rebind_branch_to_head before enqueue.
+    git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
     queue = MagicMock()
     queue.get_by_task = MagicMock(return_value=[])

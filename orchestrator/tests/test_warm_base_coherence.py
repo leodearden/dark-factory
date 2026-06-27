@@ -122,7 +122,7 @@ class TestSeedSymlinkResolution:
 
         result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
 
-        assert result is True
+        assert result == 0
         assert marker.exists(), 'seed-warm-lane.sh was not called'
         # First arg recorded is base_target
         recorded_base_target = marker.read_text().strip().split()[0]
@@ -159,7 +159,7 @@ class TestSeedSymlinkResolution:
 
         result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
 
-        assert result is True
+        assert result == 0
         assert marker.exists()
         recorded_base_target = marker.read_text().strip().split()[0]
 
@@ -229,7 +229,7 @@ class TestSeedFlockLock:
 
         result = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
 
-        assert result is True, 'seed script must exit 0'
+        assert result == 0, 'seed script must exit 0'
         assert lock_probe_marker.exists(), 'lock probe script section did not execute'
         probe_result = lock_probe_marker.read_text().strip()
 

@@ -147,6 +147,10 @@ def harness_for_run_slot() -> Harness:
     # False so _run_slot does not call _run_substrate_gate (which dereferences
     # git_ops.worktree_base, left None because TaskWorkflow is fully patched).
     h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    # is_deterministic gate (added after these tests): mock False so _run_slot
+    # follows the normal TaskWorkflow path instead of misrouting to
+    # _run_deterministic_slot on a truthy MagicMock (task 1907).
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
     return h
 
 
