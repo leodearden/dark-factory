@@ -1109,6 +1109,49 @@ async def _resolve_second_parent(git_ops: GitOps, sha: str) -> str | None:
     return out.strip() or None
 
 
+async def _commit_is_linear(git_ops: GitOps, sha: str) -> bool:
+    """Return ``True`` iff *sha* is a commit with at most one parent (linear/rebase).
+
+    Runs ``git rev-list --parents -n 1 <sha>`` in *git_ops.project_root*.  The
+    output is a single line of the form ``<sha> [<parent1> [<parent2> ...]]``.
+    A linear (rebase-flattened) commit has ≤1 parent token after its own SHA,
+    so the split yields ≤2 tokens total.
+
+    Returns ``False`` on any git error or if the commit has ≥2 parents (a real
+    ``--no-ff`` merge commit).  Fail-closed: returns ``False`` on error so the
+    caller does NOT suppress the worktree-HEAD fallback when the linearity check
+    is inconclusive (defense-in-depth — never masks a drop).
+
+    Used by :func:`_finalize_advanced_merge` as the gating condition for the
+    task-1928 fail-safe: the fail-safe (``allow_worktree_head_fallback=False``)
+    is applied ONLY when (a) no trusted branch tip is recoverable via the
+    three-term chain AND (b) the advanced SHA is *positively* linear.  This
+    distinguishes a genuinely rebase-flattened landing (safe to skip the
+    redundant gate — the tree was already re-verified by ``_reverify_rebased_tree``)
+    from a transient ``^2`` git error on a real merge commit (must keep the
+    legacy HEAD check to avoid masking a real drop).
+    """
+    try:
+        rc, out, _err = await _run(
+            ['git', 'rev-list', '--parents', '-n', '1', sha],
+            cwd=git_ops.project_root,
+        )
+    except Exception:
+        logger.warning(
+            '_commit_is_linear: git rev-list raised for %s — '
+            'returning False (fail-closed: keep legacy HEAD check)',
+            sha,
+            exc_info=True,
+        )
+        return False
+    if rc != 0:
+        return False
+    # Output: "<sha> [parent1] [parent2] ..."
+    # Linear commit → ≤1 parent → ≤2 tokens.
+    tokens = out.strip().split()
+    return len(tokens) <= 2
+
+
 async def _finalize_advanced_merge(
     git_ops: GitOps,
     req: MergeRequest,
@@ -1176,11 +1219,24 @@ async def _finalize_advanced_merge(
         or getattr(req, 'snapshot_tip', None)
     )
 
+    # Task-1928 fail-safe: if no trusted branch tip is recoverable via any of the
+    # three terms AND advanced_sha is positively linear (rebase-flattened), suppress
+    # the live worktree-HEAD fallback.  The rebased tree was already re-verified green
+    # by _reverify_rebased_tree on this path, so comparing a potentially drifted
+    # worktree HEAD would only produce phantom failures.
+    # The positive-linearity check (_commit_is_linear) distinguishes a confirmed
+    # rebase-flattened landing from a transient ^2 git error on a real merge commit —
+    # the latter must keep the legacy HEAD check to avoid masking a real drop.
+    allow_worktree_head_fallback = True
+    if resolved_merged_tip is None and await _commit_is_linear(git_ops, advanced_sha):
+        allow_worktree_head_fallback = False
+
     # Decision-2 post-merge content-equivalence check.
     equiv_failed = await _check_post_merge_equivalence(
         req.worktree, advanced_sha, git_ops, base_sha,
         task_id=req.task_id,
         merged_tip=resolved_merged_tip,
+        allow_worktree_head_fallback=allow_worktree_head_fallback,
     )
     if equiv_failed:
         logger.warning(
