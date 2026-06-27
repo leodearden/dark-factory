@@ -9000,6 +9000,83 @@ class TestCheckPostMergeEquivalence:
         finally:
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_allow_worktree_head_fallback_false_suppresses_head_read(
+        self, git_ops: GitOps,
+    ):
+        """allow_worktree_head_fallback=False suppresses the live HEAD read when
+        merged_tip=None.
+
+        Scenario: a file is committed to a branch, merged, and main is advanced.
+        The worktree HEAD is then overwritten with a DIVERGENT commit (different
+        content in the same file).
+
+        Legacy path (no kwarg / allow_worktree_head_fallback=True): reads the
+        drifted worktree HEAD → false-positive (non-empty), confirming the
+        worktree-HEAD fallback is triggered.
+
+        New path (allow_worktree_head_fallback=False, merged_tip=None): must NOT
+        read the worktree HEAD and must return [] immediately.
+
+        RED until step-2 adds the `allow_worktree_head_fallback` kwarg to
+        _check_post_merge_equivalence (TypeError on current code).
+        """
+        wt = (await git_ops.create_worktree('suppress-head-read')).path
+        (wt / 'i.py').write_text('i = 1\n')
+        await git_ops.commit(wt, 'Add i.py')
+
+        pre_merge_main = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(wt, 'suppress-head-read')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='suppress-head-read', max_attempts=1,
+            )
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
+                or merge_result.merge_commit
+            )
+            assert advanced is not None
+
+            # Drift the worktree HEAD to a DIVERGENT commit (different i.py).
+            (wt / 'i.py').write_text('DIVERGENT_I = 999\n')
+            rc, _, _ = await _run(['git', 'add', 'i.py'], cwd=wt)
+            assert rc == 0
+            rc, _, _ = await _run(
+                ['git', 'commit', '-m', 'Divergent: different i.py content'], cwd=wt,
+            )
+            assert rc == 0
+
+            # Legacy path (no kwarg, merged_tip=None): reads drifted HEAD → FP.
+            # Confirms the worktree-HEAD fallback is in effect and would diverge.
+            legacy_result = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, pre_merge_main,
+                task_id='suppress-head-fp',
+                merged_tip=None,
+            )
+            assert legacy_result != [], (
+                'Legacy path (merged_tip=None, no kwarg) must FP when worktree '
+                f'drifts; got [] — test setup may be wrong. advanced={advanced[:8]}'
+            )
+
+            # Suppressed path (allow_worktree_head_fallback=False, merged_tip=None):
+            # must NOT read the worktree HEAD → return [] immediately (fail-safe skip).
+            # RED: TypeError until step-2 adds this kwarg.
+            suppressed_result = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, pre_merge_main,
+                task_id='suppress-head-suppressed',
+                merged_tip=None,
+                allow_worktree_head_fallback=False,
+            )
+            assert suppressed_result == [], (
+                f'allow_worktree_head_fallback=False with merged_tip=None must return '
+                f'[] (no HEAD read); got {suppressed_result!r}. advanced={advanced[:8]}'
+            )
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 async def test_speculative_merger_surfaces_worktree_missing_after_plan_touched_class(
@@ -9424,6 +9501,385 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         # Must be a snapshot copy, not the live ledger reference.
         assert kw is not worker._owned_merge_worktrees, (
             'keep_worktrees must be a snapshot copy, not the live ledger set'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 1928: PRIMARY field-carry — merged_branch_tip through SpeculativeItem
+#            rebuilds on rebased_pending_reverify and cas_failed paths.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergedBranchTipCarryThroughRebuild:
+    """Tests that merged_branch_tip is preserved through SpeculativeItem rebuilds.
+
+    Task 1928: The two rebuild sites in _verify_and_advance (rebased_pending_reverify
+    at ~:10564 and cas_failed at ~:10634) drop merged_branch_tip, defeating task-1917's
+    fix for rebase-flattened landings where:
+      - term-1 = _resolve_second_parent(linear_advanced_sha) = None
+      - term-3 = req.snapshot_tip = None (workflow path)
+    All three tip-resolution terms collapse to None → gate reads the live worktree HEAD
+    → phantom POST_MERGE_EQUIVALENCE_FAILED 'blocked' on byte-identical work.
+
+    PRIMARY fix (step-4): carry merged_branch_tip=item.merged_branch_tip through
+    BOTH rebuilds so term-2 survives → _finalize_advanced_merge gets the real tip →
+    _check_post_merge_equivalence compares ORIGINAL_TIP, not a drifted HEAD.
+
+    Scenario shared by tests (A) and (A-drift):
+    - shared.py (20 lines) committed on main; branch edits line1 (top).
+    - Main then moves: edits line18 (bottom) → non-adjacent, rebase always clean.
+    - advance_main(merge_commit, expected_main=<pre-move>) detects stale expected_main
+      → rebases merge_commit onto new main → returns 'rebased_pending_reverify'.
+    - After gate cleared (patched → None), item is rebuilt at ~:10564, then
+      advance_main is called again with the rebased linear SHA → 'advanced'.
+    - advanced_sha is linear → _resolve_second_parent = None (term-1 = None).
+    - req.snapshot_tip = None (default) → term-3 = None.
+    - Only term-2 (merged_branch_tip) can provide the trusted tip.
+
+    Test (C) uses a simple branch + mocked advance_main to isolate the cas_failed
+    rebuild at ~:10634.
+    """
+
+    # 20-line shared base; branch edits line1 (top), main edits line18 (bottom).
+    # Non-adjacent → rebase always clean (no conflicts).
+    _SHARED_BASE: str = ''.join(f'line{i}\n' for i in range(20))
+
+    async def _setup_overlap_branch(
+        self,
+        git_ops: GitOps,
+        branch_name: str,
+        config: OrchestratorConfig,
+        *,
+        extra_branch_file: str | None = None,
+        extra_branch_content: str = 'branch_extra = 1\n',
+    ) -> tuple[Path, str, str, MergeRequest]:
+        """Commit shared.py on main; create branch editing line1.
+
+        Returns (branch_wt, ORIGINAL_TIP, base_main_sha, req).
+
+        If *extra_branch_file* is given, the branch also creates that file
+        (useful for the (A-drift) test which needs a file in compare_set
+        that main does NOT touch).
+        """
+        (git_ops.project_root / 'shared.py').write_text(self._SHARED_BASE)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', f'Add shared.py for {branch_name}'],
+            cwd=git_ops.project_root,
+        )
+        base_main = await git_ops.get_main_sha()
+
+        branch_wt = (await git_ops.create_worktree(branch_name)).path
+        (branch_wt / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line1\n', 'line1\nbranch-edit\n')
+        )
+        if extra_branch_file is not None:
+            (branch_wt / extra_branch_file).write_text(extra_branch_content)
+        await git_ops.commit(branch_wt, f'Branch {branch_name}: edit shared.py + extras')
+
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=branch_wt)
+        assert rc == 0
+        original_tip = head_out.strip()
+
+        req = _make_request(branch_name, branch_name, branch_wt, config)
+        return branch_wt, original_tip, base_main, req
+
+    async def test_rebased_pending_reverify_carries_merged_branch_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(A) rebased_pending_reverify: _check_post_merge_equivalence must
+        receive merged_tip == ORIGINAL_TIP (the branch tip at merge time).
+
+        Without the PRIMARY fix, the item rebuild at ~:10564 drops merged_branch_tip
+        → term-2 = None → merged_tip=None (gate reads live HEAD instead).
+        With the fix, merged_branch_tip is carried through → merged_tip=ORIGINAL_TIP.
+
+        Discriminates PRIMARY from fail-safe: under fail-safe-only the rebuild still
+        drops merged_branch_tip → merged_tip=None ≠ ORIGINAL_TIP → RED.
+
+        RED: captured_equiv_kw.get('merged_tip') == ORIGINAL_TIP fails (it's None).
+        """
+        branch = 'tip-carry-reverify'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        branch_wt, ORIGINAL_TIP, base_main, req = await self._setup_overlap_branch(
+            git_ops, branch, config,
+        )
+
+        # Merge against current main (pre-move state; base_main is the fork point)
+        merge_result = await git_ops.merge_to_main(branch_wt, branch)
+        assert merge_result.success and merge_result.merge_commit is not None
+        worker._register_owned_merge_worktree(merge_result.merge_worktree)
+
+        # Build item with merged_branch_tip=ORIGINAL_TIP (mirrors merger-loop ~:9131)
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_main,
+            speculative=False,
+            skip_verify=False,
+            merged_branch_tip=ORIGINAL_TIP,
+        )
+
+        # Move main: edit line18 (non-adjacent) → rebase succeeds → linear advanced_sha
+        # → _resolve_second_parent = None (term-1 = None).
+        (git_ops.project_root / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: tip-carry-reverify overlap'],
+            cwd=git_ops.project_root,
+        )
+
+        # Spy: capture kwargs to _check_post_merge_equivalence.
+        captured_equiv_kw: dict = {}
+
+        async def _spy_equiv(*args, **kwargs):
+            captured_equiv_kw.update(kwargs)
+            return []  # always clean so outcome proceeds to 'done'
+
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=passing),
+            ),
+            patch(
+                'orchestrator.merge_queue._reverify_rebased_tree',
+                AsyncMock(return_value=None),  # gate cleared (disjoint/green)
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                side_effect=_spy_equiv,
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, 'Expected True (main advanced)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', f'unexpected outcome: {outcome!r}'
+        # RED: without PRIMARY fix, rebased_pending_reverify rebuild drops
+        # merged_branch_tip → merged_tip=None ≠ ORIGINAL_TIP.
+        assert captured_equiv_kw.get('merged_tip') == ORIGINAL_TIP, (
+            f'_check_post_merge_equivalence must be called with '
+            f'merged_tip={ORIGINAL_TIP!r} (ORIGINAL_TIP carried through rebuild); '
+            f'got {captured_equiv_kw.get("merged_tip")!r}. '
+            f'Without the PRIMARY fix the rebuild drops merged_branch_tip.'
+        )
+
+    async def test_rebased_pending_reverify_with_drifted_worktree_still_done(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(A-drift) After the rebased_pending_reverify rebuild, even when the task
+        worktree HEAD is overwritten with a DIVERGENT commit, the outcome must still
+        be 'done' (no false-positive 'blocked').
+
+        Branch also adds 'branch_unique.py' (NOT touched by main) so the compare_set
+        = ['branch_unique.py'] (shared.py is subtracted since main also edits it).
+        The drift changes 'branch_unique.py' to DIVERGENT content.
+
+        Without the PRIMARY fix: merged_branch_tip dropped → merged_tip=None → gate
+        reads drifted HEAD → 'branch_unique.py' DIVERGENT ≠ what is in advanced_sha
+        (which has original content from ORIGINAL_TIP) → 'blocked'.
+        With the fix: merged_tip=ORIGINAL_TIP → correct comparison → [] → 'done'.
+
+        RED: assert outcome.status == 'done' fails (it's 'blocked').
+        """
+        branch = 'tip-carry-drift'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        branch_wt, ORIGINAL_TIP, base_main, req = await self._setup_overlap_branch(
+            git_ops, branch, config,
+            extra_branch_file='branch_unique.py',
+            extra_branch_content='unique = 1\n',
+        )
+
+        merge_result = await git_ops.merge_to_main(branch_wt, branch)
+        assert merge_result.success and merge_result.merge_commit is not None
+        worker._register_owned_merge_worktree(merge_result.merge_worktree)
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_main,
+            speculative=False,
+            skip_verify=False,
+            merged_branch_tip=ORIGINAL_TIP,
+        )
+
+        # Drift: overwrite branch_unique.py with DIVERGENT content.
+        # This file is in the branch's compare_set (branch touched it, main did not).
+        (branch_wt / 'branch_unique.py').write_text('DIVERGENT = 999\n')
+        rc, _, _ = await _run(['git', 'add', 'branch_unique.py'], cwd=branch_wt)
+        assert rc == 0
+        rc, _, _ = await _run(
+            ['git', 'commit', '-m', 'Drift: divergent branch_unique.py'], cwd=branch_wt,
+        )
+        assert rc == 0
+
+        # Move main: edit line18 (non-adjacent → rebased_pending_reverify;
+        # main ONLY touches shared.py so branch_unique.py is NOT in main_touched).
+        (git_ops.project_root / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: tip-carry-drift overlap'],
+            cwd=git_ops.project_root,
+        )
+
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=passing),
+            ),
+            patch(
+                'orchestrator.merge_queue._reverify_rebased_tree',
+                AsyncMock(return_value=None),  # gate cleared
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+            # No spy on _check_post_merge_equivalence: real impl runs so the
+            # drifted-HEAD false-positive (RED state) is observable end-to-end.
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        # RED: without PRIMARY fix, merged_tip=None → gate reads drifted HEAD
+        #      (DIVERGENT) → 'blocked'.
+        # GREEN: merged_tip=ORIGINAL_TIP → gate compares correct content → [] → 'done'.
+        assert advanced, (
+            'Expected True (main advanced). Drifted worktree HEAD must NOT cause '
+            'a false-positive blocked outcome.'
+        )
+        outcome = req.result.result()
+        assert outcome.status == 'done', (
+            f'Drifted branch_unique.py must NOT produce false-positive blocked outcome; '
+            f'got {outcome!r}. PRIMARY fix should carry merged_branch_tip through the '
+            f'rebased_pending_reverify rebuild so gate compares ORIGINAL_TIP.'
+        )
+
+    async def test_cas_failed_rebuild_carries_merged_branch_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(C) cas_failed path: _check_post_merge_equivalence must receive
+        merged_tip == ORIGINAL_TIP (not None).
+
+        On the cas_failed rebuild at ~:10634, merged_branch_tip is dropped.
+        With the PRIMARY fix, it is carried through.
+
+        advance_main is mocked: first call → 'cas_failed', second call → 'advanced'.
+        _resolve_second_parent is patched to None (eliminate term-1).
+        req.snapshot_tip is None by default (eliminate term-3).
+        So only term-2 (merged_branch_tip from the rebuilt item) can provide the tip.
+
+        Discriminates PRIMARY from fail-safe: under fail-safe-only the rebuild drops
+        merged_branch_tip → merged_tip=None ≠ ORIGINAL_TIP → RED.
+
+        RED: captured_equiv_kw.get('merged_tip') == ORIGINAL_TIP fails (it's None).
+        """
+        branch = 'tip-carry-cas'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Simple branch; no overlap needed (advance_main is mocked).
+        branch_wt = (await git_ops.create_worktree(branch)).path
+        (branch_wt / 'tip_carry_c.py').write_text('tip_c = 1\n')
+        await git_ops.commit(branch_wt, 'Add tip_carry_c.py')
+
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=branch_wt)
+        assert rc == 0
+        ORIGINAL_TIP = head_out.strip()
+
+        base_sha = await git_ops.get_main_sha()
+
+        merge_result = await git_ops.merge_to_main(branch_wt, branch)
+        assert merge_result.success and merge_result.merge_commit is not None
+        actual_merge_commit = merge_result.merge_commit
+        worker._register_owned_merge_worktree(merge_result.merge_worktree)
+
+        req = _make_request(branch, branch, branch_wt, config)
+        # req.snapshot_tip = None by default → term-3 = None
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=False,
+            skip_verify=False,
+            merged_branch_tip=ORIGINAL_TIP,
+        )
+
+        # Spy: capture kwargs to _check_post_merge_equivalence.
+        captured_equiv_kw: dict = {}
+
+        async def _spy_equiv(*args, **kwargs):
+            captured_equiv_kw.update(kwargs)
+            return []  # always clean
+
+        # Mock advance_main: first call → 'cas_failed', second → 'advanced'.
+        # On 'advanced', set _last_advanced_sha so _finalize_advanced_merge can
+        # resolve advanced_sha without falling back to merge_commit_fallback.
+        advance_calls = [0]
+
+        async def _fake_advance(sha, wt, **kw):
+            advance_calls[0] += 1
+            if advance_calls[0] == 1:
+                return 'cas_failed'
+            git_ops._last_advanced_sha = actual_merge_commit
+            return 'advanced'
+
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=passing),
+            ),
+            patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
+            patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=base_sha)),
+            # Eliminate term-1 so only term-2 (merged_branch_tip) can provide the tip.
+            patch(
+                'orchestrator.merge_queue._resolve_second_parent',
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                side_effect=_spy_equiv,
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, 'Expected True (main advanced)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', f'unexpected outcome: {outcome!r}'
+        # Term-1 = None (patched); term-3 = None (snapshot_tip default).
+        # RED: without PRIMARY fix, cas_failed rebuild drops merged_branch_tip
+        # → merged_tip=None ≠ ORIGINAL_TIP.
+        assert captured_equiv_kw.get('merged_tip') == ORIGINAL_TIP, (
+            f'_check_post_merge_equivalence must receive merged_tip={ORIGINAL_TIP!r} '
+            f'(term-2: merged_branch_tip carried through the cas_failed rebuild); '
+            f'got {captured_equiv_kw.get("merged_tip")!r}. '
+            f'Without the PRIMARY fix the cas_failed rebuild drops the field.'
         )
 
 
@@ -13994,6 +14450,225 @@ class TestFinalizeAdvancedMerge:
         assert outcome.merge_sha == ADVANCED, (
             f'blocked pyright outcome must carry merge_sha=ADVANCED; '
             f'got merge_sha={outcome.merge_sha!r}, expected {ADVANCED!r}'
+        )
+
+    # ------- Task-1928 FAIL-SAFE: _finalize_advanced_merge wiring tests -------
+
+    async def test_failsafe_skips_gate_when_no_tip_and_linear_commit(self) -> None:
+        """FAIL-SAFE positive: when all three tip terms are None AND advanced_sha
+        is positively linear (_commit_is_linear=True), _check_post_merge_equivalence
+        must be invoked with allow_worktree_head_fallback=False — skipping the
+        live worktree-HEAD read.  Outcome must be 'done'.
+
+        The rebased tree was already re-verified green by _reverify_rebased_tree
+        on this path, so reading a potentially drifted worktree HEAD is redundant
+        and hazardous.  The fail-safe eliminates that risk without suppressing the
+        gate when a trusted tip IS recoverable (see negative guard below).
+
+        RED: AttributeError — _commit_is_linear does not exist yet (step-6 adds it).
+        """
+        from orchestrator.merge_queue import (
+            _finalize_advanced_merge,
+        )
+
+        LINEAR_SHA = 'aabbccdd1234567890' * 2  # fake but deterministic
+        git_ops = self._make_git_ops(last_advanced_sha=LINEAR_SHA)
+        req = self._make_req()
+        req.snapshot_tip = None  # ensure term-3 = None
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        captured_equiv_kw: dict = {}
+
+        async def _spy_equiv(*args, **kwargs):
+            captured_equiv_kw.update(kwargs)
+            return []  # clean — gate would pass if invoked
+
+        with (
+            patch(
+                'orchestrator.merge_queue._resolve_second_parent',
+                AsyncMock(return_value=None),  # term-1 = None
+            ),
+            # Patch _commit_is_linear → True: advanced_sha is positively linear.
+            # RED: AttributeError because _commit_is_linear does not exist yet.
+            patch(
+                'orchestrator.merge_queue._commit_is_linear',
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                side_effect=_spy_equiv,
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                merged_branch_tip=None,  # term-2 = None; all three terms collapse
+            )
+
+        assert outcome.status == 'done', (
+            f'expected done (fail-safe should skip gate → clean); got {outcome!r}'
+        )
+        assert outcome.merge_sha == LINEAR_SHA
+        # Key assertion: gate must have been invoked with allow_worktree_head_fallback=False
+        # so it skipped the live HEAD read.
+        # RED: without step-6 wiring, allow_worktree_head_fallback is not passed
+        # → captured_kw has no such key → .get() returns None (≠ False).
+        assert captured_equiv_kw.get('allow_worktree_head_fallback') is False, (
+            f'_check_post_merge_equivalence must be called with '
+            f'allow_worktree_head_fallback=False when all tip terms are None '
+            f'and advanced_sha is linear; '
+            f'got {captured_equiv_kw.get("allow_worktree_head_fallback")!r}'
+        )
+
+    async def test_failsafe_not_taken_when_second_parent_recoverable(self) -> None:
+        """FAIL-SAFE negative guard (B): when _resolve_second_parent returns a
+        real tip (term-1 non-None), resolved_merged_tip is non-None → fail-safe
+        MUST NOT fire.  A genuine file drop is still detected and blocks.
+
+        The gate is invoked with merged_tip=RECOVERABLE_TIP and the default
+        allow_worktree_head_fallback=True (i.e. NOT suppressed).
+
+        This test passes in both RED and GREEN states: it validates that the
+        fail-safe never weakens the gate when the 2nd parent IS structurally
+        recoverable.  It does NOT reference _commit_is_linear (which would
+        fail with AttributeError in RED state).
+        """
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        RECOVERABLE_TIP = 'dead' * 10  # fake recoverable branch tip
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.snapshot_tip = None
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+
+        captured_equiv_kw: dict = {}
+
+        async def _spy_equiv_drop(*args, **kwargs):
+            captured_equiv_kw.update(kwargs)
+            return ['dropped.py']  # genuine drop detected
+
+        with (
+            # _resolve_second_parent returns the real branch tip → term-1 non-None
+            # → resolved_merged_tip = RECOVERABLE_TIP → fail-safe never fires.
+            patch(
+                'orchestrator.merge_queue._resolve_second_parent',
+                AsyncMock(return_value=RECOVERABLE_TIP),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                side_effect=_spy_equiv_drop,
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                merged_branch_tip=None,  # term-2 = None; term-1 provides the tip
+            )
+
+        # Genuine drop → outcome must be 'blocked' (fail-safe did NOT skip the gate).
+        assert outcome.status == 'blocked', (
+            f'expected blocked (genuine drop, fail-safe must not skip); got {outcome!r}'
+        )
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+        # Gate was called with the real recovered tip, not suppressed.
+        assert captured_equiv_kw.get('merged_tip') == RECOVERABLE_TIP, (
+            f'gate must use RECOVERABLE_TIP; got {captured_equiv_kw.get("merged_tip")!r}'
+        )
+        # allow_worktree_head_fallback must be True (the default) — fail-safe NOT active.
+        fb = captured_equiv_kw.get('allow_worktree_head_fallback', True)
+        assert fb is not False, (
+            f'allow_worktree_head_fallback must be truthy when tip is recoverable; '
+            f'got {fb!r}'
+        )
+
+    async def test_failsafe_not_taken_when_nonlinear_commit(self) -> None:
+        """FAIL-SAFE micro-guard: when resolved_merged_tip is None BUT advanced_sha
+        is NON-linear (_commit_is_linear=False, e.g. transient ^2 git error on a
+        real --no-ff merge), the fail-safe must NOT fire.
+
+        The gate is called with allow_worktree_head_fallback=True (legacy HEAD
+        read retained) so a real drop on a non-rebased merge is not masked.
+
+        RED: AttributeError — _commit_is_linear does not exist yet (step-6 adds it).
+        """
+        from orchestrator.merge_queue import (
+            _finalize_advanced_merge,
+        )
+
+        MERGE_SHA = 'ffee1234' * 5
+        git_ops = self._make_git_ops(last_advanced_sha=MERGE_SHA)
+        req = self._make_req()
+        req.snapshot_tip = None  # term-3 = None
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        captured_equiv_kw: dict = {}
+
+        async def _spy_equiv_clean(*args, **kwargs):
+            captured_equiv_kw.update(kwargs)
+            return []
+
+        with (
+            patch(
+                'orchestrator.merge_queue._resolve_second_parent',
+                AsyncMock(return_value=None),  # term-1 = None (transient error)
+            ),
+            # _commit_is_linear=False: advanced_sha has 2+ parents (real merge commit,
+            # or linearity check failed due to transient git error).
+            # RED: AttributeError because _commit_is_linear does not exist yet.
+            patch(
+                'orchestrator.merge_queue._commit_is_linear',
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                side_effect=_spy_equiv_clean,
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                merged_branch_tip=None,  # all terms None; non-linear → fail-safe inert
+            )
+
+        assert outcome.status == 'done', f'unexpected: {outcome!r}'
+        # Gate must use the LEGACY HEAD path (allow_worktree_head_fallback=True)
+        # because linearity was NOT confirmed — fail-safe must stay inert.
+        fb = captured_equiv_kw.get('allow_worktree_head_fallback', True)
+        assert fb is not False, (
+            f'allow_worktree_head_fallback must be truthy for non-linear advanced_sha; '
+            f'got {fb!r}'
         )
 
 
