@@ -694,40 +694,31 @@ class TestTransientResolverError:
 class TestMalformedExternalResult:
     """Regression: non-dict/malformed resolver result → fail-safe wait, NOT silent strand.
 
-    Proves the combined fix (task 1799):
+    Proves the combined behavior of tasks 1799 and 1855:
     - When the resolver returns a non-dict payload, the scheduler fails LOUD
       (WARNING logged, ExternalResolverError raised internally) and fails SAFE
       (task NOT dispatched even though upstream dep is actually 'done').
-    - No sentinel counter entry, no escalation — degraded resolver ≠ policy decision.
-    - Gate_held event emitted after threshold consecutive malformed ticks.
-    - Once the resolver answers correctly, the task dispatches immediately.
+    - No sentinel counter entry, no escalation on early (pre-threshold) ticks.
+    - EXTERNAL_DEP_RESOLVER_DEGRADED L1 escalation filed after threshold
+      consecutive malformed ticks; task blocked. No external_dep_gate_held event
+      emitted on this path (task 1855 intentionally suppresses it when a real
+      _on_external_dep_block callback is installed).
+    - Recovery: re-pending T + healthy resolver → T dispatches immediately.
 
     This is the exact failure mode that stranded reify task 4635 for hours — the
     old code fell through to ``return {}, None`` and the task was silently stranded
     with zero events/escalations/logs.
     """
 
-    @pytest.mark.xfail(
-        reason="1799-vs-1855 semantic conflict (pre-existing red-main, product "
-        "decision pending): max_external_dep_unresolved_cycles is reused as BOTH "
-        "the gate-held threshold (1799/1854) and the resolver-degraded escalation "
-        "threshold (1855). On the threshold-th degraded tick the 1855 escalation "
-        "branch (scheduler.py:1969) fires and deliberately clears the hold streak "
-        "(scheduler.py:1994-1998) before _note_external_hold, so the expected "
-        "external_dep_gate_held event can never fire on this path. Resolving needs "
-        "a product call (separate windows, or emit-on-escalation, or change the "
-        "assertion) — tracked separately, not part of task 1907.",
-        strict=False,
-    )
     @pytest.mark.asyncio
     async def test_malformed_resolver_fails_safe_and_recovers(
         self, tmp_path: Path, caplog
     ) -> None:
-        """Non-dict resolver: fail-safe wait + visible WARNING + recovery dispatch."""
+        """Non-dict resolver: fail-safe wait + WARNING + escalation-blocked + recovery dispatch."""
         import logging
 
         harness, session = build_harness(tmp_path)
-        # Inject a recording event store so we can assert gate_held events.
+        # Inject a recording event store so we can assert ABSENCE of gate_held events.
         rec = _RecordingEventStore()
         harness.scheduler.event_store = rec  # type: ignore[assignment]
 
@@ -769,36 +760,72 @@ class TestMalformedExternalResult:
             f'{count_key!r}; got {harness.scheduler._external_unresolved_counts!r}'
         )
 
-        # (d) No escalation filed — a degraded resolver is not a policy escalation.
+        # (d) No escalation filed yet — a degraded resolver is not a policy escalation
+        #     until the threshold is reached.
         assert escalations_for(harness, 'T') == [], (
             'Malformed resolver: must NOT file any escalation on Tick A'
         )
 
-        # ── Ticks B…(threshold): accumulate hold streak → gate_held event ───
+        # ── Ticks B…(threshold): accumulate degraded count → escalation on threshold tick ──
         for _ in range(threshold - 1):
             tick_result = await run_tick(harness)
             assert tick_result is None, (
                 'Malformed resolver: T must remain un-dispatched during degraded ticks'
             )
 
+        # ── After threshold malformed ticks: escalation filed, T blocked ────────────
+        # (e) Exactly one pending L1 escalation with infra_issue / EXTERNAL_DEP_RESOLVER_DEGRADED.
+        escs = escalations_for(harness, 'T')
+        assert len(escs) == 1, (
+            f'After {threshold} malformed ticks: expected exactly 1 pending L1 for T; '
+            f'got {len(escs)}: {escs!r}'
+        )
+        esc = escs[0]
+        assert esc.level == 1, f'Expected level==1; got {esc.level}'
+        assert esc.category == 'infra_issue', (
+            f'Expected category=="infra_issue"; got {esc.category!r}'
+        )
+        assert 'EXTERNAL_DEP_RESOLVER_DEGRADED' in esc.summary, (
+            f'Expected EXTERNAL_DEP_RESOLVER_DEGRADED in summary; got {esc.summary!r}'
+        )
+
+        # (f) T's status must be 'blocked' after the threshold-escalation path.
+        t_status = next(
+            (t['status'] for t in session.dependent_tasks if str(t.get('id')) == 'T'),
+            None,
+        )
+        assert t_status == 'blocked', (
+            f"Expected T.status=='blocked' after threshold degraded-resolver policy; "
+            f"got {t_status!r}"
+        )
+
+        # (g) Inverse guard: NO external_dep_gate_held event recorded.
+        #     Task 1855 deliberately suppresses gate_held on the terminal-escalation path
+        #     when a real _on_external_dep_block callback is installed (scheduler.py:1969-1999).
+        #     This assertion encodes that product decision as a regression guard.
         gate_held_events = [
             e for e in rec.events
             if e[0] == str(EventType.external_dep_gate_held)
         ]
-        assert len(gate_held_events) >= 1, (
-            f'After {threshold} malformed ticks: expected at least one '
-            f'external_dep_gate_held event; got {gate_held_events!r}'
-        )
-        _evt_type, evt_data = gate_held_events[0]
-        assert evt_data['data'].get('cause') == 'resolver_degraded', (
-            f'Expected cause="resolver_degraded"; got {evt_data["data"]!r}'
+        assert gate_held_events == [], (
+            f'After {threshold} malformed ticks with real callback: external_dep_gate_held '
+            f'must NOT be emitted (task 1855 suppresses it on the escalation path); '
+            f'got {gate_held_events!r}'
         )
 
-        # ── Recovery tick: resolver answers, upstream done → T dispatches ────
+        # ── Recovery: re-pend T manually, fix resolver → T dispatches ───────────────
+        # Task 1855 sets T to 'blocked'; re-pending mirrors the documented recovery path
+        # ("manually set the task back to pending" in _block_and_escalate_external_dep).
+        # has_open_l1 is NOT consulted for dispatch eligibility, so T dispatches even
+        # with the open L1 still queued.
+        for t in session.dependent_tasks:
+            if str(t.get('id')) == 'T':
+                t['status'] = 'pending'
+                break
         session.malformed_external_result = False
 
         tick_recovery = await run_tick(harness)
         assert tick_recovery == 'T', (
-            f'After resolver recovery: upstream done → T must dispatch; '
+            f'After re-pending T and resolver recovery: upstream done → T must dispatch; '
             f'got {tick_recovery!r}'
         )
