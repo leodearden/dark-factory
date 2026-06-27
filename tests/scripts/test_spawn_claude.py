@@ -73,14 +73,11 @@ _DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     # mirroring what a real terminal emulator does for its child shell.
     setsid env --default-signal=HUP,TERM "$@" &
     leader_pid=$!
-    # Wait for the payload bash to start up and install its signal traps
-    # before advertising the leader pid.  The pidfile is the test handshake:
-    # the test sends SIGHUP as soon as it sees this file, so the HUP trap
-    # must be in place by then.  Bash startup + trap-install is ~5-20ms;
-    # 200ms provides a generous safety margin without slowing tests noticeably
-    # (the test's must-not-hang guard is 15s).
-    sleep 0.2
-    # Write the pid so the test can signal the group.
+    # Publish the leader pid IMMEDIATELY — the readiness marker written by the
+    # fake claude binary (which spawn-claude.sh invokes only AFTER arming the
+    # EXIT/HUP/TERM traps) is the synchronization gate for SIGHUP delivery.
+    # A blind pre-publish sleep is a timing-fragile substitute and is
+    # load-sensitive under full-suite xdist contention (task-1925).
     echo "$leader_pid" > {pidfile}
     exit 0
 """)
@@ -262,17 +259,30 @@ def test_window_close_yields_129_not_hang(
 ) -> None:
     """Closing the terminal window while the session is alive must yield 129, not hang.
 
-    RED today: the sentinel is never written on SIGHUP (no trap), so
-    await_sentinel hangs forever.  Fixed by the inner-payload EXIT trap.
+    Hardened (task-1925) to use an explicit readiness handshake instead of a
+    blind pre-signal sleep, making SIGHUP-after-trap-install deterministic
+    under full-suite xdist load.
+
+    Synchronization contract (load-independent):
+      1. _DETACHING_TERM_TEMPLATE publishes the leader pid IMMEDIATELY after
+         setsid (no blind sleep).
+      2. The fake claude writes a readiness marker file before exec sleep 300.
+      3. spawn-claude.sh's $inner arms EXIT/HUP/TERM traps BEFORE invoking
+         claude, so the readiness marker is a sound proof that the HUP trap
+         is installed.
+      4. The test waits for BOTH the pidfile AND the readiness marker before
+         sending SIGHUP — SIGHUP is always delivered after trap installation.
     """
     bin_dir = _make_bin_dir(tmp_path)
 
-    # Long-running claude: sleep 300 (default SIGHUP disposition: terminate).
-    fake_claude = bin_dir / "claude"
-    fake_claude.write_text("#!/usr/bin/env bash\nexec sleep 300\n")
-    fake_claude.chmod(0o755)
-
     pidfile = tmp_path / "leader.pid"
+    readyfile = tmp_path / "claude.ready"
+
+    # Fake claude that writes a readiness marker then sleeps indefinitely.
+    # The marker is written only after spawn-claude.sh's $inner has armed the
+    # EXIT/HUP/TERM traps, so it is a deterministic proof the HUP trap is live.
+    _write_fake_claude_with_readiness(bin_dir, readyfile)
+
     _write_detaching_terminal(bin_dir, terminal_name, pidfile)
     env = _base_env(bin_dir, terminal_name)
 
@@ -285,9 +295,7 @@ def test_window_close_yields_129_not_hang(
     # a non-interactive bash cannot trap a signal that was SIG_IGN on entry
     # (POSIX), so the payload's `trap 'exit 129' HUP` becomes a silent no-op
     # unless the fake terminal resets the disposition — exactly what a real
-    # terminal emulator does for its child shell.  With this preexec the test
-    # is hermetic: it hangs on an unfixed _DETACHING_TERM_TEMPLATE and yields
-    # 129 once the template uses `env --default-signal=HUP,TERM`.
+    # terminal emulator does for its child shell.
     proc = subprocess.Popen(
         [str(SPAWN_SCRIPT), str(tmp_path), "false", "", "test prompt"],
         env=env,
@@ -297,17 +305,16 @@ def test_window_close_yields_129_not_hang(
         preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN),
     )
 
-    # Wait for the fake terminal to write the leader pid (max 5 s).
-    deadline = time.monotonic() + 5.0
-    while not pidfile.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
-
-    assert pidfile.exists(), (
-        "Fake terminal did not write leader pid within 5s — test harness broken"
-    )
+    # Wait for BOTH the leader pid AND the readiness marker.
+    # The pidfile appears first (published immediately by the terminal);
+    # the readyfile appears only after spawn-claude.sh has armed its traps and
+    # invoked the fake claude — proof that SIGHUP will land on a live HUP trap.
+    _wait_for_path(pidfile, timeout=5.0)
+    _wait_for_path(readyfile, timeout=10.0)
 
     leader_pid = int(pidfile.read_text().strip())
     # Send SIGHUP to the entire process group of the session leader.
+    # HUP trap is now guaranteed to be installed → exit 129.
     os.killpg(leader_pid, signal.SIGHUP)
 
     # Must-not-hang guard — NOT a latency SLA.
