@@ -189,7 +189,7 @@ class TestDeadLetter:
         # 20s is generous under any load while staying well under the 60s
         # pytest-timeout.  The accounting itself (attempts counter, 'dead'
         # status) is deterministic given a single worker + max_attempts=2.
-        await _poll_until_dead(q, expected_dead=1, timeout=20.0)
+        await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
 
         dead = await q.get_dead_items()
         assert len(dead) == 1

@@ -24,6 +24,19 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Suppressed-flake audit registry (run_main_tip_sweep retry-on-flake)
+# ---------------------------------------------------------------------------
+
+#: In-process registry of flakes suppressed by run_main_tip_sweep's retry-on-
+#: flake mechanism.  Each entry is a dict with keys ``sha`` (full hex),
+#: ``first_pass_category``, and ``first_pass_cause_hint``.  Accumulates for
+#: the lifetime of the process, making suppressed-but-possibly-real failures
+#: observable from tests and from any operator inspecting the live object graph
+#: — a durable complement to the WARNING log lines that otherwise live only in
+#: the log stream.
+_suppressed_flake_records: list[dict] = []
+
+# ---------------------------------------------------------------------------
 # Infra-class OSError classification (step-1/step-2)
 # ---------------------------------------------------------------------------
 
@@ -3180,11 +3193,19 @@ async def run_main_tip_sweep(
 
     Retry-on-flake: when the first ``run_full_verification`` call fails (and is
     NOT a pytest INTERNALERROR), the function re-runs it ONCE in the same pinned
-    worktree (idempotent; no second ``git worktree add``).
+    worktree (idempotent; no second ``git worktree add``).  **The retry reuses
+    first-pass worktree state by design** — no cleanup of temp files, partially-
+    written DBs, or caches is performed before the re-run.  This is intentional:
+    the purpose is a fast flake-vs-drift heuristic, not a hermetic isolation
+    guarantee.  A first run that fails partway may leave residue that makes the
+    retry non-representative in either direction; the single-retry bound and the
+    two-failure-escalates rule limit the blast radius.
 
-    - Retry PASSES → emit a WARNING and return ``(main_sha, retry_result)`` so
-      the harness files no drift escalation.  NOTE: this suppresses the flake but
-      **MAY MASK a real intermittent regression** introduced by a merge.
+    - Retry PASSES → emit a WARNING, append a record to
+      ``verify._suppressed_flake_records`` (durable in-process audit trail), and
+      return ``(main_sha, retry_result)`` so the harness files no drift
+      escalation.  NOTE: this suppresses the flake but **MAY MASK a real
+      intermittent regression** introduced by a merge.
     - Retry FAILS → return ``(main_sha, retry_result)`` so deterministic drift
       still escalates.
     - Retry hits pytest INTERNALERROR → return ``None`` (infra, retry next tick).
@@ -3265,6 +3286,9 @@ async def run_main_tip_sweep(
             # pinned worktree to distinguish a transient load-sensitive flake from
             # deterministic drift.  A second worktree add is NOT needed — the
             # worktree is already pinned at main_sha, so re-running is idempotent.
+            # NOTE: worktree state (temp files, partially-written DBs, caches) from
+            # the first run is NOT reset before the retry — this is intentional (fast
+            # heuristic, not hermetic isolation; see docstring for tradeoff discussion).
             _sha_prefix = main_sha[:12] if main_sha else '?'
             logger.warning(
                 'run_main_tip_sweep: first-pass verification failed at %s '
@@ -3293,6 +3317,15 @@ async def run_main_tip_sweep(
                     'regression introduced by a recent merge.',
                     _sha_prefix, result.category, result.cause_hint,
                 )
+                # Append to the in-process audit registry so suppressed flakes
+                # remain observable beyond the log stream (tests can inspect
+                # verify._suppressed_flake_records; operators can too via the
+                # live object graph).
+                _suppressed_flake_records.append({
+                    'sha': main_sha,
+                    'first_pass_category': result.category,
+                    'first_pass_cause_hint': result.cause_hint,
+                })
 
             # Return the retry result: passing (flake suppressed) or failing
             # (deterministic drift — harness files L1 escalation as usual).

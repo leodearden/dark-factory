@@ -318,7 +318,8 @@ class TestRunMainTipSweepRetryOnFlake:
         """First-pass FAIL + retry PASS → returns passing result (flake suppressed).
 
         RED today: returns (sha, FAILING_RESULT) after exactly one call.
-        GREEN after impl: returns (sha, PASSING_RESULT) after exactly two calls.
+        GREEN after impl: returns (sha, PASSING_RESULT) after exactly two calls,
+        and appends a structured record to verify._suppressed_flake_records.
         """
         from orchestrator import verify as verify_module
 
@@ -329,6 +330,10 @@ class TestRunMainTipSweepRetryOnFlake:
             return (0, '', '')
 
         rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        # Capture registry length before run so we can assert exactly one entry
+        # was appended (module-level list accumulates across tests in the suite).
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
 
         with (
             patch('orchestrator.git_ops._run', side_effect=_fake_run),
@@ -348,6 +353,21 @@ class TestRunMainTipSweepRetryOnFlake:
         assert rfv.call_count == 2, (
             f'Expected exactly 2 calls to run_full_verification (initial + retry), '
             f'got {rfv.call_count}'
+        )
+
+        # Verify the structured audit record was appended.
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert len(new_records) == 1, (
+            f'Expected exactly 1 new entry in _suppressed_flake_records, '
+            f'got {len(new_records)}: {new_records!r}'
+        )
+        rec = new_records[0]
+        assert rec['sha'] == MAIN_SHA, f'record sha mismatch: {rec!r}'
+        assert rec['first_pass_category'] == FAILING_RESULT.category, (
+            f'record first_pass_category mismatch: {rec!r}'
+        )
+        assert rec['first_pass_cause_hint'] == FAILING_RESULT.cause_hint, (
+            f'record first_pass_cause_hint mismatch: {rec!r}'
         )
 
     def test_run_main_tip_sweep_both_passes_fail_is_drift(
