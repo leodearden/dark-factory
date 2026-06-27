@@ -3404,6 +3404,24 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
                 await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
+    # ------------------------------------------------------------------
+    # Warm-lane auto-GC cadence loop — task 1926
+    # ------------------------------------------------------------------
+
+    async def _run_warm_lane_gc_pass(self) -> None:
+        """Invoke the warm-lane GC reclaim helper once (single cadence tick).
+
+        Delegates unconditionally to ``git_ops._run_warm_lane_gc_reclaim()``,
+        which is already fail-soft: rc 127 when the script is absent (no-op),
+        non-zero on script error (logged at WARNING inside the helper), and
+        never raises.  This method therefore also never raises — all rc values
+        are accepted and logged at INFO for observability.
+
+        Called by ``_warm_lane_gc_loop()`` on every interval tick.
+        """
+        rc = await self.git_ops._run_warm_lane_gc_reclaim()
+        logger.info('Warm-lane GC reclaim pass: rc=%d', rc)
+
     async def _block_and_escalate_substrate_flip(
         self,
         task_id: str,
