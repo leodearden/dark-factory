@@ -800,9 +800,16 @@ class TestMalformedExternalResult:
         )
 
         # (g) Inverse guard: NO external_dep_gate_held event recorded.
-        #     Task 1855 deliberately suppresses gate_held on the terminal-escalation path
-        #     when a real _on_external_dep_block callback is installed (scheduler.py:1969-1999).
-        #     This assertion encodes that product decision as a regression guard.
+        #     Two compounding mechanisms ensure gate_held is absent:
+        #       (1) Pre-threshold ticks 1..(threshold-1): _note_external_hold is called but
+        #           the streak only reaches threshold-1, which never satisfies the
+        #           streak >= threshold emission gate (scheduler.py:1889).
+        #       (2) Threshold tick N: the escalation branch's `continue` skips
+        #           _note_external_hold entirely, AND explicitly pops the streak entry for
+        #           T (scheduler.py:1994-1997) — the task-1855 intentional suppression.
+        #     We assert BOTH the event absence (covers both mechanisms) AND the streak pop
+        #     (specifically pins mechanism 2), so the guard stays unambiguous even if a
+        #     future change alters the streak/threshold relationship for mechanism 1.
         gate_held_events = [
             e for e in rec.events
             if e[0] == str(EventType.external_dep_gate_held)
@@ -811,6 +818,16 @@ class TestMalformedExternalResult:
             f'After {threshold} malformed ticks with real callback: external_dep_gate_held '
             f'must NOT be emitted (task 1855 suppresses it on the escalation path); '
             f'got {gate_held_events!r}'
+        )
+        # Specifically guard mechanism (2): after the threshold-escalation path the
+        # _external_hold_streak entry for T must be absent — popped by scheduler.py:1997,
+        # not merely never-reached.  If the pop were removed, this assertion catches it
+        # even when the surviving streak value doesn't satisfy the gate_held emission
+        # condition, preventing the test from passing for the wrong reason.
+        assert 'T' not in harness.scheduler._external_hold_streak, (
+            f"After threshold degraded-resolver escalation: _external_hold_streak['T'] "
+            f"must be absent (popped by task-1855 suppression at scheduler.py:1997); "
+            f"got {harness.scheduler._external_hold_streak!r}"
         )
 
         # ── Recovery: re-pend T manually, fix resolver → T dispatches ───────────────
