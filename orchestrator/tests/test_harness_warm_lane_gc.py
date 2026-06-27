@@ -9,7 +9,7 @@ Covers:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -17,7 +17,6 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
-
 
 # ---------------------------------------------------------------------------
 # Test factories
