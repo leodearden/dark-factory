@@ -14452,6 +14452,226 @@ class TestFinalizeAdvancedMerge:
             f'got merge_sha={outcome.merge_sha!r}, expected {ADVANCED!r}'
         )
 
+    # ------- Task-1928 FAIL-SAFE: _finalize_advanced_merge wiring tests -------
+
+    async def test_failsafe_skips_gate_when_no_tip_and_linear_commit(self) -> None:
+        """FAIL-SAFE positive: when all three tip terms are None AND advanced_sha
+        is positively linear (_commit_is_linear=True), _check_post_merge_equivalence
+        must be invoked with allow_worktree_head_fallback=False — skipping the
+        live worktree-HEAD read.  Outcome must be 'done'.
+
+        The rebased tree was already re-verified green by _reverify_rebased_tree
+        on this path, so reading a potentially drifted worktree HEAD is redundant
+        and hazardous.  The fail-safe eliminates that risk without suppressing the
+        gate when a trusted tip IS recoverable (see negative guard below).
+
+        RED: AttributeError — _commit_is_linear does not exist yet (step-6 adds it).
+        """
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        LINEAR_SHA = 'aabbccdd1234567890' * 2  # fake but deterministic
+        git_ops = self._make_git_ops(last_advanced_sha=LINEAR_SHA)
+        req = self._make_req()
+        req.snapshot_tip = None  # ensure term-3 = None
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        captured_equiv_kw: dict = {}
+
+        async def _spy_equiv(*args, **kwargs):
+            captured_equiv_kw.update(kwargs)
+            return []  # clean — gate would pass if invoked
+
+        with (
+            patch(
+                'orchestrator.merge_queue._resolve_second_parent',
+                AsyncMock(return_value=None),  # term-1 = None
+            ),
+            # Patch _commit_is_linear → True: advanced_sha is positively linear.
+            # RED: AttributeError because _commit_is_linear does not exist yet.
+            patch(
+                'orchestrator.merge_queue._commit_is_linear',
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                side_effect=_spy_equiv,
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                merged_branch_tip=None,  # term-2 = None; all three terms collapse
+            )
+
+        assert outcome.status == 'done', (
+            f'expected done (fail-safe should skip gate → clean); got {outcome!r}'
+        )
+        assert outcome.merge_sha == LINEAR_SHA
+        # Key assertion: gate must have been invoked with allow_worktree_head_fallback=False
+        # so it skipped the live HEAD read.
+        # RED: without step-6 wiring, allow_worktree_head_fallback is not passed
+        # → captured_kw has no such key → .get() returns None (≠ False).
+        assert captured_equiv_kw.get('allow_worktree_head_fallback') is False, (
+            f'_check_post_merge_equivalence must be called with '
+            f'allow_worktree_head_fallback=False when all tip terms are None '
+            f'and advanced_sha is linear; '
+            f'got {captured_equiv_kw.get("allow_worktree_head_fallback")!r}'
+        )
+
+    async def test_failsafe_not_taken_when_second_parent_recoverable(self) -> None:
+        """FAIL-SAFE negative guard (B): when _resolve_second_parent returns a
+        real tip (term-1 non-None), resolved_merged_tip is non-None → fail-safe
+        MUST NOT fire.  A genuine file drop is still detected and blocks.
+
+        The gate is invoked with merged_tip=RECOVERABLE_TIP and the default
+        allow_worktree_head_fallback=True (i.e. NOT suppressed).
+
+        This test passes in both RED and GREEN states: it validates that the
+        fail-safe never weakens the gate when the 2nd parent IS structurally
+        recoverable.  It does NOT reference _commit_is_linear (which would
+        fail with AttributeError in RED state).
+        """
+        from orchestrator.merge_queue import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        RECOVERABLE_TIP = 'dead' * 10  # fake recoverable branch tip
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.snapshot_tip = None
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+
+        captured_equiv_kw: dict = {}
+
+        async def _spy_equiv_drop(*args, **kwargs):
+            captured_equiv_kw.update(kwargs)
+            return ['dropped.py']  # genuine drop detected
+
+        with (
+            # _resolve_second_parent returns the real branch tip → term-1 non-None
+            # → resolved_merged_tip = RECOVERABLE_TIP → fail-safe never fires.
+            patch(
+                'orchestrator.merge_queue._resolve_second_parent',
+                AsyncMock(return_value=RECOVERABLE_TIP),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                side_effect=_spy_equiv_drop,
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                merged_branch_tip=None,  # term-2 = None; term-1 provides the tip
+            )
+
+        # Genuine drop → outcome must be 'blocked' (fail-safe did NOT skip the gate).
+        assert outcome.status == 'blocked', (
+            f'expected blocked (genuine drop, fail-safe must not skip); got {outcome!r}'
+        )
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+        # Gate was called with the real recovered tip, not suppressed.
+        assert captured_equiv_kw.get('merged_tip') == RECOVERABLE_TIP, (
+            f'gate must use RECOVERABLE_TIP; got {captured_equiv_kw.get("merged_tip")!r}'
+        )
+        # allow_worktree_head_fallback must be True (the default) — fail-safe NOT active.
+        fb = captured_equiv_kw.get('allow_worktree_head_fallback', True)
+        assert fb is not False, (
+            f'allow_worktree_head_fallback must be truthy when tip is recoverable; '
+            f'got {fb!r}'
+        )
+
+    async def test_failsafe_not_taken_when_nonlinear_commit(self) -> None:
+        """FAIL-SAFE micro-guard: when resolved_merged_tip is None BUT advanced_sha
+        is NON-linear (_commit_is_linear=False, e.g. transient ^2 git error on a
+        real --no-ff merge), the fail-safe must NOT fire.
+
+        The gate is called with allow_worktree_head_fallback=True (legacy HEAD
+        read retained) so a real drop on a non-rebased merge is not masked.
+
+        RED: AttributeError — _commit_is_linear does not exist yet (step-6 adds it).
+        """
+        from orchestrator.merge_queue import (
+            _finalize_advanced_merge,
+        )
+
+        MERGE_SHA = 'ffee1234' * 5
+        git_ops = self._make_git_ops(last_advanced_sha=MERGE_SHA)
+        req = self._make_req()
+        req.snapshot_tip = None  # term-3 = None
+        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+
+        captured_equiv_kw: dict = {}
+
+        async def _spy_equiv_clean(*args, **kwargs):
+            captured_equiv_kw.update(kwargs)
+            return []
+
+        with (
+            patch(
+                'orchestrator.merge_queue._resolve_second_parent',
+                AsyncMock(return_value=None),  # term-1 = None (transient error)
+            ),
+            # _commit_is_linear=False: advanced_sha has 2+ parents (real merge commit,
+            # or linearity check failed due to transient git error).
+            # RED: AttributeError because _commit_is_linear does not exist yet.
+            patch(
+                'orchestrator.merge_queue._commit_is_linear',
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                side_effect=_spy_equiv_clean,
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries=cas_retries,
+                timeouts=timeouts,
+                enospc_retries=enospc_retries,
+                merged_branch_tip=None,  # all terms None; non-linear → fail-safe inert
+            )
+
+        assert outcome.status == 'done', f'unexpected: {outcome!r}'
+        # Gate must use the LEGACY HEAD path (allow_worktree_head_fallback=True)
+        # because linearity was NOT confirmed — fail-safe must stay inert.
+        fb = captured_equiv_kw.get('allow_worktree_head_fallback', True)
+        assert fb is not False, (
+            f'allow_worktree_head_fallback must be truthy for non-linear advanced_sha; '
+            f'got {fb!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMapAdvanceFailure — unit tests for the _map_advance_failure helper
