@@ -678,6 +678,13 @@ class Harness:
         # volume's total capacity (making disk-recovery auto-resume unreachable).
         self._no_landings_floor_capacity_warned: bool = False
 
+        # Warm-lane auto-GC cadence loop — task 1926.
+        # Periodic unconditional invocation of git_ops._run_warm_lane_gc_reclaim()
+        # to bound FREE _lane-*/_spec-* target/ re-accretion independent of
+        # acquire traffic or pool exhaustion.  Mirrors the no-landings-breaker
+        # task field.
+        self._warm_lane_gc_task: asyncio.Task | None = None
+
         # Per-task consecutive-failure counter for the reconcile sweep —
         # cleared on any successful mark_done, used to gate L1 escalation.
         self._reconcile_failure_counts: dict[str, int] = {}
@@ -955,6 +962,12 @@ class Harness:
             # 1c1e. Start no-landings circuit-breaker (task θ/1893).
             # Halts dispatch when landing-rate==0 AND disk is shrinking.
             self._start_no_landings_breaker()
+
+            # 1c1f. Start warm-lane auto-GC cadence loop (task 1926).
+            # Periodically invokes _run_warm_lane_gc_reclaim() to bound FREE
+            # _lane-*/_spec-* target/ re-accretion independent of acquire
+            # traffic.  Defaults on (warm_lane_gc_enabled=True).
+            self._start_warm_lane_gc()
 
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
@@ -1323,6 +1336,10 @@ class Harness:
                 await self._stop_no_landings_breaker()
             except Exception as e:
                 logger.warning(f'_stop_no_landings_breaker() failed: {e}')
+            try:
+                await self._stop_warm_lane_gc()
+            except Exception as e:
+                logger.warning(f'_stop_warm_lane_gc() failed: {e}')
             try:
                 await self._stop_escalation_server()
             except Exception as e:
@@ -3399,6 +3416,98 @@ Output JSON matching the schema. Every task must appear in the output.
             except Exception as exc:
                 logger.error(
                     'No-landings circuit-breaker pass failed: %s: %s',
+                    type(exc).__name__,
+                    exc,
+                )
+                await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
+
+    # ------------------------------------------------------------------
+    # Warm-lane auto-GC cadence loop — task 1926
+    # ------------------------------------------------------------------
+
+    async def _run_warm_lane_gc_pass(self) -> None:
+        """Invoke the warm-lane GC reclaim helper once (single cadence tick).
+
+        Delegates unconditionally to ``git_ops._run_warm_lane_gc_reclaim()``,
+        which is already fail-soft: rc 127 when the script is absent (no-op),
+        non-zero on script error (logged at WARNING inside the helper), and
+        never raises.  This method therefore also never raises.
+
+        Logging is tiered to avoid noise on hosts where gc.sh is absent
+        (rc=127 is the expected no-op case on ~144 ticks/day with the 600s
+        default):
+          * rc==0   → INFO  (actual reclaim ran)
+          * rc==127 → DEBUG (script absent — expected no-op)
+          * other   → WARNING (unexpected non-zero)
+
+        Called by ``_warm_lane_gc_loop()`` on every interval tick.
+        """
+        rc = await self.git_ops._run_warm_lane_gc_reclaim()
+        if rc == 0:
+            logger.info('Warm-lane GC reclaim pass: reclaimed (rc=0)')
+        elif rc == 127:
+            logger.debug('Warm-lane GC reclaim pass: script absent, no-op (rc=127)')
+        else:
+            logger.warning('Warm-lane GC reclaim pass: non-zero rc=%d', rc)
+
+    def _start_warm_lane_gc(self) -> None:
+        """Start the periodic warm-lane GC reclaim cadence loop.
+
+        Mirrors ``_start_no_landings_breaker``: gate on config kill-switch,
+        dedup on a live task, then create the asyncio.Task.  Defaults to
+        enabled (warm_lane_gc_enabled=True) so the loop fires automatically
+        with no operator action — contrast warm_lane_disk_guard (opt-in,
+        defaults False).
+        """
+        if not self.config.warm_lane_gc_enabled:
+            return
+        if (
+            self._warm_lane_gc_task is not None
+            and not self._warm_lane_gc_task.done()
+        ):
+            return
+        self._warm_lane_gc_task = asyncio.create_task(
+            self._warm_lane_gc_loop(),
+            name='warm-lane-gc',
+        )
+        logger.info(
+            'Warm-lane GC cadence loop started (interval=%.0fs)',
+            self.config.warm_lane_gc_interval_secs,
+        )
+
+    async def _stop_warm_lane_gc(self) -> None:
+        """Cancel the warm-lane GC cadence loop.
+
+        Mirrors ``_stop_no_landings_breaker``: cancel + suppress + None.
+        """
+        if self._warm_lane_gc_task is not None:
+            self._warm_lane_gc_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._warm_lane_gc_task
+            self._warm_lane_gc_task = None
+            logger.info('Warm-lane GC cadence loop stopped')
+
+    async def _warm_lane_gc_loop(self) -> None:
+        """Wake periodically and run the warm-lane GC reclaim pass.
+
+        Mirrors ``_no_landings_breaker_loop``: sleep first, then run the pass;
+        re-raise CancelledError, swallow-and-log other exceptions so a
+        transient pass failure does not kill the loop.  Failure logging is
+        bounded: a one-line ``logger.error`` summary — NOT ``logger.exception``
+        (whose O(frame-count) traceback formatting can exceed per-test timeouts
+        and kill the xdist worker) — plus a fixed backoff so an
+        immediately-failing pass can never tight-spin.
+        """
+        interval = self.config.warm_lane_gc_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._run_warm_lane_gc_pass()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    'Warm-lane GC reclaim pass failed: %s: %s',
                     type(exc).__name__,
                     exc,
                 )
