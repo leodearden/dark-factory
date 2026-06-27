@@ -1829,6 +1829,7 @@ async def _check_post_merge_equivalence(
     *,
     task_id: str | None = None,
     merged_tip: str | None = None,
+    allow_worktree_head_fallback: bool = True,
 ) -> list[str]:
     """Return branch-touched paths whose ``advanced_sha`` blob differs from ``branch_HEAD``.
 
@@ -1866,9 +1867,30 @@ async def _check_post_merge_equivalence(
     is drift-proof when the worktree HEAD has been rebased or hijacked after
     the snapshot was taken.  When ``None`` (the default) the existing
     worktree-HEAD behaviour is preserved for back-compat.
+
+    *allow_worktree_head_fallback* — when ``False`` and ``merged_tip`` is
+    ``None``, return ``[]`` immediately WITHOUT reading the live worktree
+    HEAD.  This is set to ``False`` by :func:`_finalize_advanced_merge` on
+    a rebase-flattened landing where no trusted branch tip is recoverable:
+    the rebased tree was already re-verified green by
+    ``_reverify_rebased_tree`` on that path, so reading a potentially
+    drifted worktree HEAD would only produce phantom failures.  Default
+    ``True`` preserves byte-for-byte back-compat for all existing callers.
     """
     if merged_tip is not None:
         branch_head = merged_tip
+    elif not allow_worktree_head_fallback:
+        # No trusted tip and caller explicitly suppressed the worktree-HEAD
+        # fallback (rebase-flattened landing already re-verified by
+        # _reverify_rebased_tree).  Return [] rather than reading a
+        # potentially drifted live HEAD.
+        logger.debug(
+            'post-merge-equiv: allow_worktree_head_fallback=False with '
+            'merged_tip=None — skipping gate (no HEAD read). '
+            'task_id=%s advanced_sha=%s',
+            task_id or '<unknown>', advanced_sha,
+        )
+        return []
     else:
         rc, head_out, head_err = await _run(
             ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
