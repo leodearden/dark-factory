@@ -1731,3 +1731,34 @@ class TestNoLandingsBreakerTuning:
             f'{expected:,}; update both together or add a comment explaining the '
             f'intentional divergence.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task/1926: Warm-lane auto-GC cadence loop — config defaults
+# ---------------------------------------------------------------------------
+
+
+class TestWarmLaneGcConfig:
+    """OrchestratorConfig exposes the two new warm-lane-GC cadence knobs.
+
+    RED until step-2 GREEN adds warm_lane_gc_enabled and
+    warm_lane_gc_interval_secs fields to config.py.
+    """
+
+    def test_warm_lane_gc_enabled_defaults_true(self):
+        """warm_lane_gc_enabled defaults to True so the loop fires automatically."""
+        config = OrchestratorConfig()
+        assert config.warm_lane_gc_enabled is True, (
+            'warm_lane_gc_enabled must default to True — the loop must fire '
+            'automatically without manual wiring; contrast warm_lane_disk_guard '
+            'which defaults False (opt-in). '
+            f'got: {config.warm_lane_gc_enabled!r}'
+        )
+
+    def test_warm_lane_gc_interval_secs_defaults_600(self):
+        """warm_lane_gc_interval_secs defaults to 600.0 (10 min)."""
+        config = OrchestratorConfig()
+        assert config.warm_lane_gc_interval_secs == 600.0, (
+            f'warm_lane_gc_interval_secs must default to 600.0s (10 min); '
+            f'got {config.warm_lane_gc_interval_secs}'
+        )
