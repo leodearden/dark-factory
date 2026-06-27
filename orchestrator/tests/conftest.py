@@ -383,6 +383,14 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # explicitly re-enables the sweep gets a sane asyncio.sleep() argument.
     config.main_tip_sweep_enabled = False
     config.main_tip_sweep_interval_secs = 1800.0
+    # Warm-lane GC cadence loop — disabled by default in tests (task 1927).
+    # Defaults on (warm_lane_gc_enabled=True) in production; left enabled here,
+    # the loop's asyncio.sleep() call fires under the monkeypatched sleep and
+    # inflates idle-sleep counts in TestHarnessRunForever (observed: assert 3 == 1).
+    # Real interval set so any test that explicitly re-enables gets a sane
+    # asyncio.sleep() argument instead of a MagicMock crash.
+    config.warm_lane_gc_enabled = False
+    config.warm_lane_gc_interval_secs = 600.0
     # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
     # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
     # is a @property on OrchestratorConfig (see config.py) and Harness wires
