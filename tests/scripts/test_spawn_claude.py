@@ -85,6 +85,36 @@ _DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     exit 0
 """)
 
+# Stress-variant detaching terminal: injects a trap-install delay INSIDE the
+# payload (before $inner runs) to expose timing-fragile synchronization.
+# Publishes the leader pid IMMEDIATELY — no blind sleep — so the readiness
+# marker (written by the fake claude once spawn-claude.sh's traps are armed)
+# is the only valid synchronization gate for SIGHUP delivery.
+#
+# {delay}   — float seconds injected before $inner (e.g. 1.0)
+# {pidfile} — path where the leader pid is written
+_STRESS_DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    # Stress variant: inject a trap-install delay before the payload runs.
+    # Simulates slow bash startup to expose timing-fragile synchronization.
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "bash" ]]; then
+        break
+      fi
+      shift
+    done
+    # $1=bash  $2=-c  $3=<inner script>
+    inner="$3"
+    # Prepend delay BEFORE inner runs (before traps are armed in the payload).
+    setsid env --default-signal=HUP,TERM bash -c "sleep {delay}; $inner" &
+    leader_pid=$!
+    # Publish pid IMMEDIATELY — the readiness marker (written by the fake
+    # claude binary once spawn-claude.sh has armed the EXIT/HUP/TERM traps)
+    # is the synchronization gate, not a blind sleep.
+    echo "$leader_pid" > {pidfile}
+    exit 0
+""")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -100,6 +130,36 @@ def _write_fake_claude(bin_dir: pathlib.Path, exit_code: int) -> None:
     p = bin_dir / "claude"
     p.write_text(f"#!/usr/bin/env bash\nexit {exit_code}\n")
     p.chmod(0o755)
+
+
+def _write_fake_claude_with_readiness(
+    bin_dir: pathlib.Path, readyfile: pathlib.Path
+) -> None:
+    """Write a fake ``claude`` that signals readiness then sleeps indefinitely.
+
+    spawn-claude.sh's $inner arms EXIT, HUP, and TERM traps BEFORE invoking
+    ``claude``, so the moment this binary writes *readyfile* the HUP trap is
+    guaranteed to be installed in the enclosing bash process.  This makes
+    SIGHUP-after-readiness-gate deterministic regardless of load.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        f"#!/usr/bin/env bash\n"
+        f"echo ready > {readyfile!s}\n"
+        f"exec sleep 300\n"
+    )
+    p.chmod(0o755)
+
+
+def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
+    """Poll until *path* exists, raising ``AssertionError`` on timeout."""
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"Timed out after {timeout}s waiting for {path} to appear"
+            )
+        time.sleep(0.05)
 
 
 def _write_foreground_terminal(bin_dir: pathlib.Path, name: str) -> None:
@@ -349,3 +409,90 @@ def test_bad_usage_yields_2(tmp_path: pathlib.Path) -> None:
     assert result.returncode == 2, (
         f"Bad usage must yield 2, got {result.returncode}"
     )
+
+
+# ===========================================================================
+# task-1925 step-4: readiness-handshake stress test
+# ===========================================================================
+# Guards that a >=1s trap-install delay does NOT cause a hang when SIGHUP is
+# gated on the post-trap readiness marker rather than a blind pre-signal sleep.
+#
+# Design rationale: spawn-claude.sh's $inner arms EXIT/HUP/TERM traps BEFORE
+# calling `claude`, so the fake `claude` writing a readiness file is a sound
+# proof that the HUP trap is already armed.  The stress terminal template
+# injects a {delay}s sleep BEFORE $inner runs, ensuring that a blind 0.2s
+# sleep would deliver SIGHUP before the HUP trap is installed → default
+# SIGHUP terminates the payload → no sentinel → hang.  With the readiness
+# gate, SIGHUP is deferred until after the trap is in place → exit 129.
+
+
+def test_window_close_129_robust_to_delayed_trap_install(
+    tmp_path: pathlib.Path,
+) -> None:
+    """SIGHUP after readiness gate yields 129 even with a >=1s trap-install delay.
+
+    Stress test for the readiness-handshake synchronization mechanism
+    (task-1925 step-4).
+
+    The stress terminal template injects a {DELAY}s sleep BEFORE $inner runs,
+    so the HUP trap cannot be installed within DELAY seconds of the leader pid
+    being published.  A blind 0.2s pre-signal sleep would deliver SIGHUP
+    before the trap is armed → payload terminated by SIG_DFL → no sentinel →
+    hang.  With the readiness gate (waiting for the fake claude's marker file,
+    which is written only after spawn-claude.sh has armed the traps), SIGHUP
+    is always delivered after trap installation → exit 129.
+    """
+    DELAY = 1.0  # exceeds the legacy 200ms blind-sleep margin
+    terminal_name = "custom-term"
+    bin_dir = _make_bin_dir(tmp_path)
+
+    pidfile = tmp_path / "leader.pid"
+    readyfile = tmp_path / "claude.ready"
+
+    # Fake claude that signals readiness BEFORE sleeping (proves traps are armed,
+    # since spawn-claude.sh installs traps before invoking claude).
+    _write_fake_claude_with_readiness(bin_dir, readyfile)
+
+    # Stress terminal: injects DELAY before $inner, publishes pid immediately.
+    script = _STRESS_DETACHING_TERM_TEMPLATE.format(
+        delay=DELAY, pidfile=str(pidfile)
+    )
+    term = bin_dir / terminal_name
+    term.write_text(script)
+    term.chmod(0o755)
+
+    env = _base_env(bin_dir, terminal_name)
+
+    proc = subprocess.Popen(
+        [str(SPAWN_SCRIPT), str(tmp_path), "false", "", "test prompt"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN),
+    )
+
+    # Gate on BOTH the leader pid AND the readiness marker (post-trap proof).
+    # The pid is published immediately; the readiness file appears only after
+    # the DELAY + $inner trap-install sequence completes.
+    _wait_for_path(pidfile, timeout=5.0)
+    _wait_for_path(readyfile, timeout=5.0 + DELAY + 5.0)  # generous budget
+
+    leader_pid = int(pidfile.read_text().strip())
+    # SIGHUP arrives after the HUP trap is armed — must yield exit 129.
+    os.killpg(leader_pid, signal.SIGHUP)
+
+    try:
+        rc = proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        pytest.fail(
+            f"[{terminal_name}] spawn-claude.sh hung after window-close with "
+            f"{DELAY}s trap-install delay — readiness gate not effective"
+        )
+    else:
+        assert rc == 129, (
+            f"[{terminal_name}] Expected exit 129 (window closed while alive "
+            f"with {DELAY}s trap-install delay), got {rc}\n"
+            f"stderr: {proc.stderr.read().decode()}"  # type: ignore[union-attr]
+        )
