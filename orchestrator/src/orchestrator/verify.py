@@ -3173,8 +3173,21 @@ async def run_main_tip_sweep(
           - ``get_main_sha()`` raises or returns an empty string.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during sweep setup.
+          - ``run_full_verification`` returns ``category=='pytest_internalerror'``
+            on either the first pass or the retry (infra crash, not drift).
         The harness treats ``None`` as "no signal — retry next tick" and does
         NOT mark the SHA as swept, so the same tip is retried on the next interval.
+
+    Retry-on-flake: when the first ``run_full_verification`` call fails (and is
+    NOT a pytest INTERNALERROR), the function re-runs it ONCE in the same pinned
+    worktree (idempotent; no second ``git worktree add``).
+
+    - Retry PASSES → emit a WARNING and return ``(main_sha, retry_result)`` so
+      the harness files no drift escalation.  NOTE: this suppresses the flake but
+      **MAY MASK a real intermittent regression** introduced by a merge.
+    - Retry FAILS → return ``(main_sha, retry_result)`` so deterministic drift
+      still escalates.
+    - Retry hits pytest INTERNALERROR → return ``None`` (infra, retry next tick).
 
     Cleanup: scoped ``git worktree remove --force <tmp_path>`` + ``shutil.rmtree``
     always runs in a ``finally`` block.  NO broad ``git worktree prune`` (DD5
@@ -3240,12 +3253,50 @@ async def run_main_tip_sweep(
         # drift L1.  The finally block's worktree cleanup still runs.
         if result.category == 'pytest_internalerror':
             logger.warning(
-                'run_main_tip_sweep: pytest INTERNALERROR in sweep — '
+                'run_main_tip_sweep: pytest INTERNALERROR in first-pass sweep — '
                 'treating as infra crash, not drift (retrying next tick); '
                 'cause_hint=%r',
                 result.cause_hint,
             )
             return None
+
+        if not result.passed:
+            # First pass failed (not an INTERNALERROR).  Re-run once in the same
+            # pinned worktree to distinguish a transient load-sensitive flake from
+            # deterministic drift.  A second worktree add is NOT needed — the
+            # worktree is already pinned at main_sha, so re-running is idempotent.
+            _sha_prefix = main_sha[:12] if main_sha else '?'
+            logger.warning(
+                'run_main_tip_sweep: first-pass verification failed at %s '
+                '(category=%r, cause_hint=%r) — retrying once in the same '
+                'worktree to distinguish transient flake from deterministic drift',
+                _sha_prefix, result.category, result.cause_hint,
+            )
+            retry = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
+
+            if retry.category == 'pytest_internalerror':
+                logger.warning(
+                    'run_main_tip_sweep: retry at %s hit pytest INTERNALERROR — '
+                    'treating as infra crash, not drift (retrying next tick); '
+                    'cause_hint=%r',
+                    _sha_prefix, retry.cause_hint,
+                )
+                return None
+
+            if retry.passed:
+                logger.warning(
+                    'run_main_tip_sweep: first-pass failure at %s did NOT '
+                    'reproduce on retry (first-pass category=%r, '
+                    'cause_hint=%r) — treating as transient flake and '
+                    'suppressing drift escalation. '
+                    'NOTE: retry-on-flake MAY MASK a real intermittent '
+                    'regression introduced by a recent merge.',
+                    _sha_prefix, result.category, result.cause_hint,
+                )
+
+            # Return the retry result: passing (flake suppressed) or failing
+            # (deterministic drift — harness files L1 escalation as usual).
+            return (main_sha, retry)
 
         return (main_sha, result)
 
