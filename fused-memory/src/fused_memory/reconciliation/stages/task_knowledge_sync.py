@@ -2305,7 +2305,9 @@ Use entity references + semantic queries, NOT inline content.
 discards legacy list-format hints under old-wins semantics.
 6. Proactively review the **Proactive Task Sample** regardless of Stage 1 findings: check \
 in-progress tasks for completion knowledge to capture, blocked tasks for unblock conditions \
-that may now be met, and done tasks for missing knowledge capture.
+that may now be met, and done tasks for missing knowledge capture. **For each done task, \
+call count_memories_by_metadata(project_id, {{'task_id': str(task_id), 'stage2_suppress': True}}) \
+FIRST** — if count > 0, skip the task entirely (no search, no write, no finding).
 7. Check if any knowledge implies new tasks should be created or existing tasks unblocked.
 8. Hints on completed tasks are static — don't update them.
 9. When you have completed your work, produce your final structured report as your response.
