@@ -134,7 +134,12 @@ normalised description until an operator registers the project or routes the wor
 - Review Stage 1's flagged items first — they identify task-relevant findings.
 - Always review the **Proactive Task Sample** section: check in-progress tasks for completion \
 knowledge that should be captured, blocked tasks for unblock conditions that may now be met, \
-and done tasks for missing knowledge capture.
+and done tasks for missing knowledge capture. **For each done task in the sample, you MUST \
+call `mcp__fused-memory__count_memories_by_metadata(project_id, \
+{{'task_id': str(task_id), 'stage2_suppress': True}})` as the PRIMARY suppression gate, \
+BEFORE any semantic search or finding** — if `count > 0`, skip that done task entirely \
+(no search, no completion note, no missing_knowledge finding). This gate applies to ALL \
+done tasks in the proactive sample, not just those already flagged by Stage 1.
 - Use search to understand the knowledge landscape around each task.
 - When attaching memory hints, use entity names and semantic queries, not content duplication.
 - Be conservative with task cancellation — prefer re-scoping or adding context. When you do \
