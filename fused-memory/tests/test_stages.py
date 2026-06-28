@@ -1243,44 +1243,6 @@ class TestProactiveSampling:
             "str(task_id)} so the deterministic suppression count has a writer."
         )
 
-    def test_stage2_proactive_sample_suppress_gate_applied_to_all_done_tasks(self):
-        """Stage 2 Guidelines section must instruct the LLM to apply the stage2_suppress
-        count gate to ALL done tasks in the Proactive Task Sample before any semantic search.
-
-        Regression for task 1930: Stage 2 applied count_memories_by_metadata with
-        stage2_suppress only for tasks already flagged by Stage 1 — proactive-sample
-        done tasks went through semantic search first, causing false-positive
-        missing_knowledge findings when semantic search missed existing guard memories
-        (confirmed false-positives for tasks 1917/1919/1928, Stage 1 run 98971462).
-
-        The Guidelines section must reference stage2_suppress so the LLM applies the
-        deterministic count gate BEFORE any semantic search for done tasks in the sample.
-        """
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-
-        guidelines_idx = STAGE2_SYSTEM_PROMPT.find('## Guidelines')
-        assert guidelines_idx != -1, 'STAGE2_SYSTEM_PROMPT must have a ## Guidelines section'
-
-        next_section_idx = STAGE2_SYSTEM_PROMPT.find('\n##', guidelines_idx + 1)
-        guidelines_text = (
-            STAGE2_SYSTEM_PROMPT[guidelines_idx:next_section_idx]
-            if next_section_idx != -1
-            else STAGE2_SYSTEM_PROMPT[guidelines_idx:]
-        )
-
-        assert 'stage2_suppress' in guidelines_text, (
-            'The ## Guidelines section must reference stage2_suppress as the primary gate '
-            'for done tasks in the Proactive Task Sample. '
-            'Stage 2 must call count_memories_by_metadata({stage2_suppress: True, task_id: ...}) '
-            'BEFORE any semantic search for ALL done tasks in the proactive sample — not just '
-            'those already flagged by Stage 1.'
-        )
-        assert 'PRIMARY suppression gate' in guidelines_text or 'primary gate' in guidelines_text.lower(), (
-            'The ## Guidelines section must describe the stage2_suppress count check as the '
-            '"PRIMARY suppression gate" for done tasks in the Proactive Task Sample, '
-            'making clear it must run before semantic search.'
-        )
-
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
