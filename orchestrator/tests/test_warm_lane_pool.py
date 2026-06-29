@@ -1238,6 +1238,179 @@ class TestAcquireWarmLaneResetInPlace:
             f'Recycled lane path must be the same _lane-0, got {info_b.path}'
         )
 
+    # -----------------------------------------------------------------------
+    # Seed rc-failure routing through _reset_and_seed_recycled_lane (task 1932)
+    #
+    # test_recycle_reseed_fault_returns_fault (:1120) covers rc=1→FAULT via a
+    # real bash script; test_recycle_reseed_disk_pressure_returns_disk_pressure
+    # (:1163) covers rc=75→DISK_PRESSURE.  The rc=127 branch has its own log
+    # message ("seed script absent") and was not covered explicitly; it is tested
+    # here via monkeypatch to confirm the moved code still maps correctly.
+    # -----------------------------------------------------------------------
+
+    async def test_recycle_reseed_absent_seed_rc127_returns_fault(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Recycle path: _seed_warm_lane returns 127 → FAULT + lane FREE.
+
+        Regression guard for the rc=127 branch moved into
+        ``_reset_and_seed_recycled_lane`` (task 1932 step-2).  A missing seed
+        script (rc=127 sentinel) must map to FAULT, not DISK_PRESSURE, and the
+        lane must be released back to FREE with no ASSIGNED leak.
+
+        Uses a monkeypatched ``_seed_warm_lane`` so the test does not require
+        an actual absent script on disk; the real reset runs normally.
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # First acquire (create-once): passing seed → lane registered
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo), (
+            f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        )
+        lane_path = info_a.path
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        # Inject _seed_warm_lane returning 127 (absent seed script sentinel).
+        # Called as self._seed_warm_lane(lane, '--fresh-checkout'), so the
+        # instance-attribute override receives (lane, mode) positionally.
+        async def fake_seed_absent(lane_dir: Path, mode: str) -> int:
+            return 127
+
+        monkeypatch.setattr(git_ops, '_seed_warm_lane', fake_seed_absent)
+
+        # Second acquire: reset succeeds (real _reset_warm_lane), seed → 127
+        result = await git_ops.acquire_warm_lane('task-B', sha_b)
+
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Recycle seed rc=127 (absent script) must return FAULT, got {result!r}'
+        )
+        # Lane must be released back to FREE — no leaked ASSIGNED lanes
+        assert git_ops.warm_lane_pool.state(lane_path) == LaneState.FREE, (
+            f'Lane must be FREE after rc=127 FAULT, '
+            f'got {git_ops.warm_lane_pool.state(lane_path)!r}'
+        )
+
+    # -----------------------------------------------------------------------
+    # R4: in-process reset+seed retry (task 1932)
+    # -----------------------------------------------------------------------
+
+    async def test_transient_reset_fault_retries_and_dispatches(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """R4: a transient reset fault retries once and dispatches successfully.
+
+        Acceptance (1): first _reset_warm_lane call raises a transient error,
+        the acquire path retries, and the task DISPATCHES (returns WorktreeInfo
+        on the same lane at the new HEAD).
+
+        RED driver: currently the first exception escapes the inline reset call
+        (git_ops.py:2019), hits acquire_warm_lane's top-level except Exception
+        and returns WarmLaneUnavailable.FAULT instead of a WorktreeInfo.
+        """
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo)
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(info_a.path)
+
+        # Inject a transient (one-shot) reset fault via instance-level spy.
+        # orig_reset is a bound method — calling orig_reset(*a, **k) is correct
+        # because Python does NOT auto-prepend self for instance attributes.
+        orig_reset = git_ops._reset_warm_lane
+        calls: list[int] = []
+
+        async def flaky_reset(*a: object, **k: object) -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    'simulated transient git-clean race on lane disk state'
+                )
+            return await orig_reset(*a, **k)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(git_ops, '_reset_warm_lane', flaky_reset)
+
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+
+        # Acceptance (1): task DISPATCHES on the same lane
+        assert isinstance(info_b, WorktreeInfo), (
+            f'Transient reset fault must self-heal via retry (R4); got {info_b!r}'
+        )
+        assert info_b.path == info_a.path, (
+            f'Retry must reuse the same lane (_lane-0); got {info_b.path}'
+        )
+        assert len(calls) == 2, (
+            f'_reset_warm_lane must have been called exactly twice (retried once); '
+            f'got {len(calls)} call(s)'
+        )
+        # HEAD must be at sha_b (reset succeeded on retry)
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_b.path)
+        assert head_sha.strip() == sha_b, (
+            f'HEAD must be at sha_b after successful retry; '
+            f'got {head_sha.strip()!r} expected {sha_b!r}'
+        )
+
+    async def test_persistent_reset_fault_returns_fault(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """R4 GUARD: a persistent reset fault still returns FAULT + lane is FREE.
+
+        Acceptance (2): pinning the 1859 no-silent-degrade contract — the
+        one-shot retry must NOT swallow a genuine fault.
+
+        ``always_fail`` raises on every call.  After step-2's implementation
+        the helper calls _reset_warm_lane twice (attempt 1 raises, attempt 2
+        raises again), releases the lane, and returns FAULT.  The test asserts:
+        - result is WarmLaneUnavailable.FAULT   (genuine fault escalates)
+        - lane state is LaneState.FREE          (no ASSIGNED leak)
+
+        Note: this test passes immediately after step-2 (not a RED driver).
+        It is a REGRESSION GUARD that the one-shot retry preserves the
+        FAULT-on-persistent-fault path (downstream RuntimeError →
+        _mark_blocked → BLOCKED + L1 unchanged).
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo), (
+            f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        )
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(info_a.path)
+
+        # Inject a PERSISTENT fault: every call raises (no recovery possible)
+        async def always_fail(*a: object, **k: object) -> None:
+            raise RuntimeError('persistent corruption')
+
+        monkeypatch.setattr(git_ops, '_reset_warm_lane', always_fail)
+
+        result = await git_ops.acquire_warm_lane('task-B', sha_b)
+
+        # Genuine fault must still escalate (1859 no-silent-degrade preserved)
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Persistent reset fault must return FAULT (not swallowed by R4 retry); '
+            f'got {result!r}'
+        )
+        # Lane must be released back to FREE — no ASSIGNED leak
+        lane = git_ops.warm_lane_pool._base / '_lane-0'
+        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after FAULT (no ASSIGNED leak); '
+            f'got {git_ops.warm_lane_pool.state(lane)!r}'
+        )
+
 
 # ===========================================================================
 # Step-11: RED — GitOps.release_warm_lane

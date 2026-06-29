@@ -2016,32 +2016,13 @@ class GitOps:
                     return await self._reuse_warm_lane(lane, full_branch)
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
-                await self._reset_warm_lane(lane, full_branch, start_ref)
-                # β: THIN re-seed — rm target/ before seeding (no retained bloat).
-                # Defensive rmtree is robust even if reify α's replace-capable seed
-                # is not yet landed (an emptied target/ seeds cleanly either way).
-                shutil.rmtree(lane / 'target', ignore_errors=True)
-                rc = await self._seed_warm_lane(lane, '--fresh-checkout')
-                if rc != 0:
-                    if rc == 127:
-                        logger.warning(
-                            'acquire_warm_lane: reset-in-place re-seed — seed script '
-                            'absent for lane %s (rc=127) — check seed-warm-lane.sh '
-                            'deployment; EVERY task on this host will fault while '
-                            'pool is enabled and the script is missing',
-                            lane,
-                        )
-                    else:
-                        logger.warning(
-                            'acquire_warm_lane: recycle re-seed failed (rc=%d) for '
-                            '%s; releasing lane',
-                            rc, lane,
-                        )
-                    await self.warm_lane_pool.release(lane)
-                    return (
-                        WarmLaneUnavailable.DISK_PRESSURE if rc == 75
-                        else WarmLaneUnavailable.FAULT
-                    )
+                # R4: one-shot in-process retry on a transient _reset_warm_lane
+                # exception (task 1932; relates-to 1859 / 1931).
+                recycle_result = await self._reset_and_seed_recycled_lane(
+                    lane, full_branch, start_ref,
+                )
+                if recycle_result is not None:
+                    return recycle_result
 
             # ── Shared tail: gitignore, scrub, base, debug-port ──────────
             _ensure_task_gitignore(lane)
@@ -2242,6 +2223,100 @@ class GitOps:
             raise RuntimeError(
                 f'_reset_warm_lane: git clean failed for {lane_dir}: {err}'
             )
+
+    async def _reset_and_seed_recycled_lane(
+        self,
+        lane: Path,
+        full_branch: str,
+        start_ref: str,
+    ) -> 'WarmLaneUnavailable | None':
+        """Reset and re-seed a recycled FREE lane with one-shot retry on transient faults.
+
+        R4 defense-in-depth (task 1932; relates-to 1859, 1931).
+
+        R3/1931 already absorbs the one KNOWN transient (benign-ENOENT git-clean
+        race vs reify's reseed-trash rm) INSIDE ``_reset_warm_lane``, returning
+        success so it never raises.  R4 is the DURABLE SAFETY NET for any OTHER
+        failure that still makes ``_reset_warm_lane`` RAISE — e.g. the
+        ``checkout -f -B`` failure in ``_reset_warm_lane``, or a
+        genuine/empty-stderr git-clean failure in ``_reset_warm_lane``.
+        A single immediate retry self-heals transient
+        lane-disk-state races; a genuine fault recurs on retry and still
+        surfaces as FAULT (preserving 1859's no-silent-degrade contract).
+
+        Only exceptions from ``_reset_warm_lane`` are retried.  Seed rc-failures
+        (rc=127/75/other) are genuine/disk discriminants and are never retried
+        (``_seed_warm_lane`` never raises; its rc sentinels are already
+        discriminated below).
+
+        Returns:
+            ``None``
+                Reset+seed succeeded; caller falls through to the shared tail.
+            ``WarmLaneUnavailable.FAULT`` / ``.DISK_PRESSURE``
+                Seed rc-failure or persistent reset fault; lane already released;
+                caller must return the sentinel without touching the lane further.
+        """
+        # Called only after the pool handed us a lane, so it cannot be None.
+        assert self.warm_lane_pool is not None
+        # One-shot retry on _reset_warm_lane exception.
+        # attempt == 1: first try; attempt == 2: retry (scrub target/ first).
+        for attempt in (1, 2):
+            try:
+                await self._reset_warm_lane(lane, full_branch, start_ref)
+                break  # reset succeeded — proceed to seed below
+            except Exception:
+                if attempt == 1:
+                    logger.warning(
+                        '_reset_and_seed_recycled_lane: transient reset fault '
+                        'for %s; scrubbing target/ and retrying reset once (R4)',
+                        lane, exc_info=True,
+                    )
+                    # Pre-retry scrub: defensively remove any partial target/
+                    # state that may have contributed to the transient fault.
+                    # _reset_warm_lane's checkout -f -B + git clean do not
+                    # require target/ to be absent, but this best-effort removal
+                    # eliminates stale disk state before the retry, maximising
+                    # the chance the retry self-heals.  The unconditional scrub
+                    # at the seed site below is redundant on this path but
+                    # intentional — it normalises lane state regardless of which
+                    # attempt succeeded.
+                    shutil.rmtree(lane / 'target', ignore_errors=True)
+                    continue  # retry
+                # attempt == 2: fault persisted — genuine fault, escalate per 1859
+                logger.warning(
+                    '_reset_and_seed_recycled_lane: reset fault persisted after '
+                    'retry for %s -> FAULT (escalate per 1859)',
+                    lane, exc_info=True,
+                )
+                await self.warm_lane_pool.release(lane)
+                return WarmLaneUnavailable.FAULT
+
+        # Reset succeeded (attempt 1 or 2).  Run the thin re-seed unchanged.
+        # β: rm target/ before seeding (no retained bloat).
+        shutil.rmtree(lane / 'target', ignore_errors=True)
+        rc = await self._seed_warm_lane(lane, '--fresh-checkout')
+        if rc != 0:
+            if rc == 127:
+                logger.warning(
+                    'acquire_warm_lane: reset-in-place re-seed — seed script '
+                    'absent for lane %s (rc=127) — check seed-warm-lane.sh '
+                    'deployment; EVERY task on this host will fault while '
+                    'pool is enabled and the script is missing',
+                    lane,
+                )
+            else:
+                logger.warning(
+                    'acquire_warm_lane: recycle re-seed failed (rc=%d) for '
+                    '%s; releasing lane',
+                    rc, lane,
+                )
+            await self.warm_lane_pool.release(lane)
+            return (
+                WarmLaneUnavailable.DISK_PRESSURE if rc == 75
+                else WarmLaneUnavailable.FAULT
+            )
+
+        return None  # success — caller falls through to shared tail
 
     async def release_warm_lane(self, lane_dir: Path, branch_name: str) -> None:
         """Release a warm lane back to the FREE pool.
