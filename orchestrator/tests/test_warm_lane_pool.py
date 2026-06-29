@@ -2918,3 +2918,62 @@ class TestAcquireWarmLaneReattach:
             ['git', 'rev-parse', '--verify', 'task/FRESH'], cwd=wl_git_repo,
         )
         assert rc_b == 0, 'task/FRESH must exist after acquire'
+
+
+# ---------------------------------------------------------------------------
+# _reset_warm_lane reseed-trash hardening (R2 + R3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestResetWarmLaneReseedTrashHardening:
+    """Tests for _reset_warm_lane R2/R3 hardening (task-1931).
+
+    R2: git clean must exclude ``target.reseed-trash.<pid>`` dirs alongside
+        ``target/`` so it never descends into reify's detached-rm staging area.
+    R3: git clean rc=1 with only ``failed to remove ... No such file or directory``
+        ENOENT warnings is treated as success (benign concurrent-deleter race);
+        any other non-zero exit still raises RuntimeError.
+    """
+
+    async def test_reset_warm_lane_excludes_reseed_trash(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """git clean must NOT remove target.reseed-trash.<pid> directories.
+
+        RED today: ``-e target`` does not match ``target.reseed-trash.99999``, so
+        git clean -d descends into the trash dir and removes it, racing the
+        detached background ``rm -rf`` (R2 of the 4892-class warm-lane FAULT).
+
+        GREEN after step-2 adds ``-e target.reseed-trash.*`` alongside the
+        existing ``-e target`` in the clean command.
+        """
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        _, head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        head = head.strip()
+
+        # reseed-trash staging dir (created by seed-warm-lane.sh / warm-lane-gc.sh
+        # as a detached rm -rf target) — must SURVIVE git clean
+        trash_dir = wl_git_repo / 'target.reseed-trash.99999'
+        trash_dir.mkdir()
+        (trash_dir / 'junk.bin').write_bytes(b'\xff' * 64)
+
+        # warm build-cache artifact — must SURVIVE git clean
+        (wl_git_repo / 'target').mkdir(exist_ok=True)
+        (wl_git_repo / 'target' / 'cache.bin').write_bytes(b'\x00' * 128)
+
+        # genuine untracked stray — must be REMOVED by git clean
+        (wl_git_repo / 'stray.txt').write_text('stray\n')
+
+        await git_ops._reset_warm_lane(wl_git_repo, 'task/reseed-test', head)
+
+        assert (wl_git_repo / 'target.reseed-trash.99999' / 'junk.bin').exists(), (
+            'target.reseed-trash.99999/junk.bin was removed by git clean '
+            '(R2 regression: -e target does not match target.reseed-trash.*)'
+        )
+        assert (wl_git_repo / 'target' / 'cache.bin').exists(), (
+            'target/cache.bin was removed by git clean (warm artifact must survive)'
+        )
+        assert not (wl_git_repo / 'stray.txt').exists(), (
+            'stray.txt survived git clean (genuine stray must be removed)'
+        )
