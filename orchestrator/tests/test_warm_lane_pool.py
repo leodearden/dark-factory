@@ -1238,6 +1238,68 @@ class TestAcquireWarmLaneResetInPlace:
             f'Recycled lane path must be the same _lane-0, got {info_b.path}'
         )
 
+    # -----------------------------------------------------------------------
+    # R4: in-process reset+seed retry (task 1932)
+    # -----------------------------------------------------------------------
+
+    async def test_transient_reset_fault_retries_and_dispatches(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """R4: a transient reset fault retries once and dispatches successfully.
+
+        Acceptance (1): first _reset_warm_lane call raises a transient error,
+        the acquire path retries, and the task DISPATCHES (returns WorktreeInfo
+        on the same lane at the new HEAD).
+
+        RED driver: currently the first exception escapes the inline reset call
+        (git_ops.py:2019), hits acquire_warm_lane's top-level except Exception
+        and returns WarmLaneUnavailable.FAULT instead of a WorktreeInfo.
+        """
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo)
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(info_a.path)
+
+        # Inject a transient (one-shot) reset fault via instance-level spy.
+        # orig_reset is a bound method — calling orig_reset(*a, **k) is correct
+        # because Python does NOT auto-prepend self for instance attributes.
+        orig_reset = git_ops._reset_warm_lane
+        calls: list[int] = []
+
+        async def flaky_reset(*a: object, **k: object) -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    'simulated transient git-clean race on lane disk state'
+                )
+            return await orig_reset(*a, **k)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(git_ops, '_reset_warm_lane', flaky_reset)
+
+        info_b = await git_ops.acquire_warm_lane('task-B', sha_b)
+
+        # Acceptance (1): task DISPATCHES on the same lane
+        assert isinstance(info_b, WorktreeInfo), (
+            f'Transient reset fault must self-heal via retry (R4); got {info_b!r}'
+        )
+        assert info_b.path == info_a.path, (
+            f'Retry must reuse the same lane (_lane-0); got {info_b.path}'
+        )
+        assert len(calls) == 2, (
+            f'_reset_warm_lane must have been called exactly twice (retried once); '
+            f'got {len(calls)} call(s)'
+        )
+        # HEAD must be at sha_b (reset succeeded on retry)
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=info_b.path)
+        assert head_sha.strip() == sha_b, (
+            f'HEAD must be at sha_b after successful retry; '
+            f'got {head_sha.strip()!r} expected {sha_b!r}'
+        )
+
 
 # ===========================================================================
 # Step-11: RED — GitOps.release_warm_lane
