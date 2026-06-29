@@ -2237,9 +2237,10 @@ class GitOps:
         R3/1931 already absorbs the one KNOWN transient (benign-ENOENT git-clean
         race vs reify's reseed-trash rm) INSIDE ``_reset_warm_lane``, returning
         success so it never raises.  R4 is the DURABLE SAFETY NET for any OTHER
-        failure that still makes ``_reset_warm_lane`` RAISE — e.g. a
-        ``checkout -f -B`` failure (:2206) or a genuine/empty-stderr clean
-        failure (:2242).  A single immediate retry self-heals transient
+        failure that still makes ``_reset_warm_lane`` RAISE — e.g. the
+        ``checkout -f -B`` failure in ``_reset_warm_lane``, or a
+        genuine/empty-stderr git-clean failure in ``_reset_warm_lane``.
+        A single immediate retry self-heals transient
         lane-disk-state races; a genuine fault recurs on retry and still
         surfaces as FAULT (preserving 1859's no-silent-degrade contract).
 
@@ -2270,6 +2271,15 @@ class GitOps:
                         'for %s; scrubbing target/ and retrying reset once (R4)',
                         lane, exc_info=True,
                     )
+                    # Pre-retry scrub: defensively remove any partial target/
+                    # state that may have contributed to the transient fault.
+                    # _reset_warm_lane's checkout -f -B + git clean do not
+                    # require target/ to be absent, but this best-effort removal
+                    # eliminates stale disk state before the retry, maximising
+                    # the chance the retry self-heals.  The unconditional scrub
+                    # at the seed site below is redundant on this path but
+                    # intentional — it normalises lane state regardless of which
+                    # attempt succeeded.
                     shutil.rmtree(lane / 'target', ignore_errors=True)
                     continue  # retry
                 # attempt == 2: fault persisted — genuine fault, escalate per 1859

@@ -1239,6 +1239,65 @@ class TestAcquireWarmLaneResetInPlace:
         )
 
     # -----------------------------------------------------------------------
+    # Seed rc-failure routing through _reset_and_seed_recycled_lane (task 1932)
+    #
+    # test_recycle_reseed_fault_returns_fault (:1120) covers rc=1→FAULT via a
+    # real bash script; test_recycle_reseed_disk_pressure_returns_disk_pressure
+    # (:1163) covers rc=75→DISK_PRESSURE.  The rc=127 branch has its own log
+    # message ("seed script absent") and was not covered explicitly; it is tested
+    # here via monkeypatch to confirm the moved code still maps correctly.
+    # -----------------------------------------------------------------------
+
+    async def test_recycle_reseed_absent_seed_rc127_returns_fault(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Recycle path: _seed_warm_lane returns 127 → FAULT + lane FREE.
+
+        Regression guard for the rc=127 branch moved into
+        ``_reset_and_seed_recycled_lane`` (task 1932 step-2).  A missing seed
+        script (rc=127 sentinel) must map to FAULT, not DISK_PRESSURE, and the
+        lane must be released back to FREE with no ASSIGNED leak.
+
+        Uses a monkeypatched ``_seed_warm_lane`` so the test does not require
+        an actual absent script on disk; the real reset runs normally.
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # First acquire (create-once): passing seed → lane registered
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo), (
+            f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        )
+        lane_path = info_a.path
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        # Inject _seed_warm_lane returning 127 (absent seed script sentinel).
+        # Called as self._seed_warm_lane(lane, '--fresh-checkout'), so the
+        # instance-attribute override receives (lane, mode) positionally.
+        async def fake_seed_absent(lane_dir: Path, mode: str) -> int:
+            return 127
+
+        monkeypatch.setattr(git_ops, '_seed_warm_lane', fake_seed_absent)
+
+        # Second acquire: reset succeeds (real _reset_warm_lane), seed → 127
+        result = await git_ops.acquire_warm_lane('task-B', sha_b)
+
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Recycle seed rc=127 (absent script) must return FAULT, got {result!r}'
+        )
+        # Lane must be released back to FREE — no leaked ASSIGNED lanes
+        assert git_ops.warm_lane_pool.state(lane_path) == LaneState.FREE, (
+            f'Lane must be FREE after rc=127 FAULT, '
+            f'got {git_ops.warm_lane_pool.state(lane_path)!r}'
+        )
+
+    # -----------------------------------------------------------------------
     # R4: in-process reset+seed retry (task 1932)
     # -----------------------------------------------------------------------
 
