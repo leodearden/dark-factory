@@ -1508,3 +1508,89 @@ class TestHarnessIsBranchDispatched:
         assert harness._is_branch_dispatched('Z') is False, (
             'branch not in _dispatched must return False'
         )
+
+
+# ===========================================================================
+# Step-7 (1933): RED — config knob + knob-gated Harness wiring
+# ===========================================================================
+
+
+def _make_reclaim_config(
+    *,
+    max_concurrent_tasks: int,
+    warm_lane_pool: bool,
+    warm_lane_reclaim_on_exhaustion: bool,
+    tmp_path: Path,
+) -> OrchestratorConfig:
+    """Build a minimal OrchestratorConfig with reclaim-on-exhaustion knob."""
+    repo = tmp_path / 'repo'
+    repo.mkdir(exist_ok=True)
+    (repo / '.git').mkdir(exist_ok=True)
+    return OrchestratorConfig(
+        project_root=repo,
+        max_concurrent_tasks=max_concurrent_tasks,
+        git=GitConfig(
+            warm_lane_pool=warm_lane_pool,
+            warm_lane_reclaim_on_exhaustion=warm_lane_reclaim_on_exhaustion,
+        ),
+    )
+
+
+class TestReclaimOnExhaustionKnobWiring:
+    """Config knob + knob-gated wiring tests (task 1933, step-7).
+
+    (a) knob=True → git_ops callbacks are wired.
+    (b) knob=False (default) → callbacks stay None (byte-identical).
+    (c) GitConfig() default has warm_lane_reclaim_on_exhaustion == False.
+
+    RED today: GitConfig.warm_lane_reclaim_on_exhaustion does not exist
+    (ValidationError) and the Harness wiring block is absent.
+    """
+
+    def test_default_gitconfig_has_knob_false(self):
+        """(c) GitConfig() default: warm_lane_reclaim_on_exhaustion == False."""
+        cfg = GitConfig()
+        assert cfg.warm_lane_reclaim_on_exhaustion is False, (
+            'GitConfig.warm_lane_reclaim_on_exhaustion must default to False '
+            '(byte-identical, trivially revertible)'
+        )
+
+    def test_callbacks_wired_when_knob_on(self, tmp_path: Path):
+        """(a) knob=True → both callbacks installed on git_ops."""
+        config = _make_reclaim_config(
+            max_concurrent_tasks=4,
+            warm_lane_pool=True,
+            warm_lane_reclaim_on_exhaustion=True,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_reclaim_candidate_provider is (
+            harness._warm_lane_reclaim_candidates
+        ), (
+            'warm_lane_reclaim_candidate_provider must be harness._warm_lane_reclaim_candidates '
+            'when warm_lane_reclaim_on_exhaustion=True'
+        )
+        assert harness.git_ops.warm_lane_dispatched_predicate is (
+            harness._is_branch_dispatched
+        ), (
+            'warm_lane_dispatched_predicate must be harness._is_branch_dispatched '
+            'when warm_lane_reclaim_on_exhaustion=True'
+        )
+
+    def test_callbacks_none_when_knob_off(self, tmp_path: Path):
+        """(b) knob=False (default) → both callbacks stay None."""
+        config = _make_reclaim_config(
+            max_concurrent_tasks=4,
+            warm_lane_pool=True,
+            warm_lane_reclaim_on_exhaustion=False,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_reclaim_candidate_provider is None, (
+            'warm_lane_reclaim_candidate_provider must be None when knob is off'
+        )
+        assert harness.git_ops.warm_lane_dispatched_predicate is None, (
+            'warm_lane_dispatched_predicate must be None when knob is off (byte-identical)'
+        )
