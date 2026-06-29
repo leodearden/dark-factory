@@ -30,7 +30,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Collection
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -641,6 +641,16 @@ class GitOps:
         # K>1 warm-up burst.  Reset-in-place (already-registered) acquires are
         # per-lane and don't contend, so this only guards the one-time create path.
         self._spec_wt_create_lock: asyncio.Lock = asyncio.Lock()
+        # Reclaim-on-exhaustion safety valve callbacks (task 1933).
+        # Declared here (default None), installed by Harness.__init__ when
+        # config.git.warm_lane_reclaim_on_exhaustion is True — mirrors the
+        # _on_park_stop_trip / _on_external_dep_block declare-in-callee /
+        # install-in-harness pattern.  Both default None so an unwired GitOps
+        # (cli/recover/evals, knob-off) is byte-identical.
+        self.warm_lane_reclaim_candidate_provider: (
+            Callable[[list[str]], Awaitable[set[str]]] | None
+        ) = None
+        self.warm_lane_dispatched_predicate: Callable[[str], bool] | None = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -1659,6 +1669,74 @@ class GitOps:
                 lane, warm, exc_info=True,
             )
 
+    async def _try_reclaim_lane_for(self, branch_name: str) -> Path | None:
+        """Attempt to steal a non-dispatched non-terminal lane for *branch_name*.
+
+        Called from :meth:`acquire_warm_lane` when :meth:`acquire_for` returns
+        None (pool exhausted).  Returns the reclaimed lane Path on success, or
+        None if either callback is not wired, the candidate set is empty, or
+        no eligible victim exists.
+
+        Victim eligibility (checked by :meth:`WarmLanePool.reclaim_victim`):
+        - ``victim != branch_name`` — never steal from self.
+        - ``victim in candidates`` — non-terminal, per the async provider.
+        - ``not is_dispatched(victim)`` — re-checked atomically under the pool
+          lock (TOCTOU guard; see design note in task 1933).
+        - ``lane state == ASSIGNED`` — only steal a live assignment.
+
+        Before routing the stolen lane into the reset, commits any uncommitted
+        WIP onto the victim's still-checked-out branch so 1912 branch-retention
+        preserves it for the victim's future ``reattach`` recovery.
+
+        Emits a WARNING on every steal as an ops signal that pool pressure
+        required the safety valve.
+        """
+        if (
+            self.warm_lane_reclaim_candidate_provider is None
+            or self.warm_lane_dispatched_predicate is None
+            or self.warm_lane_pool is None
+        ):
+            return None
+
+        pool = self.warm_lane_pool
+        candidates = list(pool.assignments_snapshot().keys())
+        if not candidates:
+            return None
+
+        eligible = await self.warm_lane_reclaim_candidate_provider(candidates)
+        if not eligible:
+            return None
+
+        victim_result = await pool.reclaim_victim(
+            branch_name, eligible, self.warm_lane_dispatched_predicate,
+        )
+        if victim_result is None:
+            return None
+
+        victim_branch, lane = victim_result
+        # Best-effort: commit any uncommitted WIP onto the victim's branch
+        # (which is still checked out at this lane) before resetting it.
+        # 1912 branch-retention preserves the committed WIP so the resumed
+        # victim recovers it via the reattach path.
+        try:
+            await self.commit(
+                lane,
+                'chore: save WIP before warm-lane reclaim (task 1933)',
+            )
+        except Exception:
+            logger.warning(
+                'acquire_warm_lane: reclaim WIP commit failed for lane %s '
+                '(victim=%r) — proceeding with reset; uncommitted WIP may be lost',
+                lane, victim_branch,
+            )
+
+        logger.warning(
+            'acquire_warm_lane: reclaim-on-exhaustion — stole lane %s from '
+            'non-dispatched task %r for %r (pool pressure)',
+            lane, victim_branch, branch_name,
+        )
+        return lane
+
     async def acquire_warm_lane(
         self,
         branch_name: str,
@@ -1754,8 +1832,19 @@ class GitOps:
 
         acq = await self.warm_lane_pool.acquire_for(branch_name)
         if acq is None:
-            return WarmLaneUnavailable.EXHAUSTED  # Pool exhausted → backpressure
-        lane, reused = acq
+            # Pool exhausted — try to reclaim a non-dispatched non-terminal lane
+            # before falling back to EXHAUSTED (task 1933 safety valve).
+            reclaimed = await self._try_reclaim_lane_for(branch_name)
+            if reclaimed is None:
+                return WarmLaneUnavailable.EXHAUSTED  # Pool exhausted → backpressure
+            # Stolen lane: registered worktree, reused=False.  Falls through past
+            # `if reused:` (False) and `elif not _is_registered_worktree(lane)`
+            # (False — it IS registered) into the `else:` already-registered fresh-
+            # reset path (_reset_and_seed_recycled_lane + shared tail), reusing all
+            # existing reset/reseed/provision logic with zero new git plumbing.
+            lane, reused = reclaimed, False
+        else:
+            lane, reused = acq
 
         full_branch = f'{self.config.branch_prefix}{branch_name}'
 
