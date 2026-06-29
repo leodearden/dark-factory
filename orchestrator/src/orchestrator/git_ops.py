@@ -1592,18 +1592,35 @@ class GitOps:
                 await self.spec_warm_lane_pool.release(lane)
                 wt = await self.create_throwaway_verify_worktree(merge_commit)
                 return wt, False
+            # one pass.  A per-dir loop would call ``git clean -xfd -e build``
+            # (deleting dist/) then ``git clean -xfd -e dist`` (deleting
+            # build/), so with >1 dir NONE survive (step-19 regression).
+            # Also exclude <artifact_dir>.reseed-trash.* alongside each
+            # artifact dir: reify's seed-warm-lane.sh stages a detached
+            # ``rm -rf`` of ``<artifact_dir>.reseed-trash.<pid>``; without
+            # this exclude git clean -d descends into the trash and races the
+            # bg rm, producing an ENOENT failure (R2, same as _reset_warm_lane).
             clean_cmd = ['git', 'clean', '-xfd']
             for artifact_dir in self.config.reap_build_artifact_dirs:
-                clean_cmd += ['-e', artifact_dir]
+                clean_cmd += ['-e', artifact_dir, '-e', f'{artifact_dir}.reseed-trash.*']
             rc, _, err = await _run(clean_cmd, cwd=lane)
             if rc != 0:
-                logger.debug(
-                    'acquire_spec_lane: git clean failed for %s (rc=%d, err=%r)'
-                    ' — releasing lane, cold fallback', lane, rc, err,
-                )
-                await self.spec_warm_lane_pool.release(lane)
-                wt = await self.create_throwaway_verify_worktree(merge_commit)
-                return wt, False
+                if _git_clean_failure_is_benign(err):
+                    logger.warning(
+                        'acquire_spec_lane: git clean exited %d for %s but only '
+                        'benign ENOENT "failed to remove" warnings detected '
+                        '(concurrent deleter raced the clean walk; working tree '
+                        'left clean); treating as success: %s',
+                        rc, lane, err,
+                    )
+                else:
+                    logger.debug(
+                        'acquire_spec_lane: git clean failed for %s (rc=%d, err=%r)'
+                        ' — releasing lane, cold fallback', lane, rc, err,
+                    )
+                    await self.spec_warm_lane_pool.release(lane)
+                    wt = await self.create_throwaway_verify_worktree(merge_commit)
+                    return wt, False
             logger.info(
                 'acquire_spec_lane: reset %s to HEAD=%s', lane, merge_commit[:8],
             )
