@@ -26,6 +26,7 @@ and .task/.gitignore are NOT sufficient — agents bypass them routinely.
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -435,18 +436,29 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     is provided but does not exist, so the caller can distinguish a deleted
     worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
     missing binary on ``PATH``).
+
+    Locale: ``LC_ALL=C`` and ``LANG=C`` are forced in the child environment so
+    that git (and other tools) always emit English-locale diagnostics.  This is
+    required for :func:`_git_clean_failure_is_benign`, which substring-matches
+    English warning text; a non-C locale would produce translated output that
+    the matcher cannot recognise, silently defeating the R3 ENOENT-tolerance
+    fix for the 4892-class warm-lane FAULT.
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
     # can raise a typed exception consumers can pattern-match on.
     if cwd is not None and not Path(cwd).is_dir():
         raise WorktreeMissing(cwd)
+    # Force a stable C locale so git output is always in English and amenable
+    # to substring matching (see docstring above).
+    _env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(cwd) if cwd else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_env,
         )
     except FileNotFoundError as e:
         # Race: cwd existed at the pre-flight check but vanished before spawn.
@@ -457,6 +469,36 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
         raise
     stdout, stderr = await proc.communicate()
     return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
+
+
+def _git_clean_failure_is_benign(stderr: str) -> bool:
+    """Return True iff every non-empty stderr line is a benign ENOENT ``failed to remove`` warning.
+
+    git 2.43+ emits ``warning: failed to remove '<path>': No such file or
+    directory`` (via ``warning_errno("failed to remove %s")``) when a path it
+    planned to remove was already deleted by a concurrent process (e.g. the
+    detached ``rm -rf`` from reify's warm-lane reseed).  This is the R3 race
+    from the 4892-class warm-lane FAULT: we can safely ignore it because the
+    desired outcome (path gone) is already achieved.
+
+    Decision criteria:
+    - Empty stderr (no lines) → **not benign** — an unknown non-zero exit with
+      no diagnostic context must still raise so we do not silently swallow
+      genuine failures.
+    - Any line that does NOT contain both ``'failed to remove'`` AND
+      ``'No such file or directory'`` → **not benign** — could be a real error
+      (permission denied, I/O error, …) co-occurring with an ENOENT line.
+    - All non-empty lines are ENOENT ``failed to remove`` warnings → benign.
+
+    Substring matching is robust to path quoting and multi-line output ordering.
+    """
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return all(
+        'failed to remove' in line and 'No such file or directory' in line
+        for line in lines
+    )
 
 
 def _merge_subject(branch: str, main_branch: str) -> str:
@@ -2168,11 +2210,35 @@ class GitOps:
         # Single invocation excluding ALL artifact dirs at once — every
         # configured build-output dir survives in one pass.  A per-dir loop
         # would leave NONE surviving with >1 dir (κ step-19 regression).
+        # Also exclude <artifact_dir>.reseed-trash.* alongside <artifact_dir>:
+        # reify's seed-warm-lane.sh / warm-lane-gc.sh stage a detached `rm -rf`
+        # of `<artifact_dir>.reseed-trash.<pid>`; `-e <dir>` is a gitignore-style
+        # pattern matching the exact name only, so without this exclude git clean
+        # -d descends into the trash and races the bg rm, producing an ENOENT
+        # failure (R2 of the 4892-class warm-lane FAULT).
+        # Note: the '.*' glob is intentionally broader than the '<pid>' suffix
+        # alone — it preserves any '<artifact_dir>.reseed-trash.<anything>'
+        # directory, even a leftover from a crashed reseed.  This is deliberate:
+        # warm-lane-gc.sh is responsible for GC'ing all reseed-trash dirs; git
+        # clean should never race the GC by trying to remove them.
         clean_cmd = ['git', 'clean', '-xfd']
         for artifact_dir in self.config.reap_build_artifact_dirs:
-            clean_cmd += ['-e', artifact_dir]
+            clean_cmd += ['-e', artifact_dir, '-e', f'{artifact_dir}.reseed-trash.*']
         rc, _, err = await _run(clean_cmd, cwd=lane_dir)
         if rc != 0:
+            if _git_clean_failure_is_benign(err):
+                # Benign ENOENT race (R3 of the 4892-class warm-lane FAULT):
+                # a concurrent detached rm -rf already removed the path(s) that
+                # git clean tried to delete.  The desired outcome (path gone)
+                # is already achieved, so treat this as success.
+                logger.warning(
+                    '_reset_warm_lane: git clean exited %d for %s but only '
+                    'benign ENOENT "failed to remove" warnings detected '
+                    '(concurrent deleter raced the clean walk; working tree '
+                    'left clean); treating as success: %s',
+                    rc, lane_dir, err,
+                )
+                return
             raise RuntimeError(
                 f'_reset_warm_lane: git clean failed for {lane_dir}: {err}'
             )
