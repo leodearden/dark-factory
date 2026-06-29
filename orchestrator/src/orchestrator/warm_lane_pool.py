@@ -10,6 +10,7 @@ PRD ζ, D9: pool size N = max_concurrent_tasks, wired by Harness at startup.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 
@@ -142,6 +143,53 @@ class WarmLanePool:
                     self._assignments[branch_name] = lane
                     return lane, False
             # Exhausted
+            return None
+
+    async def reclaim_victim(
+        self,
+        branch_name: str,
+        candidates: set[str],
+        is_dispatched: Callable[[str], bool],
+    ) -> tuple[str, Path] | None:
+        """Steal the oldest eligible ASSIGNED lane for *branch_name*.
+
+        Used by the reclaim-on-exhaustion safety valve (task 1933): when
+        ``acquire_for`` returns None (pool exhausted), the caller can attempt
+        to reclaim a non-dispatched non-terminal lane rather than returning
+        EXHAUSTED immediately.
+
+        Victim selection (under ``self._lock``, no ``await`` in critical section):
+        - Iterates ``_assignments`` in insertion order (oldest-first).
+        - Skips ``victim == branch_name`` (never steal from self).
+        - Skips victims not in *candidates* (non-terminal set provided by the
+          async candidate provider; computed BEFORE acquiring the lock).
+        - Re-checks ``is_dispatched(victim)`` synchronously UNDER the lock to
+          close the TOCTOU window where a candidate was re-dispatched during
+          the async ``get_statuses`` call that populated *candidates*.
+        - Accepts only lanes in ``LaneState.ASSIGNED``.
+
+        On success: atomically removes ``_assignments[victim]``, sets
+        ``_assignments[branch_name] = lane``, leaves lane ``ASSIGNED``, and
+        returns ``(victim, lane)``.  On failure (no eligible victim): ``None``.
+
+        Mirrors ``acquire_for``'s atomic ASSIGNED + map idiom.
+        """
+        async with self._lock:
+            for victim, lane in list(self._assignments.items()):
+                if victim == branch_name:
+                    continue
+                if victim not in candidates:
+                    continue
+                # Re-check dispatched synchronously under lock (TOCTOU guard).
+                if is_dispatched(victim):
+                    continue
+                if self._lanes.get(lane) != LaneState.ASSIGNED:
+                    continue
+                # Atomically re-key: victim → branch_name, keep ASSIGNED.
+                del self._assignments[victim]
+                self._assignments[branch_name] = lane
+                self._lanes[lane] = LaneState.ASSIGNED  # explicit, mirrors acquire_for
+                return (victim, lane)
             return None
 
     # ── Read-only helpers ──────────────────────────────────────────────────
