@@ -459,6 +459,36 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
 
 
+def _git_clean_failure_is_benign(stderr: str) -> bool:
+    """Return True iff every non-empty stderr line is a benign ENOENT ``failed to remove`` warning.
+
+    git 2.43+ emits ``warning: failed to remove '<path>': No such file or
+    directory`` (via ``warning_errno("failed to remove %s")``) when a path it
+    planned to remove was already deleted by a concurrent process (e.g. the
+    detached ``rm -rf`` from reify's warm-lane reseed).  This is the R3 race
+    from the 4892-class warm-lane FAULT: we can safely ignore it because the
+    desired outcome (path gone) is already achieved.
+
+    Decision criteria:
+    - Empty stderr (no lines) → **not benign** — an unknown non-zero exit with
+      no diagnostic context must still raise so we do not silently swallow
+      genuine failures.
+    - Any line that does NOT contain both ``'failed to remove'`` AND
+      ``'No such file or directory'`` → **not benign** — could be a real error
+      (permission denied, I/O error, …) co-occurring with an ENOENT line.
+    - All non-empty lines are ENOENT ``failed to remove`` warnings → benign.
+
+    Substring matching is robust to path quoting and multi-line output ordering.
+    """
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return all(
+        'failed to remove' in line and 'No such file or directory' in line
+        for line in lines
+    )
+
+
 def _merge_subject(branch: str, main_branch: str) -> str:
     """Return the canonical subject line for a no-ff merge of *branch* into *main_branch*.
 
@@ -2179,6 +2209,19 @@ class GitOps:
             clean_cmd += ['-e', artifact_dir, '-e', f'{artifact_dir}.reseed-trash.*']
         rc, _, err = await _run(clean_cmd, cwd=lane_dir)
         if rc != 0:
+            if _git_clean_failure_is_benign(err):
+                # Benign ENOENT race (R3 of the 4892-class warm-lane FAULT):
+                # a concurrent detached rm -rf already removed the path(s) that
+                # git clean tried to delete.  The desired outcome (path gone)
+                # is already achieved, so treat this as success.
+                logger.warning(
+                    '_reset_warm_lane: git clean exited %d for %s but only '
+                    'benign ENOENT "failed to remove" warnings detected '
+                    '(concurrent deleter raced the clean walk; working tree '
+                    'left clean); treating as success: %s',
+                    rc, lane_dir, err,
+                )
+                return
             raise RuntimeError(
                 f'_reset_warm_lane: git clean failed for {lane_dir}: {err}'
             )
