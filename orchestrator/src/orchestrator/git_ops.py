@@ -2168,9 +2168,15 @@ class GitOps:
         # Single invocation excluding ALL artifact dirs at once — every
         # configured build-output dir survives in one pass.  A per-dir loop
         # would leave NONE surviving with >1 dir (κ step-19 regression).
+        # Also exclude <artifact_dir>.reseed-trash.* alongside <artifact_dir>:
+        # reify's seed-warm-lane.sh / warm-lane-gc.sh stage a detached `rm -rf`
+        # of `<artifact_dir>.reseed-trash.<pid>`; `-e <dir>` is a gitignore-style
+        # pattern matching the exact name only, so without this exclude git clean
+        # -d descends into the trash and races the bg rm, producing an ENOENT
+        # failure (R2 of the 4892-class warm-lane FAULT).
         clean_cmd = ['git', 'clean', '-xfd']
         for artifact_dir in self.config.reap_build_artifact_dirs:
-            clean_cmd += ['-e', artifact_dir]
+            clean_cmd += ['-e', artifact_dir, '-e', f'{artifact_dir}.reseed-trash.*']
         rc, _, err = await _run(clean_cmd, cwd=lane_dir)
         if rc != 0:
             raise RuntimeError(
