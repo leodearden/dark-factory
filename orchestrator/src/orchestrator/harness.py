@@ -1996,6 +1996,52 @@ Output JSON matching the schema. Every task must appear in the output.
         self._escalation_events[task_id] = esc_event
         return esc_event
 
+    async def _warm_lane_reclaim_candidates(
+        self, candidates: list[str],
+    ) -> set[str]:
+        """Return the non-terminal subset of *candidates* for reclaim eligibility.
+
+        Installed as :attr:`git_ops.warm_lane_reclaim_candidate_provider` when
+        the knob is on (task 1933).  Mirrors ``_reconcile_terminal_lanes``
+        INVERTED: keep branches whose status is known and NOT in
+        ``{done, cancelled}``; abort to ``set()`` on ``resolver_failed``
+        (same fail-safe as the reconciler — never act on a degraded/empty read).
+
+        Args:
+            candidates: Branch names from the pool's assignment snapshot.
+
+        Returns:
+            Set of non-terminal branch names eligible for victim selection.
+            Returns ``set()`` on empty input (fast-path, no get_statuses call),
+            or on ``resolver_failed`` (fail-safe).
+        """
+        if not candidates:
+            return set()
+        statuses, err = await self.scheduler.get_statuses(list(candidates))
+        if resolver_failed(statuses, err):
+            logger.warning(
+                'Reclaim-candidate provider: get_statuses returned %s — '
+                'returning empty set (fail-safe; mirrors terminal-lane reconciler)',
+                'error' if err is not None else 'empty',
+            )
+            return set()
+        return {
+            b for b in candidates
+            if statuses.get(b) is not None
+            and statuses.get(b) not in ('done', 'cancelled')
+        }
+
+    def _is_branch_dispatched(self, branch: str) -> bool:
+        """Return True iff *branch* is currently in the scheduler's dispatched set.
+
+        Installed as :attr:`git_ops.warm_lane_dispatched_predicate` when the
+        knob is on (task 1933).  Re-checked synchronously under the pool lock
+        inside :meth:`WarmLanePool.reclaim_victim` to close the TOCTOU window
+        where a candidate is re-dispatched during the async ``get_statuses``
+        await in :meth:`_warm_lane_reclaim_candidates`.
+        """
+        return branch in self.scheduler._dispatched
+
     async def _reconcile_terminal_lanes(self) -> None:
         """Release warm lanes whose assigned tasks are terminal and not live.
 
