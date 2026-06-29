@@ -3248,6 +3248,29 @@ async def _add_noop_seed_to_repo(repo: Path) -> None:
     await _run(['git', 'commit', '-m', 'add no-op seed-warm-lane.sh (task-1934 test helper)'], cwd=repo)
 
 
+def _make_passthrough_run(clean_result: tuple) -> object:
+    """Return a passthrough ``_run`` wrapper that fakes only git-clean calls.
+
+    Non-clean commands are delegated to the original ``orchestrator.git_ops._run``
+    captured at factory-call time (before any monkeypatch is applied).  The fake
+    clean returns ``clean_result`` — a 3-tuple ``(rc, stdout, stderr)``.
+
+    Call this **before** applying the monkeypatch so the original is captured::
+
+        passthrough = _make_passthrough_run((1, '', some_stderr))
+        monkeypatch.setattr('orchestrator.git_ops._run', passthrough)
+    """
+    import orchestrator.git_ops as _go_module
+    orig = _go_module._run
+
+    async def passthrough(cmd, cwd=None):
+        if 'clean' in cmd:
+            return clean_result
+        return await orig(cmd, cwd=cwd)
+
+    return passthrough
+
+
 # ---------------------------------------------------------------------------
 # reset_persistent_merge_worktree reseed-trash hardening (R2 + R3) – task 1934
 # ---------------------------------------------------------------------------
@@ -3333,14 +3356,6 @@ class TestResetPersistentMergeWorktreeReseedTrashHardening:
             "No such file or directory"
         )
 
-        import orchestrator.git_ops as _go_module
-        _orig_run = _go_module._run
-
-        async def passthrough_run(cmd, cwd=None):
-            if 'clean' in cmd:
-                return (1, '', benign_stderr)
-            return await _orig_run(cmd, cwd=cwd)
-
         cfg = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees', push_after_advance=False,
@@ -3356,6 +3371,7 @@ class TestResetPersistentMergeWorktreeReseedTrashHardening:
         warm_path = await git_ops.reset_persistent_merge_worktree(commit_a)
 
         # Now apply PASSTHROUGH: only fake git clean, delegate everything else
+        passthrough_run = _make_passthrough_run((1, '', benign_stderr))
         monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
 
         # Must NOT raise; must return warm_path
@@ -3370,14 +3386,6 @@ class TestResetPersistentMergeWorktreeReseedTrashHardening:
         Ensures benign-ENOENT tolerance does not swallow genuine clean failures.
         Green on base (unchanged behaviour); green after step-2 impl.
         """
-        import orchestrator.git_ops as _go_module
-        _orig_run = _go_module._run
-
-        async def passthrough_run(cmd, cwd=None):
-            if 'clean' in cmd:
-                return (1, '', "warning: failed to remove 'x': Permission denied")
-            return await _orig_run(cmd, cwd=cwd)
-
         cfg = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees', push_after_advance=False,
@@ -3393,6 +3401,7 @@ class TestResetPersistentMergeWorktreeReseedTrashHardening:
         await git_ops.reset_persistent_merge_worktree(commit_a)
 
         # Apply passthrough monkeypatch for reset-in-place call
+        passthrough_run = _make_passthrough_run((1, '', "warning: failed to remove 'x': Permission denied"))
         monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
 
         with pytest.raises(RuntimeError):
@@ -3406,14 +3415,6 @@ class TestResetPersistentMergeWorktreeReseedTrashHardening:
         Empty stderr means unknown failure — never silently ignore it.
         Green on base (unchanged behaviour); green after step-2 impl.
         """
-        import orchestrator.git_ops as _go_module
-        _orig_run = _go_module._run
-
-        async def passthrough_run(cmd, cwd=None):
-            if 'clean' in cmd:
-                return (1, '', '')
-            return await _orig_run(cmd, cwd=cwd)
-
         cfg = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees', push_after_advance=False,
@@ -3429,6 +3430,7 @@ class TestResetPersistentMergeWorktreeReseedTrashHardening:
         await git_ops.reset_persistent_merge_worktree(commit_a)
 
         # Apply passthrough monkeypatch for reset-in-place call
+        passthrough_run = _make_passthrough_run((1, '', ''))
         monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
 
         with pytest.raises(RuntimeError):
@@ -3539,15 +3541,19 @@ class TestAcquireSpecLaneReseedTrashHardening:
         await git_ops.release_spec_lane(lane, warm=True)
 
         # Apply PASSTHROUGH monkeypatch: only fake git clean, delegate everything else
-        import orchestrator.git_ops as _go_module
-        _orig_run = _go_module._run
+        passthrough_run = _make_passthrough_run((1, '', benign_stderr))
 
-        async def passthrough_run(cmd, cwd=None):
-            if 'clean' in cmd:
-                return (1, '', benign_stderr)
-            return await _orig_run(cmd, cwd=cwd)
+        # Spy on _seed_warm_lane to confirm the benign path reaches it —
+        # a regression that short-circuits before re-seeding would fail here.
+        seed_calls: list = []
+        orig_seed = git_ops._seed_warm_lane
+
+        async def spy_seed(lane_path, *args, **kwargs):
+            seed_calls.append(lane_path)
+            return await orig_seed(lane_path, *args, **kwargs)
 
         monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
+        monkeypatch.setattr(git_ops, '_seed_warm_lane', spy_seed)
 
         # Re-acquire → must return (lane, True) NOT cold fallback (throwaway, False)
         result_lane, result_warm = await git_ops.acquire_spec_lane(merge_commit)
@@ -3556,6 +3562,10 @@ class TestAcquireSpecLaneReseedTrashHardening:
         )
         assert result_lane == lane, (
             f'Expected warm lane {lane}, got cold-fallback {result_lane}'
+        )
+        assert seed_calls == [lane], (
+            'benign ENOENT path must still call _seed_warm_lane '
+            '(must not short-circuit before re-seeding)'
         )
 
     async def test_acquire_spec_lane_cold_fallback_on_genuine_clean_failure(
@@ -3584,14 +3594,7 @@ class TestAcquireSpecLaneReseedTrashHardening:
         await git_ops.release_spec_lane(lane, warm=True)
 
         # Apply PASSTHROUGH monkeypatch with genuine Permission-denied failure
-        import orchestrator.git_ops as _go_module
-        _orig_run = _go_module._run
-
-        async def passthrough_run(cmd, cwd=None):
-            if 'clean' in cmd:
-                return (1, '', "warning: failed to remove 'x': Permission denied")
-            return await _orig_run(cmd, cwd=cwd)
-
+        passthrough_run = _make_passthrough_run((1, '', "warning: failed to remove 'x': Permission denied"))
         monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
 
         # Must take cold fallback: warm=False
