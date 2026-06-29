@@ -1685,8 +1685,12 @@ class GitOps:
         - ``lane state == ASSIGNED`` — only steal a live assignment.
 
         Before routing the stolen lane into the reset, commits any uncommitted
-        WIP onto the victim's still-checked-out branch so 1912 branch-retention
-        preserves it for the victim's future ``reattach`` recovery.
+        *tracked* WIP onto the victim's still-checked-out branch so 1912
+        branch-retention preserves it via the retained branch ref for future
+        ``reattach`` recovery.  ``.task/plan.json`` is intentionally excluded
+        (the commit uses the ``:!.task`` pathspec) and is **not** preserved
+        across the reclaim; the resumed victim takes the orphan-commits reattach
+        path, not disk-backstop reuse.
 
         Emits a WARNING on every steal as an ops signal that pool pressure
         required the safety valve.

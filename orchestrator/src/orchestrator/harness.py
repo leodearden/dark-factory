@@ -556,17 +556,6 @@ class Harness:
         # - warm_lane_dispatched_predicate: sync (str)->bool — re-checked
         #   atomically under the pool lock (TOCTOU guard) inside reclaim_victim.
         if config.git.warm_lane_reclaim_on_exhaustion:
-            # Freeze the bound methods as instance attrs so identity checks
-            # (``harness.git_ops.cb is harness._warm_lane_reclaim_candidates``)
-            # are stable: Python creates a new bound method object on each
-            # class-level access, but instance attrs shadow the class and
-            # always return the same object.
-            self._warm_lane_reclaim_candidates = (  # type: ignore[method-assign]
-                self._warm_lane_reclaim_candidates
-            )
-            self._is_branch_dispatched = (  # type: ignore[method-assign]
-                self._is_branch_dispatched
-            )
             self.git_ops.warm_lane_reclaim_candidate_provider = (
                 self._warm_lane_reclaim_candidates
             )
@@ -2031,6 +2020,17 @@ Output JSON matching the schema. Every task must appear in the output.
         INVERTED: keep branches whose status is known and NOT in
         ``{done, cancelled}``; abort to ``set()`` on ``resolver_failed``
         (same fail-safe as the reconciler — never act on a degraded/empty read).
+
+        **Single-orchestrator-ownership invariant:** The warm-lane pool is
+        exclusively owned by this orchestrator process.  A non-terminal task
+        that is NOT in ``scheduler._dispatched`` (checked synchronously under
+        the pool lock by :meth:`WarmLanePool.reclaim_victim`) implies it is
+        stale or stranded — not actively executing — because any live task is
+        guaranteed to be in ``_dispatched``.  This invariant holds because
+        :meth:`_reconcile_stranded_in_progress` reverts genuinely stranded
+        ``in-progress`` tasks before the safety valve fires.  Do **not** reuse
+        this logic in a shared-pool context where non-dispatched does not imply
+        stale.
 
         Args:
             candidates: Branch names from the pool's assignment snapshot.

@@ -7995,14 +7995,8 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
 
         # Wire reclaim callbacks: provider returns all candidates as non-terminal;
         # predicate never marks anything as dispatched.
-        git_ops.warm_lane_reclaim_candidate_provider = (  # type: ignore[attr-defined]
-            lambda c: __import__('asyncio').coroutine(lambda: set(c))()
-        )
-        # Use simple async lambda via coroutine
         async def _provider(c):
             return set(c)
-        async def _pred(b):
-            return False
         git_ops.warm_lane_reclaim_candidate_provider = _provider
         git_ops.warm_lane_dispatched_predicate = lambda b: False
 
@@ -8115,4 +8109,52 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
         assert wip_commits >= 1, (
             f'task/V must carry at least 1 WIP commit beyond main, got {wip_commits} '
             '(commit-before-reset must have saved the uncommitted changes)'
+        )
+
+    async def test_empty_eligible_set_returns_exhausted(self, git_repo: Path):
+        """(e) Provider returns set() → _try_reclaim_lane_for returns None → EXHAUSTED."""
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
+
+        # Provider returns empty set — no eligible victims even though pool is exhausted
+        async def _empty_provider(c):
+            return set()
+        git_ops.warm_lane_reclaim_candidate_provider = _empty_provider
+        git_ops.warm_lane_dispatched_predicate = lambda b: False
+
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert result is WarmLaneUnavailable.EXHAUSTED, (
+            f'Empty eligible set must yield EXHAUSTED (no victim to steal), got {result!r}'
+        )
+        # V's assignment must be untouched
+        assert pool.assignment_for('V') == lane, (
+            'V assignment must be untouched when provider returns empty eligible set'
+        )
+
+    async def test_commit_failure_does_not_block_reclaim(self, git_repo: Path, monkeypatch):
+        """(f) If commit() raises during WIP-save, reclaim proceeds and returns WorktreeInfo."""
+        git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
+
+        # Force commit() to raise to exercise the except branch in _try_reclaim_lane_for
+        async def _failing_commit(worktree: 'Path', message: str) -> None:
+            raise RuntimeError('simulated commit failure')
+        monkeypatch.setattr(git_ops, 'commit', _failing_commit)
+
+        async def _provider(c):
+            return set(c)
+        git_ops.warm_lane_reclaim_candidate_provider = _provider
+        git_ops.warm_lane_dispatched_predicate = lambda b: False
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'commit() failure must not block reclaim — expect WorktreeInfo, got {result!r}'
+        )
+        assert result.path == lane, (
+            f'Reclaimed lane path must be _lane-0 ({lane}) even after commit failure'
         )

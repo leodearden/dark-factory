@@ -1565,13 +1565,13 @@ class TestReclaimOnExhaustionKnobWiring:
         )
         harness = _build_harness(config)
 
-        assert harness.git_ops.warm_lane_reclaim_candidate_provider is (
+        assert harness.git_ops.warm_lane_reclaim_candidate_provider == (
             harness._warm_lane_reclaim_candidates
         ), (
             'warm_lane_reclaim_candidate_provider must be harness._warm_lane_reclaim_candidates '
             'when warm_lane_reclaim_on_exhaustion=True'
         )
-        assert harness.git_ops.warm_lane_dispatched_predicate is (
+        assert harness.git_ops.warm_lane_dispatched_predicate == (
             harness._is_branch_dispatched
         ), (
             'warm_lane_dispatched_predicate must be harness._is_branch_dispatched '
