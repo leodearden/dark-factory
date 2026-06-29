@@ -546,6 +546,31 @@ class Harness:
         # (pending/deferred).  Declared in scheduler.py, installed here alongside the
         # other callback installs — same pattern as _on_park_stop_trip / _on_external_dep_block.
         self.scheduler._suppress_blocked_write = self._action_teardown_tasks.__contains__
+        # Wire the reclaim-on-exhaustion safety valve callbacks (task 1933).
+        # Declared on git_ops with default None (byte-identical when not wired);
+        # installed here when the knob is on — mirrors the _on_park_stop_trip /
+        # _on_external_dep_block declare-in-callee / install-in-harness pattern.
+        # - warm_lane_reclaim_candidate_provider: async (list[str])->set[str] —
+        #   returns the NON-TERMINAL subset of candidate branches (_reconcile_
+        #   terminal_lanes INVERTED, with the same fail-safe-on-resolver-failure).
+        # - warm_lane_dispatched_predicate: sync (str)->bool — re-checked
+        #   atomically under the pool lock (TOCTOU guard) inside reclaim_victim.
+        if config.git.warm_lane_reclaim_on_exhaustion:
+            # Freeze the bound methods as instance attrs so identity checks
+            # (``harness.git_ops.cb is harness._warm_lane_reclaim_candidates``)
+            # are stable: Python creates a new bound method object on each
+            # class-level access, but instance attrs shadow the class and
+            # always return the same object.
+            self._warm_lane_reclaim_candidates = (  # type: ignore[method-assign]
+                self._warm_lane_reclaim_candidates
+            )
+            self._is_branch_dispatched = (  # type: ignore[method-assign]
+                self._is_branch_dispatched
+            )
+            self.git_ops.warm_lane_reclaim_candidate_provider = (
+                self._warm_lane_reclaim_candidates
+            )
+            self.git_ops.warm_lane_dispatched_predicate = self._is_branch_dispatched
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
