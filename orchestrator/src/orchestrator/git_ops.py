@@ -26,6 +26,7 @@ and .task/.gitignore are NOT sufficient — agents bypass them routinely.
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -435,18 +436,29 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     is provided but does not exist, so the caller can distinguish a deleted
     worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
     missing binary on ``PATH``).
+
+    Locale: ``LC_ALL=C`` and ``LANG=C`` are forced in the child environment so
+    that git (and other tools) always emit English-locale diagnostics.  This is
+    required for :func:`_git_clean_failure_is_benign`, which substring-matches
+    English warning text; a non-C locale would produce translated output that
+    the matcher cannot recognise, silently defeating the R3 ENOENT-tolerance
+    fix for the 4892-class warm-lane FAULT.
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
     # can raise a typed exception consumers can pattern-match on.
     if cwd is not None and not Path(cwd).is_dir():
         raise WorktreeMissing(cwd)
+    # Force a stable C locale so git output is always in English and amenable
+    # to substring matching (see docstring above).
+    _env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(cwd) if cwd else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_env,
         )
     except FileNotFoundError as e:
         # Race: cwd existed at the pre-flight check but vanished before spawn.
@@ -2204,6 +2216,11 @@ class GitOps:
         # pattern matching the exact name only, so without this exclude git clean
         # -d descends into the trash and races the bg rm, producing an ENOENT
         # failure (R2 of the 4892-class warm-lane FAULT).
+        # Note: the '.*' glob is intentionally broader than the '<pid>' suffix
+        # alone — it preserves any '<artifact_dir>.reseed-trash.<anything>'
+        # directory, even a leftover from a crashed reseed.  This is deliberate:
+        # warm-lane-gc.sh is responsible for GC'ing all reseed-trash dirs; git
+        # clean should never race the GC by trying to remove them.
         clean_cmd = ['git', 'clean', '-xfd']
         for artifact_dir in self.config.reap_build_artifact_dirs:
             clean_cmd += ['-e', artifact_dir, '-e', f'{artifact_dir}.reseed-trash.*']
