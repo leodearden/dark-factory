@@ -2977,3 +2977,69 @@ class TestResetWarmLaneReseedTrashHardening:
         assert not (wl_git_repo / 'stray.txt').exists(), (
             'stray.txt survived git clean (genuine stray must be removed)'
         )
+    async def test_reset_warm_lane_tolerates_benign_enoent(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """git clean rc=1 with only ENOENT warnings is treated as success (R3 tolerance).
+
+        Scenario: git tried to remove a path that a concurrent detached rm -rf
+        already deleted; git 2.43+ emits
+          ``warning: failed to remove '<path>': No such file or directory``
+        and exits non-zero.  _reset_warm_lane must treat this as success.
+
+        RED today: any non-zero git clean rc raises RuntimeError.
+        GREEN after step-4 adds _git_clean_failure_is_benign + benign-return branch.
+        """
+        benign_stderr = (
+            "warning: failed to remove 'target.reseed-trash.12345/build/foo.o': "
+            "No such file or directory\n"
+            "warning: failed to remove 'target.reseed-trash.12345': "
+            "No such file or directory"
+        )
+
+        async def fake_run(cmd, cwd=None):
+            if 'clean' in cmd:
+                return (1, '', benign_stderr)
+            return (0, '', '')
+
+        monkeypatch.setattr('orchestrator.git_ops._run', fake_run)
+
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        # Must NOT raise
+        await git_ops._reset_warm_lane(wl_git_repo, 'task/x', 'deadbeef')
+
+    async def test_reset_warm_lane_raises_on_genuine_clean_failure(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """git clean rc=1 with Permission-denied error still raises RuntimeError (guard).
+
+        Ensures benign-ENOENT tolerance does not swallow genuine clean failures.
+        """
+        async def fake_run(cmd, cwd=None):
+            if 'clean' in cmd:
+                return (1, '', "warning: failed to remove 'x': Permission denied")
+            return (0, '', '')
+
+        monkeypatch.setattr('orchestrator.git_ops._run', fake_run)
+
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        with pytest.raises(RuntimeError):
+            await git_ops._reset_warm_lane(wl_git_repo, 'task/x', 'deadbeef')
+
+    async def test_reset_warm_lane_raises_on_empty_clean_stderr(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """git clean rc=1 with empty stderr still raises RuntimeError (unknown failure).
+
+        Empty stderr means we have no diagnostic context; never silently ignore it.
+        """
+        async def fake_run(cmd, cwd=None):
+            if 'clean' in cmd:
+                return (1, '', '')
+            return (0, '', '')
+
+        monkeypatch.setattr('orchestrator.git_ops._run', fake_run)
+
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+        with pytest.raises(RuntimeError):
+            await git_ops._reset_warm_lane(wl_git_repo, 'task/x', 'deadbeef')
