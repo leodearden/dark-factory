@@ -7991,8 +7991,6 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
 
     async def test_reclaim_warm_returns_worktree_info(self, git_repo: Path):
         """(a) With callbacks wired: acquire_warm_lane returns WorktreeInfo, not EXHAUSTED."""
-        from orchestrator.warm_lane_pool import LaneState
-
         git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
 
         # Wire reclaim callbacks: provider returns all candidates as non-terminal;

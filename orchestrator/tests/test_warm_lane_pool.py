@@ -3622,7 +3622,6 @@ class TestReclaimVictim:
     async def test_reclaim_returns_victim_lane(self, tmp_path: Path):
         """(a) Basic reclaim: returns (victim, lane) and re-keys _assignments."""
         pool = _make_pool(tmp_path, size=2)
-        base = tmp_path / 'worktrees'
 
         # Assign both lanes so pool is exhausted
         acq_v = await pool.acquire_for('V')
@@ -3689,7 +3688,6 @@ class TestReclaimVictim:
     async def test_reclaim_oldest_first(self, tmp_path: Path):
         """(d) Oldest (insertion-order-first) eligible victim is preferred."""
         pool = _make_pool(tmp_path, size=3)
-        base = tmp_path / 'worktrees'
 
         # Acquire in order: A first, then B (both eligible)
         acq_a = await pool.acquire_for('A')
