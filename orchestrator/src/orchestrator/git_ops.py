@@ -2255,6 +2255,8 @@ class GitOps:
                 Seed rc-failure or persistent reset fault; lane already released;
                 caller must return the sentinel without touching the lane further.
         """
+        # Called only after the pool handed us a lane, so it cannot be None.
+        assert self.warm_lane_pool is not None
         # One-shot retry on _reset_warm_lane exception.
         # attempt == 1: first try; attempt == 2: retry (scrub target/ first).
         for attempt in (1, 2):
