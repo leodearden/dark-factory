@@ -1300,6 +1300,58 @@ class TestAcquireWarmLaneResetInPlace:
             f'got {head_sha.strip()!r} expected {sha_b!r}'
         )
 
+    async def test_persistent_reset_fault_returns_fault(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """R4 GUARD: a persistent reset fault still returns FAULT + lane is FREE.
+
+        Acceptance (2): pinning the 1859 no-silent-degrade contract — the
+        one-shot retry must NOT swallow a genuine fault.
+
+        ``always_fail`` raises on every call.  After step-2's implementation
+        the helper calls _reset_warm_lane twice (attempt 1 raises, attempt 2
+        raises again), releases the lane, and returns FAULT.  The test asserts:
+        - result is WarmLaneUnavailable.FAULT   (genuine fault escalates)
+        - lane state is LaneState.FREE          (no ASSIGNED leak)
+
+        Note: this test passes immediately after step-2 (not a RED driver).
+        It is a REGRESSION GUARD that the one-shot retry preserves the
+        FAULT-on-persistent-fault path (downstream RuntimeError →
+        _mark_blocked → BLOCKED + L1 unchanged).
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        sha_a, sha_b = await self._make_repo_with_scripts_and_two_commits(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.acquire_warm_lane('task-A', sha_a)
+        assert isinstance(info_a, WorktreeInfo), (
+            f'prerequisite: create-once acquire must succeed, got {info_a!r}'
+        )
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(info_a.path)
+
+        # Inject a PERSISTENT fault: every call raises (no recovery possible)
+        async def always_fail(*a: object, **k: object) -> None:
+            raise RuntimeError('persistent corruption')
+
+        monkeypatch.setattr(git_ops, '_reset_warm_lane', always_fail)
+
+        result = await git_ops.acquire_warm_lane('task-B', sha_b)
+
+        # Genuine fault must still escalate (1859 no-silent-degrade preserved)
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Persistent reset fault must return FAULT (not swallowed by R4 retry); '
+            f'got {result!r}'
+        )
+        # Lane must be released back to FREE — no ASSIGNED leak
+        lane = git_ops.warm_lane_pool._base / '_lane-0'
+        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+            f'Lane must be FREE after FAULT (no ASSIGNED leak); '
+            f'got {git_ops.warm_lane_pool.state(lane)!r}'
+        )
+
 
 # ===========================================================================
 # Step-11: RED — GitOps.release_warm_lane
