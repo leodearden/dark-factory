@@ -3602,3 +3602,156 @@ class TestAcquireSpecLaneReseedTrashHardening:
         assert result_warm is False, (
             f'Expected cold fallback (warm=False) on genuine clean failure, got {result_warm}'
         )
+# ===========================================================================
+# Step-1 (1933): RED — WarmLanePool.reclaim_victim
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestReclaimVictim:
+    """Pure state-machine tests for WarmLanePool.reclaim_victim (task 1933, step-1).
+
+    reclaim_victim(branch_name, candidates, is_dispatched) picks the OLDEST
+    eligible victim (victim != branch_name, victim in candidates,
+    not is_dispatched(victim), state==ASSIGNED), atomically re-keys
+    _assignments from victim → branch_name, and returns (victim, lane).
+
+    All tests RED today: reclaim_victim does not exist (AttributeError).
+    """
+
+    async def test_reclaim_returns_victim_lane(self, tmp_path: Path):
+        """(a) Basic reclaim: returns (victim, lane) and re-keys _assignments."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+
+        # Assign both lanes so pool is exhausted
+        acq_v = await pool.acquire_for('V')
+        assert acq_v is not None
+        lane_v, _ = acq_v
+
+        # Acquire second lane for an unrelated branch
+        acq_other = await pool.acquire_for('X')
+        assert acq_other is not None
+
+        # reclaim_victim: steal V's lane for Z
+        result = await pool.reclaim_victim('Z', {'V'}, lambda b: False)
+
+        assert result is not None, 'reclaim_victim must return (victim, lane) when eligible'
+        victim, lane = result
+        assert victim == 'V', f'victim must be V, got {victim!r}'
+        assert lane == lane_v, f'reclaimed lane must be V\'s lane ({lane_v}), got {lane}'
+
+        # Lane must still be ASSIGNED (just re-keyed, not freed)
+        assert pool.state(lane) == LaneState.ASSIGNED, (
+            'reclaimed lane must stay ASSIGNED (re-keyed, not freed)'
+        )
+
+        # Assignment map: V dropped, Z → lane
+        assert pool.assignment_for('V') is None, (
+            '_assignments must drop V after reclaim'
+        )
+        assert pool.assignment_for('Z') == lane, (
+            '_assignments must map Z to the reclaimed lane'
+        )
+
+    async def test_reclaim_never_steals_dispatched(self, tmp_path: Path):
+        """(b) Dispatched victim is never stolen."""
+        pool = _make_pool(tmp_path, size=1)
+
+        acq = await pool.acquire_for('V')
+        assert acq is not None
+        lane_v, _ = acq
+
+        # is_dispatched returns True for V → must not steal
+        result = await pool.reclaim_victim('Z', {'V'}, lambda b: b == 'V')
+
+        assert result is None, 'reclaim_victim must return None for a dispatched victim'
+        # V's assignment must be untouched
+        assert pool.assignment_for('V') == lane_v, (
+            'dispatched victim\'s assignment must be untouched'
+        )
+
+    async def test_reclaim_none_when_not_in_candidates(self, tmp_path: Path):
+        """(c) Victim not in candidates is skipped; returns None."""
+        pool = _make_pool(tmp_path, size=1)
+
+        acq = await pool.acquire_for('V')
+        assert acq is not None
+
+        # Empty candidates → nothing to steal
+        result = await pool.reclaim_victim('Z', set(), lambda b: False)
+        assert result is None, 'reclaim_victim must return None when candidates is empty'
+
+        # V excluded from candidates
+        result2 = await pool.reclaim_victim('Z', {'other'}, lambda b: False)
+        assert result2 is None, 'reclaim_victim must return None when victim not in candidates'
+
+    async def test_reclaim_oldest_first(self, tmp_path: Path):
+        """(d) Oldest (insertion-order-first) eligible victim is preferred."""
+        pool = _make_pool(tmp_path, size=3)
+        base = tmp_path / 'worktrees'
+
+        # Acquire in order: A first, then B (both eligible)
+        acq_a = await pool.acquire_for('A')
+        assert acq_a is not None
+        lane_a, _ = acq_a
+
+        acq_b = await pool.acquire_for('B')
+        assert acq_b is not None
+
+        # Exhaust the pool
+        acq_c = await pool.acquire_for('C')
+        assert acq_c is not None
+
+        # Both A and B in candidates, neither dispatched → pick oldest (A)
+        result = await pool.reclaim_victim('Z', {'A', 'B'}, lambda b: False)
+
+        assert result is not None
+        victim, lane = result
+        assert victim == 'A', f'oldest victim (A) must be preferred, got {victim!r}'
+        assert lane == lane_a
+
+    async def test_reclaim_none_no_assigned_lanes(self, tmp_path: Path):
+        """(e) Returns None when pool has no ASSIGNED lanes / empty assignments."""
+        pool = _make_pool(tmp_path, size=3)
+
+        # No lanes acquired → _assignments is empty
+        result = await pool.reclaim_victim('Z', {'V'}, lambda b: False)
+        assert result is None, 'reclaim_victim must return None with empty assignments'
+
+    async def test_reclaim_skips_self(self, tmp_path: Path):
+        """(f) Never steals from branch_name itself (victim == branch_name skipped)."""
+        pool = _make_pool(tmp_path, size=2)
+
+        # Assign Z (the target branch itself) and another lane for X
+        acq_z = await pool.acquire_for('Z')
+        assert acq_z is not None
+        lane_z, _ = acq_z
+
+        acq_x = await pool.acquire_for('X')
+        assert acq_x is not None
+
+        # candidates includes Z itself (branch_name) — must be skipped
+        # X is NOT in candidates, so nothing to steal
+        result = await pool.reclaim_victim('Z', {'Z'}, lambda b: False)
+        assert result is None, 'reclaim_victim must not steal from branch_name itself'
+        # Z's assignment untouched
+        assert pool.assignment_for('Z') == lane_z
+
+    async def test_reclaim_skips_self_but_finds_other(self, tmp_path: Path):
+        """(f) Skips self but returns another eligible victim."""
+        pool = _make_pool(tmp_path, size=2)
+
+        acq_a = await pool.acquire_for('A')
+        assert acq_a is not None
+        lane_a, _ = acq_a
+
+        acq_b = await pool.acquire_for('B')
+        assert acq_b is not None
+
+        # branch_name='B', candidates={'A', 'B'}; 'B' itself skipped → picks 'A'
+        result = await pool.reclaim_victim('B', {'A', 'B'}, lambda b: False)
+        assert result is not None
+        victim, lane = result
+        assert victim == 'A', f'self skipped, must pick A, got {victim!r}'
+        assert lane == lane_a
