@@ -1592,14 +1592,13 @@ class GitOps:
                 await self.spec_warm_lane_pool.release(lane)
                 wt = await self.create_throwaway_verify_worktree(merge_commit)
                 return wt, False
-            clean_cmd = ['git', 'clean', '-xfd']
-            for artifact_dir in self.config.reap_build_artifact_dirs:
-                clean_cmd += ['-e', artifact_dir]
-            rc, _, err = await _run(clean_cmd, cwd=lane)
-            if rc != 0:
+            ok, err = await self._clean_lane_retaining_artifacts(
+                lane, caller='acquire_spec_lane',
+            )
+            if not ok:
                 logger.debug(
-                    'acquire_spec_lane: git clean failed for %s (rc=%d, err=%r)'
-                    ' — releasing lane, cold fallback', lane, rc, err,
+                    'acquire_spec_lane: git clean failed for %s (err=%r)'
+                    ' — releasing lane, cold fallback', lane, err,
                 )
                 await self.spec_warm_lane_pool.release(lane)
                 wt = await self.create_throwaway_verify_worktree(merge_commit)
@@ -2161,6 +2160,44 @@ class GitOps:
         )
         return True
 
+    async def _clean_lane_retaining_artifacts(
+        self, cwd: Path, *, caller: str = 'git_ops',
+    ) -> tuple[bool, str]:
+        """Run a single ``git clean -xfd`` preserving artifact dirs and reseed-trash siblings.
+
+        Builds one invocation excluding ALL configured artifact dirs (via
+        ``self.config.reap_build_artifact_dirs``) and their
+        ``<dir>.reseed-trash.*`` siblings — single-pass so >1 artifact dir all
+        survive (per-dir-loop step-19 regression).  A benign ENOENT race (R3:
+        concurrent detached ``rm -rf`` already removed the path before git clean
+        reached it) is treated as success and logged at WARNING level.
+
+        This is the single-source implementation shared by :meth:`_reset_warm_lane`,
+        :meth:`acquire_spec_lane`, and :meth:`reset_persistent_merge_worktree`.
+        Each call site only differs in how it handles the ``(False, err)`` case
+        (raise vs. cold fallback).
+
+        Returns:
+            ``(True, '')`` if git clean exited 0.
+            ``(True, err)`` if the failure was a benign ENOENT race (logged at WARNING).
+            ``(False, err)`` on a genuine clean failure.
+        """
+        clean_cmd = ['git', 'clean', '-xfd']
+        for artifact_dir in self.config.reap_build_artifact_dirs:
+            clean_cmd += ['-e', artifact_dir, '-e', f'{artifact_dir}.reseed-trash.*']
+        rc, _, err = await _run(clean_cmd, cwd=cwd)
+        if rc == 0:
+            return True, ''
+        if _git_clean_failure_is_benign(err):
+            logger.warning(
+                '%s: git clean exited %d for %s but only benign ENOENT '
+                '"failed to remove" warnings detected (concurrent deleter raced '
+                'the clean walk; working tree left clean); treating as success: %s',
+                caller, rc, cwd, err,
+            )
+            return True, err
+        return False, err
+
     async def _reset_warm_lane(
         self, lane_dir: Path, full_branch: str, target_commit: str,
     ) -> None:
@@ -2188,38 +2225,10 @@ class GitOps:
                 f'_reset_warm_lane: checkout -f -B {full_branch} {target_commit} '
                 f'failed for {lane_dir}: {err}'
             )
-        # Single invocation excluding ALL artifact dirs at once — every
-        # configured build-output dir survives in one pass.  A per-dir loop
-        # would leave NONE surviving with >1 dir (κ step-19 regression).
-        # Also exclude <artifact_dir>.reseed-trash.* alongside <artifact_dir>:
-        # reify's seed-warm-lane.sh / warm-lane-gc.sh stage a detached `rm -rf`
-        # of `<artifact_dir>.reseed-trash.<pid>`; `-e <dir>` is a gitignore-style
-        # pattern matching the exact name only, so without this exclude git clean
-        # -d descends into the trash and races the bg rm, producing an ENOENT
-        # failure (R2 of the 4892-class warm-lane FAULT).
-        # Note: the '.*' glob is intentionally broader than the '<pid>' suffix
-        # alone — it preserves any '<artifact_dir>.reseed-trash.<anything>'
-        # directory, even a leftover from a crashed reseed.  This is deliberate:
-        # warm-lane-gc.sh is responsible for GC'ing all reseed-trash dirs; git
-        # clean should never race the GC by trying to remove them.
-        clean_cmd = ['git', 'clean', '-xfd']
-        for artifact_dir in self.config.reap_build_artifact_dirs:
-            clean_cmd += ['-e', artifact_dir, '-e', f'{artifact_dir}.reseed-trash.*']
-        rc, _, err = await _run(clean_cmd, cwd=lane_dir)
-        if rc != 0:
-            if _git_clean_failure_is_benign(err):
-                # Benign ENOENT race (R3 of the 4892-class warm-lane FAULT):
-                # a concurrent detached rm -rf already removed the path(s) that
-                # git clean tried to delete.  The desired outcome (path gone)
-                # is already achieved, so treat this as success.
-                logger.warning(
-                    '_reset_warm_lane: git clean exited %d for %s but only '
-                    'benign ENOENT "failed to remove" warnings detected '
-                    '(concurrent deleter raced the clean walk; working tree '
-                    'left clean); treating as success: %s',
-                    rc, lane_dir, err,
-                )
-                return
+        ok, err = await self._clean_lane_retaining_artifacts(
+            lane_dir, caller='_reset_warm_lane',
+        )
+        if not ok:
             raise RuntimeError(
                 f'_reset_warm_lane: git clean failed for {lane_dir}: {err}'
             )
@@ -3909,16 +3918,10 @@ class GitOps:
                     f'Failed to reset persistent merge worktree {warm_path} '
                     f'to {merge_commit}: {err}'
                 )
-            # Single invocation excluding ALL artifact dirs at once — every
-            # configured build-output dir (e.g. build AND dist) survives in
-            # one pass.  A per-dir loop would call ``git clean -xfd -e build``
-            # (deleting dist/) then ``git clean -xfd -e dist`` (deleting
-            # build/), so with >1 dir NONE survive (step-19 regression).
-            clean_cmd = ['git', 'clean', '-xfd']
-            for artifact_dir in self.config.reap_build_artifact_dirs:
-                clean_cmd += ['-e', artifact_dir]
-            rc, _, err = await _run(clean_cmd, cwd=warm_path)
-            if rc != 0:
+            ok, err = await self._clean_lane_retaining_artifacts(
+                warm_path, caller='reset_persistent_merge_worktree',
+            )
+            if not ok:
                 raise RuntimeError(
                     f'Failed to clean persistent merge worktree {warm_path}: {err}'
                 )

@@ -3216,3 +3216,389 @@ class TestResetWarmLaneReseedTrashHardening:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         with pytest.raises(RuntimeError):
             await git_ops._reset_warm_lane(wl_git_repo, 'task/x', 'deadbeef')
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for 1934 hardening tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_commit(repo: Path, filename: str, content: str = 'x\n') -> str:
+    """Add a file, commit it to repo, and return the new HEAD SHA."""
+    (repo / filename).write_text(content)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', f'Add {filename}'], cwd=repo)
+    _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    return sha.strip()
+
+
+async def _add_noop_seed_to_repo(repo: Path) -> None:
+    """Commit a no-op scripts/seed-warm-lane.sh into the repo at HEAD.
+
+    The script simply exits 0, so _seed_warm_lane succeeds without touching
+    the filesystem.  Must be committed before the spec-lane worktree is created
+    so the script is present in the lane's checkout.
+    """
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'seed-warm-lane.sh'
+    script.write_text('#!/usr/bin/env bash\nexit 0\n')
+    script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add no-op seed-warm-lane.sh (task-1934 test helper)'], cwd=repo)
+
+
+def _make_passthrough_run(clean_result: tuple) -> object:
+    """Return a passthrough ``_run`` wrapper that fakes only git-clean calls.
+
+    Non-clean commands are delegated to the original ``orchestrator.git_ops._run``
+    captured at factory-call time (before any monkeypatch is applied).  The fake
+    clean returns ``clean_result`` — a 3-tuple ``(rc, stdout, stderr)``.
+
+    Call this **before** applying the monkeypatch so the original is captured::
+
+        passthrough = _make_passthrough_run((1, '', some_stderr))
+        monkeypatch.setattr('orchestrator.git_ops._run', passthrough)
+    """
+    import orchestrator.git_ops as _go_module
+    orig = _go_module._run
+
+    async def passthrough(cmd, cwd=None):
+        if 'clean' in cmd:
+            return clean_result
+        return await orig(cmd, cwd=cwd)
+
+    return passthrough
+
+
+# ---------------------------------------------------------------------------
+# reset_persistent_merge_worktree reseed-trash hardening (R2 + R3) – task 1934
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestResetPersistentMergeWorktreeReseedTrashHardening:
+    """Tests for reset_persistent_merge_worktree R2/R3 hardening (task-1934).
+
+    R2: git clean must exclude ``target.reseed-trash.<pid>`` dirs alongside
+        ``target/`` so it never descends into reify's detached-rm staging area.
+    R3: git clean rc=1 with only ``failed to remove ... No such file or directory``
+        ENOENT warnings is treated as success (benign concurrent-deleter race);
+        any other non-zero exit still raises RuntimeError.
+
+    Mirror of 1931's TestResetWarmLaneReseedTrashHardening; uses the create-once
+    → reset-in-place two-call flow to reach the clean loop (it only runs on the
+    second call when the worktree is already registered).  The passthrough
+    monkeypatch delegates all _run calls to the original except git-clean, so
+    real reset/registration still works while the clean result is injected.
+    """
+
+    async def test_reset_persistent_excludes_reseed_trash(self, wl_git_repo: Path):
+        """git clean must NOT remove target.reseed-trash.<pid> directories.
+
+        RED today: ``-e target`` does not match ``target.reseed-trash.99999``, so
+        git clean -xfd descends into the trash dir and removes it (R2 regression).
+
+        GREEN after step-2 adds ``-e target.reseed-trash.*`` alongside each
+        existing ``-e target`` in the clean command.
+        """
+        cfg = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+            persistent_merge_worktree=True,
+        )
+        git_ops = GitOps(cfg, wl_git_repo)
+
+        # Two commits: A (initial HEAD) and B (one extra file added)
+        _, commit_a, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        commit_a = commit_a.strip()
+        commit_b = await _make_commit(wl_git_repo, '_1934_sentinel_b.py')
+
+        # Create-once at A
+        warm_path = await git_ops.reset_persistent_merge_worktree(commit_a)
+        assert warm_path.exists()
+
+        # Simulate warm build + reseed-trash staging dir (reify's detached bg rm target)
+        (warm_path / 'target').mkdir(exist_ok=True)
+        (warm_path / 'target' / 'cache.bin').write_bytes(b'\x00' * 128)
+        (warm_path / 'stray.txt').write_text('stray\n')
+        trash_dir = warm_path / 'target.reseed-trash.99999'
+        trash_dir.mkdir()
+        (trash_dir / 'junk.bin').write_bytes(b'\xff' * 64)
+
+        # Reset-in-place at B — REAL git clean runs
+        warm_path_b = await git_ops.reset_persistent_merge_worktree(commit_b)
+        assert warm_path_b == warm_path
+
+        assert (warm_path / 'target.reseed-trash.99999' / 'junk.bin').exists(), (
+            'target.reseed-trash.99999/junk.bin was removed by git clean '
+            '(R2 regression: -e target does not match target.reseed-trash.*)'
+        )
+        assert (warm_path / 'target' / 'cache.bin').exists(), (
+            'target/cache.bin was removed (warm artifact must survive)'
+        )
+        assert not (warm_path / 'stray.txt').exists(), (
+            'stray.txt survived git clean (genuine stray must be removed)'
+        )
+
+    async def test_reset_persistent_tolerates_benign_enoent(
+        self, wl_git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """git clean rc=1 with only ENOENT warnings is treated as success (R3 tolerance).
+
+        RED today: any non-zero git clean rc raises RuntimeError.
+        GREEN after step-2 adds _git_clean_failure_is_benign + benign-return branch.
+        """
+        benign_stderr = (
+            "warning: failed to remove 'target.reseed-trash.12345/build/foo.o': "
+            "No such file or directory\n"
+            "warning: failed to remove 'target.reseed-trash.12345': "
+            "No such file or directory"
+        )
+
+        cfg = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+            persistent_merge_worktree=True,
+        )
+        git_ops = GitOps(cfg, wl_git_repo)
+
+        _, commit_a, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        commit_a = commit_a.strip()
+        commit_b = await _make_commit(wl_git_repo, '_1934_sentinel_b2.py')
+
+        # Create-once at A (real git — no monkeypatch yet)
+        warm_path = await git_ops.reset_persistent_merge_worktree(commit_a)
+
+        # Now apply PASSTHROUGH: only fake git clean, delegate everything else
+        passthrough_run = _make_passthrough_run((1, '', benign_stderr))
+        monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
+
+        # Must NOT raise; must return warm_path
+        result = await git_ops.reset_persistent_merge_worktree(commit_b)
+        assert result == warm_path
+
+    async def test_reset_persistent_raises_on_genuine_clean_failure(
+        self, wl_git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """git clean rc=1 with Permission-denied still raises RuntimeError (guard).
+
+        Ensures benign-ENOENT tolerance does not swallow genuine clean failures.
+        Green on base (unchanged behaviour); green after step-2 impl.
+        """
+        cfg = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+            persistent_merge_worktree=True,
+        )
+        git_ops = GitOps(cfg, wl_git_repo)
+
+        _, commit_a, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        commit_a = commit_a.strip()
+        commit_b = await _make_commit(wl_git_repo, '_1934_sentinel_b3.py')
+
+        # Create-once at A (real git)
+        await git_ops.reset_persistent_merge_worktree(commit_a)
+
+        # Apply passthrough monkeypatch for reset-in-place call
+        passthrough_run = _make_passthrough_run((1, '', "warning: failed to remove 'x': Permission denied"))
+        monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
+
+        with pytest.raises(RuntimeError):
+            await git_ops.reset_persistent_merge_worktree(commit_b)
+
+    async def test_reset_persistent_raises_on_empty_clean_stderr(
+        self, wl_git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """git clean rc=1 with empty stderr still raises RuntimeError (guard).
+
+        Empty stderr means unknown failure — never silently ignore it.
+        Green on base (unchanged behaviour); green after step-2 impl.
+        """
+        cfg = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+            persistent_merge_worktree=True,
+        )
+        git_ops = GitOps(cfg, wl_git_repo)
+
+        _, commit_a, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        commit_a = commit_a.strip()
+        commit_b = await _make_commit(wl_git_repo, '_1934_sentinel_b4.py')
+
+        # Create-once at A (real git)
+        await git_ops.reset_persistent_merge_worktree(commit_a)
+
+        # Apply passthrough monkeypatch for reset-in-place call
+        passthrough_run = _make_passthrough_run((1, '', ''))
+        monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
+
+        with pytest.raises(RuntimeError):
+            await git_ops.reset_persistent_merge_worktree(commit_b)
+
+
+# ---------------------------------------------------------------------------
+# acquire_spec_lane reseed-trash hardening (R2 + R3) – task 1934
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcquireSpecLaneReseedTrashHardening:
+    """Tests for acquire_spec_lane R2/R3 hardening (task-1934).
+
+    Mirrors TestResetPersistentMergeWorktreeReseedTrashHardening above.
+    acquire_spec_lane soft-degrades to a cold throwaway worktree on clean failure
+    instead of raising RuntimeError; the benign branch short-circuits to success
+    (warm lane retained) rather than the cold-fallback (warm=False).
+
+    Flow to reach the reset-in-place clean loop:
+      1. acquire_spec_lane(merge_commit) — create-once path (lane not registered)
+      2. release_spec_lane(lane, warm=True) — put lane back to FREE
+      3. [optionally place reseed-trash dir in lane]
+      4. acquire_spec_lane(merge_commit) — reset-in-place path (lane IS registered)
+         → git reset --hard + git clean -xfd [-e ...] runs here
+
+    A no-op scripts/seed-warm-lane.sh must be committed to wl_git_repo before
+    the first acquire so _seed_warm_lane(lane, '--reset-in-place') returns 0.
+    """
+
+    async def test_acquire_spec_lane_excludes_reseed_trash(self, wl_git_repo: Path):
+        """git clean must NOT remove target.reseed-trash.<pid> dirs.
+
+        RED today: ``-e target`` does not match ``target.reseed-trash.99999``, so
+        git clean -xfd descends into the trash dir and removes it (R2 regression).
+
+        GREEN after step-4 adds ``-e target.reseed-trash.*`` alongside each
+        existing ``-e target`` in the clean command.
+        """
+        await _add_noop_seed_to_repo(wl_git_repo)
+
+        cfg = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+            merge_spec_warm_lane_pool=True,
+        )
+        git_ops = GitOps(cfg, wl_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        merge_commit = merge_commit.strip()
+
+        # Create-once: acquire, then release back to FREE
+        lane, warm = await git_ops.acquire_spec_lane(merge_commit)
+        assert warm is True
+        await git_ops.release_spec_lane(lane, warm=True)
+
+        # Place reseed-trash staging dir + genuine stray in the lane
+        trash_dir = lane / 'target.reseed-trash.99999'
+        trash_dir.mkdir()
+        (trash_dir / 'junk.bin').write_bytes(b'\xff' * 64)
+        (lane / 'stray.txt').write_text('stray\n')
+
+        # Re-acquire — reset-in-place path runs REAL git clean
+        lane2, warm2 = await git_ops.acquire_spec_lane(merge_commit)
+
+        assert warm2 is True
+        assert lane2 == lane  # same pool-lane (pool size 1)
+        assert (lane / 'target.reseed-trash.99999' / 'junk.bin').exists(), (
+            'target.reseed-trash.99999/junk.bin was removed by git clean '
+            '(R2 regression: -e target does not match target.reseed-trash.*)'
+        )
+        assert not (lane / 'stray.txt').exists(), (
+            'stray.txt survived git clean (genuine stray must be removed)'
+        )
+
+    async def test_acquire_spec_lane_tolerates_benign_enoent(
+        self, wl_git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """git clean rc=1 with ENOENT warnings returns warm lane, not cold fallback.
+
+        RED today: clean rc!=0 → release lane + cold fallback → (throwaway, False).
+        GREEN after step-4 adds _git_clean_failure_is_benign + benign-short-circuit
+        so the lane is retained and returned as (lane, True).
+        """
+        benign_stderr = (
+            "warning: failed to remove 'target.reseed-trash.12345/build/foo.o': "
+            "No such file or directory\n"
+            "warning: failed to remove 'target.reseed-trash.12345': "
+            "No such file or directory"
+        )
+
+        await _add_noop_seed_to_repo(wl_git_repo)
+
+        cfg = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+            merge_spec_warm_lane_pool=True,
+        )
+        git_ops = GitOps(cfg, wl_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        merge_commit = merge_commit.strip()
+
+        # Create-once (real git — no monkeypatch yet)
+        lane, warm = await git_ops.acquire_spec_lane(merge_commit)
+        assert warm is True
+        await git_ops.release_spec_lane(lane, warm=True)
+
+        # Apply PASSTHROUGH monkeypatch: only fake git clean, delegate everything else
+        passthrough_run = _make_passthrough_run((1, '', benign_stderr))
+
+        # Spy on _seed_warm_lane to confirm the benign path reaches it —
+        # a regression that short-circuits before re-seeding would fail here.
+        seed_calls: list = []
+        orig_seed = git_ops._seed_warm_lane
+
+        async def spy_seed(lane_path, *args, **kwargs):
+            seed_calls.append(lane_path)
+            return await orig_seed(lane_path, *args, **kwargs)
+
+        monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
+        monkeypatch.setattr(git_ops, '_seed_warm_lane', spy_seed)
+
+        # Re-acquire → must return (lane, True) NOT cold fallback (throwaway, False)
+        result_lane, result_warm = await git_ops.acquire_spec_lane(merge_commit)
+        assert result_warm is True, (
+            f'Expected warm=True (benign ENOENT treated as success), got {result_warm}'
+        )
+        assert result_lane == lane, (
+            f'Expected warm lane {lane}, got cold-fallback {result_lane}'
+        )
+        assert seed_calls == [lane], (
+            'benign ENOENT path must still call _seed_warm_lane '
+            '(must not short-circuit before re-seeding)'
+        )
+
+    async def test_acquire_spec_lane_cold_fallback_on_genuine_clean_failure(
+        self, wl_git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """git clean rc=1 with Permission-denied → cold fallback still taken (guard).
+
+        Ensures the benign branch does not swallow genuine clean failures.
+        Green on base (unchanged behaviour); green after step-4 impl.
+        """
+        await _add_noop_seed_to_repo(wl_git_repo)
+
+        cfg = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+            merge_spec_warm_lane_pool=True,
+        )
+        git_ops = GitOps(cfg, wl_git_repo, merge_spec_warm_lane_pool_size=1)
+
+        _, merge_commit, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        merge_commit = merge_commit.strip()
+
+        # Create-once (real git)
+        lane, warm = await git_ops.acquire_spec_lane(merge_commit)
+        assert warm is True
+        await git_ops.release_spec_lane(lane, warm=True)
+
+        # Apply PASSTHROUGH monkeypatch with genuine Permission-denied failure
+        passthrough_run = _make_passthrough_run((1, '', "warning: failed to remove 'x': Permission denied"))
+        monkeypatch.setattr('orchestrator.git_ops._run', passthrough_run)
+
+        # Must take cold fallback: warm=False
+        _, result_warm = await git_ops.acquire_spec_lane(merge_commit)
+        assert result_warm is False, (
+            f'Expected cold fallback (warm=False) on genuine clean failure, got {result_warm}'
+        )
