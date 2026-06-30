@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""One-shot purge of the legacy 'knowlive' (no-separator) Graphiti graph and Mem0
+namespace, plus retirement of the two Stage-1 flag memories that keep re-surfacing
+this issue in reconciliation cycles (task 1937).
+
+Background
+----------
+Task 515 ("re-key 'knowlive' -> 'know_live'") was deliberately CANCELLED. It left
+~461 orphaned Graphiti nodes in a standalone 'knowlive' FalkorDB graph and ~22
+orphaned Mem0 memories scoped to project_id='knowlive'. Two dark_factory flag
+edges (c2b5ac3f-e8c5-41c2-a455-73f60d821679, af5dec02-bb63-4e3d-8552-f08da8d7517b)
+record "N records awaiting re-keying" and keep resurfacing in reconciliation
+because the re-key never happened and never will.
+
+Purge, not re-key
+------------------
+'know-live'/'know_live' is a LIVE project. Merging a year-old, separately
+cancelled and contamination-tainted blob of orphan data into it is the riskier
+choice, and there is no clean re-key primitive to do it with anyway (Graphiti's
+project_id IS the FalkorDB graph name, so re-key would mean a cross-graph node
+move; Mem0 has no payload-update primitive). This script purges the legacy
+namespace outright and retires (invalidates, does NOT delete) the two flag edges
+that record the cancelled migration as still-pending.
+
+What this script does
+----------------------
+  1. Enumerates, then (with --apply) DETACH DELETEs every node in the 'knowlive'
+     FalkorDB graph via a single Cypher statement scoped to that graph only.
+  2. Enumerates, then (with --apply) deletes every Mem0 memory scoped to
+     project_id='knowlive' (best-effort -- one failure does not abort the batch).
+  3. Invalidates (via update_edge(invalid_at=...), NOT delete) the two stale-flag
+     edges in the dark_factory graph, preserving their audit trail. The task-515
+     "cancelled" context edge (ea78d7a9) is left untouched -- it remains true.
+
+This is IRREVERSIBLE for steps 1 and 2 (FalkorDB DETACH DELETE / Qdrant point
+delete are not soft-deletes). Step 3 is reversible via
+``update_edge(..., clear_invalid_at=True)``.
+
+Usage
+-----
+  # Dry run (default): print a full JSON manifest, touch nothing. Redirect to a
+  # file BEFORE running --apply -- the dry-run report doubles as the only
+  # recovery record of what is about to be deleted.
+  python scripts/purge_knowlive_namespace.py > knowlive_purge_manifest.json
+
+  # Commit the purge + flag retirement.
+  python scripts/purge_knowlive_namespace.py --apply
+
+  # Override defaults (rarely needed).
+  python scripts/purge_knowlive_namespace.py --apply \
+      --namespace knowlive --flag-host-project dark_factory \
+      --flag-uuids c2b5ac3f-e8c5-41c2-a455-73f60d821679 af5dec02-bb63-4e3d-8552-f08da8d7517b
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import sys
+from datetime import UTC, datetime
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+LEGACY_NAMESPACE: str = 'knowlive'
+FLAG_HOST_PROJECT: str = 'dark_factory'
+STALE_FLAG_EDGE_UUIDS: tuple[str, ...] = (
+    'c2b5ac3f-e8c5-41c2-a455-73f60d821679',
+    'af5dec02-bb63-4e3d-8552-f08da8d7517b',
+)
+
+logger = logging.getLogger('purge_knowlive_namespace')
+
+
+# ---------------------------------------------------------------------------
+# Pure core
+# ---------------------------------------------------------------------------
+
+def build_purge_report(
+    namespace: str,
+    graphiti_rows: list[dict],
+    mem0_members: list[dict],
+    flag_uuids: tuple[str, ...] | list[str],
+    *,
+    dry_run: bool,
+) -> dict:
+    """Assemble the report skeleton dict from already-enumerated inputs. No I/O."""
+    return {
+        'namespace': namespace,
+        'dry_run': dry_run,
+        'graphiti': {
+            'count': len(graphiti_rows),
+            'node_uuids': [row['uuid'] for row in graphiti_rows],
+        },
+        'mem0': {
+            'count': len(mem0_members),
+            'memory_ids': [m['id'] for m in mem0_members],
+        },
+        'stale_flags': {
+            'uuids': list(flag_uuids),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Graphiti: enumerate + purge
+# ---------------------------------------------------------------------------
+
+async def enumerate_graphiti_namespace(
+    graphiti: Any,
+    namespace: str,
+    *,
+    limit: int = 1000,
+) -> list[dict]:
+    """Read-only enumeration of every node in the *namespace* FalkorDB graph."""
+    graph = graphiti._graph_for(namespace)
+    result = await graph.ro_query(
+        'MATCH (n) RETURN n.uuid, labels(n), n.name LIMIT $limit',
+        {'limit': limit},
+    )
+    rows = result.result_set or []
+    if len(rows) >= limit:
+        logger.warning(
+            "purge_knowlive_namespace: enumerated %d node(s) in graph '%s', which "
+            "hit limit=%d -- enumeration may be incomplete. Re-run with a higher "
+            "--limit value to ensure the full namespace is covered.",
+            len(rows), namespace, limit,
+        )
+    return [
+        {'uuid': row[0], 'labels': row[1], 'name': row[2]}
+        for row in rows
+    ]
+
+
+async def purge_graphiti_namespace(graphiti: Any, namespace: str) -> dict:
+    """Best-effort ``MATCH (n) DETACH DELETE n`` against the *namespace* graph."""
+    graph = graphiti._graph_for(namespace)
+    try:
+        await graph.query('MATCH (n) DETACH DELETE n')
+    except Exception as e:
+        logger.warning(
+            "purge_knowlive_namespace: failed to purge graph '%s': %s",
+            namespace, e,
+        )
+        return {'ok': False, 'error': str(e)}
+    return {'ok': True, 'error': None}
+
+
+# ---------------------------------------------------------------------------
+# Mem0: enumerate + purge
+# ---------------------------------------------------------------------------
+
+async def enumerate_mem0_namespace(
+    memory_service: Any,
+    namespace: str,
+    *,
+    limit: int = 1000,
+) -> tuple[list[dict], int]:
+    """Deterministic (non-semantic) enumeration of Mem0 memories scoped to *namespace*."""
+    count = await memory_service.count_memories_by_metadata(
+        project_id=namespace, filters={},
+    )
+    members = await memory_service.get_memories_by_metadata(
+        project_id=namespace, filters={}, limit=limit,
+    )
+    if len(members) < count:
+        logger.warning(
+            "purge_knowlive_namespace: enumerated %d of %d mem0 memories in "
+            "'%s' (scroll limit=%d) -- scroll cap reached; re-run with a "
+            "higher --limit value to ensure all records are covered.",
+            len(members), count, namespace, limit,
+        )
+    return members, count
+
+
+async def purge_mem0_namespace(
+    memory_service: Any,
+    namespace: str,
+    members: list[dict],
+) -> dict:
+    """Best-effort delete of every Mem0 *members* entry scoped to *namespace*."""
+    if not members:
+        return {'deleted': 0, 'failed': []}
+
+    async def _delete_one(member: dict):
+        return await memory_service.delete_memory(
+            memory_id=member['id'],
+            store='mem0',
+            project_id=namespace,
+            _source='purge_knowlive_namespace',
+        )
+
+    results = await asyncio.gather(
+        *(_delete_one(m) for m in members),
+        return_exceptions=True,
+    )
+
+    deleted = 0
+    failed: list[str] = []
+    for member, result in zip(members, results, strict=False):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'purge_knowlive_namespace: failed to delete mem0 memory %s: %s',
+                member['id'], result,
+            )
+            failed.append(member['id'])
+        else:
+            deleted += 1
+
+    return {'deleted': deleted, 'failed': failed}
+
+
+# ---------------------------------------------------------------------------
+# Stale-flag retirement (dark_factory)
+# ---------------------------------------------------------------------------
+
+async def retire_stale_flags(
+    memory_service: Any,
+    edge_uuids: tuple[str, ...] | list[str] = STALE_FLAG_EDGE_UUIDS,
+    host_project: str = FLAG_HOST_PROJECT,
+    *,
+    invalidation_time: datetime,
+) -> dict:
+    """Best-effort ``update_edge(invalid_at=...)`` for each stale-flag edge uuid."""
+    async def _retire_one(edge_uuid: str):
+        return await memory_service.update_edge(
+            edge_uuid=edge_uuid,
+            project_id=host_project,
+            invalid_at=invalidation_time,
+            _source='purge_knowlive_namespace',
+        )
+
+    results = await asyncio.gather(
+        *(_retire_one(u) for u in edge_uuids),
+        return_exceptions=True,
+    )
+
+    invalidated = 0
+    failed: list[str] = []
+    for edge_uuid, result in zip(edge_uuids, results, strict=False):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'purge_knowlive_namespace: failed to invalidate stale-flag edge %s: %s',
+                edge_uuid, result,
+            )
+            failed.append(edge_uuid)
+        else:
+            invalidated += 1
+
+    return {'invalidated': invalidated, 'failed': failed}
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+async def run(
+    args: Any,
+    memory_service: Any,
+    *,
+    invalidation_time: datetime,
+) -> dict:
+    """Enumerate the legacy namespace and, with ``args.apply``, purge + retire flags."""
+    namespace: str = getattr(args, 'namespace', None) or LEGACY_NAMESPACE
+    limit: int = getattr(args, 'limit', 1000)
+    flag_uuids: tuple[str, ...] | list[str] = (
+        getattr(args, 'flag_uuids', None) or STALE_FLAG_EDGE_UUIDS
+    )
+    host_project: str = getattr(args, 'flag_host_project', None) or FLAG_HOST_PROJECT
+
+    graphiti_rows = await enumerate_graphiti_namespace(
+        memory_service.graphiti, namespace, limit=limit,
+    )
+    mem0_members, mem0_count = await enumerate_mem0_namespace(
+        memory_service, namespace, limit=limit,
+    )
+
+    report = build_purge_report(
+        namespace, graphiti_rows, mem0_members, flag_uuids, dry_run=not args.apply,
+    )
+    # Self-document enumeration completeness so the manifest -- "the only
+    # recovery record of what is about to be deleted" -- never under-reports
+    # the true population. build_purge_report only knows the already-
+    # enumerated slice, but purge_graphiti_namespace's DETACH DELETE is
+    # unbounded by --limit: a capped graphiti enumeration means --apply would
+    # delete more nodes than this manifest lists. Similarly, mem0's
+    # authoritative count (from count_memories_by_metadata) can exceed the
+    # enumerated/deletable slice when the scroll itself is capped.
+    report['graphiti']['enumeration_capped'] = len(graphiti_rows) >= limit
+    report['mem0']['count'] = mem0_count
+    report['mem0']['enumerated'] = len(mem0_members)
+
+    if not args.apply:
+        return report
+
+    # --- Mutate: purge both stores, then retire the stale-flag edges. ---
+    graphiti_purge_result = await purge_graphiti_namespace(memory_service.graphiti, namespace)
+    mem0_purge_result = await purge_mem0_namespace(memory_service, namespace, mem0_members)
+    flags_result = await retire_stale_flags(
+        memory_service, flag_uuids, host_project, invalidation_time=invalidation_time,
+    )
+
+    report['graphiti']['purge'] = graphiti_purge_result
+    report['deleted'] = mem0_purge_result['deleted']
+    report['mem0_failed'] = mem0_purge_result['failed']
+    report['invalidated'] = flags_result['invalidated']
+    report['flags_failed'] = flags_result['failed']
+
+    # --- After-counts: re-query rather than trust the optimistic deletes. ---
+    after_graphiti_rows = await enumerate_graphiti_namespace(
+        memory_service.graphiti, namespace, limit=limit,
+    )
+    after_mem0_count = await memory_service.count_memories_by_metadata(
+        project_id=namespace, filters={},
+    )
+    report['after'] = {
+        'graphiti_count': len(after_graphiti_rows),
+        'mem0_count': after_mem0_count,
+    }
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    """Parse CLI args, build a live MemoryService, and run the purge."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+    )
+    parser = argparse.ArgumentParser(
+        description=(
+            'Purge the legacy knowlive namespace (Graphiti graph + Mem0 memories) '
+            'and retire its stale-flag edges in dark_factory.'
+        ),
+    )
+    parser.add_argument(
+        '--apply', action='store_true', default=False,
+        help='Commit the purge + flag retirement (default: dry-run only, report and exit).',
+    )
+    parser.add_argument(
+        '--namespace', default=LEGACY_NAMESPACE,
+        help=f'Legacy namespace to purge (default: {LEGACY_NAMESPACE}).',
+    )
+    parser.add_argument(
+        '--flag-host-project', dest='flag_host_project', default=FLAG_HOST_PROJECT,
+        help=f'Project hosting the stale-flag edges (default: {FLAG_HOST_PROJECT}).',
+    )
+    parser.add_argument(
+        '--flag-uuids', dest='flag_uuids', nargs='*', default=None,
+        help='Stale-flag edge uuids to retire (default: the two canonical uuids).',
+    )
+    parser.add_argument(
+        '--limit', type=int, default=1000,
+        help='Maximum records to enumerate per store (default: 1000). Increase if '
+             'the dry-run report logs a scroll/limit-cap WARNING.',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        import os  # noqa: PLC0415
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    async def _run_live() -> dict:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        try:
+            await memory.initialize()
+            return await run(args, memory, invalidation_time=datetime.now(UTC))
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+
+    report = asyncio.run(_run_live())
+    print(json.dumps(report, indent=2, default=str))
+    if not args.apply:
+        logger.info('Dry run -- nothing was modified. Use --apply to commit the purge.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
