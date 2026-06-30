@@ -7989,7 +7989,7 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
 
         return git_ops, lane, start_ref
 
-    async def test_reclaim_warm_returns_worktree_info(self, git_repo: Path):
+    async def test_reclaim_warm_returns_worktree_info(self, git_repo: Path, caplog):
         """(a) With callbacks wired: acquire_warm_lane returns WorktreeInfo, not EXHAUSTED."""
         git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
 
@@ -8003,7 +8003,8 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
         pool = git_ops.warm_lane_pool
         assert pool is not None
 
-        result = await git_ops.acquire_warm_lane('Z', start_ref)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('Z', start_ref)
 
         assert isinstance(result, WorktreeInfo), (
             f'With reclaim callbacks wired, acquire_warm_lane must return WorktreeInfo '
@@ -8027,6 +8028,17 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
         )
         assert pool.assignment_for('Z') == lane, (
             'Z must be assigned to _lane-0 after reclaim'
+        )
+
+        # The steal must be logged at WARNING — this is the only ops signal
+        # that the safety valve fired (= real pool pressure); a regression
+        # that silently downgrades or drops it should fail this test.
+        assert any(
+            'reclaim-on-exhaustion — stole lane' in r.message
+            for r in caplog.records
+        ), (
+            f'Expected a WARNING logging the reclaim steal; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
         )
 
     async def test_never_steal_dispatched(self, git_repo: Path):
@@ -8071,7 +8083,18 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
         )
 
     async def test_wip_preserved_on_victim_branch(self, git_repo: Path):
-        """(d) Uncommitted WIP in victim lane is committed before reset; task/V ref survives."""
+        """(d) Uncommitted WIP in victim lane is committed before reset; task/V ref survives.
+
+        What this actually exercises: ``git checkout -f -B task/Z`` on the
+        stolen lane only repoints/creates the branch the lane checks out next
+        — it never deletes the ``task/V`` ref, so task/V survives the steal
+        regardless of any separate retention/GC policy. The property under
+        test is that the pre-reset ``commit()`` call lands the victim's WIP
+        onto that still-intact ref *before* the lane is repointed, so a
+        resumed victim can recover it via the reattach path. This test does
+        not drive a branch-deletion/GC path, so it is not itself a guard on
+        1912 branch-retention behaviour.
+        """
         git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
 
         # Leave uncommitted tracked WIP on V's lane
@@ -8092,23 +8115,30 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
             f'With WIP-preservation reclaim, must return WorktreeInfo; got {result!r}'
         )
 
-        # task/V branch ref must still exist (WIP committed + branch retained by 1912)
+        # task/V branch ref must still exist: `checkout -f -B task/Z` only
+        # repoints the lane's newly-checked-out branch — it never deletes
+        # task/V, so the ref survives independent of any retention/GC policy.
         rc_verify, _, _ = await _run(
             ['git', 'rev-parse', '--verify', 'refs/heads/task/V'], cwd=git_repo,
         )
         assert rc_verify == 0, (
             'task/V branch ref must survive reclaim '
-            '(WIP committed before reset; 1912 branch-retention preserves it)'
+            '(checkout -f -B task/Z repoints the lane, it does not delete '
+            'task/V; this test does not exercise branch GC/retention)'
         )
 
-        # task/V must carry at least 1 commit beyond main (the WIP commit)
+        # task/V must carry at least 1 commit beyond main — this is what
+        # actually proves the pre-reset commit() call landed the WIP onto
+        # task/V before the lane was repointed, not merely that the ref
+        # happens to still exist.
         _, count_raw, _ = await _run(
             ['git', 'rev-list', '--count', 'main..task/V'], cwd=git_repo,
         )
         wip_commits = int(count_raw.strip())
         assert wip_commits >= 1, (
             f'task/V must carry at least 1 WIP commit beyond main, got {wip_commits} '
-            '(commit-before-reset must have saved the uncommitted changes)'
+            '(commit-before-reset must have saved the uncommitted changes onto '
+            'task/V prior to the lane being repointed to task/Z)'
         )
 
     async def test_empty_eligible_set_returns_exhausted(self, git_repo: Path):

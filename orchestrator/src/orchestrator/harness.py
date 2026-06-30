@@ -2018,8 +2018,10 @@ Output JSON matching the schema. Every task must appear in the output.
         Installed as :attr:`git_ops.warm_lane_reclaim_candidate_provider` when
         the knob is on (task 1933).  Mirrors ``_reconcile_terminal_lanes``
         INVERTED: keep branches whose status is known and NOT in
-        ``{done, cancelled}``; abort to ``set()`` on ``resolver_failed``
+        :data:`TERMINAL_STATUSES`; abort to ``set()`` on ``resolver_failed``
         (same fail-safe as the reconciler — never act on a degraded/empty read).
+        Both methods reference the same shared ``TERMINAL_STATUSES`` constant
+        so the inversion cannot silently drift if the terminal set ever changes.
 
         **Single-orchestrator-ownership invariant:** The warm-lane pool is
         exclusively owned by this orchestrator process.  A non-terminal task
@@ -2052,8 +2054,8 @@ Output JSON matching the schema. Every task must appear in the output.
             return set()
         return {
             b for b in candidates
-            if statuses.get(b) is not None
-            and statuses.get(b) not in ('done', 'cancelled')
+            if (status := statuses.get(b)) is not None
+            and status not in TERMINAL_STATUSES
         }
 
     def _is_branch_dispatched(self, branch: str) -> bool:
@@ -2116,7 +2118,7 @@ Output JSON matching the schema. Every task must appear in the output.
         released = 0
         for branch in list(assignments.keys()):
             status = statuses.get(branch)
-            if status not in ('done', 'cancelled'):
+            if status not in TERMINAL_STATUSES:
                 continue
             if branch in self.scheduler._dispatched:
                 # Live-acquire guard: a workflow may have just acquired this
