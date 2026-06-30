@@ -476,3 +476,98 @@ class TestRetireStaleFlags:
         )
 
         assert result == {'invalidated': 2, 'failed': []}
+
+
+# ===========================================================================
+# Tests: run() -- dry-run path
+# ===========================================================================
+
+class TestRunDryRun:
+    """Tests for async run(args, memory_service, *, invalidation_time) in dry-run."""
+
+    def _args(self, apply: bool = False, **overrides):
+        import types as _types
+        base = {'apply': apply}
+        base.update(overrides)
+        return _types.SimpleNamespace(**base)
+
+    def _make_memory_service(
+        self, graphiti_rows: list[list] | None = None,
+        mem0_members: list[dict] | None = None,
+        mem0_count: int | None = None,
+    ):
+        """AsyncMock memory_service with a MagicMock .graphiti wired for
+        enumerate_graphiti_namespace / enumerate_mem0_namespace."""
+        memory_service = AsyncMock()
+        graph = _make_graph_mock(graphiti_rows or [])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+        memory_service.graphiti = graphiti
+        members = mem0_members or []
+        memory_service.count_memories_by_metadata = AsyncMock(
+            return_value=mem0_count if mem0_count is not None else len(members)
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.update_edge = AsyncMock(return_value=None)
+        return memory_service, graph
+
+    @pytest.mark.asyncio
+    async def test_dry_run_does_not_mutate(self):
+        """Dry-run (args.apply=False): no DETACH DELETE, no delete_memory,
+        no update_edge -- nothing is mutated."""
+        rows = [['uuid-1', ['Entity'], 'Node A']]
+        members = [_mem0_member('m1')]
+        memory_service, graph = self._make_memory_service(
+            graphiti_rows=rows, mem0_members=members,
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        await _mod.run(
+            self._args(apply=False), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        graph.query.assert_not_called()
+        memory_service.delete_memory.assert_not_called()
+        memory_service.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_report_shape(self):
+        """Dry-run report has dry_run=True, enumerated graphiti node_uuids +
+        mem0 memory_ids, and the stale_flags uuids."""
+        rows = [['uuid-1', ['Entity'], 'Node A'], ['uuid-2', ['Entity'], 'Node B']]
+        members = [_mem0_member('m1'), _mem0_member('m2')]
+        memory_service, _ = self._make_memory_service(
+            graphiti_rows=rows, mem0_members=members,
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert report['namespace'] == 'knowlive'
+        assert report['dry_run'] is True
+        assert report['graphiti']['count'] == 2
+        assert report['graphiti']['node_uuids'] == ['uuid-1', 'uuid-2']
+        assert report['mem0']['count'] == 2
+        assert report['mem0']['memory_ids'] == ['m1', 'm2']
+        assert report['stale_flags']['uuids'] == list(_mod.STALE_FLAG_EDGE_UUIDS)
+
+    @pytest.mark.asyncio
+    async def test_dry_run_uses_default_namespace_when_unset(self):
+        """With no args.namespace, LEGACY_NAMESPACE is used to enumerate both stores."""
+        memory_service, _ = self._make_memory_service()
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        await _mod.run(
+            self._args(apply=False), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        memory_service.graphiti._graph_for.assert_called_once_with(_mod.LEGACY_NAMESPACE)
+        memory_service.count_memories_by_metadata.assert_called_once_with(
+            project_id=_mod.LEGACY_NAMESPACE, filters={},
+        )
