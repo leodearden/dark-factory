@@ -176,6 +176,8 @@ class MemoryService:
             retry_base_seconds=qcfg.retry_base_seconds,
             retry_max_delay_seconds=qcfg.retry_max_delay_seconds,
             write_timeout_seconds=qcfg.write_timeout_seconds,
+            transient_max_attempts=qcfg.transient_max_attempts,
+            transient_error_names=qcfg.transient_error_names,
         )
         self.durable_queue.register_callback(
             'dual_write_episode', self._dual_write_callback
