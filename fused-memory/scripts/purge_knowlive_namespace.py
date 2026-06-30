@@ -183,7 +183,35 @@ async def purge_mem0_namespace(
     members: list[dict],
 ) -> dict:
     """Best-effort delete of every Mem0 *members* entry scoped to *namespace*."""
-    raise NotImplementedError
+    if not members:
+        return {'deleted': 0, 'failed': []}
+
+    async def _delete_one(member: dict):
+        return await memory_service.delete_memory(
+            memory_id=member['id'],
+            store='mem0',
+            project_id=namespace,
+            _source='purge_knowlive_namespace',
+        )
+
+    results = await asyncio.gather(
+        *(_delete_one(m) for m in members),
+        return_exceptions=True,
+    )
+
+    deleted = 0
+    failed: list[str] = []
+    for member, result in zip(members, results, strict=False):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'purge_knowlive_namespace: failed to delete mem0 memory %s: %s',
+                member['id'], result,
+            )
+            failed.append(member['id'])
+        else:
+            deleted += 1
+
+    return {'deleted': deleted, 'failed': failed}
 
 
 # ---------------------------------------------------------------------------
