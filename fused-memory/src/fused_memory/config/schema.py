@@ -371,6 +371,29 @@ class ReconciliationConfig(BaseModel):
     # Explore agent
     explore_codebase_root: str = Field(default='.')
 
+    # Defense-in-depth Landlock confinement of recon stage/remediation agents
+    # (task 1935).  When enabled, every agent spawned through run_stage_via_cli
+    # (Stage 1/2/3 + remediation passes) is confined by a kernel Landlock
+    # ruleset (falling back to bwrap) that makes `/` read-only and DENIES writes
+    # to every tracked source file in the repository.  The only writable paths
+    # are the built-in agent scratch (/tmp, ~/.claude, /dev) plus the gitignored
+    # root .task/ directory, preserving the agent's legitimate side-effects
+    # (sysprompt/mcp temp files, OAuth state) while blocking hand-patching of
+    # production code.
+    #
+    # sandbox_recon_agents: True  (default-on = safety posture; host kernel ≥5.13
+    #   supports Landlock).  Set False only on a sandbox-less host where Landlock
+    #   and bwrap are both unavailable — running unconfined is then an explicit
+    #   operator opt-out.  Fail-CLOSED when True but no backend is available
+    #   (run_stage_via_cli returns an error StageResult rather than running an
+    #   unconfined agent).
+    #
+    # sandbox_recon_writable_extras: additional paths to add to the writable set
+    #   (e.g. a uvx/pip cache dir used by a stdio MCP server).  Empty by default;
+    #   use only when an MCP server genuinely needs to write outside /tmp.
+    sandbox_recon_agents: bool = Field(default=True)
+    sandbox_recon_writable_extras: list[str] = Field(default_factory=list)
+
     # Quiescence / burst detection
     conditional_trigger_ratio: float = Field(default=0.33)
     burst_window_seconds: float = Field(default=30.0)
