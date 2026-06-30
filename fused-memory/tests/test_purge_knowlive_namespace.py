@@ -203,3 +203,77 @@ class TestEnumerateGraphitiNamespace:
             await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
 
         assert caplog.records == []
+
+
+# ===========================================================================
+# Tests: enumerate_mem0_namespace
+# ===========================================================================
+
+class TestEnumerateMem0Namespace:
+    """Tests for async enumerate_mem0_namespace(memory_service, namespace, *, limit)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_count_and_scroll_with_project_id_and_empty_filters(self):
+        """Both count_memories_by_metadata and get_memories_by_metadata are
+        called with project_id=namespace and filters={} (deterministic, not
+        semantic search)."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        memory_service.get_memories_by_metadata = AsyncMock(
+            return_value=[_mem0_member('m1'), _mem0_member('m2')]
+        )
+        memory_service.search = AsyncMock()
+
+        await _mod.enumerate_mem0_namespace(memory_service, 'knowlive', limit=1000)
+
+        memory_service.count_memories_by_metadata.assert_called_once_with(
+            project_id='knowlive', filters={},
+        )
+        scroll_kwargs = memory_service.get_memories_by_metadata.call_args.kwargs
+        assert scroll_kwargs.get('project_id') == 'knowlive'
+        assert scroll_kwargs.get('filters') == {}
+        memory_service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_members_and_count_tuple(self):
+        """Returns (members, count) -- the full list plus the authoritative count."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        members = [_mem0_member('m1'), _mem0_member('m2')]
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+
+        result = await _mod.enumerate_mem0_namespace(memory_service, 'knowlive', limit=1000)
+
+        assert result == (members, 2)
+
+    @pytest.mark.asyncio
+    async def test_warns_when_scroll_undercounts(self, caplog):
+        """No-silent-caps: fewer enumerated members than the authoritative count
+        logs a WARNING (scroll cap reached)."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=5)
+        memory_service.get_memories_by_metadata = AsyncMock(
+            return_value=[_mem0_member('m1'), _mem0_member('m2')]
+        )
+
+        with caplog.at_level('WARNING'):
+            await _mod.enumerate_mem0_namespace(memory_service, 'knowlive', limit=2)
+
+        assert any('scroll' in rec.message.lower() or 'limit' in rec.message.lower()
+                    for rec in caplog.records), (
+            f'Expected a scroll-cap WARNING, got: {[r.message for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_fully_enumerated(self, caplog):
+        """member count == authoritative count -> no WARNING."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        memory_service.get_memories_by_metadata = AsyncMock(
+            return_value=[_mem0_member('m1'), _mem0_member('m2')]
+        )
+
+        with caplog.at_level('WARNING'):
+            await _mod.enumerate_mem0_namespace(memory_service, 'knowlive', limit=1000)
+
+        assert caplog.records == []
