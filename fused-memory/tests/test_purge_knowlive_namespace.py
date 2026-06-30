@@ -572,6 +572,58 @@ class TestRunDryRun:
             project_id=_mod.LEGACY_NAMESPACE, filters={},
         )
 
+    @pytest.mark.asyncio
+    async def test_reports_enumeration_capped_when_graphiti_limit_hit(self):
+        """The manifest self-documents an incomplete graphiti enumeration:
+        report['graphiti']['enumeration_capped'] is True when the row count
+        hits --limit, since --apply's DETACH DELETE is unbounded by limit and
+        would silently delete nodes absent from this recovery record."""
+        rows = [['uuid-1', ['Entity'], 'Node A'], ['uuid-2', ['Entity'], 'Node B']]
+        memory_service, _ = self._make_memory_service(graphiti_rows=rows)
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        report = await _mod.run(
+            self._args(apply=False, limit=2), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert report['graphiti']['enumeration_capped'] is True
+
+    @pytest.mark.asyncio
+    async def test_reports_enumeration_not_capped_when_under_graphiti_limit(self):
+        """Row count below --limit -> enumeration_capped=False."""
+        rows = [['uuid-1', ['Entity'], 'Node A']]
+        memory_service, _ = self._make_memory_service(graphiti_rows=rows)
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        report = await _mod.run(
+            self._args(apply=False, limit=1000), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert report['graphiti']['enumeration_capped'] is False
+
+    @pytest.mark.asyncio
+    async def test_reports_authoritative_mem0_count_distinct_from_enumerated(self):
+        """report['mem0']['count'] is the authoritative count_memories_by_metadata
+        total, not len(memory_ids) -- a scroll-capped namespace must not be
+        under-reported in the manifest. report['mem0']['enumerated'] carries the
+        enumerated/deletable slice size separately."""
+        members = [_mem0_member('m1'), _mem0_member('m2')]
+        memory_service, _ = self._make_memory_service(
+            mem0_members=members, mem0_count=5,
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        report = await _mod.run(
+            self._args(apply=False, limit=2), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert report['mem0']['count'] == 5
+        assert report['mem0']['enumerated'] == 2
+        assert report['mem0']['memory_ids'] == ['m1', 'm2']
+
 
 # ===========================================================================
 # Tests: run() -- apply path

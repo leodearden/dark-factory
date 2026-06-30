@@ -275,13 +275,24 @@ async def run(
     graphiti_rows = await enumerate_graphiti_namespace(
         memory_service.graphiti, namespace, limit=limit,
     )
-    mem0_members, _mem0_count = await enumerate_mem0_namespace(
+    mem0_members, mem0_count = await enumerate_mem0_namespace(
         memory_service, namespace, limit=limit,
     )
 
     report = build_purge_report(
         namespace, graphiti_rows, mem0_members, flag_uuids, dry_run=not args.apply,
     )
+    # Self-document enumeration completeness so the manifest -- "the only
+    # recovery record of what is about to be deleted" -- never under-reports
+    # the true population. build_purge_report only knows the already-
+    # enumerated slice, but purge_graphiti_namespace's DETACH DELETE is
+    # unbounded by --limit: a capped graphiti enumeration means --apply would
+    # delete more nodes than this manifest lists. Similarly, mem0's
+    # authoritative count (from count_memories_by_metadata) can exceed the
+    # enumerated/deletable slice when the scroll itself is capped.
+    report['graphiti']['enumeration_capped'] = len(graphiti_rows) >= limit
+    report['mem0']['count'] = mem0_count
+    report['mem0']['enumerated'] = len(mem0_members)
 
     if not args.apply:
         return report
