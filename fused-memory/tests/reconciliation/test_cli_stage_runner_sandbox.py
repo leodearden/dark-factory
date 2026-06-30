@@ -9,13 +9,13 @@ Verifies:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from shared.cli_invoke import AgentResult
+
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.reconciliation.cli_stage_runner import StageResult, run_stage_via_cli
+from fused_memory.reconciliation.cli_stage_runner import run_stage_via_cli
 from fused_memory.reconciliation.sandbox_guard import RemediationSandboxUnavailable
 
 
@@ -66,7 +66,7 @@ async def test_confinement_on_passes_wrap_to_invoke(tmp_path):
         return_value=sentinel_wrap,
     ) as mock_resolve:
         config = _make_config(sandbox_recon_agents=True)
-        result = await run_stage_via_cli(
+        await run_stage_via_cli(
             system_prompt='sys',
             payload='pay',
             disallowed_tools=[],
@@ -141,7 +141,7 @@ async def test_confinement_off_no_wrap(tmp_path):
         'fused_memory.reconciliation.cli_stage_runner.resolve_recon_sandbox_wrap',
     ) as mock_resolve:
         config = _make_config(sandbox_recon_agents=False)
-        result = await run_stage_via_cli(
+        await run_stage_via_cli(
             system_prompt='sys',
             payload='pay',
             disallowed_tools=[],

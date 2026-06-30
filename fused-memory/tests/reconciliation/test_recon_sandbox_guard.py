@@ -16,7 +16,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -34,7 +34,7 @@ except ImportError:
     _SANDBOX_GUARD_AVAILABLE = False
 
 try:
-    from orchestrator.agents.landlock import is_landlock_available
+    from orchestrator.agents.landlock import is_landlock_available  # type: ignore[import-not-found]
     _LANDLOCK_IMPORTABLE = True
 except ImportError:
     _LANDLOCK_IMPORTABLE = False
@@ -87,7 +87,7 @@ class TestSandboxGuardLandlockBranch:
             'orchestrator.agents.landlock.is_landlock_available',
             return_value=True,
         ):
-            wrap = resolve_recon_sandbox_wrap(tmp_path, writable_extras=['/var/tmp/extra'])
+            wrap = resolve_recon_sandbox_wrap(tmp_path, writable_extras=['/var/tmp/extra'])  # type: ignore[possibly-unbound]
 
         inner = ['claude', '--print']
         wrapped = wrap(inner)
@@ -127,12 +127,12 @@ class TestSandboxGuardLandlockBranch:
         write access to /tmp (agent scratch). leaf-signal #1.
         """
         base = Path(tempfile.mkdtemp(prefix='recon-landlock-test-', dir='/var/tmp'))
+        nonce = uuid.uuid4().hex
         try:
             repo = base / 'repo'
             repo.mkdir()
             (repo / 'src').mkdir()
 
-            nonce = uuid.uuid4().hex
             # Try to write to repo (should be denied); write to /tmp (should succeed)
             inner = [
                 '/bin/sh', '-c',
@@ -141,7 +141,7 @@ class TestSandboxGuardLandlockBranch:
                     f'touch /tmp/{nonce} && echo tmp_ok'
                 ),
             ]
-            wrap = resolve_recon_sandbox_wrap(base)
+            wrap = resolve_recon_sandbox_wrap(base)  # type: ignore[possibly-unbound]
             wrapped = wrap(inner)
             result = subprocess.run(wrapped, capture_output=True, text=True, timeout=15)
 
@@ -194,7 +194,7 @@ class TestSandboxGuardLandlockBranch:
                     f"s.close(); print('net_ok')"
                 ),
             ]
-            wrap = resolve_recon_sandbox_wrap(tmp_path)
+            wrap = resolve_recon_sandbox_wrap(tmp_path)  # type: ignore[possibly-unbound]
             wrapped = wrap(inner)
             result = subprocess.run(wrapped, capture_output=True, text=True, timeout=15)
             assert result.returncode == 0, (
@@ -224,9 +224,8 @@ class TestSandboxGuardFailClosedAndBwrap:
         ), patch(
             'orchestrator.agents.sandbox.is_bwrap_available',
             return_value=False,
-        ):
-            with pytest.raises(RemediationSandboxUnavailable):
-                resolve_recon_sandbox_wrap(tmp_path)
+        ), pytest.raises(RemediationSandboxUnavailable):  # type: ignore[possibly-unbound]
+            resolve_recon_sandbox_wrap(tmp_path)  # type: ignore[possibly-unbound]
 
     def test_bwrap_fallback_when_landlock_unavailable(self, tmp_path: Path) -> None:
         """When Landlock is unavailable and bwrap is available, routes to bwrap.
@@ -245,7 +244,7 @@ class TestSandboxGuardFailClosedAndBwrap:
             'orchestrator.agents.sandbox.build_bwrap_command',
             return_value=sentinel_result,
         ) as mock_bwrap:
-            wrap = resolve_recon_sandbox_wrap(tmp_path, writable_extras=['/e'])
+            wrap = resolve_recon_sandbox_wrap(tmp_path, writable_extras=['/e'])  # type: ignore[possibly-unbound]
             result = wrap(['claude'])
 
         assert result is sentinel_result
