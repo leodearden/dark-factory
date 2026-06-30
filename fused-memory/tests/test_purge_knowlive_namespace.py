@@ -277,3 +277,65 @@ class TestEnumerateMem0Namespace:
             await _mod.enumerate_mem0_namespace(memory_service, 'knowlive', limit=1000)
 
         assert caplog.records == []
+
+
+# ===========================================================================
+# Tests: purge_graphiti_namespace
+# ===========================================================================
+
+class TestPurgeGraphitiNamespace:
+    """Tests for async purge_graphiti_namespace(graphiti, namespace)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_graph_for_with_namespace(self):
+        """graphiti._graph_for is called with the namespace argument."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.purge_graphiti_namespace(graphiti, 'knowlive')
+
+        graphiti._graph_for.assert_called_once_with('knowlive')
+
+    @pytest.mark.asyncio
+    async def test_issues_detach_delete_write_query_not_ro_query(self):
+        """Purge is a WRITE: graph.query (NOT ro_query) is called with a
+        'MATCH (n) DETACH DELETE n'-shaped Cypher statement."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.purge_graphiti_namespace(graphiti, 'knowlive')
+
+        graph.query.assert_called_once()
+        cypher = graph.query.call_args.args[0]
+        assert 'DETACH DELETE' in cypher
+        graph.ro_query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_ok_result_dict_on_success(self):
+        """A successful purge returns a result dict with ok=True and no error."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.purge_graphiti_namespace(graphiti, 'knowlive')
+
+        assert result == {'ok': True, 'error': None}
+
+    @pytest.mark.asyncio
+    async def test_best_effort_raising_query_is_caught_not_raised(self):
+        """A raising graph.query is caught (best-effort): the exception does
+        NOT propagate, and is instead recorded in the result via ok=False
+        plus an error message."""
+        graphiti = MagicMock()
+        graph = MagicMock()
+        graph.query = AsyncMock(side_effect=RuntimeError('FalkorDB connection lost'))
+        graph.ro_query = AsyncMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        # Must not raise.
+        result = await _mod.purge_graphiti_namespace(graphiti, 'knowlive')
+
+        assert result['ok'] is False
+        assert 'FalkorDB connection lost' in result['error']
