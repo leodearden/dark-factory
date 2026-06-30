@@ -13,8 +13,14 @@ from typing import TYPE_CHECKING, Any
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+from fused_memory.reconciliation.sandbox_guard import (
+    RemediationSandboxUnavailable,
+    resolve_recon_sandbox_wrap,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import ReconciliationConfig
@@ -332,6 +338,30 @@ async def run_stage_via_cli(
 
     start_ms = int(time.monotonic() * 1000)
 
+    # ── Defense-in-depth Landlock confinement (task 1935) ─────────────────────
+    # When sandbox_recon_agents=True, resolve a sandbox-wrap callable that
+    # confines the entire claude process tree (kernel-level Landlock or bwrap).
+    # Fail-CLOSED: if confinement is requested but no backend is available,
+    # return an error StageResult WITHOUT calling invoke_with_cap_retry (never
+    # run an unconfined agent when confinement is explicitly enabled).
+    sandbox_wrap: Callable[[list[str]], list[str]] | None = None
+    if getattr(config, 'sandbox_recon_agents', False):
+        try:
+            sandbox_wrap = resolve_recon_sandbox_wrap(
+                effective_cwd,
+                list(getattr(config, 'sandbox_recon_writable_extras', [])),
+            )
+        except RemediationSandboxUnavailable as exc:
+            logger.error(
+                'Reconciliation agent NOT launched (fail-closed): %s', exc,
+            )
+            duration_ms = int(time.monotonic() * 1000) - start_ms
+            return StageResult(
+                error=str(exc),
+                duration_ms=duration_ms,
+                model=effective_model,
+            )
+
     try:
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=usage_gate,
@@ -348,6 +378,7 @@ async def run_stage_via_cli(
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
             cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            sandbox_wrap=sandbox_wrap,
         )
     except AllAccountsCappedException:
         logger.warning(
