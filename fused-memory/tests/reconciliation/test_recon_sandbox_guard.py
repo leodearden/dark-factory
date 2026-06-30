@@ -203,3 +203,60 @@ class TestSandboxGuardLandlockBranch:
             assert 'net_ok' in result.stdout, f'stdout={result.stdout!r}'
         finally:
             t.join(timeout=2)
+
+
+# ── Fail-closed and bwrap fallback (S7 / S8) ─────────────────────────────────
+
+
+@pytest.mark.skipif(not _SANDBOX_GUARD_AVAILABLE, reason='sandbox_guard not yet implemented')
+class TestSandboxGuardFailClosedAndBwrap:
+    """Fail-closed and bwrap-fallback paths for resolve_recon_sandbox_wrap."""
+
+    def test_fail_closed_when_no_backend(self, tmp_path: Path) -> None:
+        """When both Landlock and bwrap are unavailable, raises RemediationSandboxUnavailable.
+
+        An identity/passthrough wrap must never be returned — that would
+        silently reopen the write hole.
+        """
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=False,
+        ), patch(
+            'orchestrator.agents.sandbox.is_bwrap_available',
+            return_value=False,
+        ):
+            with pytest.raises(RemediationSandboxUnavailable):
+                resolve_recon_sandbox_wrap(tmp_path)
+
+    def test_bwrap_fallback_when_landlock_unavailable(self, tmp_path: Path) -> None:
+        """When Landlock is unavailable and bwrap is available, routes to bwrap.
+
+        Confirms writable_modules=[] and writable_extras are forwarded
+        to build_bwrap_command.
+        """
+        sentinel_result = ['bwrap', '--', 'claude']
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=False,
+        ), patch(
+            'orchestrator.agents.sandbox.is_bwrap_available',
+            return_value=True,
+        ), patch(
+            'orchestrator.agents.sandbox.build_bwrap_command',
+            return_value=sentinel_result,
+        ) as mock_bwrap:
+            wrap = resolve_recon_sandbox_wrap(tmp_path, writable_extras=['/e'])
+            result = wrap(['claude'])
+
+        assert result is sentinel_result
+        mock_bwrap.assert_called_once()
+        call_kwargs = mock_bwrap.call_args
+        # Second positional arg is cwd (worktree), third is writable_modules
+        # (must be []), and writable_extras must be ['/e']
+        _cmd, called_cwd, called_modules = call_kwargs.args[:3]
+        assert called_modules == [], (
+            f'writable_modules must be [] for deny-repo-writes; got {called_modules}'
+        )
+        assert call_kwargs.kwargs.get('writable_extras') == ['/e'], (
+            f'writable_extras should forward ["/e"]; got {call_kwargs.kwargs}'
+        )
