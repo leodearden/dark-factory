@@ -270,6 +270,7 @@ async def run(
     flag_uuids: tuple[str, ...] | list[str] = (
         getattr(args, 'flag_uuids', None) or STALE_FLAG_EDGE_UUIDS
     )
+    host_project: str = getattr(args, 'flag_host_project', None) or FLAG_HOST_PROJECT
 
     graphiti_rows = await enumerate_graphiti_namespace(
         memory_service.graphiti, namespace, limit=limit,
@@ -285,7 +286,32 @@ async def run(
     if not args.apply:
         return report
 
-    raise NotImplementedError
+    # --- Mutate: purge both stores, then retire the stale-flag edges. ---
+    graphiti_purge_result = await purge_graphiti_namespace(memory_service.graphiti, namespace)
+    mem0_purge_result = await purge_mem0_namespace(memory_service, namespace, mem0_members)
+    flags_result = await retire_stale_flags(
+        memory_service, flag_uuids, host_project, invalidation_time=invalidation_time,
+    )
+
+    report['graphiti']['purge'] = graphiti_purge_result
+    report['deleted'] = mem0_purge_result['deleted']
+    report['mem0_failed'] = mem0_purge_result['failed']
+    report['invalidated'] = flags_result['invalidated']
+    report['flags_failed'] = flags_result['failed']
+
+    # --- After-counts: re-query rather than trust the optimistic deletes. ---
+    after_graphiti_rows = await enumerate_graphiti_namespace(
+        memory_service.graphiti, namespace, limit=limit,
+    )
+    after_mem0_count = await memory_service.count_memories_by_metadata(
+        project_id=namespace, filters={},
+    )
+    report['after'] = {
+        'graphiti_count': len(after_graphiti_rows),
+        'mem0_count': after_mem0_count,
+    }
+
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +320,65 @@ async def run(
 
 def main() -> int:
     """Parse CLI args, build a live MemoryService, and run the purge."""
-    raise NotImplementedError
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+    )
+    parser = argparse.ArgumentParser(
+        description=(
+            'Purge the legacy knowlive namespace (Graphiti graph + Mem0 memories) '
+            'and retire its stale-flag edges in dark_factory.'
+        ),
+    )
+    parser.add_argument(
+        '--apply', action='store_true', default=False,
+        help='Commit the purge + flag retirement (default: dry-run only, report and exit).',
+    )
+    parser.add_argument(
+        '--namespace', default=LEGACY_NAMESPACE,
+        help=f'Legacy namespace to purge (default: {LEGACY_NAMESPACE}).',
+    )
+    parser.add_argument(
+        '--flag-host-project', dest='flag_host_project', default=FLAG_HOST_PROJECT,
+        help=f'Project hosting the stale-flag edges (default: {FLAG_HOST_PROJECT}).',
+    )
+    parser.add_argument(
+        '--flag-uuids', dest='flag_uuids', nargs='*', default=None,
+        help='Stale-flag edge uuids to retire (default: the two canonical uuids).',
+    )
+    parser.add_argument(
+        '--limit', type=int, default=1000,
+        help='Maximum records to enumerate per store (default: 1000). Increase if '
+             'the dry-run report logs a scroll/limit-cap WARNING.',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        import os  # noqa: PLC0415
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    async def _run_live() -> dict:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        try:
+            await memory.initialize()
+            return await run(args, memory, invalidation_time=datetime.now(UTC))
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+
+    report = asyncio.run(_run_live())
+    print(json.dumps(report, indent=2, default=str))
+    if not args.apply:
+        logger.info('Dry run -- nothing was modified. Use --apply to commit the purge.')
+    return 0
 
 
 if __name__ == '__main__':
