@@ -605,6 +605,7 @@ async def invoke_claude_agent(
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
+    sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -622,6 +623,14 @@ async def invoke_claude_agent(
 
     *env_overrides*, when set, are merged into the subprocess environment.
     Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``.
+
+    *sandbox_wrap*, when set, is applied to the built claude argv immediately
+    before the subprocess is spawned.  The callable receives the full cmd list
+    (e.g. ``['claude', '--print', ...]``) and returns a replacement list (e.g.
+    ``['python', '/path/to/landlock_exec.py', '--', 'claude', '--print', ...]``).
+    Keeps ``shared`` policy-agnostic: callers supply the confinement closure;
+    the subprocess sees the wrapped argv.  Default ``None`` → no wrap (today's
+    behavior).
     """
     return await _invoke_claude(
         prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
@@ -634,6 +643,7 @@ async def invoke_claude_agent(
         config_dir=config_dir,
         env_overrides=env_overrides,
         startup_grace_secs=startup_grace_secs,
+        sandbox_wrap=sandbox_wrap,
     )
 
 
@@ -1001,6 +1011,7 @@ async def _invoke_claude(
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
+    sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd = ['claude', '--print', '--output-format', 'json']
@@ -1093,6 +1104,15 @@ async def _invoke_claude(
             bridge = BridgeCls(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
             await bridge.start()
             env['ANTHROPIC_BASE_URL'] = bridge.url
+
+        # Apply the caller-supplied sandbox wrap (e.g. Landlock or bwrap confinement)
+        # immediately before spawning.  The wrap transforms the full claude argv
+        # (e.g. ['claude','--print',...]) into a sandboxed command
+        # (e.g. ['python','/path/landlock_exec.py','--','claude','--print',...]).
+        # Applying it here — after temp files are created — ensures the wrapped
+        # command can reference those file paths.  None → no wrap.
+        if sandbox_wrap is not None:
+            cmd = sandbox_wrap(cmd)
 
         result = await _run_subprocess(
             cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data,
