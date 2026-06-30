@@ -769,3 +769,62 @@ class TestRunApply:
 
         assert report['deleted'] == 1
         assert report['mem0_failed'] == ['m1']
+
+    @pytest.mark.asyncio
+    async def test_apply_tolerates_graphiti_purge_failure(self):
+        """A raising graph.query (Graphiti purge failure) does not abort run():
+        report['graphiti']['purge'] surfaces ok=False + the error, and the rest
+        of the apply path (mem0 deletes, flag invalidation, after-recounts)
+        still completes -- purge_graphiti_namespace's best-effort handling is
+        exercised through run(), not just in isolation."""
+        rows = [['uuid-1', ['Entity'], 'Node A']]
+        result = MagicMock()
+        result.result_set = rows
+        graph = MagicMock()
+        graph.ro_query = AsyncMock(return_value=result)
+        graph.query = AsyncMock(side_effect=RuntimeError('FalkorDB connection lost'))
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        memory_service = AsyncMock()
+        memory_service.graphiti = graphiti
+        members = [_mem0_member('m1')]
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=len(members))
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.update_edge = AsyncMock(return_value=None)
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        # Must not raise.
+        report = await _mod.run(
+            self._args(apply=True), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert report['graphiti']['purge']['ok'] is False
+        assert 'FalkorDB connection lost' in report['graphiti']['purge']['error']
+        # Best-effort: mem0 deletes and flag invalidation still ran to completion.
+        assert report['deleted'] == 1
+        assert report['invalidated'] == 2
+        assert report['after'] == {'graphiti_count': 1, 'mem0_count': 1}
+
+    @pytest.mark.asyncio
+    async def test_apply_tolerates_partial_flag_invalidation_failure(self):
+        """A single failing update_edge does not abort run(): report['flags_failed']
+        records the failed uuid and the rest of the report still builds normally
+        -- retire_stale_flags's best-effort handling is exercised through run(),
+        not just in isolation."""
+        memory_service, _ = self._make_memory_service()
+        memory_service.update_edge = AsyncMock(
+            side_effect=[RuntimeError('graph unavailable'), None]
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        # Must not raise.
+        report = await _mod.run(
+            self._args(apply=True), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert report['invalidated'] == 1
+        assert report['flags_failed'] == [_mod.STALE_FLAG_EDGE_UUIDS[0]]
