@@ -113,3 +113,93 @@ class TestBuildPurgeReport:
         r1 = _mod.build_purge_report('knowlive', graphiti_rows, mem0_members, ('f1',), dry_run=True)
         r2 = _mod.build_purge_report('knowlive', graphiti_rows, mem0_members, ('f1',), dry_run=True)
         assert r1 == r2
+
+
+# ===========================================================================
+# Tests: enumerate_graphiti_namespace
+# ===========================================================================
+
+class TestEnumerateGraphitiNamespace:
+    """Tests for async enumerate_graphiti_namespace(graphiti, namespace, *, limit)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_graph_for_with_namespace(self):
+        """graphiti._graph_for is called with the namespace argument."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
+
+        graphiti._graph_for.assert_called_once_with('knowlive')
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self):
+        """Enumeration is read-only: ro_query is used, .query is NEVER called."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
+
+        graph.ro_query.assert_called_once()
+        graph.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_normalizes_rows_to_dicts(self):
+        """result_set rows [uuid, labels, name] are normalized to
+        [{'uuid','labels','name'}, ...]."""
+        graphiti = MagicMock()
+        rows = [
+            ['uuid-1', ['Entity'], 'Node A'],
+            ['uuid-2', ['Entity', 'Episodic'], 'Node B'],
+        ]
+        graph = _make_graph_mock(rows)
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
+
+        assert result == [
+            {'uuid': 'uuid-1', 'labels': ['Entity'], 'name': 'Node A'},
+            {'uuid': 'uuid-2', 'labels': ['Entity', 'Episodic'], 'name': 'Node B'},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_graph_returns_empty_list(self):
+        """An empty result_set returns an empty list, not an error."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_warns_when_row_count_hits_limit(self, caplog):
+        """No-silent-caps: hitting the limit logs a WARNING that enumeration
+        may be incomplete."""
+        graphiti = MagicMock()
+        rows = [[f'uuid-{i}', ['Entity'], f'Node {i}'] for i in range(3)]
+        graph = _make_graph_mock(rows)
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        with caplog.at_level('WARNING'):
+            await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=3)
+
+        assert any('limit' in rec.message.lower() for rec in caplog.records), (
+            f'Expected a limit-related WARNING, got: {[r.message for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_under_limit(self, caplog):
+        """Row count below the limit does not log a WARNING."""
+        graphiti = MagicMock()
+        rows = [['uuid-1', ['Entity'], 'Node A']]
+        graph = _make_graph_mock(rows)
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        with caplog.at_level('WARNING'):
+            await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
+
+        assert caplog.records == []
