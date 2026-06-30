@@ -1294,3 +1294,131 @@ class TestGetStatsScopedByGroup:
             )
         finally:
             await q.close()
+
+
+class FlakyVisibilityError(Exception):
+    """Module-local stand-in for graphiti_core's NodeNotFoundError — a
+    transient graph-visibility race that should receive an extended retry
+    budget instead of the plain ``max_attempts`` ceiling.
+    """
+
+
+class TestTransientErrorRetryPolicy:
+    """Task 1936: known-transient errors get a longer retry budget
+    (``transient_max_attempts``) than the plain ``max_attempts`` ceiling
+    used for everything else.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_transient_dead_letters_at_max_attempts(self, tmp_path):
+        """Control: a non-transient error still dead-letters at plain max_attempts,
+        even though a (much larger) transient_max_attempts is configured."""
+        execute = AsyncMock(side_effect=RuntimeError('permanent'))
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            transient_max_attempts=5,
+            transient_error_names={'FlakyVisibilityError'},
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 2
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_transient_error_uses_extended_budget(self, tmp_path):
+        """A configured-transient error class dead-letters at transient_max_attempts,
+        not the plain (smaller) max_attempts."""
+        execute = AsyncMock(side_effect=FlakyVisibilityError('node abc-123 not found'))
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            transient_max_attempts=5,
+            transient_error_names={'FlakyVisibilityError'},
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
+            )
+            # Generous timeout: 5 attempts at a 0.01s backoff base is fast in
+            # practice, but slow CI runners need headroom (see other dead-letter
+            # tests in this file using the same 20s budget).
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 5
+            assert 'FlakyVisibilityError' in dead[0]['error']
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_transient_recovers_within_extended_budget(self, tmp_path):
+        """A transient error that fails 3 times (more than max_attempts=2, which
+        would have dead-lettered it under the old uniform policy) recovers on the
+        4th call because transient errors get the extended transient_max_attempts
+        budget instead.
+        """
+        call_count = 0
+
+        async def flaky_then_ok(op, payload):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 3:
+                raise FlakyVisibilityError('node abc-123 not found')
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=flaky_then_ok,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            transient_max_attempts=5,
+            transient_error_names={'FlakyVisibilityError'},
+        )
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
+            )
+
+            deadline = asyncio.get_event_loop().time() + 20.0
+            stats = await q.get_stats(group_id='proj1')
+            while stats['counts'].get('completed', 0) < 1:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f'Timed out waiting for completion; last counts={stats["counts"]}'
+                    )
+                await asyncio.sleep(0.05)
+                stats = await q.get_stats(group_id='proj1')
+
+            assert stats['counts'].get('dead', 0) == 0
+            assert call_count == 4
+        finally:
+            await q.close()

@@ -18,10 +18,12 @@ from fused_memory.config.schema import (
     GraphitiBackendConfig,
     LLMConfig,
     PathScopeAdjudicatorConfig,
+    QueueConfig,
     ReconciliationConfig,
     ServerConfig,
     YamlSettingsSource,
 )
+from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
 
 
 class _DummySettings(BaseSettings):
@@ -744,3 +746,43 @@ class TestPathScopeAdjudicatorConfigBudget:
             f'returns error_max_budget_usd before any verdict (silent no-op). '
             f'Check config.yaml for an override that pins the budget below cost.'
         )
+
+
+class TestQueueConfigTransientErrorFields:
+    """Task 1936: QueueConfig exposes the error-aware retry budget knobs that
+    flow into DurableWriteQueue(transient_max_attempts=..., transient_error_names=...).
+    """
+
+    def test_default_transient_max_attempts(self):
+        cfg = QueueConfig()
+        assert isinstance(cfg.transient_max_attempts, int)
+        assert cfg.transient_max_attempts == 12
+        # Must be >= the plain max_attempts default so transient errors never
+        # get a SHORTER budget than non-transient ones.
+        assert cfg.transient_max_attempts >= cfg.max_attempts
+
+    def test_default_transient_error_names_contains_node_not_found(self):
+        cfg = QueueConfig()
+        assert isinstance(cfg.transient_error_names, list)
+        assert 'NodeNotFoundError' in cfg.transient_error_names
+
+    def test_explicit_overrides_round_trip(self):
+        cfg = QueueConfig(transient_max_attempts=20, transient_error_names=['X'])
+        assert cfg.transient_max_attempts == 20
+        assert cfg.transient_error_names == ['X']
+
+    def test_transient_error_names_matches_durable_queue_default(self):
+        """The two default transient-error-name lists (QueueConfig's and
+        DurableWriteQueue's DEFAULT_TRANSIENT_ERROR_NAMES) are documented as
+        'kept in sync' but nothing enforced that — this test is the
+        enforcement, so any future drift fails CI instead of silently
+        denying one of the two lists' errors the extended retry budget.
+        """
+        assert set(QueueConfig().transient_error_names) == DEFAULT_TRANSIENT_ERROR_NAMES
+
+    def test_transient_max_attempts_below_max_attempts_rejected(self):
+        """A config that would give transient errors a SHORTER budget than
+        ordinary errors is rejected at config-load time, not silently
+        accepted (task 1936 review)."""
+        with pytest.raises(ValidationError, match='transient_max_attempts'):
+            QueueConfig(max_attempts=10, transient_max_attempts=5)

@@ -12,7 +12,7 @@ import json
 import logging
 import random
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,23 @@ logger = logging.getLogger(__name__)
 # keeping this well below 999 leaves headroom for the trailing group_id
 # placeholder and ensures correctness across all SQLite versions.
 _DELETE_DEAD_BATCH_SIZE = 500
+
+# Exception class names (matched by walking type(exc).__mro__, so subclasses
+# match too) treated as transient and granted the extended
+# transient_max_attempts retry budget instead of the plain max_attempts.
+# Name-based matching avoids a hard dependency on graphiti_core from this
+# generic SQLite write-queue component. Keep in sync with
+# config.schema.QueueConfig.transient_error_names' default.
+DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
+    'NodeNotFoundError',
+    'EdgeNotFoundError',
+    'EdgesNotFoundError',
+    'TimeoutError',
+    'ConnectionError',
+    'ConnectionResetError',
+    'ServerDisconnectedError',
+    'OperationalError',
+})
 
 # -- Schema ------------------------------------------------------------------
 
@@ -93,6 +110,8 @@ class DurableWriteQueue:
         retry_base_seconds: float = 5.0,
         retry_max_delay_seconds: float = 300.0,
         write_timeout_seconds: float = 120.0,
+        transient_max_attempts: int | None = None,
+        transient_error_names: Iterable[str] | None = None,
     ):
         self._data_dir = Path(data_dir)
         self._execute_write = execute_write
@@ -101,6 +120,14 @@ class DurableWriteQueue:
         self._retry_base_seconds = retry_base_seconds
         self._retry_max_delay_seconds = retry_max_delay_seconds
         self._write_timeout_seconds = write_timeout_seconds
+        self._transient_max_attempts = (
+            transient_max_attempts if transient_max_attempts is not None
+            else max(max_attempts, 12)
+        )
+        self._transient_error_names = (
+            frozenset(transient_error_names) if transient_error_names is not None
+            else DEFAULT_TRANSIENT_ERROR_NAMES
+        )
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
         self._db: aiosqlite.Connection | None = None
@@ -316,11 +343,19 @@ class DurableWriteQueue:
         )
         await self._db.commit()
 
+    def _is_transient(self, exc: BaseException) -> bool:
+        """Whether *exc* (or any class in its MRO) is a known-transient error
+        that should receive the extended ``transient_max_attempts`` retry
+        budget instead of the plain ``max_attempts`` ceiling.
+        """
+        return any(c.__name__ in self._transient_error_names for c in type(exc).__mro__)
+
     async def _handle_failure(self, item: QueueItem, exc: Exception) -> None:
         assert self._db is not None
         new_attempts = item.attempts + 1
         error_msg = f'{type(exc).__name__}: {exc}'
-        if new_attempts >= item.max_attempts:
+        limit = self._transient_max_attempts if self._is_transient(exc) else item.max_attempts
+        if new_attempts >= limit:
             await self._db.execute(
                 "UPDATE write_queue SET status = 'dead', attempts = ?, error = ? "
                 "WHERE id = ?",
@@ -344,7 +379,7 @@ class DurableWriteQueue:
             )
             logger.info(
                 'Item %d retry %d/%d in %.1fs: %s',
-                item.id, new_attempts, item.max_attempts, delay, error_msg,
+                item.id, new_attempts, limit, delay, error_msg,
             )
         await self._db.commit()
 

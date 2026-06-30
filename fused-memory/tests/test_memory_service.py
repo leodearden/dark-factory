@@ -2745,6 +2745,44 @@ class TestInitializeLifecycleConflict:
         MockRegistryCls.assert_not_called()
 
 
+class TestInitializeQueueTransientConfigWiring:
+    """Task 1936: initialize() must forward QueueConfig's error-aware retry
+    fields (transient_max_attempts, transient_error_names) into the
+    DurableWriteQueue construction.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_retry_config_forwarded(self, service, mock_config):
+        mock_config.queue.transient_max_attempts = 999
+        mock_config.queue.transient_error_names = ['SentinelTransientError']
+
+        mock_registry_inst = MagicMock()
+        mock_registry_inst.initialize = AsyncMock()
+        MockRegistryCls = MagicMock(return_value=mock_registry_inst)
+
+        mock_dq_inst = MagicMock()
+        mock_dq_inst.initialize = AsyncMock()
+        mock_dq_inst.register_callback = MagicMock()
+
+        with (
+            patch.object(service.graphiti, 'initialize', new_callable=AsyncMock),
+            patch(
+                'fused_memory.services.memory_service.DurableWriteQueue',
+                return_value=mock_dq_inst,
+            ) as MockDurableWriteQueueCls,
+            patch(
+                'fused_memory.services.planned_episode_registry.PlannedEpisodeRegistry',
+                MockRegistryCls,
+            ),
+        ):
+            await service.initialize()
+
+        MockDurableWriteQueueCls.assert_called_once()
+        kwargs = MockDurableWriteQueueCls.call_args.kwargs
+        assert kwargs['transient_max_attempts'] == 999
+        assert kwargs['transient_error_names'] == ['SentinelTransientError']
+
+
 class TestSearchGraphitiInvalidatedFiltering:
     """Task 312: _search_graphiti filters out edges where invalid_at is not None."""
 
