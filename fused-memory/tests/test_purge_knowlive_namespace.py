@@ -339,3 +339,60 @@ class TestPurgeGraphitiNamespace:
 
         assert result['ok'] is False
         assert 'FalkorDB connection lost' in result['error']
+
+
+# ===========================================================================
+# Tests: purge_mem0_namespace
+# ===========================================================================
+
+class TestPurgeMem0Namespace:
+    """Tests for async purge_mem0_namespace(memory_service, namespace, members)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_delete_once_per_member(self):
+        """delete_memory is called exactly once per member with correct kwargs."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        members = [_mem0_member('m1'), _mem0_member('m2')]
+        result = await _mod.purge_mem0_namespace(memory_service, 'knowlive', members)
+
+        assert memory_service.delete_memory.call_count == 2
+        calls = memory_service.delete_memory.call_args_list
+        called_ids = {c.kwargs.get('memory_id') for c in calls}
+        assert called_ids == {'m1', 'm2'}
+        for c in calls:
+            assert c.kwargs.get('store') == 'mem0', f'Expected store=mem0: {c}'
+            assert c.kwargs.get('project_id') == 'knowlive', f'Expected project_id=knowlive: {c}'
+            assert c.kwargs.get('_source') == 'purge_knowlive_namespace', (
+                f'Expected _source=purge_knowlive_namespace: {c}'
+            )
+        assert result['deleted'] == 2
+
+    @pytest.mark.asyncio
+    async def test_best_effort_one_failure_does_not_abort_batch(self):
+        """A single delete_memory failure does not abort remaining deletes or raise."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('Qdrant error'), None]
+        )
+
+        members = [_mem0_member('m1'), _mem0_member('m2')]
+        # Must not raise.
+        result = await _mod.purge_mem0_namespace(memory_service, 'knowlive', members)
+
+        assert memory_service.delete_memory.call_count == 2
+        assert result['deleted'] == 1
+        assert 'm1' in result['failed']
+
+    @pytest.mark.asyncio
+    async def test_empty_members_returns_zero_deleted(self):
+        """No members -> no delete calls, deleted=0, failed=[]."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _mod.purge_mem0_namespace(memory_service, 'knowlive', [])
+
+        memory_service.delete_memory.assert_not_called()
+        assert result['deleted'] == 0
+        assert result['failed'] == []
