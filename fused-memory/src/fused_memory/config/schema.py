@@ -203,6 +203,21 @@ class QueueConfig(BaseModel):
     max_attempts: int = Field(default=5)
     retry_base_seconds: float = Field(default=5.0)
     retry_max_delay_seconds: float = Field(default=300.0)
+    # Error-aware retry budget (task 1936): known-transient errors (e.g.
+    # graphiti_core's NodeNotFoundError — a graph-visibility race) get this
+    # longer attempts ceiling instead of max_attempts. Keep this default list
+    # in sync with durable_queue.DEFAULT_TRANSIENT_ERROR_NAMES.
+    transient_max_attempts: int = Field(default=12)
+    transient_error_names: list[str] = Field(default_factory=lambda: [
+        'NodeNotFoundError',
+        'EdgeNotFoundError',
+        'EdgesNotFoundError',
+        'TimeoutError',
+        'ConnectionError',
+        'ConnectionResetError',
+        'ServerDisconnectedError',
+        'OperationalError',
+    ])
     write_timeout_seconds: float = Field(default=120.0)
     backend_read_timeout_seconds: float = Field(default=30.0)
     backend_write_timeout_seconds: float = Field(default=120.0)
