@@ -226,7 +226,32 @@ async def retire_stale_flags(
     invalidation_time: datetime,
 ) -> dict:
     """Best-effort ``update_edge(invalid_at=...)`` for each stale-flag edge uuid."""
-    raise NotImplementedError
+    async def _retire_one(edge_uuid: str):
+        return await memory_service.update_edge(
+            edge_uuid=edge_uuid,
+            project_id=host_project,
+            invalid_at=invalidation_time,
+            _source='purge_knowlive_namespace',
+        )
+
+    results = await asyncio.gather(
+        *(_retire_one(u) for u in edge_uuids),
+        return_exceptions=True,
+    )
+
+    invalidated = 0
+    failed: list[str] = []
+    for edge_uuid, result in zip(edge_uuids, results, strict=False):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'purge_knowlive_namespace: failed to invalidate stale-flag edge %s: %s',
+                edge_uuid, result,
+            )
+            failed.append(edge_uuid)
+        else:
+            invalidated += 1
+
+    return {'invalidated': invalidated, 'failed': failed}
 
 
 # ---------------------------------------------------------------------------
