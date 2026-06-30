@@ -117,7 +117,23 @@ async def enumerate_graphiti_namespace(
     limit: int = 1000,
 ) -> list[dict]:
     """Read-only enumeration of every node in the *namespace* FalkorDB graph."""
-    raise NotImplementedError
+    graph = graphiti._graph_for(namespace)
+    result = await graph.ro_query(
+        'MATCH (n) RETURN n.uuid, labels(n), n.name LIMIT $limit',
+        {'limit': limit},
+    )
+    rows = result.result_set or []
+    if len(rows) >= limit:
+        logger.warning(
+            "purge_knowlive_namespace: enumerated %d node(s) in graph '%s', which "
+            "hit limit=%d -- enumeration may be incomplete. Re-run with a higher "
+            "--limit value to ensure the full namespace is covered.",
+            len(rows), namespace, limit,
+        )
+    return [
+        {'uuid': row[0], 'labels': row[1], 'name': row[2]}
+        for row in rows
+    ]
 
 
 async def purge_graphiti_namespace(graphiti: Any, namespace: str) -> dict:
