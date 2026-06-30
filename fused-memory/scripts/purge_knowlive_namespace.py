@@ -265,6 +265,26 @@ async def run(
     invalidation_time: datetime,
 ) -> dict:
     """Enumerate the legacy namespace and, with ``args.apply``, purge + retire flags."""
+    namespace: str = getattr(args, 'namespace', None) or LEGACY_NAMESPACE
+    limit: int = getattr(args, 'limit', 1000)
+    flag_uuids: tuple[str, ...] | list[str] = (
+        getattr(args, 'flag_uuids', None) or STALE_FLAG_EDGE_UUIDS
+    )
+
+    graphiti_rows = await enumerate_graphiti_namespace(
+        memory_service.graphiti, namespace, limit=limit,
+    )
+    mem0_members, _mem0_count = await enumerate_mem0_namespace(
+        memory_service, namespace, limit=limit,
+    )
+
+    report = build_purge_report(
+        namespace, graphiti_rows, mem0_members, flag_uuids, dry_run=not args.apply,
+    )
+
+    if not args.apply:
+        return report
+
     raise NotImplementedError
 
 
