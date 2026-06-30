@@ -138,7 +138,16 @@ async def enumerate_graphiti_namespace(
 
 async def purge_graphiti_namespace(graphiti: Any, namespace: str) -> dict:
     """Best-effort ``MATCH (n) DETACH DELETE n`` against the *namespace* graph."""
-    raise NotImplementedError
+    graph = graphiti._graph_for(namespace)
+    try:
+        await graph.query('MATCH (n) DETACH DELETE n')
+    except Exception as e:
+        logger.warning(
+            "purge_knowlive_namespace: failed to purge graph '%s': %s",
+            namespace, e,
+        )
+        return {'ok': False, 'error': str(e)}
+    return {'ok': True, 'error': None}
 
 
 # ---------------------------------------------------------------------------
