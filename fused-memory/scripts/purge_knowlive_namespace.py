@@ -89,7 +89,21 @@ def build_purge_report(
     dry_run: bool,
 ) -> dict:
     """Assemble the report skeleton dict from already-enumerated inputs. No I/O."""
-    raise NotImplementedError
+    return {
+        'namespace': namespace,
+        'dry_run': dry_run,
+        'graphiti': {
+            'count': len(graphiti_rows),
+            'node_uuids': [row['uuid'] for row in graphiti_rows],
+        },
+        'mem0': {
+            'count': len(mem0_members),
+            'memory_ids': [m['id'] for m in mem0_members],
+        },
+        'stale_flags': {
+            'uuids': list(flag_uuids),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
