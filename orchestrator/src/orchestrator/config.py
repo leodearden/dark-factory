@@ -980,6 +980,27 @@ class GitConfig(BaseModel):
             'seed-warm-lane.sh and a CoW-capable XFS volume.'
         ),
     )
+    warm_lane_reclaim_on_exhaustion: bool = Field(
+        default=False,
+        description=(
+            'When True, GitOps.acquire_warm_lane() engages the reclaim-on-exhaustion '
+            'SAFETY VALVE (task 1933): instead of returning EXHAUSTED immediately when '
+            'all pool lanes are ASSIGNED, attempt to STEAL the oldest non-dispatched '
+            'non-terminal lane, commit its uncommitted WIP onto its branch (so 1912 '
+            'branch-retention preserves it for future reattach recovery), reset + re-seed '
+            'it for the new task, and fall through the existing already-registered '
+            'fresh-reset path — zero new git plumbing.  A WARNING log records every steal '
+            '(ops signal: safety valve fired = real pool pressure).  NEVER steals a '
+            'dispatched (live) lane — the is_dispatched predicate is re-checked '
+            'synchronously under the pool lock (TOCTOU guard, task 1933).  '
+            'Falls back to EXHAUSTED/cold only when no eligible victim exists.  '
+            'Requires warm_lane_pool=True.  '
+            'Default False → byte-identical, trivially revertible, matches '
+            'warm_lane_pool/warm_lane_disk_guard convention; enable when ready '
+            '(the INTERIM MARGIN reify spare_warm_lanes deployed 2026-06-29 '
+            'covers headroom until then).'
+        ),
+    )
 
 
 class VerifyRunnerConfig(BaseModel):

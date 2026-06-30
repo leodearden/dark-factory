@@ -7934,3 +7934,257 @@ class TestReuseWarmLaneBranchAware:
             'new_wip.txt must be reachable from task/R after _reuse_warm_lane '
             '(commit() in _reuse_warm_lane committed the uncommitted WIP file)'
         )
+
+
+# ===========================================================================
+# Step-3 (1933): RED — git_ops reclaim-on-exhaustion integration tests
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneReclaimOnExhaustion:
+    """Integration tests for the reclaim-on-exhaustion safety valve (task 1933).
+
+    warm_lane_pool_size=1 so one task exhausts the pool; then acquiring for a
+    second task hits the reclaim path.
+
+    All tests RED today: warm_lane_reclaim_candidate_provider and
+    warm_lane_dispatched_predicate attributes do not exist; _try_reclaim_lane_for
+    does not exist; acquire_warm_lane returns EXHAUSTED unconditionally when
+    all lanes are ASSIGNED.
+    """
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def _setup_exhausted_pool(
+        self, git_repo: Path
+    ) -> tuple[GitOps, Path, str]:
+        """Set up a size-1 pool with V already occupying _lane-0.
+
+        Returns (git_ops, lane_path, start_ref).
+        """
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+
+        # Get start_ref (main branch SHA)
+        _, sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        start_ref = sha_raw.strip()
+
+        # Acquire _lane-0 for victim 'V' → pool exhausted
+        v_result = await git_ops.acquire_warm_lane('V', start_ref)
+        assert isinstance(v_result, WorktreeInfo), (
+            f'setup: expected WorktreeInfo for V, got {v_result!r}'
+        )
+        lane = v_result.path
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.assignment_for('V') == lane
+
+        return git_ops, lane, start_ref
+
+    async def test_reclaim_warm_returns_worktree_info(self, git_repo: Path, caplog):
+        """(a) With callbacks wired: acquire_warm_lane returns WorktreeInfo, not EXHAUSTED."""
+        git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
+
+        # Wire reclaim callbacks: provider returns all candidates as non-terminal;
+        # predicate never marks anything as dispatched.
+        async def _provider(c):
+            return set(c)
+        git_ops.warm_lane_reclaim_candidate_provider = _provider
+        git_ops.warm_lane_dispatched_predicate = lambda b: False
+
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'With reclaim callbacks wired, acquire_warm_lane must return WorktreeInfo '
+            f'(not EXHAUSTED); got {result!r}'
+        )
+        assert result.path == lane, (
+            f'Reclaimed lane path must be _lane-0 ({lane}), got {result.path}'
+        )
+
+        # Lane HEAD must be on task/Z
+        _, branch_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert branch_raw.strip() == 'task/Z', (
+            f'Lane HEAD must be on task/Z after reclaim, got {branch_raw.strip()!r}'
+        )
+
+        # Assignment map: V dropped, Z → _lane-0
+        assert pool.assignment_for('V') is None, (
+            'V assignment must be dropped after reclaim'
+        )
+        assert pool.assignment_for('Z') == lane, (
+            'Z must be assigned to _lane-0 after reclaim'
+        )
+
+        # The steal must be logged at WARNING — this is the only ops signal
+        # that the safety valve fired (= real pool pressure); a regression
+        # that silently downgrades or drops it should fail this test.
+        assert any(
+            'reclaim-on-exhaustion — stole lane' in r.message
+            for r in caplog.records
+        ), (
+            f'Expected a WARNING logging the reclaim steal; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+    async def test_never_steal_dispatched(self, git_repo: Path):
+        """(b) Dispatched victim is never stolen → EXHAUSTED."""
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
+
+        # predicate says V is dispatched → reclaim must be skipped
+        async def _provider(c):
+            return set(c)
+        git_ops.warm_lane_reclaim_candidate_provider = _provider
+        git_ops.warm_lane_dispatched_predicate = lambda b: b == 'V'
+
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert result is WarmLaneUnavailable.EXHAUSTED, (
+            f'Dispatched victim must never be stolen → EXHAUSTED, got {result!r}'
+        )
+        # V's lane must be untouched
+        assert pool.assignment_for('V') == lane, (
+            'V assignment must be untouched when victim is dispatched'
+        )
+
+    async def test_not_wired_byte_identical(self, git_repo: Path):
+        """(c) With both callbacks None (default), acquire_warm_lane returns EXHAUSTED."""
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
+
+        # Both callbacks are None (the default, not wired)
+        assert git_ops.warm_lane_reclaim_candidate_provider is None  # type: ignore[attr-defined]
+        assert git_ops.warm_lane_dispatched_predicate is None  # type: ignore[attr-defined]
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert result is WarmLaneUnavailable.EXHAUSTED, (
+            f'Unwired (both callbacks None) must return EXHAUSTED (byte-identical), got {result!r}'
+        )
+
+    async def test_wip_preserved_on_victim_branch(self, git_repo: Path):
+        """(d) Uncommitted WIP in victim lane is committed before reset; task/V ref survives.
+
+        What this actually exercises: ``git checkout -f -B task/Z`` on the
+        stolen lane only repoints/creates the branch the lane checks out next
+        — it never deletes the ``task/V`` ref, so task/V survives the steal
+        regardless of any separate retention/GC policy. The property under
+        test is that the pre-reset ``commit()`` call lands the victim's WIP
+        onto that still-intact ref *before* the lane is repointed, so a
+        resumed victim can recover it via the reattach path. This test does
+        not drive a branch-deletion/GC path, so it is not itself a guard on
+        1912 branch-retention behaviour.
+        """
+        git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
+
+        # Leave uncommitted tracked WIP on V's lane
+        wip_file = lane / 'victim_wip.txt'
+        wip_file.write_text('uncommitted WIP from task V\n')
+        await _run(['git', 'add', 'victim_wip.txt'], cwd=lane)
+        # Deliberately do NOT commit — the reclaim should commit it
+
+        # Wire reclaim callbacks
+        async def _provider(c):
+            return set(c)
+        git_ops.warm_lane_reclaim_candidate_provider = _provider
+        git_ops.warm_lane_dispatched_predicate = lambda b: False
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'With WIP-preservation reclaim, must return WorktreeInfo; got {result!r}'
+        )
+
+        # task/V branch ref must still exist: `checkout -f -B task/Z` only
+        # repoints the lane's newly-checked-out branch — it never deletes
+        # task/V, so the ref survives independent of any retention/GC policy.
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'refs/heads/task/V'], cwd=git_repo,
+        )
+        assert rc_verify == 0, (
+            'task/V branch ref must survive reclaim '
+            '(checkout -f -B task/Z repoints the lane, it does not delete '
+            'task/V; this test does not exercise branch GC/retention)'
+        )
+
+        # task/V must carry at least 1 commit beyond main — this is what
+        # actually proves the pre-reset commit() call landed the WIP onto
+        # task/V before the lane was repointed, not merely that the ref
+        # happens to still exist.
+        _, count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/V'], cwd=git_repo,
+        )
+        wip_commits = int(count_raw.strip())
+        assert wip_commits >= 1, (
+            f'task/V must carry at least 1 WIP commit beyond main, got {wip_commits} '
+            '(commit-before-reset must have saved the uncommitted changes onto '
+            'task/V prior to the lane being repointed to task/Z)'
+        )
+
+    async def test_empty_eligible_set_returns_exhausted(self, git_repo: Path):
+        """(e) Provider returns set() → _try_reclaim_lane_for returns None → EXHAUSTED."""
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
+
+        # Provider returns empty set — no eligible victims even though pool is exhausted
+        async def _empty_provider(c):
+            return set()
+        git_ops.warm_lane_reclaim_candidate_provider = _empty_provider
+        git_ops.warm_lane_dispatched_predicate = lambda b: False
+
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert result is WarmLaneUnavailable.EXHAUSTED, (
+            f'Empty eligible set must yield EXHAUSTED (no victim to steal), got {result!r}'
+        )
+        # V's assignment must be untouched
+        assert pool.assignment_for('V') == lane, (
+            'V assignment must be untouched when provider returns empty eligible set'
+        )
+
+    async def test_commit_failure_does_not_block_reclaim(self, git_repo: Path, monkeypatch):
+        """(f) If commit() raises during WIP-save, reclaim proceeds and returns WorktreeInfo."""
+        git_ops, lane, start_ref = await self._setup_exhausted_pool(git_repo)
+
+        # Force commit() to raise to exercise the except branch in _try_reclaim_lane_for
+        async def _failing_commit(worktree: 'Path', message: str) -> None:
+            raise RuntimeError('simulated commit failure')
+        monkeypatch.setattr(git_ops, 'commit', _failing_commit)
+
+        async def _provider(c):
+            return set(c)
+        git_ops.warm_lane_reclaim_candidate_provider = _provider
+        git_ops.warm_lane_dispatched_predicate = lambda b: False
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'commit() failure must not block reclaim — expect WorktreeInfo, got {result!r}'
+        )
+        assert result.path == lane, (
+            f'Reclaimed lane path must be _lane-0 ({lane}) even after commit failure'
+        )

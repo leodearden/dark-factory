@@ -1375,3 +1375,222 @@ class TestMarkInProgressDoneDiskBackstopWiring:
 
         # Must have been called EXACTLY once with allow_disk_backstop=True
         release_spy.assert_called_once_with('3459', allow_disk_backstop=True)
+
+
+# ===========================================================================
+# Step-5 (1933): RED — Harness._warm_lane_reclaim_candidates + _is_branch_dispatched
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestHarnessReclaimCandidateProvider:
+    """Tests for Harness._warm_lane_reclaim_candidates (task 1933, step-5).
+
+    The provider mirrors _reconcile_terminal_lanes INVERTED: keep branches
+    whose status is known and NOT in {done, cancelled}; abort to empty-set on
+    resolver_failed (fail-safe, never reclaim on degraded read).
+
+    All tests RED today: _warm_lane_reclaim_candidates does not exist.
+    """
+
+    def _make_harness_with_stub_scheduler(
+        self, tmp_path: Path, get_statuses_return: tuple
+    ) -> Harness:
+        """Build a harness with scheduler.get_statuses stubbed."""
+        config = _make_config(
+            max_concurrent_tasks=4,
+            warm_lane_pool=True,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+        harness.scheduler.get_statuses = AsyncMock(return_value=get_statuses_return)
+        harness.scheduler._dispatched = set()
+        return harness
+
+    async def test_non_terminal_subset_returned(self, tmp_path: Path):
+        """(a) blocked + pending returned; done + cancelled dropped."""
+        statuses = {'A': 'blocked', 'B': 'done', 'C': 'pending', 'D': 'cancelled'}
+        harness = self._make_harness_with_stub_scheduler(tmp_path, (statuses, None))
+
+        result = await harness._warm_lane_reclaim_candidates(['A', 'B', 'C', 'D'])
+
+        assert result == {'A', 'C'}, (
+            f'provider must return only non-terminal candidates (blocked, pending), '
+            f'got {result!r}'
+        )
+
+    async def test_unknown_status_dropped(self, tmp_path: Path):
+        """(b) Branch not in the statuses dict is silently dropped (unknown = skip)."""
+        # 'X' not in returned statuses → dropped
+        statuses = {'A': 'in-progress'}
+        harness = self._make_harness_with_stub_scheduler(tmp_path, (statuses, None))
+
+        result = await harness._warm_lane_reclaim_candidates(['A', 'X'])
+
+        assert 'X' not in result, (
+            f'branch with unknown/missing status must be dropped; result={result!r}'
+        )
+        assert 'A' in result, (
+            f'in-progress branch must be included as non-terminal; result={result!r}'
+        )
+
+    async def test_failsafe_empty_on_empty_statuses(self, tmp_path: Path):
+        """(c) resolver_failed (empty statuses + no error) → set() (fail-safe)."""
+        harness = self._make_harness_with_stub_scheduler(tmp_path, ({}, None))
+
+        result = await harness._warm_lane_reclaim_candidates(['A', 'B'])
+
+        assert result == set(), (
+            f'empty get_statuses must trigger fail-safe → set(), got {result!r}'
+        )
+
+    async def test_failsafe_empty_on_error(self, tmp_path: Path):
+        """(c) resolver_failed (non-empty statuses + error) → set() (fail-safe)."""
+        harness = self._make_harness_with_stub_scheduler(
+            tmp_path, ({}, Exception('transient DB error'))
+        )
+
+        result = await harness._warm_lane_reclaim_candidates(['A', 'B'])
+
+        assert result == set(), (
+            f'errored get_statuses must trigger fail-safe → set(), got {result!r}'
+        )
+
+    async def test_empty_candidates_returns_empty_without_get_statuses(
+        self, tmp_path: Path
+    ):
+        """(d) Empty candidates → set() without calling get_statuses."""
+        config = _make_config(
+            max_concurrent_tasks=4,
+            warm_lane_pool=True,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+        harness.scheduler.get_statuses = AsyncMock()
+        harness.scheduler._dispatched = set()
+
+        result = await harness._warm_lane_reclaim_candidates([])
+
+        assert result == set(), (
+            f'empty candidates must return set() immediately; got {result!r}'
+        )
+        harness.scheduler.get_statuses.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestHarnessIsBranchDispatched:
+    """Tests for Harness._is_branch_dispatched (task 1933, step-5).
+
+    Returns True iff branch is in scheduler._dispatched.
+    RED today: method does not exist.
+    """
+
+    def _build(self, tmp_path: Path) -> Harness:
+        config = _make_config(
+            max_concurrent_tasks=2,
+            warm_lane_pool=True,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+        harness.scheduler._dispatched = {'A', 'B'}
+        return harness
+
+    async def test_dispatched_branch_returns_true(self, tmp_path: Path):
+        """Branch in _dispatched → True."""
+        harness = self._build(tmp_path)
+        assert harness._is_branch_dispatched('A') is True, (
+            'branch in _dispatched must return True'
+        )
+
+    async def test_non_dispatched_returns_false(self, tmp_path: Path):
+        """Branch NOT in _dispatched → False."""
+        harness = self._build(tmp_path)
+        assert harness._is_branch_dispatched('Z') is False, (
+            'branch not in _dispatched must return False'
+        )
+
+
+# ===========================================================================
+# Step-7 (1933): RED — config knob + knob-gated Harness wiring
+# ===========================================================================
+
+
+def _make_reclaim_config(
+    *,
+    max_concurrent_tasks: int,
+    warm_lane_pool: bool,
+    warm_lane_reclaim_on_exhaustion: bool,
+    tmp_path: Path,
+) -> OrchestratorConfig:
+    """Build a minimal OrchestratorConfig with reclaim-on-exhaustion knob."""
+    repo = tmp_path / 'repo'
+    repo.mkdir(exist_ok=True)
+    (repo / '.git').mkdir(exist_ok=True)
+    return OrchestratorConfig(
+        project_root=repo,
+        max_concurrent_tasks=max_concurrent_tasks,
+        git=GitConfig(
+            warm_lane_pool=warm_lane_pool,
+            warm_lane_reclaim_on_exhaustion=warm_lane_reclaim_on_exhaustion,
+        ),
+    )
+
+
+class TestReclaimOnExhaustionKnobWiring:
+    """Config knob + knob-gated wiring tests (task 1933, step-7).
+
+    (a) knob=True → git_ops callbacks are wired.
+    (b) knob=False (default) → callbacks stay None (byte-identical).
+    (c) GitConfig() default has warm_lane_reclaim_on_exhaustion == False.
+
+    RED today: GitConfig.warm_lane_reclaim_on_exhaustion does not exist
+    (ValidationError) and the Harness wiring block is absent.
+    """
+
+    def test_default_gitconfig_has_knob_false(self):
+        """(c) GitConfig() default: warm_lane_reclaim_on_exhaustion == False."""
+        cfg = GitConfig()
+        assert cfg.warm_lane_reclaim_on_exhaustion is False, (
+            'GitConfig.warm_lane_reclaim_on_exhaustion must default to False '
+            '(byte-identical, trivially revertible)'
+        )
+
+    def test_callbacks_wired_when_knob_on(self, tmp_path: Path):
+        """(a) knob=True → both callbacks installed on git_ops."""
+        config = _make_reclaim_config(
+            max_concurrent_tasks=4,
+            warm_lane_pool=True,
+            warm_lane_reclaim_on_exhaustion=True,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_reclaim_candidate_provider == (
+            harness._warm_lane_reclaim_candidates
+        ), (
+            'warm_lane_reclaim_candidate_provider must be harness._warm_lane_reclaim_candidates '
+            'when warm_lane_reclaim_on_exhaustion=True'
+        )
+        assert harness.git_ops.warm_lane_dispatched_predicate == (
+            harness._is_branch_dispatched
+        ), (
+            'warm_lane_dispatched_predicate must be harness._is_branch_dispatched '
+            'when warm_lane_reclaim_on_exhaustion=True'
+        )
+
+    def test_callbacks_none_when_knob_off(self, tmp_path: Path):
+        """(b) knob=False (default) → both callbacks stay None."""
+        config = _make_reclaim_config(
+            max_concurrent_tasks=4,
+            warm_lane_pool=True,
+            warm_lane_reclaim_on_exhaustion=False,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_reclaim_candidate_provider is None, (
+            'warm_lane_reclaim_candidate_provider must be None when knob is off'
+        )
+        assert harness.git_ops.warm_lane_dispatched_predicate is None, (
+            'warm_lane_dispatched_predicate must be None when knob is off (byte-identical)'
+        )
