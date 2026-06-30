@@ -396,3 +396,83 @@ class TestPurgeMem0Namespace:
         memory_service.delete_memory.assert_not_called()
         assert result['deleted'] == 0
         assert result['failed'] == []
+
+
+# ===========================================================================
+# Tests: retire_stale_flags
+# ===========================================================================
+
+class TestRetireStaleFlags:
+    """Tests for async retire_stale_flags(memory_service, edge_uuids, host_project,
+    *, invalidation_time)."""
+
+    @pytest.mark.asyncio
+    async def test_default_args_target_the_two_canonical_uuids(self):
+        """With no explicit edge_uuids/host_project, the two canonical
+        stale-flag uuids and FLAG_HOST_PROJECT are targeted."""
+        memory_service = AsyncMock()
+        memory_service.update_edge = AsyncMock(return_value=None)
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        await _mod.retire_stale_flags(memory_service, invalidation_time=invalidation_time)
+
+        assert memory_service.update_edge.call_count == 2
+        called_uuids = {c.kwargs.get('edge_uuid') for c in memory_service.update_edge.call_args_list}
+        assert called_uuids == set(_mod.STALE_FLAG_EDGE_UUIDS)
+        for c in memory_service.update_edge.call_args_list:
+            assert c.kwargs.get('project_id') == _mod.FLAG_HOST_PROJECT
+            assert c.kwargs.get('invalid_at') == invalidation_time
+            assert c.kwargs.get('_source') == 'purge_knowlive_namespace'
+
+    @pytest.mark.asyncio
+    async def test_explicit_args_override_defaults(self):
+        """Explicit edge_uuids/host_project are used verbatim instead of the
+        module defaults."""
+        memory_service = AsyncMock()
+        memory_service.update_edge = AsyncMock(return_value=None)
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        await _mod.retire_stale_flags(
+            memory_service, ('custom-uuid',), 'other_project',
+            invalidation_time=invalidation_time,
+        )
+
+        memory_service.update_edge.assert_called_once_with(
+            edge_uuid='custom-uuid',
+            project_id='other_project',
+            invalid_at=invalidation_time,
+            _source='purge_knowlive_namespace',
+        )
+
+    @pytest.mark.asyncio
+    async def test_best_effort_partial_failure_populates_failed(self):
+        """A single failing update_edge does not abort the batch or raise."""
+        memory_service = AsyncMock()
+        memory_service.update_edge = AsyncMock(
+            side_effect=[RuntimeError('graph unavailable'), None]
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        # Must not raise.
+        result = await _mod.retire_stale_flags(
+            memory_service, ('uuid-a', 'uuid-b'), 'dark_factory',
+            invalidation_time=invalidation_time,
+        )
+
+        assert memory_service.update_edge.call_count == 2
+        assert result['invalidated'] == 1
+        assert 'uuid-a' in result['failed']
+
+    @pytest.mark.asyncio
+    async def test_all_succeed_returns_full_invalidated_count_and_no_failed(self):
+        """All updates succeeding returns invalidated == len(edge_uuids), failed == []."""
+        memory_service = AsyncMock()
+        memory_service.update_edge = AsyncMock(return_value=None)
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        result = await _mod.retire_stale_flags(
+            memory_service, ('uuid-a', 'uuid-b'), 'dark_factory',
+            invalidation_time=invalidation_time,
+        )
+
+        assert result == {'invalidated': 2, 'failed': []}
