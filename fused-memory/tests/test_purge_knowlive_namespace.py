@@ -571,3 +571,149 @@ class TestRunDryRun:
         memory_service.count_memories_by_metadata.assert_called_once_with(
             project_id=_mod.LEGACY_NAMESPACE, filters={},
         )
+
+
+# ===========================================================================
+# Tests: run() -- apply path
+# ===========================================================================
+
+class TestRunApply:
+    """Tests for async run(args, memory_service, *, invalidation_time) in apply mode."""
+
+    def _args(self, apply: bool = True, **overrides):
+        import types as _types
+        base = {'apply': apply}
+        base.update(overrides)
+        return _types.SimpleNamespace(**base)
+
+    def _make_memory_service(
+        self, graphiti_rows: list[list] | None = None,
+        mem0_members: list[dict] | None = None,
+        mem0_count: int | None = None,
+        delete_side_effect=None,
+    ):
+        """AsyncMock memory_service with a MagicMock .graphiti wired for both
+        enumeration and purge calls (mirrors TestRunDryRun._make_memory_service)."""
+        memory_service = AsyncMock()
+        graph = _make_graph_mock(graphiti_rows or [])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+        memory_service.graphiti = graphiti
+        members = mem0_members or []
+        memory_service.count_memories_by_metadata = AsyncMock(
+            return_value=mem0_count if mem0_count is not None else len(members)
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        if delete_side_effect is not None:
+            memory_service.delete_memory = AsyncMock(side_effect=delete_side_effect)
+        else:
+            memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.update_edge = AsyncMock(return_value=None)
+        return memory_service, graph
+
+    @pytest.mark.asyncio
+    async def test_apply_purges_graphiti_and_never_targets_another_namespace(self):
+        """purge issues a DETACH DELETE write via _graph_for(namespace); EVERY
+        _graph_for call (enumerate, purge, after-recount) targets 'knowlive'
+        only -- never know_live/dark_factory (safety guard)."""
+        rows = [['uuid-1', ['Entity'], 'Node A']]
+        memory_service, graph = self._make_memory_service(graphiti_rows=rows)
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        await _mod.run(
+            self._args(apply=True), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert len(memory_service.graphiti._graph_for.call_args_list) >= 2
+        for call in memory_service.graphiti._graph_for.call_args_list:
+            assert call.args == ('knowlive',), (
+                f'_graph_for called with unexpected namespace: {call}'
+            )
+        assert graph.query.call_count == 1
+        cypher = graph.query.call_args.args[0]
+        assert 'DETACH DELETE' in cypher
+
+    @pytest.mark.asyncio
+    async def test_apply_deletes_each_enumerated_mem0_member(self):
+        """delete_memory is called once per enumerated mem0 member."""
+        members = [_mem0_member('m1'), _mem0_member('m2')]
+        memory_service, _ = self._make_memory_service(mem0_members=members)
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        await _mod.run(
+            self._args(apply=True), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert memory_service.delete_memory.call_count == 2
+        called_ids = {
+            c.kwargs.get('memory_id') for c in memory_service.delete_memory.call_args_list
+        }
+        assert called_ids == {'m1', 'm2'}
+
+    @pytest.mark.asyncio
+    async def test_apply_invalidates_each_stale_flag_with_host_project_and_time(self):
+        """update_edge is called once per stale-flag uuid with
+        project_id=FLAG_HOST_PROJECT and invalid_at=invalidation_time."""
+        memory_service, _ = self._make_memory_service()
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        await _mod.run(
+            self._args(apply=True), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert memory_service.update_edge.call_count == 2
+        called_uuids = {
+            c.kwargs.get('edge_uuid') for c in memory_service.update_edge.call_args_list
+        }
+        assert called_uuids == set(_mod.STALE_FLAG_EDGE_UUIDS)
+        for c in memory_service.update_edge.call_args_list:
+            assert c.kwargs.get('project_id') == _mod.FLAG_HOST_PROJECT
+            assert c.kwargs.get('invalid_at') == invalidation_time
+
+    @pytest.mark.asyncio
+    async def test_apply_report_has_after_recounts_and_tallies(self):
+        """Apply report has dry_run=False, deleted/invalidated tallies, empty
+        failed lists on full success, and an 'after' recount block."""
+        rows = [['uuid-1', ['Entity'], 'Node A']]
+        members = [_mem0_member('m1'), _mem0_member('m2')]
+        memory_service, _ = self._make_memory_service(
+            graphiti_rows=rows, mem0_members=members,
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert report['dry_run'] is False
+        assert report['deleted'] == 2
+        assert report['mem0_failed'] == []
+        assert report['invalidated'] == 2
+        assert report['flags_failed'] == []
+        assert report['graphiti']['purge'] == {'ok': True, 'error': None}
+        assert report['after'] == {'graphiti_count': 1, 'mem0_count': 2}
+
+    @pytest.mark.asyncio
+    async def test_apply_tolerates_partial_mem0_delete_failure(self):
+        """A single failing mem0 delete does not abort the run or raise;
+        report['mem0_failed'] records it and the rest of the report still
+        builds normally."""
+        members = [_mem0_member('m1'), _mem0_member('m2')]
+        memory_service, _ = self._make_memory_service(
+            mem0_members=members,
+            delete_side_effect=[RuntimeError('Qdrant error'), None],
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        # Must not raise.
+        report = await _mod.run(
+            self._args(apply=True), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert report['deleted'] == 1
+        assert report['mem0_failed'] == ['m1']
