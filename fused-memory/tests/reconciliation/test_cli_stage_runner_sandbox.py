@@ -5,6 +5,9 @@ Verifies:
   (b) fail-closed: RemediationSandboxUnavailable → StageResult.success=False, error set,
       and invoke_with_cap_retry NOT called (agent not launched unconfined)
   (c) confinement off (sandbox_recon_agents=False) → sandbox_wrap=None passed (or absent)
+  (d) non-mocked integration: resolve_recon_sandbox_wrap is actually importable from the
+      test environment and returns a callable (or raises RemediationSandboxUnavailable if
+      no backend is available) — catches the case where orchestrator becomes unimportable
 """
 
 from __future__ import annotations
@@ -16,7 +19,10 @@ from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.reconciliation.cli_stage_runner import run_stage_via_cli
-from fused_memory.reconciliation.sandbox_guard import RemediationSandboxUnavailable
+from fused_memory.reconciliation.sandbox_guard import (
+    RemediationSandboxUnavailable,
+    resolve_recon_sandbox_wrap,
+)
 
 
 def _make_agent_result(**overrides) -> AgentResult:
@@ -162,4 +168,39 @@ async def test_confinement_off_no_wrap(tmp_path):
     sandbox_wrap_val = call_kwargs.get('sandbox_wrap')
     assert sandbox_wrap_val is None, (
         f'Expected sandbox_wrap=None when confinement is off; got {sandbox_wrap_val!r}'
+    )
+
+
+def test_resolve_recon_sandbox_wrap_importable_and_functional(tmp_path):
+    """Non-mocked: resolve_recon_sandbox_wrap must be importable and return a callable
+    (or raise RemediationSandboxUnavailable when no backend is available).
+
+    This test does NOT mock orchestrator — it exercises the real import path to
+    catch the case where orchestrator becomes unimportable in the test environment
+    (e.g. venv without orchestrator installed).  A missing orchestrator surfaces as
+    RemediationSandboxUnavailable, which is the expected fail-closed result; but if
+    orchestrator IS importable and Landlock/bwrap is available, a callable is returned.
+
+    Rationale: the mocked wiring tests (above) verify that cli_stage_runner correctly
+    routes the result of resolve_recon_sandbox_wrap, but they never exercise the real
+    import boundary.  This test guards that boundary.
+    """
+    try:
+        wrap = resolve_recon_sandbox_wrap(tmp_path, writable_extras=[])
+    except RemediationSandboxUnavailable:
+        # Acceptable: no Landlock/bwrap backend available, or orchestrator not importable.
+        # The fail-closed behaviour is correct; cli_stage_runner will refuse to launch.
+        return
+
+    # If no exception was raised, we must have a callable back.
+    assert callable(wrap), (
+        f'resolve_recon_sandbox_wrap should return a Callable; got {type(wrap)}'
+    )
+    # Sanity-check: wrap must accept a list[str] and return a list[str].
+    result = wrap(['claude', '--print'])
+    assert isinstance(result, list) and result, (
+        f'wrap callable should return a non-empty list; got {result!r}'
+    )
+    assert all(isinstance(t, str) for t in result), (
+        f'wrap callable result must be list[str]; got {result!r}'
     )

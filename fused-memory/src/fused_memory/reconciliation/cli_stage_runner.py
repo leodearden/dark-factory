@@ -345,11 +345,11 @@ async def run_stage_via_cli(
     # return an error StageResult WITHOUT calling invoke_with_cap_retry (never
     # run an unconfined agent when confinement is explicitly enabled).
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None
-    if getattr(config, 'sandbox_recon_agents', False):
+    if config.sandbox_recon_agents:
         try:
             sandbox_wrap = resolve_recon_sandbox_wrap(
                 effective_cwd,
-                list(getattr(config, 'sandbox_recon_writable_extras', [])),
+                list(config.sandbox_recon_writable_extras),
             )
         except RemediationSandboxUnavailable as exc:
             logger.error(

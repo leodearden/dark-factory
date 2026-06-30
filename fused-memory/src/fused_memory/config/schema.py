@@ -388,6 +388,13 @@ class ReconciliationConfig(BaseModel):
     #   (run_stage_via_cli returns an error StageResult rather than running an
     #   unconfined agent).
     #
+    #   VENV REQUIREMENT: confinement relies on `orchestrator` being importable at
+    #   runtime via the shared uv-workspace venv (both fused-memory and orchestrator
+    #   installed in the same venv).  If fused-memory runs in a venv that does NOT
+    #   include orchestrator, the ImportError-to-RemediationSandboxUnavailable guard
+    #   causes EVERY reconciliation stage to fail (fail-closed).  Operators on
+    #   standalone deployments must install orchestrator or set this to False.
+    #
     # sandbox_recon_writable_extras: additional paths to add to the writable set
     #   (e.g. a uvx/pip cache dir used by a stdio MCP server).  Empty by default;
     #   use only when an MCP server genuinely needs to write outside /tmp.

@@ -28,6 +28,25 @@ Imports of the orchestrator sandbox backends are LAZY and guarded:
   to avoid the memory→orchestrator layering inversion.
 - An ``ImportError`` on either backend also raises ``RemediationSandboxUnavailable``
   (fail-closed: if the substrate is unreachable, refuse to run unconfined).
+
+OPERATIONAL PRECONDITION — venv install contract
+-------------------------------------------------
+This module's default-on confinement (``sandbox_recon_agents=True``) depends on
+``orchestrator`` being importable at runtime.  The canonical deployment is the
+shared uv-workspace venv in which both ``fused-memory`` and ``orchestrator`` are
+installed.  **If fused-memory is ever installed in a venv that does NOT include
+orchestrator** (e.g. a stripped CI image or a standalone deployment), the
+``ImportError`` guard raises ``RemediationSandboxUnavailable``, which
+``run_stage_via_cli`` treats as fail-CLOSED: *every* reconciliation stage returns
+an error ``StageResult`` and reconciliation halts entirely.  This is the correct
+safety posture but will be operationally surprising if the venv requirement is
+not met.
+
+Operators deploying fused-memory outside the workspace venv MUST either:
+  1. Install orchestrator in the same venv (``uv add orchestrator`` / workspace
+     member), OR
+  2. Set ``reconciliation.sandbox_recon_agents = false`` in config.yaml to
+     explicitly opt out of confinement on that host.
 """
 
 from __future__ import annotations
