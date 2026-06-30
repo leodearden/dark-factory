@@ -152,7 +152,20 @@ async def enumerate_mem0_namespace(
     limit: int = 1000,
 ) -> tuple[list[dict], int]:
     """Deterministic (non-semantic) enumeration of Mem0 memories scoped to *namespace*."""
-    raise NotImplementedError
+    count = await memory_service.count_memories_by_metadata(
+        project_id=namespace, filters={},
+    )
+    members = await memory_service.get_memories_by_metadata(
+        project_id=namespace, filters={}, limit=limit,
+    )
+    if len(members) < count:
+        logger.warning(
+            "purge_knowlive_namespace: enumerated %d of %d mem0 memories in "
+            "'%s' (scroll limit=%d) -- scroll cap reached; re-run with a "
+            "higher --limit value to ensure all records are covered.",
+            len(members), count, namespace, limit,
+        )
+    return members, count
 
 
 async def purge_mem0_namespace(
