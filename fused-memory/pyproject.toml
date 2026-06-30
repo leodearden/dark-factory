@@ -28,7 +28,7 @@ dark-factory-shared = { workspace = true }
 escalation = { workspace = true }
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "../orchestrator/src"]
 asyncio_mode = "strict"
 addopts = "-n auto --dist loadgroup"
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
@@ -51,7 +51,7 @@ timeout_method = "thread"
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "tests", "scripts", "../shared/src", "../escalation/src"]
+extraPaths = ["src", "tests", "scripts", "../shared/src", "../escalation/src", "../orchestrator/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 
