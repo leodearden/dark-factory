@@ -23,6 +23,7 @@ from fused_memory.config.schema import (
     ServerConfig,
     YamlSettingsSource,
 )
+from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
 
 
 class _DummySettings(BaseSettings):
@@ -769,3 +770,19 @@ class TestQueueConfigTransientErrorFields:
         cfg = QueueConfig(transient_max_attempts=20, transient_error_names=['X'])
         assert cfg.transient_max_attempts == 20
         assert cfg.transient_error_names == ['X']
+
+    def test_transient_error_names_matches_durable_queue_default(self):
+        """The two default transient-error-name lists (QueueConfig's and
+        DurableWriteQueue's DEFAULT_TRANSIENT_ERROR_NAMES) are documented as
+        'kept in sync' but nothing enforced that — this test is the
+        enforcement, so any future drift fails CI instead of silently
+        denying one of the two lists' errors the extended retry budget.
+        """
+        assert set(QueueConfig().transient_error_names) == DEFAULT_TRANSIENT_ERROR_NAMES
+
+    def test_transient_max_attempts_below_max_attempts_rejected(self):
+        """A config that would give transient errors a SHORTER budget than
+        ordinary errors is rejected at config-load time, not silently
+        accepted (task 1936 review)."""
+        with pytest.raises(ValidationError, match='transient_max_attempts'):
+            QueueConfig(max_attempts=10, transient_max_attempts=5)

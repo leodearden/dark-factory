@@ -206,7 +206,9 @@ class QueueConfig(BaseModel):
     # Error-aware retry budget (task 1936): known-transient errors (e.g.
     # graphiti_core's NodeNotFoundError — a graph-visibility race) get this
     # longer attempts ceiling instead of max_attempts. Keep this default list
-    # in sync with durable_queue.DEFAULT_TRANSIENT_ERROR_NAMES.
+    # in sync with durable_queue.DEFAULT_TRANSIENT_ERROR_NAMES — drift is
+    # caught by test_config_schema.py::
+    # TestQueueConfigTransientErrorFields::test_transient_error_names_matches_durable_queue_default.
     transient_max_attempts: int = Field(default=12)
     transient_error_names: list[str] = Field(default_factory=lambda: [
         'NodeNotFoundError',
@@ -223,6 +225,24 @@ class QueueConfig(BaseModel):
     backend_write_timeout_seconds: float = Field(default=120.0)
     search_timeout_seconds: float = Field(default=15.0)
     data_dir: str = Field(default='./data/queue')
+
+    @model_validator(mode='after')
+    def _validate_transient_max_attempts(self) -> 'QueueConfig':
+        """A known-transient error must never get a shorter retry budget than
+        an ordinary error — the inverse of this feature's intent (task 1936).
+
+        The ``DurableWriteQueue`` constructor only falls back to
+        ``max(max_attempts, 12)`` when ``transient_max_attempts`` is omitted
+        entirely; an explicit-but-too-low override would otherwise pass
+        through uncaught. Enforce the invariant here, at config-load time.
+        """
+        if self.transient_max_attempts < self.max_attempts:
+            raise ValueError(
+                f'transient_max_attempts ({self.transient_max_attempts}) must be >= '
+                f'max_attempts ({self.max_attempts}): a known-transient error must not '
+                'receive a shorter retry budget than an ordinary error.'
+            )
+        return self
 
 
 # --- Taskmaster ---
