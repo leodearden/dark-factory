@@ -2308,6 +2308,53 @@ class TestDualWriteCallbackRefreshesSummaries:
             assert call.kwargs['group_id'] == 'test'
 
 
+class TestRefreshSummariesCallback:
+    """step-07/08: dedicated refresh-only callback for the add_memory_graphiti /
+    replay_from_store ingestion paths. Unlike _dual_write_callback, this must
+    NOT enqueue a Mem0 batch — those paths already write Mem0 directly, so a
+    second enqueue here would double-write."""
+
+    @pytest.mark.asyncio
+    async def test_refreshes_without_mem0_enqueue(self, service):
+        """Refreshes both edge endpoints and never touches the Mem0 queue."""
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(edges=[
+            MockEdge(fact='x', source_node_uuid='e1', target_node_uuid='e2'),
+        ])
+        payload = {'group_id': 'proj'}
+
+        await service._refresh_summaries_callback(
+            'refresh_entity_summaries', result, payload
+        )
+
+        assert service.graphiti.refresh_entity_summary.await_count == 2, (
+            'Expected refresh for both edge endpoints (e1, e2), got '
+            f'{service.graphiti.refresh_entity_summary.await_count}'
+        )
+        called_uuids = {
+            call.args[0] for call in service.graphiti.refresh_entity_summary.call_args_list
+        }
+        assert called_uuids == {'e1', 'e2'}
+        for call in service.graphiti.refresh_entity_summary.call_args_list:
+            assert call.kwargs['group_id'] == 'proj'
+        service.durable_queue.enqueue_batch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_result_is_noop(self, service):
+        """None result → no refresh attempts, no raise."""
+        service.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+
+        await service._refresh_summaries_callback(
+            'refresh_entity_summaries', None, {'group_id': 'proj'}
+        )
+
+        service.graphiti.refresh_entity_summary.assert_not_called()
+        service.durable_queue.enqueue_batch.assert_not_called()
+
+
 class TestExecuteGraphitiWritePlanningRegistration:
     """step-5: _execute_graphiti_write registers episodes when temporal_context='planning'."""
 
