@@ -1304,12 +1304,17 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
     of cause. Extracted from :func:`_periodic_rebuild_summaries_loop` so unit
     tests can exercise the fan-out without waiting for
     ``cfg.interval_seconds``.
+
+    Each project's result dict (``rebuilt``/``stale_entities``/``skipped``/
+    ``errors``) is logged so an operator can see whether the sweep is
+    actually reducing staleness — at WARNING when the project reported any
+    per-entity errors, INFO otherwise.
     """
     if not cfg.enabled or not cfg.projects:
         return
     for project_id in cfg.projects:
         try:
-            await memory_service.rebuild_entity_summaries(
+            result = await memory_service.rebuild_entity_summaries(
                 project_id=project_id,
                 force=cfg.force,
                 _source='periodic_maintenance',
@@ -1317,6 +1322,17 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
         except Exception:
             logger.exception('rebuild_entity_summaries failed for project %s', project_id)
             continue
+        result = result or {}
+        errors = result.get('errors', 0)
+        log_fn = logger.warning if errors else logger.info
+        log_fn(
+            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s',
+            project_id,
+            result.get('rebuilt'),
+            result.get('stale_entities'),
+            result.get('skipped'),
+            errors,
+        )
 
 
 async def _periodic_rebuild_summaries_loop(memory_service, cfg) -> None:
@@ -1331,6 +1347,9 @@ async def _periodic_rebuild_summaries_loop(memory_service, cfg) -> None:
             await asyncio.sleep(cfg.interval_seconds)
         except asyncio.CancelledError:
             return
+        logger.debug(
+            'summary rebuild loop: sweep starting over %d project(s)', len(cfg.projects)
+        )
         await _run_rebuild_summaries_cycle(memory_service, cfg)
 
 

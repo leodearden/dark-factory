@@ -46,6 +46,17 @@ class _FakeMemoryService:
         if project_id in self._fail_for:
             raise RuntimeError('boom')
         self.calls.append({'project_id': project_id, 'force': force, **kwargs})
+        # Mirror memory_service.rebuild_entity_summaries's real return contract
+        # (errors is an int count, not a list) so callers that inspect the
+        # result see production-shaped data.
+        return {
+            'total_entities': 1,
+            'stale_entities': 1,
+            'rebuilt': 1,
+            'skipped': 0,
+            'errors': 0,
+            'details': [],
+        }
 
 
 @pytest.mark.asyncio
@@ -95,6 +106,41 @@ async def test_cycle_continues_past_raising_project(caplog):
 
 
 @pytest.mark.asyncio
+async def test_cycle_logs_summary_counts_per_project(caplog):
+    """Per-project rebuilt/stale/errors counts are logged (INFO clean, WARNING on errors).
+
+    A backstop whose whole purpose is bounding staleness must give an
+    operator signal about whether a sweep actually reduced it, not just
+    that the call didn't raise.
+    """
+
+    class _ResultService:
+        async def rebuild_entity_summaries(self, *, project_id, force=False, **kwargs):
+            if project_id == 'proj_a':
+                return {
+                    'total_entities': 5, 'stale_entities': 2, 'rebuilt': 2,
+                    'skipped': 0, 'errors': 0, 'details': [],
+                }
+            return {
+                'total_entities': 5, 'stale_entities': 3, 'rebuilt': 2,
+                'skipped': 0, 'errors': 1, 'details': [],
+            }
+
+    cfg = SummaryRebuildConfig(enabled=True, projects=['proj_a', 'proj_b'])
+
+    with caplog.at_level(logging.INFO):
+        await server_main._run_rebuild_summaries_cycle(_ResultService(), cfg)
+
+    proj_a_records = [r for r in caplog.records if 'proj_a' in r.getMessage()]
+    proj_b_records = [r for r in caplog.records if 'proj_b' in r.getMessage()]
+    # Clean project (errors=0) logs at INFO with the rebuilt count visible.
+    assert any(r.levelno == logging.INFO for r in proj_a_records)
+    assert any('rebuilt' in r.getMessage() for r in proj_a_records)
+    # Project reporting per-entity errors escalates to WARNING.
+    assert any(r.levelno == logging.WARNING for r in proj_b_records)
+
+
+@pytest.mark.asyncio
 async def test_periodic_loop_runs_cycle_and_cancels_cleanly(monkeypatch):
     """The loop sleeps, runs one cycle per tick, and exits cleanly on cancel."""
     ran_count = 0
@@ -119,3 +165,34 @@ async def test_periodic_loop_runs_cycle_and_cancels_cleanly(monkeypatch):
     with contextlib.suppress(asyncio.CancelledError):
         await task
     assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_periodic_loop_logs_each_tick(monkeypatch, caplog):
+    """Each tick logs a line noting the sweep ran and over how many projects.
+
+    With a default 3600s interval and sleep-first semantics, this is the
+    only signal an operator has that the loop is alive between sweeps.
+    """
+    ran = asyncio.Event()
+
+    async def _fake_cycle(memory_service, cfg):
+        ran.set()
+
+    monkeypatch.setattr(server_main, '_run_rebuild_summaries_cycle', _fake_cycle)
+    cfg = SummaryRebuildConfig(enabled=True, projects=['proj_a', 'proj_b'], interval_seconds=0.01)
+
+    with caplog.at_level(logging.DEBUG):
+        task = asyncio.create_task(
+            server_main._periodic_rebuild_summaries_loop(_FakeMemoryService(), cfg),
+        )
+        await asyncio.wait_for(ran.wait(), timeout=1.0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert any(
+        'sweep' in rec.getMessage() and '2' in rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno == logging.DEBUG
+    )
