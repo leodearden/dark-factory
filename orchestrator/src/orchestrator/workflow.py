@@ -425,6 +425,33 @@ def compute_preexisting_main_break_fingerprint(
         return ''
 
 
+def compute_failing_test_set_fingerprint(failing_test_ids: list[str]) -> str:
+    """Dedup key for the offline-deep lane's confirmed-red fix-task spawn (β3).
+
+    Keyed on the sorted CONFIRMED failing-test ID SET — NEVER ``main_sha``
+    (DB3/C3). The model helper above (``compute_preexisting_main_break_fingerprint``)
+    keys on a probe/main_sha, which advances every merge; reusing that shape
+    here would spawn a fresh fix task + escalation on EVERY offline-lane
+    advance while red — the exact flood PRD §7/§10/§11 forbids. Keying on the
+    failing-test SET instead means one open fix task absorbs the same red
+    across advances (via an appended suspect range), while a genuinely
+    different failing set gets its own task.
+
+    ``compute_content_fingerprint`` already sorts ``affected_ids`` and ignores
+    ``description``, so the result is order-independent over the input list.
+
+    Returns '' on any exception (fail-safe — an empty fingerprint degrades to
+    the log-only path, never a crash).
+    """
+    try:
+        from escalation.dedupe import compute_content_fingerprint
+        return compute_content_fingerprint(
+            'offline_lane_red', '', sorted(failing_test_ids),
+        )
+    except Exception:
+        return ''
+
+
 def _line_ranges_stackable(
     ranges_a: dict[str, list[tuple[int, int]]],
     ranges_b: dict[str, list[tuple[int, int]]],
