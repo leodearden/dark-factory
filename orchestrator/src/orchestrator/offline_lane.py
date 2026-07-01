@@ -453,8 +453,86 @@ class OfflineLaneWorker:
         await self._maybe_promote_blocker(fp, task_id)
 
     async def _maybe_promote_blocker(self, fp: str, task_id: str) -> None:
-        """Staged L2 ``escalate_blocker`` promotion (β3 C4) — stub, filled in step-16/18."""
-        return
+        """Staged L2 ``escalate_blocker`` promotion when a fix task stalls (C4).
+
+        N-advances arm (B7): once a fingerprint's confirmed-red advance count
+        reaches ``config.git.offline_lane_red_advances_before_blocker``, file
+        a born-at-L2 blocker escalation (see :meth:`_file_blocker_escalation`)
+        and record *fp* as promoted. Promotion is idempotent per fingerprint
+        — a fingerprint already in :attr:`_promoted_blockers` returns
+        immediately, so subsequent same-set advances past the threshold never
+        re-promote.
+
+        The terminal-fix-task-status arm (cancelled/deferred promote;
+        done clears) is added by step-17/18.
+        """
+        if fp in self._promoted_blockers:
+            return
+        if self._red_advance_counts[fp] >= self.config.git.offline_lane_red_advances_before_blocker:
+            await self._file_blocker_escalation(task_id, fp)
+            self._promoted_blockers.add(fp)
+
+    async def _file_blocker_escalation(self, task_id: str, fp: str) -> None:
+        """File a born-at-L2 ``escalate_blocker`` for a stalled offline-lane fix task (B7/C4).
+
+        Mirrors the deterministic-runner / merge-worker-supervisor born-at-L2
+        pattern: ``severity='critical'`` + ``level=2`` routes straight to a
+        human, and the ``orchestrator-`` ``agent_role`` sentinel prefix keeps
+        it at level=2 past the escalation server's severity-downgrade gate.
+        ``category='dependency_discovered'`` mirrors the scheduler's
+        external-dependency escalations (``scheduler.py`` cancelled-dep /
+        unresolved-threshold cases) — this fix task IS the (in-process)
+        dependency the confirmed-red offline-lane state is blocked on.
+
+        Deduped against any already-pending L2 blocker escalation for this
+        task id (crash-safe re-dispatch guard, mirrors
+        :meth:`_file_info_escalation`'s L0 dedup) in addition to the
+        in-memory ``_promoted_blockers`` idempotency guard in
+        :meth:`_maybe_promote_blocker`. No-ops gracefully when no escalation
+        queue is attached (same log-only degrade as :attr:`task_client`).
+        """
+        if self.escalation_queue is None:
+            return
+
+        existing = [
+            e
+            for e in self.escalation_queue.get_by_task(task_id, status='pending')
+            if e.agent_role == 'orchestrator-offline-lane' and e.level == 2
+        ]
+        if existing:
+            logger.debug(
+                'offline-lane: pending L2 blocker escalation already exists for '
+                'fix task %s — skipping duplicate file',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-offline-lane',
+            severity='critical',
+            category='dependency_discovered',
+            summary=(
+                f'offline-lane: fix task {task_id} has not landed — '
+                f'confirmed-red offline-deep suite is stalled'
+            )[:200],
+            detail=(
+                f'Fingerprint {fp} has been confirmed red for '
+                f'{self._red_advance_counts.get(fp)} advance(s) without the '
+                f'fix task landing. Manual investigation is needed to land '
+                f'the fix or re-triage it.'
+            ),
+            suggested_action='manual_investigation',
+            level=2,
+        )
+        self.escalation_queue.submit(esc)
+        logger.info(
+            'offline-lane: filed L2 blocker escalation %s for stalled fix task %s',
+            esc.id, task_id,
+        )
 
     # ------------------------------------------------------------------
     # Lockfile singleton
