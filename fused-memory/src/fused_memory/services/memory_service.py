@@ -182,6 +182,9 @@ class MemoryService:
         self.durable_queue.register_callback(
             'dual_write_episode', self._dual_write_callback
         )
+        self.durable_queue.register_callback(
+            'refresh_entity_summaries', self._refresh_summaries_callback
+        )
         await self.durable_queue.initialize()
 
         logger.info('MemoryService initialized')
@@ -562,14 +565,25 @@ class MemoryService:
         logger.debug(f'Durable dual-wrote fact to Mem0: {fact_text[:80]}')
         return result
 
-    async def _dual_write_callback(
-        self, callback_type: str, result: Any, payload: dict[str, Any]
+    async def _refresh_entity_summaries_from_result(
+        self, result: Any, group_id: str
     ) -> None:
-        """Post-process callback: extract facts and enqueue each for durable Mem0 write.
+        """Best-effort post-ingestion summary refresh for edge endpoints in *result*.
 
-        Instead of writing directly to Mem0 (fire-and-forget), we batch-enqueue
-        each extracted fact as a ``mem0_classify_and_add`` queue item so it gets
-        independent retry / dead-letter handling.
+        Graphiti's ``add_episode`` LLM extraction pipeline invalidates/supersedes/
+        dedups edges internally as a side effect of ingestion, without any
+        fused-memory code observing which edges changed. This helper closes that
+        gap: it reads the edges returned by the ingestion call (mirrors the
+        ``result.edges`` / ``result.entity_edges`` idiom used elsewhere in this
+        file), collects the deduplicated set of non-empty source/target node
+        uuids, and calls ``refresh_entity_summary`` for each — so the entity
+        nodes touched by this write get a freshly rebuilt summary.
+
+        Args:
+            result: The value returned by ``add_episode`` (or equivalent),
+                    typically carrying an ``edges`` (or ``entity_edges``)
+                    attribute. ``None`` and empty/missing edges are a no-op.
+            group_id: Graphiti graph id to refresh within.
         """
         if result is None:
             return
@@ -578,27 +592,83 @@ class MemoryService:
         if not edges:
             return
 
-        project_id = payload.get('project_id', 'main')
-        group_id = f'mem0_{project_id}'
+        uuids: dict[str, None] = {}  # ordered dedup set
+        for edge in edges:
+            src_uuid = getattr(edge, 'source_node_uuid', '') or ''
+            tgt_uuid = getattr(edge, 'target_node_uuid', '') or ''
+            if src_uuid:
+                uuids[src_uuid] = None
+            if tgt_uuid:
+                uuids[tgt_uuid] = None
 
-        batch = [
-            {
-                'group_id': group_id,
-                'operation': 'mem0_classify_and_add',
-                'payload': {
-                    'fact_text': getattr(edge, 'fact', None) or str(edge),
-                    'project_id': project_id,
-                    'agent_id': payload.get('agent_id'),
-                    'session_id': payload.get('session_id'),
-                    '_causation_id': payload.get('_causation_id'),
-                    'temporal_context': payload.get('temporal_context'),
-                },
-            }
-            for edge in edges
-        ]
+        for node_uuid in uuids:
+            try:
+                await self.graphiti.refresh_entity_summary(node_uuid, group_id=group_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'post-ingest refresh_entity_summary failed for uuid=%s group=%s: %s',
+                    node_uuid, group_id, exc,
+                )
 
-        assert self.durable_queue is not None
-        await self.durable_queue.enqueue_batch(batch)
+    async def _dual_write_callback(
+        self, callback_type: str, result: Any, payload: dict[str, Any]
+    ) -> None:
+        """Post-process callback: extract facts and enqueue each for durable Mem0
+        write, then trigger a best-effort post-ingestion entity-summary refresh.
+
+        Instead of writing directly to Mem0 (fire-and-forget), we batch-enqueue
+        each extracted fact as a ``mem0_classify_and_add`` queue item so it gets
+        independent retry / dead-letter handling. After the Mem0 enqueue, we also
+        refresh the summary of every entity node touched by an edge endpoint in
+        this result — closing the ingestion-time staleness gap where graphiti_core
+        invalidates/supersedes/dedups edges internally without any fused-memory
+        code observing which nodes changed.
+        """
+        if result is None:
+            return
+
+        edges = getattr(result, 'edges', None) or getattr(result, 'entity_edges', None) or []
+
+        if edges:
+            project_id = payload.get('project_id', 'main')
+            group_id = f'mem0_{project_id}'
+
+            batch = [
+                {
+                    'group_id': group_id,
+                    'operation': 'mem0_classify_and_add',
+                    'payload': {
+                        'fact_text': getattr(edge, 'fact', None) or str(edge),
+                        'project_id': project_id,
+                        'agent_id': payload.get('agent_id'),
+                        'session_id': payload.get('session_id'),
+                        '_causation_id': payload.get('_causation_id'),
+                        'temporal_context': payload.get('temporal_context'),
+                    },
+                }
+                for edge in edges
+            ]
+
+            assert self.durable_queue is not None
+            await self.durable_queue.enqueue_batch(batch)
+
+        refresh_group_id = payload.get('group_id') or payload.get('project_id') or 'main'
+        await self._refresh_entity_summaries_from_result(result, group_id=refresh_group_id)
+
+    async def _refresh_summaries_callback(
+        self, callback_type: str, result: Any, payload: dict[str, Any]
+    ) -> None:
+        """Refresh-only post-ingestion callback: no Mem0 enqueue.
+
+        Used by ingestion paths that already handle Mem0 elsewhere —
+        ``add_memory`` writes Mem0 directly and ``replay_from_store`` only
+        re-ingests into Graphiti — so, unlike ``_dual_write_callback``, this
+        callback must not also batch-enqueue a ``mem0_classify_and_add`` for
+        each edge (that would double-write Mem0). It only triggers the
+        best-effort post-ingestion entity-summary refresh.
+        """
+        group_id = payload.get('group_id') or payload.get('project_id') or 'main'
+        await self._refresh_entity_summaries_from_result(result, group_id=group_id)
 
     # ------------------------------------------------------------------
     # Write: add_episode
@@ -751,6 +821,7 @@ class MemoryService:
                         '_causation_id': causation_id,
                         '_write_op_id': write_op_id,
                     },
+                    callback_type='refresh_entity_summaries',
                 )
                 # Durably persisted to SQLite — report as written
                 stores_written.append(SourceStore.graphiti)
@@ -873,6 +944,7 @@ class MemoryService:
                     'group_id': target,
                     'source_description': f'replay_from_mem0:{category}',
                 },
+                'callback_type': 'refresh_entity_summaries',
             })
 
         if batch:

@@ -2193,6 +2193,221 @@ class TestDualWriteCallbackEdgesField:
         )
 
 
+# ---------------------------------------------------------------------------
+# Tests for _refresh_entity_summaries_from_result (task 1949, fix a)
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshEntitySummariesFromResult:
+    """step-01/02/03/04: helper that refreshes summaries for edge endpoints
+    touched by an add_episode/add_memory_graphiti result."""
+
+    @pytest.mark.asyncio
+    async def test_dedups_and_skips_empty_uuids(self, service):
+        """Refreshes each unique non-empty edge endpoint uuid exactly once."""
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(edges=[
+            MockEdge(fact='a', source_node_uuid='n1', target_node_uuid='n2'),
+            MockEdge(fact='b', source_node_uuid='n2', target_node_uuid='n3'),
+            MockEdge(fact='c', source_node_uuid='', target_node_uuid=''),
+        ])
+
+        await service._refresh_entity_summaries_from_result(result, group_id='proj')
+
+        assert service.graphiti.refresh_entity_summary.await_count == 3, (
+            'Expected exactly 3 refresh calls (n1, n2, n3 — n2 deduped, empty uuids skipped), '
+            f'got {service.graphiti.refresh_entity_summary.await_count}'
+        )
+        called_uuids = {
+            call.args[0] for call in service.graphiti.refresh_entity_summary.call_args_list
+        }
+        assert called_uuids == {'n1', 'n2', 'n3'}
+        for call in service.graphiti.refresh_entity_summary.call_args_list:
+            assert call.kwargs['group_id'] == 'proj'
+
+    @pytest.mark.asyncio
+    async def test_best_effort_continues_past_failure(self, service, caplog):
+        """A refresh failure for one uuid must not stop refreshes for the rest."""
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        async def _raise_for_n1(uuid, *, group_id):
+            if uuid == 'n1':
+                raise RuntimeError('boom')
+            return {}
+
+        service.graphiti.refresh_entity_summary = AsyncMock(side_effect=_raise_for_n1)
+
+        result = MockAddEpisodeResult(edges=[
+            MockEdge(fact='a', source_node_uuid='n1', target_node_uuid='n2'),
+            MockEdge(fact='b', source_node_uuid='n2', target_node_uuid='n3'),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            # Must NOT raise despite n1's refresh failing
+            await service._refresh_entity_summaries_from_result(result, group_id='proj')
+
+        assert service.graphiti.refresh_entity_summary.await_count >= 3, (
+            'Expected refresh to be attempted for n1 (fails), n2, and n3 (both succeed), '
+            f'got {service.graphiti.refresh_entity_summary.await_count} attempts'
+        )
+        called_uuids = {
+            call.args[0] for call in service.graphiti.refresh_entity_summary.call_args_list
+        }
+        assert {'n1', 'n2', 'n3'} <= called_uuids
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected 1 WARNING record for the n1 failure, got {len(warning_records)}: '
+            f'{[r.message for r in warning_records]}'
+        )
+        assert 'n1' in warning_records[0].message
+
+
+class TestDualWriteCallbackRefreshesSummaries:
+    """step-05/06: _dual_write_callback also triggers a post-ingestion summary
+    refresh for edge endpoints touched by add_episode, in addition to its
+    existing Mem0 batch-enqueue side effect."""
+
+    @pytest.mark.asyncio
+    async def test_callback_refreshes_endpoints_and_still_enqueues_mem0(self, service):
+        """refresh_entity_summary is awaited for each edge endpoint, and the
+        existing Mem0 batch-enqueue side effect is preserved."""
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(edges=[
+            MockEdge(
+                fact='Auth depends on Redis',
+                source_node_uuid='auth',
+                target_node_uuid='redis',
+            ),
+        ])
+        payload = {
+            'project_id': 'test',
+            'group_id': 'test',
+            'agent_id': 'a',
+            '_causation_id': 'c',
+        }
+        await service._dual_write_callback('dual_write_episode', result, payload)
+
+        service.durable_queue.enqueue_batch.assert_called_once()
+
+        assert service.graphiti.refresh_entity_summary.await_count == 2, (
+            'Expected refresh for both edge endpoints (auth, redis), got '
+            f'{service.graphiti.refresh_entity_summary.await_count}'
+        )
+        called_uuids = {
+            call.args[0] for call in service.graphiti.refresh_entity_summary.call_args_list
+        }
+        assert called_uuids == {'auth', 'redis'}
+        for call in service.graphiti.refresh_entity_summary.call_args_list:
+            assert call.kwargs['group_id'] == 'test'
+
+
+class TestRefreshSummariesCallback:
+    """step-07/08: dedicated refresh-only callback for the add_memory_graphiti /
+    replay_from_store ingestion paths. Unlike _dual_write_callback, this must
+    NOT enqueue a Mem0 batch — those paths already write Mem0 directly, so a
+    second enqueue here would double-write."""
+
+    @pytest.mark.asyncio
+    async def test_refreshes_without_mem0_enqueue(self, service):
+        """Refreshes both edge endpoints and never touches the Mem0 queue."""
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(edges=[
+            MockEdge(fact='x', source_node_uuid='e1', target_node_uuid='e2'),
+        ])
+        payload = {'group_id': 'proj'}
+
+        await service._refresh_summaries_callback(
+            'refresh_entity_summaries', result, payload
+        )
+
+        assert service.graphiti.refresh_entity_summary.await_count == 2, (
+            'Expected refresh for both edge endpoints (e1, e2), got '
+            f'{service.graphiti.refresh_entity_summary.await_count}'
+        )
+        called_uuids = {
+            call.args[0] for call in service.graphiti.refresh_entity_summary.call_args_list
+        }
+        assert called_uuids == {'e1', 'e2'}
+        for call in service.graphiti.refresh_entity_summary.call_args_list:
+            assert call.kwargs['group_id'] == 'proj'
+        service.durable_queue.enqueue_batch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_result_is_noop(self, service):
+        """None result → no refresh attempts, no raise."""
+        service.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+
+        await service._refresh_summaries_callback(
+            'refresh_entity_summaries', None, {'group_id': 'proj'}
+        )
+
+        service.graphiti.refresh_entity_summary.assert_not_called()
+        service.durable_queue.enqueue_batch.assert_not_called()
+
+
+class TestAddMemoryGraphitiRefreshWiring:
+    """step-09/10: the add_memory_graphiti enqueue must carry
+    callback_type='refresh_entity_summaries' so ingestion-time edge
+    resolution on this path also triggers a post-write summary refresh."""
+
+    @pytest.mark.asyncio
+    async def test_add_memory_graphiti_enqueue_carries_refresh_callback_type(self, service):
+        await service.add_memory(
+            content='Auth depends on Redis',
+            category='entities_and_relations',
+            project_id='test',
+        )
+
+        graphiti_calls = [
+            c for c in service.durable_queue.enqueue.call_args_list
+            if c.kwargs.get('operation') == 'add_memory_graphiti'
+        ]
+        assert len(graphiti_calls) == 1, (
+            f'Expected exactly 1 add_memory_graphiti enqueue, got {len(graphiti_calls)}'
+        )
+        assert graphiti_calls[0].kwargs.get('callback_type') == 'refresh_entity_summaries', (
+            'add_memory_graphiti enqueue must carry callback_type=refresh_entity_summaries '
+            f'so its ingestion-time edge resolution triggers a refresh; got '
+            f'{graphiti_calls[0].kwargs.get("callback_type")!r}'
+        )
+
+
+class TestReplayFromStoreRefreshWiring:
+    """step-11/12: replay_from_store's add_memory_graphiti batch items must
+    carry callback_type='refresh_entity_summaries' so bulk re-ingestion also
+    triggers a post-write summary refresh."""
+
+    @pytest.mark.asyncio
+    async def test_replay_batch_items_carry_refresh_callback_type(self, service):
+        service.mem0.get_all = AsyncMock(return_value={
+            'results': [
+                {'memory': 'Auth depends on Redis', 'metadata': {'category': 'entities_and_relations'}},
+            ]
+        })
+
+        await service.replay_from_store('test')
+
+        service.durable_queue.enqueue_batch.assert_called_once()
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        graphiti_items = [item for item in batch if item['operation'] == 'add_memory_graphiti']
+        assert graphiti_items, 'Expected at least one add_memory_graphiti batch item'
+        for item in graphiti_items:
+            assert item.get('callback_type') == 'refresh_entity_summaries', (
+                'replay_from_store add_memory_graphiti batch items must carry '
+                f'callback_type=refresh_entity_summaries; got {item.get("callback_type")!r}'
+            )
+
+
 class TestExecuteGraphitiWritePlanningRegistration:
     """step-5: _execute_graphiti_write registers episodes when temporal_context='planning'."""
 
