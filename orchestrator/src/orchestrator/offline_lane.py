@@ -647,9 +647,36 @@ class OfflineLaneWorker:
         return proc.returncode or 0, tail
 
     async def _default_confirmation_run(self, wt: Path, head: str) -> list[str]:
-        """Default ``confirmation_runner`` seam (β3) — stub, filled in step-19/20.
+        """Default ``confirmation_runner`` seam — re-runs failures serially, isolated (β3).
 
         Cross-project scope boundary (same as :meth:`_default_run_suite`):
-        the real reify-side confirm-failures invocation is ζ's job.
+        the real reify-side confirm-failures invocation — discover which
+        tests just failed, re-run them isolated/serial once, report those
+        still failing — is ζ's job; this default builds the invocation
+        unconditionally.
+
+        ``--test-threads=1`` forces the confirmation re-run serial/isolated
+        (a flake filter must never share state across parallel test
+        workers). ``--confirm-failed`` is the confirm-failures flag
+        distinguishing this from a normal suite run. ``env``/``cwd`` mirror
+        :meth:`_default_run_suite` exactly (same ``DF_VERIFY_ROLE=offline``
+        overlay onto a full ``os.environ`` copy). ``head`` is accepted for
+        seam-signature symmetry with injected runners, same as
+        :meth:`_default_run_suite`.
+
+        Parses stdout as newline-separated test IDs; blank/whitespace-only
+        lines are skipped so trailing/blank output never becomes a spurious
+        "confirmed" entry.
         """
-        raise NotImplementedError
+        argv = [_RUN_OFFLINE_DEEP_SCRIPT, '--test-threads=1', '--confirm-failed']
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(wt),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        text = (stdout or b'').decode(errors='replace')
+        return [line.strip() for line in text.splitlines() if line.strip()]
