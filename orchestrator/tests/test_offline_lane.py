@@ -14,10 +14,53 @@ launch/stop/registration wiring, and
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from pydantic import ValidationError
 
 from orchestrator.config import GitConfig
+from orchestrator.offline_lane import OfflineLaneWorker
+
+# ---------------------------------------------------------------------------
+# Shared test helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_git_ops(*, head: str = 'headsha', worktree_path: Path | None = None) -> MagicMock:
+    """MagicMock git_ops with the async methods OfflineLaneWorker calls."""
+    git_ops = MagicMock()
+    git_ops.get_main_sha = AsyncMock(return_value=head)
+    git_ops.reset_persistent_offline_deep_worktree = AsyncMock(
+        return_value=worktree_path or Path('/tmp/_offline-deep')
+    )
+    return git_ops
+
+
+def _make_config(tmp_path: Path, **git_overrides) -> MagicMock:
+    """MagicMock OrchestratorConfig with a real GitConfig at .git."""
+    config = MagicMock()
+    config.project_root = tmp_path
+    config.git = GitConfig(**git_overrides)
+    return config
+
+
+def _make_worker(
+    tmp_path: Path,
+    *,
+    git_ops: MagicMock | None = None,
+    config: MagicMock | None = None,
+    suite_runner=None,
+) -> OfflineLaneWorker:
+    """Build an OfflineLaneWorker wired with mock deps for isolated testing."""
+    return OfflineLaneWorker(
+        git_ops if git_ops is not None else _make_git_ops(),
+        config if config is not None else _make_config(tmp_path),
+        lock_path=tmp_path / 'offline_lane.lock',
+        suite_runner=suite_runner,
+    )
+
 
 # ---------------------------------------------------------------------------
 # GitConfig knobs (step-1/2)
@@ -56,3 +99,31 @@ def test_git_config_offline_lane_knobs_validation():
         GitConfig(offline_lane_test_threads=0)
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_poll_interval_secs=0.0)
+
+
+# ---------------------------------------------------------------------------
+# on_post_merge — enqueue-and-return trigger seam (step-3/4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_post_merge_sets_dirty_and_wakes_without_running(tmp_path: Path):
+    """on_post_merge flips dirty + wakes the loop and returns — never runs inline.
+
+    Per the β1 hot-path contract (harness.py:5040-5046), the SHAs are
+    advisory only: get_main_sha and suite_runner must NOT be awaited by
+    on_post_merge itself.
+
+    Step 3 (RED): on_post_merge is a NotImplementedError stub — must fail
+    before impl.
+    """
+    git_ops = _make_git_ops()
+    suite_runner = AsyncMock(return_value=(0, ''))
+    worker = _make_worker(tmp_path, git_ops=git_ops, suite_runner=suite_runner)
+
+    await worker.on_post_merge('task-1', 'base-sha', 'head-sha')
+
+    assert worker._dirty is True
+    assert worker._wake.is_set()
+    git_ops.get_main_sha.assert_not_awaited()
+    suite_runner.assert_not_awaited()
