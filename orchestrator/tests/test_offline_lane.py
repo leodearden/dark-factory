@@ -237,3 +237,81 @@ async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
     assert run_count['n'] == 2, 'exactly one coalesced re-run — never a third'
     assert head_calls['n'] == 2
     git_ops.reset_persistent_offline_deep_worktree.assert_any_call('HEAD2')
+
+
+# ---------------------------------------------------------------------------
+# run() — poll backstop for a missed trigger (step-9/10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
+    """A missed trigger is caught by a periodic get_main_sha poll.
+
+    With ``_dirty`` False and the wake event never set (on_post_merge was
+    never called — simulating a missed trigger), and a tiny
+    ``offline_lane_poll_interval_secs``, the loop's wait must time out and
+    poll ``get_main_sha``: a mismatch against ``_last_run_head`` is
+    run-worthy (backstop catches the advance); a match is not (no spurious
+    run).
+
+    Step 9 (RED): run() has no poll timeout yet, so on a missed trigger the
+    wait blocks forever and the mismatch case's run never happens — the
+    bounded ``wait_for`` below turns that hang into a clean failure rather
+    than a slow pytest-timeout kill. Must fail before impl.
+    """
+    poll_interval = 0.05
+
+    # -- Scenario A: get_main_sha diverges from _last_run_head -> backstop runs.
+    git_ops_a = _make_git_ops(head='HEAD2')
+    config_a = _make_config(tmp_path, offline_lane_poll_interval_secs=poll_interval)
+    calls_a: list[tuple] = []
+    done = asyncio.Event()
+
+    async def _suite_runner_a(wt, head, threads):
+        calls_a.append((wt, head, threads))
+        done.set()
+        return (0, '')
+
+    worker_a = _make_worker(
+        tmp_path, git_ops=git_ops_a, config=config_a, suite_runner=_suite_runner_a
+    )
+    worker_a._last_run_head = 'HEAD1'
+
+    task_a = asyncio.create_task(worker_a.run())
+    try:
+        await asyncio.wait_for(done.wait(), timeout=2.0)
+    finally:
+        task_a.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task_a
+
+    assert len(calls_a) == 1, 'a missed-trigger mismatch must run exactly once'
+    assert calls_a[0][1] == 'HEAD2', 'the backstop run must use the polled (current) head'
+    assert worker_a._last_run_head == 'HEAD2'
+
+    # -- Scenario B: get_main_sha matches _last_run_head -> no spurious run.
+    git_ops_b = _make_git_ops(head='HEAD1')
+    config_b = _make_config(tmp_path, offline_lane_poll_interval_secs=poll_interval)
+    calls_b: list[tuple] = []
+
+    async def _suite_runner_b(wt, head, threads):
+        calls_b.append((wt, head, threads))
+        return (0, '')
+
+    worker_b = _make_worker(
+        tmp_path, git_ops=git_ops_b, config=config_b, suite_runner=_suite_runner_b
+    )
+    worker_b._last_run_head = 'HEAD1'
+
+    task_b = asyncio.create_task(worker_b.run())
+    try:
+        await asyncio.sleep(poll_interval * 6)
+    finally:
+        task_b.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task_b
+
+    assert calls_b == [], 'no advance since the last run must never trigger a spurious run'
+    assert worker_b._last_run_head == 'HEAD1'
