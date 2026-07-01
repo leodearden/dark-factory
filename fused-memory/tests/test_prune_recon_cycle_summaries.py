@@ -5,10 +5,15 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import sys
 import types
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'prune_recon_cycle_summaries.py'
 
@@ -369,3 +374,255 @@ class TestFormatSummaryTable:
         table = _mod.format_summary_table(self._report())
         assert isinstance(table, str)
         assert len(table) > 0
+
+
+# ===========================================================================
+# Tests: apply_prune (async, live shell)
+# ===========================================================================
+
+class TestApplyPrune:
+    """Async tests for apply_prune(memory, delete_ids, project_id, now).
+
+    Mirrors the best-effort delete posture already proven for
+    reconciliation.summary_pool.enforce_summary_pool_cap and
+    sweep_orphan_flag_markers.delete_orphan_markers: every id is attempted
+    (asyncio.gather with return_exceptions=True); a raising delete is logged
+    and excluded from the returned applied set, but does not abort the batch.
+    """
+
+    def _now(self) -> datetime:
+        return datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+
+    def _make_memory(self, side_effect=None) -> MagicMock:
+        memory = MagicMock()
+        if side_effect is not None:
+            memory.delete_memory = AsyncMock(side_effect=side_effect)
+        else:
+            memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+        return memory
+
+    @pytest.mark.asyncio
+    async def test_calls_delete_memory_once_per_id(self):
+        memory = self._make_memory()
+        applied = await _mod.apply_prune(memory, ['a', 'b', 'c'], 'dark_factory', self._now())
+
+        assert memory.delete_memory.await_count == 3
+        assert applied == {'a', 'b', 'c'}
+
+    @pytest.mark.asyncio
+    async def test_delete_memory_called_with_expected_kwargs(self):
+        memory = self._make_memory()
+        await _mod.apply_prune(memory, ['mem-1'], 'dark_factory', self._now())
+
+        kwargs = memory.delete_memory.call_args.kwargs
+        assert kwargs.get('memory_id') == 'mem-1'
+        assert kwargs.get('store') == 'mem0'
+        assert kwargs.get('project_id') == 'dark_factory'
+        assert kwargs.get('_source') == 'prune_recon_cycle_summaries'
+        assert kwargs.get('causation_id'), 'causation_id must be a non-empty shared run identifier'
+
+    @pytest.mark.asyncio
+    async def test_causation_id_shared_across_ids_in_one_apply_call(self):
+        """All deletes issued by a single apply_prune call share one causation_id,
+        tying them together as one traceable one-shot prune run."""
+        memory = self._make_memory()
+        await _mod.apply_prune(memory, ['id-1', 'id-2'], 'dark_factory', self._now())
+
+        causation_ids = {c.kwargs.get('causation_id') for c in memory.delete_memory.call_args_list}
+        assert len(causation_ids) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_delete_ids_no_calls(self):
+        memory = self._make_memory()
+        applied = await _mod.apply_prune(memory, [], 'dark_factory', self._now())
+
+        memory.delete_memory.assert_not_awaited()
+        assert applied == set()
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_excluded_others_proceed(self):
+        async def _side_effect(**kwargs):
+            if kwargs.get('memory_id') == 'bad':
+                raise RuntimeError('Qdrant error')
+            return {'status': 'deleted'}
+
+        memory = MagicMock()
+        memory.delete_memory = AsyncMock(side_effect=_side_effect)
+
+        applied = await _mod.apply_prune(
+            memory, ['good1', 'bad', 'good2'], 'dark_factory', self._now(),
+        )
+
+        assert memory.delete_memory.await_count == 3
+        assert applied == {'good1', 'good2'}
+
+
+# ===========================================================================
+# Tests: run (async, end-to-end live shell)
+# ===========================================================================
+
+def _cycle_summary_record(
+    id: str, stage: str, created_at: str, content: str = 'ordinary cycle summary',
+) -> dict:
+    """Build a mem0.get_all()-shaped record for a cycle_summary pool member."""
+    return {
+        'id': id,
+        'memory': content,
+        'created_at': created_at,
+        'metadata': {'kind': 'cycle_summary', 'stage': stage, 'run_id': 'r1'},
+    }
+
+
+def _unrelated_record(id: str, metadata: dict | None = None) -> dict:
+    """Build a mem0.get_all()-shaped record that must NOT enter either pool."""
+    return {
+        'id': id,
+        'memory': 'unrelated memory content',
+        'created_at': '2026-01-01T00:00:00+00:00',
+        'metadata': metadata if metadata is not None else {'kind': 'observation'},
+    }
+
+
+class TestRun:
+    """Async end-to-end tests for run(args, *, memory, known_projects_map)."""
+
+    def _fixture_records(self) -> list[dict]:
+        """4 stage1 + 3 stage2 + 2 unrelated records.
+
+        With keep_recent=2:
+          stage1 (memory_consolidator): keeps the 2 newest ('s1-newest',
+            's1-second') + 1 older remediation-bearing ('s1-old-remediation');
+            deletes 1 older quiescent ('s1-old-quiescent').
+          stage2 (task_knowledge_sync): keeps the 2 newest ('s2-newest',
+            's2-mid'); deletes 1 older quiescent ('s2-old-quiescent').
+          The 2 unrelated records must never appear in either pool.
+        """
+        return [
+            _cycle_summary_record('s1-newest', 'memory_consolidator', '2026-06-01T00:00:00+00:00'),
+            _cycle_summary_record('s1-second', 'memory_consolidator', '2026-05-01T00:00:00+00:00'),
+            _cycle_summary_record(
+                's1-old-remediation', 'memory_consolidator', '2026-02-01T00:00:00+00:00',
+                content='deleted entity e47ac10b-58cc-4372-a567-0e02b2c3d479 (duplicate)',
+            ),
+            _cycle_summary_record(
+                's1-old-quiescent', 'memory_consolidator', '2026-01-01T00:00:00+00:00',
+                content='0 new episodes, 0 mutations. Quiescent cycle.',
+            ),
+            _cycle_summary_record('s2-newest', 'task_knowledge_sync', '2026-06-15T00:00:00+00:00'),
+            _cycle_summary_record('s2-mid', 'task_knowledge_sync', '2026-04-01T00:00:00+00:00'),
+            _cycle_summary_record(
+                's2-old-quiescent', 'task_knowledge_sync', '2026-01-01T00:00:00+00:00',
+                content='0 mutations. No mutations. Quiescent cycle.',
+            ),
+            _unrelated_record('u1-wrong-kind'),  # kind != cycle_summary
+            _unrelated_record(
+                'u2-wrong-stage',
+                metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_analyzer'},
+            ),
+        ]
+
+    def _make_memory(self, records: list[dict] | None = None) -> MagicMock:
+        memory = MagicMock()
+        mem0 = MagicMock()
+        mem0.get_all = AsyncMock(return_value={'results': records if records is not None else []})
+        memory.mem0 = mem0
+        memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+        return memory
+
+    def _args(
+        self, apply=False, project_id=None, keep_recent=2,
+        limit_per_project=1000, yes_i_am_sure=False,
+    ) -> argparse.Namespace:
+        return argparse.Namespace(
+            apply=apply,
+            project_id=project_id,
+            keep_recent=keep_recent,
+            limit_per_project=limit_per_project,
+            yes_i_am_sure=yes_i_am_sure,
+        )
+
+    def _known_map(self, pid='dark_factory') -> dict:
+        return {pid: '/some/path'}
+
+    @pytest.mark.asyncio
+    async def test_dry_run_no_deletes_and_report_shape(self):
+        """Dry-run performs NO delete_memory calls; report classifies both
+        pools correctly."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(apply=False, project_id='dark_factory')
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.delete_memory.assert_not_awaited()
+        assert report['dry_run'] is True
+
+        mc = report['projects']['dark_factory']['memory_consolidator']
+        assert mc['scanned'] == 4
+        assert mc['deletable'] == 1
+        assert mc['deleted'] == 0
+        assert mc['preserved_remediation'] == 1
+
+        tks = report['projects']['dark_factory']['task_knowledge_sync']
+        assert tks['scanned'] == 3
+        assert tks['deletable'] == 1
+        assert tks['deleted'] == 0
+
+    @pytest.mark.asyncio
+    async def test_apply_deletes_exactly_the_classified_delete_set(self):
+        """--apply deletes exactly the ids classify_pool marked for deletion —
+        no more, no less — across both pools."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(apply=True, project_id='dark_factory')
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        called_ids = {c.kwargs.get('memory_id') for c in memory.delete_memory.call_args_list}
+        assert called_ids == {'s1-old-quiescent', 's2-old-quiescent'}
+        assert memory.delete_memory.await_count == 2
+        assert report['dry_run'] is False
+        assert report['totals']['deleted'] == 2
+
+    @pytest.mark.asyncio
+    async def test_unrelated_records_excluded_from_report(self):
+        """Records with kind != cycle_summary, or an unrecognised stage, never
+        appear in either pool's scanned count or in the deletions list."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(apply=False, project_id='dark_factory')
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        total_scanned = sum(
+            pool_stats['scanned']
+            for pools in report['projects'].values()
+            for pool_stats in pools.values()
+        )
+        assert total_scanned == 7  # 4 stage1 + 3 stage2; the 2 unrelated records excluded
+        all_deletion_ids = {d['id'] for d in report['deletions']}
+        assert 'u1-wrong-kind' not in all_deletion_ids
+        assert 'u2-wrong-stage' not in all_deletion_ids
+
+    @pytest.mark.asyncio
+    async def test_get_all_scoped_per_project_with_configured_limit(self):
+        """mem0.get_all is awaited once per selected project, scoped to that
+        project_id, with limit=args.limit_per_project (the scan/safety-cap value)."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(apply=False, project_id='dark_factory', limit_per_project=500)
+
+        await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.mem0.get_all.assert_awaited_once()
+        call = memory.mem0.get_all.call_args
+        scope_arg = call.args[0] if call.args else call.kwargs.get('scope')
+        assert scope_arg.project_id == 'dark_factory'
+        assert call.kwargs.get('limit') == 500
+
+    @pytest.mark.asyncio
+    async def test_unknown_project_id_aborts_before_get_all(self):
+        """An unrecognised --project-id aborts before any enumeration happens."""
+        memory = self._make_memory([])
+        args = self._args(apply=False, project_id='unknown-id')
+
+        result = await _mod.run(args, memory=memory, known_projects_map={'dark_factory': '/p'})
+
+        assert result.get('aborted') is True
+        memory.mem0.get_all.assert_not_awaited()
