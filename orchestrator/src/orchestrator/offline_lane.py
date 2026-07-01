@@ -161,8 +161,28 @@ class OfflineLaneWorker:
         """Snapshot head, reset the warm worktree, and invoke the suite seam.
 
         See module docstring — always-from-head, clear-before-snapshot.
+
+        Clear-before-snapshot: ``_dirty`` is cleared FIRST, before the
+        ``get_main_sha`` snapshot, so no advance is ever lost — an advance
+        landing after the clear either lands inside this run's snapshot
+        (fine) or re-sets ``_dirty`` for a coalesced re-run (fine).
+        Clearing AFTER the snapshot would open a lost-update window.
         """
-        raise NotImplementedError
+        self._dirty = False
+        head = await self.git_ops.get_main_sha()
+        if not head:
+            logger.warning('offline-lane: get_main_sha returned empty head; skipping run')
+            return
+        wt = await self.git_ops.reset_persistent_offline_deep_worktree(head)
+        threads = self.config.git.offline_lane_test_threads
+        start = time.monotonic()
+        rc, _tail = await self.suite_runner(wt, head, threads)
+        duration = time.monotonic() - start
+        self._last_run_head = head
+        logger.info(
+            'offline-lane: run head=%s status=%s duration=%.1fs',
+            head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+        )
 
     # ------------------------------------------------------------------
     # Lockfile singleton
