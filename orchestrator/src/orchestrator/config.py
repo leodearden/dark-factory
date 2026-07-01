@@ -865,6 +865,17 @@ class GitConfig(BaseModel):
             'only costs granularity.'
         ),
     )
+    offline_lane_red_advances_before_blocker: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'N = number of consecutive confirmed-red advances (same failing-'
+            'test-set fingerprint) the offline-deep lane worker (β3, PRD '
+            '§11.3 / C4) tolerates before promoting its filed fix task to a '
+            'born-at-L2 escalate_blocker. Not frozen — retunable via '
+            'orchestrator.yaml without a code change.'
+        ),
+    )
     persistent_merge_worktree_safety_valve_every_n: int = Field(
         default=0,
         ge=0,
