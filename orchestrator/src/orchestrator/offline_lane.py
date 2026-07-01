@@ -319,10 +319,12 @@ class OfflineLaneWorker:
         result means the failure did not reproduce — intermittent
         nondeterminism (B6): log only, no task, no escalation.
 
-        (2)+(3) The non-empty (genuinely-red) path files a new dedup'd fix
-        task via :meth:`_file_new_fix_task`. Fingerprint-keyed dedup against
-        an already-open fix task (B5, update-not-refile) is added by a later
-        step; today every confirmed-red pass is treated as new.
+        (2)+(3) UPDATE-OR-FILE: fingerprints the confirmed failing-test SET
+        (never ``main_sha`` — DB3/C3) and dispatches on whether that
+        fingerprint already has an open fix task. An already-open
+        fingerprint is UPDATED (:meth:`_update_existing_fix_task` — append
+        the suspect range, no new task/escalation, B5); a new fingerprint is
+        FILED (:meth:`_file_new_fix_task` — new fix task + INFO escalation, B4).
         """
         confirmed = await self.confirmation_runner(wt, head)
         if not confirmed:
@@ -333,7 +335,14 @@ class OfflineLaneWorker:
                 head[:12],
             )
             return
-        await self._file_new_fix_task(confirmed, head)
+
+        from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+        fp = compute_failing_test_set_fingerprint(confirmed)
+        if fp in self.open_fix_tasks:
+            await self._update_existing_fix_task(fp, head)
+        else:
+            await self._file_new_fix_task(fp, confirmed, head)
 
     def _suspect_range(self, head: str) -> str:
         """Cheapest sound over-approximation of the commits that could have
@@ -344,26 +353,21 @@ class OfflineLaneWorker:
             return f'{self._last_green_head}..{head}'
         return head
 
-    async def _file_new_fix_task(self, confirmed: list[str], head: str) -> None:
+    async def _file_new_fix_task(self, fp: str, confirmed: list[str], head: str) -> None:
         """File a NEW dedup'd fix task for a confirmed-red failing-test set (B4).
 
-        Computes the DB3/C3 fingerprint over the confirmed set, builds the
-        ``submit_task`` argument block via
-        :func:`~orchestrator.workflow.build_offline_lane_fix_task_arguments`,
-        and — when :attr:`task_client` is wired — files it and records the
-        fingerprint in :attr:`open_fix_tasks` / :attr:`_red_advance_counts`
-        so a same-set recurrence updates rather than re-files (see
+        Builds the ``submit_task`` argument block via
+        :func:`~orchestrator.workflow.build_offline_lane_fix_task_arguments`
+        and — when :attr:`task_client` is wired — files it and records *fp*
+        in :attr:`open_fix_tasks` / :attr:`_red_advance_counts` so a
+        same-set recurrence updates rather than re-files (see
         :meth:`_update_existing_fix_task`). Degrades to a log-only no-op
         when :attr:`task_client` is unwired (never a crash; worker leg of
         C7) — no fingerprint is recorded in that case, since there is no
         fix task to dedup against.
         """
-        from orchestrator.workflow import (
-            build_offline_lane_fix_task_arguments,
-            compute_failing_test_set_fingerprint,
-        )
+        from orchestrator.workflow import build_offline_lane_fix_task_arguments
 
-        fp = compute_failing_test_set_fingerprint(confirmed)
         suspect = self._suspect_range(head)
         arguments = build_offline_lane_fix_task_arguments(
             confirmed, suspect, fp, self.config.project_root, head,
@@ -432,6 +436,25 @@ class OfflineLaneWorker:
             'offline-lane: filed INFO escalation %s for fix task %s',
             esc.id, task_id,
         )
+
+    async def _update_existing_fix_task(self, fp: str, head: str) -> None:
+        """Update an ALREADY-OPEN fix task for a same-fingerprint red advance (B5).
+
+        Appends the new suspect range to the open fix task rather than
+        filing a duplicate task or raising a second INFO escalation, then
+        bumps the red-advance count and defers to
+        :meth:`_maybe_promote_blocker` for the staged L2 promotion check
+        (C4).
+        """
+        task_id = self.open_fix_tasks[fp]
+        if self.task_client is not None:
+            await self.task_client.append_suspect_range(task_id, self._suspect_range(head))
+        self._red_advance_counts[fp] += 1
+        await self._maybe_promote_blocker(fp, task_id)
+
+    async def _maybe_promote_blocker(self, fp: str, task_id: str) -> None:
+        """Staged L2 ``escalate_blocker`` promotion (β3 C4) — stub, filled in step-16/18."""
+        return
 
     # ------------------------------------------------------------------
     # Lockfile singleton

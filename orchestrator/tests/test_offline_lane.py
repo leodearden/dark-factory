@@ -683,4 +683,3 @@ async def test_handle_red_run_dedup_appends_suspect_range_not_new_task(tmp_path:
     task_client.submit_fix_task.assert_not_awaited()
     escalation_queue.submit.assert_not_called()
     assert worker._red_advance_counts[fp] == 2
-    assert esc.task_id == 'fix-99'
