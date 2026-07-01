@@ -392,6 +392,12 @@ class GraphitiBackend:
         reset to ``None``, restoring it to an active (non-superseded) state.
         This takes precedence over ``invalid_at`` if both are supplied.
         Compatible with ``fact`` (update text and un-supersede in one call).
+        Because graphiti's FalkorDB map-based ``edge.save()`` (``MERGE ... SET
+        e = $edge_data``) does not reliably clear a null-valued property, the
+        clear is force-persisted by an explicit direct-Cypher
+        ``SET e.invalid_at = NULL`` write, issued after ``edge.save()`` and
+        before the endpoint summary refresh below (so the restored edge is
+        counted valid by that refresh's ``WHERE e.invalid_at IS NULL`` filter).
 
         After saving, both source and target entity node summaries are rebuilt
         from their current valid edges so they stay consistent.
@@ -409,6 +415,19 @@ class GraphitiBackend:
         if clear_invalid_at:
             edge.invalid_at = None
         await asyncio.wait_for(edge.save(driver), timeout=self._write_timeout)
+
+        if clear_invalid_at:
+            # edge.save()'s map-based SET does not reliably clear a
+            # null-valued property on FalkorDB — force it deterministically.
+            graph = self._graph_for(group_id)
+            await asyncio.wait_for(
+                graph.query(
+                    'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
+                    'SET e.invalid_at = NULL',
+                    {'uuid': edge_uuid},
+                ),
+                timeout=self._write_timeout,
+            )
 
         # Deterministically refresh both endpoint entity summaries so they
         # reflect the updated fact text (no LLM — just fact concatenation).
