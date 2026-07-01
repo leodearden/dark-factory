@@ -12625,6 +12625,8 @@ class TestRepairStage2SummaryStageMetadata:
     never a gap that re-triggers the false "missing" diagnosis).
     """
 
+    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
     @pytest.mark.asyncio
     async def test_repairs_summary_missing_stage_key(self):
         """Happy path: one member missing 'stage' is re-added under corrected
@@ -12826,3 +12828,109 @@ class TestRepairStage2SummaryStageMetadata:
         assert memory_service.delete_memory.await_count == 2
         deleted_ids = {c.kwargs.get('memory_id') for c in memory_service.delete_memory.call_args_list}
         assert deleted_ids == {'broken-a', 'broken-b'}
+
+    @pytest.mark.asyncio
+    async def test_enumeration_failure_returns_zero_no_raise(self, caplog):
+        """When get_memories_by_metadata raises, returns 0, does NOT raise,
+        logs a WARNING, and issues no add/delete calls."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _repair_stage2_summary_stage_metadata,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant gone')
+        )
+        memory_service.add_memory = AsyncMock(return_value=None)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _repair_stage2_summary_stage_metadata(
+                memory_service, project_id='dark_factory', run_id='run-enum-fail',
+            )
+
+        assert result == 0
+        memory_service.add_memory.assert_not_awaited()
+        memory_service.delete_memory.assert_not_awaited()
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_per_member_write_failure_isolated(self, caplog):
+        """Two broken members; add_memory raises for the first only → the
+        first is not counted (and its delete is never attempted — add-before
+        -delete), the second is still repaired; returns 1; does NOT raise."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _repair_stage2_summary_stage_metadata,
+        )
+
+        run_id = 'run-partial-fail'
+        broken_members = [
+            {
+                'id': 'broken-fail',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'run_id': run_id,
+                    'recon_pool': 'stage2_cycle_summary',
+                    'data': 'Summary fail',
+                },
+            },
+            {
+                'id': 'broken-ok',
+                'created_at': '2026-07-01T00:01:00+00:00',
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'run_id': run_id,
+                    'recon_pool': 'stage2_cycle_summary',
+                    'data': 'Summary ok',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=broken_members)
+        memory_service.add_memory = AsyncMock(side_effect=[RuntimeError('add failed'), None])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _repair_stage2_summary_stage_metadata(
+                memory_service, project_id='dark_factory', run_id=run_id,
+            )
+
+        assert result == 1
+        memory_service.delete_memory.assert_awaited_once()
+        assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'broken-ok'
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_add_happens_before_delete(self):
+        """For a given member, add_memory is awaited strictly before
+        delete_memory (add-before-delete safety ordering)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _repair_stage2_summary_stage_metadata,
+        )
+
+        run_id = 'run-order'
+        broken_member = {
+            'id': 'broken-order',
+            'created_at': '2026-07-01T00:00:00+00:00',
+            'metadata': {
+                'kind': 'cycle_summary',
+                'run_id': run_id,
+                'recon_pool': 'stage2_cycle_summary',
+                'data': 'Summary order',
+            },
+        }
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[broken_member])
+
+        manager = MagicMock()
+        manager.attach_mock(memory_service.add_memory, 'add_memory')
+        manager.attach_mock(memory_service.delete_memory, 'delete_memory')
+
+        await _repair_stage2_summary_stage_metadata(
+            memory_service, project_id='dark_factory', run_id=run_id,
+        )
+
+        call_names = [c[0] for c in manager.mock_calls]
+        assert 'add_memory' in call_names and 'delete_memory' in call_names
+        assert call_names.index('add_memory') < call_names.index('delete_memory')
