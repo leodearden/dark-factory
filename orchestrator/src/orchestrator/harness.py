@@ -5037,7 +5037,14 @@ Output JSON matching the schema. Every task must appear in the output.
             base_sha[:12],
             head_sha[:12],
         )
-        await notifiee(task_id, base_sha, head_sha)
+        try:
+            await notifiee(task_id, base_sha, head_sha)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'offline-lane on_post_merge notifiee raised for task %s; ignoring (fail-open)',
+                task_id,
+                exc_info=True,
+            )
 
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.
