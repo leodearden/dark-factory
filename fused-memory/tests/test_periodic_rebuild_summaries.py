@@ -21,6 +21,8 @@ and ``_periodic_rebuild_summaries_loop`` (the thin sleep/cancel wrapper).
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from fused_memory.config.schema import SummaryRebuildConfig
@@ -70,3 +72,21 @@ async def test_cycle_noop_when_disabled_or_no_projects():
     empty_cfg = SummaryRebuildConfig(enabled=True, projects=[])
     await server_main._run_rebuild_summaries_cycle(fake_service, empty_cfg)
     assert fake_service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_cycle_continues_past_raising_project(caplog):
+    """One project's failure must not abort the sweep for the others."""
+    fake_service = _FakeMemoryService(fail_for={'bad'})
+    cfg = SummaryRebuildConfig(enabled=True, projects=['bad', 'good'])
+
+    with caplog.at_level(logging.ERROR):
+        await server_main._run_rebuild_summaries_cycle(fake_service, cfg)
+
+    # 'good' was still processed despite 'bad' raising.
+    assert [c['project_id'] for c in fake_service.calls] == ['good']
+    # The failure for 'bad' was logged rather than silently swallowed.
+    assert any(
+        'bad' in rec.getMessage() for rec in caplog.records
+        if rec.levelno >= logging.ERROR
+    )
