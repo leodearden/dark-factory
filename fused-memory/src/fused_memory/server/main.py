@@ -1297,6 +1297,21 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
             continue
 
 
+async def _periodic_rebuild_summaries_loop(memory_service, cfg) -> None:
+    """Run ``_run_rebuild_summaries_cycle`` every ``cfg.interval_seconds``.
+
+    Mirrors :func:`_periodic_checkpoint_loop`: sleeps first so a restart
+    doesn't immediately re-sweep, returns cleanly on cancellation, and bounds
+    entity-summary staleness (fix (b), esc-1949-18) regardless of cause.
+    """
+    while True:
+        try:
+            await asyncio.sleep(cfg.interval_seconds)
+        except asyncio.CancelledError:
+            return
+        await _run_rebuild_summaries_cycle(memory_service, cfg)
+
+
 async def _build_task_backend(taskmaster_config):
     """Construct the configured task backend.
 
