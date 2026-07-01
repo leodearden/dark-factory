@@ -3336,6 +3336,42 @@ class TestCuratorConfigBlocklistPath:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# task-1972 step-01 RED: TestCuratorReconPremiseRegistryConfig
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCuratorReconPremiseRegistryConfig:
+    """Tests that CuratorConfig has recon_code_fix_premise_registry_path field
+    and that FusedMemoryConfig round-trips it via YAML.
+
+    Mirrors TestCuratorConfigBlocklistPath above — same shape, new field.
+    """
+
+    def test_curator_config_has_field_default_none(self):
+        """CuratorConfig has recon_code_fix_premise_registry_path field, default None."""
+        cfg = CuratorConfig()
+        assert hasattr(cfg, "recon_code_fix_premise_registry_path")
+        assert cfg.recon_code_fix_premise_registry_path is None
+
+    def test_curator_config_accepts_string_path(self):
+        """CuratorConfig accepts a string path for recon_code_fix_premise_registry_path."""
+        cfg = CuratorConfig(recon_code_fix_premise_registry_path="/tmp/premise_registry.yaml")
+        assert cfg.recon_code_fix_premise_registry_path == "/tmp/premise_registry.yaml"
+
+    def test_fused_memory_config_roundtrips_via_yaml(self, tmp_path, monkeypatch):
+        """FusedMemoryConfig round-trips recon_code_fix_premise_registry_path via YAML."""
+        import yaml
+
+        raw = {"curator": {"recon_code_fix_premise_registry_path": "/tmp/premise_registry.yaml"}}
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text(yaml.dump(raw), encoding="utf-8")
+
+        monkeypatch.setenv("CONFIG_PATH", str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.curator.recon_code_fix_premise_registry_path == "/tmp/premise_registry.yaml"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # step-7 RED: TestCuratorBlocklistShortCircuit
 # ──────────────────────────────────────────────────────────────────────────────
 
