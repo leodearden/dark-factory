@@ -2780,3 +2780,112 @@ class TestDiffStatusCorrection:
         assert result['available'] is False
         assert result['diverged'] is False
         assert result['cached'] == {'done': 5, 'total': 10, 'active_tasks': [1, 2]}
+
+    # ------------------------------------------------------------------ #
+    # step-3/step-4: full comparison against a live (non-empty) census
+    # ------------------------------------------------------------------ #
+
+    # Shared statuses fixture: 5 done (1-5), 3 active (6 pending, 7 in-progress,
+    # 8 blocked) -> census total=8, done=5, active={6,7,8}.
+    _MATCHING_STATUSES = {
+        '1': 'done', '2': 'done', '3': 'done', '4': 'done', '5': 'done',
+        '6': 'pending', '7': 'in-progress', '8': 'blocked',
+    }
+
+    def test_matching_cache_is_not_diverged_and_is_order_and_type_insensitive(self):
+        """Matching cache -> available=True, diverged=False, no mismatch flags.
+
+        cached active_tasks is an unordered int list ([8, 6, 7]) while statuses
+        keys are strings — proves ordering and int-vs-str differences do NOT
+        cause a false mismatch.
+        """
+        metadata = {
+            'task_count_done': 5,
+            'task_count_total': 8,
+            'active_tasks': [8, 6, 7],
+        }
+
+        result = diff_status_correction(metadata, self._MATCHING_STATUSES)
+
+        assert result['available'] is True
+        assert result['diverged'] is False
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is False
+        assert result['active_mismatch'] is False
+        assert result['live'] == {'done': 5, 'total': 8, 'active_tasks': [6, 7, 8]}, (
+            f"Expected live snapshot with sorted-int active_tasks, got {result['live']!r}"
+        )
+
+    def test_done_mismatch_detected(self):
+        """cached task_count_done differs from the live census -> done_mismatch=True."""
+        metadata = {
+            'task_count_done': 4,
+            'task_count_total': 8,
+            'active_tasks': [6, 7, 8],
+        }
+
+        result = diff_status_correction(metadata, self._MATCHING_STATUSES)
+
+        assert result['available'] is True
+        assert result['diverged'] is True
+        assert result['done_mismatch'] is True
+        assert result['total_mismatch'] is False
+        assert result['active_mismatch'] is False
+        assert result['live'] == {'done': 5, 'total': 8, 'active_tasks': [6, 7, 8]}
+
+    def test_total_mismatch_detected(self):
+        """cached task_count_total differs from the live census -> total_mismatch=True."""
+        metadata = {
+            'task_count_done': 5,
+            'task_count_total': 9,
+            'active_tasks': [6, 7, 8],
+        }
+
+        result = diff_status_correction(metadata, self._MATCHING_STATUSES)
+
+        assert result['available'] is True
+        assert result['diverged'] is True
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is True
+        assert result['active_mismatch'] is False
+        assert result['live'] == {'done': 5, 'total': 8, 'active_tasks': [6, 7, 8]}
+
+    def test_active_mismatch_detected_incident_replay(self):
+        """Reproduces the incident: cached active_tasks still lists now-done ids.
+
+        112/113/114/117 transitioned to 'done' since the memory was cached, but
+        the cached active_tasks list still includes them -> active_mismatch=True
+        as a SET comparison (done_count/total_count are unaffected by the stale
+        active list, so only active_mismatch fires).
+        """
+        statuses = {
+            '110': 'pending',
+            '111': 'done',
+            '112': 'done',
+            '113': 'done',
+            '114': 'done',
+            '115': 'pending',
+            '116': 'in-progress',
+            '117': 'done',
+            '118': 'pending',
+        }
+        metadata = {
+            'task_count_done': 5,
+            'task_count_total': 9,
+            'active_tasks': [110, 112, 113, 114, 115, 116, 117, 118],
+        }
+
+        result = diff_status_correction(metadata, statuses)
+
+        assert result['available'] is True
+        assert result['diverged'] is True
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is False
+        assert result['active_mismatch'] is True
+        assert result['live'] == {
+            'done': 5,
+            'total': 9,
+            'active_tasks': [110, 115, 116, 118],
+        }, (
+            f"Expected live active_tasks=[110, 115, 116, 118] (sorted ints), got {result['live']!r}"
+        )
