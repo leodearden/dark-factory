@@ -1,5 +1,6 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
+from fused_memory.reconciliation.policies import SNAPSHOT_WRITE_BLOCKED_PROJECTS
 from fused_memory.reconciliation.prompts import (
     _RECON_REPORT_TOOL_GUIDANCE,
     _STAGE3_PROJECT_ID_GUIDELINE,
@@ -59,26 +60,33 @@ serious (fundamentally contradictory state).
 ## Snapshot Discipline Exception (task-1840)
 
 For projects whose task-count snapshot write paths are **blocked-by-design** \
-(currently: `autopilot_video`), the **ABSENCE or staleness** of a task-count \
-snapshot `temporal_fact` edge is the **CORRECT STATE** — do NOT report it as \
-`missing_knowledge` or `memory_stale`.
+(currently: {', '.join(sorted(SNAPSHOT_WRITE_BLOCKED_PROJECTS))}), the **ABSENCE \
+or staleness** of a task-count snapshot `temporal_fact` edge is the **CORRECT \
+STATE** — do NOT report it as `missing_knowledge` or `memory_stale`.
 
-Background: two write paths exist for task-count snapshot edges.  For \
-`autopilot_video`, both are blocked:
+Background: two write paths exist for task-count snapshot edges:
 - **Direct path**: `add_memory(category='temporal_facts', ...)` from any \
-  `recon-stage-*` agent is rejected by the `ReconSnapshotWriteRejected` server \
-  guard in `server/tools.py`.
-- **Graphiti async queue**: silently no-ops (`memory_ids=[]`) so no edge lands.
+  `recon-stage-*` agent is rejected by the project-agnostic \
+  `ReconSnapshotWriteRejected` server guard in `server/tools.py`. This guard \
+  carries no project_id condition, so it unconditionally blocks the direct path \
+  for every registered project.
+- **Graphiti async queue**: best-effort and unreliable. It usually silently \
+  no-ops (`memory_ids=[]`) so no edge lands, but may occasionally land an edge \
+  for some projects. Its success is never guaranteed and must not be relied upon.
 
-The absence of the edge is therefore structural and intentional.  Reporting it \
-as a gap triggers wasteful Stage 2 remediation that will always fail (task 1840; \
-run evidence: 43183638, 929b4135, 5f2d3c77, 97a11280, ccce9d10).
+Because the only reliable write path (direct) is unconditionally blocked for \
+these projects, the presence of the edge is never guaranteed — its absence or \
+staleness is therefore the expected, structural, non-actionable state, even if \
+an edge is occasionally observed via the unreliable async path. Reporting the \
+absence/staleness as a gap triggers wasteful Stage 2 remediation that will \
+always fail on the direct path (task 1840; run evidence: 43183638, 929b4135, \
+5f2d3c77, 97a11280, ccce9d10).
 
 A code-side gate (`filter_blocked_snapshot_findings` in `flag_dedup.py`) drops \
 these findings after the run as a defense-in-depth backstop — but avoiding them \
 at the source keeps Stage 2 load clean.
 
-If you observe a task-count snapshot edge for `autopilot_video` that appears \
+If you observe a task-count snapshot edge for any of these projects that appears \
 stale or missing, **skip the finding entirely**.
 
 ## Finding Classification (REQUIRED)
