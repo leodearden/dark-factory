@@ -821,6 +821,7 @@ class MemoryService:
                         '_causation_id': causation_id,
                         '_write_op_id': write_op_id,
                     },
+                    callback_type='refresh_entity_summaries',
                 )
                 # Durably persisted to SQLite — report as written
                 stores_written.append(SourceStore.graphiti)
