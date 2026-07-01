@@ -1354,6 +1354,98 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
 
 
 # ---------------------------------------------------------------------------
+# Tests for task 1938: MemoryConsolidator.run() status_correction_reconciliation
+# surfacing
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorStatusCorrectionReconciliationWiring:
+    """MemoryConsolidator.run() must surface status_correction_reconciliation
+    in report.stats.
+
+    step-17 (RED): status_correction_reconciliation attribute and stat-wiring
+        don't exist yet.
+    step-18 (GREEN): add class attribute + stat block in run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_status_correction_reconciliation_stat_set_when_present(self):
+        """When stage.status_correction_reconciliation is set, report.stats carries it."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+
+        reconciliation_record = {
+            'superseded': True, 'diverged': True, 'memory_id': 'x',
+        }
+        stage.status_correction_reconciliation = reconciliation_record
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step17-scr',
+            )
+
+        assert 'status_correction_reconciliation' in report.stats, (
+            "run() must set report.stats['status_correction_reconciliation'] when "
+            "stage.status_correction_reconciliation is set; "
+            f"got stats={report.stats!r}"
+        )
+        assert report.stats['status_correction_reconciliation'] == reconciliation_record
+
+    @pytest.mark.asyncio
+    async def test_status_correction_reconciliation_absent_when_none(self):
+        """When stage.status_correction_reconciliation is None, the key is absent."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        # Explicitly leave status_correction_reconciliation at the default (None)
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step17-scr-none',
+            )
+
+        assert 'status_correction_reconciliation' not in report.stats, (
+            "When stage.status_correction_reconciliation is None, the key must be "
+            f"absent from report.stats; got stats={report.stats!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step-15 (RED) / step-16 (GREEN): Task Count Census payload section
 # ---------------------------------------------------------------------------
 
