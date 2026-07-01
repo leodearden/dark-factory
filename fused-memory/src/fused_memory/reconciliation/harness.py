@@ -1578,6 +1578,12 @@ class ReconciliationHarness:
         statuses = await self._fetch_task_count_census(project_root)
         task_count_verification = cross_verify_task_counts(filtered_task_tree, statuses)
 
+        # Diff the cached project_status_correction memory against the same live
+        # census and supersede it on divergence (task 1938).
+        status_correction_reconciliation = await self._reconcile_status_correction(
+            project_id, statuses
+        )
+
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
         graphiti_queue_health = await self._check_graphiti_queue_health(project_id)
 
@@ -1602,6 +1608,7 @@ class ReconciliationHarness:
                         filtered_task_tree=filtered_task_tree,
                         task_count_verification=task_count_verification,
                         graphiti_queue_health=graphiti_queue_health,
+                        status_correction_reconciliation=status_correction_reconciliation,
                     )
 
                 # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
