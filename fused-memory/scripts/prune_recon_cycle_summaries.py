@@ -67,6 +67,8 @@ Usage
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 # ---------------------------------------------------------------------------
 # Pure core: carries_remediation_history
@@ -137,3 +139,87 @@ def carries_remediation_history(content: str) -> bool:
     if is_quiescent and not has_remediation:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Pure core: classify_pool
+# ---------------------------------------------------------------------------
+
+def _assume_utc(dt: datetime) -> datetime:
+    """Return *dt* with UTC timezone attached if it is naive; return *dt* unchanged otherwise.
+
+    Local copy of the "naive datetimes from our journal/Mem0 are UTC"
+    convention shared with ``reconciliation.summary_pool._assume_utc`` — this
+    script deliberately has no dependency on the fused_memory package's
+    reconciliation internals so it stays a self-contained, load-in-isolation
+    ops script (mirrors the sibling copy already in task_knowledge_sync.py).
+    """
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+def _newest_first_sort_key(item: dict) -> tuple:
+    """Sort key placing parseable created_at newest-first, unparseable last.
+
+    Mirrors the oldest-first missing-sorts-last convention used by
+    ``reconciliation.summary_pool.enforce_summary_pool_cap``, inverted for a
+    newest-first ordering: parseable dates sort by descending timestamp
+    (leading tuple element 0), missing/unparseable dates sort after every
+    parseable one (leading tuple element 1) — i.e. treated as the oldest.
+    """
+    raw = item.get('created_at')
+    if raw is None:
+        return (1, 0.0)
+    try:
+        dt = _assume_utc(datetime.fromisoformat(raw))
+        return (0, -dt.timestamp())
+    except (ValueError, TypeError):
+        return (1, 0.0)
+
+
+@dataclass
+class PruneDecision:
+    """Classification result for one project x pool's cycle-summary members."""
+    keep_ids: list[str] = field(default_factory=list)
+    delete_ids: list[str] = field(default_factory=list)
+    reasons: dict[str, str] = field(default_factory=dict)  # id -> reason
+
+
+def classify_pool(summaries: list[dict], keep_recent_n: int) -> PruneDecision:
+    """Classify a pool's cycle-summary members into keep/delete sets.
+
+    Sorts *summaries* newest-first by ``created_at`` (missing/unparseable
+    dates sort last — see :func:`_newest_first_sort_key`). The
+    ``keep_recent_n`` newest members are always kept (reason ``'recent'``).
+    Among the remainder, any member whose ``content`` carries real
+    remediation history (:func:`carries_remediation_history`) is kept
+    (reason ``'remediation'``); the rest are marked for deletion (reason
+    ``'quiescent_boilerplate'``).
+
+    Args:
+        summaries: List of normalized ``{id, created_at, content, metadata}``
+            dicts.
+        keep_recent_n: Number of most-recent members to unconditionally keep.
+
+    Returns:
+        A :class:`PruneDecision` with ``keep_ids``, ``delete_ids``, and a
+        per-id ``reasons`` mapping. Pure function — no I/O.
+    """
+    ordered = sorted(summaries, key=_newest_first_sort_key)
+
+    keep_ids: list[str] = []
+    delete_ids: list[str] = []
+    reasons: dict[str, str] = {}
+
+    for i, item in enumerate(ordered):
+        item_id = item['id']
+        if i < keep_recent_n:
+            keep_ids.append(item_id)
+            reasons[item_id] = 'recent'
+        elif carries_remediation_history(item.get('content') or ''):
+            keep_ids.append(item_id)
+            reasons[item_id] = 'remediation'
+        else:
+            delete_ids.append(item_id)
+            reasons[item_id] = 'quiescent_boilerplate'
+
+    return PruneDecision(keep_ids=keep_ids, delete_ids=delete_ids, reasons=reasons)
