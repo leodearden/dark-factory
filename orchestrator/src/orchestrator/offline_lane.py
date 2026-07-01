@@ -112,6 +112,14 @@ class OfflineLaneTaskClient(Protocol):
         ...  # pragma: no cover
 
 
+#: Fix-task statuses that are terminal and non-done — the fix "can't land" —
+#: so :meth:`OfflineLaneWorker._maybe_promote_blocker` promotes straight to
+#: escalate_blocker (B7/C4) regardless of the N-advances count.  ``blocked``
+#: is deliberately excluded: it is a resolvable escalation-in-progress state,
+#: not a can't-land verdict.
+_TERMINAL_NON_DONE: frozenset[str] = frozenset({'cancelled', 'deferred'})
+
+
 class OfflineLaneWorker:
     """Singleton offline-deep lane worker — single-flight, coalescing, from-head.
 
@@ -455,19 +463,43 @@ class OfflineLaneWorker:
     async def _maybe_promote_blocker(self, fp: str, task_id: str) -> None:
         """Staged L2 ``escalate_blocker`` promotion when a fix task stalls (C4).
 
-        N-advances arm (B7): once a fingerprint's confirmed-red advance count
-        reaches ``config.git.offline_lane_red_advances_before_blocker``, file
-        a born-at-L2 blocker escalation (see :meth:`_file_blocker_escalation`)
-        and record *fp* as promoted. Promotion is idempotent per fingerprint
-        — a fingerprint already in :attr:`_promoted_blockers` returns
-        immediately, so subsequent same-set advances past the threshold never
-        re-promote.
+        Promotion is idempotent per fingerprint — a fingerprint already in
+        :attr:`_promoted_blockers` returns immediately, so subsequent
+        same-set advances never re-promote.
 
-        The terminal-fix-task-status arm (cancelled/deferred promote;
-        done clears) is added by step-17/18.
+        Three arms, checked in order (done-clear and terminal-promote
+        precede the count check, since a status query — when
+        :attr:`task_client` is wired — is authoritative over the local
+        advance count):
+
+        1. DONE: the fix task landed — clear *fp* from :attr:`open_fix_tasks`
+           / :attr:`_red_advance_counts` / :attr:`_promoted_blockers` so a
+           genuine LATER recurrence of the same failing set files a FRESH
+           task instead of being silently swallowed by stale state. No
+           blocker filed.
+        2. TERMINAL NON-DONE (cancelled/deferred): the fix task can't land —
+           promote immediately regardless of the advance count.
+        3. N-ADVANCES (B7): once the confirmed-red advance count reaches
+           ``config.git.offline_lane_red_advances_before_blocker``, promote.
+
+        Arms 1/2 are skipped when :attr:`task_client` is unwired (no status
+        to query) — only the count-based arm 3 applies in that case.
         """
         if fp in self._promoted_blockers:
             return
+
+        if self.task_client is not None:
+            status = await self.task_client.get_status(task_id)
+            if status == 'done':
+                self.open_fix_tasks.pop(fp, None)
+                self._red_advance_counts.pop(fp, None)
+                self._promoted_blockers.discard(fp)
+                return
+            if status in _TERMINAL_NON_DONE:
+                await self._file_blocker_escalation(task_id, fp)
+                self._promoted_blockers.add(fp)
+                return
+
         if self._red_advance_counts[fp] >= self.config.git.offline_lane_red_advances_before_blocker:
             await self._file_blocker_escalation(task_id, fp)
             self._promoted_blockers.add(fp)
