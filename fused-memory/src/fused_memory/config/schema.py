@@ -745,6 +745,23 @@ class CuratorConfig(BaseModel):
         ),
     )
 
+    # Recon code-fix premise-verification registry: path (absolute, or relative
+    # to server cwd) of a YAML registry of self-referential recon code-fix
+    # premises. Matching candidates are dropped BEFORE any LLM call ONLY WHILE
+    # the live source/tests still refute the premise (self-correcting — unlike
+    # cancelled_premise_blocklist_path's unconditional forever-drop). None
+    # disables the guard. See
+    # fused-memory/config/recon_code_fix_premise_registry.yaml for the schema.
+    recon_code_fix_premise_registry_path: str | None = Field(
+        default=None,
+        description=(
+            "Path (absolute or relative to server cwd) of a YAML registry of "
+            "self-referential recon code-fix premises; matching candidates are "
+            "dropped BEFORE any LLM call only while the live source/tests still "
+            "refute the premise. None disables the guard."
+        ),
+    )
+
 
 class PathScopeAdjudicatorConfig(BaseModel):
     """LLM adjudicator config for Stage-2 path-scope guard filtering.
