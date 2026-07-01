@@ -3776,13 +3776,18 @@ class GitOps:
         """Remove a temporary merge worktree.
 
         **Persistent-worktree exemption**: if *merge_wt* resolves to
-        :attr:`persistent_merge_worktree_path`, this method is a **no-op**
-        (the warm worktree survives across attempts and across verify failures,
-        so ``target/`` warmth is preserved).  The ephemeral removal path is
-        unchanged for all other ``_merge-*`` worktrees.
+        :attr:`persistent_merge_worktree_path` OR
+        :attr:`persistent_offline_deep_worktree_path`, this method is a
+        **no-op** — both persistent worktrees survive across attempts and
+        across verify failures, so their (independently retained) ``target/``
+        warmth is preserved.  The ephemeral removal path is unchanged for all
+        other ``_merge-*`` worktrees.
         """
         if merge_wt.resolve() == self.persistent_merge_worktree_path.resolve():
             logger.debug('persistent merge worktree retained: %s', merge_wt)
+            return
+        if merge_wt.resolve() == self.persistent_offline_deep_worktree_path.resolve():
+            logger.debug('persistent offline-deep worktree retained: %s', merge_wt)
             return
 
         rc, _, err = await _run(
