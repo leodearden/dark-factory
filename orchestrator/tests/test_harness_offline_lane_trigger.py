@@ -59,3 +59,16 @@ class TestOfflineLaneTrigger:
         harness._offline_lane_notifiee.assert_awaited_once_with(
             'task-1', 'base-sha', 'head-sha'
         )
+
+    async def test_offline_lane_logs_on_post_merge_line(
+        self, harness: Harness, caplog
+    ):
+        """_note_offline_lane logs an operator-visible on_post_merge line with abbreviated SHAs."""
+        harness._offline_lane_notifiee = AsyncMock()
+
+        with caplog.at_level(logging.INFO):
+            await harness._note_merge_all('t', 'base-sha', 'head-sha')
+
+        assert 'offline-lane: on_post_merge' in caplog.text
+        assert 'base-sha'[:12] in caplog.text
+        assert 'head-sha'[:12] in caplog.text
