@@ -2021,13 +2021,30 @@ class TaskKnowledgeSync(BaseStage):
         # duplicate-write risk; when the summary is genuinely absent,
         # enumeration returns [] and repaired stays 0 (no false repair).
         # report.stats['stage2_cycle_summary_verified_count'] is set to the
-        # POST-repair count so downstream consumers see the corrected value.
+        # POST-repair (and, below, POST-reconstruction) count so downstream
+        # consumers see the corrected value.
         repaired = 0
+        reconstructed = 0
         if verified_count == 0:
             repaired = await _repair_stage2_summary_stage_metadata(self.memory, self.project_id, run_id)
             if repaired:
                 verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
+            # --- fully-absent retroactive reconstruction self-heal (task 1964) ---
+            # verified_count can still be 0 here for either of two reasons:
+            # (1) repair found nothing to enumerate (repaired==0) because the
+            # pool has ZERO members for this run_id — the FULLY-ABSENT class
+            # confirmed by run 6467daca, which the 1963 repair cannot heal
+            # since there is nothing to repair; or (2) repair fixed a member
+            # (repaired>0) but its own verbatim re-add was itself silently
+            # dedup-dropped, so the re-verify above still reports 0. Both
+            # converge here: write ONE dedup-resilient reconstruction
+            # placeholder and re-verify.
+            if verified_count == 0:
+                reconstructed = await _reconstruct_stage2_summary(self.memory, self.project_id, run_id)
+                if reconstructed:
+                    verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
         report.stats['stage2_cycle_summary_stage_repaired'] = repaired
+        report.stats['stage2_cycle_summary_reconstructed'] = reconstructed
         report.stats['stage2_cycle_summary_verified_count'] = verified_count
 
         # --- stage1_flag_marker age-based GC (task 1944) ---
