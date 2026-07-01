@@ -532,3 +532,52 @@ async def test_handle_red_run_flake_logs_and_does_not_spawn(tmp_path: Path):
     task_client.submit_fix_task.assert_not_awaited()
     escalation_queue.submit.assert_not_called()
     assert worker.open_fix_tasks == {}
+
+
+# ---------------------------------------------------------------------------
+# _run_once — wiring the red path by returncode (β3, task 1954, step-9/10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_once_wires_red_and_green_paths_by_returncode(tmp_path: Path):
+    """_run_once branches on the suite result's returncode.
+
+    A green (rc == 0) pass records the snapshot head as ``_last_green_head``
+    and never calls ``_handle_red_run``. A red (rc != 0) pass awaits
+    ``_handle_red_run(wt, head)`` exactly once and leaves ``_last_green_head``
+    untouched.
+
+    Step 9 (RED): _run_once currently only logs PASS/FAIL and never
+    branches — ``_last_green_head`` is never set and ``_handle_red_run`` is
+    never invoked. Must fail before impl.
+    """
+    wt_path = tmp_path / '_offline-deep'
+
+    # -- Scenario A: green run (rc == 0) sets _last_green_head, no red path.
+    git_ops_a = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    suite_runner_a = AsyncMock(return_value=(0, ''))
+    worker_a = _make_worker(tmp_path, git_ops=git_ops_a, suite_runner=suite_runner_a)
+    worker_a._handle_red_run = AsyncMock()
+    worker_a._dirty = True
+
+    await worker_a._run_once()
+
+    assert worker_a._last_green_head == 'HEAD1', (
+        'a green (rc == 0) run must record the snapshot head as _last_green_head'
+    )
+    worker_a._handle_red_run.assert_not_awaited()
+
+    # -- Scenario B: red run (rc != 0) awaits _handle_red_run once, no green update.
+    git_ops_b = _make_git_ops(head='HEAD2', worktree_path=wt_path)
+    suite_runner_b = AsyncMock(return_value=(1, ''))
+    worker_b = _make_worker(tmp_path, git_ops=git_ops_b, suite_runner=suite_runner_b)
+    worker_b._handle_red_run = AsyncMock()
+    worker_b._dirty = True
+
+    await worker_b._run_once()
+
+    assert worker_b._last_green_head is None, (
+        'a red (rc != 0) run must NOT update _last_green_head'
+    )
+    worker_b._handle_red_run.assert_awaited_once_with(wt_path, 'HEAD2')
