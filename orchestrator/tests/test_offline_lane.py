@@ -838,3 +838,92 @@ async def test_handle_red_run_done_status_clears_fingerprint(tmp_path: Path):
     assert fp not in worker._promoted_blockers
     escalation_queue.submit.assert_not_called()
     task_client.submit_fix_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Default confirmation-runner seam (step-19/20)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_confirmation_run_builds_serial_confirm_command(tmp_path: Path):
+    """The default (uninjected) confirmation_runner seam builds the real
+    serial confirm-failures invocation and parses the confirmed-still-failing
+    test IDs from stdout (one per line).
+
+    No confirmation_runner is supplied, so the worker falls back to its
+    ``_default_confirmation_run`` seam. ``asyncio.create_subprocess_exec`` is
+    mocked, so this asserts ONLY that the argv/env/cwd invocation is built
+    correctly and stdout is parsed — real script existence/execution is
+    ζ's job (cross-project scope boundary; see module docstring), mirroring
+    ``test_default_suite_runner_builds_run_offline_deep_command`` (β2).
+
+    Step 19 (RED): _default_confirmation_run is a NotImplementedError stub
+    — must fail before impl.
+    """
+    worker = _make_worker(tmp_path)  # no confirmation_runner injected -> default seam
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(
+        return_value=(b'tests::test_a\ntests::test_b\n', b'')
+    )
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
+
+    assert confirmed == ['tests::test_a', 'tests::test_b']
+
+    mock_exec.assert_awaited_once()
+    argv = mock_exec.call_args.args
+    kwargs = mock_exec.call_args.kwargs
+    assert argv[0] == 'scripts/run-offline-deep.sh', (
+        'argv must invoke the offline-deep script'
+    )
+    assert '--test-threads=1' in argv, 'the confirmation re-run must be serial (1 thread)'
+    assert any(a.startswith('--confirm') for a in argv[1:]), (
+        'argv must carry a confirm-failures flag distinguishing this from a '
+        'normal suite run'
+    )
+    assert kwargs['cwd'] == str(wt_path), 'cwd must be the _offline-deep worktree'
+    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
+        'DF_VERIFY_ROLE=offline must be set, same as the normal suite run'
+    )
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
+            f'not replace it (missing/altered {key!r})'
+        )
+    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert kwargs['stderr'] == asyncio.subprocess.STDOUT
+
+
+@pytest.mark.asyncio
+async def test_default_confirmation_run_empty_stdout_means_no_confirmed_failures(
+    tmp_path: Path,
+):
+    """Blank/whitespace-only lines are not test IDs — empty stdout confirms nothing.
+
+    Step 19 (RED): _default_confirmation_run is a NotImplementedError stub
+    — must fail before impl.
+    """
+    worker = _make_worker(tmp_path)
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'\n  \n', b''))
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ):
+        confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
+
+    assert confirmed == []
