@@ -11,6 +11,7 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
+    PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     GitOps,
     ScrubOutcome,
     ScrubResult,
@@ -4901,6 +4902,39 @@ class TestPersistentMergeWorktree:
         # Stray untracked file must be cleaned
         assert not stray_txt.exists(), (
             'stray.txt must be cleaned by git clean -xfd'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 1952 — second persistent warm worktree `_offline-deep` (PRD δ / §5 C5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPersistentOfflineDeepWorktree:
+    """Integration tests for reset_persistent_offline_deep_worktree and its exemptions.
+
+    Steps 1–10 of task 1952 (PRD δ / §5 C5): a SECOND persistent warm
+    worktree, dedicated to the offline-deep lane worker (β2), modeled on
+    ``TestPersistentMergeWorktree`` above but with its OWN never-shared
+    ``target/``.
+    """
+
+    # ------------------------------------------------------------------
+    # Step 1 — module constant + path property
+    # ------------------------------------------------------------------
+
+    async def test_persistent_offline_deep_worktree_path_property(
+        self, git_ops: GitOps,
+    ):
+        """persistent_offline_deep_worktree_path == worktree_base / '_offline-deep'.
+
+        Step 1 (RED): constant and property are absent today
+        (AttributeError/ImportError).
+        """
+        assert PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME == '_offline-deep'
+        assert git_ops.persistent_offline_deep_worktree_path == (
+            git_ops.worktree_base / '_offline-deep'
         )
 
 
