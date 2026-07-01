@@ -21,6 +21,8 @@ and ``_periodic_rebuild_summaries_loop`` (the thin sleep/cancel wrapper).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 
 import pytest
@@ -90,3 +92,30 @@ async def test_cycle_continues_past_raising_project(caplog):
         'bad' in rec.getMessage() for rec in caplog.records
         if rec.levelno >= logging.ERROR
     )
+
+
+@pytest.mark.asyncio
+async def test_periodic_loop_runs_cycle_and_cancels_cleanly(monkeypatch):
+    """The loop sleeps, runs one cycle per tick, and exits cleanly on cancel."""
+    ran_count = 0
+    first_run = asyncio.Event()
+
+    async def _fake_cycle(memory_service, cfg):
+        nonlocal ran_count
+        ran_count += 1
+        first_run.set()
+
+    monkeypatch.setattr(server_main, '_run_rebuild_summaries_cycle', _fake_cycle)
+
+    cfg = SummaryRebuildConfig(enabled=True, projects=['proj_a'], interval_seconds=0.01)
+    task = asyncio.create_task(
+        server_main._periodic_rebuild_summaries_loop(_FakeMemoryService(), cfg),
+    )
+
+    await asyncio.wait_for(first_run.wait(), timeout=1.0)
+    assert ran_count >= 1
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert task.done()
