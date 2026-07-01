@@ -40,6 +40,10 @@ from fused_memory.reconciliation.prompts import (
 )
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.summary_pool import (
+    enforce_summary_pool_cap,
+    pretrim_summary_pool,
+)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_task_dump_contamination,
@@ -1055,20 +1059,11 @@ async def _enforce_stage2_summary_pool_cap(
 ) -> int:
     """Trim the stage2_cycle_summary pool to at most *cap* members (default 2).
 
-    Enumerates all Mem0 memories tagged
-    ``{'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL}`` via
-    ``get_memories_by_metadata`` (deterministic Qdrant scroll — NOT semantic
-    search), sorts oldest-first by ``created_at``, then deletes the oldest
-    ``len - cap`` via parallel ``delete_memory`` calls.
-
-    Best-effort posture (mirrors ``_sweep_stale_fixc_markers``):
-    - Enumeration failure → logs WARNING, returns 0, does NOT raise.
-    - Individual delete failure → logs WARNING, excluded from count.
-
-    Created_at ordering: uses ``_assume_utc + datetime.fromisoformat``
-    convention.  Members with missing/unparseable ``created_at`` sort LAST
-    (treated as newest/kept) so an undatable summary is never preferentially
-    deleted.
+    Thin delegator to the generic ``reconciliation.summary_pool.enforce_summary_pool_cap``
+    core (task 1942 extraction) — behavior is unchanged from the original
+    Stage-2-only implementation. Kept as a distinct public name/signature so
+    the ~30 existing Stage 2 pool-cap tests (and any other callers) are
+    unaffected by the extraction.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata`` and
@@ -1083,62 +1078,14 @@ async def _enforce_stage2_summary_pool_cap(
         Number of memories successfully deleted (0 if pool <= cap or on
         enumeration failure).
     """
-    try:
-        members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters={'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL},
-        )
-    except Exception:
-        logger.warning(
-            'reconciliation._enforce_stage2_summary_pool_cap: '
-            'get_memories_by_metadata failed for project_id=%s; skipping trim',
-            project_id,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-        return 0
-
-    if len(members) <= cap:
-        return 0
-
-    def _sort_key(item: dict) -> tuple:
-        raw = item.get('created_at')
-        if raw is None:
-            return (1, 0)
-        try:
-            dt = _assume_utc(datetime.fromisoformat(raw))
-            return (0, dt)
-        except (ValueError, TypeError):
-            return (1, 0)
-
-    sorted_members = sorted(members, key=_sort_key)
-    to_delete = sorted_members[: len(sorted_members) - cap]
-
-    results = await asyncio.gather(
-        *(
-            memory_service.delete_memory(
-                memory_id=m['id'],
-                store='mem0',
-                project_id=project_id,
-                causation_id=run_id,
-                _source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
-            )
-            for m in to_delete
-        ),
-        return_exceptions=True,
+    return await enforce_summary_pool_cap(
+        memory_service,
+        project_id,
+        run_id,
+        recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
+        trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+        cap=cap,
     )
-
-    success_count = 0
-    for m, result in zip(to_delete, results, strict=True):
-        if isinstance(result, BaseException):
-            logger.warning(
-                'reconciliation._enforce_stage2_summary_pool_cap: '
-                'delete failed for memory_id=%s; not counted',
-                m['id'],
-                extra={'project_id': project_id, 'memory_id': m['id'], 'run_id': run_id},
-            )
-        else:
-            success_count += 1
-    return success_count
 
 
 async def _pretrim_stage2_summary_pool(
@@ -1149,17 +1096,18 @@ async def _pretrim_stage2_summary_pool(
 ) -> int:
     """Pre-trim the stage2_cycle_summary pool to cap-1, reserving one slot.
 
-    Delegates to ``_enforce_stage2_summary_pool_cap`` with
-    ``cap=max(cap - 1, 0)`` so the imminent agent write lands as the cap-th
-    member and can never be a trim candidate (trim-then-write ordering, task
-    1831).
+    Thin delegator to the generic ``reconciliation.summary_pool.pretrim_summary_pool``
+    core (task 1942 extraction) — behavior is unchanged from the original
+    Stage-2-only implementation: delegates with ``cap=max(cap - 1, 0)`` so the
+    imminent agent write lands as the cap-th member and can never be a trim
+    candidate (trim-then-write ordering, task 1831).
 
     Must be called BEFORE ``super().run()`` (the agent write).  Post-write
     pool size transiently reaches cap; it is bounded back to cap on the next
     cycle's pre-trim — no post-write trim is needed.
 
     Args:
-        memory_service: Forwarded to ``_enforce_stage2_summary_pool_cap``.
+        memory_service: Forwarded to :func:`_enforce_stage2_summary_pool_cap`.
         project_id: Project scope.
         run_id: Current reconciliation run identifier (audit journal).
         cap: Logical pool cap (default ``STAGE2_CYCLE_SUMMARY_POOL_CAP``).
@@ -1169,8 +1117,13 @@ async def _pretrim_stage2_summary_pool(
         Number of memories successfully deleted (0 if pool is already at
         or below cap-1, or on enumeration failure).
     """
-    return await _enforce_stage2_summary_pool_cap(
-        memory_service, project_id, run_id, cap=max(cap - 1, 0)
+    return await pretrim_summary_pool(
+        memory_service,
+        project_id,
+        run_id,
+        recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
+        trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+        cap=cap,
     )
 
 
