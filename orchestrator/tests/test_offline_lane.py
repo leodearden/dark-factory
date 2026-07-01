@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -315,3 +315,76 @@ async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
 
     assert calls_b == [], 'no advance since the last run must never trigger a spurious run'
     assert worker_b._last_run_head == 'HEAD1'
+
+
+# ---------------------------------------------------------------------------
+# run() — fail-open + clean cancellation (step-11/12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
+    """A broken lane run can never wedge the process (worker leg of C7).
+
+    (a)+(c): a suite_runner that raises on its first call is logged as a
+    bounded one-line summary (never ``logger.exception``, whose O(frames)
+    traceback formatting can starve the event loop) and the failure path
+    always sleeps a fixed backoff — so the loop cannot tight-spin — yet
+    survives: since the failed run never updated ``_last_run_head``, the
+    (already-implemented) poll backstop re-flags the still-outstanding
+    advance and a subsequent run happens.
+    (b): cancelling the ``run()`` task propagates ``asyncio.CancelledError``
+    cleanly — never swallowed.
+
+    Step 11 (RED): run() has no failure handling yet — an exception from
+    suite_runner propagates straight out of run(), killing the loop task, so
+    no second run and no backoff sleep ever happen. Must fail before impl.
+    """
+    # -- (a)+(c): fail-open with a bounded log + backoff, then survive.
+    calls = {'n': 0}
+    done = asyncio.Event()
+
+    async def _suite_runner(wt, head, threads):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError('suite boom')
+        done.set()
+        return (0, '')
+
+    git_ops = _make_git_ops(head='HEAD1')
+    config = _make_config(tmp_path, offline_lane_poll_interval_secs=0.05)
+    worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=_suite_runner)
+    worker._dirty = True
+
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def _tracking_sleep(delay, *a, **k):
+        sleeps.append(delay)
+        return await real_sleep(0)
+
+    with patch('orchestrator.offline_lane.asyncio.sleep', side_effect=_tracking_sleep), \
+            patch('orchestrator.offline_lane.logger') as mock_logger:
+        task = asyncio.create_task(worker.run())
+        try:
+            await asyncio.wait_for(done.wait(), timeout=3.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert calls['n'] == 2, 'the loop must survive the first failure and run again'
+    mock_logger.exception.assert_not_called()
+    assert mock_logger.error.call_count >= 1, 'expected a bounded logger.error summary'
+    assert 60.0 in sleeps, f'expected a backoff sleep after the failure, got {sleeps!r}'
+
+    # -- (b): cancelling run() propagates CancelledError cleanly (never swallowed).
+    worker2 = _make_worker(
+        tmp_path, config=_make_config(tmp_path, offline_lane_poll_interval_secs=120.0)
+    )
+    task2 = asyncio.create_task(worker2.run())
+    await asyncio.sleep(0)
+    task2.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task2
