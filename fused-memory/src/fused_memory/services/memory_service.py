@@ -599,7 +599,13 @@ class MemoryService:
                 uuids[tgt_uuid] = None
 
         for node_uuid in uuids:
-            await self.graphiti.refresh_entity_summary(node_uuid, group_id=group_id)
+            try:
+                await self.graphiti.refresh_entity_summary(node_uuid, group_id=group_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'post-ingest refresh_entity_summary failed for uuid=%s group=%s: %s',
+                    node_uuid, group_id, exc,
+                )
 
     async def _dual_write_callback(
         self, callback_type: str, result: Any, payload: dict[str, Any]
