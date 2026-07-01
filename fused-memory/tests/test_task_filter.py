@@ -2530,6 +2530,115 @@ class TestCountSnapshotPrimitives:
 
 
 # ---------------------------------------------------------------------------
+# PRIOR_STATE_RE / RESULTING_STATE_RE / is_mixed_temporal_framing (task 1950)
+# ---------------------------------------------------------------------------
+
+
+class TestMixedTemporalFraming:
+    """Tests for is_mixed_temporal_framing() in task_filter.py.
+
+    Detects recon-stage temporal_facts writes that mix PRIOR/superseded-state
+    framing (was, previously, no longer, ...) with RESULTING/current-state
+    framing (now, currently, ...) in a single write — the "was X, now Y"
+    transition-prose shape that causes Graphiti extraction to emit both
+    fragments as co-current, self-contradictory edges (task 1950 incident:
+    episode 8e2cec60, edges 8fb94dc2 stale + 5d080132 accurate).
+    """
+
+    # ------------------------------------------------------------------ #
+    # is_mixed_temporal_framing — positive fixtures (mixed framing → True)
+    # ------------------------------------------------------------------ #
+
+    def test_positive_incident_shape_previously_now(self):
+        """The task-1950 incident shape (previously ... now ...) must fire."""
+        from fused_memory.reconciliation.task_filter import is_mixed_temporal_framing
+
+        text = (
+            'BillingService.run_billing previously used BillingConfig with static '
+            'defaults; it now overlays governed own_use_rate_pence_per_kwh onto the '
+            'BillingConfig'
+        )
+        assert is_mixed_temporal_framing(text) is True, (
+            f'Expected is_mixed_temporal_framing to return True for the incident '
+            f'previously+now shape, got False.\ntext={text!r}'
+        )
+
+    def test_positive_was_now(self):
+        """A 'was ... now ...' transition must fire."""
+        from fused_memory.reconciliation.task_filter import is_mixed_temporal_framing
+
+        text = 'The runner was using static defaults but now applies the governed overlay'
+        assert is_mixed_temporal_framing(text) is True, (
+            f'Expected is_mixed_temporal_framing to return True for a was+now shape, '
+            f'got False.\ntext={text!r}'
+        )
+
+    def test_positive_no_longer_currently(self):
+        """A 'no longer ... currently ...' transition must fire."""
+        from fused_memory.reconciliation.task_filter import is_mixed_temporal_framing
+
+        text = 'X no longer uses static defaults; it currently overlays the governed rate'
+        assert is_mixed_temporal_framing(text) is True, (
+            f'Expected is_mixed_temporal_framing to return True for a no longer+currently '
+            f'shape, got False.\ntext={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # is_mixed_temporal_framing — negative fixtures (must return False)
+    # ------------------------------------------------------------------ #
+
+    def test_negative_resulting_state_only(self):
+        """Resulting-state-only prose (no prior marker) must NOT fire."""
+        from fused_memory.reconciliation.task_filter import is_mixed_temporal_framing
+
+        text = (
+            'BillingService.run_billing overlays governed own_use_rate_pence_per_kwh '
+            'onto the BillingConfig'
+        )
+        assert is_mixed_temporal_framing(text) is False, (
+            f'Expected is_mixed_temporal_framing to return False for resulting-state-only '
+            f'prose, got True.\ntext={text!r}'
+        )
+
+    def test_negative_single_framed_problem_only(self):
+        """Problem-only prose in the present tense (no prior marker, no 'now') must NOT fire."""
+        from fused_memory.reconciliation.task_filter import is_mixed_temporal_framing
+
+        text = 'BillingService.run_billing uses BillingConfig with static defaults'
+        assert is_mixed_temporal_framing(text) is False, (
+            f'Expected is_mixed_temporal_framing to return False for single-framed '
+            f'problem-only prose, got True.\ntext={text!r}'
+        )
+
+    def test_negative_count_snapshot_no_transition_markers(self):
+        """A count-snapshot line with no transition markers must NOT fire.
+
+        Pins that is_mixed_temporal_framing is an independent detector from
+        is_count_snapshot — a snapshot line with no prior/resulting markers
+        must not be misclassified as mixed framing.
+        """
+        from fused_memory.reconciliation.task_filter import is_mixed_temporal_framing
+
+        text = 'As of 2026-07-01: project dark_factory has 3 blocked, 18 done'
+        assert is_mixed_temporal_framing(text) is False, (
+            f'Expected is_mixed_temporal_framing to return False for a count-snapshot '
+            f'line without transition markers, got True.\ntext={text!r}'
+        )
+
+    def test_negative_innocuous_single_now(self):
+        """A lone resulting-state marker with no prior marker must NOT fire (fail-open
+        under-firing by design — see design decision in plan.json).
+        """
+        from fused_memory.reconciliation.task_filter import is_mixed_temporal_framing
+
+        text = 'The config is now validated at load'
+        assert is_mixed_temporal_framing(text) is False, (
+            f'Expected is_mixed_temporal_framing to return False for an innocuous '
+            f'single-"now" fact with no prior marker, got True.\ntext={text!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # detect_task_dump_contamination (task 1661)
 # ---------------------------------------------------------------------------
 
