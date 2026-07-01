@@ -16,16 +16,31 @@ set -euo pipefail
 # (_default_schedule_detached_restart), and even that cannot self-verify.
 #
 # Usage:
-#   restart-orchestrator.sh
+#   restart-orchestrator.sh [--drain]
+#
+# --drain is accepted-and-ignored -- a no-op alias kept for generic-caller
+# compatibility (mirrors restart-dashboard.sh's convention for services
+# without a drain layer). The orchestrator has no SIGUSR1 drain handler
+# (unlike fused-memory's --drain/"Harness fully drained" mechanism); its
+# graceful drain is delegated entirely to SIGTERM -> cancel-main-task ->
+# finally (cli.py _make_cancel_handler), bounded by the unit's
+# TimeoutStopSec=90s. A plain `systemctl restart` already triggers that
+# path, so there is nothing extra for --drain to do here.
 
 SERVICE="orchestrator-dark-factory.service"
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
 
-if [[ $# -gt 0 ]]; then
-    echo "ERROR: unexpected argument: $1" >&2
-    exit 1
-fi
+for arg in "$@"; do
+    case "$arg" in
+        --drain)
+            ;;
+        *)
+            echo "ERROR: unexpected argument: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
 
 read_field() {
     # $1 = `systemctl show` output blob, $2 = field name
