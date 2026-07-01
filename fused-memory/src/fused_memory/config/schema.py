@@ -611,6 +611,31 @@ class TicketJanitorConfig(BaseModel):
     batch_limit: int = Field(default=100)
 
 
+class SummaryRebuildConfig(BaseModel):
+    """Scheduled staleness backstop for entity summaries (fix (b), task 1958).
+
+    Follow-up to task 1949's fix (a) — a best-effort post-ingestion refresh
+    of the edge endpoints returned by a single write. That leaves residual
+    drift for entities graphiti_core resolves against but that are not in
+    the returned edge list. Only a periodic sweep of
+    ``memory_service.rebuild_entity_summaries`` bounds that drift regardless
+    of cause. Disabled by default (``enabled=False``, ``projects=[]``) so
+    the sweep costs nothing until an operator opts in.
+    """
+
+    enabled: bool = Field(default=False)
+    interval_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+        description='Seconds between sweeps of the configured projects.',
+    )
+    projects: list[str] = Field(
+        default_factory=list,
+        description='project_ids to sweep; empty = no-op regardless of enabled.',
+    )
+    force: bool = Field(default=False)
+
+
 class CuratorConfig(BaseModel):
     """Task curator gate — LLM-judged drop/combine/create decision on task creation.
 
@@ -788,6 +813,7 @@ class FusedMemoryConfig(BaseSettings):
     taskmaster: TaskmasterConfig | None = Field(default=None)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
+    summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)
     path_scope_adjudicator: PathScopeAdjudicatorConfig = Field(
         default_factory=PathScopeAdjudicatorConfig,
     )

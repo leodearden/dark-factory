@@ -899,6 +899,24 @@ async def run_server():
     else:
         logger.info('  Checkpoint loop: no SQLite targets — skipped')
 
+    # Periodic entity-summary rebuild loop — scheduled staleness backstop
+    # (fix (b), task 1958; follow-up to task 1949's fix (a) best-effort
+    # post-ingestion refresh). Disabled by default; an operator opts in by
+    # setting summary_rebuild.enabled and listing summary_rebuild.projects.
+    rebuild_summaries_task: asyncio.Task[None] | None = None
+    if config.summary_rebuild.enabled and config.summary_rebuild.projects:
+        rebuild_summaries_task = asyncio.create_task(
+            _periodic_rebuild_summaries_loop(memory_service, config.summary_rebuild),
+        )
+        logger.info(
+            '  Summary rebuild loop: enabled (interval=%.0fs projects=%s force=%s)',
+            config.summary_rebuild.interval_seconds,
+            config.summary_rebuild.projects,
+            config.summary_rebuild.force,
+        )
+    else:
+        logger.info('  Summary rebuild loop: disabled')
+
     # Run transport
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
@@ -1041,6 +1059,10 @@ async def run_server():
             checkpoint_task.cancel()
             with contextlib.suppress(BaseException):
                 await checkpoint_task
+        if rebuild_summaries_task is not None:
+            rebuild_summaries_task.cancel()
+            with contextlib.suppress(BaseException):
+                await rebuild_summaries_task
         await _shutdown_with_watchdog(
             memory_service=memory_service,
             task_interceptor=task_interceptor,
@@ -1269,6 +1291,66 @@ async def _periodic_checkpoint_loop(targets: list[tuple[str, object]]) -> None:
         except asyncio.CancelledError:
             return
         await _run_checkpoint_cycle(targets)
+
+
+async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
+    """One pass of the entity-summary staleness backstop (fix (b), task 1958).
+
+    Follow-up to task 1949's fix (a) (best-effort post-ingestion refresh of
+    the edge endpoints returned by a single write): that leaves residual
+    drift for entities graphiti_core resolves against but that are not in
+    the returned edge list. This periodic sweep of
+    ``memory_service.rebuild_entity_summaries`` bounds that drift regardless
+    of cause. Extracted from :func:`_periodic_rebuild_summaries_loop` so unit
+    tests can exercise the fan-out without waiting for
+    ``cfg.interval_seconds``.
+
+    Each project's result dict (``rebuilt``/``stale_entities``/``skipped``/
+    ``errors``) is logged so an operator can see whether the sweep is
+    actually reducing staleness — at WARNING when the project reported any
+    per-entity errors, INFO otherwise.
+    """
+    if not cfg.enabled or not cfg.projects:
+        return
+    for project_id in cfg.projects:
+        try:
+            result = await memory_service.rebuild_entity_summaries(
+                project_id=project_id,
+                force=cfg.force,
+                _source='periodic_maintenance',
+            )
+        except Exception:
+            logger.exception('rebuild_entity_summaries failed for project %s', project_id)
+            continue
+        result = result or {}
+        errors = result.get('errors', 0)
+        log_fn = logger.warning if errors else logger.info
+        log_fn(
+            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s',
+            project_id,
+            result.get('rebuilt'),
+            result.get('stale_entities'),
+            result.get('skipped'),
+            errors,
+        )
+
+
+async def _periodic_rebuild_summaries_loop(memory_service, cfg) -> None:
+    """Run ``_run_rebuild_summaries_cycle`` every ``cfg.interval_seconds``.
+
+    Mirrors :func:`_periodic_checkpoint_loop`: sleeps first so a restart
+    doesn't immediately re-sweep, returns cleanly on cancellation, and bounds
+    entity-summary staleness (fix (b), esc-1949-18) regardless of cause.
+    """
+    while True:
+        try:
+            await asyncio.sleep(cfg.interval_seconds)
+        except asyncio.CancelledError:
+            return
+        logger.debug(
+            'summary rebuild loop: sweep starting over %d project(s)', len(cfg.projects)
+        )
+        await _run_rebuild_summaries_cycle(memory_service, cfg)
 
 
 async def _build_task_backend(taskmaster_config):
