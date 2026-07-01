@@ -15,6 +15,7 @@ from fused_memory.reconciliation.task_filter import (
     _render_task_line,
     cross_verify_task_counts,
     detect_census_inconsistency,
+    diff_status_correction,
     filter_task_tree,
     format_filtered_task_tree,
     format_task_list,
@@ -2727,4 +2728,55 @@ class TestCrossVerifyTaskCounts:
         result = cross_verify_task_counts(tree, None)
 
         assert result['available'] is False
+
+
+# ---------------------------------------------------------------------------
+# diff_status_correction — step-1 (RED) / step-2 (GREEN); step-3 (RED) / step-4 (GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDiffStatusCorrection:
+    """diff_status_correction(metadata, statuses) diffs a cached Mem0
+    project_status_correction memory's metadata against the live get_statuses
+    census (task 1938).
+
+    step-1/step-2: fail-open branch — statuses empty/None means the live census
+    is unavailable, so the function must never claim divergence (a caller must
+    NOT supersede a possibly-correct cached memory against no data).
+    """
+
+    def test_empty_statuses_returns_unavailable_not_diverged(self):
+        """Empty statuses dict -> available=False, diverged=False (fail-open)."""
+        metadata = {
+            'kind': 'project_status_correction',
+            'task_count_done': 110,
+            'task_count_total': 124,
+            'active_tasks': [110, 112, 113],
+        }
+
+        result = diff_status_correction(metadata, {})
+
+        assert result['available'] is False
+        assert result['diverged'] is False
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is False
+        assert result['active_mismatch'] is False
+        assert result['live'] is None
+        assert result['cached'] == {
+            'done': 110,
+            'total': 124,
+            'active_tasks': [110, 112, 113],
+        }, (
+            f"Expected the cached snapshot echoed from metadata, got {result['cached']!r}"
+        )
+
+    def test_none_statuses_returns_unavailable_not_diverged(self):
+        """None statuses -> available=False, diverged=False (fail-open)."""
+        metadata = {'task_count_done': 5, 'task_count_total': 10, 'active_tasks': [1, 2]}
+
+        result = diff_status_correction(metadata, None)
+
+        assert result['available'] is False
+        assert result['diverged'] is False
+        assert result['cached'] == {'done': 5, 'total': 10, 'active_tasks': [1, 2]}
         assert result['consistent'] is True
