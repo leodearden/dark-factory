@@ -3563,6 +3563,37 @@ class GitOps:
             return [], subprocess.CalledProcessError(rc, cmd, output=output, stderr=stderr)
         return [f for f in output.strip().splitlines() if f.strip()], None
 
+    async def get_merge_commit_diff_files(
+        self, merge_sha: str,
+    ) -> tuple[list[str], Exception | None]:
+        """Files this merge introduced relative to its OWN first parent.
+
+        Returns ``get_merge_diff_files(f'{merge_sha}^1', merge_sha)`` —
+        inheriting ``--no-renames``, the ``:!.task/`` exclusion, and the
+        total never-raises ``(files, err)`` contract unchanged.
+
+        This is the contamination-free anchor for done-time
+        ``metadata.files`` capture.  ``merge_to_main`` always merges with
+        ``git merge --no-ff``, so *merge_sha* is a two-parent merge commit:
+        ``merge_sha^1`` is main's tip immediately BEFORE this merge, and
+        ``merge_sha^2`` is the task branch tip that was merged in — the
+        same invariant ``advance_main`` already relies on when it derives
+        the verified branch tip from ``merge_sha^2`` ("--no-ff guarantees
+        M^2 is the branch commit", see ``advance_main`` docstring).
+
+        By symmetry, ``merge_sha^1`` is captured atomically at merge time
+        and diffing against it yields EXACTLY this task's own branch
+        changes — sibling files present in both trees cancel out.
+
+        Contrast the stale-base two-dot diff a caller might otherwise use
+        (a task's own ``_base_commit`` captured once at worktree creation,
+        never refreshed after a rebase, against the final ``merge_sha``):
+        that diff unions in every sibling task that merged into main during
+        the window between this task's branch point and its own merge —
+        the reported cross-task ``metadata.files`` contamination.
+        """
+        return await self.get_merge_diff_files(f'{merge_sha}^1', merge_sha)
+
     async def get_files_touched_in_branch(
         self, base_sha: str, branch_head: str,
     ) -> list[str]:

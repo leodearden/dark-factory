@@ -6738,6 +6738,105 @@ class TestGetMergeDiffFilesWarning:
 
 
 # ---------------------------------------------------------------------------
+# Task 1965: get_merge_commit_diff_files — first-parent diff excludes siblings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGetMergeCommitDiffFiles:
+    """Task 1965: done-time metadata.files must anchor to the merge commit's
+    OWN first parent, not a task's stale ``_base_commit``.
+
+    Reproduces the cross-task contamination scenario: two sibling tasks
+    (A, B) both branch from the same ``main`` tip (C0) and merge in
+    sequence — A's merge lands first (M_A), B's merge lands second (M_B).
+    A done-reconcile for task B that (incorrectly) diffs its own stale
+    base commit (C0) against the final merge SHA (M_B) unions in A's file
+    too — this is the reported contamination.  The new first-parent diff
+    (``M_B^1..M_B`` == ``M_A..M_B``) must include ONLY B's own file.
+    """
+
+    async def test_first_parent_diff_excludes_sibling_task_file(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        rc, c0, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0
+        c0 = c0.strip()
+
+        # Branch task/A from C0 and add a.py.
+        rc, _, err = await _run(['git', 'checkout', '-b', 'task/A'], cwd=git_repo)
+        assert rc == 0, f'checkout task/A failed: {err}'
+        (git_repo / 'a.py').write_text('a = 1\n')
+        await _run(['git', 'add', 'a.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'Add a.py'], cwd=git_repo)
+        assert rc == 0, f'commit a.py failed: {err}'
+
+        # Branch task/B from the SAME C0 (main hasn't moved yet) and add
+        # b.py plus a directly-committed .task/ file (bypassing GitOps.commit's
+        # :!.task staging exclusion) so the diff-time pathspec exclusion is
+        # what's under test, not the staging-time exclusion.
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(['git', 'checkout', '-b', 'task/B'], cwd=git_repo)
+        assert rc == 0, f'checkout task/B failed: {err}'
+        (git_repo / 'b.py').write_text('b = 1\n')
+        task_dir = git_repo / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'plan.json').write_text('{}')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Add b.py and .task/plan.json'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit b.py failed: {err}'
+
+        # Merge task/A into main first — advances main to M_A.
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'task/A', '-m', 'Merge task/A into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'merge task/A failed: {err}'
+        rc, m_a, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0
+        m_a = m_a.strip()
+
+        # Merge task/B into main (now at M_A) second — advances main to M_B.
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'task/B', '-m', 'Merge task/B into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'merge task/B failed: {err}'
+        rc, m_b, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0
+        m_b = m_b.strip()
+        assert m_a != m_b
+
+        # (a) New first-parent diff: only B's own file; sibling A excluded.
+        files, err_obj = await git_ops.get_merge_commit_diff_files(m_b)
+        assert err_obj is None, f'expected no error; got {err_obj!r}'
+        assert 'b.py' in files, f'expected b.py in {files!r}'
+        assert 'a.py' not in files, (
+            f"sibling task A's file must be excluded from B's own diff; got {files!r}"
+        )
+
+        # (c) .task/ exclusion is inherited from get_merge_diff_files.
+        assert not any(f.startswith('.task/') for f in files), (
+            f'.task/ files must be excluded; got {files!r}'
+        )
+
+        # (b) Contamination baseline: the OLD two-dot diff (stale base C0)
+        # DOES include sibling A's file — documents the bug this fix removes.
+        old_files, old_err = await git_ops.get_merge_diff_files(c0, m_b)
+        assert old_err is None
+        assert 'a.py' in old_files, (
+            'contamination baseline: expected the stale two-dot diff to '
+            f"include sibling A's file; got {old_files!r}"
+        )
+        assert 'b.py' in old_files
+
+
+# ---------------------------------------------------------------------------
 # Task 1825 step-1: get_files_touched_in_branch emits WARNING on rc!=0
 # ---------------------------------------------------------------------------
 
