@@ -5032,6 +5032,11 @@ Output JSON matching the schema. Every task must appear in the output.
         notifiee = self._offline_lane_notifiee
         if notifiee is None:
             return
+        logger.info(
+            'offline-lane: on_post_merge %s..%s',
+            base_sha[:12],
+            head_sha[:12],
+        )
         await notifiee(task_id, base_sha, head_sha)
 
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
