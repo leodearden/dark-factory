@@ -589,6 +589,47 @@ class ReconReportState:
             'summary_warnings': list(entry.summary_warnings),
         }
 
+    def get_findings_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        """Return every finding filed under *run_id*, across ALL stages, raw.
+
+        Aggregates ``entry.findings`` from every ``(r_id, stage)`` entry whose
+        ``r_id == run_id`` — robust to however many stages have filed findings
+        for this run.  Each ``_Finding`` is projected to the same dict shape
+        used by :meth:`get_assembled_report` (finding_id, severity, category,
+        description, suggested_action, actionable, task_id, flag_type, and
+        copies of the four cited_* lists).
+
+        Unlike :meth:`get_assembled_report`, this method does **NOT** apply
+        Fix-1 read-time echo suppression (task-1654).  It is intentionally a
+        raw, run-scoped read: task-1966 uses it as an independent "recon_report
+        channel" for Stage 2 to poll for ``systemic_pattern`` findings, so that
+        channel stays genuinely independent of the primary (Mem0 flagged-items)
+        channel even when the latter is suppressed by a ``stage1_flag_suppression``
+        record.
+
+        Returns ``[]`` for an unknown ``run_id`` (never raises).
+        """
+        results: list[dict[str, Any]] = []
+        for (r_id, _stage), entry in self._state.items():
+            if r_id != run_id:
+                continue
+            for f in entry.findings:
+                results.append({
+                    'finding_id': f.finding_id,
+                    'severity': f.severity,
+                    'category': f.category,
+                    'description': f.description,
+                    'suggested_action': f.suggested_action,
+                    'actionable': f.actionable,
+                    'task_id': f.task_id,
+                    'flag_type': f.flag_type,
+                    'cited_entities': list(f.cited_entities),
+                    'cited_edges': list(f.cited_edges),
+                    'cited_tasks': list(f.cited_tasks),
+                    'cited_memories': list(f.cited_memories),
+                })
+        return results
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
