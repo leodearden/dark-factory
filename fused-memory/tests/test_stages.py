@@ -13175,3 +13175,199 @@ class TestReconstructStage2Summary:
 
         assert result == 0
         assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestRunStage2SummaryReconstructionWiring:
+    """TaskKnowledgeSync.run() wires _reconstruct_stage2_summary (task 1964)
+    as the final fallback in the verify -> repair -> reconstruct chain: when
+    verified_count is STILL 0 after the task-1963 repair — whether because
+    repair found nothing to enumerate (the FULLY-ABSENT class) or because a
+    "successful" repair's own re-add was itself dedup-dropped — run() invokes
+    _reconstruct_stage2_summary and, on success, re-verifies.
+
+    Mirrors the TestAssemblePayloadRunWindowStart harness: super().run()
+    executes for real (via a patched run_stage_via_cli) while the
+    module-level verify/repair/reconstruct helpers are patched directly, so
+    these tests target only the run()-level orchestration — not the
+    helpers' own internals, which are covered by
+    TestVerifyStage2SummaryWritten / TestRepairStage2SummaryStageMetadata /
+    TestReconstructStage2Summary.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.search.return_value = []
+        memory_service.add_memory.return_value = {'memory_ids': []}
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _fake_cli_result(self):
+        return MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1, tokens_used=0, cost_usd=0.0,
+            model='test-model', error=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fully_absent_triggers_reconstruction_and_reverify(self, mock_deps):
+        """verify=[0, 1], repair=0 (nothing to enumerate) -> reconstruct is
+        awaited once with (self.memory, project_id, run_id); verify is
+        re-awaited after a successful reconstruction; report.stats reflects
+        both the reconstruction outcome and the post-reconstruction verified
+        count.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            TaskKnowledgeSync,
+        )
+
+        run_id = 'run-fully-absent'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        verify_mock = AsyncMock(side_effect=[0, 1])
+        repair_mock = AsyncMock(return_value=0)
+        reconstruct_mock = AsyncMock(return_value=1)
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_stage2_summary_written',
+                new=verify_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._repair_stage2_summary_stage_metadata',
+                new=repair_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._reconstruct_stage2_summary',
+                new=reconstruct_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id=run_id,
+            )
+
+        reconstruct_mock.assert_awaited_once_with(stage.memory, 'dark_factory', run_id)
+        assert verify_mock.await_count == 2
+        assert report.stats['stage2_cycle_summary_reconstructed'] == 1
+        assert report.stats['stage2_cycle_summary_verified_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_happy_path_skips_reconstruction(self, mock_deps):
+        """verify==1 on the first call -> repair and reconstruct are never
+        awaited; stage2_cycle_summary_reconstructed==0 (explicit, not
+        absent)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            TaskKnowledgeSync,
+        )
+
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        verify_mock = AsyncMock(return_value=1)
+        repair_mock = AsyncMock(return_value=0)
+        reconstruct_mock = AsyncMock(return_value=0)
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_stage2_summary_written',
+                new=verify_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._repair_stage2_summary_stage_metadata',
+                new=repair_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._reconstruct_stage2_summary',
+                new=reconstruct_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-happy-recon',
+            )
+
+        reconstruct_mock.assert_not_awaited()
+        repair_mock.assert_not_awaited()
+        assert report.stats['stage2_cycle_summary_reconstructed'] == 0
+        assert report.stats['stage2_cycle_summary_verified_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_repair_fixed_skips_reconstruction(self, mock_deps):
+        """verify=[0, 1], repair=1 (repair fixed it, re-verify confirms) ->
+        reconstruct is never awaited; stage2_cycle_summary_reconstructed==0.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            TaskKnowledgeSync,
+        )
+
+        run_id = 'run-repair-fixed'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        verify_mock = AsyncMock(side_effect=[0, 1])
+        repair_mock = AsyncMock(return_value=1)
+        reconstruct_mock = AsyncMock(return_value=0)
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_stage2_summary_written',
+                new=verify_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._repair_stage2_summary_stage_metadata',
+                new=repair_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._reconstruct_stage2_summary',
+                new=reconstruct_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id=run_id,
+            )
+
+        reconstruct_mock.assert_not_awaited()
+        assert report.stats['stage2_cycle_summary_reconstructed'] == 0
+        assert report.stats['stage2_cycle_summary_verified_count'] == 1
