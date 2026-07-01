@@ -144,3 +144,97 @@ class TestAddMemoryMixedFramingGate:
             f'Gate must not fire when category=None (auto-classify path); got: {result!r}'
         )
         mock_service.add_memory.assert_called_once()
+
+
+class TestAddEpisodeMixedFramingGate:
+    """Write-gate: recon-stage- agents must not write mixed-temporal-framing
+    (was-X-now-Y) content via add_episode either — add_episode has no category
+    param, so this guard is scoped to agent prefix + content only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rejects_mixed_framing_from_recon_stage_agent(self):
+        """Mixed-framing content + recon-stage agent → rejected.
+
+        The gate must return the standard error dict and must NOT call
+        memory_service.add_episode.
+        """
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _MIXED_FRAMING_CONTENT,
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert result.get('error') == 'mixed_temporal_framing_write_blocked', (
+            f"Expected error='mixed_temporal_framing_write_blocked', got: {result!r}"
+        )
+        assert result.get('error_type') == 'ReconMixedFramingWriteRejected', (
+            f"Expected error_type='ReconMixedFramingWriteRejected', got: {result!r}"
+        )
+        assert result.get('agent_id') == 'recon-stage-task_knowledge_sync', (
+            f"Expected agent_id='recon-stage-task_knowledge_sync', got: {result!r}"
+        )
+        assert result.get('content_excerpt') == _MIXED_FRAMING_CONTENT[:200], (
+            f'Expected content_excerpt=content[:200], got: {result!r}'
+        )
+        mock_service.add_episode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allows_mixed_framing_from_non_recon_agent(self):
+        """Same mixed-framing content but non-recon agent_id → allowed through.
+
+        The gate must NOT fire for agent_ids that don't start with 'recon-stage-'.
+        """
+        mock_service = AsyncMock()
+        _episode_result = MagicMock()
+        _episode_result.model_dump.return_value = {'id': 'x'}
+        mock_service.add_episode.return_value = _episode_result
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _MIXED_FRAMING_CONTENT,
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'mixed_temporal_framing_write_blocked', (
+            f'Gate must not fire for non-recon agent; got: {result!r}'
+        )
+        mock_service.add_episode.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_allows_resulting_state_only_from_recon_stage_agent(self):
+        """Resulting-state-only content + recon-stage agent → allowed through.
+
+        The gate only fires when BOTH a prior-state marker and a resulting-state
+        marker co-occur; resulting-state-only prose must not be blocked.
+        """
+        mock_service = AsyncMock()
+        _episode_result = MagicMock()
+        _episode_result.model_dump.return_value = {'id': 'y'}
+        mock_service.add_episode.return_value = _episode_result
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _RESULTING_STATE_ONLY_CONTENT,
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'mixed_temporal_framing_write_blocked', (
+            f'Gate must not fire for resulting-state-only content; got: {result!r}'
+        )
+        mock_service.add_episode.assert_called_once()
