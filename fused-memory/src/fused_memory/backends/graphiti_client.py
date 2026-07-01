@@ -403,7 +403,7 @@ class GraphitiBackend:
         from their current valid edges so they stay consistent.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
-            raise ValueError('update_edge requires fact or invalid_at to be set')
+            raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
         driver = self._driver_for(group_id)
         edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
         if fact is not None:
