@@ -29,6 +29,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
     build_summary_nonce_section,
+    generate_summary_nonce,
 )
 from fused_memory.reconciliation.flag_dedup import (
     compute_flag_signature,
@@ -1004,6 +1005,17 @@ _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE = 'stage2_cycle_summary_trim'
 # report 0.
 _STAGE2_SUMMARY_STAGE_REPAIR_SOURCE = 'stage2_summary_stage_repair'
 
+# Audit tag for _reconstruct_stage2_summary's retroactive reconstruction write
+# (task 1964) — closes the FULLY-ABSENT gap: when the Stage 2 per-cycle
+# summary pool has ZERO members for a run_id (LLM crash before write, a
+# silent Mem0 dedup drop, or a wrong/absent run_id), neither
+# _verify_stage2_summary_written (observe-only) nor
+# _repair_stage2_summary_stage_metadata (heals mislabeled-but-present
+# summaries; its enumeration returns [] when nothing exists) writes a
+# discoverable summary. This helper writes ONE dedup-resilient placeholder,
+# automating the manual reconstruction performed for run 6467daca.
+_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE = 'stage2_summary_reconstruction'
+
 # Age-based GC for orphaned stage1_flag_marker records (task 1944).
 # flag_dedup._write_and_confirm_marker rewrites a stage1_flag_marker with a
 # fresh created_at on every dedup HIT (a finding that keeps recurring); a
@@ -1274,7 +1286,7 @@ async def _verify_stage2_summary_written(
     memory_service,
     project_id: str,
     run_id: str,
-) -> int:
+) -> int | None:
     """Best-effort post-write check: count this run's cycle_summary in Mem0.
 
     Counts memories matching the triple filter
@@ -1297,7 +1309,15 @@ async def _verify_stage2_summary_written(
         run_id: Current reconciliation run identifier (used as filter key).
 
     Returns:
-        Count returned by ``count_memories_by_metadata``, or 0 on failure.
+        Count returned by ``count_memories_by_metadata`` when the call
+        succeeds — 0 means CONFIRMED absent (the count query ran cleanly and
+        found nothing).  ``None`` when the count call itself raised — a
+        transient failure that does NOT confirm absence.  This distinction
+        matters to callers (task 1964 amendment): the repair/reconstruct
+        chain in ``run()`` gates on ``verified_count == 0`` specifically so
+        that a transient ``None`` is never treated as a confirmed-empty pool
+        — a transient outage must never fabricate a reconstruction
+        placeholder for a run whose real summary may already exist.
     """
     try:
         count = await memory_service.count_memories_by_metadata(
@@ -1311,11 +1331,12 @@ async def _verify_stage2_summary_written(
     except Exception:
         logger.warning(
             'reconciliation._verify_stage2_summary_written: '
-            'count_memories_by_metadata failed for run_id=%s; treating as 0',
+            'count_memories_by_metadata failed for run_id=%s; absence NOT '
+            'confirmed (transient failure, not treated as count==0)',
             run_id,
             extra={'project_id': project_id, 'run_id': run_id},
         )
-        return 0
+        return None
     if not count:
         logger.warning(
             'reconciliation._verify_stage2_summary_written: '
@@ -1438,6 +1459,142 @@ async def _repair_stage2_summary_stage_metadata(
             repaired += 1
 
     return repaired
+
+
+def _extract_response_memory_ids(response) -> list:
+    """Defensively read ``memory_ids`` from an ``add_memory`` response.
+
+    Production calls return :class:`~fused_memory.models.memory.AddMemoryResponse`
+    (attribute access); tests in this module commonly mock ``add_memory`` with a
+    plain ``{'memory_ids': [...]}`` dict. Supports both shapes so callers never
+    need to know which one they were handed.
+
+    Returns:
+        The ``memory_ids`` list, or ``[]`` if absent/falsy on either shape.
+    """
+    if isinstance(response, dict):
+        return response.get('memory_ids') or []
+    return getattr(response, 'memory_ids', None) or []
+
+
+def _build_stage2_reconstruction_content(run_id: str) -> str:
+    """Build the retroactive-reconstruction placeholder content for *run_id*.
+
+    Leads with a fresh ``generate_summary_nonce('STAGE2')`` line — the same
+    CSPRNG dedup-defeat primitive the LLM per-cycle-summary path uses (task
+    1572/1590) — so repeat calls (the one-shot retry in
+    :func:`_reconstruct_stage2_summary`) never collide on Mem0's ~0.92
+    cosine-similarity dedup threshold. The body is explicitly labeled a
+    harness reconstruction and references *run_id* so a human (or another
+    repair pass) can immediately identify it as synthetic, non-agent content.
+    """
+    nonce = generate_summary_nonce('STAGE2')
+    return (
+        f'{nonce}\n'
+        f'Stage 2 cycle summary (retroactive reconstruction) for run {run_id} — '
+        'original per-cycle summary absent after LLM write and metadata repair; '
+        'reconstructed by harness self-heal.'
+    )
+
+
+async def _reconstruct_stage2_summary(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> int:
+    """Retroactively reconstruct a FULLY-ABSENT Stage 2 per-cycle summary.
+
+    Closes the residual gap left by the existing verify/repair chain: when
+    the ``stage2_cycle_summary`` pool has ZERO members for *run_id* —
+    LLM crash/timeout before the write was ever sent, a silent Mem0 dedup
+    no-op (``memory_ids=[]``), or a wrong/absent ``run_id`` — the task-1796
+    verify (:func:`_verify_stage2_summary_written`) only logs a WARNING, and
+    the task-1963 repair (:func:`_repair_stage2_summary_stage_metadata`)
+    enumerates ``get_memories_by_metadata({recon_pool, run_id})``, finds
+    nothing, and repairs nothing. Neither writes a discoverable summary.
+    This helper is the automated form of the manual retroactive placeholder
+    Stage 1 wrote for run 6467daca (mem0 memory 4a3a42d1).
+
+    Writes ONE placeholder via ``add_memory`` tagged with the four canonical
+    identity keys (``kind='cycle_summary'``, ``stage='task_knowledge_sync'``,
+    ``run_id``, ``recon_pool='stage2_cycle_summary'``) plus
+    ``reconstructed=True``, and ``_source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE``
+    so the write is auditable and distinguishable from both agent writes and
+    task-1963 repairs. The content leads with a CSPRNG nonce (see
+    :func:`_build_stage2_reconstruction_content`) to defeat Mem0's dedup.
+
+    Because the root cause can itself be a dedup drop, the write is dedup-
+    resilient: the response's ``memory_ids`` is inspected
+    (:func:`_extract_response_memory_ids`), and if empty (a dedup no-op) the
+    write is retried exactly ONCE with a fresh nonce (metadata unchanged).
+    This mirrors the LLM prompt's own retry_nonce pattern without risking an
+    unbounded loop.
+
+    Best-effort: never raises. Any ``add_memory`` exception (first attempt or
+    retry) logs a WARNING and returns 0 — mirrors
+    :func:`_repair_stage2_summary_stage_metadata` /
+    :func:`_sweep_stale_fixc_markers`'s best-effort contract, so a Mem0 outage
+    degrades this self-heal gracefully instead of failing the whole
+    reconciliation cycle.
+
+    Args:
+        memory_service: Service with ``add_memory``.
+        project_id: Project scope for the write.
+        run_id: Current reconciliation run identifier — both the metadata
+            identity key and the ``causation_id`` for the write.
+
+    Returns:
+        1 if a reconstruction placeholder was successfully written (first
+        attempt or retry — see :func:`_extract_response_memory_ids`), else 0
+        (dedup-dropped twice, or ``add_memory`` raised).
+    """
+    metadata = {
+        'kind': 'cycle_summary',
+        'stage': 'task_knowledge_sync',
+        'run_id': run_id,
+        'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+        'reconstructed': True,
+    }
+    try:
+        response = await memory_service.add_memory(
+            content=_build_stage2_reconstruction_content(run_id),
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata=metadata,
+            causation_id=run_id,
+            _source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE,
+        )
+        if _extract_response_memory_ids(response):
+            return 1
+
+        # Dedup no-op (Mem0 ~0.92 cosine similarity) — retry once with a fresh
+        # nonce so the leading content shifts past the threshold.
+        response = await memory_service.add_memory(
+            content=_build_stage2_reconstruction_content(run_id),
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata=metadata,
+            causation_id=run_id,
+            _source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE,
+        )
+        if _extract_response_memory_ids(response):
+            return 1
+    except Exception:
+        logger.warning(
+            'reconciliation._reconstruct_stage2_summary: '
+            'add_memory failed for run_id=%s; skipping reconstruction',
+            run_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
+
+    logger.warning(
+        'reconciliation._reconstruct_stage2_summary: '
+        'reconstruction write dedup-dropped twice for run_id=%s; giving up',
+        run_id,
+        extra={'project_id': project_id, 'run_id': run_id},
+    )
+    return 0
 
 
 async def _track_flag_persistence(
@@ -1864,23 +2021,55 @@ class TaskKnowledgeSync(BaseStage):
         verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
 
         # --- cycle-summary stage-metadata repair (task 1963) ---
-        # verified_count==0 means the triple-filter found no cycle_summary for
-        # this run — either the LLM genuinely failed to write one, or it wrote
-        # one but omitted (part of) the identity metadata (the confirmed
+        # verified_count==0 means the triple-filter CONFIRMED no cycle_summary
+        # for this run — either the LLM genuinely failed to write one, or it
+        # wrote one but omitted (part of) the identity metadata (the confirmed
         # 2026-07-01 incident: stage missing while kind/run_id/recon_pool were
-        # present). Gate the repair on count==0 so the happy path (LLM
-        # complied) costs zero extra Mem0 calls and carries zero
-        # duplicate-write risk; when the summary is genuinely absent,
-        # enumeration returns [] and repaired stays 0 (no false repair).
+        # present). verified_count is None — not 0 — when
+        # count_memories_by_metadata itself raised (task 1964 amendment): a
+        # transient failure does NOT confirm absence, so the `== 0` checks
+        # below deliberately exclude None and the repair/reconstruct chain is
+        # skipped rather than risking a false repair or a fabricated
+        # reconstruction for a run whose real summary may already exist.
+        # Gate the repair on count==0 so the happy path (LLM complied) costs
+        # zero extra Mem0 calls and carries zero duplicate-write risk; when
+        # the summary is genuinely absent, enumeration returns [] and
+        # repaired stays 0 (no false repair).
         # report.stats['stage2_cycle_summary_verified_count'] is set to the
-        # POST-repair count so downstream consumers see the corrected value.
+        # POST-repair (and, below, POST-reconstruction) count so downstream
+        # consumers see the corrected value.
         repaired = 0
+        reconstructed = 0
         if verified_count == 0:
             repaired = await _repair_stage2_summary_stage_metadata(self.memory, self.project_id, run_id)
             if repaired:
                 verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
+            # --- fully-absent retroactive reconstruction self-heal (task 1964) ---
+            # verified_count can still be 0 here for either of two reasons:
+            # (1) repair found nothing to enumerate (repaired==0) because the
+            # pool has ZERO members for this run_id — the FULLY-ABSENT class
+            # confirmed by run 6467daca, which the 1963 repair cannot heal
+            # since there is nothing to repair; or (2) repair fixed a member
+            # (repaired>0) but its own verbatim re-add was itself silently
+            # dedup-dropped, so the re-verify above still reports 0. Both
+            # converge here: write ONE dedup-resilient reconstruction
+            # placeholder and re-verify. If either verify call instead
+            # returned None (transient count_memories_by_metadata failure)
+            # rather than a confirmed 0, this comparison is False and
+            # reconstruction is skipped: absence must be CONFIRMED before we
+            # fabricate new content, never merely inferred from an error.
+            if verified_count == 0:
+                reconstructed = await _reconstruct_stage2_summary(self.memory, self.project_id, run_id)
+                if reconstructed:
+                    verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
         report.stats['stage2_cycle_summary_stage_repaired'] = repaired
-        report.stats['stage2_cycle_summary_verified_count'] = verified_count
+        report.stats['stage2_cycle_summary_reconstructed'] = reconstructed
+        # verified_count is None only if the last verify call made above
+        # itself errored transiently; coerce to 0 so this stat's contract
+        # (always an int) is preserved for downstream consumers.
+        report.stats['stage2_cycle_summary_verified_count'] = (
+            verified_count if verified_count is not None else 0
+        )
 
         # --- stage1_flag_marker age-based GC (task 1944) ---
         # The stage1_flag_marker pool is written by Stage 1, not by this stage's
