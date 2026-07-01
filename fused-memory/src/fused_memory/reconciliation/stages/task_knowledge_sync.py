@@ -996,6 +996,14 @@ _STAGE2_CYCLE_SUMMARY_RECON_POOL = 'stage2_cycle_summary'
 STAGE2_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE = 'stage2_cycle_summary_trim'
 
+# Audit tag for _repair_stage2_summary_stage_metadata's delete+re-add repair
+# (task 1963) — heals the intermittent LLM-compliance failure where the Stage
+# 2 cycle_summary write omits metadata.stage='task_knowledge_sync' (or, more
+# broadly, kind='cycle_summary'), which makes the downstream triple-filter
+# count_memories_by_metadata check in _verify_stage2_summary_written falsely
+# report 0.
+_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE = 'stage2_summary_stage_repair'
+
 # Age-based GC for orphaned stage1_flag_marker records (task 1944).
 # flag_dedup._write_and_confirm_marker rewrites a stage1_flag_marker with a
 # fresh created_at on every dedup HIT (a finding that keeps recurring); a
@@ -1316,6 +1324,96 @@ async def _verify_stage2_summary_written(
             extra={'project_id': project_id, 'run_id': run_id},
         )
     return count
+
+
+async def _repair_stage2_summary_stage_metadata(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> int:
+    """Repair Stage 2 cycle_summary writes missing the required stage identity.
+
+    The Stage 2 per-cycle summary is written by the LLM agent inside
+    ``super().run()`` via ``add_memory`` with metadata
+    ``{kind:'cycle_summary', stage:'task_knowledge_sync', run_id, recon_pool:
+    'stage2_cycle_summary'}``.  Intermittently the LLM omits one of the
+    identity keys — the confirmed 2026-07-01 incident showed ``run_id`` and
+    ``recon_pool`` present with only ``stage`` missing — which makes the
+    downstream triple-filter ``count_memories_by_metadata({kind, stage,
+    run_id})`` check in :func:`_verify_stage2_summary_written` falsely report
+    0 ("Stage 2 summary missing").
+
+    There is no in-place metadata-mutation primitive available: Mem0's
+    ``update()`` rewrites the memory's TEXT only, not its payload metadata.
+    The repair is therefore delete + re-add under corrected metadata — the
+    same idiom used for this incident's data-level repair.
+
+    Enumerates this run's ``stage2_cycle_summary`` pool members
+    deterministically via ``memory_service.get_memories_by_metadata`` filtered
+    on ``{recon_pool, run_id}`` (never semantic search — ``recon_pool`` and
+    ``run_id`` are reliably present per the incident, so this scopes exactly
+    to the current run's summary/summaries). For each member that does not
+    already satisfy the full identity (``kind == 'cycle_summary'`` AND
+    ``stage == 'task_knowledge_sync'``), its content is recovered from the
+    Mem0 scroll payload's ``data`` key (the verbatim content under
+    ``infer=False``) — falling back to a synthesized placeholder when absent
+    — and re-added under the four canonical metadata keys.  The corrected
+    copy is added BEFORE the broken original is deleted (add-before-delete):
+    a crash between the two writes must never leave the run with zero
+    correctly-tagged summaries, which is precisely the false-missing state
+    this helper exists to eliminate.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata``,
+            ``add_memory``, and ``delete_memory``.
+        project_id: Project scope for enumeration and write calls.
+        run_id: Current reconciliation run identifier — both the enumeration
+            filter key and the ``causation_id`` for the repair writes.
+
+    Returns:
+        Number of members successfully repaired (0 if none are broken or none
+        are found).
+    """
+    members = await memory_service.get_memories_by_metadata(
+        project_id=project_id,
+        filters={
+            'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+            'run_id': run_id,
+        },
+    )
+
+    repaired = 0
+    for member in members:
+        metadata = member.get('metadata') or {}
+        if metadata.get('stage') != 'task_knowledge_sync' or metadata.get('kind') != 'cycle_summary':
+            mid = member.get('id')
+            content = metadata.get('data') or (
+                f'Stage 2 cycle summary (metadata-repaired) for run {run_id}'
+            )
+            corrected_metadata = {
+                'kind': 'cycle_summary',
+                'stage': 'task_knowledge_sync',
+                'run_id': run_id,
+                'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+            }
+            await memory_service.add_memory(
+                content=content,
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata=corrected_metadata,
+                causation_id=run_id,
+                _source=_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE,
+            )
+            await memory_service.delete_memory(
+                memory_id=mid,
+                store='mem0',
+                project_id=project_id,
+                causation_id=run_id,
+                _source=_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE,
+            )
+            repaired += 1
+
+    return repaired
 
 
 async def _track_flag_persistence(
