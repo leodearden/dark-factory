@@ -796,7 +796,19 @@ class ReconciliationHarness:
         if not statuses:
             return None
 
-        # step-8/step-10/step-12/step-14 (GREEN) will replace this stub.
+        memories = await self.memory.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'kind': 'project_status_correction'},
+        )
+        if not memories:
+            return {
+                'available': True,
+                'found': False,
+                'diverged': False,
+                'superseded': False,
+            }
+
+        # step-10/step-12/step-14 (GREEN) will replace this stub.
         raise NotImplementedError
 
     # ── Stale-run recovery ─────────────────────────────────────────────
