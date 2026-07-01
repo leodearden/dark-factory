@@ -638,4 +638,49 @@ async def test_handle_red_run_new_fingerprint_files_fix_task_and_info_escalation
     assert esc.severity == 'info'
     assert esc.level == 0
     assert esc.agent_role == 'orchestrator-offline-lane'
+
+
+# ---------------------------------------------------------------------------
+# _handle_red_run — dedup across advances (β3, task 1954, step-13/14)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_dedup_appends_suspect_range_not_new_task(tmp_path: Path):
+    """A confirmed red run with an ALREADY-OPEN fingerprint updates, not re-files (B5).
+
+    Priming open_fix_tasks/_red_advance_counts for the same failing-test set
+    and advancing again at a new head must append the new suspect range to
+    the existing fix task rather than filing a duplicate, and must not raise
+    a second INFO escalation.
+
+    Step 13 (RED): the existing-fingerprint branch of _handle_red_run is not
+    implemented yet — must fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.get_status = AsyncMock(return_value='in-progress')
+    escalation_queue = MagicMock()
+
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    worker.open_fix_tasks[fp] = 'fix-99'
+    worker._red_advance_counts[fp] = 1
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD2')
+
+    task_client.append_suspect_range.assert_awaited_once_with('fix-99', 'GREEN..HEAD2')
+    task_client.submit_fix_task.assert_not_awaited()
+    escalation_queue.submit.assert_not_called()
+    assert worker._red_advance_counts[fp] == 2
     assert esc.task_id == 'fix-99'
