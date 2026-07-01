@@ -2889,3 +2889,47 @@ class TestDiffStatusCorrection:
         }, (
             f"Expected live active_tasks=[110, 115, 116, 118] (sorted ints), got {result['live']!r}"
         )
+
+    def test_non_iterable_active_tasks_is_mismatch_not_typeerror(self):
+        """A malformed cached active_tasks (a non-iterable scalar) must be
+        treated as an active_mismatch instead of raising TypeError.
+
+        _coerce_id_set iterates its argument, so passing a bare int through
+        would previously blow up on `int(str(ref).split('.')[0])` inside the
+        loop's own iteration setup (task 1938 amendment)."""
+        metadata = {
+            'task_count_done': 5,
+            'task_count_total': 8,
+            'active_tasks': 6,  # malformed: should be a list, not a scalar
+        }
+
+        result = diff_status_correction(metadata, self._MATCHING_STATUSES)
+
+        assert result['available'] is True
+        assert result['active_mismatch'] is True
+        assert result['diverged'] is True
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is False
+
+    def test_active_tasks_as_set_or_tuple_is_still_coerced(self):
+        """A cached active_tasks stored as a tuple/set (not a list) is still
+        coerced and compared normally — only genuinely non-iterable/malformed
+        shapes should short-circuit to a mismatch."""
+        metadata_tuple = {
+            'task_count_done': 5,
+            'task_count_total': 8,
+            'active_tasks': (8, 6, 7),
+        }
+        metadata_set = {
+            'task_count_done': 5,
+            'task_count_total': 8,
+            'active_tasks': {8, 6, 7},
+        }
+
+        result_tuple = diff_status_correction(metadata_tuple, self._MATCHING_STATUSES)
+        result_set = diff_status_correction(metadata_set, self._MATCHING_STATUSES)
+
+        assert result_tuple['active_mismatch'] is False
+        assert result_tuple['diverged'] is False
+        assert result_set['active_mismatch'] is False
+        assert result_set['diverged'] is False

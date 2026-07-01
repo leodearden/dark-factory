@@ -796,7 +796,12 @@ class ReconciliationHarness:
                 the live census (no-op).
               - diverged=True, superseded=True, memory_id, old, new when the
                 cached memory was superseded.
-              - an 'error' key when the query/diff/supersede body raised.
+              - an 'error' key when the query/diff/supersede body raised (nothing
+                was written — add_memory itself failed, or the query/diff raised).
+              - a 'delete_errors' key (list[str]) when add_memory succeeded (or
+                the no-op branch ran) but one or more delete_memory calls raised —
+                superseded still reflects whether the authoritative memory write
+                landed, not whether every stale duplicate was cleaned up.
         """
         if not statuses:
             return None
@@ -818,13 +823,25 @@ class ReconciliationHarness:
             diff = diff_status_correction(latest.get('metadata') or {}, statuses)
 
             if not diff['diverged']:
-                return {
+                # Cap the pool to a single member even when already consistent —
+                # otherwise duplicate project_status_correction memories returned
+                # by the query (all matching the live census) would persist
+                # indefinitely, since the no-op branch never used to touch them
+                # (task 1938 amendment).
+                duplicates = [m for m in memories if m['id'] != latest['id']]
+                record = {
                     'available': True,
                     'found': True,
                     'diverged': False,
                     'superseded': False,
                     'memory_id': latest['id'],
                 }
+                delete_errors = await self._delete_status_correction_memories(
+                    duplicates, project_id
+                )
+                if delete_errors:
+                    record['delete_errors'] = delete_errors
+                return record
 
             live = diff['live']
             corrected_metadata = {
@@ -844,7 +861,10 @@ class ReconciliationHarness:
             # Add-then-delete: guarantees at least one correct memory always exists
             # even if a delete below fails — the fresh memory (supersedes=<old_id>)
             # is still the most-recent, so next cycle's max()-by-created_at selection
-            # ignores any stale leftover and self-heals.
+            # ignores any stale leftover and self-heals.  Once add_memory lands, the
+            # supersede has effectively happened regardless of delete outcomes below
+            # — delete failures are reported via 'delete_errors', not by downgrading
+            # 'superseded' (task 1938 amendment).
             await self.memory.add_memory(
                 content=content,
                 category='observations_and_summaries',
@@ -854,13 +874,11 @@ class ReconciliationHarness:
             )
             # Delete the whole queried set (not just `latest`) to bound the pool to
             # the single fresh memory just written — mirrors the stage2_cycle_summary
-            # pool-cap fix (tasks 20e8c2f1/45489c2b/db2ea69e).
-            for m in memories:
-                await self.memory.delete_memory(
-                    memory_id=m['id'],
-                    store='mem0',
-                    project_id=project_id,
-                )
+            # pool-cap fix (tasks 20e8c2f1/45489c2b/db2ea69e). Per-item failures are
+            # swallowed inside the helper so one bad delete doesn't abort the rest.
+            delete_errors = await self._delete_status_correction_memories(
+                memories, project_id
+            )
 
             logger.warning(
                 'reconciliation.status_correction_superseded',
@@ -872,7 +890,7 @@ class ReconciliationHarness:
                 },
             )
 
-            return {
+            record = {
                 'available': True,
                 'found': True,
                 'diverged': True,
@@ -881,6 +899,9 @@ class ReconciliationHarness:
                 'old': diff['cached'],
                 'new': diff['live'],
             }
+            if delete_errors:
+                record['delete_errors'] = delete_errors
+            return record
         except Exception as exc:
             logger.warning(
                 '_reconcile_status_correction failed for project_id=%r: %s',
@@ -892,6 +913,42 @@ class ReconciliationHarness:
                 'superseded': False,
                 'error': str(exc),
             }
+
+    async def _delete_status_correction_memories(
+        self, memories: list[dict], project_id: str
+    ) -> list[str]:
+        """Delete each memory in `memories`, one at a time, swallowing per-item
+        exceptions so a single failed delete doesn't stop the rest (task 1938
+        amendment — see _reconcile_status_correction).
+
+        Args:
+            memories: Memory records (each with an 'id' key) to delete. May be
+                empty — a no-op in that case.
+            project_id: Project identifier passed through to delete_memory.
+
+        Returns:
+            List of stringified errors, one per failed delete; empty when every
+            delete succeeded (or `memories` was empty). Never raises.
+        """
+        errors: list[str] = []
+        for m in memories:
+            try:
+                await self.memory.delete_memory(
+                    memory_id=m['id'],
+                    store='mem0',
+                    project_id=project_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'reconciliation.status_correction_delete_failed',
+                    extra={
+                        'project_id': project_id,
+                        'memory_id': m.get('id'),
+                        'error': str(exc),
+                    },
+                )
+                errors.append(str(exc))
+        return errors
 
     # ── Stale-run recovery ─────────────────────────────────────────────
 

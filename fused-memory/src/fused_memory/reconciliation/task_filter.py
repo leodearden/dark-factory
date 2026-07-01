@@ -430,7 +430,24 @@ def diff_status_correction(metadata: dict, statuses: dict[str, str] | None) -> d
     active_tasks comparison is order-insensitive and coerces both cached ints
     and live string keys via the first-dot-segment rule (see
     detect_census_inconsistency), so ordering or int-vs-str differences never
-    cause a false mismatch.
+    cause a false mismatch. cached['active_tasks'] is coerced only when it is
+    a list/tuple/set; any other shape (None, a scalar, a malformed type) is
+    treated as an unconditional active_mismatch rather than raised, since
+    _coerce_id_set assumes an iterable.
+
+    Shared 'total' definition (task 1938 amendment): task_count_total is
+    compared against summarize_statuses(statuses)['total'], which counts
+    EVERY status in the census — done + cancelled + active + other, not just
+    non-cancelled/live tasks. The runtime agent convention that writes
+    project_status_correction memories is assumed to use this same
+    all-statuses denominator; that write-side convention lives outside this
+    repo and is unverifiable here. If it ever diverges (e.g. an agent counts
+    only non-cancelled tasks), the practical impact is bounded: the first
+    cycle after this ships would report a spurious total_mismatch/diverged
+    for every project, _reconcile_status_correction would supersede once, and
+    subsequent cycles compare the freshly-written (all-statuses) memory
+    against itself and stop diverging — self-healing, at the cost of one
+    extra supersede + WARNING log per project.
 
     Pure: no I/O, no side effects.
     """
@@ -465,10 +482,14 @@ def diff_status_correction(metadata: dict, statuses: dict[str, str] | None) -> d
     # Missing/None cached fields count as a mismatch so a malformed memory is rewritten.
     done_mismatch = cached['done'] is None or cached['done'] != live['done']
     total_mismatch = cached['total'] is None or cached['total'] != live['total']
-    active_mismatch = (
-        cached['active_tasks'] is None
-        or _coerce_id_set(cached['active_tasks']) != live_active_ids
-    )
+    cached_active_tasks = cached['active_tasks']
+    if isinstance(cached_active_tasks, (list, tuple, set, frozenset)):
+        active_mismatch = _coerce_id_set(cached_active_tasks) != live_active_ids
+    else:
+        # None, or a malformed non-iterable scalar (e.g. an int) — _coerce_id_set
+        # requires an iterable, so treat anything else as an unconditional
+        # mismatch instead of raising TypeError on a corrupted memory.
+        active_mismatch = True
     diverged = done_mismatch or total_mismatch or active_mismatch
 
     return {
