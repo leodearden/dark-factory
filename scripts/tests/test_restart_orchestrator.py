@@ -157,7 +157,7 @@ def test_invokes_systemctl_restart_on_correct_unit(tmp_path):
     """The script must call `systemctl --user restart orchestrator-dark-factory.service`."""
     bin_dir, state_path = _make_fake_systemctl(tmp_path)
 
-    _run_script(bin_dir, state_path, env={"RESTART_VERIFY_TIMEOUT": "5"})
+    _run_script(bin_dir, state_path, env={"RESTART_VERIFY_TIMEOUT": "1"})
 
     state = _load_state(state_path)
     assert ["--user", "restart", UNIT] in state["calls"], (
@@ -184,4 +184,24 @@ def test_prints_new_main_pid_on_fresh_restart(tmp_path):
     assert new_pid != 1234, "fake systemctl did not bump MainPID -- test setup is broken"
     assert str(new_pid) in result.stdout, (
         f"Expected the new MainPID ({new_pid}) in stdout; got: {result.stdout!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED -- a restart that never comes back fresh must exit non-zero
+# ---------------------------------------------------------------------------
+
+def test_exits_nonzero_when_restart_does_not_bring_back_fresh_pid(tmp_path):
+    """A restart that leaves MainPID unchanged (stale/failed) exits non-zero."""
+    bin_dir, state_path = _make_fake_systemctl(tmp_path, scenario="stale", main_pid=1234)
+
+    result = _run_script(bin_dir, state_path, env={"RESTART_VERIFY_TIMEOUT": "1"})
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit when the restart never comes back fresh; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "stale" in (result.stdout + result.stderr).lower(), (
+        f"Expected a stale/failed-restart error message; got "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
