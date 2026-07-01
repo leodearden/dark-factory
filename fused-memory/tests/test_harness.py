@@ -7731,6 +7731,53 @@ class TestConfigureConsolidatorNewKwargs:
         assert stage.graphiti_queue_health is None
 
 
+# ── Tests for task 1938: harness._configure_consolidator status_correction_reconciliation kwarg ──
+
+
+class TestConfigureConsolidatorStatusCorrectionReconciliationKwarg:
+    """_configure_consolidator accepts and sets status_correction_reconciliation.
+
+    step-15 (RED): _configure_consolidator does not accept the new kwarg yet.
+    step-16 (GREEN): extend _configure_consolidator.
+    """
+
+    def test_sets_status_correction_reconciliation_on_stage(self):
+        """_configure_consolidator sets stage.status_correction_reconciliation from kwarg."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MagicMock(spec=MemoryConsolidator)
+        tier = MagicMock()
+        tier.episode_limit = 5
+        tier.memory_limit = 10
+
+        reconciliation_record = {
+            'available': True, 'found': True, 'diverged': True,
+            'superseded': True, 'memory_id': 'af698512-stale-memory',
+        }
+
+        ReconciliationHarness._configure_consolidator(
+            stage, tier,
+            status_correction_reconciliation=reconciliation_record,
+        )
+
+        assert stage.status_correction_reconciliation == reconciliation_record
+
+    def test_defaults_status_correction_reconciliation_to_none(self):
+        """_configure_consolidator defaults status_correction_reconciliation to None."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MagicMock(spec=MemoryConsolidator)
+        tier = MagicMock()
+        tier.episode_limit = 5
+        tier.memory_limit = 10
+
+        ReconciliationHarness._configure_consolidator(stage, tier)
+
+        assert stage.status_correction_reconciliation is None
+
+
 # ── Tests for task 1785: full-cycle wiring of diagnostics ─────────────────────
 
 
