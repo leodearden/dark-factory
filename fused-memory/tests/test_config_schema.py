@@ -21,6 +21,7 @@ from fused_memory.config.schema import (
     QueueConfig,
     ReconciliationConfig,
     ServerConfig,
+    SummaryRebuildConfig,
     YamlSettingsSource,
 )
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
@@ -786,3 +787,28 @@ class TestQueueConfigTransientErrorFields:
         accepted (task 1936 review)."""
         with pytest.raises(ValidationError, match='transient_max_attempts'):
             QueueConfig(max_attempts=10, transient_max_attempts=5)
+
+
+class TestSummaryRebuildConfigDefaults:
+    """Task 1958: SummaryRebuildConfig is the scheduled staleness backstop
+    (fix (b), follow-up to task 1949's best-effort post-ingestion refresh).
+
+    Disabled-by-default (enabled=False, projects=[]) means the periodic
+    sweep costs nothing until an operator opts in.
+    """
+
+    def test_defaults(self):
+        cfg = SummaryRebuildConfig()
+        assert cfg.enabled is False
+        assert cfg.projects == []
+        assert cfg.force is False
+        assert cfg.interval_seconds == 3600.0
+
+    def test_fused_memory_config_attaches_disabled_by_default(self):
+        cfg = FusedMemoryConfig().summary_rebuild
+        assert isinstance(cfg, SummaryRebuildConfig)
+        assert cfg.enabled is False
+
+    def test_interval_seconds_must_be_positive(self):
+        with pytest.raises(ValidationError, match='interval_seconds'):
+            SummaryRebuildConfig(interval_seconds=0)
