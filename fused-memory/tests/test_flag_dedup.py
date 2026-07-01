@@ -6232,3 +6232,70 @@ class TestFilterBlockedSnapshotFindings:
             f"got {result!r}"
         )
 
+    # -----------------------------------------------------------------------
+    # know_live registration (task 1943 — mirrors autopilot_video / task 1840)
+    # -----------------------------------------------------------------------
+
+    def test_missing_knowledge_absence_finding_dropped_for_know_live(self):
+        """Case (a) mirrored for know_live: missing_knowledge absence finding is DROPPED."""
+        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='know_live has no task-count snapshot temporal_fact edge',
+            suggested_action='Add a count snapshot temporal_fact for know_live',
+        )
+        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
+        assert result == [], (
+            "missing_knowledge finding about task-count snapshot absence must be DROPPED "
+            f"for know_live (snapshot writes blocked-by-design); got {result!r}"
+        )
+
+    def test_memory_stale_raw_count_finding_dropped_for_know_live(self):
+        """Case (b) mirrored for know_live: memory_stale raw-count finding is DROPPED."""
+        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+
+        flag = self._make_flag(
+            category='memory_stale',
+            description=(
+                'task-count snapshot edge records 607 done / 148 cancelled '
+                'but the tree shows more'
+            ),
+            suggested_action='Update the snapshot edge to reflect current counts',
+        )
+        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
+        assert result == [], (
+            "memory_stale finding quoting raw count snapshot must be DROPPED "
+            f"for know_live; got {result!r}"
+        )
+
+    def test_missing_knowledge_unrelated_to_snapshot_kept_for_know_live(self):
+        """Case (d) mirrored for know_live: unrelated missing_knowledge finding is KEPT (signature gate)."""
+        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='task 5 has no design doc and no implementation notes',
+            suggested_action='Add a design doc for task 5',
+        )
+        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
+        assert flag in result, (
+            "missing_knowledge finding unrelated to count snapshots must be KEPT; "
+            f"got {result!r}"
+        )
+
+    def test_memory_contradiction_finding_kept_for_know_live(self):
+        """Case (c) mirrored for know_live: memory_contradiction finding is KEPT (category gate)."""
+        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+
+        flag = self._make_flag(
+            category='memory_contradiction',
+            description='count snapshot contradicts task tree',
+            suggested_action='Investigate',
+        )
+        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
+        assert flag in result, (
+            "memory_contradiction finding must be KEPT (category not in suppressed set); "
+            f"got {result!r}"
+        )
+

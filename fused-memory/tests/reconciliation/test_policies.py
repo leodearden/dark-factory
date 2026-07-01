@@ -61,3 +61,20 @@ class TestIsSnapshotWriteBlocked:
         )
 
         assert AUTOPILOT_VIDEO_PROJECT_ID == 'autopilot_video'
+
+    def test_know_live_is_blocked(self):
+        """is_snapshot_write_blocked('know_live') must return True (task 1943)."""
+        from fused_memory.reconciliation.policies import is_snapshot_write_blocked
+
+        assert is_snapshot_write_blocked('know_live') is True, (
+            "is_snapshot_write_blocked('know_live') must return True; "
+            "snapshot write paths are blocked-by-design for this project"
+        )
+
+    def test_know_live_project_id_constant_value(self):
+        """KNOW_LIVE_PROJECT_ID must equal 'know_live' (task 1943)."""
+        from fused_memory.reconciliation.policies.know_live import (
+            KNOW_LIVE_PROJECT_ID,
+        )
+
+        assert KNOW_LIVE_PROJECT_ID == 'know_live'
