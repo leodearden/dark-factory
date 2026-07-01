@@ -26,6 +26,17 @@ suppression record are dropped entirely; the remaining flags proceed through
 the signature-dedup loop unchanged.  This enforces the suppression contract
 in code, making it authoritative over the LLM-side prompt directive.
 
+Scoped (task_id, flag_type) suppression (task-1966)
+-----------------------------------------------------
+A suppression record MAY carry an optional ``metadata.flag_types`` allowlist
+(``build_suppression_payload(task_id, flag_types=[...])``).  When present and
+non-empty, the record suppresses ONLY those (task_id, flag_type) pairs,
+leaving other flag_types for the same task_id free to surface.  When absent
+(the legacy shape written by all pre-existing hand-authored records), the
+record blanket-suppresses ALL flag_types for that task_id, exactly as before.
+When both a scoped and a legacy/blanket record exist for the same task_id,
+the blanket record wins (union semantics) — see ``filter_suppressed``.
+
 Best-effort replacement contract (task-1146, hardened in task-1165)
 --------------------------------------------------------------------
 On every HIT the dedup flow is:
@@ -150,7 +161,7 @@ import asyncio
 import hashlib
 import logging
 import re
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.mem0_dedup import find_prior_memories
@@ -169,10 +180,17 @@ class _SuppressionMetadata(TypedDict):
     and ``str`` task_ids for backward compat with legacy hand-authored
     records — do NOT tighten the reader to int-only without a migration
     of any pre-existing str-task_id records in Mem0.
+
+    ``flag_types`` is an OPTIONAL scoping allowlist (task-1966).  When
+    present and non-empty, the record suppresses ONLY those flag_types for
+    this task_id.  When absent — the legacy shape carried by all
+    pre-existing hand-authored records — the record blanket-suppresses ALL
+    flag_types for this task_id.
     """
 
     kind: Literal['stage1_flag_suppression']
     task_id: int
+    flag_types: NotRequired[list[str]]
 
 
 class SuppressionPayload(TypedDict):
@@ -852,7 +870,9 @@ async def dedup_flags(
     return result
 
 
-def build_suppression_payload(task_id: int | str) -> SuppressionPayload:
+def build_suppression_payload(
+    task_id: int | str, flag_types: list[str] | None = None
+) -> SuppressionPayload:
     """Build the canonical ``stage1_flag_suppression`` Mem0 payload for *task_id*.
 
     Returns a :class:`SuppressionPayload` with ``content``, ``category``, and
@@ -865,9 +885,19 @@ def build_suppression_payload(task_id: int | str) -> SuppressionPayload:
     must be passed separately to ``memory_service.add_memory``, keeping this
     helper pure and reusable across projects.
 
+    ``flag_types`` is an OPTIONAL scoping allowlist (task-1966).  When a
+    non-empty list is given, each element is coerced to ``str`` and the list
+    is sorted+deduped before being stored under ``metadata.flag_types`` — the
+    record then suppresses ONLY those (task_id, flag_type) pairs.  When
+    ``None`` or empty (the default), ``metadata.flag_types`` is omitted
+    entirely and the record keeps the legacy blanket-suppression-for-task_id
+    shape, so ``build_suppression_payload(task_id)`` is unchanged for all
+    existing callers.
+
     Canonical schema (Mem0, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
       - ``metadata.task_id = <N>`` (int — coerced by this function)
+      - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
     """
     try:
@@ -877,13 +907,16 @@ def build_suppression_payload(task_id: int | str) -> SuppressionPayload:
             f'build_suppression_payload: task_id must be an int or numeric '
             f'string, got {task_id!r}'
         ) from e
+    metadata: _SuppressionMetadata = {
+        'kind': 'stage1_flag_suppression',
+        'task_id': tid,
+    }
+    if flag_types:
+        metadata['flag_types'] = sorted({str(ft) for ft in flag_types})
     return {
         'content': f'STAGE 1 FLAG SUPPRESSION task_id={tid}',
         'category': 'observations_and_summaries',
-        'metadata': {
-            'kind': 'stage1_flag_suppression',
-            'task_id': tid,
-        },
+        'metadata': metadata,
     }
 
 
