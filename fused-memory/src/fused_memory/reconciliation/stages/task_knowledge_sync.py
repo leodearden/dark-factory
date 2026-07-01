@@ -1363,6 +1363,12 @@ async def _repair_stage2_summary_stage_metadata(
     correctly-tagged summaries, which is precisely the false-missing state
     this helper exists to eliminate.
 
+    Best-effort: never raises. Enumeration failure logs a WARNING and returns
+    0 (mirrors :func:`_sweep_stale_flag_markers`). A per-member add/delete
+    failure logs a WARNING, excludes that member from the returned count, and
+    does not abort the remaining members (mirrors :func:`_sweep_stale_fixc_markers`'s
+    per-item isolation).
+
     Args:
         memory_service: Service with ``get_memories_by_metadata``,
             ``add_memory``, and ``delete_memory``.
@@ -1371,16 +1377,25 @@ async def _repair_stage2_summary_stage_metadata(
             filter key and the ``causation_id`` for the repair writes.
 
     Returns:
-        Number of members successfully repaired (0 if none are broken or none
-        are found).
+        Number of members successfully repaired (0 if none are broken, none
+        are found, or on enumeration failure).
     """
-    members = await memory_service.get_memories_by_metadata(
-        project_id=project_id,
-        filters={
-            'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
-            'run_id': run_id,
-        },
-    )
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={
+                'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+                'run_id': run_id,
+            },
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._repair_stage2_summary_stage_metadata: '
+            'get_memories_by_metadata failed for run_id=%s; skipping repair',
+            run_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
 
     repaired = 0
     for member in members:
@@ -1396,21 +1411,30 @@ async def _repair_stage2_summary_stage_metadata(
                 'run_id': run_id,
                 'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
             }
-            await memory_service.add_memory(
-                content=content,
-                category='observations_and_summaries',
-                project_id=project_id,
-                metadata=corrected_metadata,
-                causation_id=run_id,
-                _source=_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE,
-            )
-            await memory_service.delete_memory(
-                memory_id=mid,
-                store='mem0',
-                project_id=project_id,
-                causation_id=run_id,
-                _source=_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE,
-            )
+            try:
+                await memory_service.add_memory(
+                    content=content,
+                    category='observations_and_summaries',
+                    project_id=project_id,
+                    metadata=corrected_metadata,
+                    causation_id=run_id,
+                    _source=_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE,
+                )
+                await memory_service.delete_memory(
+                    memory_id=mid,
+                    store='mem0',
+                    project_id=project_id,
+                    causation_id=run_id,
+                    _source=_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE,
+                )
+            except Exception:
+                logger.warning(
+                    'reconciliation._repair_stage2_summary_stage_metadata: '
+                    'repair failed for memory_id=%s run_id=%s; not counted',
+                    mid, run_id,
+                    extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+                )
+                continue
             repaired += 1
 
     return repaired
