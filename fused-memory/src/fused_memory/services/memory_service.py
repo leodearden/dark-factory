@@ -1429,7 +1429,13 @@ class MemoryService:
         known false-negative mode; reconciliation is mostly single-writer
         per edge so it is rare in practice.  Undercounting ``edges_updated``
         (the conservative outcome) is safer than overcounting, so the
-        behaviour is intentional.
+        behaviour is intentional.  Both readbacks (``get_edge_text`` and
+        ``get_edge_invalid_at``) resolve their Cypher through the same
+        per-``group_id`` graph object (``GraphitiBackend._graph_for``) that
+        the backend's explicit ``clear_invalid_at`` write uses, so
+        read-after-write consistency for *our own* write is expected within
+        that connection — the TOCTOU risk above is about a *different*
+        writer racing us, not about our own write lagging its readback.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
@@ -1518,7 +1524,11 @@ class MemoryService:
                     exc_info=e,
                 )
                 result['verified'] = False
-                result['verification_error'] = f'{type(e).__name__}: {e}'
+                error_msg = f'{type(e).__name__}: {e}'
+                existing_error = result.get('verification_error')
+                result['verification_error'] = (
+                    f'{existing_error}; {error_msg}' if existing_error else error_msg
+                )
 
         if self._write_journal:
             await self._write_journal.log_write_op(
