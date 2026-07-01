@@ -887,6 +887,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stats == {
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
+            'stage1_cycle_summary_pool_trimmed': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -978,6 +979,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stats == {
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
+            'stage1_cycle_summary_pool_trimmed': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -11358,6 +11360,248 @@ class TestStage2PromptCycleSummaryPoolTag:
             f"key-value pair that _enforce_stage2_summary_pool_cap filters on "
             f"(task 1657 — producer/consumer contract)."
         )
+
+
+class TestStage1PromptCycleSummaryPoolTag:
+    """Stage 1 prompt must instruct the agent to tag per-cycle summaries with
+    recon_pool='stage1_cycle_summary' so the deterministic Python trim
+    (pretrim_summary_pool, wired into MemoryConsolidator.run()) can enumerate
+    the pool by metadata key.
+
+    Task 1942: minimal key-value-fragment presence assertion only (no prose-
+    wording pins).  Mirrors TestStage2PromptCycleSummaryPoolTag.
+
+    This is the producer-contract guard: the Python trim filters pool members
+    by exactly {'recon_pool': 'stage1_cycle_summary'}.  If the prompt omits
+    the tag instruction the producer never sets the key and the consumer
+    (trim) finds an empty pool — silently leaving the pool invisible/uncapped.
+    """
+
+    def test_stage1_prompt_contains_literal_recon_pool_metadata_fragment(self):
+        """STAGE1_SYSTEM_PROMPT must contain the literal key=value metadata
+        fragment 'recon_pool': 'stage1_cycle_summary'.
+
+        Stronger than a bare token check: verifies the key and value co-occur
+        as the exact add_memory metadata fragment the producer must emit, not
+        just anywhere in unrelated prose.  If the producer instruction is
+        removed or the value changes, this test catches it immediately.
+
+        The consumer (pretrim_summary_pool, via MemoryConsolidator.run())
+        filters by exactly {'recon_pool': 'stage1_cycle_summary'} — so the
+        prompt must instruct the agent to write that exact key-value pair in
+        the per-cycle-summary add_memory metadata dict.
+        """
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        # The literal metadata fragment the producer must emit.  This ties the
+        # test to the actual contract rather than token presence anywhere.
+        fragment = "recon_pool': 'stage1_cycle_summary'"
+        assert fragment in STAGE1_SYSTEM_PROMPT, (
+            f"STAGE1_SYSTEM_PROMPT must contain the literal metadata fragment "
+            f"{fragment!r} so the Stage 1 agent writes the exact key-value pair "
+            f"that pretrim_summary_pool filters on (task 1942 — producer/consumer "
+            f"contract, mirrors Stage 2's task 1657)."
+        )
+
+
+class TestStage1CycleSummaryPoolTrim:
+    """MemoryConsolidator.run() pre-trims the stage1_cycle_summary pool to
+    cap-1 BEFORE super().run() (trim-then-write ordering, mirrors Stage 2's
+    task 1831 wiring) and sets report.stats['stage1_cycle_summary_pool_trimmed']
+    (task 1942)."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _pool_members(self, count: int) -> list:
+        """Create count pool members with distinct created_at strings."""
+        return [
+            {
+                'id': f'summary-{i}',
+                'created_at': f'2026-0{i+1}-01T00:00:00+00:00',
+                'metadata': {'recon_pool': 'stage1_cycle_summary'},
+            }
+            for i in range(count)
+        ]
+
+    def _base_report(self):
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    def test_stage1_cycle_summary_pool_cap_constant_equals_2(self):
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            STAGE1_CYCLE_SUMMARY_POOL_CAP,
+        )
+
+        assert STAGE1_CYCLE_SUMMARY_POOL_CAP == 2
+
+    def test_stage1_cycle_summary_recon_pool_constant(self):
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            _STAGE1_CYCLE_SUMMARY_RECON_POOL,
+        )
+
+        assert _STAGE1_CYCLE_SUMMARY_RECON_POOL == 'stage1_cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_stat_set_to_trimmed_count_when_pool_over_cap(self, mock_deps):
+        """3 pool members → pre-trim to cap-1=1 → pool_trimmed==2."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=self._pool_members(3)
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-cap',
+            )
+
+        assert 'stage1_cycle_summary_pool_trimmed' in report.stats
+        assert report.stats['stage1_cycle_summary_pool_trimmed'] == 2
+
+    @pytest.mark.asyncio
+    async def test_stat_is_zero_when_pool_at_cap_minus_one(self, mock_deps):
+        """1 member (already at cap-1=1) → no trim, pool_trimmed==0."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=self._pool_members(1)
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-at-cap',
+            )
+
+        assert 'stage1_cycle_summary_pool_trimmed' in report.stats
+        assert report.stats['stage1_cycle_summary_pool_trimmed'] == 0
+
+    @pytest.mark.asyncio
+    async def test_stat_is_one_when_pool_has_two_prior_members(self, mock_deps):
+        """2 prior members → pre-trim to cap-1=1 → pool_trimmed==1."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=self._pool_members(2)
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-two',
+            )
+
+        assert report.stats['stage1_cycle_summary_pool_trimmed'] == 1
+
+    @pytest.mark.asyncio
+    async def test_trim_runs_in_remediation_mode(self, mock_deps):
+        """Pre-trim runs and stat is set even when remediation_findings is set
+        (remediation passes still need the pool bounded every cycle)."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+        stage.remediation_findings = []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=self._pool_members(3)
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-remediation',
+            )
+
+        assert 'stage1_cycle_summary_pool_trimmed' in report.stats
+        assert report.stats['stage1_cycle_summary_pool_trimmed'] == 2
+        mock_deps['memory_service'].delete_memory.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_trim_precedes_agent_write_ordering(self, mock_deps):
+        """Pre-trim (get_memories_by_metadata) fires BEFORE super().run() (agent write)."""
+        order = []
+
+        async def record_trim(*args, **kwargs):
+            order.append('trim')
+            return []
+
+        async def record_agent(*args, **kwargs):
+            order.append('agent_run')
+            return self._base_report()
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=record_trim
+        )
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(side_effect=record_agent)):
+            await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-order',
+            )
+
+        trim_indices = [i for i, x in enumerate(order) if x == 'trim']
+        agent_indices = [i for i, x in enumerate(order) if x == 'agent_run']
+        assert trim_indices, 'pre-trim must call get_memories_by_metadata'
+        assert agent_indices, 'super().run() must be called'
+        assert max(trim_indices) < min(agent_indices), (
+            'all trim calls must precede agent_run; '
+            f'got order={order!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_pretrim_uses_stage1_recon_pool_filter_and_trim_source(self, mock_deps):
+        """Pretrim filters by recon_pool='stage1_cycle_summary' and deletes with
+        _source='stage1_cycle_summary_trim' (producer/consumer contract with
+        the Stage 1 prompt's add_memory metadata)."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            return_value=self._pool_members(2)
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-filter',
+            )
+
+        call = mock_deps['memory_service'].get_memories_by_metadata.call_args
+        filters = call.kwargs.get('filters') or {}
+        assert filters.get('recon_pool') == 'stage1_cycle_summary'
+
+        delete_call = mock_deps['memory_service'].delete_memory.call_args
+        assert delete_call.kwargs.get('_source') == 'stage1_cycle_summary_trim'
 
 
 class TestInjectFlagId:
