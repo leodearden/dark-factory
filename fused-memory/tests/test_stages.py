@@ -13037,3 +13037,65 @@ class TestRepairStage2SummaryStageMetadata:
         call_names = [c[0] for c in manager.mock_calls]
         assert 'add_memory' in call_names and 'delete_memory' in call_names
         assert call_names.index('add_memory') < call_names.index('delete_memory')
+
+
+class TestReconstructStage2Summary:
+    """_reconstruct_stage2_summary (task 1964): closes the FULLY-ABSENT gap left
+    by _verify_stage2_summary_written (task 1796, observe-only — logs a
+    WARNING but takes no corrective action) and
+    _repair_stage2_summary_stage_metadata (task 1963, heals a summary that
+    EXISTS but is mislabeled — its enumeration returns [] when the pool has
+    ZERO members for this run_id, so it repairs nothing).
+
+    When the summary is FULLY ABSENT — LLM crash/timeout before the write was
+    ever sent, or the write was silently dedup-dropped by Mem0 (memory_ids=[]),
+    or it was written with a wrong/absent run_id — neither of the above two
+    helpers writes a discoverable summary. This helper closes that gap: it
+    writes ONE dedup-resilient retroactive reconstruction placeholder,
+    automating the manual reconstruction Stage 1 performed for run 6467daca
+    (mem0 memory 4a3a42d1, an explicitly-labeled reconstruction).
+    """
+
+    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+    @pytest.mark.asyncio
+    async def test_happy_path_writes_reconstruction_once(self):
+        """First add_memory call returns a non-empty memory_ids: no retry,
+        return 1, and the write shape matches the canonical reconstruction
+        contract (content, category, project_id, metadata, causation_id,
+        _source). Enumeration is never used — this is a deterministic write,
+        not a semantic-search path.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _reconstruct_stage2_summary,
+        )
+
+        run_id = 'run-recon-1'
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['recon-1']})
+
+        result = await _reconstruct_stage2_summary(
+            memory_service, project_id='dark_factory', run_id=run_id,
+        )
+
+        memory_service.add_memory.assert_awaited_once()
+        kwargs = memory_service.add_memory.call_args.kwargs
+        assert kwargs.get('category') == 'observations_and_summaries'
+        assert kwargs.get('project_id') == 'dark_factory'
+        assert kwargs.get('causation_id') == run_id
+        assert kwargs.get('_source') == 'stage2_summary_reconstruction'
+
+        metadata = kwargs.get('metadata') or {}
+        assert metadata.get('kind') == 'cycle_summary'
+        assert metadata.get('stage') == 'task_knowledge_sync'
+        assert metadata.get('run_id') == run_id
+        assert metadata.get('recon_pool') == 'stage2_cycle_summary'
+        assert metadata.get('reconstructed') is True
+
+        content = kwargs.get('content')
+        assert content, 'content must be a non-empty string'
+        assert run_id in content, 'content must reference the run_id'
+        assert 'reconstruct' in content.lower(), 'content must be labeled as a reconstruction'
+
+        assert result == 1
+        memory_service.search.assert_not_awaited()
