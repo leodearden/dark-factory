@@ -116,6 +116,14 @@ DEFAULT_COMMIT_CITATION_PATTERN: str = (
 # find_inflight enumeration (see _iter_merge_worktrees).
 PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
 
+# Fixed name for the SECOND persistent warm worktree (task 1952, PRD δ /
+# §5 C5), dedicated to the offline-deep lane worker (β2).  Lives at
+# <worktree_base>/_offline-deep.  Deliberately NOT prefixed `_merge-`, so it
+# is structurally exempt from _iter_merge_worktrees / prune_stale_merge_worktrees
+# / find_inflight_merge_worktree — the same mechanism that already exempts
+# _spec-*/_lane-*/_solo-* worktrees — with no explicit skip required.
+PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
+
 
 class ScrubOutcome(Enum):
     """Outcome discriminant for :class:`ScrubResult`.
@@ -3821,6 +3829,20 @@ class GitOps:
         when the feature is off.
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+    @property
+    def persistent_offline_deep_worktree_path(self) -> Path:
+        """Fixed path for the second persistent warm worktree (offline-deep lane).
+
+        Always ``<worktree_base>/_offline-deep``.  Dedicated to the β2
+        offline-deep lane worker (task 1952, PRD δ / §5 C5) — reset in place,
+        retaining its own ``target/``, and NEVER sharing or overlaying the
+        merge lane's ``target/`` (see :attr:`persistent_merge_worktree_path`).
+        The path is independent of the ``git.persistent_offline_deep_worktree``
+        knob — the property always returns the canonical location so callers
+        can compare against it even when the feature is off.
+        """
+        return self.worktree_base / PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME
 
     @property
     def _merge_verify_artifact_path(self) -> Path:
