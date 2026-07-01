@@ -1414,14 +1414,22 @@ class MemoryService:
 
         **Guard-2 verification (TOCTOU note):** when *fact* is supplied, a
         ``get_edge_text`` readback is performed after the save to confirm
-        persistence.  There is a small TOCTOU window between the save and the
-        readback — if a concurrent writer updates the same edge in that window
-        (another reconciliation cycle, an interactive agent, or a retry) the
-        readback may return a different value and ``verified`` will be ``False``
-        even though *our* save did persist.  This is a known false-negative
-        mode; reconciliation is mostly single-writer per edge so it is rare in
-        practice.  Undercounting ``edges_updated`` (the conservative outcome) is
-        safer than overcounting, so the behaviour is intentional.
+        persistence. When *clear_invalid_at* is supplied, a separate
+        ``get_edge_invalid_at`` readback confirms the edge was actually
+        restored to active status — this is independent of the fact
+        verdict, so a combined ``fact`` + ``clear_invalid_at`` call is
+        ``verified`` only when *both* readbacks confirm. A pure
+        ``invalid_at=<timestamp>`` supersede (no fact, no clear) is not
+        readback-verified — it persists reliably via the same write path
+        used for ``fact``. There is a small TOCTOU window between each save
+        and its readback — if a concurrent writer updates the same edge in
+        that window (another reconciliation cycle, an interactive agent, or
+        a retry) the readback may return a different value and ``verified``
+        will be ``False`` even though *our* save did persist.  This is a
+        known false-negative mode; reconciliation is mostly single-writer
+        per edge so it is rare in practice.  Undercounting ``edges_updated``
+        (the conservative outcome) is safer than overcounting, so the
+        behaviour is intentional.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
@@ -1480,8 +1488,37 @@ class MemoryService:
                 result['verified'] = False
                 result['verification_error'] = f'{type(e).__name__}: {e}'
         else:
-            # invalid_at-only update — skip readback, trivially verified.
+            # No fact supplied — nothing to compare yet. May be revised below
+            # by the clear_invalid_at readback; a pure invalid_at=<timestamp>
+            # supersede (no fact, no clear) stays trivially verified here.
             result['verified'] = True
+
+        # Guard 2b: post-write clear_invalid_at verification, independent of
+        # the fact verdict above. Combines via AND — a fact+clear call is
+        # verified only when both readbacks confirm.
+        if clear_invalid_at:
+            try:
+                readback_invalid_at = await self.graphiti.get_edge_invalid_at(
+                    edge_uuid, group_id=project_id
+                )
+                cleared = readback_invalid_at is None
+                result['verified'] = bool(result.get('verified', True)) and cleared
+                if not cleared:
+                    error_msg = f'invalid_at not cleared: readback={readback_invalid_at!r}'
+                    existing_error = result.get('verification_error')
+                    result['verification_error'] = (
+                        f'{existing_error}; {error_msg}' if existing_error else error_msg
+                    )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                logger.exception(
+                    'update_edge clear_invalid_at verification readback failed for edge %s',
+                    edge_uuid,
+                    exc_info=e,
+                )
+                result['verified'] = False
+                result['verification_error'] = f'{type(e).__name__}: {e}'
 
         if self._write_journal:
             await self._write_journal.log_write_op(
