@@ -7,7 +7,6 @@ live source/test re-verification (verify_premise_refuted).
 
 from __future__ import annotations
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-03 RED: TestLoadPremiseRegistry
 # ──────────────────────────────────────────────────────────────────────────────
