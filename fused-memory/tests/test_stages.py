@@ -5682,6 +5682,137 @@ class TestSweepStaleFlagMarkers:
         memory_service.search.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_missing_or_unparseable_created_at_are_kept_not_deleted(self):
+        """Members with created_at=None, a non-ISO string, or a non-string value
+        must never be deleted — pins the docstring's documented safety posture
+        ('members with a missing or unparseable created_at are KEPT'). A
+        regression that deleted undatable markers instead of keeping them would
+        be silent data loss and must fail this test."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'missing-created-at',
+                'created_at': None,
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+            {
+                'id': 'unparseable-created-at',
+                'created_at': 'not-a-date',
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+            {
+                'id': 'non-string-created-at',
+                'created_at': 12345,
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'genuinely-stale'}
+
+    @pytest.mark.asyncio
+    async def test_created_at_exactly_at_cutoff_boundary_is_kept(self):
+        """created_at == now - max_age_days sits exactly on the cutoff boundary.
+        The comparison is strictly '<', so this member must be KEPT, not
+        deleted — pins the strict-inequality semantics against an off-by-one
+        regression (e.g. switching to '<=')."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        max_age_days = 14
+        members = [
+            {
+                'id': 'exactly-at-cutoff',
+                'created_at': (fixed_now - timedelta(days=max_age_days)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+            {
+                'id': 'just-past-cutoff',
+                'created_at': (
+                    fixed_now - timedelta(days=max_age_days, seconds=1)
+                ).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now, max_age_days=max_age_days,
+        )
+
+        assert result == 1
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'just-past-cutoff'}
+        assert 'exactly-at-cutoff' not in deleted_ids
+
+    @pytest.mark.asyncio
+    async def test_member_missing_id_is_skipped_not_raised(self):
+        """A malformed scroll member missing 'id' must be skipped, not raise
+        KeyError — the sweep is a best-effort contract end-to-end (enumeration
+        and delete failures are already swallowed; a missing 'id' must not be
+        the one path that aborts TaskKnowledgeSync.run())."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                # no 'id' key at all
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+            {
+                'id': '',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'genuinely-stale'}
+
+    @pytest.mark.asyncio
     async def test_enumeration_failure_returns_zero_and_logs_warning(self, caplog):
         """When get_memories_by_metadata raises, returns 0, does NOT raise, logs WARNING."""
         import logging
