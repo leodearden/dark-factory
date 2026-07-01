@@ -121,6 +121,8 @@ class TestOfflineLaneWiring:
         await harness._start_offline_lane()
         task = harness._offline_lane_task
         worker = harness._offline_lane_worker
+        assert task is not None, 'sanity: the task must exist after start'
+        assert worker is not None, 'sanity: the worker must exist after start'
         assert worker._lock_file is not None, 'sanity: the lock must be held after start'
 
         await harness._stop_offline_lane()
