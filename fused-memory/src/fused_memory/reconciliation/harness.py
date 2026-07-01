@@ -563,6 +563,7 @@ class ReconciliationHarness:
         filtered_task_tree: FilteredTaskTree | None = None,
         task_count_verification: dict | None = None,
         graphiti_queue_health: dict | None = None,
+        status_correction_reconciliation: dict | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
 
@@ -577,6 +578,9 @@ class ReconciliationHarness:
             in full-cycle passes; None in remediation passes).
         graphiti_queue_health: summarize_graphiti_queue_health record (available only
             in full-cycle passes; None in remediation passes).
+        status_correction_reconciliation: _reconcile_status_correction record
+            (task 1938; available only in full-cycle passes; None in
+            remediation passes).
         """
         stage.episode_limit = tier.episode_limit
         stage.memory_limit = tier.memory_limit
@@ -587,6 +591,7 @@ class ReconciliationHarness:
         stage.filtered_task_tree = filtered_task_tree
         stage.task_count_verification = task_count_verification
         stage.graphiti_queue_health = graphiti_queue_health
+        stage.status_correction_reconciliation = status_correction_reconciliation
 
     @staticmethod
     def _configure_task_sync(
