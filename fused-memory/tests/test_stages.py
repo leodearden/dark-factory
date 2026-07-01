@@ -13153,3 +13153,25 @@ class TestReconstructStage2Summary:
         assert memory_service.add_memory.await_count == 2
         assert result == 0
         assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_add_memory_exception_does_not_raise(self, caplog):
+        """When add_memory raises, _reconstruct_stage2_summary does NOT
+        propagate the exception: returns 0 and logs a WARNING. Mirrors the
+        best-effort contract of _repair_stage2_summary_stage_metadata /
+        _sweep_stale_fixc_markers.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _reconstruct_stage2_summary,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('mem0 down'))
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _reconstruct_stage2_summary(
+                memory_service, project_id='dark_factory', run_id='run-recon-exc',
+            )
+
+        assert result == 0
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
