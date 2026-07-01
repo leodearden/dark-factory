@@ -967,6 +967,7 @@ async def write_suppression_record(
     *,
     project_id: str,
     task_id: int | str,
+    flag_types: list[str] | None = None,
     causation_id: str | None = None,
 ) -> AddMemoryResponse:
     """Write a ``stage1_flag_suppression`` record to Mem0 for *task_id*.
@@ -980,15 +981,22 @@ async def write_suppression_record(
     writes from ``'stage1_flag_dedup'`` and ``'targeted_recon'`` writes in the
     audit journal, enabling per-class retention and query filtering.
 
+    ``flag_types`` is an OPTIONAL scoping allowlist (task-1966), forwarded
+    verbatim to :func:`build_suppression_payload`.  When a non-empty list is
+    given, the record suppresses ONLY those (task_id, flag_type) pairs.  When
+    ``None`` or empty (the default), ``metadata.flag_types`` is omitted and
+    the record keeps the legacy blanket-suppression-for-task_id shape.
+
     Canonical schema (Mem0, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
       - ``metadata.task_id = <N>`` (int — coerced by build_suppression_payload)
+      - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
 
     Returns the :class:`AddMemoryResponse` from the memory service so callers
     can inspect ``memory_ids`` for empty-list deduplication / no-op detection.
     """
-    payload = build_suppression_payload(task_id)
+    payload = build_suppression_payload(task_id, flag_types=flag_types)
     return await memory_service.add_memory(
         **payload,
         project_id=project_id,
