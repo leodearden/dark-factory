@@ -142,7 +142,8 @@ class OfflineLaneWorker:
         The SHAs are advisory only (never stored): the eventual run always
         snapshots its own head at run-start (see :meth:`_run_once`).
         """
-        raise NotImplementedError
+        self._dirty = True
+        self._wake.set()
 
     # ------------------------------------------------------------------
     # Run loop
