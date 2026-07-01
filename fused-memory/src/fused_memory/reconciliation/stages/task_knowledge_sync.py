@@ -1514,6 +1514,13 @@ async def _reconstruct_stage2_summary(
     task-1963 repairs. The content leads with a CSPRNG nonce (see
     :func:`_build_stage2_reconstruction_content`) to defeat Mem0's dedup.
 
+    Because the root cause can itself be a dedup drop, the write is dedup-
+    resilient: the response's ``memory_ids`` is inspected
+    (:func:`_extract_response_memory_ids`), and if empty (a dedup no-op) the
+    write is retried exactly ONCE with a fresh nonce (metadata unchanged).
+    This mirrors the LLM prompt's own retry_nonce pattern without risking an
+    unbounded loop.
+
     Args:
         memory_service: Service with ``add_memory``.
         project_id: Project scope for the write.
@@ -1521,8 +1528,8 @@ async def _reconstruct_stage2_summary(
             identity key and the ``causation_id`` for the write.
 
     Returns:
-        1 if the response's ``memory_ids`` (see
-        :func:`_extract_response_memory_ids`) is non-empty, else 0.
+        1 if a reconstruction placeholder was successfully written (first
+        attempt or retry — see :func:`_extract_response_memory_ids`), else 0.
     """
     metadata = {
         'kind': 'cycle_summary',
@@ -1541,6 +1548,26 @@ async def _reconstruct_stage2_summary(
     )
     if _extract_response_memory_ids(response):
         return 1
+
+    # Dedup no-op (Mem0 ~0.92 cosine similarity) — retry once with a fresh
+    # nonce so the leading content shifts past the threshold.
+    response = await memory_service.add_memory(
+        content=_build_stage2_reconstruction_content(run_id),
+        category='observations_and_summaries',
+        project_id=project_id,
+        metadata=metadata,
+        causation_id=run_id,
+        _source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE,
+    )
+    if _extract_response_memory_ids(response):
+        return 1
+
+    logger.warning(
+        'reconciliation._reconstruct_stage2_summary: '
+        'reconstruction write dedup-dropped twice for run_id=%s; giving up',
+        run_id,
+        extra={'project_id': project_id, 'run_id': run_id},
+    )
     return 0
 
 
