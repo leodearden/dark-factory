@@ -65,7 +65,11 @@ while [[ $SECONDS -lt $deadline ]]; do
     pid="$(read_field "$state" MainPID)"
     active="$(read_field "$state" ActiveState)"
     mono="$(read_field "$state" ActiveEnterTimestampMonotonic)"
-    if [[ "$pid" != "$baseline_pid" && "$pid" -gt 0 && "$active" == "active" && "$mono" -gt "$baseline_mono" ]]; then
+    # ActiveEnterTimestampMonotonic (+ ActiveState=active + a live pid) is the
+    # authoritative freshness signal. PID inequality is NOT required: on rare
+    # occasions the kernel reuses the old MainPID for the new process, which
+    # would otherwise make a clean restart look spuriously stale.
+    if [[ "$pid" -gt 0 && "$active" == "active" && "$mono" -gt "$baseline_mono" ]]; then
         echo " OK"
         echo "orchestrator-dark-factory restarted successfully (new MainPID=${pid})."
         exit 0
