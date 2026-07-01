@@ -23,8 +23,12 @@ Records every invocation (minus `--user`) into a JSON state file at
 $FAKE_SYSTEMCTL_STATE and answers `show`/`restart` from that file's
 fields. When state["scenario"] == "fresh", a `restart` call bumps
 MainPID/ActiveState/ActiveEnterTimestampMonotonic to simulate the
-service coming back up; any other scenario leaves the fields
-unchanged (simulating a stale/failed restart).
+service coming back up. When state["scenario"] == "bumped_but_failed",
+a `restart` call bumps MainPID/ActiveEnterTimestampMonotonic (as if a
+new process started) but reports ActiveState="failed" -- simulating a
+unit that respawned into a crash loop rather than a clean start. Any
+other scenario leaves the fields unchanged (simulating a stale/failed
+restart).
 """
 import json
 import os
@@ -66,9 +70,17 @@ def main(argv):
     state.setdefault("calls", []).append(argv[1:])
 
     if verb == "restart":
-        if state.get("scenario") == "fresh":
+        scenario = state.get("scenario")
+        if scenario == "fresh":
             state["MainPID"] = state.get("MainPID", 1000) + 1
             state["ActiveState"] = "active"
+            state["ActiveEnterTimestampMonotonic"] = (
+                state.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
+            )
+            state["ActiveEnterTimestamp"] = "restarted"
+        elif scenario == "bumped_but_failed":
+            state["MainPID"] = state.get("MainPID", 1000) + 1
+            state["ActiveState"] = "failed"
             state["ActiveEnterTimestampMonotonic"] = (
                 state.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
             )
@@ -225,4 +237,53 @@ def test_drain_flag_is_accepted_and_ignored(tmp_path):
     assert ["--user", "restart", UNIT] in state["calls"], (
         f"Expected the restart+verify flow to still run with --drain; "
         f"got calls={state['calls']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# amendment: unrecognized arguments must be rejected before any systemctl call
+# ---------------------------------------------------------------------------
+
+def test_rejects_unknown_argument(tmp_path):
+    """An unrecognized argument exits non-zero and the script never proceeds
+    to restart -- guards the `*)` branch's `exit 1` against regressions that
+    would silently widen the accepted-argument set."""
+    bin_dir, state_path = _make_fake_systemctl(tmp_path)
+
+    result = _run_script(bin_dir, state_path, "--bogus", env={"RESTART_VERIFY_TIMEOUT": "1"})
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit on an unrecognized argument; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT] not in state["calls"], (
+        f"Expected no restart call to be recorded when rejecting an unknown "
+        f"argument; got calls={state['calls']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# amendment: a fresh PID in a non-active unit state must still fail verify
+# ---------------------------------------------------------------------------
+
+def test_exits_nonzero_when_restart_bumps_pid_but_unit_not_active(tmp_path):
+    """A restart that bumps MainPID/timestamp but lands in a non-active
+    ActiveState (e.g. crash-looped into 'failed') must be treated as a
+    failed restart -- guards the ActiveState=='active' conjunct against
+    regressions that would key freshness off MainPID/timestamp alone."""
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, scenario="bumped_but_failed", main_pid=1234
+    )
+
+    result = _run_script(bin_dir, state_path, env={"RESTART_VERIFY_TIMEOUT": "1"})
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit when ActiveState is not 'active' even "
+        f"though MainPID/timestamp advanced; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "stale" in (result.stdout + result.stderr).lower(), (
+        f"Expected a stale/failed-restart error message; got "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
