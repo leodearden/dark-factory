@@ -65,13 +65,21 @@ class TestOfflineLaneTrigger:
     ):
         """_note_offline_lane logs an operator-visible on_post_merge line with abbreviated SHAs."""
         harness._offline_lane_notifiee = AsyncMock()
+        # Realistic-length (> 12 char) SHAs so the [:12] abbreviation in the
+        # log line is actually exercised, rather than being a no-op slice.
+        base_sha = 'basedeadbeef0123456789'
+        head_sha = 'headfeedface9876543210'
 
         with caplog.at_level(logging.INFO):
-            await harness._note_merge_all('t', 'base-sha', 'head-sha')
+            await harness._note_merge_all('t', base_sha, head_sha)
 
         assert 'offline-lane: on_post_merge' in caplog.text
-        assert 'base-sha'[:12] in caplog.text
-        assert 'head-sha'[:12] in caplog.text
+        assert base_sha[:12] in caplog.text
+        assert head_sha[:12] in caplog.text
+        # The truncation actually truncates -- the full untruncated SHAs must
+        # not appear in the log line.
+        assert base_sha not in caplog.text
+        assert head_sha not in caplog.text
 
     async def test_offline_lane_notifiee_raise_is_swallowed_fail_open(
         self, harness: Harness, caplog
@@ -122,3 +130,31 @@ class TestOfflineLaneTrigger:
         )
         coord_a.note_merge.assert_not_awaited()
         coord_b.note_merge.assert_not_awaited()
+
+    async def test_offline_lane_noop_when_notifiee_unset(
+        self, harness: Harness, caplog
+    ):
+        """Default production state during β1: _offline_lane_notifiee is None.
+
+        _note_merge_all (and _note_offline_lane) must be a clean no-op for the
+        lane -- no raise, no 'offline-lane' log line -- while the
+        service-restart coordinator fan-out proceeds exactly as before.
+        """
+        assert harness._offline_lane_notifiee is None
+        coord_a = MagicMock()
+        coord_a.note_merge = AsyncMock()
+        coord_b = MagicMock()
+        coord_b.note_merge = AsyncMock()
+        harness._service_restart_coordinators = [coord_a, coord_b]
+
+        with caplog.at_level(logging.INFO):
+            # Must NOT raise
+            await harness._note_merge_all('task-4', 'base4', 'head4')
+
+        assert 'offline-lane' not in caplog.text
+        coord_a.note_merge.assert_awaited_once_with(
+            'task-4', 'base4', 'head4', prefetched_diff=[]
+        )
+        coord_b.note_merge.assert_awaited_once_with(
+            'task-4', 'base4', 'head4', prefetched_diff=[]
+        )
