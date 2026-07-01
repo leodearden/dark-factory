@@ -2061,7 +2061,9 @@ class TestBuildSuppressionPayloadFlagTypes:
         result = build_suppression_payload(452, flag_types=['human_review_required_deferred'])
         assert result['metadata']['task_id'] == 452
         assert isinstance(result['metadata']['task_id'], int)
-        assert result['metadata']['flag_types'] == ['human_review_required_deferred']
+        # .get() (not ['flag_types']) — the key is NotRequired in _SuppressionMetadata,
+        # so a direct subscript trips pyright's reportTypedDictNotRequiredAccess.
+        assert result['metadata'].get('flag_types') == ['human_review_required_deferred']
         assert isinstance(result['content'], str) and result['content']
         assert result['content'].startswith('STAGE 1 FLAG SUPPRESSION task_id=452')
 
@@ -2069,8 +2071,10 @@ class TestBuildSuppressionPayloadFlagTypes:
         """(c) Mixed/duplicate/unsorted flag_types normalize to sorted-unique,
         every element str-coerced."""
         result = build_suppression_payload(452, flag_types=['b', 'a', 'a'])
-        assert result['metadata']['flag_types'] == ['a', 'b']
-        assert all(isinstance(x, str) for x in result['metadata']['flag_types'])
+        flag_types = result['metadata'].get('flag_types')
+        assert flag_types == ['a', 'b']
+        assert flag_types is not None  # narrows list[str] | None for the iteration below
+        assert all(isinstance(x, str) for x in flag_types)
 
     @pytest.mark.parametrize('flag_types', [None, []], ids=['none', 'empty_list'])
     def test_none_or_empty_flag_types_yields_legacy_shape(self, flag_types):
