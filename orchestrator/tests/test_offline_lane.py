@@ -424,3 +424,59 @@ def test_lockfile_enforces_singleton(tmp_path: Path):
     # After the holder releases, a fresh acquire on the same path succeeds.
     assert worker_b.acquire_lock() is True
     worker_b.release_lock()
+
+
+# ---------------------------------------------------------------------------
+# Default suite-runner seam (step-15/16)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Path):
+    """The default (uninjected) suite_runner seam builds the real script invocation.
+
+    No suite_runner is supplied, so the worker falls back to its
+    ``_default_run_suite`` seam. ``asyncio.create_subprocess_exec`` is
+    mocked, so this asserts ONLY that the argv/env/cwd invocation is built
+    correctly — real script existence/execution is ζ's job (cross-project
+    scope boundary; see module docstring).
+
+    Step 15 (RED): _default_run_suite is a NotImplementedError stub — must
+    fail before impl.
+    """
+    worker = _make_worker(tmp_path)  # no suite_runner injected -> default seam
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'suite output\n', b''))
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        rc, tail = await worker.suite_runner(wt_path, 'HEAD1', 6)
+
+    assert rc == 0
+    assert 'suite output' in tail
+
+    mock_exec.assert_awaited_once()
+    argv = mock_exec.call_args.args
+    kwargs = mock_exec.call_args.kwargs
+    assert list(argv) == ['scripts/run-offline-deep.sh', '--test-threads=6'], (
+        'argv must invoke the offline-deep script with the thread count'
+    )
+    assert kwargs['cwd'] == str(wt_path), 'cwd must be the _offline-deep worktree'
+    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
+        'DF_VERIFY_ROLE=offline must be set — the offline role footprint '
+        '(nice/ionice) lives inside the script (Part A), not re-implemented here'
+    )
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
+            f'not replace it (missing/altered {key!r})'
+        )
+    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert kwargs['stderr'] == asyncio.subprocess.STDOUT
