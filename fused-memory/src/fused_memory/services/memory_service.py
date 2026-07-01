@@ -944,6 +944,7 @@ class MemoryService:
                     'group_id': target,
                     'source_description': f'replay_from_mem0:{category}',
                 },
+                'callback_type': 'refresh_entity_summaries',
             })
 
         if batch:
