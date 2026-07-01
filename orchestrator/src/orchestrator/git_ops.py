@@ -4047,6 +4047,53 @@ class GitOps:
 
         return warm_path
 
+    async def reset_persistent_offline_deep_worktree(self, merge_commit: str) -> Path:
+        """Create or reset-in-place the second persistent warm worktree (offline-deep lane).
+
+        Dedicated to the offline-deep lane worker (β2, task 1952, PRD δ /
+        §5 C5) — modeled on :meth:`reset_persistent_merge_worktree` but at
+        its own fixed path (:attr:`persistent_offline_deep_worktree_path`)
+        with its own retained ``target/``, NEVER sharing or overlaying the
+        merge lane's ``target/`` (C5).
+
+        **Create-once path** (worktree not yet registered):
+            ``git worktree add --detach <fixed_path> <merge_commit>``
+
+        Returns the fixed path (:attr:`persistent_offline_deep_worktree_path`).
+        Raises :exc:`RuntimeError` on git failure (mirrors
+        :meth:`reset_persistent_merge_worktree`).
+        """
+        warm_path = self.persistent_offline_deep_worktree_path
+
+        if not await self._is_registered_worktree(warm_path):
+            # Create-once branch — self-heal a stale unregistered directory first.
+            # See reset_persistent_merge_worktree for rationale (a previous run
+            # may have left the directory on disk without a git worktree
+            # registration, e.g. worktree metadata pruned after a crash).
+            if warm_path.exists():
+                logger.warning(
+                    'Persistent offline-deep worktree path %s exists on disk but '
+                    'is not a registered git worktree; removing stale directory '
+                    'to allow fresh creation (self-heal)',
+                    warm_path,
+                )
+                shutil.rmtree(warm_path)
+            warm_path.parent.mkdir(parents=True, exist_ok=True)
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to create persistent offline-deep worktree at {warm_path}: {err}'
+                )
+            logger.info(
+                'Created persistent offline-deep worktree at %s (HEAD=%s)',
+                warm_path, merge_commit[:8],
+            )
+
+        return warm_path
+
     async def _iter_merge_worktrees(self):
         """Yield ``(wt_path, wt_resolved)`` pairs for registered ``_merge-*`` worktrees.
 
