@@ -126,3 +126,116 @@ class TestCarriesRemediationHistory:
 
     def test_ambiguous_short_content(self):
         assert self._call('...') is True
+
+
+# ===========================================================================
+# Tests: classify_pool (pure core)
+# ===========================================================================
+
+def _summary(id: str, created_at: str | None, content: str = 'ordinary cycle summary') -> dict:
+    """Build a normalized {id, created_at, content, metadata} summary dict."""
+    return {'id': id, 'created_at': created_at, 'content': content, 'metadata': {}}
+
+
+class TestClassifyPool:
+    """classify_pool(summaries, keep_recent_n) sorts by created_at descending,
+    always keeps the most-recent keep_recent_n, and among the rest keeps only
+    those carrying remediation history — the rest are marked for deletion."""
+
+    def test_pool_below_keep_recent_n_all_kept_no_deletes(self):
+        summaries = [
+            _summary('a', '2026-03-01T00:00:00+00:00'),
+            _summary('b', '2026-02-01T00:00:00+00:00'),
+        ]
+        result = _mod.classify_pool(summaries, keep_recent_n=2)
+
+        assert set(result.keep_ids) == {'a', 'b'}
+        assert result.delete_ids == []
+        assert result.reasons['a'] == 'recent'
+        assert result.reasons['b'] == 'recent'
+
+    def test_pool_smaller_than_keep_recent_n_all_kept(self):
+        summaries = [_summary('only', '2026-01-01T00:00:00+00:00')]
+        result = _mod.classify_pool(summaries, keep_recent_n=2)
+
+        assert result.keep_ids == ['only']
+        assert result.delete_ids == []
+
+    def test_older_quiescent_member_deleted(self):
+        summaries = [
+            _summary('newest1', '2026-05-01T00:00:00+00:00'),
+            _summary('newest2', '2026-04-01T00:00:00+00:00'),
+            _summary(
+                'old-quiescent', '2026-01-01T00:00:00+00:00',
+                content='0 new episodes, 0 mutations. Quiescent cycle.',
+            ),
+        ]
+        result = _mod.classify_pool(summaries, keep_recent_n=2)
+
+        assert set(result.keep_ids) == {'newest1', 'newest2'}
+        assert result.delete_ids == ['old-quiescent']
+        assert result.reasons['old-quiescent'] == 'quiescent_boilerplate'
+        assert result.reasons['newest1'] == 'recent'
+        assert result.reasons['newest2'] == 'recent'
+
+    def test_older_remediation_bearing_member_preserved(self):
+        summaries = [
+            _summary('newest1', '2026-05-01T00:00:00+00:00'),
+            _summary('newest2', '2026-04-01T00:00:00+00:00'),
+            _summary(
+                'old-remediation', '2026-01-01T00:00:00+00:00',
+                content='deleted entity e47ac10b-58cc-4372-a567-0e02b2c3d479',
+            ),
+        ]
+        result = _mod.classify_pool(summaries, keep_recent_n=2)
+
+        assert 'old-remediation' in result.keep_ids
+        assert result.reasons['old-remediation'] == 'remediation'
+        assert result.delete_ids == []
+
+    def test_sorts_newest_first_deletes_oldest_beyond_cutoff(self):
+        """4 datable members, keep_recent_n=2: the 2 newest are kept as
+        'recent'; the 2 oldest (quiescent) are deleted — proves descending
+        created_at ordering, not insertion order."""
+        summaries = [
+            _summary('third', '2026-03-01T00:00:00+00:00', content='0 mutations.'),
+            _summary('newest', '2026-04-01T00:00:00+00:00', content='0 mutations.'),
+            _summary('oldest', '2026-01-01T00:00:00+00:00', content='0 mutations.'),
+            _summary('second', '2026-02-01T00:00:00+00:00', content='0 mutations.'),
+        ]
+        result = _mod.classify_pool(summaries, keep_recent_n=2)
+
+        assert set(result.keep_ids) == {'newest', 'third'}
+        assert set(result.delete_ids) == {'second', 'oldest'}
+
+    def test_missing_created_at_sorts_last_but_eligible_for_remediation_preserve(self):
+        summaries = [
+            _summary('newest1', '2026-05-01T00:00:00+00:00'),
+            _summary('newest2', '2026-04-01T00:00:00+00:00'),
+            _summary('no-date-quiescent', None, content='0 new episodes, 0 mutations.'),
+            _summary('no-date-remediation', None, content='deleted entity xyz-123'),
+        ]
+        result = _mod.classify_pool(summaries, keep_recent_n=2)
+
+        assert set(result.keep_ids) == {'newest1', 'newest2', 'no-date-remediation'}
+        assert result.delete_ids == ['no-date-quiescent']
+        assert result.reasons['no-date-remediation'] == 'remediation'
+        assert result.reasons['no-date-quiescent'] == 'quiescent_boilerplate'
+
+    def test_unparseable_created_at_treated_same_as_missing(self):
+        summaries = [
+            _summary('newest1', '2026-05-01T00:00:00+00:00'),
+            _summary('newest2', '2026-04-01T00:00:00+00:00'),
+            _summary('bad-date-quiescent', 'not-a-real-date', content='0 mutations, no mutations.'),
+        ]
+        result = _mod.classify_pool(summaries, keep_recent_n=2)
+
+        assert 'bad-date-quiescent' in result.delete_ids
+        assert result.reasons['bad-date-quiescent'] == 'quiescent_boilerplate'
+
+    def test_empty_pool_returns_empty_decision(self):
+        result = _mod.classify_pool([], keep_recent_n=2)
+
+        assert result.keep_ids == []
+        assert result.delete_ids == []
+        assert result.reasons == {}
