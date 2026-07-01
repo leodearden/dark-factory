@@ -14,6 +14,8 @@ launch/stop/registration wiring, and
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -169,3 +171,69 @@ async def test_run_once_snapshots_head_at_run_start_and_invokes_seam(tmp_path: P
     assert worker._last_run_head == 'HEAD1', (
         '_last_run_head must equal the snapshot head, never the advisory trigger SHA'
     )
+
+
+# ---------------------------------------------------------------------------
+# run() — coalescing loop core (step-7/8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
+    """Multiple dirty-sets during one run collapse into exactly one re-run.
+
+    Drives worker.run() as a real background task; the suite_runner
+    side-effect sets _dirty multiple times during the FIRST run only. Exactly
+    two _run_once passes must happen (initial + one coalesced re-run at the
+    new head) — never a third — and the loop then quiesces.
+
+    Step 7 (RED): run() is a NotImplementedError stub — must fail before impl.
+    """
+    heads = ['HEAD1', 'HEAD2']
+    head_calls = {'n': 0}
+
+    async def _fake_get_main_sha() -> str:
+        idx = min(head_calls['n'], len(heads) - 1)
+        head_calls['n'] += 1
+        return heads[idx]
+
+    git_ops = MagicMock()
+    git_ops.get_main_sha = AsyncMock(side_effect=_fake_get_main_sha)
+    git_ops.reset_persistent_offline_deep_worktree = AsyncMock(
+        return_value=tmp_path / '_offline-deep'
+    )
+
+    run_count = {'n': 0}
+    done = asyncio.Event()
+
+    async def _suite_runner(wt, head, threads):
+        run_count['n'] += 1
+        if run_count['n'] == 1:
+            # Multiple advances landing mid-run must collapse into exactly
+            # ONE coalesced re-run afterwards, not two.
+            worker._dirty = True
+            worker._wake.set()
+            worker._dirty = True
+            worker._wake.set()
+        else:
+            done.set()
+        return (0, '')
+
+    # Large poll interval so the poll backstop (not yet implemented at this
+    # step) cannot fire and interfere with this test.
+    config = _make_config(tmp_path, offline_lane_poll_interval_secs=120.0)
+    worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=_suite_runner)
+    worker._dirty = True  # initial trigger already queued
+
+    task = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(done.wait(), timeout=5)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert run_count['n'] == 2, 'exactly one coalesced re-run — never a third'
+    assert head_calls['n'] == 2
+    git_ops.reset_persistent_offline_deep_worktree.assert_any_call('HEAD2')
