@@ -2496,6 +2496,37 @@ class TestWriteSuppressionRecord:
         assert kwargs['metadata']['task_id'] == 42
         assert isinstance(kwargs['metadata']['task_id'], int)
 
+    @pytest.mark.asyncio
+    async def test_forwards_flag_types_to_metadata(self, mock_memory_service):
+        """flag_types is forwarded into metadata.flag_types (task-1966 step-5).
+
+        RED until step-6 adds the flag_types param and forwards it to
+        build_suppression_payload.
+        """
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            mock_memory_service,
+            project_id='p',
+            task_id=452,
+            flag_types=['human_review_required_deferred'],
+        )
+
+        kwargs = mock_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['flag_types'] == ['human_review_required_deferred']
+        assert kwargs['metadata']['kind'] == 'stage1_flag_suppression'
+        assert kwargs['metadata']['task_id'] == 452
+
+    @pytest.mark.asyncio
+    async def test_omitting_flag_types_produces_legacy_metadata(self, mock_memory_service):
+        """Omitting flag_types produces metadata with NO flag_types key (legacy)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(mock_memory_service, project_id='p', task_id=452)
+
+        kwargs = mock_memory_service.add_memory.call_args.kwargs
+        assert 'flag_types' not in kwargs['metadata']
+
 
 def test_write_suppression_record_importable_from_canonical_path():
     """Smoke test: write_suppression_record is importable from the path stage1.py advertises.
