@@ -1109,15 +1109,37 @@ async def _sweep_stale_flag_markers(
         scroll_limit: Max records to enumerate in one scroll (default 1000).
 
     Returns:
-        Number of memories successfully deleted (0 if nothing is stale).
+        Number of memories successfully deleted (0 if nothing is stale, or
+        on enumeration failure).
     """
-    cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'source': 'stage1_flag_marker'},
+            limit=scroll_limit,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._sweep_stale_flag_markers: '
+            'get_memories_by_metadata failed for project_id=%s; skipping sweep',
+            project_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
 
-    members = await memory_service.get_memories_by_metadata(
-        project_id=project_id,
-        filters={'source': 'stage1_flag_marker'},
-        limit=scroll_limit,
-    )
+    if len(members) >= scroll_limit:
+        logger.warning(
+            'reconciliation._sweep_stale_flag_markers: enumerated %d of scroll_limit=%d '
+            'stage1_flag_marker records — scroll cap reached; older stale markers may '
+            'remain uncollected this cycle; re-run with a higher scroll_limit.',
+            len(members), scroll_limit,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+    if not members:
+        return 0
+
+    cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
 
     stale_ids: list[str] = []
     for member in members:
