@@ -12600,3 +12600,95 @@ class TestIntegrityCheckBlockedSnapshotWiring:
             "when no flags are dropped; "
             f"got stats={report.stats!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# step-1 (RED) / step-2 (GREEN): _repair_stage2_summary_stage_metadata core
+# ---------------------------------------------------------------------------
+
+
+class TestRepairStage2SummaryStageMetadata:
+    """_repair_stage2_summary_stage_metadata (task 1963): heals the
+    intermittent LLM-compliance failure where the Stage 2 per-cycle summary
+    is written to Mem0 without metadata.stage='task_knowledge_sync' (2026-07-01
+    incident — run_id and recon_pool present, only stage missing), which makes
+    the downstream triple-filter count_memories_by_metadata check falsely
+    report 0 (see _verify_stage2_summary_written).
+
+    There is no in-place metadata-mutation primitive (mem0_client.update()
+    rewrites TEXT only), so the repair is delete + re-add under corrected
+    metadata: enumerate this run's stage2_cycle_summary pool deterministically
+    via get_memories_by_metadata (never semantic search), and for any member
+    not already satisfying the full identity, recover its content and re-add
+    it under the four canonical metadata keys BEFORE deleting the broken
+    original (add-before-delete: a crash mid-repair must leave a superset,
+    never a gap that re-triggers the false "missing" diagnosis).
+    """
+
+    @pytest.mark.asyncio
+    async def test_repairs_summary_missing_stage_key(self):
+        """Happy path: one member missing 'stage' is re-added under corrected
+        metadata, the broken original is deleted, and the helper returns 1.
+        Enumeration is deterministic — memory_service.search is never awaited.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _repair_stage2_summary_stage_metadata,
+        )
+
+        run_id = 'run-repair-1'
+        broken_member = {
+            'id': 'broken-1',
+            'created_at': '2026-07-01T00:00:00+00:00',
+            'metadata': {
+                'kind': 'cycle_summary',
+                'run_id': run_id,
+                'recon_pool': 'stage2_cycle_summary',
+                'data': 'Cycle summary text',
+            },
+        }
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[broken_member])
+        memory_service.add_memory = AsyncMock(return_value=None)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _repair_stage2_summary_stage_metadata(
+            memory_service, project_id='dark_factory', run_id=run_id,
+        )
+
+        # (a) deterministic enumeration scoped to this run's summary pool
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        get_kwargs = memory_service.get_memories_by_metadata.call_args.kwargs
+        assert get_kwargs.get('project_id') == 'dark_factory'
+        assert get_kwargs.get('filters') == {
+            'recon_pool': 'stage2_cycle_summary',
+            'run_id': run_id,
+        }
+
+        # (b) re-add under corrected metadata, recovering content from payload['data']
+        memory_service.add_memory.assert_awaited_once()
+        add_kwargs = memory_service.add_memory.call_args.kwargs
+        assert add_kwargs.get('content') == 'Cycle summary text'
+        assert add_kwargs.get('category') == 'observations_and_summaries'
+        assert add_kwargs.get('project_id') == 'dark_factory'
+        assert add_kwargs.get('causation_id') == run_id
+        assert add_kwargs.get('_source') == 'stage2_summary_stage_repair'
+        metadata = add_kwargs.get('metadata') or {}
+        assert metadata.get('kind') == 'cycle_summary'
+        assert metadata.get('stage') == 'task_knowledge_sync'
+        assert metadata.get('run_id') == run_id
+        assert metadata.get('recon_pool') == 'stage2_cycle_summary'
+
+        # (c) broken original deleted
+        memory_service.delete_memory.assert_awaited_once()
+        del_kwargs = memory_service.delete_memory.call_args.kwargs
+        assert del_kwargs.get('memory_id') == 'broken-1'
+        assert del_kwargs.get('store') == 'mem0'
+        assert del_kwargs.get('project_id') == 'dark_factory'
+        assert del_kwargs.get('causation_id') == run_id
+        assert del_kwargs.get('_source') == 'stage2_summary_stage_repair'
+
+        # (d) return value
+        assert result == 1
+
+        # (e) never falls back to semantic search
+        memory_service.search.assert_not_awaited()
