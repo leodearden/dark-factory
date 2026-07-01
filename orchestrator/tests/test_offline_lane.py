@@ -55,6 +55,9 @@ def _make_worker(
     git_ops: MagicMock | None = None,
     config: MagicMock | None = None,
     suite_runner=None,
+    confirmation_runner=None,
+    task_client=None,
+    escalation_queue=None,
 ) -> OfflineLaneWorker:
     """Build an OfflineLaneWorker wired with mock deps for isolated testing."""
     return OfflineLaneWorker(
@@ -62,6 +65,9 @@ def _make_worker(
         config if config is not None else _make_config(tmp_path),
         lock_path=tmp_path / 'offline_lane.lock',
         suite_runner=suite_runner,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
     )
 
 
@@ -488,3 +494,41 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
         )
     assert kwargs['stdout'] == asyncio.subprocess.PIPE
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
+
+
+# ---------------------------------------------------------------------------
+# _handle_red_run — confirmation re-run + dedup'd fix-task spawn (β3, task 1954)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_flake_logs_and_does_not_spawn(tmp_path: Path):
+    """A confirmation re-run with NO still-failing test is a flake (B6).
+
+    No fix task, no escalation — just a low-severity "intermittent
+    nondeterminism" log line.
+
+    Step 7 (RED): the new constructor params + _handle_red_run do not exist
+    yet — must fail before impl.
+    """
+    confirmation_runner = AsyncMock(return_value=[])
+    task_client = AsyncMock()
+    escalation_queue = MagicMock()
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+
+    with patch('orchestrator.offline_lane.logger') as mock_logger:
+        await worker._handle_red_run(Path('/tmp/_offline-deep'), 'HEAD1')
+
+    confirmation_runner.assert_awaited_once_with(Path('/tmp/_offline-deep'), 'HEAD1')
+    assert any(
+        'intermittent nondeterminism' in call.args[0]
+        for call in mock_logger.info.call_args_list
+    ), 'expected an "intermittent nondeterminism" info log line'
+    task_client.submit_fix_task.assert_not_awaited()
+    escalation_queue.submit.assert_not_called()
+    assert worker.open_fix_tasks == {}
