@@ -29,6 +29,7 @@ def service(mock_config):
         return_value={'uuid': 'test-uuid', 'fact': 'updated', 'refreshed_nodes': []}
     )
     svc.graphiti.get_edge_text = AsyncMock(return_value=('edge-name', 'updated'))
+    svc.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
     svc.graphiti._require_client = MagicMock()
 
     svc.mem0 = MagicMock()
@@ -3117,18 +3118,74 @@ class TestUpdateEdgeClearInvalidAt:
 
     @pytest.mark.asyncio
     async def test_clear_invalid_at_result_is_verified_true(self, service):
-        """Clear-only update sets verified=True without calling get_edge_text."""
+        """Clear-only update is verified=True when the invalid_at readback confirms the clear.
+
+        Revised (task 1940) from the old 'verified=True without a readback'
+        contract: the no-fact branch used to hardcode verified=True even
+        though the clear itself was never confirmed to have persisted.
+        """
         service.graphiti.update_edge = AsyncMock(
             return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
         )
         service.graphiti.get_edge_text = AsyncMock(return_value=('edge', 'fact'))
+        service.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
         result = await service.update_edge(
             edge_uuid='e-1', project_id='proj', clear_invalid_at=True
         )
         assert result.get('verified') is True, (
-            'clear-only update must be verified=True without a readback'
+            'clear-only update must be verified=True when invalid_at readback is None'
+        )
+        service.graphiti.get_edge_invalid_at.assert_awaited_once_with(
+            'e-1', group_id='proj'
         )
         service.graphiti.get_edge_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clear_only_verified_false_when_still_invalid(self, service):
+        """get_edge_invalid_at returning a non-None value means the clear did not persist."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_invalid_at = AsyncMock(
+            return_value='2026-01-01T00:00:00+00:00'
+        )
+        result = await service.update_edge(
+            edge_uuid='e-1', project_id='proj', clear_invalid_at=True
+        )
+        assert result.get('verified') is False
+        assert 'verification_error' in result
+        assert result['verification_error']  # non-empty string
+
+    @pytest.mark.asyncio
+    async def test_fact_plus_clear_verified_false_when_not_cleared(self, service):
+        """fact readback matches but invalid_at readback is non-None → verified False (AND)."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'new fact'))
+        service.graphiti.get_edge_invalid_at = AsyncMock(
+            return_value='2026-01-01T00:00:00+00:00'
+        )
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='proj', clear_invalid_at=True
+        )
+        assert result.get('verified') is False, (
+            'verified must be the AND of the fact and invalid_at readbacks'
+        )
+        assert 'invalid_at' in result.get('verification_error', '')
+
+    @pytest.mark.asyncio
+    async def test_fact_plus_clear_verified_true_when_both_ok(self, service):
+        """fact readback matches AND invalid_at readback is None → verified True."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'new fact'))
+        service.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='proj', clear_invalid_at=True
+        )
+        assert result.get('verified') is True
 
     @pytest.mark.asyncio
     async def test_clear_invalid_at_alone_does_not_raise(self, service):
