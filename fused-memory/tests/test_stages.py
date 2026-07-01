@@ -11599,6 +11599,11 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
             side_effect=record_trim
         )
+        # Non-zero verify count keeps the task-1963 stage-metadata repair
+        # gated off — this test targets pretrim ordering only, and repair's
+        # own {'recon_pool','run_id'}-filtered enumeration would otherwise
+        # register as a spurious post-agent_run 'trim' entry.
+        mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -11647,6 +11652,12 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
             return_value=prior_members + [new_member]
         )
+        # Non-zero verify count keeps the task-1963 stage-metadata repair
+        # gated off — this test targets pretrim eviction ordering only; since
+        # new_member's metadata lacks kind/stage, an active repair pass would
+        # treat it as broken and (correctly, but irrelevantly to this test)
+        # delete+re-add it, tripping the "newest survives" assertion below.
+        mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'dark_factory'

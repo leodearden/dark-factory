@@ -1861,9 +1861,26 @@ class TaskKnowledgeSync(BaseStage):
         # pre-trim count was captured before super().run(); record it now alongside
         # the post-write verification count so both land in the same report.stats.
         report.stats['stage2_cycle_summary_pool_trimmed'] = pretrimmed
-        report.stats['stage2_cycle_summary_verified_count'] = (
-            await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
-        )
+        verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
+
+        # --- cycle-summary stage-metadata repair (task 1963) ---
+        # verified_count==0 means the triple-filter found no cycle_summary for
+        # this run — either the LLM genuinely failed to write one, or it wrote
+        # one but omitted (part of) the identity metadata (the confirmed
+        # 2026-07-01 incident: stage missing while kind/run_id/recon_pool were
+        # present). Gate the repair on count==0 so the happy path (LLM
+        # complied) costs zero extra Mem0 calls and carries zero
+        # duplicate-write risk; when the summary is genuinely absent,
+        # enumeration returns [] and repaired stays 0 (no false repair).
+        # report.stats['stage2_cycle_summary_verified_count'] is set to the
+        # POST-repair count so downstream consumers see the corrected value.
+        repaired = 0
+        if verified_count == 0:
+            repaired = await _repair_stage2_summary_stage_metadata(self.memory, self.project_id, run_id)
+            if repaired:
+                verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
+        report.stats['stage2_cycle_summary_stage_repaired'] = repaired
+        report.stats['stage2_cycle_summary_verified_count'] = verified_count
 
         # --- stage1_flag_marker age-based GC (task 1944) ---
         # The stage1_flag_marker pool is written by Stage 1, not by this stage's
