@@ -7708,6 +7708,7 @@ class TestHarnessReconcileStatusCorrection:
 
         result = await harness._reconcile_status_correction('test-project', statuses)
 
+        assert result is not None
         assert result['superseded'] is True
         assert result['memory_id'] == 'mem-a-newer'  # most-recent selected as `latest`
         assert harness.memory.delete_memory.await_count == 2
