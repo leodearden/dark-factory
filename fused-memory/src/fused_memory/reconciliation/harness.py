@@ -820,8 +820,61 @@ class ReconciliationHarness:
                 'memory_id': latest['id'],
             }
 
-        # step-12/step-14 (GREEN) will replace this stub.
-        raise NotImplementedError
+        live = diff['live']
+        corrected_metadata = {
+            'kind': 'project_status_correction',
+            'supersedes': latest['id'],
+            'task_count_done': live['done'],
+            'task_count_total': live['total'],
+            'active_tasks': live['active_tasks'],
+            'source': 'stage1_status_correction',
+        }
+        content = (
+            f'Stage 1 status-correction reconciliation (task 1938): the cached '
+            f'project_status_correction memory diverged from the authoritative '
+            f"get_statuses census: done={live['done']} total={live['total']} "
+            f"active={len(live['active_tasks'])}."
+        )
+        # Add-then-delete: guarantees at least one correct memory always exists
+        # even if a delete below fails — the fresh memory (supersedes=<old_id>)
+        # is still the most-recent, so next cycle's max()-by-created_at selection
+        # ignores any stale leftover and self-heals.
+        await self.memory.add_memory(
+            content=content,
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata=corrected_metadata,
+            _source='stage1_status_correction',
+        )
+        # Delete the whole queried set (not just `latest`) to bound the pool to
+        # the single fresh memory just written — mirrors the stage2_cycle_summary
+        # pool-cap fix (tasks 20e8c2f1/45489c2b/db2ea69e).
+        for m in memories:
+            await self.memory.delete_memory(
+                memory_id=m['id'],
+                store='mem0',
+                project_id=project_id,
+            )
+
+        logger.warning(
+            'reconciliation.status_correction_superseded',
+            extra={
+                'project_id': project_id,
+                'memory_id': latest['id'],
+                'old': diff['cached'],
+                'new': diff['live'],
+            },
+        )
+
+        return {
+            'available': True,
+            'found': True,
+            'diverged': True,
+            'superseded': True,
+            'memory_id': latest['id'],
+            'old': diff['cached'],
+            'new': diff['live'],
+        }
 
     # ── Stale-run recovery ─────────────────────────────────────────────
 
