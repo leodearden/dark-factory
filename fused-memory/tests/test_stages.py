@@ -11712,6 +11712,98 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         assert report.stats['stage2_cycle_summary_verified_count'] == 0
         assert [r for r in caplog.records if r.levelno >= logging.WARNING]
 
+    @pytest.mark.asyncio
+    async def test_repair_path_sets_repaired_and_post_repair_verified_count(self, mock_deps):
+        """When the first verify finds 0, run() repairs the stage-less summary
+        and re-verifies: stage2_cycle_summary_stage_repaired==1 and
+        stage2_cycle_summary_verified_count==1 (the POST-repair count).
+
+        Discriminates get_memories_by_metadata calls by filter shape: only the
+        repair's enumeration filters on {'recon_pool', 'run_id'} together —
+        the pre-trim filters on 'recon_pool' alone and the stage1_flag_marker
+        GC sweep filters on 'source' alone — so both must keep returning their
+        own (empty) results, unaffected by the repair fixture below.
+        """
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        run_id = 'run-repair-wiring'
+        broken_member = {
+            'id': 'broken-wiring-1',
+            'created_at': '2026-07-01T00:00:00+00:00',
+            'metadata': {
+                'kind': 'cycle_summary',
+                'run_id': run_id,
+                'recon_pool': 'stage2_cycle_summary',
+                'data': 'Cycle summary text',
+            },
+        }
+
+        async def dispatch_get_memories(*args, **kwargs):
+            filters = kwargs.get('filters') or {}
+            if 'run_id' in filters:
+                return [broken_member]
+            return []
+
+        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
+            side_effect=dispatch_get_memories
+        )
+        mock_deps['memory_service'].count_memories_by_metadata = AsyncMock(
+            side_effect=[0, 1]
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id=run_id,
+            )
+
+        assert report.stats['stage2_cycle_summary_stage_repaired'] == 1
+        assert report.stats['stage2_cycle_summary_verified_count'] == 1
+        mock_deps['memory_service'].add_memory.assert_awaited()
+        mock_deps['memory_service'].delete_memory.assert_any_await(
+            memory_id='broken-wiring-1',
+            store='mem0',
+            project_id='dark_factory',
+            causation_id=run_id,
+            _source='stage2_summary_stage_repair',
+        )
+
+    @pytest.mark.asyncio
+    async def test_happy_path_skips_repair_and_no_enumeration(self, mock_deps):
+        """When the first verify already finds a summary, run() records
+        stage2_cycle_summary_stage_repaired==0 and never enumerates for
+        repair (no {'recon_pool','run_id'}-filtered call) — zero extra Mem0
+        calls and zero duplicate-write risk on the happy path.
+        """
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-happy-wiring',
+            )
+
+        assert report.stats['stage2_cycle_summary_stage_repaired'] == 0
+        assert report.stats['stage2_cycle_summary_verified_count'] == 1
+        repair_calls = [
+            c for c in mock_deps['memory_service'].get_memories_by_metadata.call_args_list
+            if 'run_id' in (c.kwargs.get('filters') or {})
+        ]
+        assert repair_calls == [], f'repair must not enumerate on the happy path; got {repair_calls!r}'
+        mock_deps['memory_service'].add_memory.assert_not_awaited()
+
 
 class TestStage2PromptCycleSummaryPoolTag:
     """Stage 2 prompt must instruct the agent to tag per-cycle summaries with
