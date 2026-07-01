@@ -12692,3 +12692,137 @@ class TestRepairStage2SummaryStageMetadata:
 
         # (e) never falls back to semantic search
         memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_already_correct_summary_not_repaired(self):
+        """A member already satisfying kind=='cycle_summary' AND
+        stage=='task_knowledge_sync' is a no-op: returns 0, no writes."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _repair_stage2_summary_stage_metadata,
+        )
+
+        run_id = 'run-already-correct'
+        correct_member = {
+            'id': 'correct-1',
+            'created_at': '2026-07-01T00:00:00+00:00',
+            'metadata': {
+                'kind': 'cycle_summary',
+                'stage': 'task_knowledge_sync',
+                'run_id': run_id,
+                'recon_pool': 'stage2_cycle_summary',
+                'data': 'Cycle summary text',
+            },
+        }
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[correct_member])
+        memory_service.add_memory = AsyncMock(return_value=None)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _repair_stage2_summary_stage_metadata(
+            memory_service, project_id='dark_factory', run_id=run_id,
+        )
+
+        assert result == 0
+        memory_service.add_memory.assert_not_awaited()
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_summary_found_returns_zero(self):
+        """Empty enumeration → returns 0, no add/delete calls issued."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _repair_stage2_summary_stage_metadata,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.add_memory = AsyncMock(return_value=None)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _repair_stage2_summary_stage_metadata(
+            memory_service, project_id='dark_factory', run_id='run-empty',
+        )
+
+        assert result == 0
+        memory_service.add_memory.assert_not_awaited()
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_content_fallback_when_data_key_absent(self):
+        """Broken member with no 'data' key still gets re-added, using a
+        synthesized placeholder content string that references the run_id."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _repair_stage2_summary_stage_metadata,
+        )
+
+        run_id = 'run-no-data'
+        broken_member = {
+            'id': 'broken-no-data',
+            'created_at': '2026-07-01T00:00:00+00:00',
+            'metadata': {
+                'kind': 'cycle_summary',
+                'run_id': run_id,
+                'recon_pool': 'stage2_cycle_summary',
+                # no 'data' key
+            },
+        }
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[broken_member])
+        memory_service.add_memory = AsyncMock(return_value=None)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _repair_stage2_summary_stage_metadata(
+            memory_service, project_id='dark_factory', run_id=run_id,
+        )
+
+        assert result == 1
+        memory_service.add_memory.assert_awaited_once()
+        add_kwargs = memory_service.add_memory.call_args.kwargs
+        content = add_kwargs.get('content')
+        assert content, 'content must be a non-empty synthesized placeholder'
+        assert run_id in content
+        assert add_kwargs.get('metadata', {}).get('stage') == 'task_knowledge_sync'
+
+    @pytest.mark.asyncio
+    async def test_repairs_multiple_broken_members(self):
+        """Two members both missing 'stage' → both repaired; returns 2."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _repair_stage2_summary_stage_metadata,
+        )
+
+        run_id = 'run-multi'
+        broken_members = [
+            {
+                'id': 'broken-a',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'run_id': run_id,
+                    'recon_pool': 'stage2_cycle_summary',
+                    'data': 'Summary A',
+                },
+            },
+            {
+                'id': 'broken-b',
+                'created_at': '2026-07-01T00:01:00+00:00',
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'run_id': run_id,
+                    'recon_pool': 'stage2_cycle_summary',
+                    'data': 'Summary B',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=broken_members)
+        memory_service.add_memory = AsyncMock(return_value=None)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _repair_stage2_summary_stage_metadata(
+            memory_service, project_id='dark_factory', run_id=run_id,
+        )
+
+        assert result == 2
+        assert memory_service.add_memory.await_count == 2
+        assert memory_service.delete_memory.await_count == 2
+        deleted_ids = {c.kwargs.get('memory_id') for c in memory_service.delete_memory.call_args_list}
+        assert deleted_ids == {'broken-a', 'broken-b'}
