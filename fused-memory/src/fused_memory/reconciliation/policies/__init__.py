@@ -28,6 +28,10 @@ from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_PROJECT_ID,
     AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED,
 )
+from fused_memory.reconciliation.policies.know_live import (
+    KNOW_LIVE_PROJECT_ID,
+    KNOW_LIVE_SNAPSHOT_WRITES_BLOCKED,
+)
 
 # ---------------------------------------------------------------------------
 # Snapshot-write-blocked registry
@@ -39,6 +43,7 @@ from fused_memory.reconciliation.policies.autopilot_video import (
 # is later set to False is automatically removed from the set.
 _PROJECT_SNAPSHOT_FLAGS: list[tuple[str, bool]] = [
     (AUTOPILOT_VIDEO_PROJECT_ID, AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED),
+    (KNOW_LIVE_PROJECT_ID, KNOW_LIVE_SNAPSHOT_WRITES_BLOCKED),
 ]
 
 #: frozenset of project_ids whose task-count snapshot write paths are
