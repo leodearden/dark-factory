@@ -1283,6 +1283,8 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
     tests can exercise the fan-out without waiting for
     ``cfg.interval_seconds``.
     """
+    if not cfg.enabled or not cfg.projects:
+        return
     for project_id in cfg.projects:
         await memory_service.rebuild_entity_summaries(
             project_id=project_id,
