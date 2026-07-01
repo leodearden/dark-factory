@@ -2228,6 +2228,43 @@ class TestRefreshEntitySummariesFromResult:
         for call in service.graphiti.refresh_entity_summary.call_args_list:
             assert call.kwargs['group_id'] == 'proj'
 
+    @pytest.mark.asyncio
+    async def test_best_effort_continues_past_failure(self, service, caplog):
+        """A refresh failure for one uuid must not stop refreshes for the rest."""
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        async def _raise_for_n1(uuid, *, group_id):
+            if uuid == 'n1':
+                raise RuntimeError('boom')
+            return {}
+
+        service.graphiti.refresh_entity_summary = AsyncMock(side_effect=_raise_for_n1)
+
+        result = MockAddEpisodeResult(edges=[
+            MockEdge(fact='a', source_node_uuid='n1', target_node_uuid='n2'),
+            MockEdge(fact='b', source_node_uuid='n2', target_node_uuid='n3'),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            # Must NOT raise despite n1's refresh failing
+            await service._refresh_entity_summaries_from_result(result, group_id='proj')
+
+        assert service.graphiti.refresh_entity_summary.await_count >= 3, (
+            'Expected refresh to be attempted for n1 (fails), n2, and n3 (both succeed), '
+            f'got {service.graphiti.refresh_entity_summary.await_count} attempts'
+        )
+        called_uuids = {
+            call.args[0] for call in service.graphiti.refresh_entity_summary.call_args_list
+        }
+        assert {'n1', 'n2', 'n3'} <= called_uuids
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected 1 WARNING record for the n1 failure, got {len(warning_records)}: '
+            f'{[r.message for r in warning_records]}'
+        )
+        assert 'n1' in warning_records[0].message
+
 
 class TestExecuteGraphitiWritePlanningRegistration:
     """step-5: _execute_graphiti_write registers episodes when temporal_context='planning'."""
