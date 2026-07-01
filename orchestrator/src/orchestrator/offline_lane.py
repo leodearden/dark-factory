@@ -289,5 +289,25 @@ class OfflineLaneWorker:
         and its ``DF_VERIFY_ROLE=offline`` role are not yet on reify ``main``
         (gated at ζ).  This default implementation builds the invocation
         unconditionally; wiring it to a real, present script is ζ's job.
+
+        Modeled on ``DeterministicRunner._default_run_script``
+        (``deterministic_runner.py:313``): env overlays ``DF_VERIFY_ROLE``
+        onto a full ``os.environ`` copy (never a bespoke subset, so PATH /
+        HOME / XDG_RUNTIME_DIR etc. survive) — the offline role's nice/ionice
+        footprint lives inside the script itself (Part A), not re-implemented
+        here.  ``head`` is accepted for seam-signature/logging symmetry with
+        injected runners; the worktree is already checked out to it by the
+        caller (:meth:`_run_once`) before this is invoked.
         """
-        raise NotImplementedError
+        argv = [_RUN_OFFLINE_DEEP_SCRIPT, f'--test-threads={threads}']
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(wt_path),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        tail = (stdout or b'').decode(errors='replace')[-2000:]
+        return proc.returncode or 0, tail
