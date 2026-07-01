@@ -58,9 +58,11 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue
+
     from orchestrator.config import OrchestratorConfig
     from orchestrator.git_ops import GitOps
 
@@ -80,6 +82,35 @@ _RUN_OFFLINE_DEEP_SCRIPT: str = 'scripts/run-offline-deep.sh'
 #: test-thread count) -> (return code, output tail).
 SuiteRunner = Callable[[Path, str, int], Awaitable[tuple[int, str]]]
 
+#: Signature of the injectable confirmation-rerun seam (β3): (worktree path,
+#: head SHA) -> confirmed-still-failing test IDs.  An empty return means the
+#: original failure did not reproduce in isolation (flake, B6).
+ConfirmationRunner = Callable[[Path, str], Awaitable[list[str]]]
+
+
+class OfflineLaneTaskClient(Protocol):
+    """Pluggable interface for filing/updating the offline-lane fix task (β3).
+
+    Encapsulates the MCP ``submit_task`` seam so this module never talks to
+    the fused-memory MCP directly — mirrors ``SuiteRunner``'s cross-project
+    scope boundary. The real implementation (backed by the
+    ``_post_submit_tasks`` httpx pattern) is wired by the harness; unit tests
+    inject a fake.
+    """
+
+    async def submit_fix_task(self, arguments: dict) -> str:
+        """Submit a new fix task (see ``build_offline_lane_fix_task_arguments``);
+        returns the new task's id."""
+        ...  # pragma: no cover
+
+    async def append_suspect_range(self, task_id: str, suspect_range: str) -> None:
+        """Append a new suspect commit range to an already-open fix task."""
+        ...  # pragma: no cover
+
+    async def get_status(self, task_id: str) -> str:
+        """Return the current status of a previously filed fix task."""
+        ...  # pragma: no cover
+
 
 class OfflineLaneWorker:
     """Singleton offline-deep lane worker — single-flight, coalescing, from-head.
@@ -96,6 +127,18 @@ class OfflineLaneWorker:
             run.  Defaults to :meth:`_default_run_suite` (a real
             ``scripts/run-offline-deep.sh`` subprocess invocation) when not
             supplied.
+        confirmation_runner: Optional injectable async seam (β3)
+            ``(wt_path, head) -> confirmed_still_failing_ids`` used by
+            :meth:`_handle_red_run` to filter flakes before fingerprinting.
+            Defaults to :meth:`_default_confirmation_run` when not supplied.
+        task_client: Optional :class:`OfflineLaneTaskClient` (β3) used to
+            file/update the dedup'd fix task for a confirmed red run.
+            Defaults to ``None`` — the red path degrades to a log-only no-op
+            when unwired (never a crash; worker leg of C7).
+        escalation_queue: Optional ``EscalationQueue`` (β3) used to raise the
+            L0 info escalation on a new fix-task file and the staged L2
+            ``escalate_blocker`` promotion.  Defaults to ``None`` — same
+            log-only degrade as ``task_client``.
     """
 
     def __init__(
@@ -105,6 +148,9 @@ class OfflineLaneWorker:
         *,
         lock_path: str | Path,
         suite_runner: SuiteRunner | None = None,
+        confirmation_runner: ConfirmationRunner | None = None,
+        task_client: OfflineLaneTaskClient | None = None,
+        escalation_queue: EscalationQueue | None = None,
     ) -> None:
         self.git_ops = git_ops
         self.config = config
@@ -112,6 +158,13 @@ class OfflineLaneWorker:
         self.suite_runner: SuiteRunner = (
             suite_runner if suite_runner is not None else self._default_run_suite
         )
+        self.confirmation_runner: ConfirmationRunner = (
+            confirmation_runner
+            if confirmation_runner is not None
+            else self._default_confirmation_run
+        )
+        self.task_client = task_client
+        self.escalation_queue = escalation_queue
 
         # Coalescing state — flipped by on_post_merge (and the poll
         # backstop), cleared at the START of _run_once (clear-before-snapshot).
@@ -124,6 +177,23 @@ class OfflineLaneWorker:
         self._last_run_head: str | None = None
         # Held open for the lifetime of a successful acquire_lock() call.
         self._lock_file: IO | None = None
+
+        # Red-path state (β3) — keyed by compute_failing_test_set_fingerprint.
+        # Maps a confirmed failing-test-set fingerprint to its open fix task
+        # id; an in-flight fingerprint absorbs further same-set red advances
+        # (append suspect range) instead of spawning a duplicate task (B5).
+        self.open_fix_tasks: dict[str, str] = {}
+        # Consecutive confirmed-red advances recorded per open fingerprint —
+        # compared against config.git.offline_lane_red_advances_before_blocker
+        # for the N-advances staged escalate_blocker promotion (B7/C4).
+        self._red_advance_counts: dict[str, int] = {}
+        # Fingerprints already promoted to escalate_blocker — promotion is
+        # idempotent per fingerprint (never re-files once escalated).
+        self._promoted_blockers: set[str] = set()
+        # Head of the most recently PASSING run — the cheapest sound lower
+        # bound for a new fix task's suspect commit range.  None until the
+        # first green run is observed.
+        self._last_green_head: str | None = None
 
     # ------------------------------------------------------------------
     # Trigger seam (β1 consumer)
@@ -233,6 +303,32 @@ class OfflineLaneWorker:
         )
 
     # ------------------------------------------------------------------
+    # Red-path handling — confirmation, fingerprint, dedup'd fix-task spawn,
+    # staged escalation (β3, task 1954, PRD §5 C3/C4)
+    # ------------------------------------------------------------------
+
+    async def _handle_red_run(self, wt: Path, head: str) -> None:
+        """Handle a confirmed-red ``_run_once`` pass: confirm, fingerprint, file/update.
+
+        (1) CONFIRMATION RE-RUN: re-runs only the originally-failing tests,
+        isolated/serial, ONCE, via :attr:`confirmation_runner`. An empty
+        result means the failure did not reproduce — intermittent
+        nondeterminism (B6): log only, no task, no escalation.
+
+        The non-empty (genuinely-red) path is filled in by later steps.
+        """
+        confirmed = await self.confirmation_runner(wt, head)
+        if not confirmed:
+            logger.info(
+                'offline-lane: intermittent nondeterminism — confirmation '
+                're-run at head=%s found no still-failing test; not filing '
+                'a fix task',
+                head[:12],
+            )
+            return
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
     # Lockfile singleton
     # ------------------------------------------------------------------
 
@@ -311,3 +407,11 @@ class OfflineLaneWorker:
         stdout, _ = await proc.communicate()
         tail = (stdout or b'').decode(errors='replace')[-2000:]
         return proc.returncode or 0, tail
+
+    async def _default_confirmation_run(self, wt: Path, head: str) -> list[str]:
+        """Default ``confirmation_runner`` seam (β3) — stub, filled in step-19/20.
+
+        Cross-project scope boundary (same as :meth:`_default_run_suite`):
+        the real reify-side confirm-failures invocation is ζ's job.
+        """
+        raise NotImplementedError
