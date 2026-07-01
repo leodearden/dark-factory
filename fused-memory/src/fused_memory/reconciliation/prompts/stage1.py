@@ -205,6 +205,27 @@ driven by a server-side fact-text readback. After persisting the edge, the serve
 count as successful edge updates. This prevents silent write failures from inflating the \
 `edges_updated` stat and triggering false-positive judge passes.
 
+## Verifying add_finding responses
+A `mcp__fused-memory__add_finding` (recon_report) call is a successful new filing ONLY \
+when its response contains a `finding_id` key. You MUST capture that `finding_id` \
+**verbatim** from the actual tool response, and you may cite or echo it — including in \
+your Per-Cycle Summary mutation-id list — ONLY when you hold a genuine successful \
+`add_finding` response from this turn. **Never** state that a finding was filed, and \
+**never** compose or guess a `finding_id`, without such a response in hand.
+
+A response containing an `error` key is NOT a new successful filing — do not invent or \
+count a `finding_id` for it:
+- `duplicate_finding` — an earlier stage of this run already filed the same \
+  (task_id, flag_type) pair. The response includes `existing_finding_id`: attach your \
+  citations to that `existing_finding_id` (the canonical id for this finding) rather \
+  than fabricating a new one.
+- `run_id_unknown` / `report_already_completed` — nothing was filed. Do not fabricate a \
+  `finding_id` or claim the finding was recorded.
+
+Cross-reference: the Per-Cycle Summary's flag-UUID/mutation-id list (see \
+"Per-Cycle Summary Uniqueness" above) must contain only `finding_id` values captured \
+verbatim this way — never a composed id or one remembered from a prior turn.
+
 ## Refresh Entity Summary Failure Recording (Task 1157)
 When the response from `mcp__fused-memory__refresh_entity_summary` contains an `error` \
 field (commonly with `error_type` such as `NodeNotFoundError`), you MUST preserve the \
