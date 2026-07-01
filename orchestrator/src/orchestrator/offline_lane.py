@@ -168,21 +168,42 @@ class OfflineLaneWorker:
         notifiee call) and is run-worthy. Correctness lives in
         :meth:`_run_once`'s own head snapshot, not here, so a missed trigger
         only costs granularity (up to one poll interval), never correctness.
+
+        Fail-open: modeled verbatim on ``harness._main_tip_sweep_loop``
+        (``harness.py:6056``) — a failed pass is logged as a bounded
+        one-line summary (exc type + message) via ``logger.error``, NEVER
+        ``logger.exception`` (whose O(frame-count) traceback formatting can
+        starve the event loop on a pathological traceback), and is followed
+        by a fixed backoff sleep so the loop can never tight-spin.
+        ``asyncio.CancelledError`` always propagates — never swallowed.
+        Since the failed run never updates ``_last_run_head``, the poll
+        backstop (above) naturally re-flags the still-outstanding advance
+        once the backoff elapses — a broken pass costs a retry, never a
+        wedge (worker leg of C7, never-a-gate).
         """
         while True:
-            if self._dirty:
-                await self._run_once()
-                continue
-            self._wake.clear()
             try:
-                await asyncio.wait_for(
-                    self._wake.wait(),
-                    timeout=self.config.git.offline_lane_poll_interval_secs,
+                if self._dirty:
+                    await self._run_once()
+                    continue
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._wake.wait(),
+                        timeout=self.config.git.offline_lane_poll_interval_secs,
+                    )
+                except TimeoutError:
+                    head = await self.git_ops.get_main_sha()
+                    if head and head != self._last_run_head:
+                        self._dirty = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    'offline-lane: run() pass failed: %s: %s',
+                    type(exc).__name__, exc,
                 )
-            except TimeoutError:
-                head = await self.git_ops.get_main_sha()
-                if head and head != self._last_run_head:
-                    self._dirty = True
+                await asyncio.sleep(_OFFLINE_LANE_FAILURE_BACKOFF_SECS)
 
     async def _run_once(self) -> None:
         """Snapshot head, reset the warm worktree, and invoke the suite seam.
