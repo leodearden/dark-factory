@@ -68,3 +68,46 @@ class TestComputeFailingTestSetFingerprint:
         from orchestrator.workflow import compute_failing_test_set_fingerprint
         result = compute_failing_test_set_fingerprint(['tests::test_a'])
         assert result == '', f'Expected empty string on failure; got {result!r}'
+
+
+# ---------------------------------------------------------------------------
+# build_offline_lane_fix_task_arguments (step-5/6)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildOfflineLaneFixTaskArguments:
+    """build_offline_lane_fix_task_arguments must build a submit_task argument
+    block that routes THROUGH the standard gate (status='pending',
+    merge_lane='normal') — never the B3 red-main fix-forward path — carrying
+    the failing-test IDs + suspect range + fingerprint in metadata."""
+
+    def test_builds_expected_argument_block(self, tmp_path) -> None:
+        from orchestrator.workflow import build_offline_lane_fix_task_arguments
+
+        failing_test_ids = ['tests::test_b', 'tests::test_a']
+        suspect_range = 'GREEN..HEAD1'
+        fingerprint = 'fp-abc-123'
+        head = 'HEAD1'
+
+        arguments = build_offline_lane_fix_task_arguments(
+            failing_test_ids, suspect_range, fingerprint, tmp_path, head,
+        )
+
+        assert arguments['status'] == 'pending'
+        assert arguments['priority'] == 'high'
+        assert arguments['project_root'] == str(tmp_path)
+
+        metadata = arguments['metadata']
+        assert metadata['spawn_context'] == 'offline_lane_red'
+        assert metadata['offline_lane_fingerprint'] == fingerprint
+        assert metadata['failing_tests'] == sorted(failing_test_ids)
+        assert metadata['suspect_ranges'] == [suspect_range]
+        assert metadata['merge_lane'] == 'normal'
+
+        for test_id in failing_test_ids:
+            assert test_id in arguments['title'] + arguments['description'], (
+                f'{test_id!r} must be mentioned in the title or description'
+            )
+        assert suspect_range in arguments['title'] + arguments['description'], (
+            'suspect_range must be mentioned in the title or description'
+        )
