@@ -697,6 +697,17 @@ def create_mcp_server(
                     ),
                     'error_type': 'ValidationError',
                 }
+        if (
+            isinstance(agent_id, str)
+            and agent_id.startswith('recon-stage-')
+            and is_mixed_temporal_framing(content)
+        ):
+            return {
+                'error': 'mixed_temporal_framing_write_blocked',
+                'error_type': 'ReconMixedFramingWriteRejected',
+                'agent_id': agent_id,
+                'content_excerpt': content[:200],
+            }
         try:
             causation_id, op_source, _ = _extract_causation(metadata, agent_id)
             result = await memory_service.add_episode(
