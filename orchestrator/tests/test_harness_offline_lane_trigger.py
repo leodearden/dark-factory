@@ -96,3 +96,29 @@ class TestOfflineLaneTrigger:
         )
         assert 'fail-open' in caplog.text
         assert 'task-2' in caplog.text
+
+    async def test_offline_lane_fires_even_when_git_diff_fetch_fails(
+        self, harness: Harness
+    ):
+        """The offline lane needs only "main advanced", not the changed-file list.
+
+        It must fire even when get_merge_diff_files errors -- unlike the
+        service-restart coordinators, which are skipped on a diff-fetch error.
+        """
+        harness.git_ops.get_merge_diff_files = AsyncMock(
+            return_value=([], RuntimeError('git boom'))
+        )
+        harness._offline_lane_notifiee = AsyncMock()
+        coord_a = MagicMock()
+        coord_a.note_merge = AsyncMock()
+        coord_b = MagicMock()
+        coord_b.note_merge = AsyncMock()
+        harness._service_restart_coordinators = [coord_a, coord_b]
+
+        await harness._note_merge_all('task-3', 'base3', 'head3')
+
+        harness._offline_lane_notifiee.assert_awaited_once_with(
+            'task-3', 'base3', 'head3'
+        )
+        coord_a.note_merge.assert_not_awaited()
+        coord_b.note_merge.assert_not_awaited()
