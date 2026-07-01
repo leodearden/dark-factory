@@ -887,6 +887,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stats == {
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
+            'stage1_cycle_summary_pool_trimmed': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -978,6 +979,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stats == {
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
+            'stage1_cycle_summary_pool_trimmed': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at

@@ -32,6 +32,7 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     track_human_operator_stalls,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.summary_pool import pretrim_summary_pool
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_census_inconsistency,
@@ -40,6 +41,16 @@ from fused_memory.reconciliation.task_filter import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Stage 1 per-cycle summary pool cap and related constants (task 1942).
+# Mirrors Stage 2's cycle-summary pool cap (task 1657 + trim-then-write, task
+# 1831): every per-cycle summary add_memory call is tagged
+# recon_pool='stage1_cycle_summary' (producer contract: Stage 1 prompt).
+# MemoryConsolidator.run() pre-trims the pool to cap-1 BEFORE the agent write
+# via the shared reconciliation.summary_pool core.
+_STAGE1_CYCLE_SUMMARY_RECON_POOL = 'stage1_cycle_summary'
+STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
+_STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
 class MemoryConsolidator(BaseStage):
@@ -107,11 +118,23 @@ class MemoryConsolidator(BaseStage):
         point of a remediation pass is to re-emit a curated list, and running
         dedup on those flags would defeat the remediation contract.
         """
+        # --- trim-then-write: pre-trim pool to cap-1 BEFORE agent writes (task 1942) ---
+        # Mirrors Stage 2's task-1831 wiring. Runs unconditionally (full +
+        # remediation) so the pool is bounded every cycle. Best-effort.
+        pretrimmed = await pretrim_summary_pool(
+            self.memory,
+            self.project_id,
+            run_id,
+            recon_pool=_STAGE1_CYCLE_SUMMARY_RECON_POOL,
+            trim_source=_STAGE1_CYCLE_SUMMARY_TRIM_SOURCE,
+            cap=STAGE1_CYCLE_SUMMARY_POOL_CAP,
+        )
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
         report.stats['entity_summary_snapshot_lines_stripped'] = (
             self._entity_summary_snapshot_lines_stripped
         )
         report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
+        report.stats['stage1_cycle_summary_pool_trimmed'] = pretrimmed
 
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
