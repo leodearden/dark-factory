@@ -239,3 +239,133 @@ class TestClassifyPool:
         assert result.keep_ids == []
         assert result.delete_ids == []
         assert result.reasons == {}
+
+
+# ===========================================================================
+# Tests: build_prune_report / format_summary_table (pure core)
+# ===========================================================================
+
+class TestBuildPruneReport:
+    """build_prune_report assembles a structured JSON-serialisable report from
+    per-(project, pool) PruneDecisions."""
+
+    def _decisions(self):
+        d1 = _mod.classify_pool(
+            [
+                _summary('p1-new', '2026-05-01T00:00:00+00:00'),
+                _summary('p1-old-quiescent', '2026-01-01T00:00:00+00:00', content='0 mutations.'),
+                _summary('p1-old-remediation', '2026-01-02T00:00:00+00:00', content='deleted entity x'),
+            ],
+            keep_recent_n=1,
+        )
+        d2 = _mod.classify_pool(
+            [_summary('p2-only', '2026-03-01T00:00:00+00:00')],
+            keep_recent_n=2,
+        )
+        return {
+            ('dark_factory', 'memory_consolidator'): d1,
+            ('dark_factory', 'task_knowledge_sync'): d2,
+        }
+
+    def test_top_level_keys_present(self):
+        report = _mod.build_prune_report(
+            self._decisions(), applied_ids=set(), dry_run=True,
+            generated_at='2026-07-01T00:00:00+00:00',
+        )
+        for key in (
+            'dry_run', 'generated_at', 'projects', 'pools', 'totals',
+            'deletions', 'preserved_remediation',
+        ):
+            assert key in report, f'missing top-level key {key!r}'
+
+    def test_per_project_per_pool_counts(self):
+        report = _mod.build_prune_report(
+            self._decisions(), applied_ids=set(), dry_run=True,
+            generated_at='2026-07-01T00:00:00+00:00',
+        )
+        mc = report['projects']['dark_factory']['memory_consolidator']
+        assert mc['scanned'] == 3
+        assert mc['deletable'] == 1
+        assert mc['deleted'] == 0  # dry run
+        assert mc['preserved_remediation'] == 1
+
+        tks = report['projects']['dark_factory']['task_knowledge_sync']
+        assert tks['scanned'] == 1
+        assert tks['deletable'] == 0
+
+    def test_deleted_flags_empty_on_dry_run(self):
+        report = _mod.build_prune_report(
+            self._decisions(), applied_ids=set(), dry_run=True,
+            generated_at='2026-07-01T00:00:00+00:00',
+        )
+        assert all(d['deleted'] is False for d in report['deletions'])
+        assert report['totals']['deleted'] == 0
+
+    def test_deleted_flags_reflect_applied_ids_on_apply(self):
+        report = _mod.build_prune_report(
+            self._decisions(), applied_ids={'p1-old-quiescent'}, dry_run=False,
+            generated_at='2026-07-01T00:00:00+00:00',
+        )
+        deletion = next(d for d in report['deletions'] if d['id'] == 'p1-old-quiescent')
+        assert deletion['deleted'] is True
+        assert report['totals']['deleted'] == 1
+
+    def test_deletion_ordering_is_deterministic(self):
+        report1 = _mod.build_prune_report(
+            self._decisions(), applied_ids=set(), dry_run=True,
+            generated_at='2026-07-01T00:00:00+00:00',
+        )
+        report2 = _mod.build_prune_report(
+            self._decisions(), applied_ids=set(), dry_run=True,
+            generated_at='2026-07-01T00:00:00+00:00',
+        )
+        assert report1['deletions'] == report2['deletions']
+
+    def test_pools_lists_distinct_pool_names(self):
+        report = _mod.build_prune_report(
+            self._decisions(), applied_ids=set(), dry_run=True,
+            generated_at='2026-07-01T00:00:00+00:00',
+        )
+        assert set(report['pools']) == {'memory_consolidator', 'task_knowledge_sync'}
+
+    def test_empty_decisions_produces_zeroed_report(self):
+        report = _mod.build_prune_report(
+            {}, applied_ids=set(), dry_run=True, generated_at='2026-07-01T00:00:00+00:00',
+        )
+        assert report['projects'] == {}
+        assert report['deletions'] == []
+        assert report['totals']['scanned'] == 0
+
+
+class TestFormatSummaryTable:
+    """format_summary_table renders a human-readable per-(project,pool) table."""
+
+    def _report(self, dry_run=True):
+        decisions = TestBuildPruneReport()._decisions()
+        return _mod.build_prune_report(
+            decisions, applied_ids=set(), dry_run=dry_run,
+            generated_at='2026-07-01T00:00:00+00:00',
+        )
+
+    def test_contains_per_project_pool_row(self):
+        table = _mod.format_summary_table(self._report())
+        assert 'dark_factory' in table
+        assert 'memory_consolidator' in table
+        assert 'task_knowledge_sync' in table
+
+    def test_contains_total_row(self):
+        table = _mod.format_summary_table(self._report())
+        assert 'TOTAL' in table
+
+    def test_dry_run_tag_present_when_dry_run(self):
+        table = _mod.format_summary_table(self._report(dry_run=True))
+        assert '[DRY RUN]' in table
+
+    def test_dry_run_tag_absent_when_applied(self):
+        table = _mod.format_summary_table(self._report(dry_run=False))
+        assert '[DRY RUN]' not in table
+
+    def test_returns_a_string(self):
+        table = _mod.format_summary_table(self._report())
+        assert isinstance(table, str)
+        assert len(table) > 0
