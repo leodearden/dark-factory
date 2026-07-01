@@ -741,3 +741,100 @@ async def test_handle_red_run_promotes_blocker_at_n_advances(tmp_path: Path):
     assert worker._red_advance_counts[fp] == 4
     escalation_queue.submit.assert_called_once()
     task_client.submit_fix_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _maybe_promote_blocker — terminal fix-task status + done-clears (step-17/18)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('terminal_status', ['cancelled', 'deferred'])
+@pytest.mark.asyncio
+async def test_handle_red_run_promotes_blocker_on_terminal_status(
+    tmp_path: Path, terminal_status: str,
+):
+    """A fix task that reaches a TERMINAL non-done status (cancelled/deferred)
+    promotes to escalate_blocker even if the N-advances count has not been
+    reached — the fix task can't land, so waiting further is pointless.
+
+    Step 17 (RED): the terminal-status branch is not implemented yet — must
+    fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.get_status = AsyncMock(return_value=terminal_status)
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-fix-99-2'
+
+    config = _make_config(tmp_path, offline_lane_red_advances_before_blocker=3)
+    worker = _make_worker(
+        tmp_path,
+        config=config,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    worker.open_fix_tasks[fp] = 'fix-99'
+    worker._red_advance_counts[fp] = 1  # well below N=3
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD2')
+
+    escalation_queue.submit.assert_called_once()
+    esc = escalation_queue.submit.call_args.args[0]
+    assert esc.severity == 'critical'
+    assert esc.level == 2
+    assert esc.agent_role == 'orchestrator-offline-lane'
+    assert esc.task_id == 'fix-99'
+    assert fp in worker._promoted_blockers
+    task_client.submit_fix_task.assert_not_awaited()
+
+    # A further same-set advance must not re-promote (idempotent).
+    await worker._handle_red_run(wt, 'HEAD3')
+    escalation_queue.submit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_done_status_clears_fingerprint(tmp_path: Path):
+    """A fix task that reaches 'done' clears the fingerprint from
+    open_fix_tasks / _red_advance_counts — a genuine LATER recurrence of the
+    same failing set must file a FRESH fix task rather than being silently
+    swallowed by stale in-memory state. No blocker is filed on the clearing
+    advance.
+
+    Step 17 (RED): the done-clears branch is not implemented yet — must
+    fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.get_status = AsyncMock(return_value='done')
+    escalation_queue = MagicMock()
+
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    worker.open_fix_tasks[fp] = 'fix-99'
+    worker._red_advance_counts[fp] = 2
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD2')
+
+    assert fp not in worker.open_fix_tasks, 'a done fix task must clear the fingerprint'
+    assert fp not in worker._red_advance_counts
+    assert fp not in worker._promoted_blockers
+    escalation_queue.submit.assert_not_called()
+    task_client.submit_fix_task.assert_not_awaited()
