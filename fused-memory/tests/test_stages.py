@@ -11362,6 +11362,48 @@ class TestStage2PromptCycleSummaryPoolTag:
         )
 
 
+class TestStage1PromptCycleSummaryPoolTag:
+    """Stage 1 prompt must instruct the agent to tag per-cycle summaries with
+    recon_pool='stage1_cycle_summary' so the deterministic Python trim
+    (pretrim_summary_pool, wired into MemoryConsolidator.run()) can enumerate
+    the pool by metadata key.
+
+    Task 1942: minimal key-value-fragment presence assertion only (no prose-
+    wording pins).  Mirrors TestStage2PromptCycleSummaryPoolTag.
+
+    This is the producer-contract guard: the Python trim filters pool members
+    by exactly {'recon_pool': 'stage1_cycle_summary'}.  If the prompt omits
+    the tag instruction the producer never sets the key and the consumer
+    (trim) finds an empty pool — silently leaving the pool invisible/uncapped.
+    """
+
+    def test_stage1_prompt_contains_literal_recon_pool_metadata_fragment(self):
+        """STAGE1_SYSTEM_PROMPT must contain the literal key=value metadata
+        fragment 'recon_pool': 'stage1_cycle_summary'.
+
+        Stronger than a bare token check: verifies the key and value co-occur
+        as the exact add_memory metadata fragment the producer must emit, not
+        just anywhere in unrelated prose.  If the producer instruction is
+        removed or the value changes, this test catches it immediately.
+
+        The consumer (pretrim_summary_pool, via MemoryConsolidator.run())
+        filters by exactly {'recon_pool': 'stage1_cycle_summary'} — so the
+        prompt must instruct the agent to write that exact key-value pair in
+        the per-cycle-summary add_memory metadata dict.
+        """
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        # The literal metadata fragment the producer must emit.  This ties the
+        # test to the actual contract rather than token presence anywhere.
+        fragment = "recon_pool': 'stage1_cycle_summary'"
+        assert fragment in STAGE1_SYSTEM_PROMPT, (
+            f"STAGE1_SYSTEM_PROMPT must contain the literal metadata fragment "
+            f"{fragment!r} so the Stage 1 agent writes the exact key-value pair "
+            f"that pretrim_summary_pool filters on (task 1942 — producer/consumer "
+            f"contract, mirrors Stage 2's task 1657)."
+        )
+
+
 class TestStage1CycleSummaryPoolTrim:
     """MemoryConsolidator.run() pre-trims the stage1_cycle_summary pool to
     cap-1 BEFORE super().run() (trim-then-write ordering, mirrors Stage 2's
