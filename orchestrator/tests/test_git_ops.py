@@ -4910,6 +4910,25 @@ class TestPersistentMergeWorktree:
 # ---------------------------------------------------------------------------
 
 
+def test_git_config_persistent_offline_deep_worktree_knob():
+    """GitConfig knob for the second persistent offline-deep worktree.
+
+    Mirrors test_git_config_persistent_merge_worktree_knobs.
+    Step 3 (RED): the field does not yet exist — test must fail before impl.
+    """
+    # Default: feature off
+    cfg_default = GitConfig()
+    assert cfg_default.persistent_offline_deep_worktree is False, (
+        'persistent_offline_deep_worktree must default to False (feature off)'
+    )
+
+    # Round-trip True
+    cfg_on = GitConfig(persistent_offline_deep_worktree=True)
+    assert cfg_on.persistent_offline_deep_worktree is True, (
+        'persistent_offline_deep_worktree=True must round-trip'
+    )
+
+
 @pytest.mark.asyncio
 class TestPersistentOfflineDeepWorktree:
     """Integration tests for reset_persistent_offline_deep_worktree and its exemptions.
