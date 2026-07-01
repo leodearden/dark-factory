@@ -66,10 +66,25 @@ Usage
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import json
+import logging
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+
+from fused_memory.models.scope import Scope
+
+logger = logging.getLogger('prune_recon_cycle_summaries')
+
+# Pool names, keyed by the producing stage — must match the ``stage`` value
+# each stage's prompt writes into per-cycle-summary metadata (see
+# prompts/stage1.py and prompts/stage2.py).
+_POOL_STAGES: tuple[str, ...] = ('memory_consolidator', 'task_knowledge_sync')
+
 
 # ---------------------------------------------------------------------------
 # Pure core: carries_remediation_history
@@ -410,3 +425,272 @@ def check_limit_cap(
     exceeding = [pid for pid, count in per_project_delete_counts.items() if count > limit]
     abort = bool(exceeding) and not yes_i_am_sure
     return exceeding, abort
+
+
+# ---------------------------------------------------------------------------
+# Live shell: apply + run
+# ---------------------------------------------------------------------------
+
+async def apply_prune(
+    memory: Any,
+    delete_ids: list[str],
+    project_id: str,
+    now: datetime,
+) -> set[str]:
+    """Delete the classified delete-set from Mem0 (best-effort, never raises).
+
+    Mirrors the posture of ``sweep_orphan_flag_markers.delete_orphan_markers``
+    and ``reconciliation.summary_pool.enforce_summary_pool_cap``: every id is
+    attempted in parallel via ``asyncio.gather(return_exceptions=True)``; a
+    raising delete is logged (WARNING) and excluded from the returned applied
+    set, but does not abort the batch — the remaining deletes still proceed.
+
+    All deletes issued by one ``apply_prune`` call share a single
+    ``causation_id`` derived from *now*, tying every deletion in this one-shot
+    prune run together for audit/traceability (mirrors ``run_id`` scoping the
+    trim deletes in ``reconciliation.summary_pool``).
+
+    Args:
+        memory: Live (or mock) MemoryService instance.
+        delete_ids: Memory ids to delete (the classified delete-set for one
+            project).
+        project_id: Project scope passed to each ``delete_memory`` call.
+        now: Timestamp for this apply run; used to build the shared
+            causation_id.
+
+    Returns:
+        Set of memory ids that were actually deleted (excludes any id whose
+        delete_memory call raised).
+    """
+    if not delete_ids:
+        return set()
+
+    causation_id = f'prune_recon_cycle_summaries-{now.isoformat()}'
+
+    async def _delete_one(memory_id: str):
+        return await memory.delete_memory(
+            memory_id=memory_id,
+            store='mem0',
+            project_id=project_id,
+            causation_id=causation_id,
+            _source='prune_recon_cycle_summaries',
+        )
+
+    results = await asyncio.gather(
+        *(_delete_one(mid) for mid in delete_ids),
+        return_exceptions=True,
+    )
+
+    applied: set[str] = set()
+    for mid, result in zip(delete_ids, results, strict=False):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'prune_recon_cycle_summaries: failed to delete memory %s: %s',
+                mid, result,
+            )
+        else:
+            applied.add(mid)
+
+    return applied
+
+
+async def run(
+    args: argparse.Namespace,
+    *,
+    memory: Any,
+    known_projects_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Main async logic: scan, classify, report, and optionally apply.
+
+    For each selected project, enumerates its Mem0 memories via
+    ``memory.mem0.get_all`` (a deterministic full scroll — content is
+    required for :func:`carries_remediation_history`, and
+    ``get_memories_by_metadata`` omits content), filters client-side to
+    ``metadata.kind == 'cycle_summary'`` records whose ``metadata.stage`` is
+    one of the two known pools (``memory_consolidator``,
+    ``task_knowledge_sync``), and classifies each pool independently via
+    :func:`classify_pool`.
+
+    Parameters
+    ----------
+    args:
+        Parsed ``argparse.Namespace`` (apply, project_id, keep_recent,
+        limit_per_project, yes_i_am_sure).
+    memory:
+        Live (or mock) MemoryService instance.
+    known_projects_map:
+        Optional override for the project registry (used in tests to inject
+        a fixture map without reading env vars / filesystem).
+
+    Returns
+    -------
+    The prune report dict (see :func:`build_prune_report`), or an abort
+    payload (``{'aborted': True, ...}``) if an unknown ``--project-id`` was
+    given or a project's deletable count exceeds the safety cap.
+    """
+    generated_at = datetime.now(UTC).isoformat()
+
+    if known_projects_map is None:
+        from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415
+        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
+        cfg = _FMC()
+        known_projects_map = build_known_projects_map(cfg.taskmaster.project_root if cfg.taskmaster else '')
+
+    try:
+        project_ids = select_projects(known_projects_map, getattr(args, 'project_id', None))
+    except ValueError as exc:
+        abort_payload: dict[str, Any] = {
+            'error': str(exc),
+            'aborted': True,
+            'dry_run': not args.apply,
+            'generated_at': generated_at,
+        }
+        print(json.dumps(abort_payload, indent=2, default=str))
+        filter_val = getattr(args, 'project_id', None)
+        print(
+            f'ABORT: unknown --project-id {filter_val!r}; '
+            f'known: {sorted(known_projects_map)}',
+            file=sys.stderr,
+        )
+        return abort_payload
+
+    keep_recent_n: int = args.keep_recent
+
+    # Scan + classify every selected project's two pools.
+    decisions: dict[tuple[str, str], PruneDecision] = {}
+    for pid in project_ids:
+        scope = Scope(project_id=pid)
+        raw = await memory.mem0.get_all(scope, limit=args.limit_per_project)
+        results = raw.get('results') if isinstance(raw, dict) else None
+        if not isinstance(results, list):
+            logger.warning(
+                "prune_recon_cycle_summaries: mem0.get_all returned malformed/absent "
+                "'results' key for project %s; treating as empty. got: %s",
+                pid, repr(raw)[:200],
+            )
+            results = []
+
+        pool_items: dict[str, list[dict[str, Any]]] = {stage: [] for stage in _POOL_STAGES}
+        for m in results:
+            metadata = m.get('metadata') or {}
+            if metadata.get('kind') != 'cycle_summary':
+                continue
+            stage = metadata.get('stage')
+            if stage not in pool_items:
+                continue
+            pool_items[stage].append({
+                'id': m.get('id'),
+                'created_at': m.get('created_at'),
+                'content': m.get('memory') or '',
+                'metadata': metadata,
+            })
+
+        for stage, items in pool_items.items():
+            decisions[(pid, stage)] = classify_pool(items, keep_recent_n)
+
+    # Safety cap on deletable counts (irreversible), across both pools per project.
+    per_project_delete_counts: dict[str, int] = {
+        pid: sum(
+            len(dec.delete_ids)
+            for (p, _pool), dec in decisions.items()
+            if p == pid
+        )
+        for pid in project_ids
+    }
+    exceeding, abort = check_limit_cap(
+        per_project_delete_counts, args.limit_per_project, args.yes_i_am_sure,
+    )
+    if abort:
+        cap_payload: dict[str, Any] = {
+            'aborted': True,
+            'dry_run': not args.apply,
+            'exceeding_projects': exceeding,
+            'limit_per_project': args.limit_per_project,
+            'generated_at': generated_at,
+        }
+        print(json.dumps(cap_payload, indent=2, default=str))
+        print(
+            f'ABORT: projects exceeding --limit-per-project={args.limit_per_project}: '
+            f'{exceeding}. Pass --yes-i-am-sure to override.',
+            file=sys.stderr,
+        )
+        return cap_payload
+
+    # Apply or dry-run.
+    applied_ids: set[str] = set()
+    if args.apply:
+        now = datetime.now(UTC)
+        for pid in project_ids:
+            delete_ids_for_project = [
+                mid
+                for (p, _pool), dec in decisions.items()
+                if p == pid
+                for mid in dec.delete_ids
+            ]
+            applied = await apply_prune(memory, delete_ids_for_project, pid, now)
+            applied_ids |= applied
+
+    report = build_prune_report(
+        decisions_by_project_pool=decisions,
+        applied_ids=applied_ids,
+        dry_run=not args.apply,
+        generated_at=generated_at,
+    )
+
+    # JSON report goes to stdout (machine-readable); summary table to stderr.
+    print(json.dumps(report, indent=2, default=str))
+    print(format_summary_table(report), file=sys.stderr)
+
+    return report
+
+
+def main() -> int:
+    """CLI entry point."""
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='Commit deletions (default: dry-run, report only)',
+    )
+    parser.add_argument(
+        '--project-id', dest='project_id', default=None,
+        help='Restrict the prune to a single project_id',
+    )
+    parser.add_argument(
+        '--keep-recent', dest='keep_recent', type=int, default=2,
+        help='Number of most-recent cycle summaries to keep per project x pool '
+             '(default: 2)',
+    )
+    parser.add_argument(
+        '--limit-per-project', dest='limit_per_project', type=int, default=1000,
+        help='Per-project Mem0 scan limit, and safety cap on deletable count '
+             'before aborting (default: 1000)',
+    )
+    parser.add_argument(
+        '--yes-i-am-sure', dest='yes_i_am_sure', action='store_true',
+        help='Override the per-project deletable-count safety cap',
+    )
+    args = parser.parse_args()
+
+    async def _run_live() -> int:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        await memory.initialize()
+        try:
+            report = await run(args, memory=memory)
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+        return 1 if report.get('aborted') else 0
+
+    return asyncio.run(_run_live())
+
+
+if __name__ == '__main__':
+    sys.exit(main())
