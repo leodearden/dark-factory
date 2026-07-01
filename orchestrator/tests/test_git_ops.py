@@ -4956,6 +4956,80 @@ class TestPersistentOfflineDeepWorktree:
             git_ops.worktree_base / '_offline-deep'
         )
 
+    # ------------------------------------------------------------------
+    # Step 5 — create-once path + prune-exemption
+    # ------------------------------------------------------------------
+
+    async def test_reset_persistent_offline_deep_worktree_create_once_and_prune_exempt(
+        self, git_ops: GitOps,
+    ):
+        """reset_persistent_offline_deep_worktree creates on first call; prune-exempt.
+
+        Mirrors test_reset_persistent_merge_worktree_create_once +
+        test_prune_skips_persistent_worktree, combined for the offline-deep
+        worktree.
+
+        Step 5 (RED): method absent today — test must fail before impl.
+        """
+        merge_commit = await _get_merge_commit(
+            git_ops, 'offline-deep-create-1', 'offline_deep_create.py',
+        )
+
+        warm_path = await git_ops.reset_persistent_offline_deep_worktree(merge_commit)
+
+        # Returns the fixed path
+        assert warm_path == git_ops.persistent_offline_deep_worktree_path
+        assert warm_path.exists()
+
+        # Path is a registered git worktree
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        registered_paths = [
+            line[len('worktree '):].strip()
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        assert str(warm_path) in registered_paths, (
+            f'_offline-deep not in registered worktrees: {registered_paths}'
+        )
+
+        # HEAD of warm worktree == merge_commit
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=warm_path,
+        )
+        assert head_sha.strip() == merge_commit.strip(), (
+            f'warm worktree HEAD {head_sha.strip()!r} != merge_commit {merge_commit.strip()!r}'
+        )
+
+        # --- Prune-exempt: create an ephemeral _merge-<uuid> worktree ---
+        ephemeral_wt, _ = await git_ops._create_merge_worktree()
+        assert ephemeral_wt.exists()
+
+        removed = await git_ops.prune_stale_merge_worktrees()
+
+        assert any(
+            '_merge-' in r and not r.endswith('_offline-deep')
+            for r in removed
+        ), f'ephemeral worktree must appear in removed list: {removed}'
+        assert not any(
+            r.endswith('_offline-deep') for r in removed
+        ), f'_offline-deep must NOT appear in removed list: {removed}'
+
+        # _offline-deep worktree still on disk and registered
+        assert warm_path.exists(), '_offline-deep must survive prune'
+        assert await git_ops._is_registered_worktree(warm_path), (
+            '_offline-deep must still be registered after prune'
+        )
+
+        # Ephemeral is gone
+        assert not ephemeral_wt.exists(), (
+            'ephemeral _merge-<uuid> must be gone after prune'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Task 1699 — per-host disk-persistent attempt counter (step-3 RED)
