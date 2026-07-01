@@ -127,3 +127,45 @@ async def test_on_post_merge_sets_dirty_and_wakes_without_running(tmp_path: Path
     assert worker._wake.is_set()
     git_ops.get_main_sha.assert_not_awaited()
     suite_runner.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _run_once — always-from-head snapshot (step-5/6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_once_snapshots_head_at_run_start_and_invokes_seam(tmp_path: Path):
+    """_run_once clears dirty BEFORE snapshotting head, then resets + runs the seam.
+
+    Step 5 (RED): _run_once is a NotImplementedError stub — must fail
+    before impl.
+    """
+    worker_ref: dict[str, OfflineLaneWorker] = {}
+
+    async def _fake_get_main_sha() -> str:
+        # Clear-before-snapshot: by the time get_main_sha is awaited, dirty
+        # must already be cleared (no lost-update window).
+        assert worker_ref['worker']._dirty is False, (
+            '_run_once must clear _dirty BEFORE snapshotting head'
+        )
+        return 'HEAD1'
+
+    wt_path = tmp_path / '_offline-deep'
+    git_ops = MagicMock()
+    git_ops.get_main_sha = AsyncMock(side_effect=_fake_get_main_sha)
+    git_ops.reset_persistent_offline_deep_worktree = AsyncMock(return_value=wt_path)
+    suite_runner = AsyncMock(return_value=(0, ''))
+    config = _make_config(tmp_path, offline_lane_test_threads=6)
+    worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=suite_runner)
+    worker_ref['worker'] = worker
+    worker._dirty = True
+
+    await worker._run_once()
+
+    git_ops.get_main_sha.assert_awaited_once()
+    git_ops.reset_persistent_offline_deep_worktree.assert_awaited_once_with('HEAD1')
+    suite_runner.assert_awaited_once_with(wt_path, 'HEAD1', 6)
+    assert worker._last_run_head == 'HEAD1', (
+        '_last_run_head must equal the snapshot head, never the advisory trigger SHA'
+    )
