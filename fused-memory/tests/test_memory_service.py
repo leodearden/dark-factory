@@ -2382,6 +2382,32 @@ class TestAddMemoryGraphitiRefreshWiring:
         )
 
 
+class TestReplayFromStoreRefreshWiring:
+    """step-11/12: replay_from_store's add_memory_graphiti batch items must
+    carry callback_type='refresh_entity_summaries' so bulk re-ingestion also
+    triggers a post-write summary refresh."""
+
+    @pytest.mark.asyncio
+    async def test_replay_batch_items_carry_refresh_callback_type(self, service):
+        service.mem0.get_all = AsyncMock(return_value={
+            'results': [
+                {'memory': 'Auth depends on Redis', 'metadata': {'category': 'entities_and_relations'}},
+            ]
+        })
+
+        await service.replay_from_store('test')
+
+        service.durable_queue.enqueue_batch.assert_called_once()
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        graphiti_items = [item for item in batch if item['operation'] == 'add_memory_graphiti']
+        assert graphiti_items, 'Expected at least one add_memory_graphiti batch item'
+        for item in graphiti_items:
+            assert item.get('callback_type') == 'refresh_entity_summaries', (
+                'replay_from_store add_memory_graphiti batch items must carry '
+                f'callback_type=refresh_entity_summaries; got {item.get("callback_type")!r}'
+            )
+
+
 class TestExecuteGraphitiWritePlanningRegistration:
     """step-5: _execute_graphiti_write registers episodes when temporal_context='planning'."""
 
