@@ -1305,17 +1305,29 @@ class TaskWorkflow:
     async def _reconcile_metadata_files_for_done(self) -> None:
         """Set ``metadata.files`` to the merge-diff files before set_task_status('done').
 
-        Truth source: ``git diff --name-only --no-renames <_base_commit>..<_merge_sha>``
-        (excluding ``.task/``) — i.e. the files that actually landed on main,
-        not the architect's plan.files (which the merge may have squashed,
-        refactored, or rewritten).  Pre-fix, plan.files-derived metadata
-        could include paths that no longer existed post-merge, tripping the
-        phantom-done gate even though provenance was correct.
+        Truth source: ``git diff --name-only --no-renames <_merge_sha>^1..<_merge_sha>``
+        (excluding ``.task/``) — the merge commit's OWN first parent, i.e. main's
+        tip immediately before this task's merge — not the architect's plan.files
+        (which the merge may have squashed, refactored, or rewritten).  Pre-fix,
+        plan.files-derived metadata could include paths that no longer existed
+        post-merge, tripping the phantom-done gate even though provenance was
+        correct.
 
-        Fall-back paths: when ``_merge_sha`` or ``_base_commit`` is None
-        (already-on-main shortcuts, eval mode without a merge), write an
-        empty list — the fused-memory gate-skip-when-verified-provenance
-        branch handles the missing-files case from there.
+        ``self._base_commit`` is intentionally NOT a diff input here: it is the
+        task's original branch point, captured once at worktree creation and
+        never refreshed after a rebase.  Diffing it against ``_merge_sha`` would
+        union in every sibling task that merged into main during the window
+        between this task's branch point and its own merge — the cross-task
+        ``metadata.files`` contamination this method used to produce.  The merge
+        commit's first parent is captured atomically at merge time (``--no-ff``
+        guarantees a two-parent merge commit — see ``advance_main``'s symmetric
+        reliance on ``merge_sha^2`` for the verified branch tip) and yields
+        exactly this task's own branch changes.
+
+        Fall-back path: when ``_merge_sha`` is None (already-on-main shortcuts,
+        eval mode without a merge), write an empty list — the fused-memory
+        gate-skip-when-verified-provenance branch handles the missing-files
+        case from there.
 
         Sibling keys such as ``memory_hints`` and ``_causation_id`` (added by
         Stage-2 reconciliation after the workflow loaded ``self.task``) are
@@ -1331,9 +1343,9 @@ class TaskWorkflow:
         The strip can only shrink the declared set (a file-level subset of what
         landed), which keeps the phantom-done gate honest.
         """
-        if self._merge_sha and self._base_commit:
-            files, err = await self.git_ops.get_merge_diff_files(
-                self._base_commit, self._merge_sha,
+        if self._merge_sha:
+            files, err = await self.git_ops.get_merge_commit_diff_files(
+                self._merge_sha,
             )
             if err is not None:
                 files = []
