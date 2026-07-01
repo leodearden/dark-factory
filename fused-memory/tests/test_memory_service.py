@@ -3251,8 +3251,14 @@ class TestGraphitiBackendGetEdgeInvalidAt:
 class TestGraphitiBackendUpdateEdgeClearInvalidAt:
     """Backend update_edge must accept clear_invalid_at=True and set edge.invalid_at = None."""
 
-    def _make_backend_and_edge(self, mock_config):
-        """Set up a GraphitiBackend with mock driver/client and a mock edge."""
+    def _make_backend_and_edge(self, mock_config, make_graph_mock):
+        """Set up a GraphitiBackend with mock driver/client, an awaitable graph, and a mock edge.
+
+        Returns (backend, mock_edge, graph) — ``graph`` is the same object
+        ``backend._graph_for(...)`` resolves to, so tests can assert on the
+        explicit direct-Cypher clear write (task 1940) issued via
+        ``graph.query(...)``.
+        """
         from fused_memory.backends.graphiti_client import GraphitiBackend
 
         backend = GraphitiBackend(mock_config)
@@ -3261,6 +3267,9 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
         mock_driver.clone = MagicMock(return_value=mock_cloned_driver)
         backend._driver = mock_driver
         backend.client = MagicMock()
+
+        graph = make_graph_mock([])
+        mock_driver._get_graph = MagicMock(return_value=graph)
 
         mock_edge = AsyncMock()
         mock_edge.source_node_uuid = 'src-uuid'
@@ -3271,12 +3280,12 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
         mock_edge.save = AsyncMock()
         mock_edge.generate_embedding = AsyncMock()
         backend.refresh_entity_summary = AsyncMock(return_value={})
-        return backend, mock_edge
+        return backend, mock_edge, graph
 
     @pytest.mark.asyncio
-    async def test_clear_invalid_at_alone_sets_none(self, mock_config):
+    async def test_clear_invalid_at_alone_sets_none(self, mock_config, make_graph_mock):
         """clear_invalid_at=True with no fact/invalid_at clears edge.invalid_at and calls save."""
-        backend, mock_edge = self._make_backend_and_edge(mock_config)
+        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
         with patch(
             'fused_memory.backends.graphiti_client.EntityEdge'
         ) as MockEntityEdge:
@@ -3288,9 +3297,9 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
             mock_edge.save.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_clear_invalid_at_with_fact_updates_both(self, mock_config):
+    async def test_clear_invalid_at_with_fact_updates_both(self, mock_config, make_graph_mock):
         """clear_invalid_at=True combined with fact updates fact AND clears invalid_at."""
-        backend, mock_edge = self._make_backend_and_edge(mock_config)
+        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
         with patch(
             'fused_memory.backends.graphiti_client.EntityEdge'
         ) as MockEntityEdge:
@@ -3305,9 +3314,9 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
             mock_edge.save.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_clear_invalid_at_takes_precedence_over_invalid_at(self, mock_config):
+    async def test_clear_invalid_at_takes_precedence_over_invalid_at(self, mock_config, make_graph_mock):
         """When both invalid_at and clear_invalid_at=True are given, clear wins."""
-        backend, mock_edge = self._make_backend_and_edge(mock_config)
+        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
         ts = datetime(2026, 6, 1, tzinfo=UTC)
         with patch(
             'fused_memory.backends.graphiti_client.EntityEdge'
@@ -3320,6 +3329,73 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
                 'clear_invalid_at=True must take precedence: invalid_at ends up None'
             )
             mock_edge.save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_clear_invalid_at_issues_explicit_null_cypher(self, mock_config, make_graph_mock):
+        """clear_invalid_at=True must issue an explicit direct-Cypher NULL write.
+
+        graphiti-core's FalkorDB map-based ``edge.save()`` does not reliably
+        clear a null-valued property, so update_edge must force the clear via
+        an explicit ``SET e.invalid_at = NULL`` Cypher write (task 1940).
+        """
+        from _fm_helpers import extract_cypher, extract_params
+
+        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
+
+        graph.query.assert_awaited_once()
+        cypher = extract_cypher(graph.query.call_args)
+        params = extract_params(graph.query.call_args)
+        assert 'RELATES_TO' in cypher
+        assert 'SET' in cypher
+        assert 'invalid_at' in cypher
+        assert 'NULL' in cypher
+        assert params == {'uuid': 'e-1'}
+
+    @pytest.mark.asyncio
+    async def test_fact_plus_clear_still_issues_explicit_clear(self, mock_config, make_graph_mock):
+        """The explicit clear Cypher must fire even when fact is also supplied."""
+        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge('e-1', 'new fact', group_id='proj', clear_invalid_at=True)
+
+        graph.query.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_explicit_clear_precedes_summary_refresh(self, mock_config, make_graph_mock):
+        """The explicit clear Cypher must be awaited BEFORE the endpoint summary refresh runs.
+
+        Otherwise refresh_entity_summary's get_valid_edges_for_node query (which
+        filters ``WHERE e.invalid_at IS NULL``) would run before the clear lands
+        and exclude the just-restored edge from the rebuilt summary.
+        """
+        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
+        observed_await_counts = []
+
+        async def _fake_refresh(node_uuid, *, group_id):
+            observed_await_counts.append(graph.query.await_count)
+            return {}
+
+        backend.refresh_entity_summary = AsyncMock(side_effect=_fake_refresh)
+
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
+
+        assert observed_await_counts, 'refresh_entity_summary was never called'
+        assert all(count > 0 for count in observed_await_counts), (
+            'explicit clear Cypher must be awaited before summary refresh; '
+            f'observed graph.query.await_count at refresh time: {observed_await_counts}'
+        )
 
 
 class TestGetMemoriesByMetadata:
