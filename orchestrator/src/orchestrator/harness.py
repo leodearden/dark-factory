@@ -738,6 +738,13 @@ class Harness:
         #   [1] dashboard    (require_idle=False — fires even during dispatch)
         self._service_restart_coordinators: list[StaleServiceRestartCoordinator] = []
 
+        # Offline deep-test lane (task 1951, β2 — not yet built) — singleton
+        # notifiee slot fanned out from _note_merge_all alongside the service
+        # restart coordinators above.  None until β2 registers its own
+        # on_post_merge callback here directly (mirrors the direct-attribute
+        # registration convention used by _service_restart_coordinators).
+        self._offline_lane_notifiee: Callable[[str, str, str], Awaitable[object]] | None = None
+
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
 
@@ -5000,6 +5007,8 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return
 
+        await self._note_offline_lane(task_id, base_sha, head_sha)
+
         for coord in self._service_restart_coordinators:
             try:
                 await coord.note_merge(task_id, base_sha, head_sha, prefetched_diff=prefetched_diff)
@@ -5010,6 +5019,20 @@ Output JSON matching the schema. Every task must appear in the output.
                     exc,
                     exc_info=True,
                 )
+
+    async def _note_offline_lane(
+        self, task_id: str, base_sha: str, head_sha: str
+    ) -> None:
+        """Notify the offline deep-test lane's on_post_merge notifiee, if registered.
+
+        β2 (the offline lane worker, not yet built) will set
+        ``self._offline_lane_notifiee`` to its own ``on_post_merge`` callback.
+        Until then ``self._offline_lane_notifiee`` is None and this is a no-op.
+        """
+        notifiee = self._offline_lane_notifiee
+        if notifiee is None:
+            return
+        await notifiee(task_id, base_sha, head_sha)
 
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.
