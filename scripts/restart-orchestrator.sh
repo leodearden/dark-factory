@@ -57,3 +57,7 @@ while [[ $SECONDS -lt $deadline ]]; do
     fi
     sleep 1
 done
+
+echo " FAILED"
+echo "ERROR: restart did not take (stale MainPID); orchestrator-dark-factory did not come back within ${VERIFY_TIMEOUT}s" >&2
+exit 1
