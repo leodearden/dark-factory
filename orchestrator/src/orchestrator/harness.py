@@ -4996,7 +4996,14 @@ Output JSON matching the schema. Every task must appear in the output.
         all coordinators with a WARNING (fail-open); a legitimately empty diff
         (revert merges, ``.task/``-only merges) calls all coordinators with an
         empty file list — no restart is armed, but no coordinators are skipped.
+
+        The offline deep-test lane notifiee (if registered) is notified BEFORE
+        the diff fetch below, since it needs only the fact that ``main``
+        advanced, not the changed-file list — it must fire on every landed
+        advance even when the diff fetch errors (which skips the coordinators).
         """
+        await self._note_offline_lane(task_id, base_sha, head_sha)
+
         prefetched_diff, err = await self.git_ops.get_merge_diff_files(base_sha, head_sha)
         if err is not None:
             logger.warning(
@@ -5006,8 +5013,6 @@ Output JSON matching the schema. Every task must appear in the output.
                 exc_info=True,
             )
             return
-
-        await self._note_offline_lane(task_id, base_sha, head_sha)
 
         for coord in self._service_restart_coordinators:
             try:
