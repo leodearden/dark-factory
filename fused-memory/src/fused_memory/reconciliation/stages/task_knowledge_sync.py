@@ -1286,7 +1286,7 @@ async def _verify_stage2_summary_written(
     memory_service,
     project_id: str,
     run_id: str,
-) -> int:
+) -> int | None:
     """Best-effort post-write check: count this run's cycle_summary in Mem0.
 
     Counts memories matching the triple filter
@@ -1309,7 +1309,15 @@ async def _verify_stage2_summary_written(
         run_id: Current reconciliation run identifier (used as filter key).
 
     Returns:
-        Count returned by ``count_memories_by_metadata``, or 0 on failure.
+        Count returned by ``count_memories_by_metadata`` when the call
+        succeeds — 0 means CONFIRMED absent (the count query ran cleanly and
+        found nothing).  ``None`` when the count call itself raised — a
+        transient failure that does NOT confirm absence.  This distinction
+        matters to callers (task 1964 amendment): the repair/reconstruct
+        chain in ``run()`` gates on ``verified_count == 0`` specifically so
+        that a transient ``None`` is never treated as a confirmed-empty pool
+        — a transient outage must never fabricate a reconstruction
+        placeholder for a run whose real summary may already exist.
     """
     try:
         count = await memory_service.count_memories_by_metadata(
@@ -1323,11 +1331,12 @@ async def _verify_stage2_summary_written(
     except Exception:
         logger.warning(
             'reconciliation._verify_stage2_summary_written: '
-            'count_memories_by_metadata failed for run_id=%s; treating as 0',
+            'count_memories_by_metadata failed for run_id=%s; absence NOT '
+            'confirmed (transient failure, not treated as count==0)',
             run_id,
             extra={'project_id': project_id, 'run_id': run_id},
         )
-        return 0
+        return None
     if not count:
         logger.warning(
             'reconciliation._verify_stage2_summary_written: '
@@ -2012,14 +2021,20 @@ class TaskKnowledgeSync(BaseStage):
         verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
 
         # --- cycle-summary stage-metadata repair (task 1963) ---
-        # verified_count==0 means the triple-filter found no cycle_summary for
-        # this run — either the LLM genuinely failed to write one, or it wrote
-        # one but omitted (part of) the identity metadata (the confirmed
+        # verified_count==0 means the triple-filter CONFIRMED no cycle_summary
+        # for this run — either the LLM genuinely failed to write one, or it
+        # wrote one but omitted (part of) the identity metadata (the confirmed
         # 2026-07-01 incident: stage missing while kind/run_id/recon_pool were
-        # present). Gate the repair on count==0 so the happy path (LLM
-        # complied) costs zero extra Mem0 calls and carries zero
-        # duplicate-write risk; when the summary is genuinely absent,
-        # enumeration returns [] and repaired stays 0 (no false repair).
+        # present). verified_count is None — not 0 — when
+        # count_memories_by_metadata itself raised (task 1964 amendment): a
+        # transient failure does NOT confirm absence, so the `== 0` checks
+        # below deliberately exclude None and the repair/reconstruct chain is
+        # skipped rather than risking a false repair or a fabricated
+        # reconstruction for a run whose real summary may already exist.
+        # Gate the repair on count==0 so the happy path (LLM complied) costs
+        # zero extra Mem0 calls and carries zero duplicate-write risk; when
+        # the summary is genuinely absent, enumeration returns [] and
+        # repaired stays 0 (no false repair).
         # report.stats['stage2_cycle_summary_verified_count'] is set to the
         # POST-repair (and, below, POST-reconstruction) count so downstream
         # consumers see the corrected value.
@@ -2038,14 +2053,23 @@ class TaskKnowledgeSync(BaseStage):
             # (repaired>0) but its own verbatim re-add was itself silently
             # dedup-dropped, so the re-verify above still reports 0. Both
             # converge here: write ONE dedup-resilient reconstruction
-            # placeholder and re-verify.
+            # placeholder and re-verify. If either verify call instead
+            # returned None (transient count_memories_by_metadata failure)
+            # rather than a confirmed 0, this comparison is False and
+            # reconstruction is skipped: absence must be CONFIRMED before we
+            # fabricate new content, never merely inferred from an error.
             if verified_count == 0:
                 reconstructed = await _reconstruct_stage2_summary(self.memory, self.project_id, run_id)
                 if reconstructed:
                     verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
         report.stats['stage2_cycle_summary_stage_repaired'] = repaired
         report.stats['stage2_cycle_summary_reconstructed'] = reconstructed
-        report.stats['stage2_cycle_summary_verified_count'] = verified_count
+        # verified_count is None only if the last verify call made above
+        # itself errored transiently; coerce to 0 so this stat's contract
+        # (always an int) is preserved for downstream consumers.
+        report.stats['stage2_cycle_summary_verified_count'] = (
+            verified_count if verified_count is not None else 0
+        )
 
         # --- stage1_flag_marker age-based GC (task 1944) ---
         # The stage1_flag_marker pool is written by Stage 1, not by this stage's

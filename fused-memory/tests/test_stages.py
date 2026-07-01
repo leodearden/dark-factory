@@ -12395,7 +12395,12 @@ class TestMemoryConsolidatorMem0ResultsKeyWarns:
 class TestVerifyStage2SummaryWritten:
     """_verify_stage2_summary_written: calls count_memories_by_metadata with
     {'kind':'cycle_summary','stage':'task_knowledge_sync','run_id':run_id},
-    returns count, logs WARNING on count==0 or exception, never raises."""
+    returns the count (0 means CONFIRMED absent) on success, returns None
+    (transient failure, absence NOT confirmed) on exception, logs WARNING on
+    count==0 or exception, never raises. The int-vs-None distinction (task
+    1964 amendment) lets run()'s repair/reconstruct chain gate strictly on a
+    confirmed 0 rather than treating a transient error the same as absence.
+    """
 
     _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
 
@@ -12457,8 +12462,13 @@ class TestVerifyStage2SummaryWritten:
         assert [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     @pytest.mark.asyncio
-    async def test_returns_zero_and_logs_warning_on_exception(self, caplog):
-        """When count_memories_by_metadata raises, returns 0, does NOT raise, logs WARNING."""
+    async def test_returns_none_and_logs_warning_on_exception(self, caplog):
+        """When count_memories_by_metadata raises, returns None (transient
+        failure — absence NOT confirmed, distinct from a confirmed count==0),
+        does NOT raise, logs WARNING. (task 1964 amendment: run()'s
+        repair/reconstruct chain relies on this None-vs-0 distinction to
+        avoid fabricating a reconstruction when the pool's real state is
+        unknown.)"""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _verify_stage2_summary_written,
         )
@@ -12473,7 +12483,7 @@ class TestVerifyStage2SummaryWritten:
                 memory_service, 'dark_factory', 'run-error'
             )
 
-        assert result == 0
+        assert result is None
         assert [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
@@ -13095,7 +13105,11 @@ class TestReconstructStage2Summary:
         content = kwargs.get('content')
         assert content, 'content must be a non-empty string'
         assert run_id in content, 'content must reference the run_id'
-        assert 'reconstruct' in content.lower(), 'content must be labeled as a reconstruction'
+        # Human-labeling (that this is a reconstruction) is asserted via the
+        # `reconstructed=True` metadata flag above, not via a wording pin on
+        # the body prose — that would couple this test to cosmetic copy in
+        # _build_stage2_reconstruction_content and break on a harmless
+        # rewording without catching a real regression.
 
         assert result == 1
         memory_service.search.assert_not_awaited()
@@ -13371,3 +13385,120 @@ class TestRunStage2SummaryReconstructionWiring:
         reconstruct_mock.assert_not_awaited()
         assert report.stats['stage2_cycle_summary_reconstructed'] == 0
         assert report.stats['stage2_cycle_summary_verified_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_verify_error_skips_repair_and_reconstruction(self, mock_deps):
+        """verify returns None (count_memories_by_metadata raised — a
+        transient failure, NOT a confirmed-empty pool) -> neither repair nor
+        reconstruct is awaited, and every stat reads as its safe default.
+
+        Guards the task-1964 amendment: a transient count failure must never
+        be treated the same as a confirmed count==0, which would otherwise
+        risk a false repair or fabricate a reconstruction placeholder for a
+        run whose real per-cycle summary may already exist.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            TaskKnowledgeSync,
+        )
+
+        run_id = 'run-verify-errored'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        verify_mock = AsyncMock(return_value=None)
+        repair_mock = AsyncMock(return_value=0)
+        reconstruct_mock = AsyncMock(return_value=0)
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_stage2_summary_written',
+                new=verify_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._repair_stage2_summary_stage_metadata',
+                new=repair_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._reconstruct_stage2_summary',
+                new=reconstruct_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id=run_id,
+            )
+
+        repair_mock.assert_not_awaited()
+        reconstruct_mock.assert_not_awaited()
+        assert verify_mock.await_count == 1
+        assert report.stats['stage2_cycle_summary_stage_repaired'] == 0
+        assert report.stats['stage2_cycle_summary_reconstructed'] == 0
+        assert report.stats['stage2_cycle_summary_verified_count'] == 0
+
+    @pytest.mark.asyncio
+    async def test_reconstruction_succeeds_but_reverify_still_zero(self, mock_deps):
+        """verify=[0, 0] (the post-reconstruction re-verify still reports 0 —
+        e.g. the reconstruction write landed under a metadata shape the
+        triple-filter count doesn't match, or another transient count
+        failure), repair=0, reconstruct=1 -> reconstructed==1 is still
+        recorded even though verified_count stays 0.
+
+        Locks down the reconstruction-metadata-vs-verify-filter contract: a
+        successful reconstruction write must never be silently misreported
+        as a successful verify.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            TaskKnowledgeSync,
+        )
+
+        run_id = 'run-recon-verify-mismatch'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        verify_mock = AsyncMock(side_effect=[0, 0])
+        repair_mock = AsyncMock(return_value=0)
+        reconstruct_mock = AsyncMock(return_value=1)
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_stage2_summary_written',
+                new=verify_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._repair_stage2_summary_stage_metadata',
+                new=repair_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._reconstruct_stage2_summary',
+                new=reconstruct_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id=run_id,
+            )
+
+        reconstruct_mock.assert_awaited_once_with(stage.memory, 'dark_factory', run_id)
+        assert verify_mock.await_count == 2
+        assert report.stats['stage2_cycle_summary_reconstructed'] == 1
+        assert report.stats['stage2_cycle_summary_verified_count'] == 0
