@@ -146,12 +146,16 @@ timestamps embed nearly identically, causing summaries to be silently dropped \
 same pathology as Stage 2 task 1572). \
 Both tokens are required: the nonce supplies structural entropy; the ISO timestamp \
 provides human-readable temporal context. \
-In addition, pass `metadata={{'kind': 'cycle_summary', 'stage': 'memory_consolidator', 'run_id': <run_id>}}` on the \
+In addition, pass `metadata={{'kind': 'cycle_summary', 'stage': 'memory_consolidator', 'run_id': <run_id>, 'recon_pool': 'stage1_cycle_summary'}}` on the \
 `add_memory` call that writes the per-cycle summary, where `<run_id>` is the exact \
 `run_id` value from the payload context (the same run_id embedded in the content). \
 This mirrors Stage 2's cycle-summary metadata convention \
 (`stage='task_knowledge_sync'`, fixed in task 9af436fe) and makes the summary \
 deterministically findable by a metadata-keyed lookup. \
+The `recon_pool: 'stage1_cycle_summary'` key is required (task 1942): Python \
+deterministically enforces a pool cap of N≤2 by filtering on this tag and deleting \
+the oldest members — omitting it means the pool is invisible to the trim and grows \
+unboundedly. \
 The run_id in `metadata.run_id` MUST equal the run_id embedded in the content string. \
 After writing the per-cycle summary, you MUST call \
 `mcp__fused-memory__count_memories_by_metadata(project_id, \
