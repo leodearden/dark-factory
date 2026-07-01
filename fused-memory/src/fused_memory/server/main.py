@@ -1286,11 +1286,15 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
     if not cfg.enabled or not cfg.projects:
         return
     for project_id in cfg.projects:
-        await memory_service.rebuild_entity_summaries(
-            project_id=project_id,
-            force=cfg.force,
-            _source='periodic_maintenance',
-        )
+        try:
+            await memory_service.rebuild_entity_summaries(
+                project_id=project_id,
+                force=cfg.force,
+                _source='periodic_maintenance',
+            )
+        except Exception:
+            logger.exception('rebuild_entity_summaries failed for project %s', project_id)
+            continue
 
 
 async def _build_task_backend(taskmaster_config):
