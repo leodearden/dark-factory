@@ -3167,6 +3167,84 @@ class TestUpdateEdgeClearInvalidAt:
 
 
 # ---------------------------------------------------------------------------
+# Step 1 (task-1940): GraphitiBackend.get_edge_invalid_at RED tests
+# ---------------------------------------------------------------------------
+
+class TestGraphitiBackendGetEdgeInvalidAt:
+    """GraphitiBackend.get_edge_invalid_at(uuid, group_id) reads back the raw invalid_at property.
+
+    Used by MemoryService.update_edge's clear_invalid_at verification (task 1940) to
+    confirm an edge was actually restored to active status, independent of the
+    fact-text readback used for the ``fact`` verification path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_invalid_at_is_null(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """A [[None]] row (invalid_at IS NULL) must return None."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([[None]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_edge_invalid_at('edge-uuid-1', group_id='test')
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_raw_invalid_at_value(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """A row carrying a stored invalid_at must be returned verbatim (no parsing)."""
+        backend = make_backend(mock_config)
+        ts = '2026-06-01T00:00:00+00:00'
+        graph = make_graph_mock([[ts]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_edge_invalid_at('edge-uuid-1', group_id='test')
+        assert result == ts
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """get_edge_invalid_at is a read — it must use ro_query and never call graph.query."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([[None]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_edge_invalid_at('edge-uuid-1', group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_passes_uuid_param_and_matches_relates_to(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """The Cypher matches RELATES_TO and returns e.invalid_at; uuid is passed as a param."""
+        from _fm_helpers import extract_cypher, extract_params
+
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([[None]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_edge_invalid_at('specific-edge-uuid', group_id='test')
+        cypher = extract_cypher(graph.ro_query.call_args)
+        params = extract_params(graph.ro_query.call_args)
+        assert 'RELATES_TO' in cypher
+        assert 'invalid_at' in cypher
+        assert params == {'uuid': 'specific-edge-uuid'}
+
+    @pytest.mark.asyncio
+    async def test_raises_edge_not_found_when_missing(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """An empty result_set (no matching edge) must raise EdgeNotFoundError."""
+        from graphiti_core.errors import EdgeNotFoundError
+
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with pytest.raises(EdgeNotFoundError):
+            await backend.get_edge_invalid_at('missing-edge-uuid', group_id='test')
+
+
+# ---------------------------------------------------------------------------
 # Step 1: TRACK B.1 backend clear_invalid_at RED tests
 # ---------------------------------------------------------------------------
 
