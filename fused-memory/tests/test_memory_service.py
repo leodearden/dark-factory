@@ -2355,6 +2355,33 @@ class TestRefreshSummariesCallback:
         service.durable_queue.enqueue_batch.assert_not_called()
 
 
+class TestAddMemoryGraphitiRefreshWiring:
+    """step-09/10: the add_memory_graphiti enqueue must carry
+    callback_type='refresh_entity_summaries' so ingestion-time edge
+    resolution on this path also triggers a post-write summary refresh."""
+
+    @pytest.mark.asyncio
+    async def test_add_memory_graphiti_enqueue_carries_refresh_callback_type(self, service):
+        await service.add_memory(
+            content='Auth depends on Redis',
+            category='entities_and_relations',
+            project_id='test',
+        )
+
+        graphiti_calls = [
+            c for c in service.durable_queue.enqueue.call_args_list
+            if c.kwargs.get('operation') == 'add_memory_graphiti'
+        ]
+        assert len(graphiti_calls) == 1, (
+            f'Expected exactly 1 add_memory_graphiti enqueue, got {len(graphiti_calls)}'
+        )
+        assert graphiti_calls[0].kwargs.get('callback_type') == 'refresh_entity_summaries', (
+            'add_memory_graphiti enqueue must carry callback_type=refresh_entity_summaries '
+            f'so its ingestion-time edge resolution triggers a refresh; got '
+            f'{graphiti_calls[0].kwargs.get("callback_type")!r}'
+        )
+
+
 class TestExecuteGraphitiWritePlanningRegistration:
     """step-5: _execute_graphiti_write registers episodes when temporal_context='planning'."""
 
