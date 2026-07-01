@@ -154,8 +154,20 @@ class OfflineLaneWorker:
 
         See module docstring for the full single-flight / coalescing / poll
         backstop / fail-open contract.
+
+        Coalescing core: whenever ``_dirty`` is set, run once and IMMEDIATELY
+        re-check ``_dirty`` — since :meth:`_run_once` clears it before its own
+        head snapshot, a re-set during that run (one or many times) collapses
+        into exactly one further coalesced re-run at the new head, never more.
+        Otherwise, clear and wait on the wake event (set by
+        :meth:`on_post_merge`).
         """
-        raise NotImplementedError
+        while True:
+            if self._dirty:
+                await self._run_once()
+                continue
+            self._wake.clear()
+            await self._wake.wait()
 
     async def _run_once(self) -> None:
         """Snapshot head, reset the warm worktree, and invoke the suite seam.
