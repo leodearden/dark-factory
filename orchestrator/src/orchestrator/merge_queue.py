@@ -5944,6 +5944,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Post-merge notification hook — called with (task_id, base_sha,
         # advanced_sha) after each 'done' merge.  Wrapped in try/except so a
         # coordinator bug never blocks or fails the merge.  See task 1592.
+        #
+        # This is also the PRIMARY in-process trigger for the offline
+        # deep-test lane (PRD docs/prds/offline-deep-test-lane-worker.md §5
+        # C1): harness.py wires this to _note_merge_all, which fans out to
+        # _note_offline_lane (task 1951, β1).  The FALLBACK trigger, used for
+        # orchestrator-down landings via scripts/land.sh, is reify's
+        # hooks/reference-transaction main-move log, which yields the same
+        # (base, head) pair.
         self._on_merge_landed = on_merge_landed
         # Durable journal (task 1772): records worker-owned requests on accept,
         # removes them on terminal.  None-safe so bare-worker tests (no store) are
@@ -10572,6 +10580,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             and self._on_merge_landed is not None
                         ):
                             try:
+                                # PRIMARY in-process trigger for the offline
+                                # deep-test lane: harness._note_merge_all fans
+                                # out to _note_offline_lane (task 1951, β1).
+                                # See the constructor comment above for the
+                                # FALLBACK (orchestrator-down landings).
                                 await self._on_merge_landed(
                                     req.task_id, item.base_sha, outcome.merge_sha
                                 )

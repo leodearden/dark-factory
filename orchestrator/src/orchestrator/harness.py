@@ -738,6 +738,16 @@ class Harness:
         #   [1] dashboard    (require_idle=False — fires even during dispatch)
         self._service_restart_coordinators: list[StaleServiceRestartCoordinator] = []
 
+        # Offline deep-test lane (task 1951, β2 — not yet built) — singleton
+        # notifiee slot fanned out from _note_merge_all alongside the service
+        # restart coordinators above.  None until β2 registers its own
+        # on_post_merge callback here directly (mirrors the direct-attribute
+        # registration convention used by _service_restart_coordinators).
+        # Contract (see _note_offline_lane docstring): the notifiee is awaited
+        # synchronously on the merge-landed hot path, so it must
+        # enqueue-and-return promptly rather than block on the deep-test run.
+        self._offline_lane_notifiee: Callable[[str, str, str], Awaitable[object]] | None = None
+
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
 
@@ -4989,7 +4999,14 @@ Output JSON matching the schema. Every task must appear in the output.
         all coordinators with a WARNING (fail-open); a legitimately empty diff
         (revert merges, ``.task/``-only merges) calls all coordinators with an
         empty file list — no restart is armed, but no coordinators are skipped.
+
+        The offline deep-test lane notifiee (if registered) is notified BEFORE
+        the diff fetch below, since it needs only the fact that ``main``
+        advanced, not the changed-file list — it must fire on every landed
+        advance even when the diff fetch errors (which skips the coordinators).
         """
+        await self._note_offline_lane(task_id, base_sha, head_sha)
+
         prefetched_diff, err = await self.git_ops.get_merge_diff_files(base_sha, head_sha)
         if err is not None:
             logger.warning(
@@ -5010,6 +5027,40 @@ Output JSON matching the schema. Every task must appear in the output.
                     exc,
                     exc_info=True,
                 )
+
+    async def _note_offline_lane(
+        self, task_id: str, base_sha: str, head_sha: str
+    ) -> None:
+        """Notify the offline deep-test lane's on_post_merge notifiee, if registered.
+
+        β2 (the offline lane worker, not yet built) will set
+        ``self._offline_lane_notifiee`` to its own ``on_post_merge`` callback.
+        Until then ``self._offline_lane_notifiee`` is None and this is a no-op.
+
+        Contract: the notifiee is awaited synchronously and BLOCKS this call —
+        it sits on the merge-landed hot path, ahead of the diff fetch and the
+        service-restart coordinator fan-out in ``_note_merge_all``. Only
+        exceptions are handled here (fail-open); slowness is not. β2's
+        notifiee MUST enqueue-and-return promptly (e.g. flip a dirty flag and
+        wake a waiter) rather than perform the deep-test run inline, or it
+        will stall post-merge processing for the SpeculativeMergeWorker.
+        """
+        notifiee = self._offline_lane_notifiee
+        if notifiee is None:
+            return
+        logger.info(
+            'offline-lane: on_post_merge %s..%s',
+            base_sha[:12],
+            head_sha[:12],
+        )
+        try:
+            await notifiee(task_id, base_sha, head_sha)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'offline-lane on_post_merge notifiee raised for task %s; ignoring (fail-open)',
+                task_id,
+                exc_info=True,
+            )
 
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.
