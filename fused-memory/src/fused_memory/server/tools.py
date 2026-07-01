@@ -35,7 +35,11 @@ from fused_memory.middleware.task_interceptor import (
 )
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
-from fused_memory.reconciliation.task_filter import ACTIVE_TASK_STATUSES, is_count_snapshot
+from fused_memory.reconciliation.task_filter import (
+    ACTIVE_TASK_STATUSES,
+    is_count_snapshot,
+    is_mixed_temporal_framing,
+)
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     validate_int_ids,
@@ -693,6 +697,17 @@ def create_mcp_server(
                     ),
                     'error_type': 'ValidationError',
                 }
+        if (
+            isinstance(agent_id, str)
+            and agent_id.startswith('recon-stage-')
+            and is_mixed_temporal_framing(content)
+        ):
+            return {
+                'error': 'mixed_temporal_framing_write_blocked',
+                'error_type': 'ReconMixedFramingWriteRejected',
+                'agent_id': agent_id,
+                'content_excerpt': content[:200],
+            }
         try:
             causation_id, op_source, _ = _extract_causation(metadata, agent_id)
             result = await memory_service.add_episode(
@@ -763,6 +778,18 @@ def create_mcp_server(
             return {
                 'error': 'count_snapshot_write_blocked',
                 'error_type': 'ReconSnapshotWriteRejected',
+                'agent_id': agent_id,
+                'content_excerpt': content[:200],
+            }
+        if (
+            category == 'temporal_facts'
+            and isinstance(agent_id, str)
+            and agent_id.startswith('recon-stage-')
+            and is_mixed_temporal_framing(content)
+        ):
+            return {
+                'error': 'mixed_temporal_framing_write_blocked',
+                'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
                 'content_excerpt': content[:200],
             }

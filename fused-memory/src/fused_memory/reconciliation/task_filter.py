@@ -60,6 +60,52 @@ def strip_snapshot_lines(text: str) -> tuple[str, int]:
 
 
 # --------------------------------------------------------------------------- #
+# Mixed temporal-framing detection (task 1950)
+# --------------------------------------------------------------------------- #
+
+# Recon-stage temporal_facts writes must describe resulting state only. A
+# single write that mixes PRIOR/superseded-state framing ("was X", "previously
+# used Y") with RESULTING/current-state framing ("now overlays Z") causes
+# Graphiti's extraction pipeline to atomize the content into multiple
+# co-current edges — one for the stale fragment, one for the accurate
+# fragment — which are then self-contradictory (incident: episode 8e2cec60,
+# edges 8fb94dc2 stale + 5d080132 accurate).
+#
+# Detection is deterministic lexical matching (word-boundary alternation over
+# a fixed marker list), mirroring is_count_snapshot above and
+# detect_task_dump_contamination below rather than semantic/LLM
+# classification: no fragile thresholds, fully unit-testable. This may
+# occasionally false-positive on prose that combines both marker classes
+# without describing an actual state transition; the impact is bounded — a
+# rejected recon write is simply rephrased and retried, the same tolerance
+# documented for the sibling detectors in this module.
+#
+# Requiring BOTH marker classes to co-occur keeps well-formed resulting-
+# state-only writes (no prior marker) and single-marker facts (only 'now' or
+# only 'was', with no paired transition) passing — i.e. the detector fails
+# open on under-firing by design.
+PRIOR_STATE_RE: re.Pattern[str] = re.compile(
+    r'\b(?:was|were|previously|formerly|originally|used to|no longer|had been|'
+    r'prior to|deprecated|stale)\b',
+    re.IGNORECASE,
+)
+
+RESULTING_STATE_RE: re.Pattern[str] = re.compile(
+    r'\b(?:now|currently|after the fix|updated to|changed to|switched to|'
+    r'migrated to|resulting)\b',
+    re.IGNORECASE,
+)
+
+
+def is_mixed_temporal_framing(text: str) -> bool:
+    """Return True when text co-mentions a PRIOR/superseded-state marker AND a
+    RESULTING/current-state marker — the "was X, now Y" transition-prose shape
+    that causes Graphiti extraction to emit self-contradictory co-current edges.
+    """
+    return bool(PRIOR_STATE_RE.search(text)) and bool(RESULTING_STATE_RE.search(text))
+
+
+# --------------------------------------------------------------------------- #
 # Status constants
 # --------------------------------------------------------------------------- #
 

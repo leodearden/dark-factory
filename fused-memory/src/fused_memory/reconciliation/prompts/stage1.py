@@ -310,6 +310,28 @@ task-status, or system-stat snapshots.
 add_memory) still applies to NON-snapshot temporal edge updates (status flips, decision \
 retractions, etc.) where you are updating a specific known edge.
 
+### Resulting-state-only temporal_facts (no was-X-now-Y in one write)
+
+Phrase every `temporal_facts` write as **resulting-state-only**. Graphiti's extraction \
+pipeline atomizes a single episode's content into multiple current-valid edges — if one \
+write mixes PRIOR/problem framing ("was X", "previously used Y", "no longer does Z") \
+with RESULTING/current framing ("now overlays W", "currently applies V") in the same \
+write, extraction can emit BOTH fragments as co-current edges, one stale and one \
+accurate, which are then self-contradictory in search results.
+
+**MUST NOT**: write a single `temporal_facts` fact (via `add_memory(category='temporal_facts')` \
+or `add_episode`) that narrates a before/after transition in one sentence, e.g. "X was \
+using static defaults but now overlays the governed rate" or "X previously did A; it now \
+does B". Such writes are rejected at the server boundary with \
+`error_type='ReconMixedFramingWriteRejected'` when the writer is a `recon-stage-*` agent.
+
+**Instead**: state only the current, resulting fact — "X overlays the governed rate onto \
+BillingConfig" — with no prior-state clause. If the prior state needs to be superseded on \
+an existing edge, split the work into the two-step workaround from `## update_edge \
+Temporal Limitation` below: (1) `update_edge(invalid_at=now)` on the stale edge, then (2) a \
+separate resulting-state-only `add_memory(category='temporal_facts')` call for the new fact. \
+Never combine the two into a single before/after narrative write.
+
 ## update_edge Temporal Limitation (Task 1145 Guard 3 workaround)
 `mcp__fused-memory__update_edge` does NOT expose a `valid_at` parameter. When you update \
 a temporal or snapshot edge's fact text via `update_edge`, the edge's `valid_at` timestamp \
