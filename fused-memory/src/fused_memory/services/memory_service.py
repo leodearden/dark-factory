@@ -562,6 +562,45 @@ class MemoryService:
         logger.debug(f'Durable dual-wrote fact to Mem0: {fact_text[:80]}')
         return result
 
+    async def _refresh_entity_summaries_from_result(
+        self, result: Any, group_id: str
+    ) -> None:
+        """Best-effort post-ingestion summary refresh for edge endpoints in *result*.
+
+        Graphiti's ``add_episode`` LLM extraction pipeline invalidates/supersedes/
+        dedups edges internally as a side effect of ingestion, without any
+        fused-memory code observing which edges changed. This helper closes that
+        gap: it reads the edges returned by the ingestion call (mirrors the
+        ``result.edges`` / ``result.entity_edges`` idiom used elsewhere in this
+        file), collects the deduplicated set of non-empty source/target node
+        uuids, and calls ``refresh_entity_summary`` for each — so the entity
+        nodes touched by this write get a freshly rebuilt summary.
+
+        Args:
+            result: The value returned by ``add_episode`` (or equivalent),
+                    typically carrying an ``edges`` (or ``entity_edges``)
+                    attribute. ``None`` and empty/missing edges are a no-op.
+            group_id: Graphiti graph id to refresh within.
+        """
+        if result is None:
+            return
+
+        edges = getattr(result, 'edges', None) or getattr(result, 'entity_edges', None) or []
+        if not edges:
+            return
+
+        uuids: dict[str, None] = {}  # ordered dedup set
+        for edge in edges:
+            src_uuid = getattr(edge, 'source_node_uuid', '') or ''
+            tgt_uuid = getattr(edge, 'target_node_uuid', '') or ''
+            if src_uuid:
+                uuids[src_uuid] = None
+            if tgt_uuid:
+                uuids[tgt_uuid] = None
+
+        for node_uuid in uuids:
+            await self.graphiti.refresh_entity_summary(node_uuid, group_id=group_id)
+
     async def _dual_write_callback(
         self, callback_type: str, result: Any, payload: dict[str, Any]
     ) -> None:
