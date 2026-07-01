@@ -54,3 +54,19 @@ async def test_cycle_calls_rebuild_once_per_project():
 
     assert [c['project_id'] for c in fake_service.calls] == ['proj_a', 'proj_b']
     assert all(c['force'] is True for c in fake_service.calls)
+
+
+@pytest.mark.asyncio
+async def test_cycle_noop_when_disabled_or_no_projects():
+    """The cycle must not call rebuild_entity_summaries when disabled or empty."""
+    fake_service = _FakeMemoryService()
+
+    # Case A: disabled, even with configured projects.
+    disabled_cfg = SummaryRebuildConfig(enabled=False, projects=['proj_a'])
+    await server_main._run_rebuild_summaries_cycle(fake_service, disabled_cfg)
+    assert fake_service.calls == []
+
+    # Case B: enabled, but no projects configured.
+    empty_cfg = SummaryRebuildConfig(enabled=True, projects=[])
+    await server_main._run_rebuild_summaries_cycle(fake_service, empty_cfg)
+    assert fake_service.calls == []
