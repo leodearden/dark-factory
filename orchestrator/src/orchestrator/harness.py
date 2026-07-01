@@ -32,6 +32,7 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.review_checkpoint import ReviewCheckpoint
@@ -747,6 +748,12 @@ class Harness:
         # synchronously on the merge-landed hot path, so it must
         # enqueue-and-return promptly rather than block on the deep-test run.
         self._offline_lane_notifiee: Callable[[str, str, str], Awaitable[object]] | None = None
+        # The OfflineLaneWorker instance + its background asyncio.Task (task
+        # 1953, β2).  Both None until _start_offline_lane builds and launches
+        # them (enable-gated: offline_lane_enabled AND
+        # persistent_offline_deep_worktree); cleared by _stop_offline_lane.
+        self._offline_lane_worker: OfflineLaneWorker | None = None
+        self._offline_lane_task: asyncio.Task | None = None
 
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
@@ -924,6 +931,11 @@ class Harness:
 
             # 1b2. Start merge worker
             await self._start_merge_worker()
+
+            # 1b3. Start the singleton offline-deep lane worker (task 1953,
+            # β2) — enable-gated (offline_lane_enabled AND
+            # persistent_offline_deep_worktree); a clean no-op otherwise.
+            await self._start_offline_lane()
 
             # 1c. Dismiss stale escalations from prior runs (non-fatal)
             try:
@@ -1336,6 +1348,10 @@ class Harness:
                 await self._stop_merge_worker()
             except Exception as e:
                 logger.warning(f'_stop_merge_worker() failed: {e}')
+            try:
+                await self._stop_offline_lane()
+            except Exception as e:
+                logger.warning(f'_stop_offline_lane() failed: {e}')
             try:
                 await self._stop_orphan_l0_reaper()
             except Exception as e:
@@ -5061,6 +5077,72 @@ Output JSON matching the schema. Every task must appear in the output.
                 task_id,
                 exc_info=True,
             )
+
+    # ------------------------------------------------------------------
+    # Offline deep-test lane: lifecycle (task 1953, β2)
+    # ------------------------------------------------------------------
+
+    async def _start_offline_lane(self) -> None:
+        """Start the singleton offline-deep lane worker, enable-gated.
+
+        Both ``offline_lane_enabled`` and ``persistent_offline_deep_worktree``
+        must be True — the worker cannot run without its dedicated
+        ``_offline-deep`` worktree (δ, task 1952) — so a single knob left off
+        is a clean no-op.  Default False/False → byte-identical to prior
+        behaviour (trivially revertible).
+
+        Mirrors ``_start_merge_worker``'s create_task launch, but is
+        additionally gated on a lockfile acquire: a refused acquire (e.g. a
+        second orchestrator instance racing to start the same lane) is
+        logged and skipped (fail-open) rather than raised, leaving the
+        notifiee slot at None so ``_note_offline_lane`` stays a clean no-op.
+        """
+        if not (
+            self.config.git.offline_lane_enabled
+            and self.config.git.persistent_offline_deep_worktree
+        ):
+            return
+        if self._offline_lane_task is not None and not self._offline_lane_task.done():
+            return
+
+        lock_path = self.config.project_root / 'data' / 'orchestrator' / 'offline_lane.lock'
+        worker = OfflineLaneWorker(self.git_ops, self.config, lock_path=lock_path)
+        if not worker.acquire_lock():
+            logger.warning(
+                'Offline-deep lane: lock acquire refused (another instance holds '
+                '%s); skipping start',
+                lock_path,
+            )
+            return
+
+        self._offline_lane_worker = worker
+        self._offline_lane_notifiee = worker.on_post_merge
+        self._offline_lane_task = asyncio.create_task(worker.run(), name='offline-lane')
+        logger.info('Offline-deep lane worker started')
+
+    async def _stop_offline_lane(self) -> None:
+        """Stop the offline-deep lane worker gracefully and release its lock.
+
+        Mirrors ``_stop_merge_worker``: cancel + suppress + None.  Also
+        releases the worker's lockfile and clears the notifiee slot, so a
+        stopped lane leaves ``_note_offline_lane`` a clean no-op again
+        (mirroring the pre-start production default) rather than a dangling
+        registration pointing at a worker with no running consumer loop.
+        Safe to call when the lane was never started (clean no-op — logs
+        nothing, matching ``_stop_merge_worker``'s guarded log line).
+        """
+        if self._offline_lane_task is None and self._offline_lane_worker is None:
+            return
+        if self._offline_lane_task is not None:
+            self._offline_lane_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._offline_lane_task
+            self._offline_lane_task = None
+        if self._offline_lane_worker is not None:
+            self._offline_lane_worker.release_lock()
+            self._offline_lane_worker = None
+        self._offline_lane_notifiee = None
+        logger.info('Offline-deep lane worker stopped')
 
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.

@@ -828,6 +828,43 @@ class GitConfig(BaseModel):
             'the β2 consumer.'
         ),
     )
+    offline_lane_enabled: bool = Field(
+        default=False,
+        description=(
+            'When True (AND persistent_offline_deep_worktree is also True), '
+            'Harness launches the singleton offline-deep lane worker (task '
+            '1953, β2): a background loop that runs the heavy reify test '
+            'suite off the verify hot path, always from the current main '
+            'head, on every post-merge advance.  Default False → byte-'
+            'identical to prior behaviour (trivially revertible); both '
+            'knobs must be on since the worker cannot run without its '
+            'dedicated _offline-deep worktree.'
+        ),
+    )
+    offline_lane_test_threads: int = Field(
+        default=6,
+        ge=1,
+        description=(
+            'Value passed as --test-threads=N to scripts/run-offline-deep.sh '
+            'by the offline-deep lane worker (β2, PRD §11.2).  A small fixed '
+            'N in the suggested 4-8 band; not frozen, retunable via '
+            'orchestrator.yaml without a code change.'
+        ),
+    )
+    offline_lane_poll_interval_secs: float = Field(
+        default=120.0,
+        gt=0,
+        description=(
+            'Poll-backstop cadence (seconds) for the offline-deep lane '
+            "worker (β2): when the worker's wake event times out, it "
+            'compares a fresh git_ops.get_main_sha() against the head of '
+            'its last completed run and treats a mismatch as run-worthy. '
+            'Catches a missed on_post_merge trigger (e.g. a crash between '
+            'the merge and the notifiee call); correctness lives in the '
+            'run-start head snapshot, not the trigger, so a missed trigger '
+            'only costs granularity.'
+        ),
+    )
     persistent_merge_worktree_safety_valve_every_n: int = Field(
         default=0,
         ge=0,
