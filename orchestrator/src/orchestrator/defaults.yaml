@@ -301,6 +301,16 @@ git:
   # fallback (inv.6, never blocks).  The existing warm_verify_shadow_compare
   # valve covers spec-lane warm verifies automatically.  Default false.
   merge_spec_warm_lane_pool: false
+  # Offline-deep lane worker (task 1953, β2).  offline_lane_enabled gates
+  # Harness launching the singleton background worker; it also requires
+  # persistent_offline_deep_worktree (task 1952, δ) to be true, since the
+  # worker has no dedicated worktree to run in otherwise.  Default false →
+  # byte-identical to prior behaviour (trivially revertible).
+  offline_lane_enabled: false
+  # --test-threads=N passed to scripts/run-offline-deep.sh (§11.2 small fixed N).
+  offline_lane_test_threads: 6
+  # Poll-backstop cadence (seconds) catching a missed on_post_merge trigger.
+  offline_lane_poll_interval_secs: 120.0
 
 # Autonomous dry-run unblock hook
 unblock_auto:
