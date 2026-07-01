@@ -72,3 +72,27 @@ class TestOfflineLaneTrigger:
         assert 'offline-lane: on_post_merge' in caplog.text
         assert 'base-sha'[:12] in caplog.text
         assert 'head-sha'[:12] in caplog.text
+
+    async def test_offline_lane_notifiee_raise_is_swallowed_fail_open(
+        self, harness: Harness, caplog
+    ):
+        """A raising offline-lane notifiee must not block the coordinator fan-out."""
+        harness._offline_lane_notifiee = AsyncMock(side_effect=RuntimeError('lane boom'))
+        coord_a = MagicMock()
+        coord_a.note_merge = AsyncMock()
+        coord_b = MagicMock()
+        coord_b.note_merge = AsyncMock()
+        harness._service_restart_coordinators = [coord_a, coord_b]
+
+        with caplog.at_level(logging.WARNING):
+            # Must NOT raise
+            await harness._note_merge_all('task-2', 'base2', 'head2')
+
+        coord_a.note_merge.assert_awaited_once_with(
+            'task-2', 'base2', 'head2', prefetched_diff=[]
+        )
+        coord_b.note_merge.assert_awaited_once_with(
+            'task-2', 'base2', 'head2', prefetched_diff=[]
+        )
+        assert 'fail-open' in caplog.text
+        assert 'task-2' in caplog.text
