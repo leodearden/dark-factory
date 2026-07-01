@@ -452,6 +452,53 @@ def compute_failing_test_set_fingerprint(failing_test_ids: list[str]) -> str:
         return ''
 
 
+def build_offline_lane_fix_task_arguments(
+    failing_test_ids: list[str],
+    suspect_range: str,
+    fingerprint: str,
+    project_root: str | Path,
+    head: str,
+) -> dict:
+    """Build the ``submit_task`` argument block for an offline-lane fix task (β3).
+
+    Modeled on :meth:`TaskWorkflow._spawn_main_health_fix_task`'s argument
+    block (title/description/priority/project_root/metadata), but routed
+    THROUGH the standard TDD→PR→merge gate rather than the high/red-main
+    lane: ``status='pending'`` and ``metadata.merge_lane='normal'`` (never
+    the B3 red-main fix-forward path — that class hard-aborts to a human;
+    D1/§10 "the fix goes through the gate").
+
+    ``metadata.failing_tests`` is stored sorted (matching the fingerprint's
+    own sort) and ``metadata.suspect_ranges`` is seeded as a single-element
+    list so the caller can append further ranges as the same fingerprint
+    recurs across advances (C3) without restructuring the field.
+    """
+    sorted_ids = sorted(failing_test_ids)
+    test_list = ', '.join(sorted_ids)
+    title = f'offline-lane: fix {len(sorted_ids)} failing test(s) ({test_list})'
+    description = (
+        f'The offline-deep lane confirmed a red run with failing tests: '
+        f'{test_list}.\n\nSuspect commit range: {suspect_range}\n'
+        f'Head at detection: {head}\n\n'
+        f'This task was auto-filed by the offline-deep lane worker (β3). It '
+        f'merges via the standard gate, never the red-main fix-forward path.'
+    )
+    return {
+        'title': title,
+        'description': description,
+        'status': 'pending',
+        'priority': 'high',
+        'project_root': str(project_root),
+        'metadata': {
+            'merge_lane': 'normal',
+            'spawn_context': 'offline_lane_red',
+            'offline_lane_fingerprint': fingerprint,
+            'failing_tests': sorted_ids,
+            'suspect_ranges': [suspect_range],
+        },
+    }
+
+
 def _line_ranges_stackable(
     ranges_a: dict[str, list[tuple[int, int]]],
     ranges_b: dict[str, list[tuple[int, int]]],
