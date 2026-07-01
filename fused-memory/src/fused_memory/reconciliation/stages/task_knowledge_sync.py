@@ -12,7 +12,7 @@ import sys
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -961,6 +961,44 @@ async def _query_stage2_flags(
             },
         )
     return Stage2FlagPartition(current_flags, stale_missing_run_id_ids, stale_mismatched_run_id_ids, rescued_ids)
+
+
+def _query_recon_report_findings(
+    recon_report_state: Any,
+    run_id: str,
+    *,
+    categories: frozenset[str] = frozenset({'systemic_pattern'}),
+) -> list[dict]:
+    """Poll the recon_report channel for *run_id*, filtered to *categories*.
+
+    Independent second channel (task-1966 scope item 2): unlike the Mem0
+    flagged-items channel (``_query_stage2_flags`` / Stage 1's
+    ``items_flagged``), findings read via ``recon_report_state.get_findings_for_run``
+    do NOT pass through ``filter_suppressed`` — a ``stage1_flag_suppression``
+    record can never hide a ``systemic_pattern`` finding from Stage 2 through
+    this path.
+
+    Reached via duck-typed method call (no import of ``ReconReportState`` —
+    mirrors ``base.py``'s ``_active_rrs.get_assembled_report`` usage, avoiding
+    a server←reconciliation import).
+
+    Best-effort, mirrors :func:`_query_stage2_flags`: returns ``[]`` when
+    *recon_report_state* is ``None`` (recon_report channel not configured for
+    this stage instance — no call is made) or when
+    ``get_findings_for_run`` raises (logs a WARNING; never propagates).
+    """
+    if recon_report_state is None:
+        return []
+    try:
+        findings = recon_report_state.get_findings_for_run(run_id)
+    except Exception:
+        logger.warning(
+            'reconciliation._query_recon_report_findings: get_findings_for_run '
+            'failed; skipping recon_report channel this cycle',
+            extra={'run_id': run_id},
+        )
+        return []
+    return [f for f in findings if f.get('category') in categories]
 
 
 def _compute_stale_flags(
