@@ -2266,6 +2266,48 @@ class TestRefreshEntitySummariesFromResult:
         assert 'n1' in warning_records[0].message
 
 
+class TestDualWriteCallbackRefreshesSummaries:
+    """step-05/06: _dual_write_callback also triggers a post-ingestion summary
+    refresh for edge endpoints touched by add_episode, in addition to its
+    existing Mem0 batch-enqueue side effect."""
+
+    @pytest.mark.asyncio
+    async def test_callback_refreshes_endpoints_and_still_enqueues_mem0(self, service):
+        """refresh_entity_summary is awaited for each edge endpoint, and the
+        existing Mem0 batch-enqueue side effect is preserved."""
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(edges=[
+            MockEdge(
+                fact='Auth depends on Redis',
+                source_node_uuid='auth',
+                target_node_uuid='redis',
+            ),
+        ])
+        payload = {
+            'project_id': 'test',
+            'group_id': 'test',
+            'agent_id': 'a',
+            '_causation_id': 'c',
+        }
+        await service._dual_write_callback('dual_write_episode', result, payload)
+
+        service.durable_queue.enqueue_batch.assert_called_once()
+
+        assert service.graphiti.refresh_entity_summary.await_count == 2, (
+            'Expected refresh for both edge endpoints (auth, redis), got '
+            f'{service.graphiti.refresh_entity_summary.await_count}'
+        )
+        called_uuids = {
+            call.args[0] for call in service.graphiti.refresh_entity_summary.call_args_list
+        }
+        assert called_uuids == {'auth', 'redis'}
+        for call in service.graphiti.refresh_entity_summary.call_args_list:
+            assert call.kwargs['group_id'] == 'test'
+
+
 class TestExecuteGraphitiWritePlanningRegistration:
     """step-5: _execute_graphiti_write registers episodes when temporal_context='planning'."""
 
