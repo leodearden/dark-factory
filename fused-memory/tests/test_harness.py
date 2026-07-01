@@ -7516,6 +7516,93 @@ class TestHarnessReconcileStatusCorrection:
         harness.memory.add_memory.assert_not_called()
         harness.memory.delete_memory.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_diverged_cache_is_superseded_incident_replay(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Reproduces the incident: cached memory 'af698512...' still lists
+        tasks 112/113/114/117 as active after they transitioned to done.
+
+        Live census: 114 done / 124 total / 10 active.
+
+        step-11 (RED): the supersede branch does not exist yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        statuses = {str(i): 'done' for i in range(1, 110)}
+        statuses.update({
+            '110': 'pending',
+            '111': 'done',
+            '112': 'done',
+            '113': 'done',
+            '114': 'done',
+            '115': 'pending',
+            '116': 'in-progress',
+            '117': 'done',
+            '118': 'pending',
+        })
+        statuses.update({str(i): 'pending' for i in range(119, 125)})
+        assert len(statuses) == 124
+
+        cached_memory = {
+            'id': 'af698512-stale-memory',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 110,
+                'task_count_total': 124,
+                'active_tasks': [
+                    110, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124,
+                ],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[cached_memory])
+        harness.memory.add_memory = AsyncMock(return_value={'status': 'created'})
+        harness.memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+
+        result = await harness._reconcile_status_correction('test-project', statuses)
+
+        live_active = [110, 115, 116, 118, 119, 120, 121, 122, 123, 124]
+
+        # (1) add_memory awaited exactly once with the corrected metadata
+        harness.memory.add_memory.assert_awaited_once()
+        add_kwargs = harness.memory.add_memory.call_args.kwargs
+        assert add_kwargs['category'] == 'observations_and_summaries'
+        assert add_kwargs['project_id'] == 'test-project'
+        assert add_kwargs['metadata']['kind'] == 'project_status_correction'
+        assert add_kwargs['metadata']['supersedes'] == 'af698512-stale-memory'
+        assert add_kwargs['metadata']['task_count_done'] == 114
+        assert add_kwargs['metadata']['task_count_total'] == 124
+        assert sorted(add_kwargs['metadata']['active_tasks']) == live_active
+        assert add_kwargs['metadata'].get('source'), (
+            'expected a provenance source marker in the corrected metadata'
+        )
+
+        # (2) the corrected content must NOT match the count-snapshot regex —
+        # it must survive strip_snapshot_lines / filter_stale_count_snapshot_corrections
+        # when it re-enters a future Stage 1 payload.
+        from fused_memory.reconciliation.task_filter import is_count_snapshot
+        assert not is_count_snapshot(add_kwargs['content']), (
+            f"Corrected memory content must not match the count-snapshot regex; "
+            f"got {add_kwargs['content']!r}"
+        )
+
+        # (3) delete_memory awaited for the stale memory
+        harness.memory.delete_memory.assert_awaited_once_with(
+            memory_id='af698512-stale-memory',
+            store='mem0',
+            project_id='test-project',
+        )
+
+        # (4) return record carries old/new snapshots
+        assert result['diverged'] is True
+        assert result['superseded'] is True
+        assert result['memory_id'] == 'af698512-stale-memory'
+        assert result['old']['done'] == 110
+        assert result['new']['done'] == 114
+        assert result['new']['total'] == 124
+        assert sorted(result['new']['active_tasks']) == live_active
+
 
 # ── Tests for task 1785: harness._configure_consolidator new kwargs ─────────────
 
