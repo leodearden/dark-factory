@@ -5128,6 +5128,38 @@ class TestPersistentOfflineDeepWorktree:
             'lane target/ (C5)'
         )
 
+    # ------------------------------------------------------------------
+    # Step 9 — cleanup_merge_worktree is a no-op on the fixed offline-deep path
+    # ------------------------------------------------------------------
+
+    async def test_cleanup_merge_worktree_noop_on_offline_deep_path(
+        self, git_ops: GitOps,
+    ):
+        """cleanup_merge_worktree is a no-op on _offline-deep (it survives).
+
+        Mirrors test_cleanup_merge_worktree_noop_on_persistent_path.
+
+        Step 9 (RED): the current guard only exempts
+        persistent_merge_worktree_path, so the offline-deep path would be
+        force-removed.
+        """
+        merge_commit = await _get_merge_commit(
+            git_ops, 'offline-deep-cleanup-1', 'offline_deep_cleanup.py',
+        )
+        warm_path = await git_ops.reset_persistent_offline_deep_worktree(merge_commit)
+        assert warm_path.exists()
+
+        # Call cleanup on the fixed path — must be a no-op
+        await git_ops.cleanup_merge_worktree(warm_path)
+
+        # Offline-deep worktree still registered and still on disk
+        assert warm_path.exists(), (
+            '_offline-deep worktree must survive cleanup_merge_worktree'
+        )
+        assert await git_ops._is_registered_worktree(warm_path), (
+            '_offline-deep worktree must still be registered after cleanup call'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Task 1699 — per-host disk-persistent attempt counter (step-3 RED)
