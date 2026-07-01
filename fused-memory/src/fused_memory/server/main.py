@@ -899,6 +899,24 @@ async def run_server():
     else:
         logger.info('  Checkpoint loop: no SQLite targets — skipped')
 
+    # Periodic entity-summary rebuild loop — scheduled staleness backstop
+    # (fix (b), task 1958; follow-up to task 1949's fix (a) best-effort
+    # post-ingestion refresh). Disabled by default; an operator opts in by
+    # setting summary_rebuild.enabled and listing summary_rebuild.projects.
+    rebuild_summaries_task: asyncio.Task[None] | None = None
+    if config.summary_rebuild.enabled and config.summary_rebuild.projects:
+        rebuild_summaries_task = asyncio.create_task(
+            _periodic_rebuild_summaries_loop(memory_service, config.summary_rebuild),
+        )
+        logger.info(
+            '  Summary rebuild loop: enabled (interval=%.0fs projects=%s force=%s)',
+            config.summary_rebuild.interval_seconds,
+            config.summary_rebuild.projects,
+            config.summary_rebuild.force,
+        )
+    else:
+        logger.info('  Summary rebuild loop: disabled')
+
     # Run transport
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
@@ -1041,6 +1059,10 @@ async def run_server():
             checkpoint_task.cancel()
             with contextlib.suppress(BaseException):
                 await checkpoint_task
+        if rebuild_summaries_task is not None:
+            rebuild_summaries_task.cancel()
+            with contextlib.suppress(BaseException):
+                await rebuild_summaries_task
         await _shutdown_with_watchdog(
             memory_service=memory_service,
             task_interceptor=task_interceptor,

@@ -155,3 +155,15 @@ curator:
     interval_seconds: 60
     cooldown_seconds: 3600
     batch_limit: 100
+
+# Periodic entity-summary rebuild — scheduled staleness backstop (fix (b),
+# task 1958; follow-up to task 1949's fix (a) best-effort post-ingestion
+# refresh). Calls memory_service.rebuild_entity_summaries(project_id, force)
+# on each listed project every interval_seconds. Disabled by default
+# (enabled: false, projects: []) — costs nothing until an operator opts in
+# by enabling it and listing the project_ids to sweep.
+summary_rebuild:
+  enabled: false
+  interval_seconds: 3600
+  projects: []
+  force: false
