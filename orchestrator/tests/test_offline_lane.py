@@ -683,3 +683,61 @@ async def test_handle_red_run_dedup_appends_suspect_range_not_new_task(tmp_path:
     task_client.submit_fix_task.assert_not_awaited()
     escalation_queue.submit.assert_not_called()
     assert worker._red_advance_counts[fp] == 2
+
+
+# ---------------------------------------------------------------------------
+# _maybe_promote_blocker — STALL -> escalate_blocker by N-advances (β3, task 1954, step-15/16)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_promotes_blocker_at_n_advances(tmp_path: Path):
+    """A same-set red advance that reaches N confirmed-red advances stages a
+    born-at-L2 ``escalate_blocker`` promotion (B7/C4) — exactly once, and a
+    further same-set advance beyond N must not re-promote (idempotent) nor
+    spawn a new fix task.
+
+    Step 15 (RED): _maybe_promote_blocker is a no-op stub — must fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.get_status = AsyncMock(return_value='in-progress')
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-fix-99-2'
+
+    config = _make_config(tmp_path, offline_lane_red_advances_before_blocker=3)
+    worker = _make_worker(
+        tmp_path,
+        config=config,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    worker.open_fix_tasks[fp] = 'fix-99'
+    worker._red_advance_counts[fp] = 2
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD3')
+
+    assert worker._red_advance_counts[fp] == 3, 'count still bumps on the promoting advance'
+    escalation_queue.submit.assert_called_once()
+    esc = escalation_queue.submit.call_args.args[0]
+    assert esc.severity == 'critical'
+    assert esc.level == 2
+    assert esc.agent_role == 'orchestrator-offline-lane'
+    assert esc.task_id == 'fix-99'
+    task_client.submit_fix_task.assert_not_awaited()
+
+    # A 4th same-set advance must NOT file a further blocker (idempotent) and
+    # must NOT spawn a new fix task.
+    await worker._handle_red_run(wt, 'HEAD4')
+
+    assert worker._red_advance_counts[fp] == 4
+    escalation_queue.submit.assert_called_once()
+    task_client.submit_fix_task.assert_not_awaited()
