@@ -1909,6 +1909,53 @@ class TestBuildSuppressionPayload:
 
 
 # ---------------------------------------------------------------------------
+# build_suppression_payload — optional flag_types allowlist (task-1966 step-1)
+#
+# RED until step-2 adds the flag_types param.  All TestBuildSuppressionPayload
+# assertions above (legacy shape) must remain green throughout.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSuppressionPayloadFlagTypes:
+    """Tests for the OPTIONAL flag_types scoping allowlist (task-1966)."""
+
+    def test_legacy_call_has_no_flag_types_key(self):
+        """(a) build_suppression_payload(42) still equals the canonical dict —
+        NO 'flag_types' key in metadata (backward compat)."""
+        result = build_suppression_payload(42)
+        assert result == {
+            'content': 'STAGE 1 FLAG SUPPRESSION task_id=42',
+            'category': 'observations_and_summaries',
+            'metadata': {'kind': 'stage1_flag_suppression', 'task_id': 42},
+        }
+        assert 'flag_types' not in result['metadata']
+
+    def test_scoped_call_includes_flag_types_in_metadata(self):
+        """(b) Non-empty flag_types produces metadata.task_id (int-coerced) AND
+        metadata.flag_types (list[str]); content is still the canonical
+        non-empty 'STAGE 1 FLAG SUPPRESSION task_id=452...' string."""
+        result = build_suppression_payload(452, flag_types=['human_review_required_deferred'])
+        assert result['metadata']['task_id'] == 452
+        assert isinstance(result['metadata']['task_id'], int)
+        assert result['metadata']['flag_types'] == ['human_review_required_deferred']
+        assert isinstance(result['content'], str) and result['content']
+        assert result['content'].startswith('STAGE 1 FLAG SUPPRESSION task_id=452')
+
+    def test_flag_types_normalized_sorted_unique_str_coerced(self):
+        """(c) Mixed/duplicate/unsorted flag_types normalize to sorted-unique,
+        every element str-coerced."""
+        result = build_suppression_payload(452, flag_types=['b', 'a', 'a'])
+        assert result['metadata']['flag_types'] == ['a', 'b']
+        assert all(isinstance(x, str) for x in result['metadata']['flag_types'])
+
+    @pytest.mark.parametrize('flag_types', [None, []], ids=['none', 'empty_list'])
+    def test_none_or_empty_flag_types_yields_legacy_shape(self, flag_types):
+        """(d) flag_types=[] or None yields the legacy no-flag_types shape."""
+        result = build_suppression_payload(452, flag_types=flag_types)
+        assert 'flag_types' not in result['metadata']
+
+
+# ---------------------------------------------------------------------------
 # Round-trip schema validation tests (task-1185 step-5)
 #
 # FakeMemoryService: in-test stub generalising the FakeMem0 pattern already
