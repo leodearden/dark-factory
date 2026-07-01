@@ -808,7 +808,19 @@ class ReconciliationHarness:
                 'superseded': False,
             }
 
-        # step-10/step-12/step-14 (GREEN) will replace this stub.
+        latest = max(memories, key=lambda m: m.get('created_at') or '')
+        diff = diff_status_correction(latest.get('metadata') or {}, statuses)
+
+        if not diff['diverged']:
+            return {
+                'available': True,
+                'found': True,
+                'diverged': False,
+                'superseded': False,
+                'memory_id': latest['id'],
+            }
+
+        # step-12/step-14 (GREEN) will replace this stub.
         raise NotImplementedError
 
     # ── Stale-run recovery ─────────────────────────────────────────────
