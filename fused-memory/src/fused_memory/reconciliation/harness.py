@@ -45,6 +45,7 @@ from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     cross_verify_task_counts,
+    diff_status_correction,
     filter_task_tree,
 )
 from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
@@ -562,6 +563,7 @@ class ReconciliationHarness:
         filtered_task_tree: FilteredTaskTree | None = None,
         task_count_verification: dict | None = None,
         graphiti_queue_health: dict | None = None,
+        status_correction_reconciliation: dict | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
 
@@ -576,6 +578,9 @@ class ReconciliationHarness:
             in full-cycle passes; None in remediation passes).
         graphiti_queue_health: summarize_graphiti_queue_health record (available only
             in full-cycle passes; None in remediation passes).
+        status_correction_reconciliation: _reconcile_status_correction record
+            (task 1938; available only in full-cycle passes; None in
+            remediation passes).
         """
         stage.episode_limit = tier.episode_limit
         stage.memory_limit = tier.memory_limit
@@ -586,6 +591,7 @@ class ReconciliationHarness:
         stage.filtered_task_tree = filtered_task_tree
         stage.task_count_verification = task_count_verification
         stage.graphiti_queue_health = graphiti_queue_health
+        stage.status_correction_reconciliation = status_correction_reconciliation
 
     @staticmethod
     def _configure_task_sync(
@@ -763,6 +769,186 @@ class ReconciliationHarness:
                 f'_check_graphiti_queue_health failed for project_id={project_id!r}: {exc}'
             )
             return None
+
+    async def _reconcile_status_correction(
+        self, project_id: str, statuses: dict[str, str]
+    ) -> dict | None:
+        """Diff the cached Mem0 project_status_correction memory against the
+        live get_statuses census and supersede it on divergence (task 1938).
+
+        Reuses the `statuses` census already fetched for task_count_verification
+        in run_full_cycle — no extra get_statuses round-trip.  Fail-open at every
+        branch (empty statuses / no cached memory / any exception), mirroring
+        _check_graphiti_queue_health: a memory-store hiccup must never abort a
+        reconciliation cycle.
+
+        Args:
+            project_id: Project identifier — scopes the metadata query and writes.
+            statuses: Compact {id: status} map from get_statuses(), already
+                fetched by run_full_cycle.  Empty/falsy means the live census is
+                unavailable.
+
+        Returns:
+            None when statuses is empty (fail-open: no supersede attempted, and
+            no memory-service calls are made).  Otherwise a record dict:
+              - found=False when no cached project_status_correction memory exists.
+              - diverged=False, superseded=False when the cached memory matches
+                the live census (no-op).
+              - diverged=True, superseded=True, memory_id, old, new when the
+                cached memory was superseded.
+              - an 'error' key when the query/diff/supersede body raised (nothing
+                was written — add_memory itself failed, or the query/diff raised).
+              - a 'delete_errors' key (list[str]) when add_memory succeeded (or
+                the no-op branch ran) but one or more delete_memory calls raised —
+                superseded still reflects whether the authoritative memory write
+                landed, not whether every stale duplicate was cleaned up.
+        """
+        if not statuses:
+            return None
+
+        try:
+            memories = await self.memory.get_memories_by_metadata(
+                project_id=project_id,
+                filters={'kind': 'project_status_correction'},
+            )
+            if not memories:
+                return {
+                    'available': True,
+                    'found': False,
+                    'diverged': False,
+                    'superseded': False,
+                }
+
+            latest = max(memories, key=lambda m: m.get('created_at') or '')
+            diff = diff_status_correction(latest.get('metadata') or {}, statuses)
+
+            if not diff['diverged']:
+                # Cap the pool to a single member even when already consistent —
+                # otherwise duplicate project_status_correction memories returned
+                # by the query (all matching the live census) would persist
+                # indefinitely, since the no-op branch never used to touch them
+                # (task 1938 amendment).
+                duplicates = [m for m in memories if m['id'] != latest['id']]
+                record = {
+                    'available': True,
+                    'found': True,
+                    'diverged': False,
+                    'superseded': False,
+                    'memory_id': latest['id'],
+                }
+                delete_errors = await self._delete_status_correction_memories(
+                    duplicates, project_id
+                )
+                if delete_errors:
+                    record['delete_errors'] = delete_errors
+                return record
+
+            live = diff['live']
+            corrected_metadata = {
+                'kind': 'project_status_correction',
+                'supersedes': latest['id'],
+                'task_count_done': live['done'],
+                'task_count_total': live['total'],
+                'active_tasks': live['active_tasks'],
+                'source': 'stage1_status_correction',
+            }
+            content = (
+                f'Stage 1 status-correction reconciliation (task 1938): the cached '
+                f'project_status_correction memory diverged from the authoritative '
+                f"get_statuses census: done={live['done']} total={live['total']} "
+                f"active={len(live['active_tasks'])}."
+            )
+            # Add-then-delete: guarantees at least one correct memory always exists
+            # even if a delete below fails — the fresh memory (supersedes=<old_id>)
+            # is still the most-recent, so next cycle's max()-by-created_at selection
+            # ignores any stale leftover and self-heals.  Once add_memory lands, the
+            # supersede has effectively happened regardless of delete outcomes below
+            # — delete failures are reported via 'delete_errors', not by downgrading
+            # 'superseded' (task 1938 amendment).
+            await self.memory.add_memory(
+                content=content,
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata=corrected_metadata,
+                _source='stage1_status_correction',
+            )
+            # Delete the whole queried set (not just `latest`) to bound the pool to
+            # the single fresh memory just written — mirrors the stage2_cycle_summary
+            # pool-cap fix (tasks 20e8c2f1/45489c2b/db2ea69e). Per-item failures are
+            # swallowed inside the helper so one bad delete doesn't abort the rest.
+            delete_errors = await self._delete_status_correction_memories(
+                memories, project_id
+            )
+
+            logger.warning(
+                'reconciliation.status_correction_superseded',
+                extra={
+                    'project_id': project_id,
+                    'memory_id': latest['id'],
+                    'old': diff['cached'],
+                    'new': diff['live'],
+                },
+            )
+
+            record = {
+                'available': True,
+                'found': True,
+                'diverged': True,
+                'superseded': True,
+                'memory_id': latest['id'],
+                'old': diff['cached'],
+                'new': diff['live'],
+            }
+            if delete_errors:
+                record['delete_errors'] = delete_errors
+            return record
+        except Exception as exc:
+            logger.warning(
+                '_reconcile_status_correction failed for project_id=%r: %s',
+                project_id,
+                exc,
+            )
+            return {
+                'available': True,
+                'superseded': False,
+                'error': str(exc),
+            }
+
+    async def _delete_status_correction_memories(
+        self, memories: list[dict], project_id: str
+    ) -> list[str]:
+        """Delete each memory in `memories`, one at a time, swallowing per-item
+        exceptions so a single failed delete doesn't stop the rest (task 1938
+        amendment — see _reconcile_status_correction).
+
+        Args:
+            memories: Memory records (each with an 'id' key) to delete. May be
+                empty — a no-op in that case.
+            project_id: Project identifier passed through to delete_memory.
+
+        Returns:
+            List of stringified errors, one per failed delete; empty when every
+            delete succeeded (or `memories` was empty). Never raises.
+        """
+        errors: list[str] = []
+        for m in memories:
+            try:
+                await self.memory.delete_memory(
+                    memory_id=m['id'],
+                    store='mem0',
+                    project_id=project_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'reconciliation.status_correction_delete_failed',
+                    extra={
+                        'project_id': project_id,
+                        'memory_id': m.get('id'),
+                        'error': str(exc),
+                    },
+                )
+                errors.append(str(exc))
+        return errors
 
     # ── Stale-run recovery ─────────────────────────────────────────────
 
@@ -1449,6 +1635,12 @@ class ReconciliationHarness:
         statuses = await self._fetch_task_count_census(project_root)
         task_count_verification = cross_verify_task_counts(filtered_task_tree, statuses)
 
+        # Diff the cached project_status_correction memory against the same live
+        # census and supersede it on divergence (task 1938).
+        status_correction_reconciliation = await self._reconcile_status_correction(
+            project_id, statuses
+        )
+
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
         graphiti_queue_health = await self._check_graphiti_queue_health(project_id)
 
@@ -1473,6 +1665,7 @@ class ReconciliationHarness:
                         filtered_task_tree=filtered_task_tree,
                         task_count_verification=task_count_verification,
                         graphiti_queue_health=graphiti_queue_health,
+                        status_correction_reconciliation=status_correction_reconciliation,
                     )
 
                 # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)

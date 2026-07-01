@@ -15,6 +15,7 @@ from fused_memory.reconciliation.task_filter import (
     _render_task_line,
     cross_verify_task_counts,
     detect_census_inconsistency,
+    diff_status_correction,
     filter_task_tree,
     format_filtered_task_tree,
     format_task_list,
@@ -2728,3 +2729,207 @@ class TestCrossVerifyTaskCounts:
 
         assert result['available'] is False
         assert result['consistent'] is True
+
+
+# ---------------------------------------------------------------------------
+# diff_status_correction — step-1 (RED) / step-2 (GREEN); step-3 (RED) / step-4 (GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDiffStatusCorrection:
+    """diff_status_correction(metadata, statuses) diffs a cached Mem0
+    project_status_correction memory's metadata against the live get_statuses
+    census (task 1938).
+
+    step-1/step-2: fail-open branch — statuses empty/None means the live census
+    is unavailable, so the function must never claim divergence (a caller must
+    NOT supersede a possibly-correct cached memory against no data).
+    """
+
+    def test_empty_statuses_returns_unavailable_not_diverged(self):
+        """Empty statuses dict -> available=False, diverged=False (fail-open)."""
+        metadata = {
+            'kind': 'project_status_correction',
+            'task_count_done': 110,
+            'task_count_total': 124,
+            'active_tasks': [110, 112, 113],
+        }
+
+        result = diff_status_correction(metadata, {})
+
+        assert result['available'] is False
+        assert result['diverged'] is False
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is False
+        assert result['active_mismatch'] is False
+        assert result['live'] is None
+        assert result['cached'] == {
+            'done': 110,
+            'total': 124,
+            'active_tasks': [110, 112, 113],
+        }, (
+            f"Expected the cached snapshot echoed from metadata, got {result['cached']!r}"
+        )
+
+    def test_none_statuses_returns_unavailable_not_diverged(self):
+        """None statuses -> available=False, diverged=False (fail-open)."""
+        metadata = {'task_count_done': 5, 'task_count_total': 10, 'active_tasks': [1, 2]}
+
+        result = diff_status_correction(metadata, None)
+
+        assert result['available'] is False
+        assert result['diverged'] is False
+        assert result['cached'] == {'done': 5, 'total': 10, 'active_tasks': [1, 2]}
+
+    # ------------------------------------------------------------------ #
+    # step-3/step-4: full comparison against a live (non-empty) census
+    # ------------------------------------------------------------------ #
+
+    # Shared statuses fixture: 5 done (1-5), 3 active (6 pending, 7 in-progress,
+    # 8 blocked) -> census total=8, done=5, active={6,7,8}.
+    _MATCHING_STATUSES = {
+        '1': 'done', '2': 'done', '3': 'done', '4': 'done', '5': 'done',
+        '6': 'pending', '7': 'in-progress', '8': 'blocked',
+    }
+
+    def test_matching_cache_is_not_diverged_and_is_order_and_type_insensitive(self):
+        """Matching cache -> available=True, diverged=False, no mismatch flags.
+
+        cached active_tasks is an unordered int list ([8, 6, 7]) while statuses
+        keys are strings — proves ordering and int-vs-str differences do NOT
+        cause a false mismatch.
+        """
+        metadata = {
+            'task_count_done': 5,
+            'task_count_total': 8,
+            'active_tasks': [8, 6, 7],
+        }
+
+        result = diff_status_correction(metadata, self._MATCHING_STATUSES)
+
+        assert result['available'] is True
+        assert result['diverged'] is False
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is False
+        assert result['active_mismatch'] is False
+        assert result['live'] == {'done': 5, 'total': 8, 'active_tasks': [6, 7, 8]}, (
+            f"Expected live snapshot with sorted-int active_tasks, got {result['live']!r}"
+        )
+
+    def test_done_mismatch_detected(self):
+        """cached task_count_done differs from the live census -> done_mismatch=True."""
+        metadata = {
+            'task_count_done': 4,
+            'task_count_total': 8,
+            'active_tasks': [6, 7, 8],
+        }
+
+        result = diff_status_correction(metadata, self._MATCHING_STATUSES)
+
+        assert result['available'] is True
+        assert result['diverged'] is True
+        assert result['done_mismatch'] is True
+        assert result['total_mismatch'] is False
+        assert result['active_mismatch'] is False
+        assert result['live'] == {'done': 5, 'total': 8, 'active_tasks': [6, 7, 8]}
+
+    def test_total_mismatch_detected(self):
+        """cached task_count_total differs from the live census -> total_mismatch=True."""
+        metadata = {
+            'task_count_done': 5,
+            'task_count_total': 9,
+            'active_tasks': [6, 7, 8],
+        }
+
+        result = diff_status_correction(metadata, self._MATCHING_STATUSES)
+
+        assert result['available'] is True
+        assert result['diverged'] is True
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is True
+        assert result['active_mismatch'] is False
+        assert result['live'] == {'done': 5, 'total': 8, 'active_tasks': [6, 7, 8]}
+
+    def test_active_mismatch_detected_incident_replay(self):
+        """Reproduces the incident: cached active_tasks still lists now-done ids.
+
+        112/113/114/117 transitioned to 'done' since the memory was cached, but
+        the cached active_tasks list still includes them -> active_mismatch=True
+        as a SET comparison (done_count/total_count are unaffected by the stale
+        active list, so only active_mismatch fires).
+        """
+        statuses = {
+            '110': 'pending',
+            '111': 'done',
+            '112': 'done',
+            '113': 'done',
+            '114': 'done',
+            '115': 'pending',
+            '116': 'in-progress',
+            '117': 'done',
+            '118': 'pending',
+        }
+        metadata = {
+            'task_count_done': 5,
+            'task_count_total': 9,
+            'active_tasks': [110, 112, 113, 114, 115, 116, 117, 118],
+        }
+
+        result = diff_status_correction(metadata, statuses)
+
+        assert result['available'] is True
+        assert result['diverged'] is True
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is False
+        assert result['active_mismatch'] is True
+        assert result['live'] == {
+            'done': 5,
+            'total': 9,
+            'active_tasks': [110, 115, 116, 118],
+        }, (
+            f"Expected live active_tasks=[110, 115, 116, 118] (sorted ints), got {result['live']!r}"
+        )
+
+    def test_non_iterable_active_tasks_is_mismatch_not_typeerror(self):
+        """A malformed cached active_tasks (a non-iterable scalar) must be
+        treated as an active_mismatch instead of raising TypeError.
+
+        _coerce_id_set iterates its argument, so passing a bare int through
+        would previously blow up on `int(str(ref).split('.')[0])` inside the
+        loop's own iteration setup (task 1938 amendment)."""
+        metadata = {
+            'task_count_done': 5,
+            'task_count_total': 8,
+            'active_tasks': 6,  # malformed: should be a list, not a scalar
+        }
+
+        result = diff_status_correction(metadata, self._MATCHING_STATUSES)
+
+        assert result['available'] is True
+        assert result['active_mismatch'] is True
+        assert result['diverged'] is True
+        assert result['done_mismatch'] is False
+        assert result['total_mismatch'] is False
+
+    def test_active_tasks_as_set_or_tuple_is_still_coerced(self):
+        """A cached active_tasks stored as a tuple/set (not a list) is still
+        coerced and compared normally — only genuinely non-iterable/malformed
+        shapes should short-circuit to a mismatch."""
+        metadata_tuple = {
+            'task_count_done': 5,
+            'task_count_total': 8,
+            'active_tasks': (8, 6, 7),
+        }
+        metadata_set = {
+            'task_count_done': 5,
+            'task_count_total': 8,
+            'active_tasks': {8, 6, 7},
+        }
+
+        result_tuple = diff_status_correction(metadata_tuple, self._MATCHING_STATUSES)
+        result_set = diff_status_correction(metadata_set, self._MATCHING_STATUSES)
+
+        assert result_tuple['active_mismatch'] is False
+        assert result_tuple['diverged'] is False
+        assert result_set['active_mismatch'] is False
+        assert result_set['diverged'] is False

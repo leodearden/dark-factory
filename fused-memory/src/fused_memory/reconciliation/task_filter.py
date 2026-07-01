@@ -381,6 +381,128 @@ def cross_verify_task_counts(tree: FilteredTaskTree, statuses: dict[str, str] | 
     }
 
 
+def _coerce_id_set(values: Iterable) -> set[int]:
+    """Coerce a mixed int/str id iterable into a canonical int set.
+
+    Reuses the first-dot-segment rule from detect_census_inconsistency: ints
+    are used directly, strings are split on '.' and the first segment is
+    coerced to int, and unparseable entries are silently ignored.
+    """
+    result: set[int] = set()
+    for ref in values:
+        try:
+            result.add(int(str(ref).split('.')[0]))
+        except (TypeError, ValueError, AttributeError):
+            continue  # silently ignore unparseable entries
+    return result
+
+
+def diff_status_correction(metadata: dict, statuses: dict[str, str] | None) -> dict:
+    """Diff a cached Mem0 ``project_status_correction`` memory against the live census.
+
+    ``project_status_correction`` memories are written at runtime by agents
+    (metadata ``kind='project_status_correction'``, fields ``task_count_done``/
+    ``task_count_total``/``active_tasks``) and can silently go stale.  This pure
+    helper compares that cached snapshot against the authoritative get_statuses
+    census so a caller (``ReconciliationHarness._reconcile_status_correction``)
+    can decide whether to supersede it.
+
+    Args:
+        metadata: The cached memory's metadata dict (or falsy for a missing/
+            malformed record).  ``task_count_done``/``task_count_total``/
+            ``active_tasks`` are read from it; missing fields become None.
+        statuses: Compact {id: status} map from get_statuses(), or None/empty
+            when the live census is unavailable.
+
+    Returns:
+        dict with:
+            available (bool): False when statuses is empty/None — fail-open,
+                a caller must NOT supersede against an unavailable census.
+            diverged (bool): True when available and any field mismatches.
+            done_mismatch / total_mismatch / active_mismatch (bool): per-field
+                divergence flags (available only when `available` is True).
+            cached (dict): {'done', 'total', 'active_tasks'} echoed from metadata,
+                always populated so callers can log the pre-diff snapshot.
+            live (dict | None): {'done', 'total', 'active_tasks'} recomputed from
+                statuses (active_tasks as a sorted int list), or None when
+                unavailable.
+
+    active_tasks comparison is order-insensitive and coerces both cached ints
+    and live string keys via the first-dot-segment rule (see
+    detect_census_inconsistency), so ordering or int-vs-str differences never
+    cause a false mismatch. cached['active_tasks'] is coerced only when it is
+    a list/tuple/set; any other shape (None, a scalar, a malformed type) is
+    treated as an unconditional active_mismatch rather than raised, since
+    _coerce_id_set assumes an iterable.
+
+    Shared 'total' definition (task 1938 amendment): task_count_total is
+    compared against summarize_statuses(statuses)['total'], which counts
+    EVERY status in the census — done + cancelled + active + other, not just
+    non-cancelled/live tasks. The runtime agent convention that writes
+    project_status_correction memories is assumed to use this same
+    all-statuses denominator; that write-side convention lives outside this
+    repo and is unverifiable here. If it ever diverges (e.g. an agent counts
+    only non-cancelled tasks), the practical impact is bounded: the first
+    cycle after this ships would report a spurious total_mismatch/diverged
+    for every project, _reconcile_status_correction would supersede once, and
+    subsequent cycles compare the freshly-written (all-statuses) memory
+    against itself and stop diverging — self-healing, at the cost of one
+    extra supersede + WARNING log per project.
+
+    Pure: no I/O, no side effects.
+    """
+    metadata = metadata or {}
+    cached = {
+        'done': metadata.get('task_count_done'),
+        'total': metadata.get('task_count_total'),
+        'active_tasks': metadata.get('active_tasks'),
+    }
+
+    if not statuses:
+        return {
+            'available': False,
+            'diverged': False,
+            'done_mismatch': False,
+            'total_mismatch': False,
+            'active_mismatch': False,
+            'cached': cached,
+            'live': None,
+        }
+
+    census = summarize_statuses(statuses)
+    live_active_ids = _coerce_id_set(
+        tid for tid, status in statuses.items() if status in ACTIVE_TASK_STATUSES
+    )
+    live = {
+        'done': census['done'],
+        'total': census['total'],
+        'active_tasks': sorted(live_active_ids),
+    }
+
+    # Missing/None cached fields count as a mismatch so a malformed memory is rewritten.
+    done_mismatch = cached['done'] is None or cached['done'] != live['done']
+    total_mismatch = cached['total'] is None or cached['total'] != live['total']
+    cached_active_tasks = cached['active_tasks']
+    if isinstance(cached_active_tasks, (list, tuple, set, frozenset)):
+        active_mismatch = _coerce_id_set(cached_active_tasks) != live_active_ids
+    else:
+        # None, or a malformed non-iterable scalar (e.g. an int) — _coerce_id_set
+        # requires an iterable, so treat anything else as an unconditional
+        # mismatch instead of raising TypeError on a corrupted memory.
+        active_mismatch = True
+    diverged = done_mismatch or total_mismatch or active_mismatch
+
+    return {
+        'available': True,
+        'diverged': diverged,
+        'done_mismatch': done_mismatch,
+        'total_mismatch': total_mismatch,
+        'active_mismatch': active_mismatch,
+        'cached': cached,
+        'live': live,
+    }
+
+
 def detect_census_inconsistency(max_task_id: int, referenced_ids: Iterable) -> list[int]:
     """Return referenced task ids that strictly exceed the census maximum.
 

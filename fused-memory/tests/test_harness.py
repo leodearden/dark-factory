@@ -7424,6 +7424,413 @@ class TestHarnessCheckGraphitiQueueHealth:
         assert result is None
 
 
+# ── Tests for task 1938: harness._reconcile_status_correction ──────────────────
+
+
+class TestHarnessReconcileStatusCorrection:
+    """ReconciliationHarness._reconcile_status_correction diffs the cached Mem0
+    project_status_correction memory against the live get_statuses census and
+    supersedes it on divergence.
+
+    step-5 (RED): _reconcile_status_correction does not exist yet.
+    step-6 (GREEN): add it to harness.py with only the empty-statuses guard.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_statuses_returns_none_and_no_io(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Empty statuses -> returns None; no memory-service calls (fail-open:
+        never supersede against an unavailable census)."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        result = await harness._reconcile_status_correction('test-project', {})
+
+        assert result is None
+        harness.memory.get_memories_by_metadata.assert_not_called()  # type: ignore[attr-defined]
+        harness.memory.add_memory.assert_not_called()  # type: ignore[attr-defined]
+        harness.memory.delete_memory.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_no_cached_memory_returns_found_false_and_no_write(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """No cached project_status_correction memory -> found=False, no writes.
+
+        step-7 (RED): the query branch does not exist yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+
+        result = await harness._reconcile_status_correction(
+            'test-project', {'1': 'done', '2': 'pending'}
+        )
+
+        assert result == {
+            'available': True,
+            'found': False,
+            'diverged': False,
+            'superseded': False,
+        }
+        harness.memory.get_memories_by_metadata.assert_awaited_once_with(
+            project_id='test-project',
+            filters={'kind': 'project_status_correction'},
+        )
+        harness.memory.add_memory.assert_not_called()  # type: ignore[attr-defined]
+        harness.memory.delete_memory.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_matching_cached_memory_is_noop(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Cached memory exactly matches the live census -> no-op (no writes).
+
+        step-9 (RED): most-recent selection + diff wiring does not exist yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        statuses = {
+            '1': 'done', '2': 'done', '3': 'done', '4': 'done', '5': 'done',
+            '6': 'pending', '7': 'in-progress', '8': 'blocked',
+        }
+        cached_memory = {
+            'id': 'mem-abc123',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 5,
+                'task_count_total': 8,
+                'active_tasks': [6, 7, 8],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[cached_memory])
+
+        result = await harness._reconcile_status_correction('test-project', statuses)
+
+        assert result == {
+            'available': True,
+            'found': True,
+            'diverged': False,
+            'superseded': False,
+            'memory_id': 'mem-abc123',
+        }
+        harness.memory.add_memory.assert_not_called()  # type: ignore[attr-defined]
+        harness.memory.delete_memory.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_diverged_cache_is_superseded_incident_replay(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Reproduces the incident: cached memory 'af698512...' still lists
+        tasks 112/113/114/117 as active after they transitioned to done.
+
+        Live census: 114 done / 124 total / 10 active.
+
+        step-11 (RED): the supersede branch does not exist yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        statuses = {str(i): 'done' for i in range(1, 110)}
+        statuses.update({
+            '110': 'pending',
+            '111': 'done',
+            '112': 'done',
+            '113': 'done',
+            '114': 'done',
+            '115': 'pending',
+            '116': 'in-progress',
+            '117': 'done',
+            '118': 'pending',
+        })
+        statuses.update({str(i): 'pending' for i in range(119, 125)})
+        assert len(statuses) == 124
+
+        cached_memory = {
+            'id': 'af698512-stale-memory',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 110,
+                'task_count_total': 124,
+                'active_tasks': [
+                    110, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124,
+                ],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[cached_memory])
+        harness.memory.add_memory = AsyncMock(return_value={'status': 'created'})
+        harness.memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+
+        result = await harness._reconcile_status_correction('test-project', statuses)
+        assert result is not None
+
+        live_active = [110, 115, 116, 118, 119, 120, 121, 122, 123, 124]
+
+        # (1) add_memory awaited exactly once with the corrected metadata
+        harness.memory.add_memory.assert_awaited_once()
+        add_kwargs = harness.memory.add_memory.call_args.kwargs
+        assert add_kwargs['category'] == 'observations_and_summaries'
+        assert add_kwargs['project_id'] == 'test-project'
+        assert add_kwargs['metadata']['kind'] == 'project_status_correction'
+        assert add_kwargs['metadata']['supersedes'] == 'af698512-stale-memory'
+        assert add_kwargs['metadata']['task_count_done'] == 114
+        assert add_kwargs['metadata']['task_count_total'] == 124
+        assert sorted(add_kwargs['metadata']['active_tasks']) == live_active
+        assert add_kwargs['metadata'].get('source'), (
+            'expected a provenance source marker in the corrected metadata'
+        )
+
+        # (2) the corrected content must NOT match the count-snapshot regex —
+        # it must survive strip_snapshot_lines / filter_stale_count_snapshot_corrections
+        # when it re-enters a future Stage 1 payload.
+        from fused_memory.reconciliation.task_filter import is_count_snapshot
+        assert not is_count_snapshot(add_kwargs['content']), (
+            f"Corrected memory content must not match the count-snapshot regex; "
+            f"got {add_kwargs['content']!r}"
+        )
+
+        # (3) delete_memory awaited for the stale memory
+        harness.memory.delete_memory.assert_awaited_once_with(
+            memory_id='af698512-stale-memory',
+            store='mem0',
+            project_id='test-project',
+        )
+
+        # (4) return record carries old/new snapshots
+        assert result['diverged'] is True
+        assert result['superseded'] is True
+        assert result['memory_id'] == 'af698512-stale-memory'
+        assert result['old']['done'] == 110
+        assert result['new']['done'] == 114
+        assert result['new']['total'] == 124
+        assert sorted(result['new']['active_tasks']) == live_active
+
+    @pytest.mark.asyncio
+    async def test_query_exception_fails_open(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """get_memories_by_metadata raising must not propagate (fail-open,
+        mirrors _check_graphiti_queue_health).
+
+        step-13 (RED): no try/except yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.get_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down')
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._reconcile_status_correction(
+                'test-project', {'1': 'done'}
+            )
+
+        assert result is not None
+        assert result['superseded'] is False
+        assert 'error' in result
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'Expected a WARNING log when get_memories_by_metadata raises'
+        )
+
+    @pytest.mark.asyncio
+    async def test_add_memory_exception_fails_open(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """add_memory raising during the supersede branch must not propagate.
+
+        step-13 (RED): no try/except yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        cached_memory = {
+            'id': 'mem-xyz',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 0,
+                'task_count_total': 1,
+                'active_tasks': [],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[cached_memory])
+        harness.memory.add_memory = AsyncMock(side_effect=RuntimeError('mem0 write failed'))
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._reconcile_status_correction(
+                'test-project', {'1': 'done'}
+            )
+
+        assert result is not None
+        assert result['superseded'] is False
+        assert 'error' in result
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'Expected a WARNING log when add_memory raises'
+        )
+
+    # ------------------------------------------------------------------ #
+    # task 1938 amendment: pool-capping + delete-loop resilience
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_diverged_deletes_every_queried_memory_not_just_latest(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """The supersede branch deletes the WHOLE queried set, not just the
+        most-recent memory — proves the multi-memory delete loop actually
+        iterates every stale record."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        statuses = {
+            '1': 'done', '2': 'done', '3': 'done', '4': 'done', '5': 'done',
+            '6': 'pending', '7': 'in-progress', '8': 'blocked',
+        }
+        memory_newer = {
+            'id': 'mem-a-newer',
+            'created_at': '2026-06-30T12:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 4,  # diverges: live done=5
+                'task_count_total': 8,
+                'active_tasks': [6, 7, 8],
+            },
+        }
+        memory_older = {
+            'id': 'mem-b-older',
+            'created_at': '2026-06-29T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 3,
+                'task_count_total': 8,
+                'active_tasks': [6, 7, 8],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(
+            return_value=[memory_older, memory_newer]
+        )
+        harness.memory.add_memory = AsyncMock(return_value={'status': 'created'})
+        harness.memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+
+        result = await harness._reconcile_status_correction('test-project', statuses)
+
+        assert result is not None
+        assert result['superseded'] is True
+        assert result['memory_id'] == 'mem-a-newer'  # most-recent selected as `latest`
+        assert harness.memory.delete_memory.await_count == 2
+        deleted_ids = {
+            c.kwargs['memory_id'] for c in harness.memory.delete_memory.await_args_list
+        }
+        assert deleted_ids == {'mem-a-newer', 'mem-b-older'}
+        for c in harness.memory.delete_memory.await_args_list:
+            assert c.kwargs['store'] == 'mem0'
+            assert c.kwargs['project_id'] == 'test-project'
+        assert 'delete_errors' not in result
+
+    @pytest.mark.asyncio
+    async def test_delete_memory_exception_mid_loop_is_swallowed_and_add_still_happened(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """A delete_memory failure on one queried memory must not stop the
+        loop from attempting the rest, and must not downgrade `superseded`
+        to False — add_memory already landed, so the supersede happened even
+        if cleanup of stale duplicates partially failed."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        memory_a = {
+            'id': 'mem-a',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 0,
+                'task_count_total': 1,
+                'active_tasks': [],
+            },
+        }
+        memory_b = {
+            'id': 'mem-b',
+            'created_at': '2026-06-29T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 0,
+                'task_count_total': 1,
+                'active_tasks': [],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(
+            return_value=[memory_a, memory_b]
+        )
+        harness.memory.add_memory = AsyncMock(return_value={'status': 'created'})
+        # First delete raises, second succeeds — proves the loop continues
+        # past a mid-loop failure instead of aborting on the first exception.
+        harness.memory.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('qdrant delete failed'), {'status': 'deleted'}]
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._reconcile_status_correction(
+                'test-project', {'1': 'done'}
+            )
+
+        assert result is not None
+        harness.memory.add_memory.assert_awaited_once()
+        assert result['superseded'] is True, (
+            'add_memory landed; a downstream delete failure must not be '
+            'reported as an overall supersede failure'
+        )
+        assert 'error' not in result
+        assert result.get('delete_errors') == ['qdrant delete failed']
+        assert harness.memory.delete_memory.await_count == 2, (
+            'the loop must attempt every queried memory, not stop at the first failure'
+        )
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'Expected a WARNING log when a delete_memory call raises'
+        )
+
+    @pytest.mark.asyncio
+    async def test_noop_branch_deletes_duplicate_cached_memories(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Even when the cache already matches the live census (no-op), any
+        extra duplicate project_status_correction memories returned by the
+        query must be deleted so the pool converges to a single member —
+        only the no-op path previously left duplicates untouched."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        statuses = {
+            '1': 'done', '2': 'done', '3': 'done', '4': 'done', '5': 'done',
+            '6': 'pending', '7': 'in-progress', '8': 'blocked',
+        }
+        matching_metadata = {
+            'kind': 'project_status_correction',
+            'task_count_done': 5,
+            'task_count_total': 8,
+            'active_tasks': [6, 7, 8],
+        }
+        memory_newer = {
+            'id': 'mem-newer',
+            'created_at': '2026-06-30T12:00:00+00:00',
+            'metadata': matching_metadata,
+        }
+        memory_older_dup = {
+            'id': 'mem-older-dup',
+            'created_at': '2026-06-29T00:00:00+00:00',
+            'metadata': matching_metadata,
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(
+            return_value=[memory_older_dup, memory_newer]
+        )
+        harness.memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+
+        result = await harness._reconcile_status_correction('test-project', statuses)
+
+        assert result == {
+            'available': True,
+            'found': True,
+            'diverged': False,
+            'superseded': False,
+            'memory_id': 'mem-newer',
+        }
+        harness.memory.add_memory.assert_not_called()  # type: ignore[attr-defined]
+        harness.memory.delete_memory.assert_awaited_once_with(
+            memory_id='mem-older-dup',
+            store='mem0',
+            project_id='test-project',
+        )
+
+
 # ── Tests for task 1785: harness._configure_consolidator new kwargs ─────────────
 
 
@@ -7489,6 +7896,53 @@ class TestConfigureConsolidatorNewKwargs:
 
         assert stage.task_count_verification is None
         assert stage.graphiti_queue_health is None
+
+
+# ── Tests for task 1938: harness._configure_consolidator status_correction_reconciliation kwarg ──
+
+
+class TestConfigureConsolidatorStatusCorrectionReconciliationKwarg:
+    """_configure_consolidator accepts and sets status_correction_reconciliation.
+
+    step-15 (RED): _configure_consolidator does not accept the new kwarg yet.
+    step-16 (GREEN): extend _configure_consolidator.
+    """
+
+    def test_sets_status_correction_reconciliation_on_stage(self):
+        """_configure_consolidator sets stage.status_correction_reconciliation from kwarg."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MagicMock(spec=MemoryConsolidator)
+        tier = MagicMock()
+        tier.episode_limit = 5
+        tier.memory_limit = 10
+
+        reconciliation_record = {
+            'available': True, 'found': True, 'diverged': True,
+            'superseded': True, 'memory_id': 'af698512-stale-memory',
+        }
+
+        ReconciliationHarness._configure_consolidator(
+            stage, tier,
+            status_correction_reconciliation=reconciliation_record,
+        )
+
+        assert stage.status_correction_reconciliation == reconciliation_record
+
+    def test_defaults_status_correction_reconciliation_to_none(self):
+        """_configure_consolidator defaults status_correction_reconciliation to None."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MagicMock(spec=MemoryConsolidator)
+        tier = MagicMock()
+        tier.episode_limit = 5
+        tier.memory_limit = 10
+
+        ReconciliationHarness._configure_consolidator(stage, tier)
+
+        assert stage.status_correction_reconciliation is None
 
 
 # ── Tests for task 1785: full-cycle wiring of diagnostics ─────────────────────
@@ -7594,6 +8048,98 @@ class TestFullCycleWiringDiagnostics:
         assert gqh.get('healthy') is False, (
             f'Expected graphiti_queue_health["healthy"]==False, got {gqh.get("healthy")!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_status_correction_reconciliation_into_stage1(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """run_full_cycle calls _reconcile_status_correction with the same statuses
+        used for task_count_verification and threads its result into Stage 1.
+
+        step-19 (RED): run_full_cycle does not call _reconcile_status_correction
+            nor pass status_correction_reconciliation= to _configure_consolidator yet.
+        step-20 (GREEN): wire it in immediately after cross_verify_task_counts.
+        """
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        assert harness.taskmaster is not None
+        harness.taskmaster.get_tasks = AsyncMock(
+            return_value={
+                'tasks': [
+                    {'id': 1, 'status': 'done'},
+                    {'id': 2, 'status': 'pending'},
+                ]
+            }
+        )
+        harness.taskmaster.get_statuses = AsyncMock(
+            return_value={'1': 'done', '2': 'pending'}
+        )
+
+        # Stale cached project_status_correction memory: cached done=0 diverges
+        # from the live census (done=1), so _reconcile_status_correction must
+        # supersede it (add_memory + delete_memory).
+        stale_memory = {
+            'id': 'stale-mem-1',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 0,
+                'task_count_total': 2,
+                'active_tasks': [1, 2],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[stale_memory])
+        harness.memory.add_memory = AsyncMock(return_value={'status': 'created'})
+        harness.memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+
+        captured: dict = {}
+
+        async def capture_diags(stage):
+            captured['status_correction_reconciliation'] = (
+                stage.status_correction_reconciliation
+            )
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_diags)
+            else:
+                _mock_stage_run(stage)
+
+        with patch.object(
+            harness,
+            '_reconcile_status_correction',
+            wraps=harness._reconcile_status_correction,
+        ) as spy:
+            await harness.run_full_cycle(
+                'test-project',
+                'wiring-test-status-correction',
+                events=[_make_event()],
+            )
+
+        # _reconcile_status_correction must be awaited once with the SAME
+        # statuses map used for task_count_verification (no extra get_statuses
+        # round-trip).
+        spy.assert_awaited_once_with('test-project', {'1': 'done', '2': 'pending'})
+
+        # The real implementation ran (via wraps=) and superseded the stale memory.
+        harness.memory.add_memory.assert_awaited_once()
+        harness.memory.delete_memory.assert_awaited_once()
+
+        scr = captured.get('status_correction_reconciliation')
+        assert scr is not None, (
+            'MemoryConsolidator.status_correction_reconciliation is None — '
+            'run_full_cycle must call _reconcile_status_correction and pass '
+            'status_correction_reconciliation= to _configure_consolidator'
+        )
+        assert scr.get('superseded') is True, (
+            f'Expected the record reaching Stage 1 to have superseded=True, got {scr!r}'
+        )
+        assert scr.get('memory_id') == 'stale-mem-1'
 
 
 # ---------------------------------------------------------------------------
