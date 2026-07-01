@@ -1143,6 +1143,9 @@ async def _sweep_stale_flag_markers(
 
     stale_ids: list[str] = []
     for member in members:
+        mid = member.get('id')
+        if not mid:
+            continue
         raw = member.get('created_at')
         if raw is None:
             continue
@@ -1151,7 +1154,7 @@ async def _sweep_stale_flag_markers(
         except (ValueError, TypeError):
             continue
         if created_at < cutoff:
-            stale_ids.append(member['id'])
+            stale_ids.append(mid)
 
     if not stale_ids:
         return 0
