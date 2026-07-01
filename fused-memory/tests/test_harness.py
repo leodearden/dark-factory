@@ -7424,6 +7424,34 @@ class TestHarnessCheckGraphitiQueueHealth:
         assert result is None
 
 
+# ── Tests for task 1938: harness._reconcile_status_correction ──────────────────
+
+
+class TestHarnessReconcileStatusCorrection:
+    """ReconciliationHarness._reconcile_status_correction diffs the cached Mem0
+    project_status_correction memory against the live get_statuses census and
+    supersedes it on divergence.
+
+    step-5 (RED): _reconcile_status_correction does not exist yet.
+    step-6 (GREEN): add it to harness.py with only the empty-statuses guard.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_statuses_returns_none_and_no_io(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Empty statuses -> returns None; no memory-service calls (fail-open:
+        never supersede against an unavailable census)."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        result = await harness._reconcile_status_correction('test-project', {})
+
+        assert result is None
+        harness.memory.get_memories_by_metadata.assert_not_called()
+        harness.memory.add_memory.assert_not_called()
+        harness.memory.delete_memory.assert_not_called()
+
+
 # ── Tests for task 1785: harness._configure_consolidator new kwargs ─────────────
 
 
