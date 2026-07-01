@@ -1521,6 +1521,13 @@ async def _reconstruct_stage2_summary(
     This mirrors the LLM prompt's own retry_nonce pattern without risking an
     unbounded loop.
 
+    Best-effort: never raises. Any ``add_memory`` exception (first attempt or
+    retry) logs a WARNING and returns 0 — mirrors
+    :func:`_repair_stage2_summary_stage_metadata` /
+    :func:`_sweep_stale_fixc_markers`'s best-effort contract, so a Mem0 outage
+    degrades this self-heal gracefully instead of failing the whole
+    reconciliation cycle.
+
     Args:
         memory_service: Service with ``add_memory``.
         project_id: Project scope for the write.
@@ -1529,7 +1536,8 @@ async def _reconstruct_stage2_summary(
 
     Returns:
         1 if a reconstruction placeholder was successfully written (first
-        attempt or retry — see :func:`_extract_response_memory_ids`), else 0.
+        attempt or retry — see :func:`_extract_response_memory_ids`), else 0
+        (dedup-dropped twice, or ``add_memory`` raised).
     """
     metadata = {
         'kind': 'cycle_summary',
@@ -1538,29 +1546,38 @@ async def _reconstruct_stage2_summary(
         'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
         'reconstructed': True,
     }
-    response = await memory_service.add_memory(
-        content=_build_stage2_reconstruction_content(run_id),
-        category='observations_and_summaries',
-        project_id=project_id,
-        metadata=metadata,
-        causation_id=run_id,
-        _source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE,
-    )
-    if _extract_response_memory_ids(response):
-        return 1
+    try:
+        response = await memory_service.add_memory(
+            content=_build_stage2_reconstruction_content(run_id),
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata=metadata,
+            causation_id=run_id,
+            _source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE,
+        )
+        if _extract_response_memory_ids(response):
+            return 1
 
-    # Dedup no-op (Mem0 ~0.92 cosine similarity) — retry once with a fresh
-    # nonce so the leading content shifts past the threshold.
-    response = await memory_service.add_memory(
-        content=_build_stage2_reconstruction_content(run_id),
-        category='observations_and_summaries',
-        project_id=project_id,
-        metadata=metadata,
-        causation_id=run_id,
-        _source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE,
-    )
-    if _extract_response_memory_ids(response):
-        return 1
+        # Dedup no-op (Mem0 ~0.92 cosine similarity) — retry once with a fresh
+        # nonce so the leading content shifts past the threshold.
+        response = await memory_service.add_memory(
+            content=_build_stage2_reconstruction_content(run_id),
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata=metadata,
+            causation_id=run_id,
+            _source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE,
+        )
+        if _extract_response_memory_ids(response):
+            return 1
+    except Exception:
+        logger.warning(
+            'reconciliation._reconstruct_stage2_summary: '
+            'add_memory failed for run_id=%s; skipping reconstruction',
+            run_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
 
     logger.warning(
         'reconciliation._reconstruct_stage2_summary: '
