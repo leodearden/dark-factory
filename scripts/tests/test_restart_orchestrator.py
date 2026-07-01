@@ -21,8 +21,10 @@ FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 
 Records every invocation (minus `--user`) into a JSON state file at
 $FAKE_SYSTEMCTL_STATE and answers `show`/`restart` from that file's
-fields. State is static — a `restart` call is recorded but never
-changes MainPID/ActiveState/timestamp fields.
+fields. When state["scenario"] == "fresh", a `restart` call bumps
+MainPID/ActiveState/ActiveEnterTimestampMonotonic to simulate the
+service coming back up; any other scenario leaves the fields
+unchanged (simulating a stale/failed restart).
 """
 import json
 import os
@@ -64,6 +66,13 @@ def main(argv):
     state.setdefault("calls", []).append(argv[1:])
 
     if verb == "restart":
+        if state.get("scenario") == "fresh":
+            state["MainPID"] = state.get("MainPID", 1000) + 1
+            state["ActiveState"] = "active"
+            state["ActiveEnterTimestampMonotonic"] = (
+                state.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
+            )
+            state["ActiveEnterTimestamp"] = "restarted"
         _save(state)
         return 0
 
@@ -92,8 +101,13 @@ if __name__ == "__main__":
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_fake_systemctl(tmp_path, *, main_pid=1234):
+def _make_fake_systemctl(tmp_path, *, scenario="stale", main_pid=1234):
     """Write a fake `systemctl` into <tmp_path>/bin/ + its backing state file.
+
+    scenario="fresh" makes a `restart` call bump MainPID/ActiveState/
+    ActiveEnterTimestampMonotonic (simulating a successful restart);
+    scenario="stale" (default) leaves them unchanged (simulating a
+    failed/no-op restart).
 
     Returns (bin_dir, state_path).
     """
@@ -109,6 +123,7 @@ def _make_fake_systemctl(tmp_path, *, main_pid=1234):
         "ActiveState": "active",
         "ActiveEnterTimestamp": "baseline",
         "ActiveEnterTimestampMonotonic": 1_000_000,
+        "scenario": scenario,
         "calls": [],
     }))
     return bin_dir, state_path
@@ -148,4 +163,25 @@ def test_invokes_systemctl_restart_on_correct_unit(tmp_path):
     assert ["--user", "restart", UNIT] in state["calls"], (
         f"Expected a `systemctl --user restart {UNIT}` call; "
         f"got calls={state['calls']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED -- fresh MainPID after restart must be verified and reported
+# ---------------------------------------------------------------------------
+
+def test_prints_new_main_pid_on_fresh_restart(tmp_path):
+    """A restart that comes back with a fresh MainPID exits 0 and names it."""
+    bin_dir, state_path = _make_fake_systemctl(tmp_path, scenario="fresh", main_pid=1234)
+
+    result = _run_script(bin_dir, state_path, env={"RESTART_VERIFY_TIMEOUT": "5"})
+
+    assert result.returncode == 0, (
+        f"Expected exit 0 on a fresh restart; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    new_pid = _load_state(state_path)["MainPID"]
+    assert new_pid != 1234, "fake systemctl did not bump MainPID -- test setup is broken"
+    assert str(new_pid) in result.stdout, (
+        f"Expected the new MainPID ({new_pid}) in stdout; got: {result.stdout!r}"
     )
