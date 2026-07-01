@@ -4059,6 +4059,14 @@ class GitOps:
         **Create-once path** (worktree not yet registered):
             ``git worktree add --detach <fixed_path> <merge_commit>``
 
+        **Reset-in-place path** (worktree already registered):
+            ``git reset --hard <merge_commit>`` followed by
+            ``git clean -xfd -e <dir>`` for each dir in
+            ``config.reap_build_artifact_dirs`` — so the source tree is
+            bit-identical to a fresh checkout of *merge_commit* while
+            build-artifact dirs (e.g. ``target/``) are retained — this
+            worktree's OWN warmth, self-warming across resets.
+
         Returns the fixed path (:attr:`persistent_offline_deep_worktree_path`).
         Raises :exc:`RuntimeError` on git failure (mirrors
         :meth:`reset_persistent_merge_worktree`).
@@ -4089,6 +4097,29 @@ class GitOps:
                 )
             logger.info(
                 'Created persistent offline-deep worktree at %s (HEAD=%s)',
+                warm_path, merge_commit[:8],
+            )
+        else:
+            # Reset-in-place branch — retains this worktree's OWN target/,
+            # never touching or seeding from the merge lane's target/ (C5).
+            rc, _, err = await _run(
+                ['git', 'reset', '--hard', merge_commit],
+                cwd=warm_path,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to reset persistent offline-deep worktree {warm_path} '
+                    f'to {merge_commit}: {err}'
+                )
+            ok, err = await self._clean_lane_retaining_artifacts(
+                warm_path, caller='reset_persistent_offline_deep_worktree',
+            )
+            if not ok:
+                raise RuntimeError(
+                    f'Failed to clean persistent offline-deep worktree {warm_path}: {err}'
+                )
+            logger.info(
+                'Reset persistent offline-deep worktree %s to HEAD=%s',
                 warm_path, merge_commit[:8],
             )
 
