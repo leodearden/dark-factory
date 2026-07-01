@@ -425,6 +425,80 @@ def compute_preexisting_main_break_fingerprint(
         return ''
 
 
+def compute_failing_test_set_fingerprint(failing_test_ids: list[str]) -> str:
+    """Dedup key for the offline-deep lane's confirmed-red fix-task spawn (β3).
+
+    Keyed on the sorted CONFIRMED failing-test ID SET — NEVER ``main_sha``
+    (DB3/C3). The model helper above (``compute_preexisting_main_break_fingerprint``)
+    keys on a probe/main_sha, which advances every merge; reusing that shape
+    here would spawn a fresh fix task + escalation on EVERY offline-lane
+    advance while red — the exact flood PRD §7/§10/§11 forbids. Keying on the
+    failing-test SET instead means one open fix task absorbs the same red
+    across advances (via an appended suspect range), while a genuinely
+    different failing set gets its own task.
+
+    ``compute_content_fingerprint`` already sorts ``affected_ids`` and ignores
+    ``description``, so the result is order-independent over the input list.
+
+    Returns '' on any exception (fail-safe — an empty fingerprint degrades to
+    the log-only path, never a crash).
+    """
+    try:
+        from escalation.dedupe import compute_content_fingerprint
+        return compute_content_fingerprint(
+            'offline_lane_red', '', sorted(failing_test_ids),
+        )
+    except Exception:
+        return ''
+
+
+def build_offline_lane_fix_task_arguments(
+    failing_test_ids: list[str],
+    suspect_range: str,
+    fingerprint: str,
+    project_root: str | Path,
+    head: str,
+) -> dict:
+    """Build the ``submit_task`` argument block for an offline-lane fix task (β3).
+
+    Modeled on :meth:`TaskWorkflow._spawn_main_health_fix_task`'s argument
+    block (title/description/priority/project_root/metadata), but routed
+    THROUGH the standard TDD→PR→merge gate rather than the high/red-main
+    lane: ``status='pending'`` and ``metadata.merge_lane='normal'`` (never
+    the B3 red-main fix-forward path — that class hard-aborts to a human;
+    D1/§10 "the fix goes through the gate").
+
+    ``metadata.failing_tests`` is stored sorted (matching the fingerprint's
+    own sort) and ``metadata.suspect_ranges`` is seeded as a single-element
+    list so the caller can append further ranges as the same fingerprint
+    recurs across advances (C3) without restructuring the field.
+    """
+    sorted_ids = sorted(failing_test_ids)
+    test_list = ', '.join(sorted_ids)
+    title = f'offline-lane: fix {len(sorted_ids)} failing test(s) ({test_list})'
+    description = (
+        f'The offline-deep lane confirmed a red run with failing tests: '
+        f'{test_list}.\n\nSuspect commit range: {suspect_range}\n'
+        f'Head at detection: {head}\n\n'
+        f'This task was auto-filed by the offline-deep lane worker (β3). It '
+        f'merges via the standard gate, never the red-main fix-forward path.'
+    )
+    return {
+        'title': title,
+        'description': description,
+        'status': 'pending',
+        'priority': 'high',
+        'project_root': str(project_root),
+        'metadata': {
+            'merge_lane': 'normal',
+            'spawn_context': 'offline_lane_red',
+            'offline_lane_fingerprint': fingerprint,
+            'failing_tests': sorted_ids,
+            'suspect_ranges': [suspect_range],
+        },
+    }
+
+
 def _line_ranges_stackable(
     ranges_a: dict[str, list[tuple[int, int]]],
     ranges_b: dict[str, list[tuple[int, int]]],

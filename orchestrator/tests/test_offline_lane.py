@@ -55,6 +55,9 @@ def _make_worker(
     git_ops: MagicMock | None = None,
     config: MagicMock | None = None,
     suite_runner=None,
+    confirmation_runner=None,
+    task_client=None,
+    escalation_queue=None,
 ) -> OfflineLaneWorker:
     """Build an OfflineLaneWorker wired with mock deps for isolated testing."""
     return OfflineLaneWorker(
@@ -62,6 +65,9 @@ def _make_worker(
         config if config is not None else _make_config(tmp_path),
         lock_path=tmp_path / 'offline_lane.lock',
         suite_runner=suite_runner,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
     )
 
 
@@ -71,7 +77,7 @@ def _make_worker(
 
 
 def test_git_config_offline_lane_knobs():
-    """GitConfig exposes the three offline-lane knobs with correct defaults.
+    """GitConfig exposes the offline-lane knobs with correct defaults.
 
     Step 1 (RED): the fields do not yet exist — must fail before impl.
     """
@@ -85,23 +91,31 @@ def test_git_config_offline_lane_knobs():
     assert cfg_default.offline_lane_poll_interval_secs == 120.0, (
         'offline_lane_poll_interval_secs must default to 120.0'
     )
+    assert cfg_default.offline_lane_red_advances_before_blocker == 3, (
+        'offline_lane_red_advances_before_blocker must default to 3 (§11.3, β3 C4)'
+    )
 
     cfg_set = GitConfig(
         offline_lane_enabled=True,
         offline_lane_test_threads=4,
         offline_lane_poll_interval_secs=30.0,
+        offline_lane_red_advances_before_blocker=5,
     )
     assert cfg_set.offline_lane_enabled is True
     assert cfg_set.offline_lane_test_threads == 4
     assert cfg_set.offline_lane_poll_interval_secs == 30.0
+    assert cfg_set.offline_lane_red_advances_before_blocker == 5
 
 
 def test_git_config_offline_lane_knobs_validation():
-    """offline_lane_test_threads is ge=1; offline_lane_poll_interval_secs is gt=0."""
+    """offline_lane_test_threads is ge=1; offline_lane_poll_interval_secs is gt=0;
+    offline_lane_red_advances_before_blocker is ge=1."""
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_test_threads=0)
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_poll_interval_secs=0.0)
+    with pytest.raises(ValidationError):
+        GitConfig(offline_lane_red_advances_before_blocker=0)
 
 
 # ---------------------------------------------------------------------------
@@ -480,3 +494,436 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
         )
     assert kwargs['stdout'] == asyncio.subprocess.PIPE
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
+
+
+# ---------------------------------------------------------------------------
+# _handle_red_run — confirmation re-run + dedup'd fix-task spawn (β3, task 1954)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_flake_logs_and_does_not_spawn(tmp_path: Path):
+    """A confirmation re-run with NO still-failing test is a flake (B6).
+
+    No fix task, no escalation — just a low-severity "intermittent
+    nondeterminism" log line.
+
+    Step 7 (RED): the new constructor params + _handle_red_run do not exist
+    yet — must fail before impl.
+    """
+    confirmation_runner = AsyncMock(return_value=[])
+    task_client = AsyncMock()
+    escalation_queue = MagicMock()
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+
+    with patch('orchestrator.offline_lane.logger') as mock_logger:
+        await worker._handle_red_run(Path('/tmp/_offline-deep'), 'HEAD1')
+
+    confirmation_runner.assert_awaited_once_with(Path('/tmp/_offline-deep'), 'HEAD1')
+    assert any(
+        'intermittent nondeterminism' in call.args[0]
+        for call in mock_logger.info.call_args_list
+    ), 'expected an "intermittent nondeterminism" info log line'
+    task_client.submit_fix_task.assert_not_awaited()
+    escalation_queue.submit.assert_not_called()
+    assert worker.open_fix_tasks == {}
+
+
+# ---------------------------------------------------------------------------
+# _run_once — wiring the red path by returncode (β3, task 1954, step-9/10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_once_wires_red_and_green_paths_by_returncode(tmp_path: Path):
+    """_run_once branches on the suite result's returncode.
+
+    A green (rc == 0) pass records the snapshot head as ``_last_green_head``
+    and never calls ``_handle_red_run``. A red (rc != 0) pass awaits
+    ``_handle_red_run(wt, head)`` exactly once and leaves ``_last_green_head``
+    untouched.
+
+    Step 9 (RED): _run_once currently only logs PASS/FAIL and never
+    branches — ``_last_green_head`` is never set and ``_handle_red_run`` is
+    never invoked. Must fail before impl.
+    """
+    wt_path = tmp_path / '_offline-deep'
+
+    # -- Scenario A: green run (rc == 0) sets _last_green_head, no red path.
+    git_ops_a = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    suite_runner_a = AsyncMock(return_value=(0, ''))
+    worker_a = _make_worker(tmp_path, git_ops=git_ops_a, suite_runner=suite_runner_a)
+    worker_a._handle_red_run = AsyncMock()
+    worker_a._dirty = True
+
+    await worker_a._run_once()
+
+    assert worker_a._last_green_head == 'HEAD1', (
+        'a green (rc == 0) run must record the snapshot head as _last_green_head'
+    )
+    worker_a._handle_red_run.assert_not_awaited()
+
+    # -- Scenario B: red run (rc != 0) awaits _handle_red_run once, no green update.
+    git_ops_b = _make_git_ops(head='HEAD2', worktree_path=wt_path)
+    suite_runner_b = AsyncMock(return_value=(1, ''))
+    worker_b = _make_worker(tmp_path, git_ops=git_ops_b, suite_runner=suite_runner_b)
+    worker_b._handle_red_run = AsyncMock()
+    worker_b._dirty = True
+
+    await worker_b._run_once()
+
+    assert worker_b._last_green_head is None, (
+        'a red (rc != 0) run must NOT update _last_green_head'
+    )
+    worker_b._handle_red_run.assert_awaited_once_with(wt_path, 'HEAD2')
+
+
+# ---------------------------------------------------------------------------
+# _handle_red_run — new-fingerprint fix-task spawn (β3, task 1954, step-11/12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_new_fingerprint_files_fix_task_and_info_escalation(
+    tmp_path: Path,
+):
+    """A confirmed red run with a NEW fingerprint files a fix task + INFO escalation (B4).
+
+    The suspect range spans the last-known-green head through the current
+    head; the fingerprint is recorded in ``open_fix_tasks`` so a same-set
+    recurrence updates rather than re-files (see the DEDUP test).
+
+    Step 11 (RED): the non-empty branch of _handle_red_run is still a stub
+    (raises ``NotImplementedError``) — must fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.submit_fix_task = AsyncMock(return_value='fix-99')
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-fix-99-1'
+
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD1')
+
+    task_client.submit_fix_task.assert_awaited_once()
+    arguments = task_client.submit_fix_task.await_args.args[0]
+    assert arguments['status'] == 'pending'
+    assert arguments['metadata']['merge_lane'] == 'normal'
+    assert arguments['metadata']['failing_tests'] == ['t::a', 't::b']
+    assert arguments['metadata']['suspect_ranges'] == ['GREEN..HEAD1']
+
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    assert worker.open_fix_tasks[fp] == 'fix-99'
+    assert worker._red_advance_counts[fp] == 1
+
+    escalation_queue.submit.assert_called_once()
+    esc = escalation_queue.submit.call_args.args[0]
+    assert esc.severity == 'info'
+    assert esc.level == 0
+    assert esc.agent_role == 'orchestrator-offline-lane'
+
+
+# ---------------------------------------------------------------------------
+# _handle_red_run — dedup across advances (β3, task 1954, step-13/14)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_dedup_appends_suspect_range_not_new_task(tmp_path: Path):
+    """A confirmed red run with an ALREADY-OPEN fingerprint updates, not re-files (B5).
+
+    Priming open_fix_tasks/_red_advance_counts for the same failing-test set
+    and advancing again at a new head must append the new suspect range to
+    the existing fix task rather than filing a duplicate, and must not raise
+    a second INFO escalation.
+
+    Step 13 (RED): the existing-fingerprint branch of _handle_red_run is not
+    implemented yet — must fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.get_status = AsyncMock(return_value='in-progress')
+    escalation_queue = MagicMock()
+
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    worker.open_fix_tasks[fp] = 'fix-99'
+    worker._red_advance_counts[fp] = 1
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD2')
+
+    task_client.append_suspect_range.assert_awaited_once_with('fix-99', 'GREEN..HEAD2')
+    task_client.submit_fix_task.assert_not_awaited()
+    escalation_queue.submit.assert_not_called()
+    assert worker._red_advance_counts[fp] == 2
+
+
+# ---------------------------------------------------------------------------
+# _maybe_promote_blocker — STALL -> escalate_blocker by N-advances (β3, task 1954, step-15/16)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_promotes_blocker_at_n_advances(tmp_path: Path):
+    """A same-set red advance that reaches N confirmed-red advances stages a
+    born-at-L2 ``escalate_blocker`` promotion (B7/C4) — exactly once, and a
+    further same-set advance beyond N must not re-promote (idempotent) nor
+    spawn a new fix task.
+
+    Step 15 (RED): _maybe_promote_blocker is a no-op stub — must fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.get_status = AsyncMock(return_value='in-progress')
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-fix-99-2'
+
+    config = _make_config(tmp_path, offline_lane_red_advances_before_blocker=3)
+    worker = _make_worker(
+        tmp_path,
+        config=config,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    worker.open_fix_tasks[fp] = 'fix-99'
+    worker._red_advance_counts[fp] = 2
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD3')
+
+    assert worker._red_advance_counts[fp] == 3, 'count still bumps on the promoting advance'
+    escalation_queue.submit.assert_called_once()
+    esc = escalation_queue.submit.call_args.args[0]
+    assert esc.severity == 'critical'
+    assert esc.level == 2
+    assert esc.agent_role == 'orchestrator-offline-lane'
+    assert esc.task_id == 'fix-99'
+    task_client.submit_fix_task.assert_not_awaited()
+
+    # A 4th same-set advance must NOT file a further blocker (idempotent) and
+    # must NOT spawn a new fix task.
+    await worker._handle_red_run(wt, 'HEAD4')
+
+    assert worker._red_advance_counts[fp] == 4
+    escalation_queue.submit.assert_called_once()
+    task_client.submit_fix_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _maybe_promote_blocker — terminal fix-task status + done-clears (step-17/18)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('terminal_status', ['cancelled', 'deferred'])
+@pytest.mark.asyncio
+async def test_handle_red_run_promotes_blocker_on_terminal_status(
+    tmp_path: Path, terminal_status: str,
+):
+    """A fix task that reaches a TERMINAL non-done status (cancelled/deferred)
+    promotes to escalate_blocker even if the N-advances count has not been
+    reached — the fix task can't land, so waiting further is pointless.
+
+    Step 17 (RED): the terminal-status branch is not implemented yet — must
+    fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.get_status = AsyncMock(return_value=terminal_status)
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-fix-99-2'
+
+    config = _make_config(tmp_path, offline_lane_red_advances_before_blocker=3)
+    worker = _make_worker(
+        tmp_path,
+        config=config,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    worker.open_fix_tasks[fp] = 'fix-99'
+    worker._red_advance_counts[fp] = 1  # well below N=3
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD2')
+
+    escalation_queue.submit.assert_called_once()
+    esc = escalation_queue.submit.call_args.args[0]
+    assert esc.severity == 'critical'
+    assert esc.level == 2
+    assert esc.agent_role == 'orchestrator-offline-lane'
+    assert esc.task_id == 'fix-99'
+    assert fp in worker._promoted_blockers
+    task_client.submit_fix_task.assert_not_awaited()
+
+    # A further same-set advance must not re-promote (idempotent).
+    await worker._handle_red_run(wt, 'HEAD3')
+    escalation_queue.submit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_done_status_clears_fingerprint(tmp_path: Path):
+    """A fix task that reaches 'done' clears the fingerprint from
+    open_fix_tasks / _red_advance_counts — a genuine LATER recurrence of the
+    same failing set must file a FRESH fix task rather than being silently
+    swallowed by stale in-memory state. No blocker is filed on the clearing
+    advance.
+
+    Step 17 (RED): the done-clears branch is not implemented yet — must
+    fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.get_status = AsyncMock(return_value='done')
+    escalation_queue = MagicMock()
+
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    worker.open_fix_tasks[fp] = 'fix-99'
+    worker._red_advance_counts[fp] = 2
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD2')
+
+    assert fp not in worker.open_fix_tasks, 'a done fix task must clear the fingerprint'
+    assert fp not in worker._red_advance_counts
+    assert fp not in worker._promoted_blockers
+    escalation_queue.submit.assert_not_called()
+    task_client.submit_fix_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Default confirmation-runner seam (step-19/20)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_confirmation_run_builds_serial_confirm_command(tmp_path: Path):
+    """The default (uninjected) confirmation_runner seam builds the real
+    serial confirm-failures invocation and parses the confirmed-still-failing
+    test IDs from stdout (one per line).
+
+    No confirmation_runner is supplied, so the worker falls back to its
+    ``_default_confirmation_run`` seam. ``asyncio.create_subprocess_exec`` is
+    mocked, so this asserts ONLY that the argv/env/cwd invocation is built
+    correctly and stdout is parsed — real script existence/execution is
+    ζ's job (cross-project scope boundary; see module docstring), mirroring
+    ``test_default_suite_runner_builds_run_offline_deep_command`` (β2).
+
+    Step 19 (RED): _default_confirmation_run is a NotImplementedError stub
+    — must fail before impl.
+    """
+    worker = _make_worker(tmp_path)  # no confirmation_runner injected -> default seam
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(
+        return_value=(b'tests::test_a\ntests::test_b\n', b'')
+    )
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
+
+    assert confirmed == ['tests::test_a', 'tests::test_b']
+
+    mock_exec.assert_awaited_once()
+    argv = mock_exec.call_args.args
+    kwargs = mock_exec.call_args.kwargs
+    assert argv[0] == 'scripts/run-offline-deep.sh', (
+        'argv must invoke the offline-deep script'
+    )
+    assert '--test-threads=1' in argv, 'the confirmation re-run must be serial (1 thread)'
+    assert any(a.startswith('--confirm') for a in argv[1:]), (
+        'argv must carry a confirm-failures flag distinguishing this from a '
+        'normal suite run'
+    )
+    assert kwargs['cwd'] == str(wt_path), 'cwd must be the _offline-deep worktree'
+    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
+        'DF_VERIFY_ROLE=offline must be set, same as the normal suite run'
+    )
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
+            f'not replace it (missing/altered {key!r})'
+        )
+    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert kwargs['stderr'] == asyncio.subprocess.STDOUT
+
+
+@pytest.mark.asyncio
+async def test_default_confirmation_run_empty_stdout_means_no_confirmed_failures(
+    tmp_path: Path,
+):
+    """Blank/whitespace-only lines are not test IDs — empty stdout confirms nothing.
+
+    Step 19 (RED): _default_confirmation_run is a NotImplementedError stub
+    — must fail before impl.
+    """
+    worker = _make_worker(tmp_path)
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'\n  \n', b''))
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ):
+        confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
+
+    assert confirmed == []

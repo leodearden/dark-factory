@@ -58,9 +58,11 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue
+
     from orchestrator.config import OrchestratorConfig
     from orchestrator.git_ops import GitOps
 
@@ -80,6 +82,43 @@ _RUN_OFFLINE_DEEP_SCRIPT: str = 'scripts/run-offline-deep.sh'
 #: test-thread count) -> (return code, output tail).
 SuiteRunner = Callable[[Path, str, int], Awaitable[tuple[int, str]]]
 
+#: Signature of the injectable confirmation-rerun seam (β3): (worktree path,
+#: head SHA) -> confirmed-still-failing test IDs.  An empty return means the
+#: original failure did not reproduce in isolation (flake, B6).
+ConfirmationRunner = Callable[[Path, str], Awaitable[list[str]]]
+
+
+class OfflineLaneTaskClient(Protocol):
+    """Pluggable interface for filing/updating the offline-lane fix task (β3).
+
+    Encapsulates the MCP ``submit_task`` seam so this module never talks to
+    the fused-memory MCP directly — mirrors ``SuiteRunner``'s cross-project
+    scope boundary. The real implementation (backed by the
+    ``_post_submit_tasks`` httpx pattern) is wired by the harness; unit tests
+    inject a fake.
+    """
+
+    async def submit_fix_task(self, arguments: dict) -> str:
+        """Submit a new fix task (see ``build_offline_lane_fix_task_arguments``);
+        returns the new task's id."""
+        ...  # pragma: no cover
+
+    async def append_suspect_range(self, task_id: str, suspect_range: str) -> None:
+        """Append a new suspect commit range to an already-open fix task."""
+        ...  # pragma: no cover
+
+    async def get_status(self, task_id: str) -> str:
+        """Return the current status of a previously filed fix task."""
+        ...  # pragma: no cover
+
+
+#: Fix-task statuses that are terminal and non-done — the fix "can't land" —
+#: so :meth:`OfflineLaneWorker._maybe_promote_blocker` promotes straight to
+#: escalate_blocker (B7/C4) regardless of the N-advances count.  ``blocked``
+#: is deliberately excluded: it is a resolvable escalation-in-progress state,
+#: not a can't-land verdict.
+_TERMINAL_NON_DONE: frozenset[str] = frozenset({'cancelled', 'deferred'})
+
 
 class OfflineLaneWorker:
     """Singleton offline-deep lane worker — single-flight, coalescing, from-head.
@@ -96,6 +135,18 @@ class OfflineLaneWorker:
             run.  Defaults to :meth:`_default_run_suite` (a real
             ``scripts/run-offline-deep.sh`` subprocess invocation) when not
             supplied.
+        confirmation_runner: Optional injectable async seam (β3)
+            ``(wt_path, head) -> confirmed_still_failing_ids`` used by
+            :meth:`_handle_red_run` to filter flakes before fingerprinting.
+            Defaults to :meth:`_default_confirmation_run` when not supplied.
+        task_client: Optional :class:`OfflineLaneTaskClient` (β3) used to
+            file/update the dedup'd fix task for a confirmed red run.
+            Defaults to ``None`` — the red path degrades to a log-only no-op
+            when unwired (never a crash; worker leg of C7).
+        escalation_queue: Optional ``EscalationQueue`` (β3) used to raise the
+            L0 info escalation on a new fix-task file and the staged L2
+            ``escalate_blocker`` promotion.  Defaults to ``None`` — same
+            log-only degrade as ``task_client``.
     """
 
     def __init__(
@@ -105,6 +156,9 @@ class OfflineLaneWorker:
         *,
         lock_path: str | Path,
         suite_runner: SuiteRunner | None = None,
+        confirmation_runner: ConfirmationRunner | None = None,
+        task_client: OfflineLaneTaskClient | None = None,
+        escalation_queue: EscalationQueue | None = None,
     ) -> None:
         self.git_ops = git_ops
         self.config = config
@@ -112,6 +166,13 @@ class OfflineLaneWorker:
         self.suite_runner: SuiteRunner = (
             suite_runner if suite_runner is not None else self._default_run_suite
         )
+        self.confirmation_runner: ConfirmationRunner = (
+            confirmation_runner
+            if confirmation_runner is not None
+            else self._default_confirmation_run
+        )
+        self.task_client = task_client
+        self.escalation_queue = escalation_queue
 
         # Coalescing state — flipped by on_post_merge (and the poll
         # backstop), cleared at the START of _run_once (clear-before-snapshot).
@@ -124,6 +185,23 @@ class OfflineLaneWorker:
         self._last_run_head: str | None = None
         # Held open for the lifetime of a successful acquire_lock() call.
         self._lock_file: IO | None = None
+
+        # Red-path state (β3) — keyed by compute_failing_test_set_fingerprint.
+        # Maps a confirmed failing-test-set fingerprint to its open fix task
+        # id; an in-flight fingerprint absorbs further same-set red advances
+        # (append suspect range) instead of spawning a duplicate task (B5).
+        self.open_fix_tasks: dict[str, str] = {}
+        # Consecutive confirmed-red advances recorded per open fingerprint —
+        # compared against config.git.offline_lane_red_advances_before_blocker
+        # for the N-advances staged escalate_blocker promotion (B7/C4).
+        self._red_advance_counts: dict[str, int] = {}
+        # Fingerprints already promoted to escalate_blocker — promotion is
+        # idempotent per fingerprint (never re-files once escalated).
+        self._promoted_blockers: set[str] = set()
+        # Head of the most recently PASSING run — the cheapest sound lower
+        # bound for a new fix task's suspect commit range.  None until the
+        # first green run is observed.
+        self._last_green_head: str | None = None
 
     # ------------------------------------------------------------------
     # Trigger seam (β1 consumer)
@@ -231,6 +309,262 @@ class OfflineLaneWorker:
             'offline-lane: run head=%s status=%s duration=%.1fs',
             head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
         )
+        if rc == 0:
+            self._last_green_head = head
+        else:
+            await self._handle_red_run(wt, head)
+
+    # ------------------------------------------------------------------
+    # Red-path handling — confirmation, fingerprint, dedup'd fix-task spawn,
+    # staged escalation (β3, task 1954, PRD §5 C3/C4)
+    # ------------------------------------------------------------------
+
+    async def _handle_red_run(self, wt: Path, head: str) -> None:
+        """Handle a confirmed-red ``_run_once`` pass: confirm, fingerprint, file/update.
+
+        (1) CONFIRMATION RE-RUN: re-runs only the originally-failing tests,
+        isolated/serial, ONCE, via :attr:`confirmation_runner`. An empty
+        result means the failure did not reproduce — intermittent
+        nondeterminism (B6): log only, no task, no escalation.
+
+        (2)+(3) UPDATE-OR-FILE: fingerprints the confirmed failing-test SET
+        (never ``main_sha`` — DB3/C3) and dispatches on whether that
+        fingerprint already has an open fix task. An already-open
+        fingerprint is UPDATED (:meth:`_update_existing_fix_task` — append
+        the suspect range, no new task/escalation, B5); a new fingerprint is
+        FILED (:meth:`_file_new_fix_task` — new fix task + INFO escalation, B4).
+        """
+        confirmed = await self.confirmation_runner(wt, head)
+        if not confirmed:
+            logger.info(
+                'offline-lane: intermittent nondeterminism — confirmation '
+                're-run at head=%s found no still-failing test; not filing '
+                'a fix task',
+                head[:12],
+            )
+            return
+
+        from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+        fp = compute_failing_test_set_fingerprint(confirmed)
+        if fp in self.open_fix_tasks:
+            await self._update_existing_fix_task(fp, head)
+        else:
+            await self._file_new_fix_task(fp, confirmed, head)
+
+    def _suspect_range(self, head: str) -> str:
+        """Cheapest sound over-approximation of the commits that could have
+        introduced a confirmed break: the last-known-green head through the
+        current run's head, or just ``head`` when no green run has been
+        observed yet (``_last_green_head`` is still ``None``)."""
+        if self._last_green_head:
+            return f'{self._last_green_head}..{head}'
+        return head
+
+    async def _file_new_fix_task(self, fp: str, confirmed: list[str], head: str) -> None:
+        """File a NEW dedup'd fix task for a confirmed-red failing-test set (B4).
+
+        Builds the ``submit_task`` argument block via
+        :func:`~orchestrator.workflow.build_offline_lane_fix_task_arguments`
+        and — when :attr:`task_client` is wired — files it and records *fp*
+        in :attr:`open_fix_tasks` / :attr:`_red_advance_counts` so a
+        same-set recurrence updates rather than re-files (see
+        :meth:`_update_existing_fix_task`). Degrades to a log-only no-op
+        when :attr:`task_client` is unwired (never a crash; worker leg of
+        C7) — no fingerprint is recorded in that case, since there is no
+        fix task to dedup against.
+        """
+        from orchestrator.workflow import build_offline_lane_fix_task_arguments
+
+        suspect = self._suspect_range(head)
+        arguments = build_offline_lane_fix_task_arguments(
+            confirmed, suspect, fp, self.config.project_root, head,
+        )
+        if self.task_client is None:
+            logger.info(
+                'offline-lane: confirmed red run (tests=%s) but no task_client '
+                'wired — skipping fix-task file (log-only degrade)',
+                ', '.join(sorted(confirmed)),
+            )
+            return
+        task_id = await self.task_client.submit_fix_task(arguments)
+        self.open_fix_tasks[fp] = task_id
+        self._red_advance_counts[fp] = 1
+        await self._file_info_escalation(task_id, confirmed, suspect)
+
+    async def _file_info_escalation(
+        self, task_id: str, confirmed: list[str], suspect: str,
+    ) -> None:
+        """File a non-blocking L0 INFO escalation announcing a new fix task (B4).
+
+        Mirrors ``harness._file_starvation_info``: a pure operator-signal
+        INFO escalation (``severity='info'``, ``level=0``), deduped against
+        any already-pending L0 escalation for this fix task id so a crash
+        + re-dispatch can't double-file. No-ops gracefully when no
+        escalation queue is attached (same log-only degrade as
+        :attr:`task_client`).
+        """
+        if self.escalation_queue is None:
+            return
+
+        existing = [
+            e
+            for e in self.escalation_queue.get_by_task(task_id, status='pending')
+            if e.agent_role == 'orchestrator-offline-lane' and e.level == 0
+        ]
+        if existing:
+            logger.debug(
+                'offline-lane: pending INFO escalation already exists for '
+                'fix task %s — skipping duplicate file',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-offline-lane',
+            severity='info',
+            category='risk_identified',
+            summary=(
+                f'offline-lane: filed fix task {task_id} for '
+                f'{len(confirmed)} confirmed-failing test(s)'
+            )[:200],
+            detail=(
+                f'Failing tests: {", ".join(sorted(confirmed))}\n'
+                f'Suspect commit range: {suspect}'
+            ),
+            suggested_action='manual_investigation',
+            level=0,
+        )
+        self.escalation_queue.submit(esc)
+        logger.info(
+            'offline-lane: filed INFO escalation %s for fix task %s',
+            esc.id, task_id,
+        )
+
+    async def _update_existing_fix_task(self, fp: str, head: str) -> None:
+        """Update an ALREADY-OPEN fix task for a same-fingerprint red advance (B5).
+
+        Appends the new suspect range to the open fix task rather than
+        filing a duplicate task or raising a second INFO escalation, then
+        bumps the red-advance count and defers to
+        :meth:`_maybe_promote_blocker` for the staged L2 promotion check
+        (C4).
+        """
+        task_id = self.open_fix_tasks[fp]
+        if self.task_client is not None:
+            await self.task_client.append_suspect_range(task_id, self._suspect_range(head))
+        self._red_advance_counts[fp] += 1
+        await self._maybe_promote_blocker(fp, task_id)
+
+    async def _maybe_promote_blocker(self, fp: str, task_id: str) -> None:
+        """Staged L2 ``escalate_blocker`` promotion when a fix task stalls (C4).
+
+        Promotion is idempotent per fingerprint — a fingerprint already in
+        :attr:`_promoted_blockers` returns immediately, so subsequent
+        same-set advances never re-promote.
+
+        Three arms, checked in order (done-clear and terminal-promote
+        precede the count check, since a status query — when
+        :attr:`task_client` is wired — is authoritative over the local
+        advance count):
+
+        1. DONE: the fix task landed — clear *fp* from :attr:`open_fix_tasks`
+           / :attr:`_red_advance_counts` / :attr:`_promoted_blockers` so a
+           genuine LATER recurrence of the same failing set files a FRESH
+           task instead of being silently swallowed by stale state. No
+           blocker filed.
+        2. TERMINAL NON-DONE (cancelled/deferred): the fix task can't land —
+           promote immediately regardless of the advance count.
+        3. N-ADVANCES (B7): once the confirmed-red advance count reaches
+           ``config.git.offline_lane_red_advances_before_blocker``, promote.
+
+        Arms 1/2 are skipped when :attr:`task_client` is unwired (no status
+        to query) — only the count-based arm 3 applies in that case.
+        """
+        if fp in self._promoted_blockers:
+            return
+
+        if self.task_client is not None:
+            status = await self.task_client.get_status(task_id)
+            if status == 'done':
+                self.open_fix_tasks.pop(fp, None)
+                self._red_advance_counts.pop(fp, None)
+                self._promoted_blockers.discard(fp)
+                return
+            if status in _TERMINAL_NON_DONE:
+                await self._file_blocker_escalation(task_id, fp)
+                self._promoted_blockers.add(fp)
+                return
+
+        if self._red_advance_counts[fp] >= self.config.git.offline_lane_red_advances_before_blocker:
+            await self._file_blocker_escalation(task_id, fp)
+            self._promoted_blockers.add(fp)
+
+    async def _file_blocker_escalation(self, task_id: str, fp: str) -> None:
+        """File a born-at-L2 ``escalate_blocker`` for a stalled offline-lane fix task (B7/C4).
+
+        Mirrors the deterministic-runner / merge-worker-supervisor born-at-L2
+        pattern: ``severity='critical'`` + ``level=2`` routes straight to a
+        human, and the ``orchestrator-`` ``agent_role`` sentinel prefix keeps
+        it at level=2 past the escalation server's severity-downgrade gate.
+        ``category='dependency_discovered'`` mirrors the scheduler's
+        external-dependency escalations (``scheduler.py`` cancelled-dep /
+        unresolved-threshold cases) — this fix task IS the (in-process)
+        dependency the confirmed-red offline-lane state is blocked on.
+
+        Deduped against any already-pending L2 blocker escalation for this
+        task id (crash-safe re-dispatch guard, mirrors
+        :meth:`_file_info_escalation`'s L0 dedup) in addition to the
+        in-memory ``_promoted_blockers`` idempotency guard in
+        :meth:`_maybe_promote_blocker`. No-ops gracefully when no escalation
+        queue is attached (same log-only degrade as :attr:`task_client`).
+        """
+        if self.escalation_queue is None:
+            return
+
+        existing = [
+            e
+            for e in self.escalation_queue.get_by_task(task_id, status='pending')
+            if e.agent_role == 'orchestrator-offline-lane' and e.level == 2
+        ]
+        if existing:
+            logger.debug(
+                'offline-lane: pending L2 blocker escalation already exists for '
+                'fix task %s — skipping duplicate file',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-offline-lane',
+            severity='critical',
+            category='dependency_discovered',
+            summary=(
+                f'offline-lane: fix task {task_id} has not landed — '
+                f'confirmed-red offline-deep suite is stalled'
+            )[:200],
+            detail=(
+                f'Fingerprint {fp} has been confirmed red for '
+                f'{self._red_advance_counts.get(fp)} advance(s) without the '
+                f'fix task landing. Manual investigation is needed to land '
+                f'the fix or re-triage it.'
+            ),
+            suggested_action='manual_investigation',
+            level=2,
+        )
+        self.escalation_queue.submit(esc)
+        logger.info(
+            'offline-lane: filed L2 blocker escalation %s for stalled fix task %s',
+            esc.id, task_id,
+        )
 
     # ------------------------------------------------------------------
     # Lockfile singleton
@@ -311,3 +645,38 @@ class OfflineLaneWorker:
         stdout, _ = await proc.communicate()
         tail = (stdout or b'').decode(errors='replace')[-2000:]
         return proc.returncode or 0, tail
+
+    async def _default_confirmation_run(self, wt: Path, head: str) -> list[str]:
+        """Default ``confirmation_runner`` seam — re-runs failures serially, isolated (β3).
+
+        Cross-project scope boundary (same as :meth:`_default_run_suite`):
+        the real reify-side confirm-failures invocation — discover which
+        tests just failed, re-run them isolated/serial once, report those
+        still failing — is ζ's job; this default builds the invocation
+        unconditionally.
+
+        ``--test-threads=1`` forces the confirmation re-run serial/isolated
+        (a flake filter must never share state across parallel test
+        workers). ``--confirm-failed`` is the confirm-failures flag
+        distinguishing this from a normal suite run. ``env``/``cwd`` mirror
+        :meth:`_default_run_suite` exactly (same ``DF_VERIFY_ROLE=offline``
+        overlay onto a full ``os.environ`` copy). ``head`` is accepted for
+        seam-signature symmetry with injected runners, same as
+        :meth:`_default_run_suite`.
+
+        Parses stdout as newline-separated test IDs; blank/whitespace-only
+        lines are skipped so trailing/blank output never becomes a spurious
+        "confirmed" entry.
+        """
+        argv = [_RUN_OFFLINE_DEEP_SCRIPT, '--test-threads=1', '--confirm-failed']
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(wt),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        text = (stdout or b'').decode(errors='replace')
+        return [line.strip() for line in text.splitlines() if line.strip()]
