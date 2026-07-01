@@ -1,13 +1,13 @@
 """know_live-specific reconciliation guardrail policy.
 
 All know_live-specific constants live here so that shared reconciliation
-infrastructure (stage2.py, task_knowledge_sync.py) does not embed
-project-specific magic values.
+infrastructure does not embed project-specific magic values.
 """
 
 from __future__ import annotations
 
-# Canonical project identifier — single source of truth for stage2 prompt injection.
+# Canonical project identifier — single source of truth for the
+# snapshot-write-blocked registry (see policies/__init__.py).
 KNOW_LIVE_PROJECT_ID: str = 'know_live'
 
 # Snapshot write paths blocked-by-design for know_live.
