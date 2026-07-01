@@ -21,9 +21,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
 from pydantic import ValidationError
 
-from orchestrator.config import GitConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.offline_lane import OfflineLaneWorker
 
 # ---------------------------------------------------------------------------
@@ -43,7 +44,7 @@ def _make_git_ops(*, head: str = 'headsha', worktree_path: Path | None = None) -
 
 def _make_config(tmp_path: Path, **git_overrides) -> MagicMock:
     """MagicMock OrchestratorConfig with a real GitConfig at .git."""
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = tmp_path
     config.git = GitConfig(**git_overrides)
     return config
