@@ -1740,6 +1740,15 @@ class TaskKnowledgeSync(BaseStage):
             await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
         )
 
+        # --- stage1_flag_marker age-based GC (task 1944) ---
+        # The stage1_flag_marker pool is written by Stage 1, not by this stage's
+        # agent write, so post-write placement is correct (unlike the pre-write
+        # summary pool trim above). Runs unconditionally on both full and
+        # remediation paths so the pool is bounded every cycle. Explicit zero
+        # so downstream consumers never need a .get(..., 0) fallback.
+        gc_swept = await _sweep_stale_flag_markers(self.memory, self.project_id, run_id)
+        report.stats['stale_flag_markers_gc_swept'] = gc_swept
+
         return report
 
     async def _apply_post_flight_guards(

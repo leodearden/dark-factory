@@ -11444,14 +11444,21 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
 
     @pytest.mark.asyncio
     async def test_trim_precedes_agent_write_ordering(self, mock_deps):
-        """Pre-trim (get_memories_by_metadata) fires BEFORE super().run() (agent write)."""
+        """Pre-trim (get_memories_by_metadata) fires BEFORE super().run() (agent write).
+
+        Only records calls filtered on 'recon_pool' (the stage2_cycle_summary
+        pretrim this test targets) — run() also calls get_memories_by_metadata
+        post-write for the unrelated stage1_flag_marker GC sweep (task 1944),
+        which must NOT be mistaken for a (misordered) pretrim call.
+        """
         from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.stages.base import BaseStage
 
         order = []
 
         async def record_trim(*args, **kwargs):
-            order.append('trim')
+            if 'recon_pool' in (kwargs.get('filters') or {}):
+                order.append('trim')
             return []
 
         async def record_agent(*args, **kwargs):
