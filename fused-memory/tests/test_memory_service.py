@@ -3188,6 +3188,49 @@ class TestUpdateEdgeClearInvalidAt:
         assert result.get('verified') is True
 
     @pytest.mark.asyncio
+    async def test_fact_fail_plus_clear_ok_verified_false(self, service):
+        """fact readback mismatches even though invalid_at readback clears → verified False (AND).
+
+        Exercises the AND logic from the 'fact fails' side: a successful
+        clear must not paper over a failed fact-text verification.
+        """
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'stale fact'))
+        service.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='proj', clear_invalid_at=True
+        )
+        assert result.get('verified') is False, (
+            'verified must stay False when the fact readback fails, even if invalid_at clears'
+        )
+        assert 'Readback fact mismatch' in result.get('verification_error', '')
+
+    @pytest.mark.asyncio
+    async def test_fact_fail_plus_clear_exception_preserves_fact_error(self, service):
+        """An exception in the clear_invalid_at readback must not discard a prior fact-mismatch error.
+
+        Regression test: the Guard-2b exception handler used to overwrite
+        result['verification_error'] outright, discarding the fact-mismatch
+        diagnostic set by the block above it.
+        """
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'stale fact'))
+        service.graphiti.get_edge_invalid_at = AsyncMock(side_effect=RuntimeError('boom'))
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='proj', clear_invalid_at=True
+        )
+        assert result.get('verified') is False
+        error = result.get('verification_error', '')
+        assert 'Readback fact mismatch' in error, (
+            'the earlier fact-verification error must be preserved, not overwritten'
+        )
+        assert 'RuntimeError: boom' in error
+
+    @pytest.mark.asyncio
     async def test_clear_invalid_at_alone_does_not_raise(self, service):
         """Guard must allow clear_invalid_at=True even when fact and invalid_at are None."""
         service.graphiti.update_edge = AsyncMock(
