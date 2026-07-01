@@ -610,40 +610,47 @@ class MemoryService:
     async def _dual_write_callback(
         self, callback_type: str, result: Any, payload: dict[str, Any]
     ) -> None:
-        """Post-process callback: extract facts and enqueue each for durable Mem0 write.
+        """Post-process callback: extract facts and enqueue each for durable Mem0
+        write, then trigger a best-effort post-ingestion entity-summary refresh.
 
         Instead of writing directly to Mem0 (fire-and-forget), we batch-enqueue
         each extracted fact as a ``mem0_classify_and_add`` queue item so it gets
-        independent retry / dead-letter handling.
+        independent retry / dead-letter handling. After the Mem0 enqueue, we also
+        refresh the summary of every entity node touched by an edge endpoint in
+        this result — closing the ingestion-time staleness gap where graphiti_core
+        invalidates/supersedes/dedups edges internally without any fused-memory
+        code observing which nodes changed.
         """
         if result is None:
             return
 
         edges = getattr(result, 'edges', None) or getattr(result, 'entity_edges', None) or []
-        if not edges:
-            return
 
-        project_id = payload.get('project_id', 'main')
-        group_id = f'mem0_{project_id}'
+        if edges:
+            project_id = payload.get('project_id', 'main')
+            group_id = f'mem0_{project_id}'
 
-        batch = [
-            {
-                'group_id': group_id,
-                'operation': 'mem0_classify_and_add',
-                'payload': {
-                    'fact_text': getattr(edge, 'fact', None) or str(edge),
-                    'project_id': project_id,
-                    'agent_id': payload.get('agent_id'),
-                    'session_id': payload.get('session_id'),
-                    '_causation_id': payload.get('_causation_id'),
-                    'temporal_context': payload.get('temporal_context'),
-                },
-            }
-            for edge in edges
-        ]
+            batch = [
+                {
+                    'group_id': group_id,
+                    'operation': 'mem0_classify_and_add',
+                    'payload': {
+                        'fact_text': getattr(edge, 'fact', None) or str(edge),
+                        'project_id': project_id,
+                        'agent_id': payload.get('agent_id'),
+                        'session_id': payload.get('session_id'),
+                        '_causation_id': payload.get('_causation_id'),
+                        'temporal_context': payload.get('temporal_context'),
+                    },
+                }
+                for edge in edges
+            ]
 
-        assert self.durable_queue is not None
-        await self.durable_queue.enqueue_batch(batch)
+            assert self.durable_queue is not None
+            await self.durable_queue.enqueue_batch(batch)
+
+        refresh_group_id = payload.get('group_id') or payload.get('project_id') or 'main'
+        await self._refresh_entity_summaries_from_result(result, group_id=refresh_group_id)
 
     # ------------------------------------------------------------------
     # Write: add_episode
