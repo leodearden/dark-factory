@@ -20,6 +20,7 @@ set -euo pipefail
 
 SERVICE="orchestrator-dark-factory.service"
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
+VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
 
 if [[ $# -gt 0 ]]; then
     echo "ERROR: unexpected argument: $1" >&2
@@ -37,6 +38,22 @@ get_state() {
 
 baseline="$(get_state)"
 baseline_pid="$(read_field "$baseline" MainPID)"
+baseline_mono="$(read_field "$baseline" ActiveEnterTimestampMonotonic)"
 
 echo "Restarting ${SERVICE} (baseline MainPID=${baseline_pid})..."
 systemctl --user restart "$SERVICE"
+
+echo -n "Verifying fresh MainPID..."
+deadline=$((SECONDS + VERIFY_TIMEOUT))
+while [[ $SECONDS -lt $deadline ]]; do
+    state="$(get_state)"
+    pid="$(read_field "$state" MainPID)"
+    active="$(read_field "$state" ActiveState)"
+    mono="$(read_field "$state" ActiveEnterTimestampMonotonic)"
+    if [[ "$pid" != "$baseline_pid" && "$pid" -gt 0 && "$active" == "active" && "$mono" -gt "$baseline_mono" ]]; then
+        echo " OK"
+        echo "orchestrator-dark-factory restarted successfully (new MainPID=${pid})."
+        exit 0
+    fi
+    sleep 1
+done
