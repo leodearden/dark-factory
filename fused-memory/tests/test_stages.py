@@ -5681,6 +5681,119 @@ class TestSweepStaleFlagMarkers:
         # Deterministic scroll only — semantic search must never be used for GC.
         memory_service.search.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_enumeration_failure_returns_zero_and_logs_warning(self, caplog):
+        """When get_memories_by_metadata raises, returns 0, does NOT raise, logs WARNING."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant gone')
+        )
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_flag_markers(memory_service, 'reify', run_id='r1')
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+    @pytest.mark.asyncio
+    async def test_empty_enumeration_returns_zero_and_no_deletes(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_flag_markers(memory_service, 'reify', run_id='r1')
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_partial_delete_failure_excluded_from_count_logs_warning(self, caplog):
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'bad',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+            {
+                'id': 'ok',
+                'created_at': (fixed_now - timedelta(days=30)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(side_effect=[RuntimeError('boom'), None])
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        assert result == 1
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) == 1
+        assert 'bad' in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_scroll_cap_reached_logs_no_silent_caps_warning(self, caplog):
+        """When enumeration returns exactly scroll_limit members, log a WARNING that
+        older stale markers may remain uncollected this cycle."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': f'm{i}',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker'},
+            }
+            for i in range(3)
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _sweep_stale_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=3,
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
 
 class TestComputeStaleFlags:
     """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
