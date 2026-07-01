@@ -100,8 +100,8 @@ class OfflineLaneWorker:
 
     def __init__(
         self,
-        git_ops: 'GitOps',
-        config: 'OrchestratorConfig',
+        git_ops: GitOps,
+        config: OrchestratorConfig,
         *,
         lock_path: str | Path,
         suite_runner: SuiteRunner | None = None,
