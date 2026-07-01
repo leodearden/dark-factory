@@ -45,6 +45,7 @@ from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     cross_verify_task_counts,
+    diff_status_correction,
     filter_task_tree,
 )
 from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
@@ -763,6 +764,40 @@ class ReconciliationHarness:
                 f'_check_graphiti_queue_health failed for project_id={project_id!r}: {exc}'
             )
             return None
+
+    async def _reconcile_status_correction(
+        self, project_id: str, statuses: dict[str, str]
+    ) -> dict | None:
+        """Diff the cached Mem0 project_status_correction memory against the
+        live get_statuses census and supersede it on divergence (task 1938).
+
+        Reuses the `statuses` census already fetched for task_count_verification
+        in run_full_cycle — no extra get_statuses round-trip.  Fail-open at every
+        branch (empty statuses / no cached memory / any exception), mirroring
+        _check_graphiti_queue_health: a memory-store hiccup must never abort a
+        reconciliation cycle.
+
+        Args:
+            project_id: Project identifier — scopes the metadata query and writes.
+            statuses: Compact {id: status} map from get_statuses(), already
+                fetched by run_full_cycle.  Empty/falsy means the live census is
+                unavailable.
+
+        Returns:
+            None when statuses is empty (fail-open: no supersede attempted, and
+            no memory-service calls are made).  Otherwise a record dict:
+              - found=False when no cached project_status_correction memory exists.
+              - diverged=False, superseded=False when the cached memory matches
+                the live census (no-op).
+              - diverged=True, superseded=True, memory_id, old, new when the
+                cached memory was superseded.
+              - an 'error' key when the query/diff/supersede body raised.
+        """
+        if not statuses:
+            return None
+
+        # step-8/step-10/step-12/step-14 (GREEN) will replace this stub.
+        raise NotImplementedError
 
     # ── Stale-run recovery ─────────────────────────────────────────────
 
