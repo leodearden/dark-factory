@@ -71,6 +71,11 @@ class MemoryConsolidator(BaseStage):
     # None when durable_queue was unavailable or in remediation passes.
     graphiti_queue_health: dict | None = None
 
+    # Cached project_status_correction memory vs. live get_statuses census
+    # diff/supersede record — set by harness (task 1938).
+    # None when the status map was unavailable or in remediation passes.
+    status_correction_reconciliation: dict | None = None
+
     # Count of snapshot lines stripped from the payload in the current cycle (task 1547)
     _entity_summary_snapshot_lines_stripped: int = 0
 
@@ -212,6 +217,15 @@ class MemoryConsolidator(BaseStage):
                         'dead_count': self.graphiti_queue_health.get('dead_count'),
                     },
                 )
+
+        # ── Status-correction reconciliation (task 1938) ───────────────────────
+        # Surface the cached project_status_correction memory vs. live get_statuses
+        # diff/supersede record so a stale Mem0 correction never silently outlives
+        # the authoritative census.
+        if self.status_correction_reconciliation is not None:
+            report.stats['status_correction_reconciliation'] = (
+                self.status_correction_reconciliation
+            )
 
         # ── Stale human-operator-required detector (task 1201) ────────────────
         # Short-circuit when the escalation queue is unavailable — writing Mem0
