@@ -160,14 +160,29 @@ class OfflineLaneWorker:
         head snapshot, a re-set during that run (one or many times) collapses
         into exactly one further coalesced re-run at the new head, never more.
         Otherwise, clear and wait on the wake event (set by
-        :meth:`on_post_merge`).
+        :meth:`on_post_merge`), bounded by ``offline_lane_poll_interval_secs``.
+
+        Poll backstop: a wait that times out (no trigger arrived) polls
+        ``get_main_sha`` itself — a mismatch against ``_last_run_head`` means
+        an advance was missed (e.g. a crash between the merge and the
+        notifiee call) and is run-worthy. Correctness lives in
+        :meth:`_run_once`'s own head snapshot, not here, so a missed trigger
+        only costs granularity (up to one poll interval), never correctness.
         """
         while True:
             if self._dirty:
                 await self._run_once()
                 continue
             self._wake.clear()
-            await self._wake.wait()
+            try:
+                await asyncio.wait_for(
+                    self._wake.wait(),
+                    timeout=self.config.git.offline_lane_poll_interval_secs,
+                )
+            except TimeoutError:
+                head = await self.git_ops.get_main_sha()
+                if head and head != self._last_run_head:
+                    self._dirty = True
 
     async def _run_once(self) -> None:
         """Snapshot head, reset the warm worktree, and invoke the suite seam.
