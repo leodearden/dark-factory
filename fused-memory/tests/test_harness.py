@@ -7451,6 +7451,34 @@ class TestHarnessReconcileStatusCorrection:
         harness.memory.add_memory.assert_not_called()
         harness.memory.delete_memory.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_no_cached_memory_returns_found_false_and_no_write(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """No cached project_status_correction memory -> found=False, no writes.
+
+        step-7 (RED): the query branch does not exist yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+
+        result = await harness._reconcile_status_correction(
+            'test-project', {'1': 'done', '2': 'pending'}
+        )
+
+        assert result == {
+            'available': True,
+            'found': False,
+            'diverged': False,
+            'superseded': False,
+        }
+        harness.memory.get_memories_by_metadata.assert_awaited_once_with(
+            project_id='test-project',
+            filters={'kind': 'project_status_correction'},
+        )
+        harness.memory.add_memory.assert_not_called()
+        harness.memory.delete_memory.assert_not_called()
+
 
 # ── Tests for task 1785: harness._configure_consolidator new kwargs ─────────────
 
