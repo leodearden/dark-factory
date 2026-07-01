@@ -182,6 +182,9 @@ class MemoryService:
         self.durable_queue.register_callback(
             'dual_write_episode', self._dual_write_callback
         )
+        self.durable_queue.register_callback(
+            'refresh_entity_summaries', self._refresh_summaries_callback
+        )
         await self.durable_queue.initialize()
 
         logger.info('MemoryService initialized')
@@ -651,6 +654,21 @@ class MemoryService:
 
         refresh_group_id = payload.get('group_id') or payload.get('project_id') or 'main'
         await self._refresh_entity_summaries_from_result(result, group_id=refresh_group_id)
+
+    async def _refresh_summaries_callback(
+        self, callback_type: str, result: Any, payload: dict[str, Any]
+    ) -> None:
+        """Refresh-only post-ingestion callback: no Mem0 enqueue.
+
+        Used by ingestion paths that already handle Mem0 elsewhere —
+        ``add_memory`` writes Mem0 directly and ``replay_from_store`` only
+        re-ingests into Graphiti — so, unlike ``_dual_write_callback``, this
+        callback must not also batch-enqueue a ``mem0_classify_and_add`` for
+        each edge (that would double-write Mem0). It only triggers the
+        best-effort post-ingestion entity-summary refresh.
+        """
+        group_id = payload.get('group_id') or payload.get('project_id') or 'main'
+        await self._refresh_entity_summaries_from_result(result, group_id=group_id)
 
     # ------------------------------------------------------------------
     # Write: add_episode
