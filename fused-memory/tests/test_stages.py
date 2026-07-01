@@ -13099,3 +13099,57 @@ class TestReconstructStage2Summary:
 
         assert result == 1
         memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dedup_drop_retries_once_with_fresh_content(self):
+        """First add_memory returns empty memory_ids (Mem0 cosine dedup
+        no-op) — retried exactly once with different content (fresh nonce)
+        and unchanged metadata; the retry succeeds and the helper returns 1.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _reconstruct_stage2_summary,
+        )
+
+        run_id = 'run-recon-retry'
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            side_effect=[{'memory_ids': []}, {'memory_ids': ['recon-2']}]
+        )
+
+        result = await _reconstruct_stage2_summary(
+            memory_service, project_id='dark_factory', run_id=run_id,
+        )
+
+        assert memory_service.add_memory.await_count == 2
+        first_kwargs = memory_service.add_memory.call_args_list[0].kwargs
+        second_kwargs = memory_service.add_memory.call_args_list[1].kwargs
+        assert first_kwargs.get('content') != second_kwargs.get('content'), (
+            'retry must use fresh content (new nonce) so the embedding shifts '
+            'past Mem0\'s dedup threshold'
+        )
+        assert first_kwargs.get('metadata') == second_kwargs.get('metadata'), (
+            'metadata must be unchanged between the first attempt and the retry'
+        )
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_dedup_drop_twice_returns_zero_and_warns(self, caplog):
+        """Both the first attempt and the retry return empty memory_ids —
+        exactly two awaits, return value 0, and a WARNING is logged."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _reconstruct_stage2_summary,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            side_effect=[{'memory_ids': []}, {'memory_ids': []}]
+        )
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _reconstruct_stage2_summary(
+                memory_service, project_id='dark_factory', run_id='run-recon-double-drop',
+            )
+
+        assert memory_service.add_memory.await_count == 2
+        assert result == 0
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
