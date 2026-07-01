@@ -10575,11 +10575,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     if outcome.status == 'done':
                         # ι=1894: record clean landing, pop drift base for this req
                         self._note_merge_landing(req.request_id)
-                        # PRIMARY in-process trigger for the offline deep-test lane
-                        # (fanned out via harness _note_merge_all -> _note_offline_lane,
-                        # task 1951 β1); FALLBACK for orchestrator-down landings via
-                        # scripts/land.sh is reify's hooks/reference-transaction
-                        # main-move log (same (base, head) pair).
                         if (
                             outcome.merge_sha is not None
                             and self._on_merge_landed is not None
