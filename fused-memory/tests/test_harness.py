@@ -7882,6 +7882,98 @@ class TestFullCycleWiringDiagnostics:
             f'Expected graphiti_queue_health["healthy"]==False, got {gqh.get("healthy")!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_status_correction_reconciliation_into_stage1(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """run_full_cycle calls _reconcile_status_correction with the same statuses
+        used for task_count_verification and threads its result into Stage 1.
+
+        step-19 (RED): run_full_cycle does not call _reconcile_status_correction
+            nor pass status_correction_reconciliation= to _configure_consolidator yet.
+        step-20 (GREEN): wire it in immediately after cross_verify_task_counts.
+        """
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        assert harness.taskmaster is not None
+        harness.taskmaster.get_tasks = AsyncMock(
+            return_value={
+                'tasks': [
+                    {'id': 1, 'status': 'done'},
+                    {'id': 2, 'status': 'pending'},
+                ]
+            }
+        )
+        harness.taskmaster.get_statuses = AsyncMock(
+            return_value={'1': 'done', '2': 'pending'}
+        )
+
+        # Stale cached project_status_correction memory: cached done=0 diverges
+        # from the live census (done=1), so _reconcile_status_correction must
+        # supersede it (add_memory + delete_memory).
+        stale_memory = {
+            'id': 'stale-mem-1',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 0,
+                'task_count_total': 2,
+                'active_tasks': [1, 2],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[stale_memory])
+        harness.memory.add_memory = AsyncMock(return_value={'status': 'created'})
+        harness.memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+
+        captured: dict = {}
+
+        async def capture_diags(stage):
+            captured['status_correction_reconciliation'] = (
+                stage.status_correction_reconciliation
+            )
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_diags)
+            else:
+                _mock_stage_run(stage)
+
+        with patch.object(
+            harness,
+            '_reconcile_status_correction',
+            wraps=harness._reconcile_status_correction,
+        ) as spy:
+            await harness.run_full_cycle(
+                'test-project',
+                'wiring-test-status-correction',
+                events=[_make_event()],
+            )
+
+        # _reconcile_status_correction must be awaited once with the SAME
+        # statuses map used for task_count_verification (no extra get_statuses
+        # round-trip).
+        spy.assert_awaited_once_with('test-project', {'1': 'done', '2': 'pending'})
+
+        # The real implementation ran (via wraps=) and superseded the stale memory.
+        harness.memory.add_memory.assert_awaited_once()
+        harness.memory.delete_memory.assert_awaited_once()
+
+        scr = captured.get('status_correction_reconciliation')
+        assert scr is not None, (
+            'MemoryConsolidator.status_correction_reconciliation is None — '
+            'run_full_cycle must call _reconcile_status_correction and pass '
+            'status_correction_reconciliation= to _configure_consolidator'
+        )
+        assert scr.get('superseded') is True, (
+            f'Expected the record reaching Stage 1 to have superseded=True, got {scr!r}'
+        )
+        assert scr.get('memory_id') == 'stale-mem-1'
+
 
 # ---------------------------------------------------------------------------
 # step-05 (RED) / step-06 (GREEN): fingerprint-compute failure → fail-toward-escalate
