@@ -1271,6 +1271,26 @@ async def _periodic_checkpoint_loop(targets: list[tuple[str, object]]) -> None:
         await _run_checkpoint_cycle(targets)
 
 
+async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
+    """One pass of the entity-summary staleness backstop (fix (b), task 1958).
+
+    Follow-up to task 1949's fix (a) (best-effort post-ingestion refresh of
+    the edge endpoints returned by a single write): that leaves residual
+    drift for entities graphiti_core resolves against but that are not in
+    the returned edge list. This periodic sweep of
+    ``memory_service.rebuild_entity_summaries`` bounds that drift regardless
+    of cause. Extracted from :func:`_periodic_rebuild_summaries_loop` so unit
+    tests can exercise the fan-out without waiting for
+    ``cfg.interval_seconds``.
+    """
+    for project_id in cfg.projects:
+        await memory_service.rebuild_entity_summaries(
+            project_id=project_id,
+            force=cfg.force,
+            _source='periodic_maintenance',
+        )
+
+
 async def _build_task_backend(taskmaster_config):
     """Construct the configured task backend.
 
