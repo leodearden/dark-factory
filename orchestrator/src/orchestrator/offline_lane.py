@@ -319,7 +319,10 @@ class OfflineLaneWorker:
         result means the failure did not reproduce — intermittent
         nondeterminism (B6): log only, no task, no escalation.
 
-        The non-empty (genuinely-red) path is filled in by later steps.
+        (2)+(3) The non-empty (genuinely-red) path files a new dedup'd fix
+        task via :meth:`_file_new_fix_task`. Fingerprint-keyed dedup against
+        an already-open fix task (B5, update-not-refile) is added by a later
+        step; today every confirmed-red pass is treated as new.
         """
         confirmed = await self.confirmation_runner(wt, head)
         if not confirmed:
@@ -330,7 +333,105 @@ class OfflineLaneWorker:
                 head[:12],
             )
             return
-        raise NotImplementedError
+        await self._file_new_fix_task(confirmed, head)
+
+    def _suspect_range(self, head: str) -> str:
+        """Cheapest sound over-approximation of the commits that could have
+        introduced a confirmed break: the last-known-green head through the
+        current run's head, or just ``head`` when no green run has been
+        observed yet (``_last_green_head`` is still ``None``)."""
+        if self._last_green_head:
+            return f'{self._last_green_head}..{head}'
+        return head
+
+    async def _file_new_fix_task(self, confirmed: list[str], head: str) -> None:
+        """File a NEW dedup'd fix task for a confirmed-red failing-test set (B4).
+
+        Computes the DB3/C3 fingerprint over the confirmed set, builds the
+        ``submit_task`` argument block via
+        :func:`~orchestrator.workflow.build_offline_lane_fix_task_arguments`,
+        and — when :attr:`task_client` is wired — files it and records the
+        fingerprint in :attr:`open_fix_tasks` / :attr:`_red_advance_counts`
+        so a same-set recurrence updates rather than re-files (see
+        :meth:`_update_existing_fix_task`). Degrades to a log-only no-op
+        when :attr:`task_client` is unwired (never a crash; worker leg of
+        C7) — no fingerprint is recorded in that case, since there is no
+        fix task to dedup against.
+        """
+        from orchestrator.workflow import (
+            build_offline_lane_fix_task_arguments,
+            compute_failing_test_set_fingerprint,
+        )
+
+        fp = compute_failing_test_set_fingerprint(confirmed)
+        suspect = self._suspect_range(head)
+        arguments = build_offline_lane_fix_task_arguments(
+            confirmed, suspect, fp, self.config.project_root, head,
+        )
+        if self.task_client is None:
+            logger.info(
+                'offline-lane: confirmed red run (tests=%s) but no task_client '
+                'wired — skipping fix-task file (log-only degrade)',
+                ', '.join(sorted(confirmed)),
+            )
+            return
+        task_id = await self.task_client.submit_fix_task(arguments)
+        self.open_fix_tasks[fp] = task_id
+        self._red_advance_counts[fp] = 1
+        await self._file_info_escalation(task_id, confirmed, suspect)
+
+    async def _file_info_escalation(
+        self, task_id: str, confirmed: list[str], suspect: str,
+    ) -> None:
+        """File a non-blocking L0 INFO escalation announcing a new fix task (B4).
+
+        Mirrors ``harness._file_starvation_info``: a pure operator-signal
+        INFO escalation (``severity='info'``, ``level=0``), deduped against
+        any already-pending L0 escalation for this fix task id so a crash
+        + re-dispatch can't double-file. No-ops gracefully when no
+        escalation queue is attached (same log-only degrade as
+        :attr:`task_client`).
+        """
+        if self.escalation_queue is None:
+            return
+
+        existing = [
+            e
+            for e in self.escalation_queue.get_by_task(task_id, status='pending')
+            if e.agent_role == 'orchestrator-offline-lane' and e.level == 0
+        ]
+        if existing:
+            logger.debug(
+                'offline-lane: pending INFO escalation already exists for '
+                'fix task %s — skipping duplicate file',
+                task_id,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-offline-lane',
+            severity='info',
+            category='risk_identified',
+            summary=(
+                f'offline-lane: filed fix task {task_id} for '
+                f'{len(confirmed)} confirmed-failing test(s)'
+            )[:200],
+            detail=(
+                f'Failing tests: {", ".join(sorted(confirmed))}\n'
+                f'Suspect commit range: {suspect}'
+            ),
+            suggested_action='manual_investigation',
+            level=0,
+        )
+        self.escalation_queue.submit(esc)
+        logger.info(
+            'offline-lane: filed INFO escalation %s for fix task %s',
+            esc.id, task_id,
+        )
 
     # ------------------------------------------------------------------
     # Lockfile singleton
