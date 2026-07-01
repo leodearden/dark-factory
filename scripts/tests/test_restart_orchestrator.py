@@ -205,3 +205,24 @@ def test_exits_nonzero_when_restart_does_not_bring_back_fresh_pid(tmp_path):
         f"Expected a stale/failed-restart error message; got "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-7: RED -- a stray --drain argument must be accepted, not rejected
+# ---------------------------------------------------------------------------
+
+def test_drain_flag_is_accepted_and_ignored(tmp_path):
+    """`--drain` is accepted-and-ignored; the restart+verify flow still runs."""
+    bin_dir, state_path = _make_fake_systemctl(tmp_path, scenario="fresh", main_pid=1234)
+
+    result = _run_script(bin_dir, state_path, "--drain", env={"RESTART_VERIFY_TIMEOUT": "5"})
+
+    assert result.returncode == 0, (
+        f"Expected --drain to be accepted (exit 0); got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT] in state["calls"], (
+        f"Expected the restart+verify flow to still run with --drain; "
+        f"got calls={state['calls']!r}"
+    )
