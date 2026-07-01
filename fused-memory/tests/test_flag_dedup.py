@@ -1569,6 +1569,130 @@ class TestFilterSuppressed:
             f'[{label}] Preserved flag differs from input: {result[0]}'
         )
 
+    # -----------------------------------------------------------------
+    # Scoped (task_id, flag_type) suppression — task-1966 step-3
+    #
+    # RED until step-4 rewrites filter_suppressed's matching to a
+    # task_id -> (wildcard | flag_types-set) map.
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_scoped_record_drops_only_matching_flag_type(self):
+        """(a) A SCOPED suppression record drops only its listed flag_type(s),
+        keeping other flag_types for the same task_id — the core fix."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        scoped_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+            'flag_types': ['human_review_required_deferred'],
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[scoped_record])
+
+        suppressed_flag = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
+        surviving_flag = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}
+        result = await filter_suppressed(memory_service, 'p', [suppressed_flag, surviving_flag])
+
+        assert result == [surviving_flag]
+
+    @pytest.mark.asyncio
+    async def test_legacy_record_still_blanket_drops_all_flag_types(self):
+        """(b) A LEGACY record (no flag_types key) still blanket-drops ALL
+        flag_types for that task_id — backward compat, mirrors
+        test_suppressed_flag_dropped_and_unrelated_kept."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        legacy_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[legacy_record])
+
+        flag_a = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
+        flag_b = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}
+        result = await filter_suppressed(memory_service, 'p', [flag_a, flag_b])
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_absent_flag_type_kept_against_scoped_but_dropped_against_legacy(self):
+        """(c) A flag whose flag_type is None/absent cannot match a specific
+        flag_type, so it is KEPT against a scoped record — but a legacy
+        blanket record still drops it (no flag_type to check against)."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        flag_no_type = {'task_id': 452}  # flag_type key intentionally absent
+
+        scoped_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+            'flag_types': ['human_review_required_deferred'],
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[scoped_record])
+        result = await filter_suppressed(memory_service, 'p', [flag_no_type])
+        assert result == [flag_no_type], 'flag_type=None cannot match a scoped allowlist'
+
+        legacy_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+        })
+        memory_service_legacy = AsyncMock()
+        memory_service_legacy.search = AsyncMock(return_value=[legacy_record])
+        result2 = await filter_suppressed(memory_service_legacy, 'p', [flag_no_type])
+        assert result2 == [], 'legacy blanket record must still drop a flag with no flag_type'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_task_id,record_task_id',
+        [
+            pytest.param(452, 452, id='int-int'),
+            pytest.param(452, '452', id='int-str'),
+            pytest.param('452', 452, id='str-int'),
+            pytest.param('452', '452', id='str-str'),
+        ],
+    )
+    async def test_scoped_record_task_id_coercion(self, flag_task_id, record_task_id):
+        """(d) task_id str/int coercion still applies with scoped records."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        scoped_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': record_task_id,
+            'flag_types': ['human_review_required_deferred'],
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[scoped_record])
+
+        suppressed_flag = {'task_id': flag_task_id, 'flag_type': 'human_review_required_deferred'}
+        result = await filter_suppressed(memory_service, 'p', [suppressed_flag])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_scoped_and_legacy_records_for_same_task_id_union_to_blanket(self):
+        """(e) One scoped + one legacy-blanket record for the same task_id
+        results in blanket suppression (union semantics: wildcard wins)."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        scoped_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+            'flag_types': ['human_review_required_deferred'],
+        })
+        legacy_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[scoped_record, legacy_record])
+
+        flag_a = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
+        flag_b = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}
+        result = await filter_suppressed(memory_service, 'p', [flag_a, flag_b])
+        assert result == []
+
 
 # ---------------------------------------------------------------------------
 # task-1186 step-3 — filter_suppressed: search exception → pass-through + WARNING
