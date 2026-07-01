@@ -581,3 +581,61 @@ async def test_run_once_wires_red_and_green_paths_by_returncode(tmp_path: Path):
         'a red (rc != 0) run must NOT update _last_green_head'
     )
     worker_b._handle_red_run.assert_awaited_once_with(wt_path, 'HEAD2')
+
+
+# ---------------------------------------------------------------------------
+# _handle_red_run — new-fingerprint fix-task spawn (β3, task 1954, step-11/12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_new_fingerprint_files_fix_task_and_info_escalation(
+    tmp_path: Path,
+):
+    """A confirmed red run with a NEW fingerprint files a fix task + INFO escalation (B4).
+
+    The suspect range spans the last-known-green head through the current
+    head; the fingerprint is recorded in ``open_fix_tasks`` so a same-set
+    recurrence updates rather than re-files (see the DEDUP test).
+
+    Step 11 (RED): the non-empty branch of _handle_red_run is still a stub
+    (raises ``NotImplementedError``) — must fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    confirmed_ids = ['t::a', 't::b']
+    confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.submit_fix_task = AsyncMock(return_value='fix-99')
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-fix-99-1'
+
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD1')
+
+    task_client.submit_fix_task.assert_awaited_once()
+    arguments = task_client.submit_fix_task.await_args.args[0]
+    assert arguments['status'] == 'pending'
+    assert arguments['metadata']['merge_lane'] == 'normal'
+    assert arguments['metadata']['failing_tests'] == ['t::a', 't::b']
+    assert arguments['metadata']['suspect_ranges'] == ['GREEN..HEAD1']
+
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    assert worker.open_fix_tasks[fp] == 'fix-99'
+    assert worker._red_advance_counts[fp] == 1
+
+    escalation_queue.submit.assert_called_once()
+    esc = escalation_queue.submit.call_args.args[0]
+    assert esc.severity == 'info'
+    assert esc.level == 0
+    assert esc.agent_role == 'orchestrator-offline-lane'
+    assert esc.task_id == 'fix-99'
