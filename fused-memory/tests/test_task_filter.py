@@ -2728,6 +2728,7 @@ class TestCrossVerifyTaskCounts:
         result = cross_verify_task_counts(tree, None)
 
         assert result['available'] is False
+        assert result['consistent'] is True
 
 
 # ---------------------------------------------------------------------------
@@ -2779,4 +2780,3 @@ class TestDiffStatusCorrection:
         assert result['available'] is False
         assert result['diverged'] is False
         assert result['cached'] == {'done': 5, 'total': 10, 'active_tasks': [1, 2]}
-        assert result['consistent'] is True

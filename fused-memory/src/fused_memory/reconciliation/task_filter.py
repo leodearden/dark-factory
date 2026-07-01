@@ -381,6 +381,65 @@ def cross_verify_task_counts(tree: FilteredTaskTree, statuses: dict[str, str] | 
     }
 
 
+def diff_status_correction(metadata: dict, statuses: dict[str, str] | None) -> dict:
+    """Diff a cached Mem0 ``project_status_correction`` memory against the live census.
+
+    ``project_status_correction`` memories are written at runtime by agents
+    (metadata ``kind='project_status_correction'``, fields ``task_count_done``/
+    ``task_count_total``/``active_tasks``) and can silently go stale.  This pure
+    helper compares that cached snapshot against the authoritative get_statuses
+    census so a caller (``ReconciliationHarness._reconcile_status_correction``)
+    can decide whether to supersede it.
+
+    Args:
+        metadata: The cached memory's metadata dict (or falsy for a missing/
+            malformed record).  ``task_count_done``/``task_count_total``/
+            ``active_tasks`` are read from it; missing fields become None.
+        statuses: Compact {id: status} map from get_statuses(), or None/empty
+            when the live census is unavailable.
+
+    Returns:
+        dict with:
+            available (bool): False when statuses is empty/None — fail-open,
+                a caller must NOT supersede against an unavailable census.
+            diverged (bool): True when available and any field mismatches.
+            done_mismatch / total_mismatch / active_mismatch (bool): per-field
+                divergence flags (available only when `available` is True).
+            cached (dict): {'done', 'total', 'active_tasks'} echoed from metadata,
+                always populated so callers can log the pre-diff snapshot.
+            live (dict | None): {'done', 'total', 'active_tasks'} recomputed from
+                statuses (active_tasks as a sorted int list), or None when
+                unavailable.
+
+    active_tasks comparison is order-insensitive and coerces both cached ints
+    and live string keys via the first-dot-segment rule (see
+    detect_census_inconsistency), so ordering or int-vs-str differences never
+    cause a false mismatch.
+
+    Pure: no I/O, no side effects.
+    """
+    metadata = metadata or {}
+    cached = {
+        'done': metadata.get('task_count_done'),
+        'total': metadata.get('task_count_total'),
+        'active_tasks': metadata.get('active_tasks'),
+    }
+
+    if not statuses:
+        return {
+            'available': False,
+            'diverged': False,
+            'done_mismatch': False,
+            'total_mismatch': False,
+            'active_mismatch': False,
+            'cached': cached,
+            'live': None,
+        }
+
+    # step-4 (GREEN) will replace this with the full census comparison.
+    raise NotImplementedError
+
+
 def detect_census_inconsistency(max_task_id: int, referenced_ids: Iterable) -> list[int]:
     """Return referenced task ids that strictly exceed the census maximum.
 
