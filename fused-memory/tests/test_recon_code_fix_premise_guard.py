@@ -7,6 +7,8 @@ live source/test re-verification (verify_premise_refuted).
 
 from __future__ import annotations
 
+from fused_memory.middleware.task_curator import CandidateTask
+
 # ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-03 RED: TestLoadPremiseRegistry
 # ──────────────────────────────────────────────────────────────────────────────
@@ -190,3 +192,148 @@ class TestLoadPremiseRegistry:
         sa = entries[0].source_assertions[0]
         assert sa.must_contain == []
         assert sa.must_not_contain == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-1972 step-05 RED: TestMatchCandidate
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestMatchCandidate:
+    """Tests for match_candidate() from fused_memory.middleware.recon_code_fix_premise_guard.
+
+    Same matching shape as cancelled_premise_blocklist.match_candidate — see
+    TestCancelledPremiseBlocklistMatcher in test_task_curator.py.
+    """
+
+    def _make_entry(
+        self,
+        name: str = "test_entry",
+        title_subs: list | None = None,
+        desc_subs: list | None = None,
+        reason: str = "test reason",
+        source_assertions: list | None = None,
+    ):
+        from fused_memory.middleware.recon_code_fix_premise_guard import PremiseEntry
+        return PremiseEntry(
+            name=name,
+            reason=reason,
+            title_substrings=title_subs or ["entity-summary rebuild", "invalid_at"],
+            description_substrings=desc_subs or ["missing invalid_at filter"],
+            source_assertions=source_assertions or [],
+        )
+
+    def _make_candidate(self, title: str, description: str = "", details: str = ""):
+        return CandidateTask(title=title, description=description, details=details)
+
+    def test_match_all_title_subs_and_one_desc_sub(self):
+        """(a) Matches when ALL title_substrings AND at least one description_substring hit."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["entity-summary rebuild", "invalid_at"],
+            desc_subs=["missing invalid_at filter", "stale entities"],
+        )
+        candidate = self._make_candidate(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is entry
+
+    def test_no_match_when_title_substring_missing(self):
+        """(b) Returns None when any title_substring is absent."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["entity-summary rebuild", "invalid_at"],
+            desc_subs=["missing invalid_at filter"],
+        )
+        # Title has 'invalid_at' but NOT 'entity-summary rebuild'
+        candidate = self._make_candidate(
+            title="Fix invalid_at handling in memory service",
+            description="Includes missing invalid_at filter check.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is None
+
+    def test_no_match_when_no_description_substring_hits(self):
+        """(c) Returns None when none of description_substrings appear."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["entity-summary rebuild", "invalid_at"],
+            desc_subs=["missing invalid_at filter", "stale entities"],
+        )
+        # Title matches but description has neither substring
+        candidate = self._make_candidate(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Completely unrelated description about something else.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is None
+
+    def test_no_match_when_entries_empty(self):
+        """(d) Returns None when entries list is empty."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        candidate = self._make_candidate(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter.",
+        )
+        result = match_candidate(candidate, [])
+        assert result is None
+
+    def test_returns_first_match_in_list_order(self):
+        """(e) When multiple entries match, returns the first one."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entry_a = self._make_entry(
+            name="entry_a",
+            title_subs=["entity-summary rebuild", "invalid_at"],
+            desc_subs=["missing invalid_at filter"],
+        )
+        entry_b = self._make_entry(
+            name="entry_b",
+            title_subs=["entity-summary rebuild", "invalid_at"],
+            desc_subs=["stale entities"],
+        )
+        # Candidate matches both
+        candidate = self._make_candidate(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="missing invalid_at filter causes stale entities to linger.",
+        )
+        result = match_candidate(candidate, [entry_a, entry_b])
+        assert result is entry_a
+
+    def test_case_insensitive_matching(self):
+        """Match is case-insensitive for both title and description."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["ENTITY-SUMMARY REBUILD", "INVALID_AT"],
+            desc_subs=["MISSING INVALID_AT FILTER"],
+        )
+        candidate = self._make_candidate(
+            title="fix entity-summary rebuild missing invalid_at filter",
+            description="missing invalid_at filter in the rebuild path.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is entry
+
+    def test_desc_substring_can_appear_in_details(self):
+        """Description_substrings are matched against description + details combined."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["entity-summary rebuild", "invalid_at"],
+            desc_subs=["stale entities"],
+        )
+        # Match is in details, not description
+        candidate = self._make_candidate(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Unrelated description.",
+            details="Leaves stale entities visible after tombstoning.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is entry
