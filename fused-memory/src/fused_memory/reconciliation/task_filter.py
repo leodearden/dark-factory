@@ -381,6 +381,22 @@ def cross_verify_task_counts(tree: FilteredTaskTree, statuses: dict[str, str] | 
     }
 
 
+def _coerce_id_set(values: Iterable) -> set[int]:
+    """Coerce a mixed int/str id iterable into a canonical int set.
+
+    Reuses the first-dot-segment rule from detect_census_inconsistency: ints
+    are used directly, strings are split on '.' and the first segment is
+    coerced to int, and unparseable entries are silently ignored.
+    """
+    result: set[int] = set()
+    for ref in values:
+        try:
+            result.add(int(str(ref).split('.')[0]))
+        except (TypeError, ValueError, AttributeError):
+            continue  # silently ignore unparseable entries
+    return result
+
+
 def diff_status_correction(metadata: dict, statuses: dict[str, str] | None) -> dict:
     """Diff a cached Mem0 ``project_status_correction`` memory against the live census.
 
@@ -436,8 +452,34 @@ def diff_status_correction(metadata: dict, statuses: dict[str, str] | None) -> d
             'live': None,
         }
 
-    # step-4 (GREEN) will replace this with the full census comparison.
-    raise NotImplementedError
+    census = summarize_statuses(statuses)
+    live_active_ids = _coerce_id_set(
+        tid for tid, status in statuses.items() if status in ACTIVE_TASK_STATUSES
+    )
+    live = {
+        'done': census['done'],
+        'total': census['total'],
+        'active_tasks': sorted(live_active_ids),
+    }
+
+    # Missing/None cached fields count as a mismatch so a malformed memory is rewritten.
+    done_mismatch = cached['done'] is None or cached['done'] != live['done']
+    total_mismatch = cached['total'] is None or cached['total'] != live['total']
+    active_mismatch = (
+        cached['active_tasks'] is None
+        or _coerce_id_set(cached['active_tasks']) != live_active_ids
+    )
+    diverged = done_mismatch or total_mismatch or active_mismatch
+
+    return {
+        'available': True,
+        'diverged': diverged,
+        'done_mismatch': done_mismatch,
+        'total_mismatch': total_mismatch,
+        'active_mismatch': active_mismatch,
+        'cached': cached,
+        'live': live,
+    }
 
 
 def detect_census_inconsistency(max_task_id: int, referenced_ids: Iterable) -> list[int]:
