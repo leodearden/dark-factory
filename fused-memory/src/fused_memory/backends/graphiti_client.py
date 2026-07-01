@@ -392,12 +392,18 @@ class GraphitiBackend:
         reset to ``None``, restoring it to an active (non-superseded) state.
         This takes precedence over ``invalid_at`` if both are supplied.
         Compatible with ``fact`` (update text and un-supersede in one call).
+        Because graphiti's FalkorDB map-based ``edge.save()`` (``MERGE ... SET
+        e = $edge_data``) does not reliably clear a null-valued property, the
+        clear is force-persisted by an explicit direct-Cypher
+        ``SET e.invalid_at = NULL`` write, issued after ``edge.save()`` and
+        before the endpoint summary refresh below (so the restored edge is
+        counted valid by that refresh's ``WHERE e.invalid_at IS NULL`` filter).
 
         After saving, both source and target entity node summaries are rebuilt
         from their current valid edges so they stay consistent.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
-            raise ValueError('update_edge requires fact or invalid_at to be set')
+            raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
         driver = self._driver_for(group_id)
         edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
         if fact is not None:
@@ -409,6 +415,19 @@ class GraphitiBackend:
         if clear_invalid_at:
             edge.invalid_at = None
         await asyncio.wait_for(edge.save(driver), timeout=self._write_timeout)
+
+        if clear_invalid_at:
+            # edge.save()'s map-based SET does not reliably clear a
+            # null-valued property on FalkorDB — force it deterministically.
+            graph = self._graph_for(group_id)
+            await asyncio.wait_for(
+                graph.query(
+                    'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
+                    'SET e.invalid_at = NULL',
+                    {'uuid': edge_uuid},
+                ),
+                timeout=self._write_timeout,
+            )
 
         # Deterministically refresh both endpoint entity summaries so they
         # reflect the updated fact text (no LLM — just fact concatenation).
@@ -1359,6 +1378,29 @@ class GraphitiBackend:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         row = result.result_set[0]
         return (row[0] or '', row[1] or '')
+
+    async def get_edge_invalid_at(self, uuid: str, *, group_id: str) -> Any:
+        """Return the raw stored ``invalid_at`` for the RELATES_TO edge with the given UUID.
+
+        Returns ``None`` when the property is null or absent (i.e. the edge is
+        active/non-superseded). The value is returned verbatim (no parsing) —
+        used by MemoryService.update_edge to verify that a clear_invalid_at
+        write actually persisted, independent of the fact-text readback.
+
+        Uses ro_query since no writes are performed.
+
+        Raises:
+            EdgeNotFoundError: if no edge with that UUID exists.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
+            'RETURN e.invalid_at'
+        )
+        result = await graph.ro_query(cypher, {'uuid': uuid})
+        if not result.result_set:
+            raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
+        return result.result_set[0][0]
 
     async def update_node_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
         """Update the name_embedding vector for an Entity node using vecf32()."""
