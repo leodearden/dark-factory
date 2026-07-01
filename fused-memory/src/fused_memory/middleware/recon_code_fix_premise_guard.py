@@ -23,8 +23,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
+
+if TYPE_CHECKING:
+    from fused_memory.middleware.task_curator import CandidateTask
 
 logger = logging.getLogger(__name__)
 
@@ -193,3 +197,42 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
         )
 
     return entries
+
+
+def match_candidate(
+    candidate: CandidateTask,
+    entries: list[PremiseEntry],
+) -> PremiseEntry | None:
+    """Return the first matching premise entry for *candidate*, or ``None``.
+
+    Matching is case-insensitive string search — identical in shape to
+    cancelled_premise_blocklist.match_candidate:
+    - ALL strings in ``entry.title_substrings`` must appear in
+      ``candidate.title``.
+    - AT LEAST ONE string in ``entry.description_substrings`` must appear in
+      the combined ``candidate.description + " " + candidate.details``.
+
+    A textual match alone does not mean the premise is refuted — callers
+    should additionally check ``verify_premise_refuted`` (see
+    ``premise_refuted_entry``).
+
+    Returns the first match in list order (deterministic). Returns ``None``
+    when *entries* is empty or no entry matches.
+
+    Pure string operations — no regex, no async, no I/O.
+    """
+    title_lower = (candidate.title or "").lower()
+    desc_lower = (
+        (candidate.description or "") + " " + (candidate.details or "")
+    ).lower()
+
+    for entry in entries:
+        # All title substrings must match
+        if not all(sub.lower() in title_lower for sub in entry.title_substrings):
+            continue
+        # At least one description substring must match
+        if not any(sub.lower() in desc_lower for sub in entry.description_substrings):
+            continue
+        return entry
+
+    return None
