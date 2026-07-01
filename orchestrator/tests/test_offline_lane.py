@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -388,3 +389,38 @@ async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
     task2.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task2
+
+
+# ---------------------------------------------------------------------------
+# Lockfile singleton (step-13/14)
+# ---------------------------------------------------------------------------
+
+
+def test_lockfile_enforces_singleton(tmp_path: Path):
+    """acquire_lock enforces a singleton via flock; release_lock frees it.
+
+    A second OfflineLaneWorker on the SAME lock_path must refuse to start
+    while the first holds the lock; after the first releases, acquiring
+    again on that path succeeds.
+
+    Step 13 (RED): acquire_lock/release_lock are NotImplementedError stubs
+    — must fail before impl.
+    """
+    # Nested, not-yet-existing parent dirs — acquire_lock must mkdir(parents=True).
+    lock_path = tmp_path / 'data' / 'orchestrator' / 'offline_lane.lock'
+    worker_a = OfflineLaneWorker(_make_git_ops(), _make_config(tmp_path), lock_path=lock_path)
+    worker_b = OfflineLaneWorker(_make_git_ops(), _make_config(tmp_path), lock_path=lock_path)
+
+    assert worker_a.acquire_lock() is True
+    assert lock_path.exists()
+    diagnostic = lock_path.read_text()
+    assert str(os.getpid()) in diagnostic, 'lockfile must record the holder PID'
+
+    # A second worker instance on the same lock_path must refuse to start.
+    assert worker_b.acquire_lock() is False
+
+    worker_a.release_lock()
+
+    # After the holder releases, a fresh acquire on the same path succeeds.
+    assert worker_b.acquire_lock() is True
+    worker_b.release_lock()
