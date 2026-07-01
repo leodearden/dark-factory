@@ -7479,6 +7479,43 @@ class TestHarnessReconcileStatusCorrection:
         harness.memory.add_memory.assert_not_called()
         harness.memory.delete_memory.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_matching_cached_memory_is_noop(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Cached memory exactly matches the live census -> no-op (no writes).
+
+        step-9 (RED): most-recent selection + diff wiring does not exist yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        statuses = {
+            '1': 'done', '2': 'done', '3': 'done', '4': 'done', '5': 'done',
+            '6': 'pending', '7': 'in-progress', '8': 'blocked',
+        }
+        cached_memory = {
+            'id': 'mem-abc123',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 5,
+                'task_count_total': 8,
+                'active_tasks': [6, 7, 8],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[cached_memory])
+
+        result = await harness._reconcile_status_correction('test-project', statuses)
+
+        assert result == {
+            'available': True,
+            'found': True,
+            'diverged': False,
+            'superseded': False,
+            'memory_id': 'mem-abc123',
+        }
+        harness.memory.add_memory.assert_not_called()
+        harness.memory.delete_memory.assert_not_called()
+
 
 # ── Tests for task 1785: harness._configure_consolidator new kwargs ─────────────
 
