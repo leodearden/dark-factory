@@ -301,6 +301,10 @@ class OfflineLaneWorker:
             'offline-lane: run head=%s status=%s duration=%.1fs',
             head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
         )
+        if rc == 0:
+            self._last_green_head = head
+        else:
+            await self._handle_red_run(wt, head)
 
     # ------------------------------------------------------------------
     # Red-path handling — confirmation, fingerprint, dedup'd fix-task spawn,
