@@ -152,9 +152,7 @@ def carries_remediation_history(content: str) -> bool:
         any(keyword in text for keyword in _REMEDIATION_KEYWORDS)
         or bool(_NONZERO_MUTATION_RE.search(text))
     )
-    if is_quiescent and not has_remediation:
-        return False
-    return True
+    return not (is_quiescent and not has_remediation)
 
 
 # ---------------------------------------------------------------------------
