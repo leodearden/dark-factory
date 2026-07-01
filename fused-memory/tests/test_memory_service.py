@@ -2193,6 +2193,42 @@ class TestDualWriteCallbackEdgesField:
         )
 
 
+# ---------------------------------------------------------------------------
+# Tests for _refresh_entity_summaries_from_result (task 1949, fix a)
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshEntitySummariesFromResult:
+    """step-01/02/03/04: helper that refreshes summaries for edge endpoints
+    touched by an add_episode/add_memory_graphiti result."""
+
+    @pytest.mark.asyncio
+    async def test_dedups_and_skips_empty_uuids(self, service):
+        """Refreshes each unique non-empty edge endpoint uuid exactly once."""
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(edges=[
+            MockEdge(fact='a', source_node_uuid='n1', target_node_uuid='n2'),
+            MockEdge(fact='b', source_node_uuid='n2', target_node_uuid='n3'),
+            MockEdge(fact='c', source_node_uuid='', target_node_uuid=''),
+        ])
+
+        await service._refresh_entity_summaries_from_result(result, group_id='proj')
+
+        assert service.graphiti.refresh_entity_summary.await_count == 3, (
+            'Expected exactly 3 refresh calls (n1, n2, n3 — n2 deduped, empty uuids skipped), '
+            f'got {service.graphiti.refresh_entity_summary.await_count}'
+        )
+        called_uuids = {
+            call.args[0] for call in service.graphiti.refresh_entity_summary.call_args_list
+        }
+        assert called_uuids == {'n1', 'n2', 'n3'}
+        for call in service.graphiti.refresh_entity_summary.call_args_list:
+            assert call.kwargs['group_id'] == 'proj'
+
+
 class TestExecuteGraphitiWritePlanningRegistration:
     """step-5: _execute_graphiti_write registers episodes when temporal_context='planning'."""
 
