@@ -7603,6 +7603,66 @@ class TestHarnessReconcileStatusCorrection:
         assert result['new']['total'] == 124
         assert sorted(result['new']['active_tasks']) == live_active
 
+    @pytest.mark.asyncio
+    async def test_query_exception_fails_open(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """get_memories_by_metadata raising must not propagate (fail-open,
+        mirrors _check_graphiti_queue_health).
+
+        step-13 (RED): no try/except yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.get_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down')
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._reconcile_status_correction(
+                'test-project', {'1': 'done'}
+            )
+
+        assert result is not None
+        assert result['superseded'] is False
+        assert 'error' in result
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'Expected a WARNING log when get_memories_by_metadata raises'
+        )
+
+    @pytest.mark.asyncio
+    async def test_add_memory_exception_fails_open(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """add_memory raising during the supersede branch must not propagate.
+
+        step-13 (RED): no try/except yet.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        cached_memory = {
+            'id': 'mem-xyz',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 0,
+                'task_count_total': 1,
+                'active_tasks': [],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[cached_memory])
+        harness.memory.add_memory = AsyncMock(side_effect=RuntimeError('mem0 write failed'))
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._reconcile_status_correction(
+                'test-project', {'1': 'done'}
+            )
+
+        assert result is not None
+        assert result['superseded'] is False
+        assert 'error' in result
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'Expected a WARNING log when add_memory raises'
+        )
+
 
 # ── Tests for task 1785: harness._configure_consolidator new kwargs ─────────────
 
