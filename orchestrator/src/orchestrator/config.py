@@ -812,6 +812,22 @@ class GitConfig(BaseModel):
             'otherwise.'
         ),
     )
+    persistent_offline_deep_worktree: bool = Field(
+        default=False,
+        description=(
+            'When True, the offline-deep lane worker (β2) may reuse a '
+            'SECOND FIXED worktree at <worktree_dir>/_offline-deep (task '
+            '1952, PRD δ / §5 C5) instead of a fresh ephemeral worktree. '
+            'Modeled on persistent_merge_worktree: reset-in-place to the '
+            'target commit via git reset --hard, scrubbed of untracked '
+            'files except build-artifact dirs, retaining its own target/ '
+            'warmth across attempts.  That target/ is dedicated and is '
+            'never shared with or seeded from the merge-lane target/ at '
+            '_merge-verify (C5).  Default False → byte-identical to prior '
+            'behaviour (trivially revertible); activation gate owned by '
+            'the β2 consumer.'
+        ),
+    )
     persistent_merge_worktree_safety_valve_every_n: int = Field(
         default=0,
         ge=0,

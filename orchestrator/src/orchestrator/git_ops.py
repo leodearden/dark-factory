@@ -116,6 +116,14 @@ DEFAULT_COMMIT_CITATION_PATTERN: str = (
 # find_inflight enumeration (see _iter_merge_worktrees).
 PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
 
+# Fixed name for the SECOND persistent warm worktree (task 1952, PRD δ /
+# §5 C5), dedicated to the offline-deep lane worker (β2).  Lives at
+# <worktree_base>/_offline-deep.  Deliberately NOT prefixed `_merge-`, so it
+# is structurally exempt from _iter_merge_worktrees / prune_stale_merge_worktrees
+# / find_inflight_merge_worktree — the same mechanism that already exempts
+# _spec-*/_lane-*/_solo-* worktrees — with no explicit skip required.
+PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
+
 
 class ScrubOutcome(Enum):
     """Outcome discriminant for :class:`ScrubResult`.
@@ -3768,13 +3776,18 @@ class GitOps:
         """Remove a temporary merge worktree.
 
         **Persistent-worktree exemption**: if *merge_wt* resolves to
-        :attr:`persistent_merge_worktree_path`, this method is a **no-op**
-        (the warm worktree survives across attempts and across verify failures,
-        so ``target/`` warmth is preserved).  The ephemeral removal path is
-        unchanged for all other ``_merge-*`` worktrees.
+        :attr:`persistent_merge_worktree_path` OR
+        :attr:`persistent_offline_deep_worktree_path`, this method is a
+        **no-op** — both persistent worktrees survive across attempts and
+        across verify failures, so their (independently retained) ``target/``
+        warmth is preserved.  The ephemeral removal path is unchanged for all
+        other ``_merge-*`` worktrees.
         """
         if merge_wt.resolve() == self.persistent_merge_worktree_path.resolve():
             logger.debug('persistent merge worktree retained: %s', merge_wt)
+            return
+        if merge_wt.resolve() == self.persistent_offline_deep_worktree_path.resolve():
+            logger.debug('persistent offline-deep worktree retained: %s', merge_wt)
             return
 
         rc, _, err = await _run(
@@ -3821,6 +3834,20 @@ class GitOps:
         when the feature is off.
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+    @property
+    def persistent_offline_deep_worktree_path(self) -> Path:
+        """Fixed path for the second persistent warm worktree (offline-deep lane).
+
+        Always ``<worktree_base>/_offline-deep``.  Dedicated to the β2
+        offline-deep lane worker (task 1952, PRD δ / §5 C5) — reset in place,
+        retaining its own ``target/``, and NEVER sharing or overlaying the
+        merge lane's ``target/`` (see :attr:`persistent_merge_worktree_path`).
+        The path is independent of the ``git.persistent_offline_deep_worktree``
+        knob — the property always returns the canonical location so callers
+        can compare against it even when the feature is off.
+        """
+        return self.worktree_base / PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME
 
     @property
     def _merge_verify_artifact_path(self) -> Path:
@@ -4020,6 +4047,84 @@ class GitOps:
                 )
             logger.info(
                 'Reset persistent merge worktree %s to HEAD=%s',
+                warm_path, merge_commit[:8],
+            )
+
+        return warm_path
+
+    async def reset_persistent_offline_deep_worktree(self, merge_commit: str) -> Path:
+        """Create or reset-in-place the second persistent warm worktree (offline-deep lane).
+
+        Dedicated to the offline-deep lane worker (β2, task 1952, PRD δ /
+        §5 C5) — modeled on :meth:`reset_persistent_merge_worktree` but at
+        its own fixed path (:attr:`persistent_offline_deep_worktree_path`)
+        with its own retained ``target/``, NEVER sharing or overlaying the
+        merge lane's ``target/`` (C5).
+
+        **Create-once path** (worktree not yet registered):
+            ``git worktree add --detach <fixed_path> <merge_commit>``
+
+        **Reset-in-place path** (worktree already registered):
+            ``git reset --hard <merge_commit>`` followed by
+            ``git clean -xfd -e <dir>`` for each dir in
+            ``config.reap_build_artifact_dirs`` — so the source tree is
+            bit-identical to a fresh checkout of *merge_commit* while
+            build-artifact dirs (e.g. ``target/``) are retained — this
+            worktree's OWN warmth, self-warming across resets.
+
+        Returns the fixed path (:attr:`persistent_offline_deep_worktree_path`).
+        Raises :exc:`RuntimeError` on git failure (mirrors
+        :meth:`reset_persistent_merge_worktree`).
+        """
+        warm_path = self.persistent_offline_deep_worktree_path
+
+        if not await self._is_registered_worktree(warm_path):
+            # Create-once branch — self-heal a stale unregistered directory first.
+            # See reset_persistent_merge_worktree for rationale (a previous run
+            # may have left the directory on disk without a git worktree
+            # registration, e.g. worktree metadata pruned after a crash).
+            if warm_path.exists():
+                logger.warning(
+                    'Persistent offline-deep worktree path %s exists on disk but '
+                    'is not a registered git worktree; removing stale directory '
+                    'to allow fresh creation (self-heal)',
+                    warm_path,
+                )
+                shutil.rmtree(warm_path)
+            warm_path.parent.mkdir(parents=True, exist_ok=True)
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to create persistent offline-deep worktree at {warm_path}: {err}'
+                )
+            logger.info(
+                'Created persistent offline-deep worktree at %s (HEAD=%s)',
+                warm_path, merge_commit[:8],
+            )
+        else:
+            # Reset-in-place branch — retains this worktree's OWN target/,
+            # never touching or seeding from the merge lane's target/ (C5).
+            rc, _, err = await _run(
+                ['git', 'reset', '--hard', merge_commit],
+                cwd=warm_path,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'Failed to reset persistent offline-deep worktree {warm_path} '
+                    f'to {merge_commit}: {err}'
+                )
+            ok, err = await self._clean_lane_retaining_artifacts(
+                warm_path, caller='reset_persistent_offline_deep_worktree',
+            )
+            if not ok:
+                raise RuntimeError(
+                    f'Failed to clean persistent offline-deep worktree {warm_path}: {err}'
+                )
+            logger.info(
+                'Reset persistent offline-deep worktree %s to HEAD=%s',
                 warm_path, merge_commit[:8],
             )
 

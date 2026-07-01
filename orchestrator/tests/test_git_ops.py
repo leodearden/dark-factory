@@ -11,6 +11,7 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
+    PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     GitOps,
     ScrubOutcome,
     ScrubResult,
@@ -4901,6 +4902,262 @@ class TestPersistentMergeWorktree:
         # Stray untracked file must be cleaned
         assert not stray_txt.exists(), (
             'stray.txt must be cleaned by git clean -xfd'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 1952 — second persistent warm worktree `_offline-deep` (PRD δ / §5 C5)
+# ---------------------------------------------------------------------------
+
+
+def test_git_config_persistent_offline_deep_worktree_knob():
+    """GitConfig knob for the second persistent offline-deep worktree.
+
+    Mirrors test_git_config_persistent_merge_worktree_knobs.
+    Step 3 (RED): the field does not yet exist — test must fail before impl.
+    """
+    # Default: feature off
+    cfg_default = GitConfig()
+    assert cfg_default.persistent_offline_deep_worktree is False, (
+        'persistent_offline_deep_worktree must default to False (feature off)'
+    )
+
+    # Round-trip True
+    cfg_on = GitConfig(persistent_offline_deep_worktree=True)
+    assert cfg_on.persistent_offline_deep_worktree is True, (
+        'persistent_offline_deep_worktree=True must round-trip'
+    )
+
+
+@pytest.mark.asyncio
+class TestPersistentOfflineDeepWorktree:
+    """Integration tests for reset_persistent_offline_deep_worktree and its exemptions.
+
+    Steps 1–10 of task 1952 (PRD δ / §5 C5): a SECOND persistent warm
+    worktree, dedicated to the offline-deep lane worker (β2), modeled on
+    ``TestPersistentMergeWorktree`` above but with its OWN never-shared
+    ``target/``.
+    """
+
+    # ------------------------------------------------------------------
+    # Step 1 — module constant + path property
+    # ------------------------------------------------------------------
+
+    async def test_persistent_offline_deep_worktree_path_property(
+        self, git_ops: GitOps,
+    ):
+        """persistent_offline_deep_worktree_path == worktree_base / '_offline-deep'.
+
+        Step 1 (RED): constant and property are absent today
+        (AttributeError/ImportError).
+        """
+        assert PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME == '_offline-deep'
+        assert git_ops.persistent_offline_deep_worktree_path == (
+            git_ops.worktree_base / '_offline-deep'
+        )
+
+    # ------------------------------------------------------------------
+    # Step 5 — create-once path + prune-exemption
+    # ------------------------------------------------------------------
+
+    async def test_reset_persistent_offline_deep_worktree_create_once_and_prune_exempt(
+        self, git_ops: GitOps,
+    ):
+        """reset_persistent_offline_deep_worktree creates on first call; prune-exempt.
+
+        Mirrors test_reset_persistent_merge_worktree_create_once +
+        test_prune_skips_persistent_worktree, combined for the offline-deep
+        worktree.
+
+        Step 5 (RED): method absent today — test must fail before impl.
+        """
+        merge_commit = await _get_merge_commit(
+            git_ops, 'offline-deep-create-1', 'offline_deep_create.py',
+        )
+
+        warm_path = await git_ops.reset_persistent_offline_deep_worktree(merge_commit)
+
+        # Returns the fixed path
+        assert warm_path == git_ops.persistent_offline_deep_worktree_path
+        assert warm_path.exists()
+
+        # Path is a registered git worktree
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        registered_paths = [
+            line[len('worktree '):].strip()
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        assert str(warm_path) in registered_paths, (
+            f'_offline-deep not in registered worktrees: {registered_paths}'
+        )
+
+        # HEAD of warm worktree == merge_commit
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=warm_path,
+        )
+        assert head_sha.strip() == merge_commit.strip(), (
+            f'warm worktree HEAD {head_sha.strip()!r} != merge_commit {merge_commit.strip()!r}'
+        )
+
+        # --- Prune-exempt: create an ephemeral _merge-<uuid> worktree ---
+        ephemeral_wt, _ = await git_ops._create_merge_worktree()
+        assert ephemeral_wt.exists()
+
+        removed = await git_ops.prune_stale_merge_worktrees()
+
+        assert any(
+            '_merge-' in r and not r.endswith('_offline-deep')
+            for r in removed
+        ), f'ephemeral worktree must appear in removed list: {removed}'
+        assert not any(
+            r.endswith('_offline-deep') for r in removed
+        ), f'_offline-deep must NOT appear in removed list: {removed}'
+
+        # _offline-deep worktree still on disk and registered
+        assert warm_path.exists(), '_offline-deep must survive prune'
+        assert await git_ops._is_registered_worktree(warm_path), (
+            '_offline-deep must still be registered after prune'
+        )
+
+        # Ephemeral is gone
+        assert not ephemeral_wt.exists(), (
+            'ephemeral _merge-<uuid> must be gone after prune'
+        )
+
+    # ------------------------------------------------------------------
+    # Step 7 — reset-in-place on an EXISTING warm worktree + dedicated target/
+    # ------------------------------------------------------------------
+
+    async def test_reset_persistent_offline_deep_worktree_reset_in_place_retains_own_target(
+        self, git_ops: GitOps,
+    ):
+        """reset_persistent_offline_deep_worktree resets in-place on a second call.
+
+        Verifies:
+        - Still the same single registered path after reset.
+        - HEAD updated to the new merge_commit B.
+        - Tracked source reflects B (not A).
+        - target/cache.bin STILL EXISTS (target/ retained — self-warming).
+        - stray.txt was removed (git clean -xfd cleaned except target/).
+        - C5: the offline-deep target/ is physically distinct from the merge
+          lane's target/ (never shared or overlaid).
+
+        Step 7 (RED): reset-in-place branch not yet implemented (second call
+        currently hits create-once self-heal / raises or mis-behaves).
+        """
+        # --- First reset: create at merge_commit A ---
+        merge_commit_a = await _get_merge_commit(
+            git_ops, 'offline-deep-reset-a', 'offline_deep_a.py',
+        )
+        warm_path = await git_ops.reset_persistent_offline_deep_worktree(merge_commit_a)
+        assert warm_path.exists()
+
+        # Simulate a warm build: write a build artifact and a stray file
+        target_dir = warm_path / 'target'
+        target_dir.mkdir()
+        cache_bin = target_dir / 'cache.bin'
+        cache_bin.write_bytes(b'\xde\xad\xbe\xef')
+        stray_txt = warm_path / 'stray.txt'
+        stray_txt.write_text('stray untracked\n')
+
+        # --- Second reset: create a different merge_commit B ---
+        merge_commit_b = await _get_merge_commit(
+            git_ops, 'offline-deep-reset-b', 'offline_deep_b.py',
+        )
+        warm_path_b = await git_ops.reset_persistent_offline_deep_worktree(merge_commit_b)
+
+        # Same single registered path
+        assert warm_path_b == git_ops.persistent_offline_deep_worktree_path
+        assert warm_path_b == warm_path, 'path must not change on second call'
+
+        # Only one _offline-deep worktree registered
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        registered = [
+            line[len('worktree '):].strip()
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        offline_deep_paths = [p for p in registered if p.endswith('_offline-deep')]
+        assert len(offline_deep_paths) == 1, (
+            f'expected exactly 1 _offline-deep registration, got {offline_deep_paths}'
+        )
+
+        # HEAD == merge_commit_b (not A)
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=warm_path_b,
+        )
+        assert head_sha.strip() == merge_commit_b.strip(), (
+            f'HEAD should be B={merge_commit_b[:8]}, got {head_sha.strip()[:8]}'
+        )
+
+        # Source reflects B: offline_deep_b.py present, offline_deep_a.py absent
+        assert (warm_path_b / 'offline_deep_b.py').exists(), (
+            'offline_deep_b.py (B commit) should be present in warm worktree'
+        )
+        assert not (warm_path_b / 'offline_deep_a.py').exists(), (
+            'offline_deep_a.py (A commit) should NOT be present after reset to B'
+        )
+
+        # target/cache.bin STILL EXISTS (target/ retained -> self-warming)
+        assert cache_bin.exists(), (
+            'target/cache.bin must be retained (self-warming build artifact)'
+        )
+
+        # stray.txt removed (git clean -xfd removed it)
+        assert not stray_txt.exists(), (
+            'stray.txt must be cleaned by git clean -xfd'
+        )
+
+        # C5: dedicated target/ — never shared with or overlaying the merge lane's
+        assert (
+            git_ops.persistent_offline_deep_worktree_path / 'target'
+            != git_ops.persistent_merge_worktree_path / 'target'
+        ), (
+            'offline-deep target/ must be physically distinct from the merge '
+            'lane target/ (C5)'
+        )
+
+    # ------------------------------------------------------------------
+    # Step 9 — cleanup_merge_worktree is a no-op on the fixed offline-deep path
+    # ------------------------------------------------------------------
+
+    async def test_cleanup_merge_worktree_noop_on_offline_deep_path(
+        self, git_ops: GitOps,
+    ):
+        """cleanup_merge_worktree is a no-op on _offline-deep (it survives).
+
+        Mirrors test_cleanup_merge_worktree_noop_on_persistent_path.
+
+        Step 9 (RED): the current guard only exempts
+        persistent_merge_worktree_path, so the offline-deep path would be
+        force-removed.
+        """
+        merge_commit = await _get_merge_commit(
+            git_ops, 'offline-deep-cleanup-1', 'offline_deep_cleanup.py',
+        )
+        warm_path = await git_ops.reset_persistent_offline_deep_worktree(merge_commit)
+        assert warm_path.exists()
+
+        # Call cleanup on the fixed path — must be a no-op
+        await git_ops.cleanup_merge_worktree(warm_path)
+
+        # Offline-deep worktree still registered and still on disk
+        assert warm_path.exists(), (
+            '_offline-deep worktree must survive cleanup_merge_worktree'
+        )
+        assert await git_ops._is_registered_worktree(warm_path), (
+            '_offline-deep worktree must still be registered after cleanup call'
         )
 
 
