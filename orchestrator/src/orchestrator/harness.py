@@ -743,6 +743,9 @@ class Harness:
         # restart coordinators above.  None until β2 registers its own
         # on_post_merge callback here directly (mirrors the direct-attribute
         # registration convention used by _service_restart_coordinators).
+        # Contract (see _note_offline_lane docstring): the notifiee is awaited
+        # synchronously on the merge-landed hot path, so it must
+        # enqueue-and-return promptly rather than block on the deep-test run.
         self._offline_lane_notifiee: Callable[[str, str, str], Awaitable[object]] | None = None
 
         # Event store — created at run start with a generated run_id
@@ -5033,6 +5036,14 @@ Output JSON matching the schema. Every task must appear in the output.
         β2 (the offline lane worker, not yet built) will set
         ``self._offline_lane_notifiee`` to its own ``on_post_merge`` callback.
         Until then ``self._offline_lane_notifiee`` is None and this is a no-op.
+
+        Contract: the notifiee is awaited synchronously and BLOCKS this call —
+        it sits on the merge-landed hot path, ahead of the diff fetch and the
+        service-restart coordinator fan-out in ``_note_merge_all``. Only
+        exceptions are handled here (fail-open); slowness is not. β2's
+        notifiee MUST enqueue-and-return promptly (e.g. flip a dirty flag and
+        wake a waiter) rather than perform the deep-test run inline, or it
+        will stall post-merge processing for the SpeculativeMergeWorker.
         """
         notifiee = self._offline_lane_notifiee
         if notifiee is None:
