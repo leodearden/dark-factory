@@ -245,11 +245,38 @@ class OfflineLaneWorker:
         outcome the caller (``Harness._start_offline_lane``) handles
         fail-open (log + skip), not a fatal error.
         """
-        raise NotImplementedError
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(self.lock_path, 'w')  # noqa: SIM115
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Another instance holds the lock — read its diagnostic info.
+            try:
+                with open(self.lock_path) as f:
+                    info = f.read().strip()
+            except OSError:
+                info = '(unknown)'
+            logger.error(
+                'offline-lane: another instance already holds the lock '
+                '(holder: %s, lock file: %s) — refusing to start',
+                info, self.lock_path,
+            )
+            lock_file.close()
+            return False
+
+        # Write diagnostic info for anyone who tries to acquire next.
+        lock_file.truncate(0)
+        lock_file.seek(0)
+        lock_file.write(f'PID {os.getpid()} started {datetime.now(UTC).isoformat()}')
+        lock_file.flush()
+        self._lock_file = lock_file
+        return True
 
     def release_lock(self) -> None:
         """Release a previously-acquired lockfile, if held."""
-        raise NotImplementedError
+        if self._lock_file is not None:
+            self._lock_file.close()
+            self._lock_file = None
 
     # ------------------------------------------------------------------
     # Default injectable seam implementation
