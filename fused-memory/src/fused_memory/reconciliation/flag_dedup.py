@@ -663,6 +663,17 @@ async def dedup_flags(
     consecutive_confirmation_misses: int = 0
     confirmation_disabled: bool = False
 
+    # In-batch signature memoization (task-1978): records, for each
+    # (task_id, flag_type) signature already processed in THIS call, the
+    # resolved persisted_from_run to use for any later occurrence of that same
+    # signature.  Function-local so each dedup_flags invocation starts with a
+    # fresh, empty memo (mirrors the circuit-breaker locals above).  This
+    # bounds each signature to at most ONE search+write+confirm+delete cycle
+    # per call, which is what prevents duplicate markers from accumulating
+    # when Mem0 read-after-write indexing lag causes a later occurrence's
+    # pre-write search to miss a marker written earlier in the SAME call.
+    seen_signatures: dict[tuple[str, str], str] = {}
+
     async def _confirm_and_track(
         response_memory_ids: list[str],
         active_miss_warning_msg: str,
@@ -766,6 +777,23 @@ async def dedup_flags(
                 ' (flag_type %s) — rejected by _is_valid_marker_task_id',
                 tid, ftype,
             )
+            result.append(flag)
+            continue
+        # In-batch signature memoization (task-1978): the SAME (task_id, flag_type)
+        # signature can be emitted multiple times in ONE items_flagged list within a
+        # single dedup_flags call (e.g. a task genuinely re-evaluated multiple times
+        # in one Stage 1 run).  A later occurrence's pre-write search below is a
+        # SEPARATE Mem0 read that may not yet see a marker written by an EARLIER
+        # occurrence in this SAME call (Mem0 read-after-write indexing lag) — so
+        # without memoization, every occurrence independently MISSes/HITs and writes
+        # its own replacement, accumulating duplicate markers WITHIN a single run.
+        # On the 2nd+ occurrence of a signature in this call, skip the entire
+        # search/write/confirm/delete cycle and annotate deterministically from the
+        # first occurrence's resolved outcome instead.
+        if (tid, ftype) in seen_signatures:
+            flag = dict(flag)
+            flag['persisted_from_run'] = seen_signatures[(tid, ftype)]
+            flag['last_seen_run_id'] = run_id
             result.append(flag)
             continue
         # Delegate search+filter to the shared helper.  find_prior_memories logs a
