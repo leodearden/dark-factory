@@ -97,6 +97,22 @@ _REBLOCK_GUARD_THRESHOLD: int = 3
 # the open-L1 /unblock veto guard (harness.py _reconcile_one_stranded:~1598).
 _RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'})
 
+# Non-terminal parked statuses whose worktrees are inviolable — owned by a
+# non-scheduler party, not by the task's own progress — and so must NEVER be
+# selected as warm-lane reclaim victims (task 2018):
+#   'merge-deferred'  — train-parked (PRD § 9.8); owned by the group-merge
+#                        worker, which is promised an intact worktree.
+#   'deferred'         — human-deferred; owned by manual resolution.
+# Mirrors the merge-deferred early-return guard in _reconcile_one_stranded
+# (harness.py:2437) and the _RECONCILE_SWEEP_STATUSES exclusions above.
+# Deliberately EXCLUDES 'blocked': a stranded blocked task is a legitimate
+# reclaim target (_reconcile_stranded_in_progress sweeps
+# {'in-progress', 'blocked'} via _RECONCILE_SWEEP_STATUSES), so it must stay
+# eligible here too.
+_WARM_LANE_RECLAIM_PROTECTED_STATUSES: frozenset[str] = frozenset(
+    {'merge-deferred', 'deferred'}
+)
+
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
 # exit cleanly before the supervisor kills it with a SIGTERM timeout.
@@ -2116,6 +2132,13 @@ Output JSON matching the schema. Every task must appear in the output.
         Both methods reference the same shared ``TERMINAL_STATUSES`` constant
         so the inversion cannot silently drift if the terminal set ever changes.
 
+        Also excludes :data:`_WARM_LANE_RECLAIM_PROTECTED_STATUSES` — parked
+        branches (``merge-deferred``, ``deferred``) whose worktrees are owned
+        by a non-scheduler party and must survive intact (task 2018), mirroring
+        the merge-deferred early-return guard in :meth:`_reconcile_one_stranded`
+        (harness.py:~2437).  ``blocked`` is deliberately NOT excluded here — a
+        stranded blocked task remains a legitimate reclaim target.
+
         **Single-orchestrator-ownership invariant:** The warm-lane pool is
         exclusively owned by this orchestrator process.  A non-terminal task
         that is NOT in ``scheduler._dispatched`` (checked synchronously under
@@ -2131,9 +2154,10 @@ Output JSON matching the schema. Every task must appear in the output.
             candidates: Branch names from the pool's assignment snapshot.
 
         Returns:
-            Set of non-terminal branch names eligible for victim selection.
-            Returns ``set()`` on empty input (fast-path, no get_statuses call),
-            or on ``resolver_failed`` (fail-safe).
+            Set of non-terminal, non-protected-parked branch names eligible
+            for victim selection.  Returns ``set()`` on empty input
+            (fast-path, no get_statuses call), or on ``resolver_failed``
+            (fail-safe).
         """
         if not candidates:
             return set()
@@ -2149,6 +2173,7 @@ Output JSON matching the schema. Every task must appear in the output.
             b for b in candidates
             if (status := statuses.get(b)) is not None
             and status not in TERMINAL_STATUSES
+            and status not in _WARM_LANE_RECLAIM_PROTECTED_STATUSES
         }
 
     def _is_branch_dispatched(self, branch: str) -> bool:
