@@ -4774,14 +4774,31 @@ class GitOps:
                     beyond = await self.worktree_head_beyond_main(wt_path)
                     if beyond is None:
                         stamp_path = wt_path / '.task' / 'interactive.json'
-                        stamp = json.loads(stamp_path.read_text())
-                        created_at = datetime.fromisoformat(stamp['created_at'])
-                        if (now - created_at).total_seconds() > ttl:
-                            reason = 'ttl_idle'
-                        elif disk_pressure:
-                            # No unmerged work to lose — safe to evict under
-                            # pressure even though still within TTL.
-                            reason = 'disk_pressure'
+                        try:
+                            stamp = json.loads(stamp_path.read_text())
+                            created_at = datetime.fromisoformat(stamp['created_at'])
+                        except (OSError, ValueError, KeyError, TypeError) as exc:
+                            # Missing/corrupt stamp and no unmerged work to
+                            # lose — fail-soft towards reaping (I2: never an
+                            # indefinite leak) rather than preserving forever.
+                            # A worktree WITH unmerged commits never reaches
+                            # this branch at all (beyond is not None below),
+                            # so a corrupt stamp can never silently drop work.
+                            logger.warning(
+                                'reap_interactive_worktrees: unreadable stamp '
+                                'for %s (%s: %s) — reaping as stale (no '
+                                'unmerged work to lose)',
+                                wt_path, type(exc).__name__, exc,
+                            )
+                            reason = 'stale_no_stamp'
+                        else:
+                            if (now - created_at).total_seconds() > ttl:
+                                reason = 'ttl_idle'
+                            elif disk_pressure:
+                                # No unmerged work to lose — safe to evict
+                                # under pressure even though still within
+                                # TTL.
+                                reason = 'disk_pressure'
                     else:
                         rc_ct, ct_out, _ = await _run(
                             ['git', 'show', '-s', '--format=%ct', 'HEAD'],
