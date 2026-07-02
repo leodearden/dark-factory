@@ -8141,6 +8141,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     mcp=self.mcp,
                     config=self.config,
                     event_store=getattr(self, 'event_store', None),
+                    usage_gate=self.usage_gate,
+                    cost_store=self.cost_store,
                 ),
                 name=_task_name,
             )
