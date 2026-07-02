@@ -442,3 +442,18 @@ def test_apply_preserves_config_file_permissions(tmp_path):
         f"Expected orchestrator.yaml to keep mode 0644 after the flip; "
         f"got {oct(mode)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-15: RED -- the working-tree script must be executable
+# ---------------------------------------------------------------------------
+
+def test_script_is_executable():
+    """The working-tree script must carry the executable bit (mode 100755)
+    -- pins the os.X_OK requirement enforced by fused-memory's
+    deterministic_task_guard at IE4's submit_task time for
+    before_done.script."""
+    assert os.access(SCRIPT, os.X_OK), (
+        f"Expected {SCRIPT} to be executable (os.X_OK); it is not. "
+        f"Run: chmod +x {SCRIPT}"
+    )
