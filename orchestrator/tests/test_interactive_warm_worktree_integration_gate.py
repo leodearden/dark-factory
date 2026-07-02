@@ -273,3 +273,53 @@ class TestIsolationInvariantI1:
         assert harness.scheduler._dispatched == dispatched_before, (
             'I1 VIOLATION: release_warm_worktree perturbed scheduler._dispatched'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-03/04: claim/release roundtrip — worktree registered after claim,
+# gone from `git worktree list` after release.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestClaimReleaseRoundtrip:
+    """The user-observable claim→worktree / release→removed roundtrip,
+    driven through the β verbs (distinct from TestIsolationInvariantI1,
+    which asserts pool isolation rather than the roundtrip observable).
+    """
+
+    async def test_claim_registers_release_removes(self, tmp_path: Path) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+        await _add_seed_script(repo)
+        config = _make_config(repo, max_concurrent_tasks=3)
+        _harness, server = _build_harness_and_server(config, tmp_path)
+
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='rt', project_root=str(repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+        assert set(claim.keys()) >= {'path', 'branch', 'warm', 'base_ref'}, (
+            f'expected claim to carry path/branch/warm/base_ref, got: {claim.keys()}'
+        )
+        assert claim['branch'] == 'task/rt', (
+            f"expected branch == 'task/rt', got {claim['branch']!r}"
+        )
+        claimed_path = str(Path(claim['path']).resolve())
+        registered = await _registered_worktree_paths(repo)
+        assert claimed_path in registered, (
+            f'expected {claimed_path} to be a registered git worktree; got: {registered}'
+        )
+
+        rel = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(repo),
+        )
+        assert rel['removed'] is True, f'expected removed=True, got: {rel}'
+
+        registered_after = await _registered_worktree_paths(repo)
+        assert claimed_path not in registered_after, (
+            f'expected {claimed_path} gone from `git worktree list` after release; '
+            f'got: {registered_after}'
+        )
