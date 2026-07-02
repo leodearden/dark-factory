@@ -6999,3 +6999,143 @@ class TestAcknowledgeFlagMarkerDelete:
             f'expected a WARNING mentioning the failed marker id; got {warning_messages!r}'
         )
 
+
+# ---------------------------------------------------------------------------
+# acknowledge_flag_marker(mode='tag') — step-3 RED tests.
+#
+# RED until step-4 adds the mode=='tag' branch to flag_dedup.py.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcknowledgeFlagMarkerTag:
+    """RED tests for acknowledge_flag_marker(..., mode='tag') (step-3).
+
+    RED until step-4 adds the mode=='tag' branch to flag_dedup.py.
+    """
+
+    async def test_writes_replacement_marker_then_deletes_prior_returns_one(self):
+        """Confirmed write (non-empty memory_ids): add_memory called with the
+        canonical marker metadata PLUS addressed_by/addressed_at_run=run_id,
+        THEN the prior is deleted (write-first ordering); returns 1.
+        """
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior.id = 'm1'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[prior])
+        memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['new']))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await acknowledge_flag_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            task_id='42',
+            flag_type='missing_deliverable',
+            mode='tag',
+        )
+
+        assert result == 1
+
+        # add_memory called once with the canonical marker payload plus
+        # addressed_by/addressed_at_run provenance.
+        memory_service.add_memory.assert_called_once()
+        call_kwargs = memory_service.add_memory.call_args.kwargs
+        assert call_kwargs.get('category') == 'observations_and_summaries'
+        meta = call_kwargs.get('metadata', {})
+        assert meta.get('source') == 'stage1_flag_marker'
+        assert meta.get('kind') == 'stage1_flag_marker'
+        assert meta.get('task_id') == '42'
+        assert meta.get('flag_type') == 'missing_deliverable'
+        assert meta.get('run_id') == 'r1'
+        assert meta.get('addressed_by') == 'r1'
+        assert meta.get('addressed_at_run') == 'r1'
+
+        # prior deleted after the replacement write.
+        memory_service.delete_memory.assert_called_once_with(
+            memory_id='m1',
+            store='mem0',
+            project_id='p',
+            causation_id='r1',
+            _source='flag_acknowledgment',
+        )
+
+        # write-first ordering: add_memory precedes delete_memory in method_calls.
+        method_names = [c[0] for c in memory_service.method_calls]
+        add_idx = method_names.index('add_memory')
+        del_idx = method_names.index('delete_memory')
+        assert add_idx < del_idx, (
+            f'add_memory (idx {add_idx}) must precede delete_memory (idx {del_idx})'
+        )
+
+    async def test_unconfirmed_write_leaves_prior_intact_no_delete(self):
+        """add_memory returns empty memory_ids (unconfirmed) -> prior NOT deleted,
+        delete_memory is never called, returns 0.
+        """
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior.id = 'm1'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[prior])
+        memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=[]))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await acknowledge_flag_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            task_id='42',
+            flag_type='missing_deliverable',
+            mode='tag',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_called()
+
+    async def test_add_memory_exception_is_caught_no_delete_returns_zero(self):
+        """add_memory raising is caught, no delete occurs, returns 0."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior.id = 'm1'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[prior])
+        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('add blew up'))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await acknowledge_flag_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            task_id='42',
+            flag_type='missing_deliverable',
+            mode='tag',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_called()
+
