@@ -33,8 +33,17 @@ class TestNeutralCliCwd:
         assert first == second
 
     def test_differs_from_project_root(self, tmp_path):
+        """Neutral cwd sits outside the filing project's tree entirely.
+
+        Not merely unequal (a fresh mkdtemp path is trivially unequal to any
+        other path), but genuinely neither an ancestor nor a descendant of
+        the project root.
+        """
         from shared.neutral_cwd import neutral_cli_cwd
 
         project_root = tmp_path / 'proj'
         project_root.mkdir()
-        assert neutral_cli_cwd() != project_root
+        neutral = neutral_cli_cwd()
+        assert neutral != project_root
+        assert project_root not in neutral.parents
+        assert neutral not in project_root.parents
