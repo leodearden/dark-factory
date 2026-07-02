@@ -1121,3 +1121,66 @@ async def test_default_infra_confirmation_run_no_fail_lines_means_no_confirmed_f
         confirmed = await worker.infra_confirmation_runner(wt_path, 'HEAD1')
 
     assert confirmed == []
+
+
+# ---------------------------------------------------------------------------
+# _handle_red_run — optional confirmation_runner kwarg for infra reuse
+# (task 1959, IE1, step-9/10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_uses_injected_confirmation_runner_for_infra(tmp_path: Path):
+    """_handle_red_run accepts an OPTIONAL confirmation_runner kwarg so the
+    infra sub-run's red path reuses the entire confirm→fingerprint→file/
+    update→escalate machinery (IE-D1/§6) with its OWN confirmation seam,
+    while the numeric call site (bare, no kwarg) keeps using
+    self.confirmation_runner unchanged (back-compat).
+
+    Step 9 (RED): _handle_red_run has no confirmation_runner param yet — the
+    kwarg call raises TypeError. Must fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    numeric_confirmation_runner = AsyncMock(return_value=['numeric::should-not-be-used'])
+    infra_confirmed = ['test_cgroup_burn.sh', 'test_reflink_fs.sh']
+    infra_conf = AsyncMock(return_value=infra_confirmed)
+    task_client = AsyncMock()
+    task_client.submit_fix_task = AsyncMock(return_value='fix-infra-1')
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-1'
+
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=numeric_confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD1', confirmation_runner=infra_conf)
+
+    infra_conf.assert_awaited_once_with(wt, 'HEAD1')
+    numeric_confirmation_runner.assert_not_awaited()
+
+    task_client.submit_fix_task.assert_awaited_once()
+    arguments = task_client.submit_fix_task.await_args.args[0]
+    assert arguments['metadata']['failing_tests'] == sorted(infra_confirmed)
+    assert arguments['metadata']['merge_lane'] == 'normal'
+
+    fp = compute_failing_test_set_fingerprint(infra_confirmed)
+    assert worker.open_fix_tasks[fp] == 'fix-infra-1'
+
+    escalation_queue.submit.assert_called_once()
+    esc = escalation_queue.submit.call_args.args[0]
+    assert esc.severity == 'info'
+    assert esc.level == 0
+    assert esc.agent_role == 'orchestrator-offline-lane'
+
+    # Back-compat: the bare (no-kwarg) call site still uses the numeric
+    # self.confirmation_runner.
+    wt2 = Path('/tmp/_offline-deep-2')
+    await worker._handle_red_run(wt2, 'HEAD1')
+    numeric_confirmation_runner.assert_awaited_once_with(wt2, 'HEAD1')
