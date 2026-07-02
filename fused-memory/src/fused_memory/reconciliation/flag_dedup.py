@@ -107,17 +107,28 @@ instead annotated directly from the memo:
   the first occurrence was a MISS — a MISS-first repeat is itself a genuine
   same-run duplicate, so the current run is the correct provenance.
 
-The memo is populated only when the first occurrence's own write was
-confirmed persisted (``write_succeeded`` from ``_write_and_confirm_marker``
-on both the HIT and MISS branches).  If that write was never confirmed
-(``add_memory`` raised, or the read-back confirmation missed), the signature
-is deliberately left out of the memo so a later occurrence of it in the same
-call retries the full search/write/confirm/delete cycle instead of silently
-inheriting provenance for a marker that does not exist.  Without this gate, a
-signature emitted N times with a failing first write would memoize a
-never-persisted outcome and every subsequent occurrence would skip straight
-to the memo branch — persisting ZERO markers for the whole call instead of
-giving each occurrence its own chance to write one.
+The memo is recorded UNCONDITIONALLY at the first occurrence — it is **not**
+gated on ``write_succeeded`` (the bool ``_write_and_confirm_marker`` returns
+on both the HIT and MISS branches).  Gating on ``write_succeeded`` looks
+appealing at first glance (a genuinely-failed ``add_memory`` would then let a
+later same-call occurrence retry instead of inheriting a never-written
+signature's provenance), but ``write_succeeded`` conflates two situations
+``_write_and_confirm_marker`` cannot distinguish through its bool-only
+return: (1) ``add_memory`` itself raised — nothing persisted — and (2)
+``add_memory`` succeeded but ``confirm_marker_persisted``'s own read-back
+search missed under the exact same Mem0 read-after-write lag this memo
+exists to route around.  Case (2) is the validated production mechanism (see
+"In-batch memoization" above); gating on ``write_succeeded`` would skip
+memoizing it, so a later same-call occurrence would retry the full cycle, hit
+the same lag on its own confirmation search, and also fail to be memoized —
+reopening the unbounded within-run duplicate accumulation this fix targets.
+Recording the memo unconditionally bounds every signature to exactly one
+write per call regardless of confirmation outcome. The trade-off this
+accepts: on the rarer genuine-failure case (1), a later same-call occurrence
+inherits provenance for a marker that was never written; the next
+``dedup_flags`` cycle's pre-write search then correctly finds no prior and
+re-MISSes, writing a fresh marker — a one-cycle-delayed self-heal, not a
+permanent loss.
 
 This bounds every signature to at most one search+write+confirm+delete cycle
 per ``dedup_flags`` call regardless of how many times it is emitted, which
