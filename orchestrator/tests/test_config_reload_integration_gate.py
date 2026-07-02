@@ -325,3 +325,55 @@ class TestS3NonAllowlistedSemaphoreWarning:
             if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
         ]
         assert harness_warnings, 'Expected at least one WARNING when restart_required is nonempty'
+
+
+# ---------------------------------------------------------------------------
+# Scenario 4 (I6 report completeness): a single reload whose diff spans both
+# an allowlisted and a non-allowlisted leaf must split them into disjoint
+# dispositions that together account for every changed path exactly once.
+# ---------------------------------------------------------------------------
+
+
+class TestS4MixedDispositionCompleteness:
+    """PRD boundary scenario 4: a mixed edit splits dispositions exactly once each (I6)."""
+
+    @pytest.mark.asyncio
+    async def test_mixed_edit_splits_dispositions_exactly_once(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        harness, config_path = _make_reload_harness(tmp_path, monkeypatch)
+
+        live_implementer = harness.config.models.implementer
+        new_implementer = _other_model(live_implementer)
+        live_max_concurrent = harness.config.max_concurrent_tasks
+        new_max_concurrent = live_max_concurrent + 1
+
+        _edit_yaml(config_path, 'models.implementer', new_implementer)
+        _edit_yaml(config_path, 'max_concurrent_tasks', new_max_concurrent)
+
+        report = await harness.reload_config()
+
+        assert report['reloaded'] is True
+        assert report['applied'] == {
+            'models.implementer': {'old': live_implementer, 'new': new_implementer},
+        }
+        assert report['restart_required'] == {
+            'max_concurrent_tasks': {'old': live_max_concurrent, 'new': new_max_concurrent},
+        }
+
+        assert harness.config.models.implementer == new_implementer, (
+            'the allowlisted leaf must be mutated on the live config'
+        )
+        assert harness.config.max_concurrent_tasks == live_max_concurrent, (
+            'the non-allowlisted leaf must NOT be mutated on the live config (I2)'
+        )
+
+        # I6 exactly-once: applied/restart_required are disjoint, and their
+        # union is exactly the set of changed dotted paths — no path
+        # reported twice, none silently dropped.
+        applied_keys = set(report['applied'])
+        restart_keys = set(report['restart_required'])
+        assert applied_keys.isdisjoint(restart_keys), (
+            f'a path must not appear in both dispositions: {applied_keys & restart_keys!r}'
+        )
+        assert applied_keys | restart_keys == {'models.implementer', 'max_concurrent_tasks'}
