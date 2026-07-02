@@ -37,9 +37,11 @@ from orchestrator.run_store import RunStore
 def _make_harness_with_mocks(tmp_path: Path) -> tuple[Harness, MagicMock, EventStore]:
     """Build a Harness with a real Scheduler, a MagicMock RunStore, and a real EventStore.
 
-    The Harness is constructed via __new__ to avoid the full startup sequence
-    (which requires a running MCP server), then the relevant attributes are
-    populated directly — matching the pattern in test_harness_terminal_status_watcher.py.
+    Harness is constructed directly via ``Harness(config)`` — its ``__init__``
+    only wires up in-process collaborators (GitOps, Scheduler, callbacks) and
+    does not start the MCP server or perform any other full-startup side
+    effect, so it is safe to call from a test. The RunStore and EventStore
+    are then swapped in directly so persistence/audit calls can be inspected.
     """
     config = OrchestratorConfig(project_root=tmp_path)
     harness = Harness(config)
@@ -117,7 +119,17 @@ class TestHarnessReloadConfigSuccess:
         }
         assert expected_diff.restart_required == {}
 
-        before_module_configs = harness.config._module_configs
+        # Copy (not alias) — harness.config._module_configs is the same dict
+        # object the assertion below re-reads, so aliasing it here would make
+        # the check vacuous against an in-place mutation. It's None at this
+        # point (only the real load_config() populates it — harness.config
+        # was built directly via OrchestratorConfig(...), not load_config()),
+        # so only copy when it's actually a dict.
+        before_module_configs = (
+            dict(harness.config._module_configs)
+            if harness.config._module_configs is not None
+            else None
+        )
 
         config_path = tmp_path / 'orchestrator.yaml'
         monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
@@ -141,6 +153,10 @@ class TestHarnessReloadConfigSuccess:
         assert harness.config.models.implementer == new_implementer
         assert harness.config._module_configs == before_module_configs, (
             "fresh's discovered _module_configs must NOT be copied onto live "
+            '(PRD decision 7)'
+        )
+        assert 'foo' not in (harness.config._module_configs or {}), (
+            "fresh's distinct 'foo' module config must not leak onto live "
             '(PRD decision 7)'
         )
 
@@ -317,3 +333,139 @@ class TestHarnessReloadConfigRestartRequired:
         assert harness_warnings, (
             'Expected a WARNING even though reloaded=True, because restart_required != {}'
         )
+
+
+class TestHarnessReloadConfigHybridRollback:
+    """Harness-level plumbing around an apply_reload I5 rollback (task 2006 amendment).
+
+    The real I5 hybrid-invariant rollback inside apply_reload (task alpha) is
+    unreachable end-to-end through the harness under the real
+    RELOADABLE_FIELDS allowlist — test_config.py's
+    TestApplyReloadHybridRollback only reaches it via an injectable
+    SYNTHETIC allowlist, and reload_config always calls apply_reload with the
+    real (default) allowlist. So this test verifies the harness's own
+    handling of a `reloaded=False` report — audit event, WARNING, and the
+    report passed through verbatim — by patching apply_reload directly
+    rather than trying to reconstruct a real cross-field invariant break.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reload_config_reports_apply_reload_rollback(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """apply_reload reporting reloaded=False is audited, warned, and returned as-is."""
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+
+        fresh = OrchestratorConfig(project_root=tmp_path)
+        config_path = tmp_path / 'orchestrator.yaml'
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+
+        before = harness.config.model_dump_json()
+
+        rollback_report = {
+            'reloaded': False,
+            'applied': {},
+            'restart_required': {'timeouts.steward': {'old': 1800.0, 'new': 5.0}},
+            'unchanged': 41,
+            'error': 'hybrid-invariant: boom',
+        }
+
+        with (
+            patch('orchestrator.harness.load_config', return_value=fresh),
+            patch(
+                'orchestrator.harness.apply_reload',
+                return_value=dict(rollback_report),
+            ) as mock_apply_reload,
+            caplog.at_level(logging.WARNING, logger='orchestrator.harness'),
+        ):
+            report = await harness.reload_config()
+
+        mock_apply_reload.assert_called_once_with(harness.config, fresh)
+        assert report == {**rollback_report, 'config_path': str(config_path)}
+
+        assert harness.config.model_dump_json() == before, (
+            'reload_config itself must not mutate live config beyond whatever '
+            '(mocked-away) apply_reload did'
+        )
+
+        rows = _query_events(event_store, 'config_reload')
+        assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
+        assert json.loads(rows[0]['data']) == report
+
+        harness_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        assert harness_warnings, 'Expected a WARNING when apply_reload reports reloaded=False'
+
+
+class TestHarnessReloadConfigNoOp:
+    """No-op reload: fresh == live (task 2006 amendment)."""
+
+    @pytest.mark.asyncio
+    async def test_reload_config_noop_when_fresh_matches_live(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """No differing leaves: reloaded=True, applied/restart_required empty, no warning."""
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+
+        # Independently constructed but structurally identical to harness.config
+        # (same pattern as the `live_snapshot` in the success-path test above).
+        fresh = OrchestratorConfig(project_root=tmp_path)
+        config_path = tmp_path / 'orchestrator.yaml'
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+
+        with (
+            patch('orchestrator.harness.load_config', return_value=fresh),
+            caplog.at_level(logging.WARNING, logger='orchestrator.harness'),
+        ):
+            report = await harness.reload_config()
+
+        assert report['reloaded'] is True
+        assert report['applied'] == {}
+        assert report['restart_required'] == {}
+        assert report['unchanged'] > 0
+        assert report['error'] is None
+        assert report['config_path'] == str(config_path)
+
+        rows = _query_events(event_store, 'config_reload')
+        assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
+        assert json.loads(rows[0]['data']) == report
+
+        harness_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        assert not harness_warnings, (
+            'Expected no WARNING on a no-op reload; got '
+            + repr([r.getMessage() for r in harness_warnings])
+        )
+
+
+class TestHarnessReloadConfigNoEventStore:
+    """Graceful skip of the audit emit when event_store is None (task 2006 amendment)."""
+
+    @pytest.mark.asyncio
+    async def test_reload_config_without_event_store_does_not_raise(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The `if self.event_store:` guard means a reload works with no EventStore wired."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.event_store = None
+
+        live_implementer = harness.config.models.implementer
+        new_implementer = _other_model(live_implementer)
+        fresh = OrchestratorConfig(project_root=tmp_path)
+        fresh.models.implementer = new_implementer
+
+        config_path = tmp_path / 'orchestrator.yaml'
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+
+        with patch('orchestrator.harness.load_config', return_value=fresh):
+            report = await harness.reload_config()  # must not raise despite no event_store
+
+        assert report['reloaded'] is True
+        assert report['applied'] == {
+            'models.implementer': {'old': live_implementer, 'new': new_implementer}
+        }
+        assert harness.config.models.implementer == new_implementer
