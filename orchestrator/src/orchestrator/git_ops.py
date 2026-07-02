@@ -4663,6 +4663,41 @@ class GitOps:
                 continue
             yield wt_path, wt_resolved
 
+    async def _interactive_worktree_landed(self, full_branch: str) -> bool:
+        """True if a ``Merge {full_branch} into {main_branch}`` marker exists on main.
+
+        Reproduces :func:`find_merge_marker`'s grep core (``git log
+        <main_branch> --fixed-strings --grep=<subject> --max-count=1
+        --format=%H``) but deliberately WITHOUT its branch-existence gate:
+        :meth:`find_merge_marker` returns ``None`` immediately whenever the
+        branch ref still resolves, on the assumption that a live branch means
+        ``is_ancestor`` is the right check — but an ``_iact-*`` branch is
+        *always* still checked out in its own worktree at reap time, so that
+        gate would short-circuit to ``False`` here every single time.
+
+        Deliberately NOT ``is_ancestor(HEAD, main)``: a freshly-created
+        ``_iact-*`` worktree has zero commits of its own, so its HEAD trivially
+        *is* an ancestor of (equal to) main at creation time — using
+        ``is_ancestor`` here would misclassify every brand-new interactive
+        session as "landed" and reap it immediately. The merge-marker grep
+        only matches a REAL merge commit, so it cannot false-positive on that
+        shape (see :meth:`worktree_head_beyond_main`'s docstring and
+        ``find_task_citation_commit`` for the same is_ancestor pitfall
+        elsewhere in this module).
+        """
+        grep_pattern = _merge_subject(full_branch, self.config.main_branch)
+        rc, out, _ = await _run(
+            [
+                'git', 'log', self.config.main_branch,
+                '--fixed-strings',
+                f'--grep={grep_pattern}',
+                '--max-count=1',
+                '--format=%H',
+            ],
+            cwd=self.project_root,
+        )
+        return rc == 0 and bool(out.strip())
+
     async def reap_interactive_worktrees(
         self, *, now: datetime | None = None,
     ) -> list[ReapedInteractiveWorktree]:
@@ -4679,18 +4714,23 @@ class GitOps:
         this does not depend on the ``.task/interactive.json`` stamp being
         intact.
 
-        Per-worktree TTL rule (the only reap rule at this stage — landed-on-
-        main detection and disk-pressure eviction are layered in separately):
+        Per-worktree reap predicate (disk-pressure eviction is layered in
+        separately):
 
-        * :meth:`worktree_head_beyond_main` is ``None`` (no commits beyond
-          main) → age is measured from the ``.task/interactive.json``
-          stamp's ``created_at``.  Reaped when that age exceeds
+        * :meth:`_interactive_worktree_landed` finds a ``Merge <branch> into
+          <main_branch>`` marker on main → reaped immediately as
+          ``'landed'``, regardless of age (the work is already safe on
+          main).
+        * Otherwise, :meth:`worktree_head_beyond_main` is ``None`` (no
+          commits beyond main) → age is measured from the
+          ``.task/interactive.json`` stamp's ``created_at``.  Reaped
+          (``'ttl_idle'``) when that age exceeds
           ``config.interactive_worktree_ttl``.
         * Otherwise (the worktree carries unmerged commits) → age is
           measured from the newest commit's time (``git show -s
           --format=%ct HEAD``), NOT the stamp — an in-progress session that
           keeps committing must never be reaped merely because it is old.
-          Reaped when that age exceeds the same TTL.
+          Reaped (``'ttl_idle'``) when that age exceeds the same TTL.
 
         Removal uses ``git worktree remove --force`` per reaped candidate,
         followed by a single ``git worktree prune`` if at least one was
@@ -4716,24 +4756,29 @@ class GitOps:
                 full_branch = f'{self.config.branch_prefix}{slug}'
 
                 reason: str | None = None
-                beyond = await self.worktree_head_beyond_main(wt_path)
-                if beyond is None:
-                    stamp_path = wt_path / '.task' / 'interactive.json'
-                    stamp = json.loads(stamp_path.read_text())
-                    created_at = datetime.fromisoformat(stamp['created_at'])
-                    if (now - created_at).total_seconds() > ttl:
-                        reason = 'ttl_idle'
+                if await self._interactive_worktree_landed(full_branch):
+                    # Landed on main — safe to reap regardless of age (the
+                    # PROMPT-safe case: the work already lives on main).
+                    reason = 'landed'
                 else:
-                    rc_ct, ct_out, _ = await _run(
-                        ['git', 'show', '-s', '--format=%ct', 'HEAD'],
-                        cwd=wt_path,
-                    )
-                    if rc_ct == 0 and ct_out.strip():
-                        commit_time = datetime.fromtimestamp(
-                            int(ct_out.strip()), tz=UTC,
-                        )
-                        if (now - commit_time).total_seconds() > ttl:
+                    beyond = await self.worktree_head_beyond_main(wt_path)
+                    if beyond is None:
+                        stamp_path = wt_path / '.task' / 'interactive.json'
+                        stamp = json.loads(stamp_path.read_text())
+                        created_at = datetime.fromisoformat(stamp['created_at'])
+                        if (now - created_at).total_seconds() > ttl:
                             reason = 'ttl_idle'
+                    else:
+                        rc_ct, ct_out, _ = await _run(
+                            ['git', 'show', '-s', '--format=%ct', 'HEAD'],
+                            cwd=wt_path,
+                        )
+                        if rc_ct == 0 and ct_out.strip():
+                            commit_time = datetime.fromtimestamp(
+                                int(ct_out.strip()), tz=UTC,
+                            )
+                            if (now - commit_time).total_seconds() > ttl:
+                                reason = 'ttl_idle'
 
                 if reason is None:
                     continue
