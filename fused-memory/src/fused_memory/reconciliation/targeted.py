@@ -58,6 +58,11 @@ _PARENT_CANCELLED_REOPEN_PREFIX = 'parent_cancelled:'
 # convention used by scope_violation_escalator.py and ticket_janitor.py.
 _ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 
+# Metadata `source` value stamped on the completion-echo memory written by
+# _on_task_done's fast path.  Single-sourced so _is_authoritative_resolution
+# and the fast-path write can't drift out of sync (task 1984).
+_ECHO_SOURCE = 'targeted_reconciliation'
+
 
 class TargetedReconciler:
     """Lightweight reconciliation triggered by task state transitions."""
@@ -227,7 +232,7 @@ class TargetedReconciler:
                 category='observations_and_summaries',
                 project_id=project_id,
                 metadata={
-                    'source': 'targeted_reconciliation',
+                    'source': _ECHO_SOURCE,
                     'task_id': task_id,
                     'transition': 'done',
                 },
@@ -897,3 +902,22 @@ def _extract_scope_hints(task: dict) -> list[str]:
             if cleaned:
                 hints.append(cleaned)
     return hints[:5]
+
+
+def _is_authoritative_resolution(metadata: dict) -> bool:
+    """True when *metadata* marks an authoritative resolution/superseding memory.
+
+    A memory is authoritative when its metadata carries a truthy ``supersedes``
+    marker (the established superseding-memory convention, harness.py:849) OR a
+    ``source`` other than the targeted-reconciliation echo source (_ECHO_SOURCE).
+
+    Plain prior targeted echoes (``source=_ECHO_SOURCE``, no ``supersedes``) are
+    deliberately NOT authoritative, so a task's own earlier echoes never trigger
+    suppression or oscillation — see _on_task_done's pre-echo guard (task 1984).
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get('supersedes'):
+        return True
+    source = metadata.get('source')
+    return bool(source) and source != _ECHO_SOURCE
