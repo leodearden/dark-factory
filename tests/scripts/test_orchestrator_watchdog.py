@@ -520,6 +520,53 @@ def test_watched_ports_match_configured_escalation_ports() -> None:
             f"my-solar-challenge/orchestrator.yaml escalation.port ({my_solar_port})"
         )
 
+    # --- know-live orchestrator (check if present) ---
+    know_live_config_path = pathlib.Path("/home/leo/src/know-live/orchestrator.yaml")
+    if know_live_config_path.exists():
+        know_live_cfg = yaml.safe_load(know_live_config_path.read_text())
+        know_live_port = _extract_escalation_port(know_live_cfg, know_live_config_path)
+        assert unit_to_port["orchestrator-know-live.service"] == know_live_port, (
+            f"WATCHED port for orchestrator-know-live.service "
+            f"({unit_to_port['orchestrator-know-live.service']}) != "
+            f"know-live/orchestrator.yaml escalation.port ({know_live_port})"
+        )
+
+    # --- autopilot-video orchestrator (check if present) ---
+    autopilot_video_config_path = pathlib.Path(
+        "/home/leo/src/autopilot-video/orchestrator-config.yaml"
+    )
+    if autopilot_video_config_path.exists():
+        autopilot_video_cfg = yaml.safe_load(autopilot_video_config_path.read_text())
+        autopilot_video_port = _extract_escalation_port(
+            autopilot_video_cfg, autopilot_video_config_path
+        )
+        assert unit_to_port["orchestrator-autopilot-video.service"] == autopilot_video_port, (
+            f"WATCHED port for orchestrator-autopilot-video.service "
+            f"({unit_to_port['orchestrator-autopilot-video.service']}) != "
+            f"autopilot-video/orchestrator-config.yaml escalation.port ({autopilot_video_port})"
+        )
+
+    # --- solar-challenge-platform orchestrator (check if present) ---
+    solar_challenge_platform_config_path = pathlib.Path(
+        "/home/leo/src/solar-challenge-platform/orchestrator.yaml"
+    )
+    if solar_challenge_platform_config_path.exists():
+        solar_challenge_platform_cfg = yaml.safe_load(
+            solar_challenge_platform_config_path.read_text()
+        )
+        solar_challenge_platform_port = _extract_escalation_port(
+            solar_challenge_platform_cfg, solar_challenge_platform_config_path
+        )
+        assert (
+            unit_to_port["orchestrator-solar-challenge-platform.service"]
+            == solar_challenge_platform_port
+        ), (
+            f"WATCHED port for orchestrator-solar-challenge-platform.service "
+            f"({unit_to_port['orchestrator-solar-challenge-platform.service']}) != "
+            f"solar-challenge-platform/orchestrator.yaml escalation.port "
+            f"({solar_challenge_platform_port})"
+        )
+
     # --- reify orchestrator (skip if absent in this environment) ---
     reify_config_path = pathlib.Path("/home/leo/src/reify/orchestrator.yaml")
     if not reify_config_path.exists():
@@ -546,6 +593,9 @@ def test_main_targets_expected_pairs() -> None:
         (8102, "orchestrator-dark-factory.service"),
         (8100, "orchestrator-reify.service"),
         (8106, "orchestrator-my-solar-challenge.service"),
+        (8105, "orchestrator-know-live.service"),
+        (8101, "orchestrator-autopilot-video.service"),
+        (8107, "orchestrator-solar-challenge-platform.service"),
     ]
 
 
