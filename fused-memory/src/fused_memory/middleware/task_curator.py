@@ -1900,7 +1900,10 @@ class TaskCurator:
         On failure, raises :exc:`CuratorFailureError`; the caller in
         :meth:`curate_batch` is responsible for the per-item fallback.
         """
-        cwd = self._cwd or Path(project_root)
+        # Task 1989: neutral CLI cwd decouples per-call cost from the filing
+        # project's CLAUDE.md/MEMORY.md; self._cwd stays project-root for
+        # Python-side premise/blocklist resolution (L774/863/870).
+        cwd = neutral_cli_cwd()
         n = len(candidates)
         user_prompt = self._build_batch_user_prompt(candidates, pools)
 
