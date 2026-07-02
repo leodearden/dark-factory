@@ -186,3 +186,92 @@ class TestClaimWarmWorktreeHappyPath:
         assert res['base_ref'] == second_sha, (
             f'expected base_ref == start_ref {second_sha!r}, got {res["base_ref"]!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-3 (RED) / step-4 (GREEN): claim guards + error mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestClaimWarmWorktreeGuards:
+    """Standalone guard (regression), project_root mismatch, exception mapping."""
+
+    async def test_a_standalone_returns_error(self, tmp_path: Path) -> None:
+        """(a) No harness wired → {'error'} — already green from step-2; regression."""
+        server = create_server(EscalationQueue(tmp_path / 'esc'))  # no harness
+        result = await _call_tool(
+            server, 'claim_warm_worktree', slug='x', project_root=str(tmp_path),
+        )
+        assert 'error' in result, f'expected an error key, got: {result}'
+
+    async def test_b_project_root_mismatch_creates_nothing(
+        self, warm_repo: Path, server: Any,
+    ) -> None:
+        """(b) project_root mismatch → {'error'} mentioning mismatch, nothing created."""
+        other = warm_repo.parent / 'not-the-repo'
+        other.mkdir()
+
+        result = await _call_tool(
+            server, 'claim_warm_worktree',
+            slug='mismatch-slug', project_root=str(other),
+        )
+
+        assert 'error' in result, f'expected an error key, got: {result}'
+        assert 'mismatch' in result['error'].lower(), (
+            f"expected 'mismatch' in error message, got: {result['error']!r}"
+        )
+
+        rc_list, wt_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=warm_repo,
+        )
+        assert '_iact-' not in wt_list, (
+            f'no worktree should have been created on mismatch, got: {wt_list}'
+        )
+
+    async def test_c_maps_interactive_worktree_limit_error(self, tmp_path: Path) -> None:
+        """(c) create_interactive_worktree raising the cap error → {'error', reason}."""
+        root = tmp_path / 'root'
+        root.mkdir()
+
+        async def _raise_limit(slug: str, *, start_ref: str | None = None) -> Any:
+            raise InteractiveWorktreeLimitError('at cap: 2/2 _iact-* worktrees')
+
+        fake_git_ops = types.SimpleNamespace(
+            project_root=root, create_interactive_worktree=_raise_limit,
+        )
+        stub_harness = types.SimpleNamespace(git_ops=fake_git_ops)
+        server = create_server(EscalationQueue(tmp_path / 'esc'), harness=stub_harness)
+
+        result = await _call_tool(
+            server, 'claim_warm_worktree', slug='x', project_root=str(root),
+        )
+
+        assert 'error' in result, f'expected an error key, got: {result}'
+        assert result.get('reason') == 'interactive_worktree_limit', (
+            f'expected reason=interactive_worktree_limit, got: {result}'
+        )
+
+    async def test_d_maps_value_error(self, tmp_path: Path) -> None:
+        """(d) create_interactive_worktree raising ValueError (bad slug) → {'error', reason}."""
+        root = tmp_path / 'root'
+        root.mkdir()
+
+        async def _raise_value(slug: str, *, start_ref: str | None = None) -> Any:
+            raise ValueError('bad slug')
+
+        fake_git_ops = types.SimpleNamespace(
+            project_root=root, create_interactive_worktree=_raise_value,
+        )
+        stub_harness = types.SimpleNamespace(git_ops=fake_git_ops)
+        server = create_server(EscalationQueue(tmp_path / 'esc'), harness=stub_harness)
+
+        result = await _call_tool(
+            server, 'claim_warm_worktree', slug='x', project_root=str(root),
+        )
+
+        assert 'error' in result, f'expected an error key, got: {result}'
+        assert result.get('reason') == 'invalid_slug', (
+            f'expected reason=invalid_slug, got: {result}'
+        )
