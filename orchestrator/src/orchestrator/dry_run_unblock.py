@@ -64,6 +64,20 @@ _BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
 # retryable and operationally distinct from a substantive
 # 'investigation_failed' agent conclusion. api_error is deliberately NOT
 # included: it is handled at another layer, not treated as infra here.
+#
+# NOTE: classification is by AgentFailureKind alone (timed_out=True ->
+# TIMED_OUT) and is intentionally NOT gated on transcript_turns — a genuine
+# investigation that ran many turns before hitting the timeout ceiling is
+# classified identically to a pre-turn-1 wedge (both land here as
+# 'infra_failure'). This is safe today because risk_label stays
+# 'human-review-required' either way, so no auto-retry/auto-unblock path is
+# opened by this status alone (see TestTwoWayBoundary.
+# test_infra_failure_and_investigation_failed_both_aborted in
+# test_b3_gate.py). A future consumer that auto-retries specifically on
+# infra_failure should itself gate on transcript_turns rather than assume
+# near-zero turns. Current behavior is pinned by TestInfraFailureClassification.
+# test_high_turn_timeout_still_classified_infra_failure in
+# test_dry_run_unblock.py.
 _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
     AgentFailureKind.TIMED_OUT,
     AgentFailureKind.EMPTY_OUTPUT,
