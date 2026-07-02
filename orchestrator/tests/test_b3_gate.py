@@ -1132,6 +1132,51 @@ class TestTwoWayBoundary:
                                  run_git=_run_git, now=self._NOW)
         assert verdict['verdict'] == ABORT, f'expected abort for failure entry: {verdict}'
 
+    def test_infra_failure_and_investigation_failed_both_aborted(self, tmp_path):
+        """task 2020 step-9: the new infra_failure status (a retryable HOST
+        wedge) and the existing investigation_failed status both carry a
+        'status' key, and both must be aborted by check_proposal — proving
+        the infra reclassification cannot open the B3 low-risk auto-unblock
+        path. b3_gate.py is intentionally NOT modified for this task.
+        """
+        from orchestrator.b3_gate import ABORT, _run_git, check_proposal
+        from orchestrator.dry_run_unblock import _build_entry
+        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+
+        # Wedge: pre-turn-1 kill at the 600s UnblockAutoConfig timeout
+        # ceiling -> empty stdout + timed_out=True.
+        wedge_agent = _make_agent_result(
+            success=False,
+            subtype='error_empty_output',
+            output='Agent produced no output',
+            timed_out=True,
+            duration_ms=600000,
+            transcript_turns=0,
+            session_id='sess-x',
+            stderr='...Absolute ceiling reached after 600.0s...',
+        )
+        wedge_entry = _build_entry(wedge_agent, reason='blocked', budget_usd=5.0)
+        wedge_entry['head_sha'] = head_sha
+        wedge_entry['main_sha'] = main_sha
+        assert wedge_entry['status'] == 'infra_failure'
+
+        # Substantive: agent ran and concluded a human must look — not timed
+        # out, not empty output.
+        substantive_agent = _make_agent_result(
+            success=False, subtype='error_max_turns', output='Exceeded max turns',
+        )
+        substantive_entry = _build_entry(substantive_agent, reason='blocked', budget_usd=5.0)
+        substantive_entry['head_sha'] = head_sha
+        substantive_entry['main_sha'] = main_sha
+        assert substantive_entry['status'] == 'investigation_failed'
+
+        for entry in (wedge_entry, substantive_entry):
+            verdict = check_proposal(entry, worktree=str(repo), category='task_failure',
+                                     run_git=_run_git, now=self._NOW)
+            assert verdict['verdict'] == ABORT, (
+                f"expected abort for status={entry['status']!r}: {verdict}"
+            )
+
     def test_success_entry_has_no_status_key(self, tmp_path):
         """Success _build_entry must NOT have a 'status' key (contract invariant)."""
         _, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
