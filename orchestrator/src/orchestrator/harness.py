@@ -3631,6 +3631,11 @@ Output JSON matching the schema. Every task must appear in the output.
           * rc==127 → DEBUG (script absent — expected no-op)
           * other   → WARNING (unexpected non-zero)
 
+        Also folds in the interactive-worktree (``_iact-*``) crash-safety
+        reaper (task δ/2012) — no separate cadence loop or config knob is
+        added for it; it rides this existing tick.  That delegate is itself
+        fail-soft, so it cannot break this pass's never-raise contract.
+
         Called by ``_warm_lane_gc_loop()`` on every interval tick.
         """
         rc = await self.git_ops._run_warm_lane_gc_reclaim()
@@ -3640,6 +3645,7 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.debug('Warm-lane GC reclaim pass: script absent, no-op (rc=127)')
         else:
             logger.warning('Warm-lane GC reclaim pass: non-zero rc=%d', rc)
+        await self._run_interactive_worktree_reaper_pass()
 
     def _start_warm_lane_gc(self) -> None:
         """Start the periodic warm-lane GC reclaim cadence loop.
