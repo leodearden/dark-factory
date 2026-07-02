@@ -4087,3 +4087,193 @@ class TestCallLlmSingleBudgetScaling:
             )
         _, kwargs = mock.call_args
         assert kwargs['max_budget_usd'] == pytest.approx(0.75)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-1972 step-11 RED: TestCuratorPremiseRefutedDrop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_premise_registry_yaml(
+    tmp_path, title_subs, desc_subs, source_assertions, name="test_premise_entry",
+):
+    """Write a minimal recon code-fix premise registry YAML and return its path."""
+    import yaml
+    content = [{
+        "name": name,
+        "reason": "test premise reason",
+        "title_substrings": title_subs,
+        "description_substrings": desc_subs,
+        "source_assertions": source_assertions,
+    }]
+    p = tmp_path / "premise_registry.yaml"
+    p.write_text(yaml.dump(content), encoding="utf-8")
+    return p
+
+
+def _make_config_with_premise_registry(registry_path_str: str) -> FusedMemoryConfig:
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(recon_code_fix_premise_registry_path=registry_path_str)
+    return cfg
+
+
+@pytest.mark.asyncio
+class TestCuratorPremiseRefutedDrop:
+    """Tests that a recon code-fix premise refuted by live source returns drop
+    BEFORE corpus/LLM calls. Mirrors TestCuratorBlocklistShortCircuit.
+    """
+
+    async def test_premise_refuted_returns_drop_without_llm(self, tmp_path):
+        """(a)+(b) curate() returns drop with recon-premise-refuted justification;
+        taskmaster/LLM path is NOT invoked (pre-LLM drop)."""
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))) as mock_corpus, \
+             patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))) as mock_llm, \
+             patch.object(curator, "_pre_llm_exact_match", new=AsyncMock(side_effect=AssertionError("_pre_llm_exact_match must not be called"))) as mock_exact:
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "drop"
+        assert decision.justification.startswith("recon-premise-refuted:")
+        assert "test_premise_entry" in decision.justification
+        mock_corpus.assert_not_called()
+        mock_llm.assert_not_called()
+        mock_exact.assert_not_called()
+
+    async def test_decision_stored_in_cache(self, tmp_path):
+        """The decision is stored in _decision_cache under payload_hash."""
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text("invalid_at\n", encoding="utf-8")
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        payload_hash = candidate.payload_hash()
+        assert payload_hash in curator._decision_cache
+        cached_dec, _ = curator._decision_cache[payload_hash]
+        assert cached_dec.action == "drop"
+        assert cached_dec.justification == decision.justification
+
+    async def test_registry_unset_falls_through(self, tmp_path):
+        """(c1) recon_code_fix_premise_registry_path=None -> curate() proceeds past the guard."""
+        config = _make_config()  # default CuratorConfig: path=None
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "create"
+
+    async def test_non_matching_candidate_falls_through(self, tmp_path):
+        """(c2) A candidate that doesn't textually match the registry proceeds past the guard."""
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text("invalid_at\n", encoding="utf-8")
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        # Title does not contain "entity-summary rebuild"
+        candidate = CandidateTask(
+            title="Improve unrelated logging in the worker",
+            description="No mention of the guarded premise here.",
+        )
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "create"
+
+    async def test_matches_but_source_no_longer_refutes_falls_through(self, tmp_path):
+        """(self-correcting) Textual match hits, but the live source no longer refutes
+        the premise -> curate() proceeds past the guard instead of dropping."""
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        # The file no longer contains "invalid_at" — premise is no longer refuted.
+        (source_root / "memory_service.py").write_text("no marker here\n", encoding="utf-8")
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "create"
+
