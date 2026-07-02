@@ -321,21 +321,32 @@ async def run_dry_run_unblock(
                 timeout_seconds=ua_cfg.timeout_seconds,
             )
 
-        result = await _one_attempt(str(uuid.uuid4()))
-        if is_zero_output_timeout(result):
-            # Transcript-authoritative pre-turn-1 wedge: retry EXACTLY once
-            # with a freshly-allocated session_id. Never reuse the wedged
-            # UUID — a possibly-committed session id makes the CLI's
-            # --session-id exit instantly with 'already in use' (reify-3604 /
-            # _reset_for_fresh_retry semantics, shared/cli_invoke.py:562).
-            logger.warning(
-                'dry_run_unblock: zero-output timeout wedge for task %s — '
-                'retrying once with a fresh session',
-                task_id,
-            )
+        try:
             result = await _one_attempt(str(uuid.uuid4()))
+            if is_zero_output_timeout(result):
+                # Transcript-authoritative pre-turn-1 wedge: retry EXACTLY once
+                # with a freshly-allocated session_id. Never reuse the wedged
+                # UUID — a possibly-committed session id makes the CLI's
+                # --session-id exit instantly with 'already in use' (reify-3604 /
+                # _reset_for_fresh_retry semantics, shared/cli_invoke.py:562).
+                logger.warning(
+                    'dry_run_unblock: zero-output timeout wedge for task %s — '
+                    'retrying once with a fresh session',
+                    task_id,
+                )
+                result = await _one_attempt(str(uuid.uuid4()))
 
-        entry = _build_entry(result, reason=reason, budget_usd=ua_cfg.budget_usd)
+            entry = _build_entry(result, reason=reason, budget_usd=ua_cfg.budget_usd)
+        except AllAccountsCappedException as cap_exc:
+            # A retryable infra wedge, not a substantive investigation
+            # conclusion — must NOT surface as 'investigation_failed' (that
+            # shape is terminal for the B3 low-risk auto-unblock path).
+            logger.warning(
+                'dry_run_unblock: all accounts capped for task %s: %s',
+                task_id, cap_exc,
+            )
+            entry = _cap_exhausted_entry(reason=reason, exc=cap_exc)
+            result = None
 
     except Exception as exc:
         logger.warning('dry_run_unblock: unexpected error for task %s: %s', task_id, exc)
@@ -496,4 +507,31 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
         'block_reason': reason,
         'investigated_at': now,
         'timestamp': now,
+    }
+
+
+def _cap_exhausted_entry(*, reason: str, exc: AllAccountsCappedException) -> dict[str, Any]:
+    """Build the retryable infra_failure entry for a cap-exhausted investigation.
+
+    AllAccountsCappedException means invoke_with_cap_retry exceeded the
+    ``_DRY_RUN_CAP_WAIT_SANITY_SECS`` bound (all accounts capped) — no
+    AgentResult was ever produced, so this reuses the None-safe
+    ``_failure_diagnostics(None)`` shape rather than the AgentResult-derived
+    one, matching the task-2020 infra_failure entry shape.
+    """
+    now = _now_iso()
+    return {
+        'status': 'infra_failure',
+        'proposal_text': (
+            f'Infra wedge (retryable, not a human-review conclusion): '
+            f'all accounts capped after {exc.retries} retries '
+            f'({exc.elapsed_secs:.1f}s elapsed)'
+        ),
+        'risk_label': _HUMAN_REVIEW_REQUIRED,
+        'files_referenced': [],
+        'block_reason': reason,
+        'cost_usd': 0.0,
+        'investigated_at': now,
+        'timestamp': now,
+        **_failure_diagnostics(None),
     }
