@@ -258,7 +258,10 @@ def _assertion_holds(assertion: SourceAssertion, source_root: Path) -> bool:
     target = source_root / assertion.file
     try:
         text = target.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError) as exc:
+    except OSError as exc:
+        # FileNotFoundError is a subclass of OSError and is covered here — the
+        # common "cited file missing" case, but any unreadable-file OSError
+        # fails open the same way.
         logger.warning(
             "recon_code_fix_premise_guard: cannot read %s: %s — assertion fails open", target, exc,
         )
