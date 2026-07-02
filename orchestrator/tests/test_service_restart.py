@@ -268,6 +268,7 @@ def _make_coordinator_with_mutable_clock(
     debounce_secs: float = 120.0,
     enabled: bool = True,
     restart_executor: AsyncMock | None = None,
+    restart_precondition=None,
 ) -> tuple[StaleServiceRestartCoordinator, list[float], AsyncMock, MagicMock]:
     """Build a coordinator with a mutable-list clock and injectable executor."""
     git_ops = MagicMock()
@@ -285,6 +286,7 @@ def _make_coordinator_with_mutable_clock(
         enabled=enabled,
         restart_executor=executor,
         clock=lambda: current_time[0],
+        restart_precondition=restart_precondition,
     )
     return coord, current_time, executor, event_store
 
@@ -822,3 +824,204 @@ async def test_note_merge_empty_success_returns_false_not_error() -> None:
         'is_pending must NOT be armed for an empty-success diff'
     )
     mock_diff.assert_awaited_once_with('base_sha', 'head_sha')
+
+
+# ---------------------------------------------------------------------------
+# U2 (task 1973): schedule_detached_systemd_restart — cgroup-escaping restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_schedule_detached_systemd_restart_builds_correct_argv() -> None:
+    """Builds the systemd-run --user cgroup-escaping argv and spawns it with PIPE/STDOUT.
+
+    Mirrors DeterministicRunner._default_schedule_detached_restart's argv
+    pattern (systemd-run --user --on-active=N --unit=<unit> --collect <target>)
+    but WITHOUT the /bin/sh on-failure wrapper — restart-orchestrator.sh
+    self-verifies and self-reports to journald, and the coordinator's
+    maybe_restart already clears pending on executor failure.
+    """
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from orchestrator.service_restart import schedule_detached_systemd_restart
+
+    fake_proc = MagicMock()
+    fake_proc.communicate = AsyncMock(return_value=(b'', None))
+    fake_proc.returncode = 0
+
+    with patch(
+        'orchestrator.service_restart.asyncio.create_subprocess_exec',
+        new_callable=AsyncMock,
+        return_value=fake_proc,
+    ) as mock_exec:
+        await schedule_detached_systemd_restart(
+            script='scripts/restart-orchestrator.sh',
+            script_args=[],
+            project_root='/fake/project',
+            transient_unit='orch-selfrestart-on-merge-0.service',
+            on_active_secs=10,
+        )
+
+    mock_exec.assert_awaited_once()
+    call_args = mock_exec.call_args
+    pos_args = call_args.args if call_args.args else call_args[0]
+    assert pos_args == (
+        'systemd-run',
+        '--user',
+        '--on-active=10',
+        '--unit=orch-selfrestart-on-merge-0.service',
+        '--collect',
+        str(Path('/fake/project') / 'scripts/restart-orchestrator.sh'),
+    )
+    assert call_args.kwargs.get('stdout') is not None
+    assert call_args.kwargs.get('stderr') is not None
+    fake_proc.communicate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_schedule_detached_systemd_restart_appends_script_args() -> None:
+    """script_args are appended after the script path, mirroring the coordinator's spawn convention."""
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from orchestrator.service_restart import schedule_detached_systemd_restart
+
+    fake_proc = MagicMock()
+    fake_proc.communicate = AsyncMock(return_value=(b'', None))
+    fake_proc.returncode = 0
+
+    with patch(
+        'orchestrator.service_restart.asyncio.create_subprocess_exec',
+        new_callable=AsyncMock,
+        return_value=fake_proc,
+    ) as mock_exec:
+        await schedule_detached_systemd_restart(
+            script='scripts/restart-orchestrator.sh',
+            script_args=['--drain'],
+            project_root='/fake/project',
+            transient_unit='orch-selfrestart-on-merge-1.service',
+            on_active_secs=10,
+        )
+
+    call_args = mock_exec.call_args
+    pos_args = call_args.args if call_args.args else call_args[0]
+    assert pos_args == (
+        'systemd-run',
+        '--user',
+        '--on-active=10',
+        '--unit=orch-selfrestart-on-merge-1.service',
+        '--collect',
+        str(Path('/fake/project') / 'scripts/restart-orchestrator.sh'),
+        '--drain',
+    )
+
+
+@pytest.mark.asyncio
+async def test_schedule_detached_systemd_restart_raises_on_nonzero_rc() -> None:
+    """A non-zero systemd-run registration rc raises RuntimeError carrying the output tail."""
+    from unittest.mock import patch
+
+    from orchestrator.service_restart import schedule_detached_systemd_restart
+
+    fake_proc = MagicMock()
+    fake_proc.communicate = AsyncMock(
+        return_value=(b'systemd-run: failed to register unit', None)
+    )
+    fake_proc.returncode = 1
+
+    with patch(
+        'orchestrator.service_restart.asyncio.create_subprocess_exec',
+        new_callable=AsyncMock,
+        return_value=fake_proc,
+    ), pytest.raises(RuntimeError) as exc_info:
+        await schedule_detached_systemd_restart(
+            script='scripts/restart-orchestrator.sh',
+            script_args=[],
+            project_root='/fake/project',
+            transient_unit='orch-selfrestart-on-merge-2.service',
+            on_active_secs=10,
+        )
+
+    assert 'failed to register unit' in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# U2 (task 1973): restart_precondition gate on StaleServiceRestartCoordinator
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restart_precondition_false_defers_and_keeps_pending() -> None:
+    """(a) restart_precondition=False: no executor call, returns False, stays pending (retryable)."""
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=0.0,
+        restart_precondition=lambda: False,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord.is_pending is True
+
+    current_time[0] = 1.0
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
+
+
+@pytest.mark.asyncio
+async def test_restart_precondition_true_fires_normally() -> None:
+    """(b) restart_precondition=True: fires normally — executor awaited once, pending cleared."""
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=0.0,
+        restart_precondition=lambda: True,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 1.0
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+
+
+@pytest.mark.asyncio
+async def test_restart_precondition_raises_is_fail_safe() -> None:
+    """(c) restart_precondition raising: maybe_restart returns False, no propagation, stays pending."""
+
+    def _boom() -> bool:
+        raise RuntimeError('precondition boom')
+
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=0.0,
+        restart_precondition=_boom,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 1.0
+    result = await coord.maybe_restart(agents_idle=True)  # must not raise
+
+    assert result is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
+
+
+@pytest.mark.asyncio
+async def test_restart_precondition_default_none_preserves_existing_behavior() -> None:
+    """Default restart_precondition=None fires exactly like the pre-U2 coordinator (regression guard)."""
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=0.0,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 1.0
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False

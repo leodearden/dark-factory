@@ -1,14 +1,15 @@
 """Tests for harness wiring of StaleServiceRestartCoordinator (multi-coordinator API).
 
-Two coordinators are built and stored in a list:
+Three coordinators are built and stored in a list:
   - fused-memory (service_name='fused-memory', require_idle=True)
   - dashboard   (service_name='dashboard', require_idle=False)
+  - orchestrator (service_name='orchestrator', require_idle=True, U2 — task 1973)
 
 Asserts:
   (a) _build_service_restart_coordinator() returns fused-memory coordinator.
   (b) _build_dashboard_restart_coordinator() returns dashboard coordinator.
   (c) After _start_merge_worker, harness._service_restart_coordinators is a
-      list of two coordinators.
+      list of three coordinators.
   (d) _maybe_restart_stale_service(agents_idle=X) calls maybe_restart(agents_idle=X)
       on EVERY coordinator in the list; returns True iff any returned True.
       No-op returning False when list is empty.
@@ -43,6 +44,13 @@ def harness(tmp_path: Path, mock_orch_config):
     mock_orch_config.dashboard_restart_debounce_secs = 20.0
     mock_orch_config.dashboard_restart_watch_prefixes = ['dashboard/src/']
     mock_orch_config.dashboard_restart_script = 'scripts/restart-dashboard.sh'
+    # orchestrator restart config (U2 — task 1973); mirrors the real Config
+    # defaults (disabled-by-default operator gate — see config.py).
+    mock_orch_config.orchestrator_restart_on_merge_enabled = False
+    mock_orch_config.orchestrator_restart_debounce_secs = 300.0
+    mock_orch_config.orchestrator_restart_watch_prefixes = ['orchestrator/src/']
+    mock_orch_config.orchestrator_restart_script = 'scripts/restart-orchestrator.sh'
+    mock_orch_config.orchestrator_restart_on_active_secs = 10
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -171,29 +179,32 @@ class TestBuildDashboardRestartCoordinator:
 
 
 # ---------------------------------------------------------------------------
-# (c) _start_merge_worker stores list of two coordinators
+# (c) _start_merge_worker stores list of three coordinators
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestStartMergeWorkerBuildsCoordinatorList:
-    """After _start_merge_worker, harness._service_restart_coordinators is a list of two."""
+    """After _start_merge_worker, harness._service_restart_coordinators is a list of three."""
 
-    async def test_coordinators_list_has_two_entries(self, harness: Harness):
-        """_start_merge_worker populates _service_restart_coordinators with fused+dashboard."""
+    async def test_coordinators_list_has_three_entries(self, harness: Harness):
+        """_start_merge_worker populates _service_restart_coordinators with fused+dashboard+orchestrator."""
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_queue.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         assert isinstance(harness._service_restart_coordinators, list)
-        assert len(harness._service_restart_coordinators) == 2
+        assert len(harness._service_restart_coordinators) == 3
         # First entry: fused-memory (require_idle=True)
         assert harness._service_restart_coordinators[0]._service_name == 'fused-memory'
         assert harness._service_restart_coordinators[0]._require_idle is True
         # Second entry: dashboard (require_idle=False)
         assert harness._service_restart_coordinators[1]._service_name == 'dashboard'
         assert harness._service_restart_coordinators[1]._require_idle is False
+        # Third entry: orchestrator (require_idle=True, U2 — task 1973)
+        assert harness._service_restart_coordinators[2]._service_name == 'orchestrator'
+        assert harness._service_restart_coordinators[2]._require_idle is True
 
     async def test_start_merge_worker_continues_when_liveness_check_raises(
         self, harness: Harness, caplog
@@ -210,7 +221,7 @@ class TestStartMergeWorkerBuildsCoordinatorList:
 
         mock_smw.assert_called_once()
         assert isinstance(harness._service_restart_coordinators, list)
-        assert len(harness._service_restart_coordinators) == 2
+        assert len(harness._service_restart_coordinators) == 3
         mock_ct.assert_called_once()
         assert 'liveness boom' in caplog.text
 
@@ -471,3 +482,273 @@ class TestMaybeRestartStaleServiceBusyPath:
 
         executor.assert_not_awaited()
         assert fused_coord.is_pending is True  # still pending — waiting for the idle branch
+
+
+# ---------------------------------------------------------------------------
+# U2 (task 1973): Harness._merge_pipeline_idle
+# ---------------------------------------------------------------------------
+
+
+class TestMergePipelineIdle:
+    """_merge_pipeline_idle() reports whether the merge queue + worker pipeline is drained.
+
+    Used as the orchestrator restart coordinator's restart_precondition — a
+    genuine quiet window requires BOTH the merge queue empty AND the merge
+    worker's in-flight pipeline (snapshot()['depth']) at zero.
+    """
+
+    def test_true_when_merge_worker_is_none(self, harness: Harness):
+        """(a) _merge_worker=None → True (bare/unit-test harness)."""
+        harness._merge_worker = None
+
+        assert harness._merge_pipeline_idle() is True
+
+    def test_true_when_depth_zero_and_queue_empty(self, harness: Harness):
+        """(b) snapshot depth==0 and _merge_queue empty → True."""
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 0}
+        harness._merge_worker = worker
+        assert harness._merge_queue.empty()
+
+        assert harness._merge_pipeline_idle() is True
+
+    def test_false_when_depth_nonzero(self, harness: Harness):
+        """(c) snapshot depth==2 → False."""
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 2}
+        harness._merge_worker = worker
+
+        assert harness._merge_pipeline_idle() is False
+
+    def test_false_when_queue_has_item_even_if_depth_zero(self, harness: Harness):
+        """(d) snapshot depth==0 but _merge_queue non-empty → False."""
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 0}
+        harness._merge_worker = worker
+        harness._merge_queue.put_nowait({'task_id': 'queued-task'})
+
+        assert harness._merge_pipeline_idle() is False
+
+    def test_false_when_snapshot_raises(self, harness: Harness):
+        """(e) snapshot() raising → False (fail-safe), no exception propagates."""
+        worker = MagicMock()
+        worker.snapshot.side_effect = RuntimeError('snapshot boom')
+        harness._merge_worker = worker
+
+        result = harness._merge_pipeline_idle()  # must not raise
+
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# U2 (task 1973): Harness._build_orchestrator_restart_coordinator
+# ---------------------------------------------------------------------------
+
+
+class TestBuildOrchestratorRestartCoordinator:
+    """_build_orchestrator_restart_coordinator() reads orchestrator_restart_* config.
+
+    Unlike the fused-memory/dashboard builders, this coordinator is wired
+    with a CUSTOM restart_executor (cgroup-escaping systemd-run, not the
+    coordinator's default create_subprocess_exec path) and a
+    restart_precondition (the merge-drain gate, Harness._merge_pipeline_idle).
+    """
+
+    def test_builds_coordinator_with_correct_config_values(self, harness: Harness):
+        """Coordinator fields match the orchestrator_restart_* config values."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert isinstance(coord, StaleServiceRestartCoordinator)
+        assert coord._debounce_secs == 300.0
+        assert coord._watch_prefixes == ['orchestrator/src/']
+        assert coord._script_path == 'scripts/restart-orchestrator.sh'
+
+    def test_service_name_is_orchestrator(self, harness: Harness):
+        """Coordinator has service_name='orchestrator'."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._service_name == 'orchestrator'
+
+    def test_requires_idle(self, harness: Harness):
+        """Coordinator has require_idle=True — never fires while agents dispatch."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._require_idle is True
+
+    def test_disabled_by_default(self, harness: Harness):
+        """Disabled under the default config (operator gate — soak + sign-off required)."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord.enabled is False
+
+    def test_enabled_when_config_flag_flipped(self, harness: Harness):
+        """Enabled once the operator flips orchestrator_restart_on_merge_enabled."""
+        harness.config.orchestrator_restart_on_merge_enabled = True
+
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord.enabled is True
+
+    def test_restart_precondition_is_merge_pipeline_idle(self, harness: Harness):
+        """restart_precondition is harness._merge_pipeline_idle (the drain gate)."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        # Bound-method equality: __self__ identity + __func__ identity.
+        assert coord._restart_precondition == harness._merge_pipeline_idle
+
+    def test_restart_executor_is_custom_injected(self, harness: Harness):
+        """restart_executor is a custom closure — NOT the coordinator's default path.
+
+        The default path (create_subprocess_exec + start_new_session=True) does
+        NOT cgroup-escape, so it must never be used for the orchestrator's own
+        self-restart (see module design note in service_restart.py).
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._restart_executor is not None
+
+    def test_git_ops_is_harness_git_ops(self, harness: Harness):
+        """Coordinator receives the harness's git_ops instance."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._git_ops is harness.git_ops
+
+    def test_project_root_matches_config(self, harness: Harness):
+        """Coordinator project_root matches config.project_root."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._project_root == Path(harness.config.project_root)
+
+
+# ---------------------------------------------------------------------------
+# U2 (task 1973): end-to-end — armed -> drain-gated -> systemd-run fire
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOrchestratorCoordinatorEndToEnd:
+    """Full wiring through the real list built by _start_merge_worker.
+
+    Exercises the actual production path: note_merge fan-out
+    (_note_merge_all) arms the orchestrator coordinator on a watched-path
+    diff, and _maybe_restart_stale_service fires it via systemd-run only once
+    the merge pipeline is drained (restart_precondition).
+    """
+
+    async def test_fires_systemd_run_once_pipeline_drained(self, harness: Harness):
+        """note_merge arms the coordinator; a drained pipeline lets it fire via systemd-run.
+
+        Also confirms the systemd-run argv actually threads config's
+        on_active_secs/project_root/script through (not just that SOME
+        non-None executor ran), and that a second fire's transient unit
+        name advances via the closure's itertools counter.
+        """
+        harness.config.orchestrator_restart_on_merge_enabled = True
+        harness.config.orchestrator_restart_debounce_secs = 0.0
+
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+             patch('asyncio.create_task'), \
+             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+            await harness._start_merge_worker()
+
+        # Drained pipeline: no in-flight/verifying merge, empty queue.
+        mock_smw.return_value.snapshot.return_value = {'depth': 0}
+        assert harness._merge_queue.empty()
+
+        harness.git_ops.get_merge_diff_files = AsyncMock(
+            return_value=(['orchestrator/src/orchestrator/git_ops.py'], None)
+        )
+        orch_coord = harness._service_restart_coordinators[2]
+        expected_script = str(
+            Path(harness.config.project_root) / 'scripts/restart-orchestrator.sh'
+        )
+
+        await harness._note_merge_all('task-1', 'base', 'head')
+        assert orch_coord.is_pending is True
+
+        fake_proc = MagicMock()
+        fake_proc.communicate = AsyncMock(return_value=(b'', None))
+        fake_proc.returncode = 0
+        with patch(
+            'orchestrator.service_restart.asyncio.create_subprocess_exec',
+            new_callable=AsyncMock,
+            return_value=fake_proc,
+        ) as mock_exec:
+            fired = await harness._maybe_restart_stale_service(agents_idle=True)
+
+        assert fired is True
+        mock_exec.assert_awaited_once()
+        pos_args = mock_exec.call_args.args
+        assert pos_args[0] == 'systemd-run'
+        assert '--on-active=10' in pos_args
+        assert '--unit=orch-selfrestart-on-merge-0.service' in pos_args
+        assert expected_script in pos_args
+        assert orch_coord.is_pending is False
+
+        # Second merge + fire: the executor closure's itertools counter must
+        # advance the unit name — a fixed/hardcoded name would collide with
+        # the (already --collect'd) prior unit and is the exact regression
+        # the counter exists to prevent.
+        await harness._note_merge_all('task-2', 'base2', 'head2')
+        assert orch_coord.is_pending is True
+
+        with patch(
+            'orchestrator.service_restart.asyncio.create_subprocess_exec',
+            new_callable=AsyncMock,
+            return_value=fake_proc,
+        ) as mock_exec_2:
+            fired_2 = await harness._maybe_restart_stale_service(agents_idle=True)
+
+        assert fired_2 is True
+        pos_args_2 = mock_exec_2.call_args.args
+        assert '--unit=orch-selfrestart-on-merge-1.service' in pos_args_2
+
+    async def test_precondition_blocks_fire_when_merge_in_flight(self, harness: Harness):
+        """When the merge pipeline is NOT drained (depth>0), the fire is deferred."""
+        harness.config.orchestrator_restart_on_merge_enabled = True
+        harness.config.orchestrator_restart_debounce_secs = 0.0
+
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+             patch('asyncio.create_task'), \
+             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+            await harness._start_merge_worker()
+
+        mock_smw.return_value.snapshot.return_value = {'depth': 1}  # in-flight — NOT drained
+
+        harness.git_ops.get_merge_diff_files = AsyncMock(
+            return_value=(['orchestrator/src/orchestrator/git_ops.py'], None)
+        )
+        orch_coord = harness._service_restart_coordinators[2]
+
+        await harness._note_merge_all('task-1', 'base', 'head')
+        assert orch_coord.is_pending is True
+
+        with patch(
+            'orchestrator.service_restart.asyncio.create_subprocess_exec',
+            new_callable=AsyncMock,
+        ) as mock_exec:
+            fired = await harness._maybe_restart_stale_service(agents_idle=True)
+
+        assert fired is False
+        mock_exec.assert_not_awaited()
+        assert orch_coord.is_pending is True  # still armed, waiting for drain
+
+    async def test_disabled_config_never_arms(self, harness: Harness):
+        """With orchestrator_restart_on_merge_enabled=False (fixture default), it never arms."""
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
+             patch('asyncio.create_task'), \
+             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+            await harness._start_merge_worker()
+
+        orch_coord = harness._service_restart_coordinators[2]
+        assert orch_coord.enabled is False
+
+        # Re-bind (same fixture default) so pyright narrows the attribute to
+        # AsyncMock in this scope — it can't see the fixture's assignment
+        # from a different function — and .assert_not_awaited() is valid.
+        harness.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
+        result = await orch_coord.note_merge('task-1', 'base', 'head')
+
+        assert result is False
+        assert orch_coord.is_pending is False
+        harness.git_ops.get_merge_diff_files.assert_not_awaited()

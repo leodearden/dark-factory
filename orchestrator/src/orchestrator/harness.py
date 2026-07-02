@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import itertools
 import json
 import logging
 import os
@@ -42,7 +43,10 @@ from orchestrator.scheduler import (
     SetTaskStatusRejected,
     files_to_modules,
 )
-from orchestrator.service_restart import StaleServiceRestartCoordinator
+from orchestrator.service_restart import (
+    StaleServiceRestartCoordinator,
+    schedule_detached_systemd_restart,
+)
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -4963,6 +4967,7 @@ Output JSON matching the schema. Every task must appear in the output.
         self._service_restart_coordinators = [
             self._build_service_restart_coordinator(),
             self._build_dashboard_restart_coordinator(),
+            self._build_orchestrator_restart_coordinator(),
         ]
 
         # Build the callback factory here (where self.scheduler is live) and
@@ -5144,6 +5149,33 @@ Output JSON matching the schema. Every task must appear in the output.
         self._offline_lane_notifiee = None
         logger.info('Offline-deep lane worker stopped')
 
+    def _merge_pipeline_idle(self) -> bool:
+        """True when the merge queue and merge-worker pipeline are both quiescent.
+
+        Used as the orchestrator restart coordinator's ``restart_precondition``
+        (U2): even at the run-loop's idle quiet-window (``agents_idle=True``),
+        a merge can still be queued or in-flight/verifying — restarting the
+        orchestrator mid-merge would be disruptive. True only when there is
+        nothing queued (``self._merge_queue.empty()``) AND nothing in-flight
+        or verifying (``worker.snapshot()['depth'] == 0``). True when
+        ``_merge_worker`` is None (bare / unit-test harness — no pipeline to
+        drain). Fail-safe: any exception reading the snapshot returns False
+        (never restart when drain state is unknown).
+        """
+        if self._merge_worker is None:
+            return True
+        try:
+            worker = cast('SpeculativeMergeWorker', self._merge_worker)
+            depth = worker.snapshot().get('depth', 1)
+        except Exception:
+            logger.warning(
+                '_merge_pipeline_idle: snapshot() failed; treating pipeline as'
+                ' NOT idle (fail-safe)',
+                exc_info=True,
+            )
+            return False
+        return self._merge_queue.empty() and depth == 0
+
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.
 
@@ -5183,6 +5215,69 @@ Output JSON matching the schema. Every task must appear in the output.
             service_name='dashboard',
             require_idle=False,
             script_args=[],
+        )
+
+    def _build_orchestrator_restart_coordinator(self) -> StaleServiceRestartCoordinator:
+        """Construct the StaleServiceRestartCoordinator for the orchestrator itself (U2).
+
+        Unlike the fused-memory/dashboard builders, this coordinator restarts
+        the SAME service the orchestrator process is running under
+        (orchestrator-dark-factory.service), which requires two departures
+        from the coordinator's generic default path:
+
+        - ``restart_executor``: a cgroup-escaping ``systemd-run --user`` closure
+          (built here, over ``schedule_detached_systemd_restart``) rather than
+          the default ``create_subprocess_exec(start_new_session=True)`` spawn.
+          ``start_new_session`` detaches the POSIX session/process-group but
+          NOT the systemd cgroup, so under this service's
+          ``KillMode=control-group`` a ``systemctl restart`` would SIGKILL a
+          same-cgroup restart child before it could bring the service back.
+          The closure holds its own ``itertools.count()`` so every fire gets a
+          distinct transient unit name (``orch-selfrestart-on-merge-{n}.service``);
+          collisions would require two fires within one process lifetime inside
+          the ~30s external-verify window, which debounce + single-restart
+          coalescing + the drain gate below make effectively impossible.
+        - ``restart_precondition``: ``self._merge_pipeline_idle`` — even at the
+          run-loop's idle quiet-window (``agents_idle=True``), a merge can
+          still be queued or in-flight/verifying; this gate additionally
+          defers the fire until the merge pipeline is fully drained.
+
+        ``require_idle=True`` and ``script_args=[]`` mirror the fused-memory
+        coordinator (idle-only; restart-orchestrator.sh takes no positional
+        args). Called once from _start_merge_worker alongside the other two
+        builders.
+
+        ``on_active_secs`` is clamped to a minimum of 5 (mirroring
+        ``DeterministicRunner``'s ``max(int(...), 5)`` clamp on the
+        analogous field) so an operator misconfiguring
+        ``orchestrator_restart_on_active_secs`` to 0 or a negative value
+        can't remove the settle window entirely or produce an invalid
+        ``--on-active=`` argument at registration.
+        """
+        counter = itertools.count()
+
+        async def _systemd_run_restart_executor() -> None:
+            await schedule_detached_systemd_restart(
+                script=self.config.orchestrator_restart_script,
+                script_args=[],
+                project_root=self.config.project_root,
+                transient_unit=f'orch-selfrestart-on-merge-{next(counter)}.service',
+                on_active_secs=max(self.config.orchestrator_restart_on_active_secs, 5),
+            )
+
+        return StaleServiceRestartCoordinator(
+            git_ops=self.git_ops,
+            event_store=self.event_store,
+            watch_prefixes=self.config.orchestrator_restart_watch_prefixes,
+            debounce_secs=self.config.orchestrator_restart_debounce_secs,
+            enabled=self.config.orchestrator_restart_on_merge_enabled,
+            script_path=self.config.orchestrator_restart_script,
+            project_root=self.config.project_root,
+            service_name='orchestrator',
+            require_idle=True,
+            script_args=[],
+            restart_precondition=self._merge_pipeline_idle,
+            restart_executor=_systemd_run_restart_executor,
         )
 
     async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
