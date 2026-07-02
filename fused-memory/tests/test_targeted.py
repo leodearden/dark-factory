@@ -1784,14 +1784,24 @@ async def test_on_task_done_writes_own_title_in_multicompletion_window(
     'metadata, expected',
     [
         pytest.param({'supersedes': '959b8497'}, True, id='truthy_supersedes'),
-        pytest.param({'source': 'stage2_task_knowledge_sync'}, True, id='allowlisted_source'),
+        pytest.param(
+            {'stage2_suppress': True, 'task_id': '7'}, True, id='stage2_suppress_guard',
+        ),
+        pytest.param(
+            {'stage2_suppress': False, 'task_id': '7'},
+            False,
+            id='falsy_stage2_suppress_no_other_marker',
+        ),
+        pytest.param(
+            {'source': 'stage2_task_knowledge_sync'},
+            False,
+            id='dead_trigger_source_removed',
+        ),
         pytest.param(
             {'source': 'targeted_reconciliation', 'task_id': '361', 'transition': 'done'},
             False,
             id='plain_prior_echo',
         ),
-        pytest.param({}, False, id='empty_metadata'),
-        pytest.param({'supersedes': ''}, False, id='falsy_supersedes_no_other_marker'),
         pytest.param(
             {'source': 'stage1_flag_marker', 'task_id': '7', 'flag_type': 'x'},
             False,
@@ -1802,21 +1812,32 @@ async def test_on_task_done_writes_own_title_in_multicompletion_window(
             False,
             id='non_authoritative_stall_marker_source',
         ),
+        pytest.param({}, False, id='empty_metadata'),
+        pytest.param({'supersedes': ''}, False, id='falsy_supersedes_no_other_marker'),
     ],
 )
 def test_is_authoritative_resolution_truth_table(metadata, expected):
-    """Pure classifier: truthy `supersedes` OR allowlisted `source` => authoritative.
+    """Pure classifier: truthy `supersedes` OR truthy `stage2_suppress` => authoritative.
 
-    The source check is an allowlist (`_AUTHORITATIVE_SOURCES`), not "any source
-    other than the echo source" — real task_id-tagged writers like flag_dedup.py's
-    `stage1_flag_marker` and stage1_stall_detector.py's
-    `stage1_human_operator_stall_marker` are lifecycle/flag markers, not
-    resolutions, and must NOT suppress the completion echo's description
-    (task 1984 amendment: over-suppression-risk fix).
+    `stage2_suppress` is Stage 2's real completion-note guard key
+    (prompts/stage2.py documents its write side as "the only writer of the
+    `stage2_suppress` key") — replacing an earlier revision's `source`
+    allowlist (`_AUTHORITATIVE_SOURCES = {'stage2_task_knowledge_sync'}`) that
+    a task 1984 review pass found was never actually stamped by any writer in
+    the codebase (dead-trigger fix): `dead_trigger_source_removed` below locks
+    in that a bare `source='stage2_task_knowledge_sync'` is no longer
+    authoritative on its own.
 
-    Plain prior targeted echoes (source='targeted_reconciliation', no supersedes)
-    are deliberately NOT authoritative, so a task's own earlier echoes never
-    trigger suppression or oscillation.
+    Neither check treats "any other source" as authoritative — real
+    task_id-tagged writers like flag_dedup.py's `stage1_flag_marker` and
+    stage1_stall_detector.py's `stage1_human_operator_stall_marker` are
+    lifecycle/flag markers, not resolutions, and must NOT suppress the
+    completion echo's description (task 1984 amendment: over-suppression-risk
+    fix).
+
+    Plain prior targeted echoes (source='targeted_reconciliation', no
+    supersedes, no stage2_suppress) are deliberately NOT authoritative, so a
+    task's own earlier echoes never trigger suppression or oscillation.
     """
     from fused_memory.reconciliation.targeted import _is_authoritative_resolution
 
