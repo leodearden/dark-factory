@@ -617,3 +617,64 @@ async def test_b6_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, t
     worker.task_client.submit_fix_task.assert_not_awaited()
     assert worker.open_fix_tasks == {}
     assert worker.escalation_queue.get_pending() == []
+
+
+# ---------------------------------------------------------------------------
+# B7 — stall promotes to a born-at-L2 escalate_blocker
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b7_stall_promotes_to_blocker(harness, git_ops, repo, tmp_path):
+    """B7 (PRD §8, C4) — a fix task that stalls promotes the L0 info signal
+    to a real, born-at-L2 escalate_blocker via either arm: the confirmed-red
+    advance count reaching the configured threshold (arm 1), or the fix task
+    itself landing in a terminal non-done status (arm 2, cancelled/deferred).
+    Promotion is idempotent per fingerprint and never touches the merge
+    queue."""
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    # Arm 1 — N-advances: the confirmed-red count reaches the (small,
+    # explicitly configured) threshold.
+    failing_a = ['t::stall_a']
+    worker_a = _build_worker(
+        git_ops, tmp_path / 'arm1',
+        git_overrides={'offline_lane_red_advances_before_blocker': 2},
+    )
+    _wire_lane(harness, worker_a)
+    await _drive_reds(harness, repo, worker_a, failing_a, 2)
+
+    fp_a = compute_failing_test_set_fingerprint(failing_a)
+    task_a = worker_a.open_fix_tasks[fp_a]
+    blockers_a = _l2_blocker_escalations(worker_a.escalation_queue, task_a)
+    assert len(blockers_a) == 1
+    assert blockers_a[0].severity == 'critical'
+    assert blockers_a[0].agent_role == 'orchestrator-offline-lane'
+
+    # A further same-set red must not re-promote (idempotent per fingerprint).
+    await _drive_reds(harness, repo, worker_a, failing_a, 1)
+    assert len(_l2_blocker_escalations(worker_a.escalation_queue, task_a)) == 1
+    assert harness.get_merge_halt_status() == {'wired': False}
+
+    # Arm 2 — terminal non-done status: promotes immediately regardless of
+    # the count (threshold set deliberately high so arm 1 cannot explain it).
+    failing_b = ['t::stall_b']
+    worker_b = _build_worker(
+        git_ops, tmp_path / 'arm2',
+        task_client=_terminal_status_task_client('cancelled'),
+        git_overrides={'offline_lane_red_advances_before_blocker': 100},
+    )
+    _wire_lane(harness, worker_b)
+    await _drive_reds(harness, repo, worker_b, failing_b, 2)
+
+    fp_b = compute_failing_test_set_fingerprint(failing_b)
+    task_b = worker_b.open_fix_tasks[fp_b]
+    blockers_b = _l2_blocker_escalations(worker_b.escalation_queue, task_b)
+    assert len(blockers_b) == 1, (
+        'a terminal non-done fix-task status must promote immediately, '
+        'regardless of the configured advance-count threshold'
+    )
+
+    await _drive_reds(harness, repo, worker_b, failing_b, 1)
+    assert len(_l2_blocker_escalations(worker_b.escalation_queue, task_b)) == 1
+    assert harness.get_merge_halt_status() == {'wired': False}
