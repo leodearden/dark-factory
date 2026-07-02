@@ -184,3 +184,92 @@ async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
     """Invoke an async MCP tool by name (mirrors test_server.py's _call_tool)."""
     tool = await server.get_tool(name)
     return await tool.fn(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Step-01/02: I1 isolation across claim→release THROUGH the β verbs, with a
+# real WarmLanePool + a seeded scheduler._dispatched set live on the harness.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestIsolationInvariantI1:
+    """I1: claiming/releasing an interactive worktree THROUGH the β verbs
+    must never perturb WarmLanePool state or scheduler dispatch capacity —
+    proven across the full verb surface (distinct from α's primitive-level
+    isolation test, which never goes through claim_warm_worktree/
+    release_warm_worktree).
+    """
+
+    async def test_pool_and_dispatch_capacity_unchanged_across_claim_release(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+        await _add_seed_script(repo)
+        config = _make_config(repo, max_concurrent_tasks=3)
+        harness, server = _build_harness_and_server(config, tmp_path)
+        pool = harness.git_ops.warm_lane_pool
+        assert pool is not None, 'setup: warm_lane_pool must be enabled'
+
+        def _free_count() -> int:
+            return sum(1 for s in pool._lanes.values() if s == LaneState.FREE)
+
+        free_before = _free_count()
+        assert free_before == 3, f'setup: expected 3 FREE lanes, got {free_before}'
+        assignments_before = pool.assignments_snapshot()
+        dispatched_before = set(harness.scheduler._dispatched)
+
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='iso', project_root=str(repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+
+        # I1 must hold immediately AFTER claim.
+        assert _free_count() == free_before, (
+            f'I1 VIOLATION: claim_warm_worktree changed the FREE lane count '
+            f'(before={free_before}, after={_free_count()})'
+        )
+        assert pool.assignments_snapshot() == assignments_before, (
+            'I1 VIOLATION: claim_warm_worktree perturbed assignments_snapshot()'
+        )
+        assert harness.scheduler._dispatched == dispatched_before, (
+            'I1 VIOLATION: claim_warm_worktree perturbed scheduler._dispatched'
+        )
+        claim_path = Path(claim['path'])
+        assert pool.is_lane(claim_path) is False, (
+            'I1 VIOLATION: the interactive worktree path is registered as a pool lane'
+        )
+        assert pool.state(claim_path) is None, (
+            'I1 VIOLATION: the pool reports a LaneState for the interactive '
+            'worktree path'
+        )
+        lane_dirs = sorted(
+            p.name for p in harness.git_ops.worktree_base.iterdir()
+            if p.name.startswith('_lane-')
+        )
+        assert lane_dirs == [], (
+            f'I1 VIOLATION: a _lane-* dir was created on disk: {lane_dirs}'
+        )
+        assert claim_path.name.startswith('_iact-'), (
+            f'expected the claimed path in the _iact-* band, got {claim_path.name!r}'
+        )
+
+        rel = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(repo),
+        )
+        assert rel['removed'] is True, f'expected removed=True, got: {rel}'
+
+        # I1 must hold again AFTER release.
+        assert _free_count() == free_before, (
+            f'I1 VIOLATION: release_warm_worktree changed the FREE lane count '
+            f'(before={free_before}, after={_free_count()})'
+        )
+        assert pool.assignments_snapshot() == assignments_before, (
+            'I1 VIOLATION: release_warm_worktree perturbed assignments_snapshot()'
+        )
+        assert harness.scheduler._dispatched == dispatched_before, (
+            'I1 VIOLATION: release_warm_worktree perturbed scheduler._dispatched'
+        )
