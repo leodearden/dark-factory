@@ -21,6 +21,7 @@ from orchestrator.config import (
     TimeoutsConfig,
     _deep_merge,
     _discover_module_configs,
+    apply_reload,
     diff_config,
     load_config,
 )
@@ -1948,3 +1949,110 @@ class TestDiffConfig:
         assert not any('_module_configs' in p for p in all_paths), (
             f'_module_configs is a PrivateAttr and must never appear in a diff path; got {all_paths}'
         )
+
+
+class TestApplyReload:
+    """apply_reload(live, fresh, allowlist) mutates *live* in place for every
+    allowlisted differing leaf, reports restart_required leaves WITHOUT
+    touching live, and never replaces a submodel object (I3 identity).
+    Hybrid-invariant rollback (I5) is covered separately in
+    TestApplyReloadHybridRollback.
+    """
+
+    def test_allowlisted_apply_mutates_live_and_reports(self, monkeypatch, tmp_path):
+        from orchestrator.config import GitConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            models=ModelsConfig(architect='sonnet'),
+            git=GitConfig(offline_lane_test_threads=8),
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert report['applied'] == {
+            'models.architect': {'old': 'opus', 'new': 'sonnet'},
+            'git.offline_lane_test_threads': {'old': 6, 'new': 8},
+        }
+        assert live.models.architect == 'sonnet'
+        assert live.git.offline_lane_test_threads == 8
+
+    def test_submodel_identity_preserved(self, monkeypatch, tmp_path):
+        """I3: allowlisted leaves are mutated in place on the existing
+        submodel objects — models/git objects are never replaced, so any
+        other holder of a reference (e.g. GitOps) observes the update."""
+        from orchestrator.config import GitConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            models=ModelsConfig(architect='sonnet'),
+            git=GitConfig(offline_lane_test_threads=8),
+        )
+        models_id_before = id(live.models)
+        git_id_before = id(live.git)
+        apply_reload(live, fresh)
+        assert id(live.models) == models_id_before
+        assert id(live.git) == git_id_before
+
+    def test_restart_required_change_not_mutated_on_live(self, monkeypatch, tmp_path):
+        """I2: a restart_required leaf is reported but live is left untouched."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(max_concurrent_tasks=3)
+        fresh = OrchestratorConfig(max_concurrent_tasks=5)
+        report = apply_reload(live, fresh)
+        assert report['applied'] == {}
+        assert report['restart_required'] == {
+            'max_concurrent_tasks': {'old': 3, 'new': 5},
+        }
+        assert live.max_concurrent_tasks == 3
+
+    def test_mixed_change_only_allowlisted_leaf_mutated(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(models=ModelsConfig(architect='opus'), max_concurrent_tasks=3)
+        fresh = OrchestratorConfig(models=ModelsConfig(architect='sonnet'), max_concurrent_tasks=5)
+        report = apply_reload(live, fresh)
+        assert live.models.architect == 'sonnet'
+        assert live.max_concurrent_tasks == 3
+        assert report['applied'] == {
+            'models.architect': {'old': 'opus', 'new': 'sonnet'},
+        }
+        assert report['restart_required'] == {
+            'max_concurrent_tasks': {'old': 3, 'new': 5},
+        }
+        # I6: each differing path reported exactly once, in exactly one bucket.
+        assert not (set(report['applied']) & set(report['restart_required']))
+
+    def test_no_op_apply_reports_success_with_nothing_to_do(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        report = apply_reload(cfg, cfg)
+        assert report['reloaded'] is True
+        assert report['applied'] == {}
+        assert report['restart_required'] == {}
+        assert report['unchanged'] > 0
+
+    def test_verify_env_replaced_wholesale(self, monkeypatch, tmp_path):
+        """verify_env is a single atomic top-level leaf (I3): applying it
+        replaces the whole dict on live in one shot, as load_config's
+        sccache fold (config.verify_env = config.effective_verify_env)
+        would produce on *fresh*."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(verify_env={})
+        fresh = OrchestratorConfig(verify_env={
+            'RUSTC_WRAPPER': 'sccache',
+            'SCCACHE_REDIS': 'redis://h:6379',
+        })
+        report = apply_reload(live, fresh)
+        assert live.verify_env == fresh.verify_env
+        assert report['applied']['verify_env'] == {
+            'old': {},
+            'new': {'RUSTC_WRAPPER': 'sccache', 'SCCACHE_REDIS': 'redis://h:6379'},
+        }
