@@ -24,7 +24,7 @@ import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
@@ -41,6 +41,7 @@ from orchestrator.config import (
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
+from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow
@@ -229,6 +230,7 @@ class TestS1BadYamlFailClosed:
             'live config must be byte-identical after a failed real-disk load (I1)'
         )
 
+        assert harness.event_store is not None
         rows = _query_config_reload_events(harness.event_store)
         assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
         assert json.loads(rows[0]['data']) == report
@@ -460,6 +462,7 @@ class TestS6NoOpReload:
         assert report['error'] is None
         assert report['config_path'] == str(config_path)
 
+        assert harness.event_store is not None
         rows = _query_config_reload_events(harness.event_store)
         assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
         assert json.loads(rows[0]['data']) == report
@@ -512,4 +515,56 @@ class TestS8Straddle:
         assert stub.calls[-1]['model'] == new_implementer, (
             'the implementer stage spawned after the reload must use the NEW '
             'model — the same workflow/task straddles the reload cleanly'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 9 (I3 + offline_lane.py:408): the offline-lane worker's next run
+# reads the reloaded thread count fresh, and the leaf mutation preserves
+# GitConfig object identity for a real GitOps instance constructed at
+# "startup" — the held-reference-observes-the-update-in-place guarantee I3
+# exists specifically to protect.
+# ---------------------------------------------------------------------------
+
+
+class TestS9OfflineLaneThreadsIdentity:
+    """PRD boundary scenario 9: next lane run uses new threads; GitOps identity survives (I3)."""
+
+    @pytest.mark.asyncio
+    async def test_next_lane_run_uses_new_threads_and_preserves_git_identity(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        harness, config_path = _make_reload_harness(tmp_path, monkeypatch)
+
+        git_ops = GitOps(harness.config.git, tmp_path)
+        assert git_ops.config is harness.config.git, (
+            'a real GitOps captures harness.config.git by reference at construction'
+        )
+        git_ops.get_main_sha = AsyncMock(return_value='deadbeef')
+        wt_path = tmp_path / '_offline-deep'
+        git_ops.reset_persistent_offline_deep_worktree = AsyncMock(return_value=wt_path)
+        suite_runner = AsyncMock(return_value=(0, ''))
+
+        worker = OfflineLaneWorker(
+            git_ops, harness.config,
+            lock_path=tmp_path / 'offline_lane.lock',
+            suite_runner=suite_runner,
+        )
+
+        old_threads = harness.config.git.offline_lane_test_threads
+        new_threads = old_threads + 4
+        _edit_yaml(config_path, 'git.offline_lane_test_threads', new_threads)
+
+        report = await harness.reload_config()
+        assert report['applied']['git.offline_lane_test_threads'] == {
+            'old': old_threads, 'new': new_threads,
+        }
+
+        await worker._run_once()
+
+        suite_runner.assert_awaited_once_with(wt_path, 'deadbeef', new_threads)
+        assert git_ops.config is harness.config.git, (
+            'leaf-mutation must preserve GitConfig object identity (I3) — the '
+            'GitOps instance captured at "startup" observes the reloaded '
+            'value through the SAME object, not a stale copy'
         )
