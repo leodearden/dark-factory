@@ -2113,6 +2113,15 @@ class GitOps:
                             f'Inspect the branch and, once wanted work is preserved, '
                             f'remove the other worktree and retry.'
                         )
+                    # Reaching this guard means .task/ (if present) belongs to
+                    # the lane's PREVIOUS occupant — the same-task case already
+                    # returned via the disk-backstop reuse above.  checkout -f
+                    # replaces tracked files but leaves untracked .task/ intact,
+                    # and _reuse_warm_lane deliberately preserves .task/ (its
+                    # same-task contract) — clear it here or the incoming task
+                    # inherits a foreign plan.json/iterations.jsonl/reviews/
+                    # (reify esc-4920-163: _lane-26 4949→4920 contamination).
+                    shutil.rmtree(lane / '.task', ignore_errors=True)
                     return await self._reuse_warm_lane(lane, full_branch)
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
