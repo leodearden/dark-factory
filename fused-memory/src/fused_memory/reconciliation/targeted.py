@@ -220,9 +220,19 @@ class TargetedReconciler:
 
         # 0. Fast-path: write completion fact immediately (no search/verify needed)
         try:
-            memories = await self.memory.get_memories_by_metadata(
-                project_id=project_id, filters={'task_id': task_id},
-            )
+            # Narrowly scoped: a Mem0/Qdrant hiccup here must fail open (treat the
+            # task as having no authoritative memory) rather than propagate into
+            # the broad try/except below and skip the completion write entirely.
+            try:
+                memories = await self.memory.get_memories_by_metadata(
+                    project_id=project_id, filters={'task_id': task_id},
+                )
+            except Exception as e:
+                logger.warning(
+                    f'Authoritative-memory pre-check failed for task {task_id}: {e}; '
+                    'echoing description (fail-open)'
+                )
+                memories = []
             has_authoritative = any(
                 _is_authoritative_resolution(m.get('metadata') or {}) for m in memories
             )
