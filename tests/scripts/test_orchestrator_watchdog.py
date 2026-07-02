@@ -1793,6 +1793,36 @@ def test_staleness_pass_e2e_disabled_unit_not_restarted(monkeypatch: pytest.Monk
 
     _assert_zero_mutating_calls(recorded_calls)
 
+    # Positive confirmation that the DISABLED gate — not empty enumeration or
+    # an early commit-grace return — is what suppressed the restart: an
+    # is-enabled call must have been recorded for the unit, ...
+    is_enabled_calls = [
+        c
+        for c in recorded_calls
+        if c[:3] == ["systemctl", "--user", "is-enabled"] and c[-1] == unit
+    ]
+    assert is_enabled_calls, (
+        f"Expected an is-enabled call recorded for {unit}, proving the disabled "
+        f"gate actually evaluated this unit; recorded calls: {recorded_calls}"
+    )
+    # ...and no staleness-comparison show call (monotonic elapsed or realtime
+    # start epoch) may have been made against it, proving is-enabled=False
+    # short-circuited BEFORE the staleness comparison ever ran.
+    staleness_show_calls = [
+        c
+        for c in recorded_calls
+        if c[:3] == ["systemctl", "--user", "show"]
+        and c[3] == unit
+        and (
+            "--property=ExecMainStartTimestampMonotonic" in c
+            or "--timestamp=unix" in c
+        )
+    ]
+    assert staleness_show_calls == [], (
+        f"is-enabled=False must short-circuit before any staleness-comparison "
+        f"show call for {unit}; got {staleness_show_calls}"
+    )
+
 
 def _assert_zero_mutating_calls(recorded_calls: list[list[str]]) -> None:
     """Assert no recorded argv contains a mutating systemctl verb.

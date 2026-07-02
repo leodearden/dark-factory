@@ -49,17 +49,6 @@ from orchestrator.service_restart import StaleServiceRestartCoordinator
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DF_CONFIG_PATH = REPO_ROOT / 'orchestrator' / 'config.yaml'
 
-# The committed fleet-restart watch prefixes (orchestrator/config.yaml,
-# task γ) — asserted verbatim below so a drift in the committed YAML fails
-# this test as well as the γ drift test.
-_COMMITTED_WATCH_PREFIXES = [
-    'orchestrator/src/',
-    'escalation/src/',
-    'orchestrator/pyproject.toml',
-    'orchestrator/uv.lock',
-    'escalation/pyproject.toml',
-]
-
 
 def _load_committed_orchestrator_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
     """Load the COMMITTED orchestrator/config.yaml through the real pydantic model.
@@ -157,7 +146,12 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         assert isinstance(coord, StaleServiceRestartCoordinator)
         assert coord.enabled is True
         assert coord._script_path == 'scripts/restart-all-orchestrators.sh'
-        assert coord._watch_prefixes == _COMMITTED_WATCH_PREFIXES
+        # Asserted against the parsed committed config's own field (not a
+        # second hardcoded literal) — the verbatim-bytes guard for the watch
+        # prefixes belongs solely to the γ drift test
+        # (test_orchestrator_restart_config_drift.py); this test's unique
+        # value is that the parsed value reaches the coordinator's field.
+        assert coord._watch_prefixes == committed.orchestrator_restart_watch_prefixes
         assert coord._require_idle is True
         # I3: the merge-drain precondition is unchanged by the fleet config.
         assert coord._restart_precondition == harness._merge_pipeline_idle
@@ -169,7 +163,10 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         """End-to-end: note_merge arms the real (list-index-2) coordinator on a
         watched-path diff; once the merge pipeline is drained, the systemd-run
         argv targets the FLEET script (restart-all-orchestrators.sh) — not
-        restart-orchestrator.sh — with the committed on_active_secs.
+        restart-orchestrator.sh — with the resulting on_active_secs. Note:
+        orchestrator/config.yaml does not set orchestrator_restart_on_active_secs,
+        so the asserted value (10) comes from config.py's pydantic default, not
+        a value pinned in the committed YAML.
         """
         committed = _load_committed_orchestrator_config(monkeypatch)
         _graft_committed_restart_config(harness, committed)
