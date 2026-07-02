@@ -32,6 +32,7 @@ def service(mock_config):
     svc.graphiti.get_edge_text = AsyncMock(return_value=('edge-name', 'updated'))
     svc.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
     svc.graphiti._require_client = MagicMock()
+    svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
