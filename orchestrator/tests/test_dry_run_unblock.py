@@ -366,6 +366,13 @@ class TestBudgetExhaustedFallback:
         assert 'proposal incomplete' in entry['proposal_text'].lower()
         assert entry['risk_label'] == 'human-review-required'
         assert entry['cost_usd'] == pytest.approx(5.0)
+        # task 2020 step-5: diagnostic keys also present on budget_exhausted.
+        assert entry['subtype'] == 'error_max_budget_usd'
+        assert 'timed_out' in entry
+        assert 'transcript_turns' in entry
+        assert 'session_id' in entry
+        assert 'stderr_tail' in entry
+        assert 'duration_ms' in entry
 
 
 # ---------------------------------------------------------------------------
