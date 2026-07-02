@@ -2450,3 +2450,72 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
                 prefix, prefix_depth, config.lock_depth,
             )
     return config
+
+
+# ---------------------------------------------------------------------------
+# Config hot-reload (plans/config-hot-reload-prd.md, task alpha): RELOADABLE_FIELDS
+# ---------------------------------------------------------------------------
+
+
+def _submodel_leaf_paths(field_name: str, submodel_cls: type[BaseModel]) -> frozenset[str]:
+    """Return {'<field_name>.<leaf>', ...} for every field on *submodel_cls*.
+
+    Generates a whole-submodel RELOADABLE_FIELDS group from the submodel's own
+    model_fields, so adding a field to e.g. ModelsConfig automatically becomes
+    reloadable without a RELOADABLE_FIELDS edit (PRD Open Q1 resolution).
+    """
+    return frozenset(f'{field_name}.{leaf}' for leaf in submodel_cls.model_fields)
+
+
+# Code-owned allowlist of dotted OrchestratorConfig leaf paths that may be
+# applied to a live config via apply_reload() without a process restart.
+# See plans/config-hot-reload-prd.md §Allowlist (v1). Reload-safety is a code
+# property, not operator-tunable, so this constant lives here rather than in
+# orchestrator.yaml.
+#
+# Whole-submodel groups are generated from each submodel class's own
+# model_fields (kept in sync automatically as those classes grow). NOTE: the
+# "turns" submodel is exposed on OrchestratorConfig under the field name
+# `max_turns` (see TurnsConfig, above), so its group is keyed 'max_turns', not
+# 'turns' — the PRD's "turns.* (max_turns)" parenthetical is authoritative.
+RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
+    _submodel_leaf_paths('models', ModelsConfig),
+    _submodel_leaf_paths('budgets', BudgetsConfig),
+    _submodel_leaf_paths('max_turns', TurnsConfig),
+    _submodel_leaf_paths('effort', EffortConfig),
+    _submodel_leaf_paths('timeouts', TimeoutsConfig),
+    _submodel_leaf_paths('backends', BackendsConfig),
+    _submodel_leaf_paths('unblock_auto', UnblockAutoConfig),
+    {
+        # Steward grace
+        'steward_completion_timeout',
+        'steward_lifetime_budget',
+        # Scheduler tuning
+        'fairness.skip_threshold',
+        'starvation_watchdog.enabled',
+        'starvation_watchdog.skip_threshold',
+        'starvation_watchdog.idle_secs',
+        # Loop-pass thresholds (+ the two crashloop-window params read live
+        # per rotation; the misconfigured-guard params are a distinct
+        # failure-mode family and stay restart-only)
+        'idle_poll_secs',
+        'orphan_l0_timeout_secs',
+        'watcher_rotation_escalations',
+        'watcher_rotation_hours',
+        'watcher_max_crashloop_restarts',
+        'watcher_crashloop_window_secs',
+        # Review knobs
+        'review.enabled',
+        'review.interval',
+        'review.full_review_on_complete',
+        'review.full_review_min_interval_secs',
+        'review.full_review_min_tasks',
+        # Verify env (fresh config's value already carries the sccache fold)
+        'verify_env',
+        # Offline-lane tunables (leaf fields on the existing `git` submodel —
+        # leaf-mutation only per I3)
+        'git.offline_lane_test_threads',
+        'git.offline_lane_poll_interval_secs',
+        'git.offline_lane_red_advances_before_blocker',
+    },
+)
