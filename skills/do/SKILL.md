@@ -43,7 +43,7 @@ Write it to the plan file named in the plan-mode system message. Write for a rea
      - **Escalation MCP unreachable, or any `{error}` / `{error, reason}` return** (`reason` ∈ `interactive_worktree_limit`, `invalid_slug`, `git_failure`; or a bare `{error}` when the server is standalone or `project_root` doesn't match): explicitly note the fallback — never fail silently — and fall back to the cold path exactly as before: call `EnterWorktree`. Name it so the resulting branch follows the `task/<short-slug>` convention `/merge-queue` expects; rename the branch if EnterWorktree's default doesn't match.
   2. Implement the plan in the worktree and run the verification above until it passes.
   3. Run **`/merge-queue`** to land the branch on main. It auto-detects whether the orchestrator is running and routes the merge safely either way.
-  4. Run **`/reflect`** to capture the decisions and discoveries from the implementation to memory.
+  4. Run **`/reflect`** to capture the decisions and discoveries from the implementation to memory. If step 1 took the warm claim, also release it here: call `mcp__escalation__release_warm_worktree(path_or_branch="<the claimed path>", project_root="<same root passed to claim>")`. This is idempotent — safe to call even if delta's periodic/startup reaper already cleaned the worktree up, which is the safety net if release is skipped or the session crashes before reaching this step. A cold `EnterWorktree` fallback worktree is not released this way — it keeps the harness's existing worktree cleanup, unchanged.
   5. Work **autonomously** — this plan is the contract. Don't pause for confirmation unless you hit something genuinely blocking that the plan doesn't cover.
 
 ### 5. Exit plan mode for approval
