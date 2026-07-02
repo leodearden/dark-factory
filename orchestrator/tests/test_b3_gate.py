@@ -58,8 +58,18 @@ def _diverge_feature_branch(path: Path) -> str:
 def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
                        subtype='', output='', duration_ms=1000,
                        timed_out=False, transcript_turns=None, session_id='',
-                       stderr='', turns=0, api_error_status=None):
-    """Create a minimal MagicMock AgentResult stand-in for _build_entry tests."""
+                       stderr='', turns=0, api_error_status=None,
+                       schema_salvaged=False, output_tokens=None):
+    """Create a minimal MagicMock AgentResult stand-in for _build_entry tests.
+
+    NOTE: duplicated verbatim in test_dry_run_unblock.py (task 2020 review:
+    code_duplication). Both copies must be extended together whenever
+    shared.cli_invoke.AgentResult gains/renames a field consumed by
+    classify_agent_failure(). Out of this task's locked scope: hoisting both
+    into the existing orchestrator/tests/_orch_helpers.py shared-helper
+    module (the established convention for cross-suite test helpers in this
+    package) is a follow-up.
+    """
     r = MagicMock()
     r.success = success
     r.cost_usd = cost_usd
@@ -68,16 +78,22 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
     r.output = output
     r.duration_ms = duration_ms
     # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
-    # A bare MagicMock auto-vivifies .timed_out as a truthy attribute, which
-    # would make classify_agent_failure() misclassify every failure result as
-    # TIMED_OUT -> infra. Setting explicit defaults keeps these mocks faithful
-    # stand-ins for classify_agent_failure()'s decision rules.
+    # A bare MagicMock auto-vivifies every unset attribute as a truthy
+    # MagicMock, which would silently corrupt classify_agent_failure()'s
+    # decision rules: .timed_out truthy -> misclassifies every failure as
+    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
+    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
+    # every field classify_agent_failure() consults (including
+    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
+    # these mocks faithful stand-ins for its decision rules.
     r.timed_out = timed_out
     r.transcript_turns = transcript_turns
     r.session_id = session_id
     r.stderr = stderr
     r.turns = turns
     r.api_error_status = api_error_status
+    r.schema_salvaged = schema_salvaged
+    r.output_tokens = output_tokens
     return r
 
 

@@ -126,7 +126,15 @@ def _init_git_repo(path) -> str:
 def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
                        subtype='', output='', duration_ms=1000,
                        timed_out=False, transcript_turns=None, session_id='',
-                       stderr='', turns=0, api_error_status=None):
+                       stderr='', turns=0, api_error_status=None,
+                       schema_salvaged=False, output_tokens=None):
+    # NOTE: duplicated verbatim in test_b3_gate.py (task 2020 review:
+    # code_duplication). Both copies must be extended together whenever
+    # shared.cli_invoke.AgentResult gains/renames a field consumed by
+    # classify_agent_failure(). Out of this task's locked scope: hoisting
+    # both into the existing orchestrator/tests/_orch_helpers.py shared-helper
+    # module (the established convention for cross-suite test helpers in this
+    # package) is a follow-up.
     r = MagicMock()
     r.success = success
     r.cost_usd = cost_usd
@@ -135,16 +143,22 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
     r.output = output
     r.duration_ms = duration_ms
     # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
-    # A bare MagicMock auto-vivifies .timed_out as a truthy attribute, which
-    # would make classify_agent_failure() misclassify every failure result as
-    # TIMED_OUT -> infra. Setting explicit defaults keeps these mocks faithful
-    # stand-ins for classify_agent_failure()'s decision rules.
+    # A bare MagicMock auto-vivifies every unset attribute as a truthy
+    # MagicMock, which would silently corrupt classify_agent_failure()'s
+    # decision rules: .timed_out truthy -> misclassifies every failure as
+    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
+    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
+    # every field classify_agent_failure() consults (including
+    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
+    # these mocks faithful stand-ins for its decision rules.
     r.timed_out = timed_out
     r.transcript_turns = transcript_turns
     r.session_id = session_id
     r.stderr = stderr
     r.turns = turns
     r.api_error_status = api_error_status
+    r.schema_salvaged = schema_salvaged
+    r.output_tokens = output_tokens
     return r
 
 
@@ -905,6 +919,55 @@ class TestInfraFailureClassification:
         scheduler.update_task.assert_awaited_once()
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'investigation_failed'
+
+    @pytest.mark.asyncio
+    async def test_high_turn_timeout_still_classified_infra_failure(self, tmp_path):
+        """Pin current behavior (review note, task 2020): classification is
+        by AgentFailureKind alone (timed_out=True -> TIMED_OUT), NOT gated on
+        transcript_turns. A genuine investigation that ran many turns before
+        hitting the timeout ceiling is classified identically to a
+        pre-turn-1 wedge — both land as 'infra_failure'. This is intentional:
+        risk_label stays 'human-review-required' either way, so no
+        auto-retry/auto-unblock path opens because of it (both statuses
+        still ABORT at the B3 gate; see
+        TestTwoWayBoundary.test_infra_failure_and_investigation_failed_both_aborted
+        in test_b3_gate.py). A future consumer that auto-retries specifically
+        on infra_failure should itself gate on transcript_turns rather than
+        assume this status implies near-zero turns.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_empty_output',
+            output='',
+            timed_out=True,
+            duration_ms=600000,
+            transcript_turns=47,
+            session_id='sess-y',
+            stderr='...Absolute ceiling reached after 600.0s...',
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='704',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure'
+        assert entry['transcript_turns'] == 47
 
 
 # ---------------------------------------------------------------------------
