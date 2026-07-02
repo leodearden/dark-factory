@@ -14,6 +14,8 @@ FREE-count / assignments_snapshot / is_lane assertions for the I1 signal.
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -203,4 +205,51 @@ class TestCreateInteractiveWorktreeHappyPath:
         )
         assert info.base_ref == prior_sha, (
             f'expected base_ref == pinned start_ref {prior_sha!r}, got {info.base_ref!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-05: .task/interactive.json stamp
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInteractiveWorktreeStamp:
+    """RED — .task/interactive.json stamp written for the δ reaper to consume."""
+
+    async def test_stamp_written_and_gitignored(self, iw_git_repo: Path) -> None:
+        """The stamp records owner/created_at and is never git-tracked."""
+        await _add_seed_script(iw_git_repo)
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info = await git_ops.create_interactive_worktree('stamp-slug')
+
+        stamp_path = info.path / '.task' / 'interactive.json'
+        assert stamp_path.exists(), f'expected stamp to exist at {stamp_path}'
+
+        stamp = json.loads(stamp_path.read_text())
+        assert stamp['owner'] == 'stamp-slug', (
+            f"expected stamp['owner'] == 'stamp-slug', got {stamp.get('owner')!r}"
+        )
+        # Machine-parseable ISO8601 — raises ValueError on failure.
+        datetime.fromisoformat(stamp['created_at'])
+
+        # Not git-tracked: ls-files --error-unmatch must fail (non-zero rc),
+        # and `git status --porcelain` must not list it (gitignored via
+        # .task/.gitignore, written by _ensure_task_gitignore).
+        rc_ls, _, _ = await _run(
+            ['git', 'ls-files', '--error-unmatch', '.task/interactive.json'],
+            cwd=info.path,
+        )
+        assert rc_ls != 0, (
+            'expected .task/interactive.json to NOT be git-tracked '
+            '(git ls-files --error-unmatch unexpectedly succeeded)'
+        )
+        rc_status, status_out, _ = await _run(
+            ['git', 'status', '--porcelain'], cwd=info.path,
+        )
+        assert rc_status == 0 and 'interactive.json' not in status_out, (
+            f'expected .task/interactive.json to be absent from git status '
+            f'(gitignored); got status: {status_out!r}'
         )
