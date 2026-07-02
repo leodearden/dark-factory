@@ -370,13 +370,16 @@ class OfflineLaneWorker:
     # staged escalation (β3, task 1954, PRD §5 C3/C4)
     # ------------------------------------------------------------------
 
-    async def _handle_red_run(self, wt: Path, head: str) -> None:
+    async def _handle_red_run(
+        self, wt: Path, head: str, *, confirmation_runner: ConfirmationRunner | None = None,
+    ) -> None:
         """Handle a confirmed-red ``_run_once`` pass: confirm, fingerprint, file/update.
 
         (1) CONFIRMATION RE-RUN: re-runs only the originally-failing tests,
-        isolated/serial, ONCE, via :attr:`confirmation_runner`. An empty
-        result means the failure did not reproduce — intermittent
-        nondeterminism (B6): log only, no task, no escalation.
+        isolated/serial, ONCE, via *confirmation_runner* if supplied, else
+        :attr:`confirmation_runner` (the numeric seam). An empty result
+        means the failure did not reproduce — intermittent nondeterminism
+        (B6): log only, no task, no escalation.
 
         (2)+(3) UPDATE-OR-FILE: fingerprints the confirmed failing-test SET
         (never ``main_sha`` — DB3/C3) and dispatches on whether that
@@ -384,8 +387,19 @@ class OfflineLaneWorker:
         fingerprint is UPDATED (:meth:`_update_existing_fix_task` — append
         the suspect range, no new task/escalation, B5); a new fingerprint is
         FILED (:meth:`_file_new_fix_task` — new fix task + INFO escalation, B4).
+
+        The optional *confirmation_runner* kwarg (task 1959, IE1) lets the
+        infra sub-run's red path reuse this entire method with its OWN
+        confirmation seam (:attr:`infra_confirmation_runner`) while the
+        numeric call site stays bare (``_handle_red_run(wt, head)``,
+        unchanged) and keeps using :attr:`confirmation_runner`. Everything
+        downstream of the confirmation re-run — fingerprint, file/update,
+        escalation — is content-agnostic and unchanged, so infra
+        test-file-names dedup exactly like numeric test IDs (IE-D1/§6): no
+        new dedup mechanism.
         """
-        confirmed = await self.confirmation_runner(wt, head)
+        runner = confirmation_runner if confirmation_runner is not None else self.confirmation_runner
+        confirmed = await runner(wt, head)
         if not confirmed:
             logger.info(
                 'offline-lane: intermittent nondeterminism — confirmation '
