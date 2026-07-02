@@ -1,0 +1,95 @@
+# Recon Code-Fix Premise-Verification Registry
+# ============================================================
+# Each entry documents a self-referential (reconciler / fused-memory-internal)
+# code-fix premise that an architect empirically REFUTED against live
+# source/tests. Unlike cancelled_premise_blocklist.yaml — which drops a
+# matching candidate unconditionally, forever — the curator RE-VERIFIES each
+# entry's source_assertions against the live source tree on every match.
+# A matching candidate is dropped BEFORE any LLM call ONLY WHILE those
+# assertions still hold. If a later refactor makes the premise valid again
+# (e.g. the cited filter is genuinely removed), the candidate stops matching
+# on the very next check — no operator action required.
+#
+# Schema per entry:
+#   name                  : str  — stable identifier for the entry
+#   reason                : str  — human-readable explanation (cite the esc id + incident)
+#   title_substrings      : list[str]  — ALL must appear in candidate title (case-insensitive)
+#   description_substrings: list[str]  — AT LEAST ONE must appear in
+#                           candidate description+details (case-insensitive)
+#   source_assertions     : list[{file, must_contain, must_not_contain}]
+#                           — file is relative to the fused-memory/ server cwd;
+#                           an assertion holds iff every must_contain token is
+#                           present in the file AND every must_not_contain
+#                           token is absent. ALL assertions in the entry must
+#                           hold for the premise to still be considered
+#                           refuted (must_contain/must_not_contain each
+#                           default to [] when omitted).
+#
+# Guidance for operators adding new entries:
+#   - Use a tight title anchor: prefer 2-3 specific tokens over generic
+#     phrases to minimize false positives. Always pair a title anchor with
+#     specific description_substrings.
+#   - source_assertions should cite the SAME evidence the architect used to
+#     refute the premise (a filter/token that is present, a pinning test
+#     name, or a constraint that is absent) so the gate self-corrects the
+#     moment that evidence changes.
+#   - A textual match alone never drops a candidate — see
+#     recon_code_fix_premise_guard.premise_refuted_entry.
+# ============================================================
+
+- name: entity_summary_rebuild_invalid_at_filter_already_present
+  reason: >
+    esc-1946-15 claimed the entity-summary rebuild is missing an invalid_at
+    filter. Empirically refuted by the architect: memory_service.py already
+    applies the invalid_at filter throughout (40 occurrences on the
+    inspected branch). Any recurrence of this claim should be dropped
+    without an LLM call while the filter remains present.
+  title_substrings:
+    - "entity-summary rebuild"
+    - "invalid_at"
+  description_substrings:
+    - "missing invalid_at filter"
+    - "invalid_at filter"
+  source_assertions:
+    - file: src/fused_memory/services/memory_service.py
+      must_contain:
+        - "invalid_at"
+
+- name: stage2_flag_query_stage1_flag_marker_forbidden_regression
+  reason: >
+    esc-1947-17 asked Stage2's flag-query to also consume stage1_flag_marker,
+    framing it as a schema-drift bug. This is a forbidden regression: the two
+    marker families are deliberately kept separate, pinned by
+    tests/test_stages.py::test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2.
+    Any recurrence should be dropped without an LLM call while that pinning
+    test remains in place.
+  title_substrings:
+    - "stage2 flag-query"
+    - "stage1_flag_marker"
+  description_substrings:
+    - "schema drift"
+    - "stage1_flag_marker"
+  source_assertions:
+    - file: tests/test_stages.py
+      must_contain:
+        - "test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2"
+
+- name: add_finding_suggested_action_no_max_length_field
+  reason: >
+    esc-1971-34 claimed add_finding drops long suggested_action values due to
+    a length field-required bug. Empirically refuted by the architect:
+    add_finding's description/suggested_action fields are plain str with no
+    Field(max_length=...) constraint in recon_report.py, so the proposed
+    regression test would be green on first run (invalid TDD). Any
+    recurrence should be dropped without an LLM call while no max_length
+    constraint exists on those fields.
+  title_substrings:
+    - "add_finding"
+    - "suggested_action"
+  description_substrings:
+    - "length"
+    - "field-required"
+  source_assertions:
+    - file: src/fused_memory/server/recon_report.py
+      must_not_contain:
+        - "max_length"
