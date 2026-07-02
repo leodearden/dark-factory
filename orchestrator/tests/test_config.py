@@ -14,12 +14,14 @@ from orchestrator.config import (
     ConfigRequiredError,
     CpuPriorityConfig,
     JobserverConfig,
+    ModelsConfig,
     ModuleConfig,
     OrchestratorConfig,
     SccacheConfig,
     TimeoutsConfig,
     _deep_merge,
     _discover_module_configs,
+    diff_config,
     load_config,
 )
 
@@ -1862,4 +1864,87 @@ class TestConfigReload:
         assert path not in RELOADABLE_FIELDS, (
             f'{path!r} requires a process restart to take effect and must NOT '
             f'be in RELOADABLE_FIELDS'
+        )
+
+
+class TestDiffConfig:
+    """diff_config(live, fresh, allowlist) categorizes every differing leaf
+    into applied_candidates (allowlisted) or restart_required (not), and
+    counts unchanged leaves. Both live and fresh are pinned via explicit
+    constructor kwargs so assertions are robust to defaults.yaml drift.
+    """
+
+    def test_no_op_diff_has_no_candidates(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        diff = diff_config(cfg, cfg)
+        assert diff.applied_candidates == {}
+        assert diff.restart_required == {}
+        assert diff.unchanged > 0
+
+    def test_allowlisted_change_lands_in_applied_candidates(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(models=ModelsConfig(architect='opus'))
+        fresh = OrchestratorConfig(models=ModelsConfig(architect='sonnet'))
+        diff = diff_config(live, fresh)
+        assert diff.applied_candidates == {
+            'models.architect': {'old': 'opus', 'new': 'sonnet'},
+        }
+        assert diff.restart_required == {}
+
+    def test_restart_required_change_lands_in_restart_required(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(max_concurrent_tasks=3)
+        fresh = OrchestratorConfig(max_concurrent_tasks=5)
+        diff = diff_config(live, fresh)
+        assert diff.restart_required == {
+            'max_concurrent_tasks': {'old': 3, 'new': 5},
+        }
+        assert diff.applied_candidates == {}
+
+    def test_mixed_change_each_path_in_exactly_one_bucket(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(models=ModelsConfig(architect='opus'), max_concurrent_tasks=3)
+        fresh = OrchestratorConfig(models=ModelsConfig(architect='sonnet'), max_concurrent_tasks=5)
+        diff = diff_config(live, fresh)
+        assert diff.applied_candidates == {
+            'models.architect': {'old': 'opus', 'new': 'sonnet'},
+        }
+        assert diff.restart_required == {
+            'max_concurrent_tasks': {'old': 3, 'new': 5},
+        }
+        # I6: total reported == number of differing leaves; each path in exactly one bucket.
+        applied_paths = set(diff.applied_candidates)
+        restart_paths = set(diff.restart_required)
+        assert not (applied_paths & restart_paths)
+        assert len(applied_paths | restart_paths) == 2
+
+    def test_verify_env_is_a_single_atomic_leaf(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(verify_env={})
+        fresh = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
+        diff = diff_config(live, fresh)
+        assert diff.applied_candidates.get('verify_env') == {
+            'old': {}, 'new': {'RUSTC_WRAPPER': 'sccache'},
+        }
+        all_paths = set(diff.applied_candidates) | set(diff.restart_required)
+        assert not any(p.startswith('verify_env.') for p in all_paths), (
+            f'verify_env must be a single atomic leaf, not per-key paths; got {all_paths}'
+        )
+
+    def test_private_module_configs_excluded_from_diff(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig()
+        live._module_configs = {'foo': ModuleConfig(prefix='foo')}
+        diff = diff_config(live, fresh)
+        all_paths = set(diff.applied_candidates) | set(diff.restart_required)
+        assert not any('_module_configs' in p for p in all_paths), (
+            f'_module_configs is a PrivateAttr and must never appear in a diff path; got {all_paths}'
         )
