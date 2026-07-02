@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -201,3 +202,55 @@ class TestHarnessReloadConfigLoadFailure:
             if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
         ]
         assert harness_warnings, 'Expected at least one WARNING on a failed reload'
+
+
+class TestHarnessReloadConfigTimeout:
+    """I1 fail-closed behavior when the thread-off load exceeds its bound (task 2006 step 5)."""
+
+    @pytest.mark.asyncio
+    async def test_reload_config_load_timeout_is_fail_closed(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """A wedged load_config() (PRD Open Q3): bounded, reported as a timeout, live untouched."""
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+
+        config_path = tmp_path / 'orchestrator.yaml'
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+        monkeypatch.setattr('orchestrator.harness._RELOAD_LOAD_TIMEOUT_SECS', 0.05)
+
+        def _wedged_load() -> OrchestratorConfig:
+            time.sleep(0.3)
+            return OrchestratorConfig(project_root=tmp_path)
+
+        before = harness.config.model_dump_json()
+
+        with (
+            patch('orchestrator.harness.load_config', side_effect=_wedged_load),
+            caplog.at_level(logging.WARNING, logger='orchestrator.harness'),
+        ):
+            report = await harness.reload_config()
+
+        assert report['reloaded'] is False
+        assert report['config_path'] == str(config_path)
+        assert report['applied'] == {}
+        assert report['restart_required'] == {}
+        assert report['unchanged'] == 0
+        assert report['error'], 'Expected a non-empty timeout error message'
+        error_lower = report['error'].lower()
+        assert 'timeout' in error_lower or 'timed out' in error_lower, (
+            f'Expected a timeout-specific error message; got {report["error"]!r}'
+        )
+
+        assert harness.config.model_dump_json() == before, (
+            'live config must be untouched when the load times out'
+        )
+
+        rows = _query_events(event_store, 'config_reload')
+        assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
+        assert json.loads(rows[0]['data']) == report
+
+        harness_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        assert harness_warnings, 'Expected at least one WARNING on a timed-out reload'
