@@ -218,6 +218,16 @@ class StaleServiceRestartCoordinator:
         dashboard).  Used by the orchestrator coordinator to defer restart
         until the merge pipeline is drained (see
         ``Harness._merge_pipeline_idle``).
+    max_executor_failures:
+        Number of consecutive TRANSIENT restart-executor failures (any
+        exception other than ``FileNotFoundError``/``PermissionError``, e.g. a
+        momentary ``systemd-run`` registration hiccup) to tolerate before
+        giving up.  Each transient failure below this bound retains pending
+        and trigger metadata so the next idle tick retries — symmetric with
+        the ``restart_precondition`` fail-safe path.  Once the bound is
+        reached, pending and trigger metadata are cleared and a loud ERROR is
+        logged (a new ``note_merge`` will re-arm).  The counter resets to 0
+        on a successful fire.  Default: 3.
     """
 
     def __init__(
@@ -236,6 +246,7 @@ class StaleServiceRestartCoordinator:
         require_idle: bool = True,
         script_args: list[str] | None = None,
         restart_precondition: Callable[[], bool] | None = None,
+        max_executor_failures: int = 3,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -261,6 +272,8 @@ class StaleServiceRestartCoordinator:
         # Default None → the gate check below is skipped entirely, so
         # existing coordinators (fused-memory, dashboard) are unaffected.
         self._restart_precondition = restart_precondition
+        # Bound on consecutive TRANSIENT executor failures before giving up.
+        self._max_executor_failures = max_executor_failures
 
         # State
         self._pending: bool = False
@@ -268,6 +281,8 @@ class StaleServiceRestartCoordinator:
         # Accumulated trigger metadata for the current pending burst
         self._trigger_task_ids: list[str] = []
         self._trigger_merge_shas: list[str] = []
+        # Consecutive TRANSIENT executor failures since the last success/arming.
+        self._consecutive_executor_failures: int = 0
 
     # ------------------------------------------------------------------
     # Properties
@@ -395,16 +410,33 @@ class StaleServiceRestartCoordinator:
             self._pending = False
             self._trigger_task_ids = []
             self._trigger_merge_shas = []
+            self._consecutive_executor_failures = 0
             return False
         except Exception:
             # TRANSIENT: e.g. a momentary systemd-run registration hiccup
             # (RuntimeError from schedule_detached_systemd_restart). Retain
             # pending and trigger metadata — symmetric with the
             # restart_precondition fail-safe path — so the next idle tick
-            # retries instead of silently dropping the restart.
+            # retries instead of silently dropping the restart. Bounded by
+            # max_executor_failures: a persistent transient failure degrades
+            # loudly instead of retrying forever.
+            self._consecutive_executor_failures += 1
+            if self._consecutive_executor_failures >= self._max_executor_failures:
+                logger.error(
+                    f'{self._service_name} restart executor failed'
+                    f' {self._consecutive_executor_failures} consecutive times;'
+                    ' giving up and clearing pending. A new note_merge will re-arm.',
+                    exc_info=True,
+                )
+                self._pending = False
+                self._trigger_task_ids = []
+                self._trigger_merge_shas = []
+                self._consecutive_executor_failures = 0
+                return False
             logger.warning(
-                f'{self._service_name} restart executor failed (transient); retaining'
-                ' pending — will retry on the next idle tick.',
+                f'{self._service_name} restart executor failed (transient, attempt'
+                f' {self._consecutive_executor_failures}/{self._max_executor_failures});'
+                ' retaining pending — will retry on the next idle tick.',
                 exc_info=True,
             )
             return False
