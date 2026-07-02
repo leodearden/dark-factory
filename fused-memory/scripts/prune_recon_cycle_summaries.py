@@ -91,17 +91,25 @@ _POOL_STAGES: tuple[str, ...] = ('memory_consolidator', 'task_knowledge_sync')
 # ---------------------------------------------------------------------------
 
 # Markers indicating a cycle produced no mutations (candidates for deletion,
-# absent any remediation signal below).
+# absent any remediation signal below). Includes the structured zero-count
+# field forms real Stage 1/2 summaries use ("MUTATIONS THIS CYCLE:
+# - memories_deleted: 0").
 _QUIESCENT_MARKERS: tuple[str, ...] = (
     '0 new episodes',
     '0 mutations',
     'no mutations',
     'quiescent cycle',
+    'no new episodes',
+    'clean cycle',
+    'memories_added: 0',
+    'memories_deleted: 0',
 )
 
 # Action keywords indicating the cycle actually did something worth
 # preserving, even if it also happens to mention a quiescent marker above
-# (e.g. "0 new episodes, but 1 flag processed").
+# (e.g. "0 new episodes, but 1 flag processed"). Matched AFTER zero-valued
+# fields are stripped (see _ZERO_VALUED_FIELD_RE) so that a field NAME like
+# "memories_deleted: 0" cannot trip the 'deleted' keyword.
 _REMEDIATION_KEYWORDS: tuple[str, ...] = (
     'deleted',
     'invalidated',
@@ -109,11 +117,34 @@ _REMEDIATION_KEYWORDS: tuple[str, ...] = (
     'flag processed',
     'edge correct',
     'refreshed entity',
+    'remediation',
+    'resolved',
 )
 
 # A non-zero mutation/deletion count is a remediation signal even without
 # one of the keywords above (e.g. "3 mutations applied").
 _NONZERO_MUTATION_RE = re.compile(r'\b[1-9]\d*\s+(?:mutations?|deletions?)\b')
+
+# Zero/empty-valued structured fields ("memories_deleted: 0",
+# "flag_ids_emitted: none", "flag_ids_this_cycle: []") are boilerplate, not
+# remediation evidence -- strip them before keyword matching so their field
+# names cannot count as remediation signals.
+_ZERO_VALUED_FIELD_RE = re.compile(r'\b[\w.]+\s*[:=]\s*(?:0|none|\[\s*\])(?![\w.])')
+
+# Structured action fields with a NON-zero count ("edges_updated: 3",
+# "stage1_flags_processed: 2", "memories_written: 1") are remediation
+# evidence even when no prose keyword appears.
+_NONZERO_ACTION_FIELD_RE = re.compile(
+    r'\b[\w.]*(?:added|deleted|updated|created|modified|processed'
+    r'|invalidated|merged|refreshed|written|queued|emitted)[\w.]*\s*[:=]\s*[1-9]',
+)
+
+# Parenthesised action counts ("memories_deleted (3):", "REMEDIATION
+# FINDINGS ADDRESSED (4)") are likewise remediation evidence.
+_NONZERO_PAREN_COUNT_RE = re.compile(
+    r'(?:added|deleted|updated|created|modified|processed|invalidated'
+    r'|merged|refreshed|written|addressed|resolved|emitted)\s*\(\s*[1-9]\d*\s*\)',
+)
 
 
 def carries_remediation_history(content: str) -> bool:
@@ -125,12 +156,15 @@ def carries_remediation_history(content: str) -> bool:
     function defaults to True (preserve) for anything that is not CLEARLY
     pure-quiescent boilerplate.
 
-    Returns False ONLY when a quiescent marker is present (one of "0 new
-    episodes", "0 mutations", "no mutations", "quiescent cycle") AND no
-    remediation signal is found.  A remediation signal is either one of the
-    action keywords (``deleted``, ``invalidated``, ``merged``,
-    ``flag processed``, ``edge correct``, ``refreshed entity``) or a
-    non-zero mutation/deletion count (e.g. "3 mutations", "2 deletions").
+    Returns False ONLY when a quiescent marker is present (see
+    ``_QUIESCENT_MARKERS``) AND no remediation signal is found.  Remediation
+    signals are matched against the text with zero/empty-valued structured
+    fields stripped (``_ZERO_VALUED_FIELD_RE``) so that boilerplate field
+    names like "memories_deleted: 0" cannot count as evidence.  A remediation
+    signal is any of: an action keyword (``_REMEDIATION_KEYWORDS``), a
+    non-zero mutation/deletion count ("3 mutations"), a non-zero action
+    field ("edges_updated: 3"), or a parenthesised action count
+    ("memories_deleted (3):").
 
     Empty, whitespace-only, or otherwise ambiguous content (no quiescent
     marker present at all) also returns True — there is nothing to safely
@@ -147,12 +181,16 @@ def carries_remediation_history(content: str) -> bool:
         return True
 
     text = content.lower()
-    is_quiescent = any(marker in text for marker in _QUIESCENT_MARKERS)
-    has_remediation = (
-        any(keyword in text for keyword in _REMEDIATION_KEYWORDS)
-        or bool(_NONZERO_MUTATION_RE.search(text))
+    if not any(marker in text for marker in _QUIESCENT_MARKERS):
+        return True
+
+    stripped = _ZERO_VALUED_FIELD_RE.sub(' ', text)
+    return (
+        any(keyword in stripped for keyword in _REMEDIATION_KEYWORDS)
+        or bool(_NONZERO_MUTATION_RE.search(stripped))
+        or bool(_NONZERO_ACTION_FIELD_RE.search(stripped))
+        or bool(_NONZERO_PAREN_COUNT_RE.search(stripped))
     )
-    return not (is_quiescent and not has_remediation)
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +571,15 @@ async def run(
         from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
         cfg = _FMC()
         known_projects_map = build_known_projects_map(cfg.taskmaster.project_root if cfg.taskmaster else '')
+        if len(known_projects_map) <= 1:
+            logger.warning(
+                'prune_recon_cycle_summaries: known-projects map resolved to '
+                'only %s. If you expected the full project registry, run with '
+                'the fused-memory service environment (PROJECT_ROOT + '
+                'DASHBOARD_KNOWN_PROJECT_ROOTS) -- otherwise this prune '
+                'silently skips every other project.',
+                sorted(known_projects_map),
+            )
 
     try:
         project_ids = select_projects(known_projects_map, getattr(args, 'project_id', None))

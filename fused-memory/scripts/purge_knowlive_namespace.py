@@ -62,6 +62,8 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from fused_memory.models.scope import Scope
+
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
@@ -160,13 +162,25 @@ async def enumerate_mem0_namespace(
     *,
     limit: int = 1000,
 ) -> tuple[list[dict], int]:
-    """Deterministic (non-semantic) enumeration of Mem0 memories scoped to *namespace*."""
-    count = await memory_service.count_memories_by_metadata(
-        project_id=namespace, filters={},
-    )
-    members = await memory_service.get_memories_by_metadata(
-        project_id=namespace, filters={}, limit=limit,
-    )
+    """Deterministic (non-semantic) enumeration of Mem0 memories scoped to *namespace*.
+
+    Uses the no-filter collection APIs (``mem0.count`` / ``mem0.get_all``):
+    this enumeration deliberately wants the WHOLE namespace, and the
+    metadata-filter APIs (``count_memories_by_metadata`` /
+    ``get_memories_by_metadata``) reject an empty ``filters`` dict.
+    """
+    scope = Scope(project_id=namespace)
+    count = await memory_service.mem0.count(scope)
+    raw = await memory_service.mem0.get_all(scope, limit=limit)
+    results = raw.get('results') if isinstance(raw, dict) else None
+    if not isinstance(results, list):
+        logger.warning(
+            "purge_knowlive_namespace: mem0.get_all returned malformed/absent "
+            "'results' for namespace '%s'; treating as empty. got: %s",
+            namespace, repr(raw)[:200],
+        )
+        results = []
+    members = [m for m in results if m.get('id')]
     if len(members) < count:
         logger.warning(
             "purge_knowlive_namespace: enumerated %d of %d mem0 memories in "
@@ -314,9 +328,7 @@ async def run(
     after_graphiti_rows = await enumerate_graphiti_namespace(
         memory_service.graphiti, namespace, limit=limit,
     )
-    after_mem0_count = await memory_service.count_memories_by_metadata(
-        project_id=namespace, filters={},
-    )
+    after_mem0_count = await memory_service.mem0.count(Scope(project_id=namespace))
     report['after'] = {
         'graphiti_count': len(after_graphiti_rows),
         'mem0_count': after_mem0_count,
