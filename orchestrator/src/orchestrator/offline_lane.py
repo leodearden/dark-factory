@@ -712,11 +712,35 @@ class OfflineLaneWorker:
     async def _default_run_infra(self, wt_path: Path, head: str, threads: int) -> tuple[int, str]:
         """Default ``infra_runner`` seam — runs reify's H9 host-infra scope (IE1).
 
-        Body lands in a later step (task 1959 step-6); this stub exists so
-        the constructor wiring (step-4) has a real bound method to fall
-        back to.
+        Cross-project scope boundary (same as :meth:`_default_run_suite`):
+        reify's ``tests/infra/run_all.sh`` (H9 = reify:4929) is not
+        necessarily present/confirmed on every checkout — real wiring is
+        gated separately via ``config.git.offline_lane_infra_enabled``
+        (task 1959, IE1), exactly like ``offline_lane_enabled`` gates
+        :meth:`_default_run_suite`'s ζ script. This default builds the
+        invocation unconditionally.
+
+        NO ``--test-threads``: IE-D2 — ``--scope host-infra`` SELF-ACQUIRES
+        the H8 Lane-X flock and runs the host-exclusive set serially, so a
+        thread count is meaningless and no DF-side flock is taken here.
+        ``env``/``cwd`` mirror :meth:`_default_run_suite` exactly (same
+        ``DF_VERIFY_ROLE=offline`` overlay onto a full ``os.environ``
+        copy). ``head``/``threads`` are accepted only for ``SuiteRunner``
+        seam-signature symmetry with the numeric runner; ``threads`` is
+        unused.
         """
-        raise NotImplementedError
+        argv = [_RUN_ALL_INFRA_SCRIPT, '--scope', _INFRA_SCOPE]
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(wt_path),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        tail = (stdout or b'').decode(errors='replace')[-2000:]
+        return proc.returncode or 0, tail
 
     async def _default_infra_confirmation_run(self, wt: Path, head: str) -> list[str]:
         """Default ``infra_confirmation_runner`` seam — re-runs H9 host-infra (IE1).
