@@ -433,6 +433,19 @@ class WorktreeMissing(FileNotFoundError):
         super().__init__(f'Worktree missing: {self.path}')
 
 
+class InteractiveWorktreeLimitError(Exception):
+    """Raised by create_interactive_worktree when the _iact-* cap is reached.
+
+    REJECT policy (task 2010 design decision): rather than evicting an idle
+    interactive worktree, creation is simply refused once the on-disk
+    ``_iact-*`` count under ``worktree_base`` reaches
+    ``config.max_interactive_worktrees``.  Evict-oldest-idle would require
+    TTL/idle discrimination that belongs to the δ reaper, not this primitive.
+    Raised BEFORE any git operation — callers must free a slot (the β release
+    verb, a direct ``git worktree remove``, or the δ reaper) and retry.
+    """
+
+
 class WarmLaneRequeue(Exception):
     """Base class for warm-lane failures that should requeue (not block + L1).
 
@@ -1281,10 +1294,32 @@ class GitOps:
             InteractiveWorktreeInfo(path, branch, warm, base_ref).
 
         Raises:
+            InteractiveWorktreeLimitError: the on-disk ``_iact-*`` count under
+                ``worktree_base`` is already at ``config.max_interactive_worktrees``.
+                Raised FIRST, before any git operation (REJECT policy).
             RuntimeError: start_ref/main_branch fails to resolve, or
                 ``git worktree add`` fails (e.g. a path/branch collision
                 that self-heal could not clear).
         """
+        # ── Cap enforcement (REJECT), FIRST — before any git op ──────────
+        # Strictly filtered by iact_prefix so this never counts _lane-*/
+        # _spec-*/_merge-verify/_offline-deep (isolation invariant I1).
+        if self.worktree_base.exists():
+            existing = sum(
+                1 for child in self.worktree_base.iterdir()
+                if child.is_dir() and child.name.startswith(self.config.iact_prefix)
+            )
+        else:
+            existing = 0
+        if existing >= self.config.max_interactive_worktrees:
+            raise InteractiveWorktreeLimitError(
+                f'create_interactive_worktree({slug!r}): at cap — '
+                f'{existing}/{self.config.max_interactive_worktrees} '
+                f'{self.config.iact_prefix}* worktrees already exist under '
+                f'{self.worktree_base}. Free a slot (release one, or wait for '
+                f'the δ reaper) and retry.'
+            )
+
         path = self.worktree_base / f'{self.config.iact_prefix}{slug}'
         full_branch = f'{self.config.branch_prefix}{slug}'
 
