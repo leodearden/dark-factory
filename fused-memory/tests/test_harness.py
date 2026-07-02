@@ -838,11 +838,13 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
     # re-raises TimeoutError.  A fixed sub-100ms sleep races those background writes and
     # starves under full-suite CPU contention.  Polling returns as soon as cleanup lands
     # (~ms in isolation) and only fails after a generous deadline — eliminating the race
-    # rather than widening it.  5s is ~100× the normal sub-50ms cleanup latency yet far
-    # below the 60s global thread-method pytest-timeout (pyproject.toml).
-    # De-flake precedent: task 1836 commit b12a5ffeb9.
+    # rather than widening it.  30s is well below the 60s global thread-method
+    # pytest-timeout (pyproject.toml) yet gives real headroom over the sub-50ms
+    # cleanup latency; 5s was measured to still starve (and fail this assertion)
+    # under `-n auto` worker contention.
+    # De-flake precedent: task 1836 commit b12a5ffeb9 (same 10s->30s pattern).
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 5.0
+    deadline = loop.time() + 30.0
     recent_runs = []
     run = None
     stats = None
