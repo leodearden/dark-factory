@@ -10,15 +10,19 @@ import yaml
 from pydantic import ValidationError
 
 from orchestrator.config import (
+    RELOADABLE_FIELDS,
     ConfigRequiredError,
     CpuPriorityConfig,
     JobserverConfig,
+    ModelsConfig,
     ModuleConfig,
     OrchestratorConfig,
     SccacheConfig,
     TimeoutsConfig,
     _deep_merge,
     _discover_module_configs,
+    apply_reload,
+    diff_config,
     load_config,
 )
 
@@ -1780,3 +1784,327 @@ class TestWarmLaneGcConfig:
             f'warm_lane_gc_interval_secs must default to 600.0s (10 min); '
             f'got {config.warm_lane_gc_interval_secs}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task/2005 (config-hot-reload PRD, task alpha): RELOADABLE_FIELDS + diff_config
+# + apply_reload
+# ---------------------------------------------------------------------------
+
+
+class TestConfigReload:
+    """RELOADABLE_FIELDS: code-owned allowlist of dotted leaf paths safe to
+    apply via hot-reload without a process restart.
+    """
+
+    def test_reloadable_fields_is_nonempty_frozenset_of_str(self):
+        """PRD Open Q1 audit property: a non-empty frozenset[str]."""
+        assert isinstance(RELOADABLE_FIELDS, frozenset)
+        assert len(RELOADABLE_FIELDS) > 0
+        assert all(isinstance(path, str) for path in RELOADABLE_FIELDS), (
+            f'RELOADABLE_FIELDS must contain only str paths; got types '
+            f'{sorted({type(p).__name__ for p in RELOADABLE_FIELDS})}'
+        )
+
+    def test_every_path_resolves_on_default_config(self, monkeypatch, tmp_path):
+        """Every dotted path in RELOADABLE_FIELDS must resolve via getattr-walk
+        on a default OrchestratorConfig — catches typos in the allowlist that
+        would otherwise silently no-op inside diff_config/apply_reload.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        for path in RELOADABLE_FIELDS:
+            obj = cfg
+            for part in path.split('.'):
+                try:
+                    obj = getattr(obj, part)
+                except AttributeError:
+                    pytest.fail(
+                        f'RELOADABLE_FIELDS path {path!r} does not resolve on a '
+                        f'default OrchestratorConfig (failed at component {part!r})'
+                    )
+
+    @pytest.mark.parametrize('path', [
+        'models.architect',
+        'budgets.implementer',
+        'max_turns.implementer',  # NOTE: field name is max_turns, not turns
+        'effort.reviewer',
+        'timeouts.steward',
+        'timeouts.startup_grace_secs',
+        'backends.merger',
+        'unblock_auto.enabled',
+        'steward_completion_timeout',
+        'steward_lifetime_budget',
+        'fairness.skip_threshold',
+        'starvation_watchdog.idle_secs',
+        'idle_poll_secs',
+        'orphan_l0_timeout_secs',
+        'watcher_rotation_escalations',
+        'watcher_crashloop_window_secs',
+        'review.full_review_min_tasks',
+        'verify_env',
+        'git.offline_lane_test_threads',
+        'git.offline_lane_red_advances_before_blocker',
+    ])
+    def test_representative_reloadable_members_present(self, path):
+        assert path in RELOADABLE_FIELDS, (
+            f'{path!r} is expected to be reloadable but is missing from '
+            f'RELOADABLE_FIELDS'
+        )
+
+    @pytest.mark.parametrize('path', [
+        'max_concurrent_tasks',
+        'verify_runners',
+        'sandbox.backend',
+        'escalation.port',
+        'project_root',
+        'git.main_branch',
+    ])
+    def test_restart_only_members_absent(self, path):
+        assert path not in RELOADABLE_FIELDS, (
+            f'{path!r} requires a process restart to take effect and must NOT '
+            f'be in RELOADABLE_FIELDS'
+        )
+
+
+class TestDiffConfig:
+    """diff_config(live, fresh, allowlist) categorizes every differing leaf
+    into applied_candidates (allowlisted) or restart_required (not), and
+    counts unchanged leaves. Both live and fresh are pinned via explicit
+    constructor kwargs so assertions are robust to defaults.yaml drift.
+    """
+
+    def test_no_op_diff_has_no_candidates(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        diff = diff_config(cfg, cfg)
+        assert diff.applied_candidates == {}
+        assert diff.restart_required == {}
+        assert diff.unchanged > 0
+
+    def test_allowlisted_change_lands_in_applied_candidates(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(models=ModelsConfig(architect='opus'))
+        fresh = OrchestratorConfig(models=ModelsConfig(architect='sonnet'))
+        diff = diff_config(live, fresh)
+        assert diff.applied_candidates == {
+            'models.architect': {'old': 'opus', 'new': 'sonnet'},
+        }
+        assert diff.restart_required == {}
+
+    def test_restart_required_change_lands_in_restart_required(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(max_concurrent_tasks=3)
+        fresh = OrchestratorConfig(max_concurrent_tasks=5)
+        diff = diff_config(live, fresh)
+        assert diff.restart_required == {
+            'max_concurrent_tasks': {'old': 3, 'new': 5},
+        }
+        assert diff.applied_candidates == {}
+
+    def test_mixed_change_each_path_in_exactly_one_bucket(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(models=ModelsConfig(architect='opus'), max_concurrent_tasks=3)
+        fresh = OrchestratorConfig(models=ModelsConfig(architect='sonnet'), max_concurrent_tasks=5)
+        diff = diff_config(live, fresh)
+        assert diff.applied_candidates == {
+            'models.architect': {'old': 'opus', 'new': 'sonnet'},
+        }
+        assert diff.restart_required == {
+            'max_concurrent_tasks': {'old': 3, 'new': 5},
+        }
+        # I6: total reported == number of differing leaves; each path in exactly one bucket.
+        applied_paths = set(diff.applied_candidates)
+        restart_paths = set(diff.restart_required)
+        assert not (applied_paths & restart_paths)
+        assert len(applied_paths | restart_paths) == 2
+
+    def test_verify_env_is_a_single_atomic_leaf(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(verify_env={})
+        fresh = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
+        diff = diff_config(live, fresh)
+        assert diff.applied_candidates.get('verify_env') == {
+            'old': {}, 'new': {'RUSTC_WRAPPER': 'sccache'},
+        }
+        all_paths = set(diff.applied_candidates) | set(diff.restart_required)
+        assert not any(p.startswith('verify_env.') for p in all_paths), (
+            f'verify_env must be a single atomic leaf, not per-key paths; got {all_paths}'
+        )
+
+    def test_private_module_configs_excluded_from_diff(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig()
+        live._module_configs = {'foo': ModuleConfig(prefix='foo')}
+        diff = diff_config(live, fresh)
+        all_paths = set(diff.applied_candidates) | set(diff.restart_required)
+        assert not any('_module_configs' in p for p in all_paths), (
+            f'_module_configs is a PrivateAttr and must never appear in a diff path; got {all_paths}'
+        )
+
+
+class TestApplyReload:
+    """apply_reload(live, fresh, allowlist) mutates *live* in place for every
+    allowlisted differing leaf, reports restart_required leaves WITHOUT
+    touching live, and never replaces a submodel object (I3 identity).
+    Hybrid-invariant rollback (I5) is covered separately in
+    TestApplyReloadHybridRollback.
+    """
+
+    def test_allowlisted_apply_mutates_live_and_reports(self, monkeypatch, tmp_path):
+        from orchestrator.config import GitConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # Both sides pin `models`/`git` explicitly (not just `fresh`): a bare
+        # OrchestratorConfig() sources unset submodel leaves from the packaged
+        # defaults.yaml via YamlSettingsSource, which diverges from the
+        # ModelsConfig Field(default=...) values on several roles (e.g.
+        # implementer/debugger/reviewer) — leaving `live` unpinned would leak
+        # those extra diffs into report['applied'] below.
+        live = OrchestratorConfig(
+            models=ModelsConfig(architect='opus'),
+            git=GitConfig(offline_lane_test_threads=6),
+        )
+        fresh = OrchestratorConfig(
+            models=ModelsConfig(architect='sonnet'),
+            git=GitConfig(offline_lane_test_threads=8),
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert report['applied'] == {
+            'models.architect': {'old': 'opus', 'new': 'sonnet'},
+            'git.offline_lane_test_threads': {'old': 6, 'new': 8},
+        }
+        assert live.models.architect == 'sonnet'
+        assert live.git.offline_lane_test_threads == 8
+
+    def test_submodel_identity_preserved(self, monkeypatch, tmp_path):
+        """I3: allowlisted leaves are mutated in place on the existing
+        submodel objects — models/git objects are never replaced, so any
+        other holder of a reference (e.g. GitOps) observes the update."""
+        from orchestrator.config import GitConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            models=ModelsConfig(architect='sonnet'),
+            git=GitConfig(offline_lane_test_threads=8),
+        )
+        models_id_before = id(live.models)
+        git_id_before = id(live.git)
+        apply_reload(live, fresh)
+        assert id(live.models) == models_id_before
+        assert id(live.git) == git_id_before
+
+    def test_restart_required_change_not_mutated_on_live(self, monkeypatch, tmp_path):
+        """I2: a restart_required leaf is reported but live is left untouched."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(max_concurrent_tasks=3)
+        fresh = OrchestratorConfig(max_concurrent_tasks=5)
+        report = apply_reload(live, fresh)
+        assert report['applied'] == {}
+        assert report['restart_required'] == {
+            'max_concurrent_tasks': {'old': 3, 'new': 5},
+        }
+        assert live.max_concurrent_tasks == 3
+
+    def test_mixed_change_only_allowlisted_leaf_mutated(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(models=ModelsConfig(architect='opus'), max_concurrent_tasks=3)
+        fresh = OrchestratorConfig(models=ModelsConfig(architect='sonnet'), max_concurrent_tasks=5)
+        report = apply_reload(live, fresh)
+        assert live.models.architect == 'sonnet'
+        assert live.max_concurrent_tasks == 3
+        assert report['applied'] == {
+            'models.architect': {'old': 'opus', 'new': 'sonnet'},
+        }
+        assert report['restart_required'] == {
+            'max_concurrent_tasks': {'old': 3, 'new': 5},
+        }
+        # I6: each differing path reported exactly once, in exactly one bucket.
+        assert not (set(report['applied']) & set(report['restart_required']))
+
+    def test_no_op_apply_reports_success_with_nothing_to_do(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        report = apply_reload(cfg, cfg)
+        assert report['reloaded'] is True
+        assert report['applied'] == {}
+        assert report['restart_required'] == {}
+        assert report['unchanged'] > 0
+
+    def test_verify_env_replaced_wholesale(self, monkeypatch, tmp_path):
+        """verify_env is a single atomic top-level leaf (I3): applying it
+        replaces the whole dict on live in one shot, as load_config's
+        sccache fold (config.verify_env = config.effective_verify_env)
+        would produce on *fresh*."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(verify_env={})
+        fresh = OrchestratorConfig(verify_env={
+            'RUSTC_WRAPPER': 'sccache',
+            'SCCACHE_REDIS': 'redis://h:6379',
+        })
+        report = apply_reload(live, fresh)
+        assert live.verify_env == fresh.verify_env
+        assert report['applied']['verify_env'] == {
+            'old': {},
+            'new': {'RUSTC_WRAPPER': 'sccache', 'SCCACHE_REDIS': 'redis://h:6379'},
+        }
+
+
+class TestApplyReloadHybridRollback:
+    """I5: a partial apply that leaves *live* in a hybrid-invalid state (only
+    one side of a cross-field invariant updated) must be synchronously
+    rolled back — apply_reload must never leave `live` mutated into a config
+    that OrchestratorConfig itself would reject.
+
+    Uses a SYNTHETIC allowlist containing ONLY 'timeouts.steward' (omitting
+    'steward_completion_timeout', which travels with it under the real
+    RELOADABLE_FIELDS). This is PRD boundary scenario 5 — unreachable
+    end-to-end under v1 because the real allowlist keeps both sides of the
+    _validate_steward_timeout_invariant together — so it is exercised here
+    at the unit level via the injectable `allowlist` param.
+    """
+
+    def test_hybrid_invariant_violation_rolls_back_synchronously(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # live is valid on its own: 1800 >= 900.
+        live = OrchestratorConfig(
+            timeouts=TimeoutsConfig(steward=1800.0),
+            steward_completion_timeout=900.0,
+        )
+        # fresh is valid on its own: 800 >= 700.
+        fresh = OrchestratorConfig(
+            timeouts=TimeoutsConfig(steward=800.0),
+            steward_completion_timeout=700.0,
+        )
+        live_dump_before = live.model_dump()
+        # Applying ONLY timeouts.steward (1800 -> 800) while
+        # steward_completion_timeout stays at live's 900 produces an invalid
+        # hybrid (800 < 900) that OrchestratorConfig.model_validate must reject.
+        report = apply_reload(live, fresh, allowlist=frozenset({'timeouts.steward'}))
+        assert report['reloaded'] is False
+        assert report['error'].startswith('hybrid-invariant')
+        assert report['applied'] == {}
+        # Rolled back byte-for-byte: timeouts.steward restored to 1800.0;
+        # steward_completion_timeout was never touched (it was categorized
+        # restart_required under the synthetic allowlist).
+        assert live.model_dump() == live_dump_before
+        assert live.timeouts.steward == 1800.0
+        assert live.steward_completion_timeout == 900.0

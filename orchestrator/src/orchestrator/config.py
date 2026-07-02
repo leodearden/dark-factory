@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -2450,3 +2457,211 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
                 prefix, prefix_depth, config.lock_depth,
             )
     return config
+
+
+# ---------------------------------------------------------------------------
+# Config hot-reload (plans/config-hot-reload-prd.md, task alpha): RELOADABLE_FIELDS
+# ---------------------------------------------------------------------------
+
+
+def _submodel_leaf_paths(field_name: str, submodel_cls: type[BaseModel]) -> frozenset[str]:
+    """Return {'<field_name>.<leaf>', ...} for every field on *submodel_cls*.
+
+    Generates a whole-submodel RELOADABLE_FIELDS group from the submodel's own
+    model_fields, so adding a field to e.g. ModelsConfig automatically becomes
+    reloadable without a RELOADABLE_FIELDS edit (PRD Open Q1 resolution).
+    """
+    return frozenset(f'{field_name}.{leaf}' for leaf in submodel_cls.model_fields)
+
+
+# Code-owned allowlist of dotted OrchestratorConfig leaf paths that may be
+# applied to a live config via apply_reload() without a process restart.
+# See plans/config-hot-reload-prd.md §Allowlist (v1). Reload-safety is a code
+# property, not operator-tunable, so this constant lives here rather than in
+# orchestrator.yaml.
+#
+# Whole-submodel groups are generated from each submodel class's own
+# model_fields (kept in sync automatically as those classes grow). NOTE: the
+# "turns" submodel is exposed on OrchestratorConfig under the field name
+# `max_turns` (see TurnsConfig, above), so its group is keyed 'max_turns', not
+# 'turns' — the PRD's "turns.* (max_turns)" parenthetical is authoritative.
+RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
+    _submodel_leaf_paths('models', ModelsConfig),
+    _submodel_leaf_paths('budgets', BudgetsConfig),
+    _submodel_leaf_paths('max_turns', TurnsConfig),
+    _submodel_leaf_paths('effort', EffortConfig),
+    _submodel_leaf_paths('timeouts', TimeoutsConfig),
+    _submodel_leaf_paths('backends', BackendsConfig),
+    _submodel_leaf_paths('unblock_auto', UnblockAutoConfig),
+    {
+        # Steward grace
+        'steward_completion_timeout',
+        'steward_lifetime_budget',
+        # Scheduler tuning
+        'fairness.skip_threshold',
+        'starvation_watchdog.enabled',
+        'starvation_watchdog.skip_threshold',
+        'starvation_watchdog.idle_secs',
+        # Loop-pass thresholds (+ the two crashloop-window params read live
+        # per rotation; the misconfigured-guard params are a distinct
+        # failure-mode family and stay restart-only)
+        'idle_poll_secs',
+        'orphan_l0_timeout_secs',
+        'watcher_rotation_escalations',
+        'watcher_rotation_hours',
+        'watcher_max_crashloop_restarts',
+        'watcher_crashloop_window_secs',
+        # Review knobs
+        'review.enabled',
+        'review.interval',
+        'review.full_review_on_complete',
+        'review.full_review_min_interval_secs',
+        'review.full_review_min_tasks',
+        # Verify env (fresh config's value already carries the sccache fold)
+        'verify_env',
+        # Offline-lane tunables (leaf fields on the existing `git` submodel —
+        # leaf-mutation only per I3)
+        'git.offline_lane_test_threads',
+        'git.offline_lane_poll_interval_secs',
+        'git.offline_lane_red_advances_before_blocker',
+    },
+)
+
+
+@dataclass
+class ConfigDiff:
+    """Result of diff_config(): every differing leaf, bucketed by allowlist membership."""
+
+    applied_candidates: dict[str, dict[str, Any]]
+    restart_required: dict[str, dict[str, Any]]
+    unchanged: int
+
+
+def _iter_leaves(model: BaseModel):
+    """Yield (dotted_path, value) for every leaf field of *model*.
+
+    Descends exactly one level into BaseModel-valued fields (e.g. models,
+    timeouts); dict/list/set-valued fields (verify_env, verify_runners, …)
+    are yielded whole as atomic leaves compared by equality. PrivateAttrs
+    (e.g. _module_configs) are never visited because they are not in
+    model_fields.
+    """
+    for name in type(model).model_fields:
+        value = getattr(model, name)
+        if isinstance(value, BaseModel):
+            for sub in type(value).model_fields:
+                yield f'{name}.{sub}', getattr(value, sub)
+        else:
+            yield name, value
+
+
+def diff_config(
+    live: 'OrchestratorConfig',
+    fresh: 'OrchestratorConfig',
+    allowlist: frozenset[str] = RELOADABLE_FIELDS,
+) -> ConfigDiff:
+    """Structurally diff two fully-constructed OrchestratorConfig instances.
+
+    Every leaf where live != fresh is categorized into applied_candidates
+    (path in *allowlist*) or restart_required (otherwise); equal leaves are
+    counted in ``unchanged``. Pure and synchronous — no I/O, no mutation of
+    either argument.
+    """
+    fresh_leaves = dict(_iter_leaves(fresh))
+    applied_candidates: dict[str, dict[str, Any]] = {}
+    restart_required: dict[str, dict[str, Any]] = {}
+    unchanged = 0
+    for path, live_val in _iter_leaves(live):
+        fresh_val = fresh_leaves[path]
+        if live_val != fresh_val:
+            entry = {'old': live_val, 'new': fresh_val}
+            if path in allowlist:
+                applied_candidates[path] = entry
+            else:
+                restart_required[path] = entry
+        else:
+            unchanged += 1
+    return ConfigDiff(
+        applied_candidates=applied_candidates,
+        restart_required=restart_required,
+        unchanged=unchanged,
+    )
+
+
+def _get_leaf(model: 'OrchestratorConfig', path: str) -> Any:
+    """Return the value at dotted *path* by walking getattr across its components."""
+    obj: Any = model
+    for part in path.split('.'):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _set_leaf(model: 'OrchestratorConfig', path: str, value: Any) -> None:
+    """Write *value* to dotted *path* on *model*, bypassing per-write validation.
+
+    A one-component path (top-level scalar, e.g. 'verify_env') is written via
+    object.__setattr__, bypassing OrchestratorConfig's validate_assignment so
+    no per-write cross-field validator fires mid-apply — the single
+    authoritative check is the post-apply re-validation in apply_reload. A
+    two-component path (submodel leaf, e.g. 'models.architect') is written
+    via plain setattr on the submodel object — submodels have no
+    validate_assignment of their own, and this preserves submodel identity
+    (I3) so held references (e.g. GitOps, UsageGate) observe the update in
+    place.
+    """
+    parts = path.split('.')
+    if len(parts) == 1:
+        object.__setattr__(model, parts[0], value)
+    else:
+        sub_name, leaf = parts
+        setattr(getattr(model, sub_name), leaf, value)
+
+
+def apply_reload(
+    live: 'OrchestratorConfig',
+    fresh: 'OrchestratorConfig',
+    allowlist: frozenset[str] = RELOADABLE_FIELDS,
+) -> dict[str, Any]:
+    """Diff *live* against *fresh* and apply every allowlisted differing leaf
+    to *live* in place.
+
+    I5 hybrid re-validation: leaf-copies bypass per-write validation (see
+    _set_leaf), so after copying, the resulting *live* is re-validated as a
+    whole via OrchestratorConfig.model_validate. Two individually-valid
+    configs can still combine into an invalid hybrid when an allowlist omits
+    one side of a cross-field invariant (e.g.
+    _validate_steward_timeout_invariant) — if that happens, every applied
+    leaf is synchronously rolled back to its captured old value and the
+    reload is reported as failed. Nothing is left mutated on failure.
+
+    Returns {reloaded, applied, restart_required, unchanged, error} — see
+    plans/config-hot-reload-prd.md §Contract. config_path is intentionally
+    absent; the harness-level reload_config (task beta) supplies it.
+    """
+    d = diff_config(live, fresh, allowlist)
+    applied: dict[str, dict[str, Any]] = {}
+    try:
+        for path, old_new in d.applied_candidates.items():
+            _set_leaf(live, path, old_new['new'])
+            applied[path] = old_new
+        OrchestratorConfig.model_validate(live.model_dump())
+    except (ValidationError, ValueError) as exc:
+        # Roll back every leaf applied so far (order-independent: each
+        # write restores its own captured old value) so `live` is left
+        # exactly as it was before this call, even on a mid-loop raise.
+        for path, old_new in applied.items():
+            _set_leaf(live, path, old_new['old'])
+        return {
+            'reloaded': False,
+            'applied': {},
+            'restart_required': d.restart_required,
+            'unchanged': d.unchanged,
+            'error': f'hybrid-invariant: {exc}',
+        }
+    return {
+        'reloaded': True,
+        'applied': applied,
+        'restart_required': d.restart_required,
+        'unchanged': d.unchanged,
+        'error': None,
+    }
