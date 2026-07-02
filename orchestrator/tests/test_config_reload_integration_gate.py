@@ -18,7 +18,6 @@ running the full owning-package suite instead of a scoped subset.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sqlite3
@@ -304,7 +303,6 @@ class TestS3NonAllowlistedSemaphoreWarning:
 
         live_max_concurrent = harness.config.max_concurrent_tasks
         new_max_concurrent = live_max_concurrent + 1
-        sem_before = asyncio.Semaphore(live_max_concurrent)
 
         _edit_yaml(config_path, 'max_concurrent_tasks', new_max_concurrent)
 
@@ -318,13 +316,10 @@ class TestS3NonAllowlistedSemaphoreWarning:
         }
 
         assert harness.config.max_concurrent_tasks == live_max_concurrent, (
-            'a restart-only leaf must NOT be mutated on the live config (I2)'
-        )
-        sem_after = asyncio.Semaphore(harness.config.max_concurrent_tasks)
-        assert sem_after._value == sem_before._value, (
-            'any dispatch semaphore built from the live config is unchanged in '
-            'size — the non-allowlisted edit never reaches the running '
-            'structure without a restart'
+            'a restart-only leaf must NOT be mutated on the live config (I2) — '
+            'any dispatch semaphore built from it (the real one is a '
+            'run()-local at harness.py:1193) is therefore still sized from '
+            'the pre-reload value until a restart'
         )
 
         harness_warnings = [
