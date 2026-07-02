@@ -30,6 +30,7 @@ import yaml
 from _workflow_helpers import FakeBriefing, FakeScheduler
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.config import load_config
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
@@ -231,3 +232,44 @@ class TestS1BadYamlFailClosed:
             if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
         ]
         assert harness_warnings, 'Expected at least one WARNING on a failed reload'
+
+
+# ---------------------------------------------------------------------------
+# Scenario 2 (read-at-spawn, workflow.py:6801): an allowlisted models.*
+# edit must be observed by the NEXT agent spawn — a surface
+# test_harness_config_reload.py never touches, since its tests only assert
+# on harness.config and never drive a TaskWorkflow invocation against the
+# reloaded config.
+# ---------------------------------------------------------------------------
+
+
+class TestS2AllowlistedNextSpawn:
+    """PRD boundary scenario 2: an allowlisted models.implementer edit reaches the next spawn."""
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_model_edit_applies_to_next_spawn(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        harness, config_path = _make_reload_harness(tmp_path, monkeypatch)
+        workflow, stub = _make_reload_workflow(harness, tmp_path, monkeypatch)
+
+        live_implementer = harness.config.models.implementer
+        new_implementer = _other_model(live_implementer)
+        _edit_yaml(config_path, 'models.implementer', new_implementer)
+
+        report = await harness.reload_config()
+
+        assert report['reloaded'] is True
+        assert report['applied']['models.implementer'] == {
+            'old': live_implementer, 'new': new_implementer,
+        }
+        assert harness.config.models.implementer == new_implementer
+
+        result = await workflow._invoke(IMPLEMENTER, 'do the task', tmp_path)
+
+        assert result.success is True
+        assert stub.calls, 'Expected the stubbed invoke_agent to have been called'
+        assert stub.calls[-1]['model'] == new_implementer, (
+            'the next spawn must read models.implementer fresh at call time, '
+            'observing the reloaded value rather than one captured earlier'
+        )
