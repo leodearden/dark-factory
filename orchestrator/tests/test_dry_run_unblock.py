@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 from _orch_helpers import pydantic_spec
+from shared.cli_invoke import AllAccountsCappedException
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.config import OrchestratorConfig
@@ -1217,3 +1218,60 @@ class TestDryRunFreshRetry:
         scheduler.update_task.assert_awaited_once()
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'infra_failure'
+
+
+# ---------------------------------------------------------------------------
+# task 2021 step-5: cap exhaustion converts to a retryable infra_failure entry
+# ---------------------------------------------------------------------------
+
+class TestDryRunCapExhaustion:
+    """AllAccountsCappedException (raised by invoke_with_cap_retry when the
+    1800s cap-wait sanity bound is exceeded) is caught and converted into a
+    retryable 'infra_failure' proposal entry — it must NOT propagate out of
+    run_dry_run_unblock, and must NOT be written as the terminal
+    'investigation_failed' shape (which would disable B3 auto-retry).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cap_exhaustion_writes_infra_failure_entry(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        cap_exc = AllAccountsCappedException(
+            retries=3, elapsed_secs=1800.0, label='Task 42 [unblock_auto]',
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_with_cap_retry',
+            new=AsyncMock(side_effect=cap_exc),
+        ):
+            # Must not raise.
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure', (
+            f"cap exhaustion must land on 'infra_failure', not "
+            f"{entry.get('status')!r} — a terminal 'investigation_failed' "
+            f"would disable the B3 low-risk auto-unblock retry path"
+        )
+        assert entry['risk_label'] == 'human-review-required'
+        assert entry['files_referenced'] == []
+        assert 'capped' in entry['proposal_text'].lower()
+        assert '3' in entry['proposal_text']
+        for key in (
+            'timed_out', 'duration_ms', 'subtype',
+            'transcript_turns', 'session_id', 'stderr_tail',
+        ):
+            assert key in entry, f'{key} must be present on the cap-exhaustion entry'
+            assert entry[key] is None, f'{key} must be None on the cap-exhaustion entry'
