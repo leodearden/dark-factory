@@ -359,3 +359,30 @@ async def test_b2_coalesces_burst_of_advances_to_one_rerun(harness, git_ops, rep
         'a burst of advances during an in-flight run must coalesce into '
         'exactly one re-run at the newest head, never a queue of stale runs'
     )
+
+
+# ---------------------------------------------------------------------------
+# B3 — never-a-gate (C7): prompt return, fail-open, no halt/gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path, caplog):
+    """B3 (PRD §8, C7) — a merge-landed notification while the lane is
+    in-flight must never gate the merge: it returns promptly (never blocks
+    the synchronous notifiee call on the in-flight run), sets _dirty for a
+    coalesced re-run, is fail-open when the notifiee raises, and never
+    files an escalation (the only halt/gate-adjacent side-effect reachable
+    from this call path)."""
+    runner = _ControllableSuiteRunner()
+    worker = _build_worker(git_ops, tmp_path, suite_runner=runner)
+    _wire_lane(harness, worker)
+
+    await _drive_advance(harness, repo)
+    lane_task = asyncio.create_task(_run_lane(worker, expected_passes=1))
+    await runner.wait_entered()
+
+    await _assert_never_a_gate(harness, worker, runner, repo, git_ops, caplog)
+
+    runner.release()
+    await lane_task
