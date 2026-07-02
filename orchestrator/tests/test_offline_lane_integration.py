@@ -45,6 +45,7 @@ OUT OF SCOPE:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -200,6 +201,56 @@ def _wire_lane(harness: Harness, worker: OfflineLaneWorker) -> None:
     under their own control rather than as a live background task.
     """
     harness._offline_lane_notifiee = worker.on_post_merge
+
+
+async def _drive_advance(
+    harness: Harness, repo: Path, task_id: str = 'task-1',
+) -> tuple[str, str]:
+    """Advance main and await the REAL on_merge_landed fan-out.
+
+    ``harness._note_merge_all`` IS the exact callback the
+    ``SpeculativeMergeWorker`` invokes as ``on_merge_landed`` in production
+    (see ``harness.py:4979``) — driving it directly here (rather than
+    standing up a full merge worker) exercises the real fan-out without
+    pulling the whole speculative-merge machinery into this integration
+    gate. Returns ``(base_sha, head_sha)`` — the pre- and post-advance main
+    SHAs — for the caller's own assertions.
+    """
+    base_sha = await harness.git_ops.get_main_sha()
+    head_sha = await _advance_main(repo)
+    await harness._note_merge_all(task_id, base_sha, head_sha)
+    return base_sha, head_sha
+
+
+async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 5.0) -> None:
+    """Drive worker.run() as a real background task for exactly one pass.
+
+    Wraps whatever ``suite_runner`` is currently on *worker* with a call
+    counter and cancels the loop task as soon as the FIRST pass completes —
+    modeled on ``test_offline_lane.py``'s
+    ``test_loop_coalesces_to_exactly_one_rerun`` cancel-after-N pattern.
+    Requires ``worker._dirty`` (or the wake event) to already be set by a
+    prior trigger, exactly as production wiring would leave it.
+    """
+    inner_runner = worker.suite_runner
+    done = asyncio.Event()
+    count = {'n': 0}
+
+    async def _counting_runner(wt, head, threads):
+        result = await inner_runner(wt, head, threads)
+        count['n'] += 1
+        if count['n'] == 1:
+            done.set()
+        return result
+
+    worker.suite_runner = _counting_runner
+    task = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(done.wait(), timeout=timeout)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 # ---------------------------------------------------------------------------
