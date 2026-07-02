@@ -2641,6 +2641,79 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
 
 
 @pytest.mark.asyncio
+async def test_done_provenance_accepts_deterministic_deploy_scheduled(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='deterministic-deploy-scheduled' with unit+transient_unit+fire_delay_secs is accepted without a commit.
+
+    DeterministicRunner emits this shape on a successful OWN-UNIT self-restart
+    (epsilon branch, B8): the runner schedules a detached restart of its own
+    unit and immediately returns DONE (done = scheduled, not yet verified —
+    the runner cannot block on the restart without self-killing). No git
+    commit is available (the work is a service restart, not a code merge),
+    so this kind must pass the provenance gate commit-less while preserving
+    its scheduling evidence in the persisted provenance blob.
+    """
+    # No git repo needed — deterministic-deploy-scheduled carries no commit.
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'deterministic-deploy-scheduled',
+            'unit': 'orchestrator-dark-factory.service',
+            'transient_unit': 'orch-redeploy-restart-1.service',
+            'fire_delay_secs': 60,
+        },
+    )
+
+    assert 'error' not in result, f'expected acceptance but got: {result}'
+    taskmaster.set_task_status.assert_called_once()
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    assert persisted['kind'] == 'deterministic-deploy-scheduled'
+    assert persisted['unit'] == 'orchestrator-dark-factory.service'
+    assert persisted['transient_unit'] == 'orch-redeploy-restart-1.service'
+    assert persisted['fire_delay_secs'] == 60
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_shape(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='deterministic-deploy-scheduled' with note+unit (no transient_unit/fire_delay_secs) is accepted.
+
+    The runner emits this shape on the resume-after-crash path: before_done_ran_at
+    and before_done_scheduled_at are already set (the transient unit was
+    successfully registered), but the orchestrator crashed before the done
+    write landed; a later re-dispatch resumes and drives the task to done
+    with this note-only shape.
+    """
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'deterministic-deploy-scheduled',
+            'note': 'resumed after self-restart scheduled (crash before done write)',
+            'unit': 'orchestrator-dark-factory.service',
+        },
+    )
+
+    assert 'error' not in result, f'expected acceptance but got: {result}'
+    taskmaster.set_task_status.assert_called_once()
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    assert persisted['kind'] == 'deterministic-deploy-scheduled'
+    assert persisted['note'] == 'resumed after self-restart scheduled (crash before done write)'
+    assert persisted['unit'] == 'orchestrator-dark-factory.service'
+
+
+@pytest.mark.asyncio
 async def test_update_task_rejects_metadata_done_provenance(taskmaster, reconciler, event_buffer):
     """update_task must NOT be a side door for writing done_provenance.
 

@@ -3545,7 +3545,12 @@ def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> d
     }
 
 
-_VALID_PROVENANCE_KINDS = ('merged', 'found_on_main', 'deterministic-deploy')
+_VALID_PROVENANCE_KINDS = (
+    'merged',
+    'found_on_main',
+    'deterministic-deploy',
+    'deterministic-deploy-scheduled',
+)
 
 
 async def _validate_done_provenance(
@@ -3559,13 +3564,17 @@ async def _validate_done_provenance(
 
     Schema:
         {
-            "kind": "merged" | "found_on_main" | "deterministic-deploy",  # required
+            "kind": "merged" | "found_on_main" | "deterministic-deploy"
+                    | "deterministic-deploy-scheduled",       # required
             "commit": <sha-or-ref>,              # required for "merged"/"found_on_main"
             "note":   <free text>,               # required if kind="found_on_main";
                                                  # optional for "deterministic-deploy"
+                                                 # and "deterministic-deploy-scheduled"
             "pid":    <int>,                     # deterministic-deploy: new MainPID
-            "unit":   <str>,                     # deterministic-deploy: target unit name
+            "unit":   <str>,                     # deterministic-deploy(-scheduled): target unit name
             "active_enter_timestamp": <str>,     # deterministic-deploy: new AET string
+            "transient_unit": <str>,             # deterministic-deploy-scheduled: scheduled restart unit
+            "fire_delay_secs": <int>,            # deterministic-deploy-scheduled: --on-active delay
         }
 
     - ``kind="merged"``: the work landed on main via a merge commit. ``commit``
@@ -3584,6 +3593,16 @@ async def _validate_done_provenance(
       human-readable annotation (e.g. resume path). The phantom-done file gate
       is NOT bypassed for this kind — deploy gate tasks carry no
       ``metadata.files`` so the gate is already a no-op.
+    - ``kind="deterministic-deploy-scheduled"``: the task was completed by
+      DeterministicRunner's own-unit self-restart path (epsilon): a detached
+      ``systemd-run`` transient unit was successfully *registered* to restart
+      the orchestrator's own unit after ``run()`` returns, but — unlike
+      ``deterministic-deploy`` — the restart has not fired yet, so there is no
+      fresh PID/AET to verify (done = scheduled, not verified). No ``commit``
+      is required or expected. ``unit`` (str) is the target (own) unit,
+      ``transient_unit`` (str) is the scheduled restart unit's name, and
+      ``fire_delay_secs`` (int) is its ``--on-active`` delay; ``note`` may
+      carry a human-readable annotation (e.g. the crash-resume path).
 
     Returns ``(error_payload, resolved_provenance)``. Error payload is a
     structured dict suitable for returning to the MCP caller; when it is
@@ -3639,18 +3658,23 @@ async def _validate_done_provenance(
         return _done_provenance_error(
             task_id,
             'done_provenance.kind is required (must be "merged", '
-            '"found_on_main", or "deterministic-deploy"). Use kind="merged" '
+            '"found_on_main", "deterministic-deploy", or '
+            '"deterministic-deploy-scheduled"). Use kind="merged" '
             'with commit=<merge-sha> after a successful merge_request, '
             'kind="found_on_main" with note=<explanation> when the '
-            'implementation is already on main from a sibling task, or '
+            'implementation is already on main from a sibling task, '
             'kind="deterministic-deploy" for a cross-unit service-restart '
-            'deploy (no commit required).',
+            'deploy (no commit required), or '
+            'kind="deterministic-deploy-scheduled" for an own-unit '
+            'self-restart that was scheduled but not yet verified (no '
+            'commit required).',
         ), None
     if kind not in _VALID_PROVENANCE_KINDS:
         return _done_provenance_error(
             task_id,
-            f'done_provenance.kind must be "merged", "found_on_main", or '
-            f'"deterministic-deploy" (got {kind!r})',
+            f'done_provenance.kind must be "merged", "found_on_main", '
+            f'"deterministic-deploy", or "deterministic-deploy-scheduled" '
+            f'(got {kind!r})',
         ), None
 
     if kind == 'merged' and commit_input is None:
@@ -3702,25 +3726,40 @@ async def _validate_done_provenance(
     if note is not None:
         resolved['note'] = note
 
-    if kind == 'deterministic-deploy':
-        # Preserve the PID evidence captured by DeterministicRunner after
-        # a cross-unit service restart (B6 success path and resume path).
-        # Only copy fields that carry the right type — silently skip missing
-        # or wrongly-typed fields so a partial shape (e.g. resume without pid)
-        # is still accepted.
-        pid = raw.get('pid')
+    if kind in ('deterministic-deploy', 'deterministic-deploy-scheduled'):
+        # Preserve the evidence captured by DeterministicRunner after a
+        # cross-unit service restart (B6 success path and resume path) or an
+        # own-unit self-restart scheduling (epsilon B8 success path and
+        # resume path).  Only copy fields that carry the right type —
+        # silently skip missing or wrongly-typed fields so a partial shape
+        # (e.g. resume without pid, or resume without transient_unit) is
+        # still accepted.
         unit = raw.get('unit')
-        active_enter_timestamp = raw.get('active_enter_timestamp')
-        if isinstance(pid, int):
-            resolved['pid'] = pid
         if isinstance(unit, str):
             unit_stripped = unit.strip()
             if unit_stripped:
                 resolved['unit'] = unit_stripped
+
+    if kind == 'deterministic-deploy':
+        pid = raw.get('pid')
+        active_enter_timestamp = raw.get('active_enter_timestamp')
+        if isinstance(pid, int):
+            resolved['pid'] = pid
         if isinstance(active_enter_timestamp, str):
             aet_stripped = active_enter_timestamp.strip()
             if aet_stripped:
                 resolved['active_enter_timestamp'] = aet_stripped
+    elif kind == 'deterministic-deploy-scheduled':
+        # transient_unit: the scheduled restart unit's name (B8 success path).
+        # fire_delay_secs: its --on-active delay in seconds.
+        transient_unit = raw.get('transient_unit')
+        fire_delay_secs = raw.get('fire_delay_secs')
+        if isinstance(transient_unit, str):
+            transient_unit_stripped = transient_unit.strip()
+            if transient_unit_stripped:
+                resolved['transient_unit'] = transient_unit_stripped
+        if isinstance(fire_delay_secs, int):
+            resolved['fire_delay_secs'] = fire_delay_secs
 
     return None, resolved
 

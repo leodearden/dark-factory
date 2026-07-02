@@ -21,7 +21,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.harness import Harness
-from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.scheduler import ProvenanceValidationRejection, Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -1318,6 +1318,185 @@ class TestB8SelfRestart:
         assert meta.get('before_done_scheduled_at') is not None, (
             'before_done_scheduled_at must be stamped after restart scheduled'
         )
+
+
+class _RaisingScheduledDoneStoreScheduler(_StoreScheduler):
+    """``_StoreScheduler`` variant that reproduces the real provenance-validator
+    rejection of ``kind='deterministic-deploy-scheduled'``.
+
+    Task 2004's root cause: fused-memory's ``_VALID_PROVENANCE_KINDS``
+    allowlist omitted the scheduled kind, so the REAL
+    ``TaskInterceptor.set_task_status`` raised ``ProvenanceValidationRejection``
+    on the epsilon self-restart success path's terminal ``done`` write — the
+    plain ``_StoreScheduler`` fake used by ``TestB8SelfRestart`` never
+    exercises the validator, which is why those tests passed while the real
+    system silently stranded tasks 1976/1982 in ``blocked``.
+
+    ``set_task_status`` raises ONLY for the ``done`` write carrying
+    ``kind='deterministic-deploy-scheduled'``; the ``blocked`` write (used by
+    ``_file_infra_issue_and_block``) and ``update_task`` (the
+    ``before_done_scheduled_at`` stamp) behave normally so the runner's
+    defense-in-depth can still reach a terminal state.
+    """
+
+    async def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        done_provenance: dict | None = None,
+    ) -> None:
+        if (
+            status == 'done'
+            and done_provenance is not None
+            and done_provenance.get('kind') == 'deterministic-deploy-scheduled'
+        ):
+            raise ProvenanceValidationRejection(
+                task_id=str(task_id),
+                error_code='done_provenance_invalid',
+                raw=(
+                    "done_provenance.kind must be \"merged\", \"found_on_main\", "
+                    "\"deterministic-deploy\", or \"deterministic-deploy-scheduled\" "
+                    "(got 'deterministic-deploy-scheduled')"
+                ),
+            )
+        await super().set_task_status(task_id, status, done_provenance=done_provenance)
+
+
+class _RaisingScheduledStampStoreScheduler(_StoreScheduler):
+    """``_StoreScheduler`` variant whose ``before_done_scheduled_at`` stamp
+    write raises, simulating a terminal-write failure that hits the
+    ``always_escalates=True`` fall-through path rather than the
+    not-``always_escalates`` scheduled-``done`` write.
+
+    Task 2004 amendment: the try/except guarding the epsilon self-target
+    branch's scheduling+completion region was widened to also cover the
+    ``before_done_scheduled_at`` stamp used by BOTH the ``always_escalates``
+    branches — but only the not-``always_escalates`` completion write
+    (``_RaisingScheduledDoneStoreScheduler`` above) had a regression test.
+    This fake locks in the ``always_escalates=True`` side: only the
+    ``update_task`` call carrying ``before_done_scheduled_at`` raises; the
+    earlier ``before_done_ran_at`` stamp and every ``set_task_status`` call
+    (including the ``blocked`` write used by ``_file_infra_issue_and_block``)
+    behave normally.
+    """
+
+    async def update_task(
+        self,
+        task_id: str,
+        fields: dict,
+        *,
+        metadata_mode: str = 'merge',
+    ) -> bool:
+        if 'before_done_scheduled_at' in fields:
+            raise RuntimeError('simulated before_done_scheduled_at write failure')
+        return await super().update_task(task_id, fields, metadata_mode=metadata_mode)
+
+
+@pytest.mark.asyncio
+class TestB8SelfRestartTerminalWriteFailure:
+    """Regression (task 2004): a terminal-write failure on the epsilon
+    scheduled-done path must surface LOUDLY — a born-at-L2 infra_issue
+    escalation and a BLOCKED outcome — instead of letting the exception
+    bubble out of ``run()``.
+
+    Before this fix, an uncaught exception here would propagate past
+    ``Harness._run_slot``'s generic ``except Exception`` handler, which
+    returns a silent BLOCKED TaskReport with no escalation filed. Because
+    ``before_done_ran_at`` is already stamped by this point (I1 once-only),
+    the task would never be re-dispatched and would never self-heal — the
+    exact signature observed on tasks 1976 and 1982.
+    """
+
+    def _setup(self, tmp_path: Path, own_unit: str):
+        """Build a store whose scheduled-done write raises, queue, and a self-target deploy task."""
+        store = _RaisingScheduledDoneStoreScheduler()
+        queue = EscalationQueue(tmp_path / 'queue')
+        task = _deploy_task(
+            task_id='deploy-b8-fail',
+            target_unit=own_unit,  # self-target
+        )
+        store.seed(task)
+        return store, queue, task
+
+    async def _run(self, tmp_path: Path, own_unit: str = 'orchestrator.service'):
+        """Build the failing-store harness and run() it once.
+
+        Shared by the three tests below (task 2004 amendment) — they all assert
+        on the SAME single execution (outcome, final store status, escalation
+        queue state), so each was independently rebuilding an identical
+        store/queue/task/runner/assignment just to call ``run()`` once more.
+        """
+        store, queue, task = self._setup(tmp_path, own_unit)
+        restart_scheduler = AsyncMock(return_value=(0, 'ok'))
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: own_unit,
+            restart_scheduler=restart_scheduler,
+        )
+        assignment = _make_assignment(task)
+        outcome = await runner.run(assignment)
+        return outcome, store, queue
+
+    async def test_run_does_not_raise_and_returns_blocked(self, tmp_path: Path) -> None:
+        """run() catches the rejection instead of letting it propagate, returning BLOCKED."""
+        outcome, _store, _queue = await self._run(tmp_path)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_store_status_blocked(self, tmp_path: Path) -> None:
+        """The store's final status for the task is 'blocked' (a loud terminal state)."""
+        _outcome, store, _queue = await self._run(tmp_path)
+
+        assert await store.get_status('deploy-b8-fail') == 'blocked'
+
+    async def test_files_exactly_one_l2_infra_issue(self, tmp_path: Path) -> None:
+        """Exactly one pending L2 infra_issue escalation is filed (the forward-progress signal)."""
+        _outcome, _store, queue = await self._run(tmp_path)
+
+        pending = queue.get_by_task('deploy-b8-fail', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'infra_issue'
+        assert esc.level == 2
+
+    async def test_always_escalates_stamp_failure_blocks_with_single_l2(
+        self, tmp_path: Path
+    ) -> None:
+        """always_escalates=True: a before_done_scheduled_at write failure still
+        surfaces loudly (BLOCKED + one L2 infra_issue) instead of propagating.
+
+        Locks in the widened try/except scope (task 2004 amendment): the stamp
+        write is shared by both the not-always_escalates completion write
+        (covered above) and the always_escalates=True gate fall-through, so a
+        failure on THIS side of the branch must be caught the same way.
+        """
+        own_unit = 'orchestrator.service'
+        store = _RaisingScheduledStampStoreScheduler()
+        queue = EscalationQueue(tmp_path / 'queue')
+        task = _deploy_task(
+            task_id='deploy-b8-ae-fail',
+            target_unit=own_unit,  # self-target
+        )
+        task['metadata']['always_escalates'] = True
+        store.seed(task)
+        restart_scheduler = AsyncMock(return_value=(0, 'ok'))
+        runner = _build_runner(
+            store, queue,
+            own_unit_resolver=lambda: own_unit,
+            restart_scheduler=restart_scheduler,
+        )
+        assignment = _make_assignment(task)
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert await store.get_status('deploy-b8-ae-fail') == 'blocked'
+        pending = queue.get_by_task('deploy-b8-ae-fail', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'infra_issue'
+        assert esc.level == 2
 
 
 # ---------------------------------------------------------------------------
