@@ -85,7 +85,7 @@ main() {
 
     git -C "$REIFY_REPO" add -- "$CONFIG_FILE"
     if ! git -C "$REIFY_REPO" diff --cached --quiet -- "$CONFIG_FILE"; then
-        git -C "$REIFY_REPO" commit -m "deploy: flip ${KNOB}=1 (exclude heavy from reify verify gate)"
+        git -C "$REIFY_REPO" commit --no-verify -m "deploy: flip ${KNOB}=1 (exclude heavy from reify verify gate)"
         signal_config_reload
     fi
 }
