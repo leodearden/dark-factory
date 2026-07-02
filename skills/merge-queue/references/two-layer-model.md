@@ -150,6 +150,65 @@ sites — `from orchestrator.merge_queue import MergeRequest`, etc. — keep wor
 | `_HostUnavailability` | merge_types.py | Per-host `RunnerUnavailable` streak tracker entry (task 1795) |
 | `_INFLIGHT_MERGE_ETA_ESTIMATE_SECS` | merge_types.py | Coarse ETA estimate (seconds) used by `InFlightMergeRegistry.eta_seconds` |
 
+### 7.2 merge_gates.py — post-merge gates + finalize + reason prefixes (MQ-refactor task β)
+
+The pre-/post-merge gate functions, the advance-finalize and advance-failure-mapping
+functions, and their supporting types and gate-owned reason-prefix constants were
+extracted verbatim into `orchestrator/merge_gates.py` (task β of
+`plans/merge-queue-modularization-invariants-prd.md`). `merge_queue.py` re-exports every
+one of these names through a single top-level shim import (`from orchestrator.merge_gates
+import (...)  # noqa: F401  re-export shim`), so existing call sites —
+`from orchestrator.merge_queue import _finalize_advanced_merge`, etc. — keep working
+unchanged.
+
+**Open Q1 (resolved NO):** verify *execution* — `_run_post_merge_verify` and its cluster
+(`_run_unscoped_typechecks` + `_POST_MERGE_PYRIGHT_MAX_DETAIL`, `_ensure_verify_disk_space`,
+`_classify_main_health_red`, `_verify_hit_enospc`) — stays in `merge_queue.py`. This module
+owns gate *policy* only. `_run_unscoped_typechecks` staying is decisive for behavior
+preservation: the equivalence/pyright tests patch `orchestrator.merge_queue.run_verification`
+(the dependency beneath it), and because it stays in `merge_queue.py` it resolves
+`run_verification` in `merge_queue`'s own namespace — no reach-back needed for that
+specific patch chain.
+
+**Reach-back convention (for future γ/δ extractors):** a moved function that calls a
+merge_queue-resident sibling — whether that sibling stays permanently or was co-moved here
+but is monkeypatched by the existing test suite via the string path
+`orchestrator.merge_queue.<name>` — resolves it through a function-local (deferred)
+`from orchestrator.merge_queue import <name>` import rather than a direct intra-module
+reference. This mirrors the pre-existing `_main_health_fingerprint` convention
+(`merge_queue.py`) and keeps `merge_gates.py` free of any top-level import of
+`merge_queue` (which would deadlock module load, since merge_queue's shim needs this
+module fully defined first). Counterintuitively, this applies even to calls between two
+functions that *both* moved here (e.g. `_finalize_advanced_merge` →
+`_check_post_merge_pyright`), because the patch target the test suite uses is the
+`merge_queue` shim binding, not the `merge_gates` definition. Watch also for **bare
+module-level constants** referenced inside a moved function body (not just callables) —
+`_finalize_advanced_merge`'s `AUTO_CHAIN_GENERATIONS_ENABLED` kill-switch check needed the
+same deferred-import treatment even though it is a plain `bool`, not a function.
+
+| Symbol | Location | Description |
+|--------|----------|-------------|
+| `DROPPED_PLAN_TARGETS_REASON_PREFIX` | merge_gates.py | Reason prefix: drop-guard found branch work missing from the merge commit |
+| `PLAN_FILES_NOT_TOUCHED_REASON_PREFIX` | merge_gates.py | Reason prefix: pre-merge Decision-1 check found a declared plan file untouched by the branch |
+| `POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX` | merge_gates.py | Reason prefix: post-merge Decision-2 content-equivalence gate failed |
+| `POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX` | merge_gates.py | Reason prefix: post-merge unscoped type-check found a cross-PR union break |
+| `DropGuardResult` | merge_gates.py | Structured return value from `_check_plan_targets_in_tree` |
+| `PlanFilesTouchedResult` | merge_gates.py | Structured return value from `_check_plan_files_touched_in_branch` |
+| `PostMergePyrightResult` | merge_gates.py | Structured return value from `_check_post_merge_pyright` / `_run_unscoped_typechecks` |
+| `_GenerationChainContext` | merge_gates.py | Bundle passed into `_finalize_advanced_merge` for γ2 auto-chaining (queue + counters + retention) |
+| `_OVERLAP_GIT_ERROR_SENTINEL` | merge_gates.py | Fail-CLOSED sentinel returned by `_rebase_delta_touched_overlap` on a git error |
+| `_check_plan_targets_in_tree()` | merge_gates.py | Drop-guard: files on task HEAD but dropped from the merge commit |
+| `_normalize_plan_path()` | merge_gates.py | Git-canonical form of a declared plan path (helper of the plan-files-touched gate) |
+| `_check_plan_files_touched_in_branch()` | merge_gates.py | Pre-merge Decision-1: every declared plan file must be touched on the branch |
+| `_check_post_merge_equivalence()` | merge_gates.py | Post-merge Decision-2: branch-touched paths must match the advanced main tree |
+| `_rebase_delta_touched_overlap()` | merge_gates.py | Intersection of branch-touched and intervening-rebase-delta files (fail-closed) |
+| `_reverify_rebased_tree()` | merge_gates.py | Disjoint-delta re-verify gate; delegates to `_run_post_merge_verify` when overlapping |
+| `_check_post_merge_pyright()` | merge_gates.py | Post-merge Decision-3: unscoped package-wide type-check against the advanced main SHA |
+| `_resolve_second_parent()` | merge_gates.py | Second parent (`sha^2`) of a `--no-ff` merge commit, for equivalence-gate tip resolution |
+| `_commit_is_linear()` | merge_gates.py | True iff a commit has ≤1 parent (task-1928 worktree-HEAD-fallback fail-safe gate) |
+| `_finalize_advanced_merge()` | merge_gates.py | Post-advance success block: runs the equivalence + pyright gates, returns `MergeOutcome` |
+| `_map_advance_failure()` | merge_gates.py | `advance_main` failure-result → `MergeOutcome` mapping shared by both workers |
+
 ---
 
 ## 8. Greek→task-ID provenance table
