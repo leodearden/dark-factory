@@ -45,6 +45,7 @@ OUT OF SCOPE:
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -199,3 +200,37 @@ def _wire_lane(harness: Harness, worker: OfflineLaneWorker) -> None:
     under their own control rather than as a live background task.
     """
     harness._offline_lane_notifiee = worker.on_post_merge
+
+
+# ---------------------------------------------------------------------------
+# B1 — advance triggers a from-head run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b1_advance_triggers_from_head_run(harness, git_ops, repo, tmp_path, caplog):
+    """B1 (PRD §8) — a landed advance triggers a lane run snapshotted from the
+    CURRENT main head, never the advisory trigger SHA passed to on_post_merge."""
+    calls: list[tuple] = []
+
+    async def _suite_runner(wt, head, threads):
+        calls.append((wt, head, threads))
+        return (0, '')
+
+    worker = _build_worker(git_ops, tmp_path, suite_runner=_suite_runner)
+    _wire_lane(harness, worker)
+
+    with caplog.at_level(logging.INFO):
+        base_sha, head_sha = await _drive_advance(harness, repo)
+        await _run_one_lane_pass(worker)
+
+    real_head = await git_ops.get_main_sha()
+    assert real_head == head_sha
+    assert len(calls) == 1
+    assert calls[0][1] == real_head, (
+        'suite_runner must be invoked with the real from-head snapshot'
+    )
+
+    assert 'offline-lane: on_post_merge' in caplog.text
+    assert base_sha[:12] in caplog.text
+    assert head_sha[:12] in caplog.text
