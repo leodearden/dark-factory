@@ -27,6 +27,16 @@ so it conservatively treats all tasks as owned.  Consequence: while the project
 orchestrator is alive, stranded-work escalations are suppressed project-wide,
 not just for the task the orchestrator is currently processing.
 
+**Status scoping.** Callers that know the task's current status may pass it via
+the ``status`` keyword.  When ``status`` is one of ``ORCH_LIVE_INELIGIBLE_STATUSES``
+(statuses that are never actively dispatched: ``deferred``, ``done``,
+``cancelled``), the project-wide ``orchestrator_live`` signal is forced to
+``False`` for that call — the orchestrator being alive elsewhere is not evidence
+that *this* task is live.  The per-task ``worktree_registered`` and
+``recent_commit`` signals are unaffected by ``status``, so genuine per-branch
+evidence still marks the task live.  ``status=None`` (the default) preserves the
+prior, status-blind behavior.
+
 The legitimate stranded case (orchestrator down, no worktree, no recent commits)
 has all three signals False, so recon still escalates it.
 
@@ -55,6 +65,16 @@ DEFAULT_BRANCH_PREFIX: str = 'task/'
 
 # Timeout for each individual git subprocess call (seconds).
 _GIT_TIMEOUT: int = 10
+
+# Statuses that are never actively dispatched by the orchestrator.  For a task
+# in one of these statuses, the project-wide orchestrator PID-lock signal is not
+# evidence of a live pipeline for *that* task, so it is dropped (see `status`
+# param on detect_live_workflow).  Deliberately excludes 'blocked' (may
+# auto-unblock), 'review'/'merge-deferred' (in the verify/review/merge
+# pipeline), and 'pending'/'in-progress' (dispatch-eligible or active) — for
+# those statuses a live orchestrator legitimately means "don't race the
+# pipeline."
+ORCH_LIVE_INELIGIBLE_STATUSES: frozenset[str] = frozenset({'deferred', 'done', 'cancelled'})
 
 
 @dataclass(frozen=True)
@@ -86,6 +106,7 @@ def detect_live_workflow(
     now: datetime | None = None,
     max_commit_age_hours: float = DEFAULT_MAX_COMMIT_AGE_HOURS,
     branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+    status: str | None = None,
     _orchestrator_live: bool | None = None,
 ) -> WorkflowLiveness:
     """Detect whether a live workflow is active for *task_id*.
@@ -99,6 +120,14 @@ def detect_live_workflow(
         max_commit_age_hours: Commits newer than this many hours count as recent.
         branch_prefix: Branch name prefix; combined with *task_id* to form the
             branch name (e.g. ``"task/4321"``).
+        status: The task's current status, when known.  When this is a member
+            of :data:`ORCH_LIVE_INELIGIBLE_STATUSES` (statuses never actively
+            dispatched: ``deferred``, ``done``, ``cancelled``), the project-wide
+            ``orchestrator_live`` signal is forced to ``False`` for this call,
+            short-circuiting before ``_orchestrator_live``/
+            ``is_orchestrator_live_for`` are consulted.  ``None`` (default)
+            leaves the orchestrator_live computation unaffected — fully
+            backward compatible.
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
@@ -106,6 +135,7 @@ def detect_live_workflow(
             ``None`` (default) triggers a fresh ``is_orchestrator_live_for``
             call.  Tests monkeypatch the module attribute directly; this
             parameter is only for performance hoisting, not test isolation.
+            Ignored when *status* is in :data:`ORCH_LIVE_INELIGIBLE_STATUSES`.
 
     Returns:
         A :class:`WorkflowLiveness` dataclass with all signals populated.
@@ -121,11 +151,17 @@ def detect_live_workflow(
     # orchestrator process holds an active lock for this project_root, regardless
     # of which task it is currently dispatching).  Pre-computed callers may pass
     # it via _orchestrator_live to avoid redundant per-task subprocess calls.
-    orchestrator_live = (
-        _orchestrator_live
-        if _orchestrator_live is not None
-        else is_orchestrator_live_for(project_root)
-    )
+    # Statuses that are never actively dispatched (see
+    # ORCH_LIVE_INELIGIBLE_STATUSES) force this signal False — the project-wide
+    # lock is not evidence of liveness for a task that will never be dispatched.
+    if status is not None and status in ORCH_LIVE_INELIGIBLE_STATUSES:
+        orchestrator_live = False
+    else:
+        orchestrator_live = (
+            _orchestrator_live
+            if _orchestrator_live is not None
+            else is_orchestrator_live_for(project_root)
+        )
 
     is_live = worktree_registered or recent_commit or orchestrator_live
 
