@@ -330,6 +330,33 @@ class TestReleaseWarmWorktreeRemoval:
         assert second['removed'] is False, (
             f'expected removed=False on already-gone path, got: {second}'
         )
+        # Regression: an already-gone *absolute path* must still resolve to
+        # its canonical path/branch (path-mode), not be treated as one giant
+        # branch-mode slug (which would previously yield path/branch values
+        # derived from the whole path string).
+        assert second['path'] == claim['path'], (
+            f"expected path to still resolve to the claimed worktree path, "
+            f"got: {second['path']!r} vs claimed {claim['path']!r}"
+        )
+        assert second['branch'] == 'task/rel1b', (
+            f"expected branch derived from the path's basename, got: {second['branch']!r}"
+        )
+
+    async def test_release_failure_surfaces_stderr_detail(
+        self, warm_repo: Path, server: Any,
+    ) -> None:
+        """A genuine (non-idempotent) removal failure carries a 'detail' with git's stderr."""
+        never_claimed = warm_repo / '_iact-never-claimed'
+
+        result = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=str(never_claimed), project_root=str(warm_repo),
+        )
+
+        assert result['removed'] is False, f'expected removed=False, got: {result}'
+        assert result.get('detail'), (
+            f'expected a non-empty detail explaining the removal failure, got: {result}'
+        )
 
     async def test_release_standalone_returns_error(self, tmp_path: Path) -> None:
         """(i) No harness wired → {'error'}."""

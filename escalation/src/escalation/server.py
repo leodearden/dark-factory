@@ -1308,8 +1308,13 @@ def create_server(
 
         *path_or_branch* accepts either shape claim_warm_worktree returned: an
         absolute worktree ``path``, or the ``task/<slug>`` ``branch`` name
-        (bare ``<slug>`` is also accepted). An existing directory is treated
-        as path-mode; anything else is treated as branch-mode.
+        (bare ``<slug>`` is also accepted). An existing directory, or any
+        absolute path (even one already removed — the idempotent second-call
+        case), is treated as path-mode; anything else is treated as
+        branch-mode. In path-mode, the branch is read from the worktree's
+        ``.task/interactive.json`` stamp when present and parseable, else
+        derived from the path's basename — a truncated/corrupt stamp never
+        raises, it just falls back to the basename derivation.
 
         *project_root* is validated exactly like claim_warm_worktree's guard.
 
@@ -1319,11 +1324,15 @@ def create_server(
         WarmLanePool, violating isolation invariant I1: interactive
         worktrees never touch the dispatch/speculation pools).
 
-        Returns ``{removed, path, branch, branch_pruned}``. ``removed`` is
-        False (not an error) when the target was already gone — idempotent,
-        safe to call from a session-end hook after the δ reaper already
-        cleaned up.  A standalone server or a ``project_root`` mismatch
-        returns ``{error}`` instead, and removes nothing.
+        Returns ``{removed, path, branch, branch_pruned}``, plus an optional
+        ``detail`` key holding the ``git worktree remove`` stderr whenever
+        ``removed`` is False and git reported something — lets a caller
+        distinguish an idempotent already-gone target from a genuine removal
+        failure (locked worktree, permission, ...).  ``removed`` is False
+        (not an error) when the target was already gone — idempotent, safe
+        to call from a session-end hook after the δ reaper already cleaned
+        up.  A standalone server or a ``project_root`` mismatch returns
+        ``{error}`` instead, and removes nothing.
 
         After removal, ``branch`` is deleted (``git branch -D``) — and
         ``branch_pruned`` set True — only when its tip is an ancestor of
@@ -1339,12 +1348,26 @@ def create_server(
 
         gops = harness.git_ops
         candidate = Path(path_or_branch)
-        if candidate.is_dir():
+        # Path-mode covers both a still-live worktree directory AND an
+        # already-removed one referenced by its (necessarily absolute)
+        # claimed path — the idempotent second-release case. Keying off
+        # shape (absolute / exists) rather than is_dir() alone keeps the
+        # returned path/branch meaningful instead of silently falling
+        # through to branch-mode and treating the whole path string as a
+        # branch slug.
+        if candidate.is_absolute() or candidate.exists():
             path = candidate.resolve()
+            branch = None
             stamp_path = path / '.task' / 'interactive.json'
             if stamp_path.exists():
-                branch = json.loads(stamp_path.read_text())['branch']
-            else:
+                try:
+                    branch = json.loads(stamp_path.read_text())['branch']
+                except (json.JSONDecodeError, KeyError, OSError):
+                    # Truncated/corrupt stamp (e.g. a crash mid-write) — fall
+                    # back to the basename derivation below rather than
+                    # raising out of a documented never-raise verb.
+                    branch = None
+            if branch is None:
                 branch = (
                     f'{gops.config.branch_prefix}'
                     f'{path.name.removeprefix(gops.config.iact_prefix)}'
@@ -1359,7 +1382,7 @@ def create_server(
         # Runtime-only reverse import — mirrors claim_warm_worktree above.
         from orchestrator.git_ops import _run  # type: ignore[reportMissingImports]
 
-        rc, _, _ = await _run(
+        rc, _, remove_stderr = await _run(
             ['git', 'worktree', 'remove', '--force', str(path)], cwd=gops.project_root,
         )
         await _run(['git', 'worktree', 'prune'], cwd=gops.project_root)
@@ -1373,12 +1396,19 @@ def create_server(
             rc_del, _, _ = await _run(['git', 'branch', '-D', branch], cwd=gops.project_root)
             branch_pruned = rc_del == 0
 
-        return {
+        result: dict[str, Any] = {
             'removed': removed,
             'path': str(path),
             'branch': branch,
             'branch_pruned': branch_pruned,
         }
+        if not removed and remove_stderr.strip():
+            # Present only on removal failure — its text is what lets a
+            # caller tell an idempotent already-gone target apart from a
+            # genuine failure (locked worktree, permission, ...); the
+            # removed=False contract itself is unchanged.
+            result['detail'] = remove_stderr.strip()
+        return result
 
     # ── merge_status — read-only lifecycle probe (PRD α3 / task 1630) ──────────
 
