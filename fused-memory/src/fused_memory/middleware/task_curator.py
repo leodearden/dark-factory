@@ -817,7 +817,13 @@ class TaskCurator:
         :class:`TaskCurator` instance (no hot-reload; a server restart is required
         to pick up YAML changes). The live source/test re-verification itself is
         NOT cached — it re-reads the cited files on every call, so the guard is
-        self-correcting.
+        self-correcting. Unlike ``_maybe_blocklist_drop``, the resulting drop
+        DECISION is also deliberately NOT written to the idempotency cache
+        (``self._decision_cache``): caching it would let a stale drop resurface
+        via ``_check_cache`` for up to ``idempotency_ttl_seconds`` after the
+        cited source stops refuting the premise, silently suppressing a
+        genuinely-fixed bug-fix task. ``payload_hash`` is accepted only for
+        signature symmetry with ``_maybe_blocklist_drop`` and is unused here.
 
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
@@ -874,7 +880,10 @@ class TaskCurator:
             pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
             latency_ms=0,
         )
-        self._store_cache(payload_hash, decision)
+        # Deliberately NOT self._store_cache(...)'d — see docstring. The guard
+        # must self-correct the moment the cited source stops refuting the
+        # premise, so every call re-verifies live source rather than trusting a
+        # cached decision for the idempotency TTL.
         logger.info(
             'task_curator: recon-premise-refuted drop entry=%s candidate=%r',
             entry.name, candidate.title,
@@ -1189,9 +1198,13 @@ class TaskCurator:
         # ── Recon code-fix premise-verification check ──────────────────────────
         # For each unique (non-blocklist) candidate, check the premise-verification
         # registry BEFORE corpus assembly or any LLM call. A match is dropped only
-        # while the live source/tests still refute the premise; decisions are
-        # stored in the idempotency cache so identical retries short-circuit
-        # without re-loading the YAML or re-reading source.
+        # while the live source/tests still refute the premise. Unlike the
+        # blocklist decisions above, these are deliberately NOT stored in the
+        # idempotency cache — every call re-verifies live source (registry YAML
+        # stays cached on the instance, but the file re-reads are cheap and are
+        # the entire point) so the guard self-corrects the moment the cited
+        # source stops refuting the premise, instead of pinning a stale drop for
+        # idempotency_ttl_seconds.
         premise_decisions: dict[int, CuratorDecision] = {}  # original-space i → decision
         non_premise_unique: list[int] = []
         for i in unique_indices:

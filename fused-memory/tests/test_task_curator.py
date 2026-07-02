@@ -4495,25 +4495,30 @@ class TestCuratorBatchPremiseRefutedDrop:
         config = _make_config_with_premise_registry(str(registry))
         curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
 
+        # A second, ordinary candidate keeps this a genuine 2-item batch so
+        # curate_batch_prepared exercises the real bisecting-LLM path instead
+        # of its len(prepared) == 1 shortcut straight to curate().
         c0 = CandidateTask(
             title="Fix entity-summary rebuild missing invalid_at filter",
             description="Rebuild does not check missing invalid_at filter before writing.",
         )
+        c1 = CandidateTask(title="Improve worker logging", description="Normal task")
 
         empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
         prepared = [
             PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
         ]
 
-        llm_decisions_returned = [
-            CuratorDecision(action="create", justification="genuinely new",
-                            pool_sizes=empty_sizes, latency_ms=0),
-        ]
         llm_candidates_received: list[CandidateTask] = []
 
         async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
             llm_candidates_received.extend(cands)
-            return llm_decisions_returned
+            return [
+                CuratorDecision(action="create", justification=f"genuinely new {i}",
+                                pool_sizes=empty_sizes, latency_ms=0)
+                for i in range(len(cands))
+            ]
 
         with patch.object(
             curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
@@ -4522,10 +4527,15 @@ class TestCuratorBatchPremiseRefutedDrop:
                 prepared, project_id="p", project_root="/x"
             )
 
+            # c0 is dropped pre-LLM; only the ordinary c1 reaches the mocked LLM.
             assert decisions1[0].action == "drop"
             assert decisions1[0].justification.startswith("recon-premise-refuted:")
-            assert len(llm_candidates_received) == 0
+            assert decisions1[1].action == "create"
+            assert len(llm_candidates_received) == 1
+            assert llm_candidates_received[0] is c1
             assert c0.payload_hash() not in curator._decision_cache
+
+            llm_candidates_received.clear()
 
             # Premise now VALID: rewrite the fixture, removing the must_contain
             # token — a genuine bug now exists (the filter really is missing).
@@ -4535,8 +4545,9 @@ class TestCuratorBatchPremiseRefutedDrop:
                 prepared, project_id="p", project_root="/x"
             )
 
-        assert len(llm_candidates_received) == 1
-        assert llm_candidates_received[0] is c0
+        # c0 must now reach the (mocked) LLM instead of being suppressed by a
+        # stale cached drop from the first call.
+        assert any(c is c0 for c in llm_candidates_received)
         assert decisions2[0].action == "create"
         assert not decisions2[0].justification.startswith("recon-premise-refuted:")
 
