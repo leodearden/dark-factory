@@ -205,3 +205,42 @@ class TestReachBackRouting:
             # merge_ahead_bound omitted → None-default path; num_hosts=1 →
             # per_host=ceil(5/1)=5 > 1 → raises.
             enforce_persistent_worktree_serial_lane(cfg)
+
+
+def test_merge_queue_reexports_identical_objects() -> None:
+    """merge_queue re-exports the SAME objects from merge_liveness (shim identity).
+
+    Covers every one of the 14 moved names.
+
+    RED (pre-shim): merge_queue.py still defines its own independent copies
+    of these names (the duplicate definitions left in place by the EXPAND
+    step), so ``getattr(merge_queue, name) is getattr(merge_liveness, name)``
+    fails for every name — two distinct objects that merely share a name.
+    """
+    import orchestrator.merge_liveness as merge_liveness
+    import orchestrator.merge_queue as merge_queue
+
+    moved_names = [
+        'MergeLivenessAssessment',
+        'check_merge_liveness_margin',
+        'MergeLivenessConfigError',
+        'enforce_merge_liveness_margin',
+        'PersistentWorktreeConfigError',
+        '_safety_valve_due',
+        '_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX',
+        '_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX',
+        '_MERGE_WORKER_LOOP_DIED_SENTINEL',
+        '_verify_host_unreachable_sentinel',
+        '_alarm_verify_host_unreachable',
+        '_clear_verify_host_unreachable',
+        '_acquire_warm_verify_worktree',
+        'enforce_persistent_worktree_serial_lane',
+    ]
+
+    for name in moved_names:
+        mq_obj = getattr(merge_queue, name)
+        ml_obj = getattr(merge_liveness, name)
+        assert mq_obj is ml_obj, (
+            f'{name}: orchestrator.merge_queue.{name} and '
+            f'orchestrator.merge_liveness.{name} must be the identical object'
+        )

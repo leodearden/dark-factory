@@ -315,3 +315,48 @@ class TestReachBackRouting:
             f'_run_unscoped_typechecks result to short-circuit the scoped '
             f'test_output to empty, got {result!r}'
         )
+
+
+def test_merge_queue_reexports_identical_objects() -> None:
+    """merge_queue re-exports the SAME objects from merge_shadow (shim identity).
+
+    Covers every one of the 20 moved names.
+
+    RED (pre-shim): merge_queue.py still defines its own independent copies
+    of these names (the duplicate definitions left in place by the EXPAND
+    step), so ``getattr(merge_queue, name) is getattr(merge_shadow, name)``
+    fails for every name — two distinct objects that merely share a name.
+    """
+    import orchestrator.merge_queue as merge_queue
+    import orchestrator.merge_shadow as merge_shadow
+
+    moved_names = [
+        'ShadowCompareState',
+        'ShadowCompareDiff',
+        'parse_per_test_results',
+        '_classify_test_status',
+        '_nextest_reported_test_count',
+        '_NEXTEST_TEST_LINE_RE',
+        '_LIBTEST_TEST_LINE_RE',
+        '_NEXTEST_SUMMARY_LINE_RE',
+        'diff_per_test_results',
+        '_persistent_alarm_tests',
+        '_load_shadow_compare_state',
+        '_save_shadow_compare_state',
+        '_shadow_compare_due',
+        '_WARM_COLD_SHADOW_SENTINEL',
+        '_WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL',
+        '_submit_shadow_divergence_escalation',
+        '_alarm_warm_shadow_unparseable',
+        '_run_cold_shadow_verify',
+        '_run_shadow_compare',
+        '_maybe_schedule_shadow_compare',
+    ]
+
+    for name in moved_names:
+        mq_obj = getattr(merge_queue, name)
+        ms_obj = getattr(merge_shadow, name)
+        assert mq_obj is ms_obj, (
+            f'{name}: orchestrator.merge_queue.{name} and '
+            f'orchestrator.merge_shadow.{name} must be the identical object'
+        )

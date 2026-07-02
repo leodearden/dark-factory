@@ -195,3 +195,30 @@ class TestReachBackRouting:
             f'govern _run_drift_check and reach a local/remote parity agreement, '
             f'emitted event types: {event_store.emitted!r}'
         )
+
+
+def test_merge_queue_reexports_identical_objects() -> None:
+    """merge_queue re-exports the SAME objects from merge_drift (shim identity).
+
+    Covers both of the 2 moved names.
+
+    RED (pre-shim): merge_queue.py still defines its own independent copies
+    of these names (the duplicate definitions left in place by the EXPAND
+    step), so ``getattr(merge_queue, name) is getattr(merge_drift, name)``
+    fails for every name — two distinct objects that merely share a name.
+    """
+    import orchestrator.merge_drift as merge_drift
+    import orchestrator.merge_queue as merge_queue
+
+    moved_names = [
+        '_run_drift_check',
+        '_maybe_run_drift_check',
+    ]
+
+    for name in moved_names:
+        mq_obj = getattr(merge_queue, name)
+        md_obj = getattr(merge_drift, name)
+        assert mq_obj is md_obj, (
+            f'{name}: orchestrator.merge_queue.{name} and '
+            f'orchestrator.merge_drift.{name} must be the identical object'
+        )
