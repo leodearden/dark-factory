@@ -264,7 +264,12 @@ class TargetedReconciler:
             result['actions'].append({'type': action_type})
             await self.journal.add_run_action(
                 run_id, 'write', 'memory', 'add_memory',
-                {'task_id': task_id, 'type': 'completion_fast', 'deferred': not written},
+                {
+                    'task_id': task_id,
+                    'type': 'completion_fast',
+                    'deferred': not written,
+                    'echo_suppressed': has_authoritative,
+                },
                 causation_id=run_id,
             )
         except Exception as e:
