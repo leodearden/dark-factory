@@ -693,6 +693,14 @@ class CuratorConfig(BaseModel):
     #                          batch_turns_cap)
     #          budget    = min(max_budget_usd + per_item_budget_usd * (N-1),
     #                          batch_budget_cap_usd)
+    # NOTE: max_budget_usd and batch_budget_cap_usd are both $2.00 (task 1980
+    # / esc-task-curator-194), so the budget formula's additive term
+    # (per_item_budget_usd) is currently inert — every N clamps to the same
+    # flat $2.00. timeout and max_turns above are unaffected by that raise
+    # and still scale normally. per_item_budget_usd is retained (not
+    # removed) in case the flat ceiling is ever re-tuned; TestScaleBudget in
+    # test_task_curator.py pins the underlying min(base + per_entry*size,
+    # cap) arithmetic independent of these currently-equal defaults.
     batch_max: int = Field(default=5)
     per_item_slack_seconds: float = Field(default=30.0)
     per_item_turns: int = Field(default=1)
@@ -722,7 +730,9 @@ class CuratorConfig(BaseModel):
     # down, defeating the durable raise (see TestCuratorConfigBudgetRaise in
     # test_config_schema.py). With base == cap == $2.00, this formula now
     # clamps to a flat $2.00 for every pool size, including pathologically
-    # large ones — the scaling knob below is retained but inert.
+    # large ones — the scaling knob below is retained but inert (its
+    # min(base + per_entry*size, cap) arithmetic is pinned independent of
+    # these defaults by TestScaleBudget in test_task_curator.py).
     per_pool_entry_budget_usd: float = Field(default=0.0125)
     single_call_budget_cap_usd: float = Field(default=2.00)
 
