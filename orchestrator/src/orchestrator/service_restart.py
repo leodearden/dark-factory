@@ -380,7 +380,10 @@ class StaleServiceRestartCoordinator:
         executor = self._restart_executor or self._default_restart_executor
         try:
             await executor()
-        except Exception:
+        except (FileNotFoundError, PermissionError):
+            # PERMANENT: a missing or non-executable script will fail identically
+            # on every idle tick, so retrying would crash-loop. Clear pending
+            # (fail-open) — a new note_merge will re-arm.
             logger.warning(
                 f'{self._service_name} restart executor failed; clearing pending to avoid'
                 ' a crash-loop on a permanently-missing or non-executable script.'
@@ -392,6 +395,18 @@ class StaleServiceRestartCoordinator:
             self._pending = False
             self._trigger_task_ids = []
             self._trigger_merge_shas = []
+            return False
+        except Exception:
+            # TRANSIENT: e.g. a momentary systemd-run registration hiccup
+            # (RuntimeError from schedule_detached_systemd_restart). Retain
+            # pending and trigger metadata — symmetric with the
+            # restart_precondition fail-safe path — so the next idle tick
+            # retries instead of silently dropping the restart.
+            logger.warning(
+                f'{self._service_name} restart executor failed (transient); retaining'
+                ' pending — will retry on the next idle tick.',
+                exc_info=True,
+            )
             return False
 
         # Emit observability event

@@ -428,8 +428,8 @@ async def test_maybe_restart_executor_raises_does_not_propagate(caplog: pytest.L
 
 @pytest.mark.asyncio
 async def test_maybe_restart_executor_raises_subsequent_tick_does_not_retry() -> None:
-    """After an executor failure, is_pending is False — subsequent idle ticks are no-ops."""
-    raising_executor = AsyncMock(side_effect=OSError('permission denied'))
+    """After a PERMANENT executor failure, is_pending is False — subsequent idle ticks are no-ops."""
+    raising_executor = AsyncMock(side_effect=PermissionError('permission denied'))
     coord, current_time, _, _ = _make_coordinator_with_mutable_clock(
         ['fused-memory/src/server/main.py'],
         debounce_secs=0.0,
