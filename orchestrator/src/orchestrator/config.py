@@ -2519,3 +2519,63 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_red_advances_before_blocker',
     },
 )
+
+
+@dataclass
+class ConfigDiff:
+    """Result of diff_config(): every differing leaf, bucketed by allowlist membership."""
+
+    applied_candidates: dict[str, dict[str, Any]]
+    restart_required: dict[str, dict[str, Any]]
+    unchanged: int
+
+
+def _iter_leaves(model: BaseModel):
+    """Yield (dotted_path, value) for every leaf field of *model*.
+
+    Descends exactly one level into BaseModel-valued fields (e.g. models,
+    timeouts); dict/list/set-valued fields (verify_env, verify_runners, …)
+    are yielded whole as atomic leaves compared by equality. PrivateAttrs
+    (e.g. _module_configs) are never visited because they are not in
+    model_fields.
+    """
+    for name in type(model).model_fields:
+        value = getattr(model, name)
+        if isinstance(value, BaseModel):
+            for sub in type(value).model_fields:
+                yield f'{name}.{sub}', getattr(value, sub)
+        else:
+            yield name, value
+
+
+def diff_config(
+    live: 'OrchestratorConfig',
+    fresh: 'OrchestratorConfig',
+    allowlist: frozenset[str] = RELOADABLE_FIELDS,
+) -> ConfigDiff:
+    """Structurally diff two fully-constructed OrchestratorConfig instances.
+
+    Every leaf where live != fresh is categorized into applied_candidates
+    (path in *allowlist*) or restart_required (otherwise); equal leaves are
+    counted in ``unchanged``. Pure and synchronous — no I/O, no mutation of
+    either argument.
+    """
+    fresh_leaves = dict(_iter_leaves(fresh))
+    applied_candidates: dict[str, dict[str, Any]] = {}
+    restart_required: dict[str, dict[str, Any]] = {}
+    unchanged = 0
+    for path, live_val in _iter_leaves(live):
+        fresh_val = fresh_leaves[path]
+        if live_val != fresh_val:
+            entry = {'old': live_val, 'new': fresh_val}
+            if path in allowlist:
+                applied_candidates[path] = entry
+            else:
+                restart_required[path] = entry
+        else:
+            unchanged += 1
+    return ConfigDiff(
+        applied_candidates=applied_candidates,
+        restart_required=restart_required,
+        unchanged=unchanged,
+    )
