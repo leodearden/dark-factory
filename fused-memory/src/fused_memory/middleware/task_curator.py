@@ -1186,6 +1186,25 @@ class TaskCurator:
         unique_indices = non_blocklist_unique
         # ── End blocklist check ───────────────────────────────────────────────
 
+        # ── Recon code-fix premise-verification check ──────────────────────────
+        # For each unique (non-blocklist) candidate, check the premise-verification
+        # registry BEFORE corpus assembly or any LLM call. A match is dropped only
+        # while the live source/tests still refute the premise; decisions are
+        # stored in the idempotency cache so identical retries short-circuit
+        # without re-loading the YAML or re-reading source.
+        premise_decisions: dict[int, CuratorDecision] = {}  # original-space i → decision
+        non_premise_unique: list[int] = []
+        for i in unique_indices:
+            pr_decision = await self._maybe_premise_refuted_drop(
+                candidates[i], candidates[i].payload_hash(),
+            )
+            if pr_decision is not None:
+                premise_decisions[i] = pr_decision
+            else:
+                non_premise_unique.append(i)
+        unique_indices = non_premise_unique
+        # ── End premise-verification check ──────────────────────────────────────
+
         # ── Decision cache check ───────────────────────────────────────────────
         # Consult the idempotency cache for each unique (non-blocklist) candidate
         # before issuing an LLM call.  Under steady-state load (the same
@@ -1309,6 +1328,8 @@ class TaskCurator:
             if i in pre_dedup_decisions
             else blocklist_decisions[i]
             if i in blocklist_decisions
+            else premise_decisions[i]
+            if i in premise_decisions
             else unique_decision_map[i]
             for i in range(len(candidates))
         ]
