@@ -713,6 +713,10 @@ class TestOrchestratorCoordinatorEndToEnd:
         orch_coord = harness._service_restart_coordinators[2]
         assert orch_coord.enabled is False
 
+        # Re-bind (same fixture default) so pyright narrows the attribute to
+        # AsyncMock in this scope — it can't see the fixture's assignment
+        # from a different function — and .assert_not_awaited() is valid.
+        harness.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
         result = await orch_coord.note_merge('task-1', 'base', 'head')
 
         assert result is False
