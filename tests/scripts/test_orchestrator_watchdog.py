@@ -1537,6 +1537,280 @@ def test_staleness_pass_commit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# staleness_pass END-TO-END tests (δ task 2027, scenarios 1-4)
+#
+# α's staleness_pass tests above stub every helper function directly
+# (_enumerate_running_units, is_unit_enabled, _unit_start_elapsed_secs,
+# _newest_watched_commit_epoch, _unit_start_epoch, restart_unit). These tests
+# drive staleness_pass() through the REAL helpers against a single injected
+# fake subprocess.run — extending the report()-tests' argv-shape-dispatch
+# pattern (below) with is-enabled, the monotonic elapsed-secs show call,
+# restart_unit's stop/reset-failed/start sequence, and systemd-cat (log()) —
+# with wdog.time.time and wdog.time.clock_gettime controlled. This is the
+# strictly-higher integration level the δ gate calls for: it validates that
+# the real helpers' parsing composes correctly with staleness_pass's decision
+# logic, not just that the decision logic is correct given pre-decided inputs.
+# ---------------------------------------------------------------------------
+
+# Fixed CLOCK_MONOTONIC "now" used by _fleet_fake_run below to realize a
+# desired per-unit elapsed-secs via the paired ExecMainStartTimestampMonotonic
+# value — callers must monkeypatch wdog.time.clock_gettime to this constant.
+_E2E_CLOCK_MONOTONIC_NOW = 1_000_000.0
+
+
+def _fleet_fake_run(
+    *,
+    units: list[str],
+    commit_epoch: int,
+    start_epochs: dict[str, int],
+    recorded_calls: list[list[str]],
+    log_messages: list[str],
+    enabled: dict[str, bool] | None = None,
+    elapsed_secs: dict[str, float] | None = None,
+):
+    """Build a fake subprocess.run for staleness_pass() end-to-end tests.
+
+    Dispatches on argv shape (extends the report()-tests' dispatcher below
+    with the mutating/log calls staleness_pass can also issue): list-units /
+    is-enabled / the two distinct ``systemctl show`` calls (monotonic
+    elapsed-secs, realtime start epoch) / git log / restart_unit's
+    stop-reset-failed-start sequence / systemd-cat (log()). Unhandled argv
+    shapes fail the test outright rather than returning a default result, so
+    a change to the real helpers' argv is caught here instead of silently
+    driving staleness_pass() off a wrong assumption.
+
+    ``enabled`` defaults every unit to enabled (True); ``elapsed_secs``
+    defaults every unit to 300.0s (past STARTUP_GRACE_SECS=120).
+    """
+    enabled = {} if enabled is None else enabled
+    elapsed_secs = {} if elapsed_secs is None else elapsed_secs
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        recorded_calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(f"{u} loaded active running desc\n" for u in units)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "is-enabled"]:
+            unit = cmd[-1]
+            rc = 0 if enabled.get(unit, True) else 1
+            return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"] and (
+            "--property=ExecMainStartTimestampMonotonic" in cmd
+        ):
+            unit = cmd[3]
+            secs = elapsed_secs.get(unit, 300.0)
+            start_mono_us = int((_E2E_CLOCK_MONOTONIC_NOW - secs) * 1_000_000)
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=f"ExecMainStartTimestampMonotonic={start_mono_us}\n",
+                stderr="",
+            )
+        if cmd[:3] == ["systemctl", "--user", "show"] and "--timestamp=unix" in cmd:
+            unit = cmd[3]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epochs[unit]}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        if cmd[:3] in (
+            ["systemctl", "--user", "stop"],
+            ["systemctl", "--user", "reset-failed"],
+            ["systemctl", "--user", "start"],
+        ):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[0] == "systemd-cat":
+            log_messages.append(str(kwargs.get("input", "")))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside staleness_pass() e2e: {cmd}")
+
+    return fake_run
+
+
+def test_staleness_pass_e2e_restarts_stale_unit_then_converges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario 1 (I6): end-to-end, staleness_pass() restarts a unit whose real
+    start epoch predates the newest watched commit, logs a WARNING naming it,
+    and self-clears on the very next pass once the unit reads fresh again.
+
+    Unlike test_staleness_pass_core (which stubs every helper), this drives
+    _enumerate_running_units, is_unit_enabled, _unit_start_elapsed_secs,
+    _newest_watched_commit_epoch, _unit_start_epoch, and restart_unit all
+    through ONE injected fake subprocess.run — the integration level above
+    α's helper-stubbed unit test. Expected GREEN against merged α.
+    """
+    wdog = _load_watchdog()
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
+
+    unit = "orchestrator-know-live.service"
+    start_epochs = {unit: commit_epoch - 100}  # started before the commit -> stale
+
+    recorded_calls: list[list[str]] = []
+    log_messages: list[str] = []
+    fake_run = _fleet_fake_run(
+        units=[unit],
+        commit_epoch=commit_epoch,
+        start_epochs=start_epochs,
+        recorded_calls=recorded_calls,
+        log_messages=log_messages,
+    )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
+
+    wdog.staleness_pass()
+
+    restart_verbs = [
+        c[2]
+        for c in recorded_calls
+        if c[0] == "systemctl" and c[2] in {"stop", "reset-failed", "start"} and c[-1] == unit
+    ]
+    assert restart_verbs == ["stop", "reset-failed", "start"], (
+        f"Expected stop->reset-failed->start restart sequence for {unit}; got {restart_verbs}"
+    )
+    assert any(("WARNING" in m and unit in m) for m in log_messages), (
+        f"Expected a WARNING log line naming {unit}: {log_messages}"
+    )
+
+    # --- I6 convergence: a real restart would refresh the unit's start
+    # epoch, so flip it to newer-than-commit and run staleness_pass() again —
+    # no further restart sequence must be issued (stateless self-clear).
+    recorded_calls.clear()
+    start_epochs[unit] = commit_epoch + 50
+
+    wdog.staleness_pass()
+
+    restart_verbs_2 = [c[2] for c in recorded_calls if c[0] == "systemctl" and c[2] != "show"]
+    mutating_2 = [v for v in restart_verbs_2 if v in {"stop", "reset-failed", "start"}]
+    assert mutating_2 == [], (
+        f"staleness_pass must self-clear once {unit} reads fresh; got {mutating_2}"
+    )
+
+
+def test_staleness_pass_e2e_commit_grace_suppresses_all_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario 2 (I5, end-to-end): a commit younger than STALENESS_GRACE_SECS
+    performs zero mutating systemctl calls and never even enumerates units,
+    even though the running unit's real start epoch predates the commit.
+    """
+    wdog = _load_watchdog()
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - 300  # younger than STALENESS_GRACE_SECS=1800
+
+    unit = "orchestrator-know-live.service"
+    start_epochs = {unit: commit_epoch - 100}  # would be stale but for the grace gate
+
+    recorded_calls: list[list[str]] = []
+    log_messages: list[str] = []
+    fake_run = _fleet_fake_run(
+        units=[unit],
+        commit_epoch=commit_epoch,
+        start_epochs=start_epochs,
+        recorded_calls=recorded_calls,
+        log_messages=log_messages,
+    )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
+
+    wdog.staleness_pass()
+
+    assert not any(c[:3] == ["systemctl", "--user", "list-units"] for c in recorded_calls), (
+        f"commit-grace gate must return before enumerating units; got {recorded_calls}"
+    )
+    _assert_zero_mutating_calls(recorded_calls)
+
+
+def test_staleness_pass_e2e_fresh_unit_not_restarted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scenario 3 (I5, end-to-end): a unit whose real start epoch is newer than
+    the newest watched commit performs zero mutating systemctl calls.
+    """
+    wdog = _load_watchdog()
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
+
+    unit = "orchestrator-know-live.service"
+    start_epochs = {unit: commit_epoch + 100}  # fresh: started after the commit
+
+    recorded_calls: list[list[str]] = []
+    log_messages: list[str] = []
+    fake_run = _fleet_fake_run(
+        units=[unit],
+        commit_epoch=commit_epoch,
+        start_epochs=start_epochs,
+        recorded_calls=recorded_calls,
+        log_messages=log_messages,
+    )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
+
+    wdog.staleness_pass()
+
+    assert recorded_calls, "fresh-unit scenario must still drive real subprocess calls"
+    _assert_zero_mutating_calls(recorded_calls)
+
+
+def test_staleness_pass_e2e_disabled_unit_not_restarted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scenario 4 (I5, end-to-end): a disabled unit that is otherwise
+    stale-beyond-grace performs zero mutating systemctl calls — operator
+    intent (is-enabled) is respected before the staleness comparison ever
+    runs against that unit.
+    """
+    wdog = _load_watchdog()
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
+
+    unit = "orchestrator-know-live.service"
+    start_epochs = {unit: commit_epoch - 100}  # stale-beyond-grace, but for is-enabled
+
+    recorded_calls: list[list[str]] = []
+    log_messages: list[str] = []
+    fake_run = _fleet_fake_run(
+        units=[unit],
+        commit_epoch=commit_epoch,
+        start_epochs=start_epochs,
+        recorded_calls=recorded_calls,
+        log_messages=log_messages,
+        enabled={unit: False},
+    )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
+
+    wdog.staleness_pass()
+
+    _assert_zero_mutating_calls(recorded_calls)
+
+
+def _assert_zero_mutating_calls(recorded_calls: list[list[str]]) -> None:
+    """Assert no recorded argv contains a mutating systemctl verb.
+
+    Mirrors test_report_mixed_fleet_returns_1_and_lists_all_units's
+    mutating-verbs check (report()'s I7 read-only guarantee) — reused here
+    for staleness_pass()'s restraint gates (I5).
+    """
+    mutating_verbs = {"stop", "start", "restart", "reset-failed"}
+    for call in recorded_calls:
+        for token in call:
+            assert token not in mutating_verbs, (
+                f"staleness_pass() must perform zero mutating systemctl calls in this "
+                f"restraint scenario; saw {call}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # report() tests
 # ---------------------------------------------------------------------------
 
