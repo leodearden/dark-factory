@@ -741,3 +741,31 @@ async def test_ib4_same_infra_set_recurrence_updates_not_duplicates(
     task_id = worker.open_fix_tasks[fp]
     escalations = _l0_info_escalations(cast(EscalationQueue, worker.escalation_queue), task_id)
     assert len(escalations) == 1, 'a same-set recurrence must not raise a second L0 escalation'
+
+
+# ---------------------------------------------------------------------------
+# IB5 — flake filtered: infra fail-then-pass on confirmation is not a red
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ib5_infra_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, tmp_path):
+    """IB5 — an infra run that fails, then passes on the isolated
+    confirmation re-run, is intermittent nondeterminism, never a genuine
+    break: no fix task and no escalation are ever raised.
+
+    Negative control: filing a task on an unconfirmed (flaky) infra fail
+    makes this RED.
+    """
+    worker = _build_infra_worker(git_ops, tmp_path)
+    _wire_lane(harness, worker)
+    _inject_infra_flake(worker)
+
+    await _drive_advance(harness, repo)
+    await _run_one_lane_pass(worker)
+
+    # Intermittent-nondeterminism handling is proven behaviorally below (no
+    # fix task, no open fingerprint, no escalation) rather than by log text.
+    cast(AsyncMock, worker.task_client).submit_fix_task.assert_not_awaited()
+    assert worker.open_fix_tasks == {}
+    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
