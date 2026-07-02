@@ -442,3 +442,184 @@ class TestCreateInteractiveWorktreeIsolation:
             'I1 VIOLATION: removing the interactive worktree left an '
             'assignments entry behind'
         )
+
+
+# ---------------------------------------------------------------------------
+# Amendment: slug validation (reviewer_comprehensive robustness #2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreateInteractiveWorktreeSlugValidation:
+    """Amendment — slug is validated against a safe charset before any state
+    is touched, so a hostile/malformed slug can't escape worktree_base or
+    produce an opaque git ref error."""
+
+    @pytest.mark.parametrize(
+        'bad_slug',
+        [
+            'has/slash',
+            '../escape',
+            'a..b',
+            'has space',
+            '',
+            '.leading-dot',
+            '-leading-dash',
+            'trailing/../traversal',
+        ],
+    )
+    async def test_invalid_slug_raises_value_error_with_no_side_effects(
+        self, iw_git_repo: Path, bad_slug: str,
+    ) -> None:
+        """An invalid slug raises ValueError and creates nothing on disk or in git."""
+        await _add_seed_script(iw_git_repo)
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        with pytest.raises(ValueError):
+            await git_ops.create_interactive_worktree(bad_slug)
+
+        # No worktree_base side effect at all (validation runs before any I/O).
+        assert not git_ops.worktree_base.exists(), (
+            f'expected no worktree_base side effects for invalid slug {bad_slug!r}, '
+            f'but {git_ops.worktree_base} exists'
+        )
+
+    async def test_valid_slug_with_dots_and_dashes_still_works(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """A slug using the allowed charset (letters/digits/./_/-) is accepted."""
+        await _add_seed_script(iw_git_repo)
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info = await git_ops.create_interactive_worktree('feature.v2_final-1')
+        assert info.path == git_ops.worktree_base / '_iact-feature.v2_final-1', (
+            f'expected a valid dotted/dashed slug to be accepted, got {info.path}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Amendment: branch-namespace collision self-heal (reviewer_comprehensive
+# robustness #1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreateInteractiveWorktreeBranchCollision:
+    """Amendment — a leftover branch_prefix-namespaced branch for the same
+    slug (worktree dir removed, branch not deleted) is cleaned up when
+    provably safe, or retained with a RuntimeError when it carries work."""
+
+    async def test_leftover_empty_branch_is_cleaned_up_and_recreate_succeeds(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """A branch with 0 commits beyond main is deleted; recreate succeeds."""
+        await _add_seed_script(iw_git_repo)
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info1 = await git_ops.create_interactive_worktree('reuse-me')
+        rc_remove, _, remove_err = await _run(
+            ['git', 'worktree', 'remove', '--force', str(info1.path)],
+            cwd=iw_git_repo,
+        )
+        assert rc_remove == 0, f'setup: failed to remove {info1.path}: {remove_err}'
+
+        # `git worktree remove` never deletes branches — confirm the
+        # collision setup is real before recreating.
+        rc_branch, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/reuse-me'], cwd=iw_git_repo,
+        )
+        assert rc_branch == 0, 'setup: expected leftover task/reuse-me branch to exist'
+
+        info2 = await git_ops.create_interactive_worktree('reuse-me')
+        assert info2.branch == 'task/reuse-me', (
+            f"expected reuse to still land on 'task/reuse-me', got {info2.branch!r}"
+        )
+        rc_list, wt_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=iw_git_repo,
+        )
+        assert rc_list == 0 and str(info2.path.resolve()) in wt_list, (
+            f'expected {info2.path} to be a registered worktree after reuse; '
+            f'worktree list: {wt_list!r}'
+        )
+
+    async def test_leftover_branch_with_commits_is_retained_and_raises(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """A branch carrying commits beyond main is NEVER deleted; create raises."""
+        await _add_seed_script(iw_git_repo)
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info1 = await git_ops.create_interactive_worktree('has-work')
+        wip_sha = await _commit_file(
+            info1.path, 'wip.txt', 'wip\n', 'uncommitted work on the branch',
+        )
+        rc_remove, _, remove_err = await _run(
+            ['git', 'worktree', 'remove', '--force', str(info1.path)],
+            cwd=iw_git_repo,
+        )
+        assert rc_remove == 0, f'setup: failed to remove {info1.path}: {remove_err}'
+
+        with pytest.raises(RuntimeError):
+            await git_ops.create_interactive_worktree('has-work')
+
+        # Fail-safe retain: the branch (and its commit) must survive the
+        # rejected create — this is the "never destroy work" contract.
+        rc_branch, branch_sha, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/has-work'], cwd=iw_git_repo,
+        )
+        assert rc_branch == 0 and branch_sha.strip() == wip_sha, (
+            f'expected task/has-work to survive the rejected create and still '
+            f'point at {wip_sha!r}, got rc={rc_branch}, sha={branch_sha.strip()!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Amendment: cap enforcement is TOCTOU-safe under concurrency
+# (reviewer_comprehensive concurrency #3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreateInteractiveWorktreeConcurrency:
+    """Amendment — concurrent creates on one GitOps instance cannot both slip
+    past the REJECT cap (the count-then-create span is lock-serialized)."""
+
+    async def test_concurrent_creates_do_not_overrun_the_cap(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """Two concurrent create calls at cap=1 yield exactly 1 success, 1 reject."""
+        await _add_seed_script(iw_git_repo)
+        config = GitConfig(max_interactive_worktrees=1)
+        git_ops = GitOps(config, iw_git_repo)
+
+        results = await asyncio.gather(
+            git_ops.create_interactive_worktree('race-a'),
+            git_ops.create_interactive_worktree('race-b'),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if isinstance(r, InteractiveWorktreeInfo)]
+        limit_errors = [
+            r for r in results if isinstance(r, InteractiveWorktreeLimitError)
+        ]
+        assert len(successes) == 1, (
+            f'expected exactly 1 success under max_interactive_worktrees=1 '
+            f'(TOCTOU guard), got {results!r}'
+        )
+        assert len(limit_errors) == 1, (
+            f'expected exactly 1 InteractiveWorktreeLimitError (TOCTOU guard), '
+            f'got {results!r}'
+        )
+
+        iact_dirs = [
+            p for p in git_ops.worktree_base.iterdir()
+            if p.is_dir() and p.name.startswith('_iact-')
+        ]
+        assert len(iact_dirs) == 1, (
+            f'expected exactly 1 _iact-* dir on disk (cap held under race), '
+            f'got {[p.name for p in iact_dirs]!r}'
+        )

@@ -377,6 +377,17 @@ class WorktreeInfo:
     reify_debug_port: int | None = None
 
 
+# Validation for create_interactive_worktree's slug argument.  slug is
+# interpolated directly into a filesystem path segment
+# (worktree_base / f'{iact_prefix}{slug}') and a git branch name
+# (f'{branch_prefix}{slug}'), so it is restricted to a conservative safe
+# charset — no '/' (would turn the f-string into a multi-component path via
+# the Path '/' operator — traversal), no whitespace, no leading '.'/'-'.
+# '..' is rejected separately below since it passes this charset but is
+# invalid in a git ref component.
+_INTERACTIVE_SLUG_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+
+
 @dataclass(frozen=True)
 class InteractiveWorktreeInfo:
     """Return value from create_interactive_worktree — an isolated interactive worktree.
@@ -452,6 +463,13 @@ class InteractiveWorktreeLimitError(Exception):
     TTL/idle discrimination that belongs to the δ reaper, not this primitive.
     Raised BEFORE any git operation — callers must free a slot (the β release
     verb, a direct ``git worktree remove``, or the δ reaper) and retry.
+
+    The count is raw on-disk ``_iact-*`` directory names under
+    ``worktree_base`` — it is NOT cross-checked against ``git worktree
+    list``, so a stale/unregistered ``_iact-*`` directory (e.g. left behind
+    by a crashed create, before self-heal removes it on its own next
+    attempt) occupies a cap slot too.  Reclaiming those is the δ reaper's
+    job, not this primitive's.
     """
 
 
@@ -697,6 +715,14 @@ class GitOps:
         # K>1 warm-up burst.  Reset-in-place (already-registered) acquires are
         # per-lane and don't contend, so this only guards the one-time create path.
         self._spec_wt_create_lock: asyncio.Lock = asyncio.Lock()
+        # Serialize create_interactive_worktree's cap-count + create-once span
+        # on THIS instance (task 2010 amendment) — mirrors _spec_wt_create_lock
+        # above.  Without it, two concurrent calls can both observe the
+        # on-disk _iact-* count under max_interactive_worktrees and both
+        # proceed, overrunning the REJECT cap (TOCTOU).  In-process only —
+        # matches the pool's own in-process concurrency scope, not
+        # cross-process safe.
+        self._interactive_wt_lock: asyncio.Lock = asyncio.Lock()
         # Reclaim-on-exhaustion safety valve callbacks (task 1933).
         # Declared here (default None), installed by Harness.__init__ when
         # config.git.warm_lane_reclaim_on_exhaustion is True — mirrors the
@@ -1288,6 +1314,24 @@ class GitOps:
         the ``_lane-*`` dispatch pool and the ``_spec-*`` merge-speculation
         pool.
 
+        **Branch namespace** (NOT disjoint): the branch is
+        ``f'{branch_prefix}{slug}'`` — the SAME namespace shared with
+        dispatch task branches and every other interactive slug. Only the
+        on-disk ``_iact-*`` directory band is dedicated; the branch
+        namespace is not. A leftover ``branch_prefix``-namespaced branch for
+        this slug (a live dispatch task reusing the id, or a prior
+        interactive session whose worktree directory was removed without
+        deleting its branch) is handled exactly like :meth:`create_worktree`
+        handles it: deleted when provably safe (no commits beyond main, no
+        dirty tree — see :meth:`_cleanup_leftover_branch`), otherwise the
+        create is refused with a ``RuntimeError`` rather than risk
+        destroying work.
+
+        **Concurrency**: cap-count + create-once are serialized by a
+        per-instance lock (``_interactive_wt_lock``), so two concurrent
+        calls on the SAME GitOps instance cannot both slip past the cap
+        (TOCTOU-safe in-process; not cross-process).
+
         Unlike :meth:`acquire_warm_lane`, a seed failure is FAIL-SOFT: the
         worktree is retained (never removed) and ``warm=False`` is returned
         rather than raising — an interactive session should get a usable
@@ -1295,7 +1339,12 @@ class GitOps:
 
         Args:
             slug: caller-chosen claim identity; becomes both the branch
-                suffix and the ``.task/interactive.json`` owner.
+                suffix and the ``.task/interactive.json`` owner. Must match
+                ``^[A-Za-z0-9][A-Za-z0-9._-]*$`` and must not contain
+                ``'..'`` — it is interpolated directly into a filesystem
+                path segment and a git branch name, so anything else raises
+                ``ValueError`` immediately rather than risking an escaped
+                path or an opaque git failure.
             start_ref: optional ref/SHA to pin as the base; defaults to the
                 current local ``main_branch`` tip.
 
@@ -1303,67 +1352,104 @@ class GitOps:
             InteractiveWorktreeInfo(path, branch, warm, base_ref).
 
         Raises:
+            ValueError: slug fails the safe-charset validation above.
+                Raised FIRST, before any state is inspected.
             InteractiveWorktreeLimitError: the on-disk ``_iact-*`` count under
                 ``worktree_base`` is already at ``config.max_interactive_worktrees``.
-                Raised FIRST, before any git operation (REJECT policy).
-            RuntimeError: start_ref/main_branch fails to resolve, or
-                ``git worktree add`` fails (e.g. a path/branch collision
-                that self-heal could not clear).
+                Raised before any git operation (REJECT policy).
+            RuntimeError: start_ref/main_branch fails to resolve; a leftover
+                branch for this slug provably carries work that would be
+                destroyed by reuse (see :meth:`_cleanup_leftover_branch`); or
+                ``git worktree add`` fails for another reason.
         """
-        # ── Cap enforcement (REJECT), FIRST — before any git op ──────────
-        # Strictly filtered by iact_prefix so this never counts _lane-*/
-        # _spec-*/_merge-verify/_offline-deep (isolation invariant I1).
-        if self.worktree_base.exists():
-            existing = sum(
-                1 for child in self.worktree_base.iterdir()
-                if child.is_dir() and child.name.startswith(self.config.iact_prefix)
-            )
-        else:
-            existing = 0
-        if existing >= self.config.max_interactive_worktrees:
-            raise InteractiveWorktreeLimitError(
-                f'create_interactive_worktree({slug!r}): at cap — '
-                f'{existing}/{self.config.max_interactive_worktrees} '
-                f'{self.config.iact_prefix}* worktrees already exist under '
-                f'{self.worktree_base}. Free a slot (release one, or wait for '
-                f'the δ reaper) and retry.'
+        # ── Slug validation, FIRST — a caller bug independent of any state ──
+        # slug is interpolated directly into a filesystem path segment and a
+        # git branch name (see _INTERACTIVE_SLUG_RE).  '..' passes the
+        # charset but is invalid in a git ref component, so it is rejected
+        # separately here instead.
+        if not _INTERACTIVE_SLUG_RE.match(slug) or '..' in slug:
+            raise ValueError(
+                f'create_interactive_worktree: invalid slug {slug!r} — must '
+                f"match {_INTERACTIVE_SLUG_RE.pattern!r} and must not contain "
+                f"'..' (it becomes both a path segment under "
+                f'{self.worktree_base} and a git branch suffix).'
             )
 
-        path = self.worktree_base / f'{self.config.iact_prefix}{slug}'
-        full_branch = f'{self.config.branch_prefix}{slug}'
+        # ── Cap enforcement (REJECT) + create-once, serialized ────────────
+        # _interactive_wt_lock guards count-through-`git worktree add` so two
+        # concurrent callers on this instance can't both observe count < cap
+        # and both create, overrunning the REJECT cap (TOCTOU) — mirrors
+        # _spec_wt_create_lock's create-once serialization. In-process only.
+        async with self._interactive_wt_lock:
+            # Strictly filtered by iact_prefix so this never counts _lane-*/
+            # _spec-*/_merge-verify/_offline-deep (isolation invariant I1).
+            # Raw on-disk directory names, NOT cross-checked against `git
+            # worktree list` — see InteractiveWorktreeLimitError's docstring.
+            if self.worktree_base.exists():
+                existing = sum(
+                    1 for child in self.worktree_base.iterdir()
+                    if child.is_dir() and child.name.startswith(self.config.iact_prefix)
+                )
+            else:
+                existing = 0
+            if existing >= self.config.max_interactive_worktrees:
+                raise InteractiveWorktreeLimitError(
+                    f'create_interactive_worktree({slug!r}): at cap — '
+                    f'{existing}/{self.config.max_interactive_worktrees} '
+                    f'{self.config.iact_prefix}* worktrees already exist under '
+                    f'{self.worktree_base}. Free a slot (release one, or wait for '
+                    f'the δ reaper) and retry.'
+                )
 
-        ref_rc, ref_out, ref_err = await _run(
-            ['git', 'rev-parse', start_ref or self.config.main_branch],
-            cwd=self.project_root,
-        )
-        if ref_rc != 0:
-            raise RuntimeError(
-                f'create_interactive_worktree: failed to resolve start ref '
-                f'{start_ref or self.config.main_branch!r}: {ref_err.strip()!r}'
+            path = self.worktree_base / f'{self.config.iact_prefix}{slug}'
+            full_branch = f'{self.config.branch_prefix}{slug}'
+
+            ref_rc, ref_out, ref_err = await _run(
+                ['git', 'rev-parse', start_ref or self.config.main_branch],
+                cwd=self.project_root,
             )
-        base_ref = ref_out.strip()
+            if ref_rc != 0:
+                raise RuntimeError(
+                    f'create_interactive_worktree: failed to resolve start ref '
+                    f'{start_ref or self.config.main_branch!r}: {ref_err.strip()!r}'
+                )
+            base_ref = ref_out.strip()
 
-        path.parent.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Self-heal a stale unregistered directory (mirrors acquire_warm_lane's
-        # create-once branch) so `git worktree add` doesn't refuse a non-empty dir.
-        if path.exists() and not await self._is_registered_worktree(path):
-            logger.warning(
-                'create_interactive_worktree: %s exists but is not registered; '
-                'removing stale directory (self-heal)', path,
+            # Self-heal a stale unregistered directory (mirrors acquire_warm_lane's
+            # create-once branch) so `git worktree add` doesn't refuse a non-empty dir.
+            if path.exists() and not await self._is_registered_worktree(path):
+                logger.warning(
+                    'create_interactive_worktree: %s exists but is not registered; '
+                    'removing stale directory (self-heal)', path,
+                )
+                shutil.rmtree(path)
+
+            # Branch-namespace self-heal: full_branch shares config.branch_prefix
+            # with dispatch task branches and other interactive slugs (see the
+            # docstring's "Branch namespace" note), so a leftover ref for this
+            # slug would otherwise collide with `git worktree add -b` below.
+            # Mirror create_worktree's leftover-branch handling: clean it up
+            # ONLY when _cleanup_leftover_branch proves it non-destructive (no
+            # commits beyond main, no dirty tree); it raises RuntimeError
+            # rather than delete anything it cannot prove safe.
+            branch_exists_rc, _, _ = await _run(
+                ['git', 'rev-parse', '--verify', full_branch], cwd=self.project_root,
             )
-            shutil.rmtree(path)
+            if branch_exists_rc == 0:
+                await self._cleanup_leftover_branch(full_branch, slug)
 
-        add_rc, _, add_err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(path), base_ref],
-            cwd=self.project_root,
-        )
-        if add_rc != 0:
-            raise RuntimeError(
-                f'create_interactive_worktree: git worktree add failed for '
-                f'{path} (branch {full_branch!r}, base {base_ref!r}): '
-                f'{add_err.strip()!r}'
+            add_rc, _, add_err = await _run(
+                ['git', 'worktree', 'add', '-b', full_branch, str(path), base_ref],
+                cwd=self.project_root,
             )
+            if add_rc != 0:
+                raise RuntimeError(
+                    f'create_interactive_worktree: git worktree add failed for '
+                    f'{path} (branch {full_branch!r}, base {base_ref!r}): '
+                    f'{add_err.strip()!r}'
+                )
 
         # .task/interactive.json stamp for the δ reaper (owner/created_at let
         # the reaper age out worktrees with no activity past the TTL).
