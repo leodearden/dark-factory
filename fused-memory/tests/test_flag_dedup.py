@@ -1671,9 +1671,26 @@ class TestFilterSuppressed:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_scoped_and_legacy_records_for_same_task_id_union_to_blanket(self):
+    @pytest.mark.parametrize(
+        'record_order',
+        [
+            pytest.param('scoped_first', id='scoped-then-legacy'),
+            pytest.param('legacy_first', id='legacy-then-scoped'),
+        ],
+    )
+    async def test_scoped_and_legacy_records_for_same_task_id_union_to_blanket(
+        self, record_order
+    ):
         """(e) One scoped + one legacy-blanket record for the same task_id
-        results in blanket suppression (union semantics: wildcard wins)."""
+        results in blanket suppression (union semantics: wildcard wins),
+        regardless of which order Mem0's search returns them in — result
+        ordering is nondeterministic in practice, so both orders occur.
+
+        'legacy-then-scoped' exercises the wildcard-already-present
+        short-circuit branch (``if tid_str in suppressed and
+        suppressed[tid_str] is None: continue``), which 'scoped-then-legacy'
+        never reaches (the scoped record's ``set`` is simply overwritten by
+        the legacy record's wildcard in that order)."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
         scoped_record = _make_memory_result({
@@ -1685,8 +1702,13 @@ class TestFilterSuppressed:
             'kind': 'stage1_flag_suppression',
             'task_id': 452,
         })
+        records = (
+            [scoped_record, legacy_record]
+            if record_order == 'scoped_first'
+            else [legacy_record, scoped_record]
+        )
         memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[scoped_record, legacy_record])
+        memory_service.search = AsyncMock(return_value=records)
 
         flag_a = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
         flag_b = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}

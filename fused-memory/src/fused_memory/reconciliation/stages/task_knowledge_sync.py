@@ -2682,6 +2682,18 @@ class TaskKnowledgeSync(BaseStage):
                     '_source': 'mem0_active_query',
                     'flag_id': f['id'],
                     'task_id': f['task_id'],
+                    # flag_type surfaced from the Mem0 marker's own metadata
+                    # (task-1966 amendment, reviewer finding dedup_gap):
+                    # compute_flag_signature() requires BOTH task_id and
+                    # flag_type to produce a signature, so without this a
+                    # surviving mem0_active_query flag never enters
+                    # existing_signatures below and the recon_report_systemic
+                    # poll could double-render a finding that also survived
+                    # this channel.  Stage 1 markers are documented (stage1.py
+                    # "## Stage 2 Flag Relay (FIX B)") to carry flag_type
+                    # alongside task_id; falls back to None (no signature,
+                    # same as before) when a legacy marker omits it.
+                    'flag_type': f.get('metadata', {}).get('flag_type'),
                     'content': f['content'],
                 }
             )

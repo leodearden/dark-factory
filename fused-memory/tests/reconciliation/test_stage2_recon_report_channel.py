@@ -38,8 +38,16 @@ class _FakeReconReportState:
 class TestQueryReconReportFindings:
     """Tests for _query_recon_report_findings(recon_report_state, run_id)."""
 
-    def test_none_state_returns_empty_no_call(self):
-        """(a) recon_report_state is None -> returns [] and performs no call (no error)."""
+    def test_none_state_returns_empty(self):
+        """(a) recon_report_state is None -> returns [] without raising.
+
+        This only asserts the empty-return; there is no observable object to
+        assert a "no call" contract against when state is None (None has no
+        ``get_findings_for_run`` to spy on). The guard is the early
+        ``if recon_report_state is None: return []`` check in the helper —
+        see test_filters_to_systemic_pattern_category_only below for a case
+        that positively confirms ``get_findings_for_run`` IS called (and
+        exactly once) when a real state object is supplied."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _query_recon_report_findings,
         )
@@ -218,6 +226,42 @@ class TestAssemblePayloadReconReportChannel:
                 'description': 'already flagged by stage 1',
             },
         ])
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        assert payload.count('live_workflow_recurrence_counter_needed') == 1
+        assert stage._recon_report_systemic_polled == 0
+
+    @pytest.mark.asyncio
+    async def test_systemic_finding_deduped_against_surviving_mem0_flag(
+        self, mock_deps, watermark
+    ):
+        """Regression (reviewer finding dedup_gap): a surviving Mem0
+        active-query flag (mem0_active_query source, from a live
+        flag_for_stage2 marker) carries flag_type sourced from the marker's
+        own metadata, so compute_flag_signature can dedup the recon_report
+        channel poll against it too — not only against the Stage 1
+        structured-output channel. Without surfacing flag_type here, this
+        finding would be rendered a second time via the recon_report poll."""
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='mem0-marker-1',
+                content='live workflow recurrence counter needed for task 452',
+                metadata={
+                    'flag_for_stage2': True,
+                    'task_id': '452',
+                    'flag_type': 'live_workflow_recurrence_counter_needed',
+                    'run_id': 'test-run',
+                },
+                created_at=None,
+            ),
+        ]
+        stage = _make_configured_stage(
+            mock_deps, project_id='autopilot_video', project_root='/home/leo/src/autopilot-video'
+        )
+        finding = self._systemic_finding()
+        stage._recon_report_state = _FakeReconReportState(findings=[finding])
+        stage1_report = self._stage1_report(items_flagged=[])  # Stage 1 channel empty
 
         payload = await stage.assemble_payload([], watermark, [stage1_report])
 
