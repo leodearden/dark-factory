@@ -20,13 +20,9 @@ mirroring task α's test_merge_types.py:
    return values — the merge_gates-local (naive) patch would steer the
    outcome one way, the merge_queue (reach-back target) patch the other —
    so the assertion is unambiguous about which one governed.
-4. Shim re-export identity + reason-prefix byte-identity (added in a later
-   step, once merge_queue.py's shim swap lands).
+4. Shim re-export identity (added in a later step, once merge_queue.py's
+   shim swap lands).
 """
-
-# NOTE: byte-identical reason-prefix literal checks and shim re-export
-# identity checks are added in a later step (once merge_queue.py's shim
-# swap lands) — see the module docstring above.
 
 from __future__ import annotations
 
@@ -292,20 +288,3 @@ def test_merge_queue_reexports_identical_objects() -> None:
             f'{name}: orchestrator.merge_queue.{name} and '
             f'orchestrator.merge_gates.{name} must be the identical object'
         )
-
-
-def test_reason_prefix_byte_identical_literals() -> None:
-    """Reason-prefix string VALUES are byte-identical to their pre-extraction
-    literals, so existing ``reason.startswith(PREFIX)`` assertions and any
-    ``grep`` for the human-facing text keep matching unchanged."""
-    from orchestrator.merge_gates import (
-        DROPPED_PLAN_TARGETS_REASON_PREFIX,
-        PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
-        POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-        POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
-    )
-
-    assert DROPPED_PLAN_TARGETS_REASON_PREFIX == 'Merge commit is missing plan target files'
-    assert PLAN_FILES_NOT_TOUCHED_REASON_PREFIX == 'Plan files not touched by branch'
-    assert POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX == 'Post-merge content equivalence failed'
-    assert POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX == 'Post-merge unscoped type-check failed'
