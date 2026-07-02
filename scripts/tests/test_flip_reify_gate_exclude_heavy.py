@@ -112,3 +112,53 @@ def _commit_count(repo):
 
 def _read_config(repo):
     return (repo / CONFIG_FILE).read_text()
+
+
+def _head_files(repo):
+    result = subprocess.run(
+        ["git", "-C", str(repo), "show", "--name-only", "--pretty=format:", "HEAD"],
+        capture_output=True, text=True, check=True,
+    )
+    return result.stdout.split()
+
+
+# ---------------------------------------------------------------------------
+# step-1: RED -- default (apply) mode inserts the knob and commits
+# ---------------------------------------------------------------------------
+
+def test_apply_inserts_knob_and_commits(tmp_path):
+    """Default (no-arg) apply mode inserts the knob as the first child of
+    verify_env:, preserves the surrounding comments/children, commits the
+    change in the reify repo, and exits 0."""
+    repo = _make_fake_reify_repo(tmp_path)
+    before_commits = _commit_count(repo)
+
+    result = _run_script(repo)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0 on a fresh apply; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    lines = _read_config(repo).splitlines()
+    verify_env_idx = lines.index("verify_env:")
+    assert lines[verify_env_idx + 1] == f'  {KNOB}: "1"', (
+        f"Expected the knob as the first child right after verify_env:; "
+        f"got: {lines[verify_env_idx:verify_env_idx + 3]!r}"
+    )
+
+    config_text = _read_config(repo)
+    assert "RUSTC_WRAPPER: sccache" in config_text, "pre-existing child dropped"
+    assert "CARGO_INCREMENTAL is required alongside sccache" in config_text, (
+        "pre-existing comment dropped"
+    )
+    assert 'CARGO_INCREMENTAL: "0"' in config_text, "pre-existing child dropped"
+    assert "other_top_level_key: true" in config_text, "unrelated top-level key dropped"
+
+    after_commits = _commit_count(repo)
+    assert after_commits == before_commits + 1, (
+        f"Expected exactly one new commit; before={before_commits} after={after_commits}"
+    )
+    assert CONFIG_FILE in _head_files(repo), (
+        f"Expected HEAD to name {CONFIG_FILE}; got {_head_files(repo)!r}"
+    )
