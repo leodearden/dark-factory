@@ -450,6 +450,66 @@ async def test_maybe_restart_executor_raises_subsequent_tick_does_not_retry() ->
 
 
 # ---------------------------------------------------------------------------
+# Transient vs permanent executor failures (asymmetry fix — task 2017)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_transient_executor_failure_retains_pending_and_retries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A TRANSIENT executor failure (e.g. a RuntimeError from a systemd-run
+    registration hiccup) retains pending — symmetric with the restart_precondition
+    fail-safe path — so the next idle tick retries. Once the executor recovers, the
+    retry fires normally (event emitted, pending cleared).
+    """
+    import logging
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['fused-memory/src/server/main.py'], None)
+    )
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+    executor = AsyncMock(side_effect=[RuntimeError('systemd-run rc=1'), None])
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+    )
+
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord.is_pending is True
+
+    current_time[0] = 1.0  # past debounce (0)
+
+    # First tick: executor raises RuntimeError (transient) — pending is retained.
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result1 = await coord.maybe_restart(agents_idle=True)
+
+    assert result1 is False
+    assert coord.is_pending is True
+    executor.assert_awaited_once()
+    assert any(
+        'transient' in r.message.lower() or 'retry' in r.message.lower()
+        for r in caplog.records
+    )
+
+    # Second tick: executor recovers — fires, emits event, clears pending.
+    result2 = await coord.maybe_restart(agents_idle=True)
+
+    assert result2 is True
+    assert executor.await_count == 2
+    event_store.emit.assert_called_once()
+    assert coord.is_pending is False
+
+
+# ---------------------------------------------------------------------------
 # Burst-coalescing (step-7) + default executor tests
 # ---------------------------------------------------------------------------
 
