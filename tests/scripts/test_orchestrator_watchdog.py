@@ -1211,3 +1211,116 @@ def test_staleness_grace_secs_malformed_env_falls_back(monkeypatch: pytest.Monke
     wdog = _load_watchdog()
     assert wdog.STALENESS_GRACE_SECS == 1800
 
+
+# ---------------------------------------------------------------------------
+# staleness_pass core tests
+#
+# These tests set every restraint gate permissive (enabled, past startup
+# grace, commit older than STALENESS_GRACE_SECS) so they exercise the core
+# per-unit staleness comparison. Later steps add tests for each gate itself.
+# ---------------------------------------------------------------------------
+
+
+def test_staleness_pass_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    """staleness_pass restarts only the unit stale w.r.t. the newest watched commit.
+
+    Also exercises I6 convergence: once a restart refreshes a unit's start
+    epoch to newer-than-commit, a second pass issues no further restart.
+    """
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+    log_messages: list[str] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
+
+    stale_unit = "orchestrator-stale.service"
+    fresh_unit = "orchestrator-fresh.service"
+    unknown_unit = "orchestrator-unknown.service"
+
+    start_epochs = {
+        stale_unit: commit_epoch - 100,  # started before the commit -> stale
+        fresh_unit: commit_epoch + 100,  # started after the commit -> fresh
+        unknown_unit: None,  # undeterminable -> must not restart
+    }
+
+    monkeypatch.setattr(
+        wdog, "_enumerate_running_units", lambda: [stale_unit, fresh_unit, unknown_unit]
+    )
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda u: start_epochs[u])
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.staleness_pass()
+
+    assert restarted == [stale_unit], f"Expected only {stale_unit} restarted, got {restarted}"
+    assert any(("WARNING" in m and stale_unit in m) for m in log_messages), (
+        f"Expected a WARNING log line naming {stale_unit}: {log_messages}"
+    )
+
+    # --- Convergence (I6): a real restart refreshes the unit's start epoch,
+    # so a second pass must issue no further restart for the same unit.
+    restarted.clear()
+    start_epochs[stale_unit] = commit_epoch + 50  # as if just restarted
+    wdog.staleness_pass()
+    assert restarted == [], (
+        f"staleness_pass must self-clear once the unit's start epoch is fresh; got {restarted}"
+    )
+
+
+def test_staleness_pass_isolates_per_unit_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """staleness_pass must not let one unit's exception stop later units from processing."""
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    boom_unit = "orchestrator-boom.service"
+    stale_unit = "orchestrator-stale2.service"
+
+    def fake_start_epoch(unit: str):  # noqa: ANN001
+        if unit == boom_unit:
+            raise RuntimeError("systemctl exploded")
+        return commit_epoch - 100  # stale
+
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [boom_unit, stale_unit])
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", fake_start_epoch)
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    # Must not raise
+    wdog.staleness_pass()
+
+    assert stale_unit in restarted, (
+        f"{stale_unit} must still be processed after {boom_unit} raised; got {restarted}"
+    )
+
+
+def test_staleness_pass_noop_when_commit_epoch_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """staleness_pass takes no action at all when the commit epoch is undeterminable."""
+    wdog = _load_watchdog()
+    enumerated: list[str] = []
+
+    def fake_enumerate():
+        enumerated.append("called")
+        return ["orchestrator-x.service"]
+
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_enumerate_running_units", fake_enumerate)
+    monkeypatch.setattr(wdog, "restart_unit", lambda _u: pytest.fail("must not restart"))
+
+    wdog.staleness_pass()
+
+    assert enumerated == [], (
+        "staleness_pass must return before enumerating units when commit_epoch is None"
+    )
+
