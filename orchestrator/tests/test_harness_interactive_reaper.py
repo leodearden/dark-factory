@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,7 +26,7 @@ import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, ReapedInteractiveWorktree
+from orchestrator.git_ops import GitOps, ReapedInteractiveWorktree, _run
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
 
@@ -47,6 +48,51 @@ def _make_harness(tmp_path: Path) -> tuple[Harness, MagicMock]:
     harness._run_id = 'run-interactive-reaper-0001'
     harness.event_store = EventStore(tmp_path / 'events.db', 'run-interactive-reaper-0001')
     return harness, mock_run_store
+
+
+# ---------------------------------------------------------------------------
+# Real-repo fixtures + helpers (mirrors test_interactive_worktree_reaper.py)
+# ---------------------------------------------------------------------------
+
+
+async def _init_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+async def _commit_file(repo: Path, name: str, content: str, message: str) -> str:
+    """Write+commit a file on the repo's current branch; return the new commit SHA."""
+    (repo / name).write_text(content)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', message], cwd=repo)
+    rc, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse HEAD failed after committing {name!r}'
+    return sha.strip()
+
+
+def _backdate_stamp(path: Path, created_at: datetime) -> None:
+    """Rewrite the ``.task/interactive.json`` stamp's ``created_at`` field."""
+    import json
+
+    stamp_path = path / '.task' / 'interactive.json'
+    stamp = json.loads(stamp_path.read_text())
+    stamp['created_at'] = created_at.isoformat()
+    stamp_path.write_text(json.dumps(stamp))
+
+
+async def _registered_worktree_paths(repo: Path) -> set[str]:
+    """Return the set of registered worktree paths (resolved) via `git worktree list`."""
+    rc, out, _ = await _run(['git', 'worktree', 'list', '--porcelain'], cwd=repo)
+    assert rc == 0, 'git worktree list --porcelain failed'
+    paths = set()
+    for line in out.splitlines():
+        if line.startswith('worktree '):
+            paths.add(str(Path(line[len('worktree '):].strip()).resolve()))
+    return paths
 
 
 # ---------------------------------------------------------------------------
