@@ -253,3 +253,64 @@ class TestInteractiveWorktreeStamp:
             f'expected .task/interactive.json to be absent from git status '
             f'(gitignored); got status: {status_out!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-07: fail-soft warmth (the key deviation from acquire_warm_lane)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreateInteractiveWorktreeFailSoftWarmth:
+    """RED — a seed fault must be fail-soft: worktree retained, warm=False, no raise."""
+
+    async def test_absent_seed_script_returns_cold_but_usable(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """No scripts/seed-warm-lane.sh committed (rc=127) → cold, usable, stamped."""
+        # Deliberately do NOT commit a seed script.
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info = await git_ops.create_interactive_worktree('cold-a')
+
+        assert info.warm is False, (
+            f'expected warm is False (no seed script present), got {info.warm!r}'
+        )
+        assert info.path.exists(), f'expected {info.path} to exist'
+
+        rc_list, wt_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=iw_git_repo,
+        )
+        assert rc_list == 0 and str(info.path.resolve()) in wt_list, (
+            f'expected {info.path} to be a registered git worktree even though '
+            f'cold; worktree list: {wt_list!r}'
+        )
+        assert (info.path / '.task' / 'interactive.json').exists(), (
+            'expected the stamp to be present even though the worktree is cold '
+            '(worktree is usable)'
+        )
+
+    async def test_seed_script_failure_retains_worktree(self, iw_git_repo: Path) -> None:
+        """Seed script exiting 1 → worktree RETAINED (not removed), warm=False, no raise."""
+        await _add_seed_script(iw_git_repo, exit_code=1)
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info = await git_ops.create_interactive_worktree('cold-b')
+
+        assert info.warm is False, (
+            f'expected warm is False (seed script exited 1), got {info.warm!r}'
+        )
+        assert info.path.exists(), (
+            f'expected {info.path} to exist — fail-soft retention, NOT removed'
+        )
+
+        rc_list, wt_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=iw_git_repo,
+        )
+        assert rc_list == 0 and str(info.path.resolve()) in wt_list, (
+            f'expected {info.path} to remain a REGISTERED git worktree after a '
+            f'seed failure (fail-soft retention, not the acquire_warm_lane '
+            f'remove-on-failure behaviour); worktree list: {wt_list!r}'
+        )
