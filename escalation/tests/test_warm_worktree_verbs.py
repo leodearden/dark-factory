@@ -364,3 +364,77 @@ class TestReleaseWarmWorktreeRemoval:
         assert '_iact-rel2' in wt_list, (
             f'expected _iact-rel2 still registered after mismatch, got: {wt_list}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7 (RED) / step-8 (GREEN): release prunes a merged branch, keeps an
+# unmerged one, and accepts branch-name input.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestReleaseWarmWorktreeBranchPrune:
+    """Prune-if-merged after removal; branch-mode path_or_branch resolution."""
+
+    async def test_a_merged_branch_is_pruned(
+        self, warm_repo: Path, server: Any,
+    ) -> None:
+        """(a) task/mrg tip == main tip (already an ancestor) → pruned + gone."""
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='mrg', project_root=str(warm_repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+
+        res = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(warm_repo),
+        )
+
+        assert res['branch_pruned'] is True, f'expected branch_pruned=True, got: {res}'
+        rc, out, _ = await _run(['git', 'branch', '--list', 'task/mrg'], cwd=warm_repo)
+        assert rc == 0
+        assert out.strip() == '', f'expected task/mrg branch gone, got: {out!r}'
+
+    async def test_b_unmerged_branch_is_kept(
+        self, warm_repo: Path, server: Any,
+    ) -> None:
+        """(b) task/wip has a commit beyond main → branch_pruned False, kept."""
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='wip', project_root=str(warm_repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+        await _commit_file(Path(claim['path']), 'wip.txt', 'x', 'wip commit')
+
+        res = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(warm_repo),
+        )
+
+        assert res['branch_pruned'] is False, f'expected branch_pruned=False, got: {res}'
+        rc, out, _ = await _run(['git', 'branch', '--list', 'task/wip'], cwd=warm_repo)
+        assert rc == 0
+        assert 'task/wip' in out, f'expected task/wip branch kept, got: {out!r}'
+
+    async def test_c_release_by_branch_name(
+        self, warm_repo: Path, server: Any,
+    ) -> None:
+        """(c) path_or_branch='task/bybr' (branch-mode) resolves + removes."""
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='bybr', project_root=str(warm_repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+
+        res = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch='task/bybr', project_root=str(warm_repo),
+        )
+
+        assert res['removed'] is True, f'expected removed=True, got: {res}'
+        rc_list, wt_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=warm_repo,
+        )
+        assert rc_list == 0
+        assert '_iact-bybr' not in wt_list, (
+            f'expected _iact-bybr gone from worktree list, got: {wt_list}'
+        )
