@@ -1956,7 +1956,7 @@ async def test_on_task_done_suppresses_when_stage2_suppress_guard_exists(
 
 @pytest.mark.asyncio
 async def test_on_task_done_fails_open_when_metadata_query_raises(
-    reconciler, mock_memory_service,
+    reconciler, mock_memory_service, journal,
 ):
     """A Mem0/Qdrant hiccup during the authoritative-memory pre-check must never
     drop the completion echo — it must fail open and preserve the current
@@ -1989,6 +1989,24 @@ async def test_on_task_done_fails_open_when_metadata_query_raises(
 
     # (d) completion-fact audit action is preserved
     assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+    # (e) the journal audit row must not leak a truthy echo_suppressed flag on
+    # the fail-open path — mirrors test_on_task_done_echo_suppressed_flag_in_journal_action's
+    # non-authoritative case so a future refactor can't regress this silently.
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    completion_rows = [
+        a for a in actions
+        if a['operation'] == 'add_memory' and a['detail'].get('type') == 'completion_fast'
+    ]
+    assert len(completion_rows) == 1, (
+        f'Expected exactly one completion_fast journal row, got: {completion_rows}'
+    )
+    assert completion_rows[0]['detail'].get('echo_suppressed') is False, (
+        f'Expected echo_suppressed=False on the fail-open path, '
+        f'got detail: {completion_rows[0]["detail"]}'
+    )
 
 
 @pytest.mark.asyncio
