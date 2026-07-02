@@ -2065,3 +2065,46 @@ class TestApplyReload:
             'old': {},
             'new': {'RUSTC_WRAPPER': 'sccache', 'SCCACHE_REDIS': 'redis://h:6379'},
         }
+
+
+class TestApplyReloadHybridRollback:
+    """I5: a partial apply that leaves *live* in a hybrid-invalid state (only
+    one side of a cross-field invariant updated) must be synchronously
+    rolled back — apply_reload must never leave `live` mutated into a config
+    that OrchestratorConfig itself would reject.
+
+    Uses a SYNTHETIC allowlist containing ONLY 'timeouts.steward' (omitting
+    'steward_completion_timeout', which travels with it under the real
+    RELOADABLE_FIELDS). This is PRD boundary scenario 5 — unreachable
+    end-to-end under v1 because the real allowlist keeps both sides of the
+    _validate_steward_timeout_invariant together — so it is exercised here
+    at the unit level via the injectable `allowlist` param.
+    """
+
+    def test_hybrid_invariant_violation_rolls_back_synchronously(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # live is valid on its own: 1800 >= 900.
+        live = OrchestratorConfig(
+            timeouts=TimeoutsConfig(steward=1800.0),
+            steward_completion_timeout=900.0,
+        )
+        # fresh is valid on its own: 800 >= 700.
+        fresh = OrchestratorConfig(
+            timeouts=TimeoutsConfig(steward=800.0),
+            steward_completion_timeout=700.0,
+        )
+        live_dump_before = live.model_dump()
+        # Applying ONLY timeouts.steward (1800 -> 800) while
+        # steward_completion_timeout stays at live's 900 produces an invalid
+        # hybrid (800 < 900) that OrchestratorConfig.model_validate must reject.
+        report = apply_reload(live, fresh, allowlist=frozenset({'timeouts.steward'}))
+        assert report['reloaded'] is False
+        assert report['error'].startswith('hybrid-invariant')
+        assert report['applied'] == {}
+        # Rolled back byte-for-byte: timeouts.steward restored to 1800.0;
+        # steward_completion_timeout was never touched (it was categorized
+        # restart_required under the synthetic allowlist).
+        assert live.model_dump() == live_dump_before
+        assert live.timeouts.steward == 1800.0
+        assert live.steward_completion_timeout == 900.0
